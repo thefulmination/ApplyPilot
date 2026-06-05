@@ -68,7 +68,10 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     Schema columns by stage:
       - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
-      - Scoring:    fit_score, score_reasoning, scored_at
+      - Scoring:    fit_score, score_reasoning, score_model, score_provider, scored_at
+      - Diagnosis:  fit_gap_category, fit_gap_severity, resume_fixability,
+                    recommended_action, fit_diagnosis, fit_diagnosis_json,
+                    diagnosis_model, diagnosis_provider, diagnosed_at
       - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
@@ -96,6 +99,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             description           TEXT,
             location              TEXT,
             site                  TEXT,
+            company               TEXT,
+            source_board          TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
 
@@ -108,7 +113,29 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Scoring stage (job_scorer)
             fit_score             INTEGER,
             score_reasoning       TEXT,
+            score_error           TEXT,
+            score_error_at        TEXT,
+            score_attempts        INTEGER DEFAULT 0,
+            score_model           TEXT,
+            score_provider        TEXT,
             scored_at             TEXT,
+            role_fit_score        INTEGER,
+            audit_score           REAL,
+            audit_label           TEXT,
+            audit_flags           TEXT,
+            audit_reason          TEXT,
+            audited_at            TEXT,
+
+            -- Diagnosis stage (fit diagnosis / resume gap analysis)
+            fit_gap_category      TEXT,
+            fit_gap_severity      TEXT,
+            resume_fixability     TEXT,
+            recommended_action    TEXT,
+            fit_diagnosis         TEXT,
+            fit_diagnosis_json    TEXT,
+            diagnosis_model       TEXT,
+            diagnosis_provider    TEXT,
+            diagnosed_at          TEXT,
 
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
@@ -136,6 +163,11 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    backfill_company_source_fields(conn)
+    repair_retryable_score_errors(conn)
+    ensure_job_indexes(conn)
+    ensure_application_tables(conn)
+    ensure_pipeline_tables(conn)
 
     return conn
 
@@ -151,6 +183,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "description": "TEXT",
     "location": "TEXT",
     "site": "TEXT",
+    "company": "TEXT",
+    "source_board": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
     # Enrichment
@@ -161,7 +195,29 @@ _ALL_COLUMNS: dict[str, str] = {
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
+    "score_error": "TEXT",
+    "score_error_at": "TEXT",
+    "score_attempts": "INTEGER DEFAULT 0",
+    "score_model": "TEXT",
+    "score_provider": "TEXT",
     "scored_at": "TEXT",
+    # Score audit / reranking
+    "role_fit_score": "INTEGER",
+    "audit_score": "REAL",
+    "audit_label": "TEXT",
+    "audit_flags": "TEXT",
+    "audit_reason": "TEXT",
+    "audited_at": "TEXT",
+    # Fit diagnosis / gap analysis
+    "fit_gap_category": "TEXT",
+    "fit_gap_severity": "TEXT",
+    "resume_fixability": "TEXT",
+    "recommended_action": "TEXT",
+    "fit_diagnosis": "TEXT",
+    "fit_diagnosis_json": "TEXT",
+    "diagnosis_model": "TEXT",
+    "diagnosis_provider": "TEXT",
+    "diagnosed_at": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -219,6 +275,380 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     return added
 
 
+def backfill_company_source_fields(conn: sqlite3.Connection | None = None) -> None:
+    """Populate company/source_board for databases created before those fields existed."""
+    if conn is None:
+        conn = get_connection()
+
+    board_names = (
+        "indeed",
+        "linkedin",
+        "zip_recruiter",
+        "glassdoor",
+        "the_muse",
+        "remotejobs_org",
+        "remotive",
+        "arbeitnow",
+    )
+    placeholders = ",".join("?" for _ in board_names)
+    conn.execute(
+        f"""
+        UPDATE jobs
+           SET source_board = COALESCE(source_board, site)
+         WHERE source_board IS NULL
+           AND lower(COALESCE(site, '')) IN ({placeholders})
+        """,
+        board_names,
+    )
+    conn.execute(
+        f"""
+        UPDATE jobs
+           SET company = COALESCE(company, site)
+         WHERE company IS NULL
+           AND lower(COALESCE(site, '')) NOT IN ({placeholders})
+        """,
+        board_names,
+    )
+    conn.execute(
+        """
+        UPDATE jobs
+           SET source_board = COALESCE(source_board, strategy, site)
+         WHERE source_board IS NULL
+        """
+    )
+    conn.commit()
+
+
+def repair_retryable_score_errors(conn: sqlite3.Connection | None = None) -> int:
+    """Move legacy LLM error scores back to pending scoring.
+
+    Older runs persisted provider failures as fit_score=0, which made them look
+    completed. Those rows should remain retryable and keep the failure note.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    cursor = conn.execute(
+        """
+        UPDATE jobs
+           SET score_error = COALESCE(score_error, score_reasoning),
+               score_error_at = COALESCE(score_error_at, scored_at),
+               fit_score = NULL,
+               scored_at = NULL
+         WHERE fit_score = 0
+           AND score_reasoning LIKE '%LLM error:%'
+        """
+    )
+    repaired = int(cursor.rowcount or 0)
+    conn.execute(
+        """
+        UPDATE jobs
+           SET role_fit_score = NULL,
+               audit_score = NULL,
+               audit_label = NULL,
+               audit_flags = NULL,
+               audit_reason = NULL,
+               audited_at = NULL,
+               fit_gap_category = NULL,
+               fit_gap_severity = NULL,
+               resume_fixability = NULL,
+               recommended_action = NULL,
+               fit_diagnosis = NULL,
+               fit_diagnosis_json = NULL,
+               diagnosis_model = NULL,
+               diagnosis_provider = NULL,
+               diagnosed_at = NULL
+         WHERE fit_score IS NULL
+           AND score_error IS NOT NULL
+        """
+    )
+    conn.commit()
+    return repaired
+
+
+def ensure_job_indexes(conn: sqlite3.Connection | None = None) -> None:
+    """Create indexes used by status and resumable pipeline stages."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_source_board ON jobs(source_board)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_discovered_at ON jobs(discovered_at)")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_pending_score
+            ON jobs(discovered_at)
+         WHERE full_description IS NOT NULL AND fit_score IS NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_pending_tailor
+            ON jobs(COALESCE(audit_score, fit_score), discovered_at)
+         WHERE full_description IS NOT NULL
+           AND tailored_resume_path IS NULL
+           AND COALESCE(tailor_attempts, 0) < 5
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_ready_to_apply
+            ON jobs(COALESCE(audit_score, fit_score), discovered_at)
+         WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL
+        """
+    )
+    conn.commit()
+
+
+def ensure_application_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create first-class application tracking tables.
+
+    jobs.applied_at is the quick pipeline flag. These tables are the durable
+    tracker: current application status plus an append-only status history.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_url               TEXT NOT NULL UNIQUE,
+            title                 TEXT,
+            company               TEXT,
+            source                TEXT,
+            source_url            TEXT,
+            application_url       TEXT,
+            status                TEXT NOT NULL DEFAULT 'shortlisted',
+            channel               TEXT,
+            applied_at            TEXT,
+            last_status_at        TEXT,
+            next_follow_up_at     TEXT,
+            resume_path           TEXT,
+            cover_letter_path     TEXT,
+            contact_name          TEXT,
+            contact_email         TEXT,
+            contact_url           TEXT,
+            notes                 TEXT,
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL,
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS application_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_url               TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            event_type            TEXT NOT NULL,
+            channel               TEXT,
+            happened_at           TEXT NOT NULL,
+            notes                 TEXT,
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_applied_at ON applications(applied_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_followup ON applications(next_follow_up_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_application_events_job_url ON application_events(job_url)")
+
+    # Backfill current applied jobs into the tracker once, preserving dates.
+    rows = conn.execute("""
+        SELECT j.*
+        FROM jobs j
+        LEFT JOIN applications a ON a.job_url = j.url
+        WHERE j.applied_at IS NOT NULL AND a.job_url IS NULL
+    """).fetchall()
+    for row in rows:
+        applied_at = row["applied_at"]
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            INSERT INTO applications (
+                job_url, title, company, source, source_url, application_url,
+                status, channel, applied_at, last_status_at, resume_path,
+                cover_letter_path, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'applied', 'legacy', ?, ?, ?, ?, ?, ?)
+        """, (
+            row["url"], row["title"], row["company"] or row["site"], row["source_board"] or row["site"], row["url"],
+            row["application_url"], applied_at, applied_at,
+            row["tailored_resume_path"], row["cover_letter_path"], now, now,
+        ))
+        conn.execute("""
+            INSERT INTO application_events (
+                job_url, status, event_type, channel, happened_at, notes
+            )
+            VALUES (?, 'applied', 'backfill', 'legacy', ?, 'Backfilled from jobs.applied_at')
+        """, (row["url"], applied_at))
+    conn.commit()
+
+
+def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create durable pipeline run/checkpoint tables."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            stages                TEXT NOT NULL,
+            mode                  TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            min_score             INTEGER,
+            batch_size            INTEGER,
+            workers               INTEGER,
+            validation_mode       TEXT,
+            started_at            TEXT NOT NULL,
+            ended_at              TEXT,
+            error                 TEXT,
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_stage_runs (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id                INTEGER NOT NULL,
+            stage                 TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            pending_before        INTEGER,
+            pending_after         INTEGER,
+            elapsed_seconds       REAL,
+            started_at            TEXT NOT NULL,
+            ended_at              TEXT,
+            error                 TEXT,
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES pipeline_runs(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started_at ON pipeline_runs(started_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_stage ON pipeline_stage_runs(stage)")
+    conn.commit()
+
+
+def create_pipeline_run(
+    conn: sqlite3.Connection | None = None,
+    *,
+    stages: list[str],
+    mode: str,
+    min_score: int,
+    batch_size: int | None,
+    workers: int,
+    validation_mode: str,
+) -> int:
+    """Record a new pipeline run and return its id."""
+    if conn is None:
+        conn = get_connection()
+    ensure_pipeline_tables(conn)
+
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO pipeline_runs (
+            stages, mode, status, min_score, batch_size, workers,
+            validation_mode, started_at, created_at, updated_at
+        )
+        VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ",".join(stages),
+            mode,
+            min_score,
+            batch_size,
+            workers,
+            validation_mode,
+            now,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def finish_pipeline_run(
+    conn: sqlite3.Connection | None,
+    run_id: int,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Mark a pipeline run complete, partial, or failed."""
+    if conn is None:
+        conn = get_connection()
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        UPDATE pipeline_runs
+           SET status = ?,
+               ended_at = ?,
+               error = ?,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (status, now, error, now, run_id),
+    )
+    conn.commit()
+
+
+def start_pipeline_stage(
+    conn: sqlite3.Connection | None,
+    run_id: int,
+    stage: str,
+    pending_before: int | None = None,
+) -> int:
+    """Record the start of one pipeline stage and return its stage-run id."""
+    if conn is None:
+        conn = get_connection()
+
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO pipeline_stage_runs (
+            run_id, stage, status, pending_before,
+            started_at, created_at, updated_at
+        )
+        VALUES (?, ?, 'running', ?, ?, ?, ?)
+        """,
+        (run_id, stage, pending_before, now, now, now),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def finish_pipeline_stage(
+    conn: sqlite3.Connection | None,
+    stage_run_id: int,
+    *,
+    status: str,
+    pending_after: int | None = None,
+    elapsed_seconds: float | None = None,
+    error: str | None = None,
+) -> None:
+    """Record the end state for one pipeline stage."""
+    if conn is None:
+        conn = get_connection()
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        UPDATE pipeline_stage_runs
+           SET status = ?,
+               pending_after = ?,
+               elapsed_seconds = ?,
+               ended_at = ?,
+               error = ?,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (status, pending_after, elapsed_seconds, now, error, now, stage_run_id),
+    )
+    conn.commit()
+
+
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     """Return job counts by pipeline stage.
 
@@ -244,7 +674,12 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     # By site breakdown
     rows = conn.execute(
-        "SELECT site, COUNT(*) as cnt FROM jobs GROUP BY site ORDER BY cnt DESC"
+        """
+        SELECT COALESCE(source_board, strategy, site, 'Unknown') AS source, COUNT(*) as cnt
+          FROM jobs
+         GROUP BY COALESCE(source_board, strategy, site, 'Unknown')
+         ORDER BY cnt DESC
+        """
     ).fetchall()
     stats["by_site"] = [(row[0], row[1]) for row in rows]
 
@@ -279,6 +714,31 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     ).fetchall()
     stats["score_distribution"] = [(row[0], row[1]) for row in dist_rows]
 
+    stats["audited"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE audited_at IS NOT NULL"
+    ).fetchone()[0]
+
+    stats["recommended"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE audit_label IN ('priority', 'recommended')"
+    ).fetchone()[0]
+
+    stats["audit_excluded"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE audit_label = 'exclude'"
+    ).fetchone()[0]
+
+    stats["diagnosed"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE diagnosed_at IS NOT NULL"
+    ).fetchone()[0]
+
+    stats["undiagnosed"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE fit_score IS NOT NULL AND full_description IS NOT NULL "
+        "AND (diagnosed_at IS NULL "
+        "OR (scored_at IS NOT NULL AND diagnosed_at < scored_at) "
+        "OR (audited_at IS NOT NULL AND diagnosed_at < audited_at))"
+    ).fetchone()[0]
+
     # Tailoring stage
     stats["tailored"] = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL"
@@ -286,7 +746,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE fit_score >= 7 AND full_description IS NOT NULL "
+        "WHERE COALESCE(audit_score, fit_score) >= 7 AND full_description IS NOT NULL "
         "AND tailored_resume_path IS NULL"
     ).fetchone()[0]
 
@@ -320,7 +780,29 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
         "AND applied_at IS NULL "
-        "AND application_url IS NOT NULL"
+        "AND (apply_status IS NULL OR apply_status = 'failed') "
+        "AND COALESCE(audit_score, fit_score, 0) >= 7"
+    ).fetchone()[0]
+
+    stats["applications_tracked"] = conn.execute(
+        "SELECT COUNT(*) FROM applications"
+    ).fetchone()[0]
+
+    stats["interviews"] = conn.execute(
+        "SELECT COUNT(*) FROM applications "
+        "WHERE status IN ('recruiter_screen', 'hiring_manager', 'assessment', 'final')"
+    ).fetchone()[0]
+
+    stats["rejections"] = conn.execute(
+        "SELECT COUNT(*) FROM applications WHERE status = 'rejected'"
+    ).fetchone()[0]
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    stats["followups_due"] = conn.execute(
+        "SELECT COUNT(*) FROM applications "
+        "WHERE next_follow_up_at IS NOT NULL AND substr(next_follow_up_at, 1, 10) <= ? "
+        "AND status NOT IN ('rejected', 'closed', 'offer', 'withdrawn')",
+        (today,),
     ).fetchone()[0]
 
     return stats
@@ -349,10 +831,25 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                """
+                INSERT INTO jobs (
+                    url, title, salary, description, location, site,
+                    company, source_board, strategy, discovered_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    url,
+                    job.get("title"),
+                    job.get("salary"),
+                    job.get("description"),
+                    job.get("location"),
+                    job.get("company") or site,
+                    job.get("company") or site,
+                    job.get("source_board") or site,
+                    strategy,
+                    now,
+                ),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -386,14 +883,21 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "enriched": "full_description IS NOT NULL",
         "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
         "scored": "fit_score IS NOT NULL",
+        "pending_diagnosis": (
+            "fit_score IS NOT NULL AND full_description IS NOT NULL "
+            "AND (diagnosed_at IS NULL "
+            "OR (scored_at IS NOT NULL AND diagnosed_at < scored_at) "
+            "OR (audited_at IS NOT NULL AND diagnosed_at < audited_at))"
+        ),
         "pending_tailor": (
-            "fit_score >= ? AND full_description IS NOT NULL "
+            "COALESCE(audit_score, fit_score) >= ? AND full_description IS NOT NULL "
             "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
-            "AND application_url IS NOT NULL"
+            "AND (apply_status IS NULL OR apply_status = 'failed') "
+            "AND COALESCE(audit_score, fit_score, 0) >= 7"
         ),
         "applied": "applied_at IS NOT NULL",
     }
@@ -407,10 +911,14 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         params.append(7)  # default min_score
 
     if min_score is not None and "fit_score" not in where and stage in ("scored", "tailored", "applied"):
-        where += " AND fit_score >= ?"
+        where += " AND COALESCE(audit_score, fit_score) >= ?"
         params.append(min_score)
 
-    query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    query = (
+        f"SELECT * FROM jobs WHERE {where} "
+        "ORDER BY COALESCE(audit_score, fit_score) DESC NULLS LAST, "
+        "fit_score DESC NULLS LAST, discovered_at DESC"
+    )
     if limit > 0:
         query += " LIMIT ?"
         params.append(limit)

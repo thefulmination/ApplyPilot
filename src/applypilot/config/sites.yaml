@@ -36,6 +36,7 @@ blocked_sso:
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.
 base_urls:
+  "Eluta": "https://www.eluta.ca"
   "Job Bank Canada": "https://www.jobbank.gc.ca"
   "CareerJet Canada": "https://www.careerjet.ca"
   "BuiltIn Remote": "https://builtin.com"
@@ -47,6 +48,7 @@ base_urls:
   "Startup.jobs": "https://startup.jobs"
   "Nodesk": "https://nodesk.co"
   "Talent.com": "https://www.talent.com"
+  "SimplyHired": "https://www.simplyhired.com"
   "JustRemote": "https://justremote.co"
   "Arc.dev": "https://arc.dev"
   "Himalayas": "https://himalayas.app"

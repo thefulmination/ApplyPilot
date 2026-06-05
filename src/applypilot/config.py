@@ -8,17 +8,28 @@ from pathlib import Path
 # User data directory — all user-specific files live here
 APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
 
+
+def _path_from_env(name: str, default: Path) -> Path:
+    value = os.environ.get(name)
+    return Path(value) if value else default
+
+
 # Core paths
-DB_PATH = APP_DIR / "applypilot.db"
-PROFILE_PATH = APP_DIR / "profile.json"
-RESUME_PATH = APP_DIR / "resume.txt"
-RESUME_PDF_PATH = APP_DIR / "resume.pdf"
-SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
-ENV_PATH = APP_DIR / ".env"
+DB_PATH = _path_from_env("APPLYPILOT_DB_PATH", APP_DIR / "applypilot.db")
+PROFILE_PATH = _path_from_env("APPLYPILOT_PROFILE_PATH", APP_DIR / "profile.json")
+RESUME_PATH = _path_from_env("APPLYPILOT_RESUME_PATH", APP_DIR / "resume.txt")
+RESUME_PDF_PATH = _path_from_env("APPLYPILOT_RESUME_PDF_PATH", APP_DIR / "resume.pdf")
+SEARCH_CONFIG_PATH = _path_from_env("APPLYPILOT_SEARCH_CONFIG_PATH", APP_DIR / "searches.yaml")
+RESUME_STRATEGY_PATH = _path_from_env("APPLYPILOT_RESUME_STRATEGY_PATH", APP_DIR / "resume_strategy.yaml")
+PREFERENCE_PROFILE_PATH = _path_from_env("APPLYPILOT_PREFERENCE_PROFILE_PATH", APP_DIR / "job_preference_profile.json")
+ENV_PATH = _path_from_env("APPLYPILOT_ENV_PATH", APP_DIR / ".env")
 
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR = APP_DIR / "cover_letters"
+JOB_EXPORT_DIR = APP_DIR / "job_exports"
+SCORE_AUDIT_DIR = APP_DIR / "score_audits"
+APPLICATION_EXPORT_DIR = APP_DIR / "application_exports"
 LOG_DIR = APP_DIR / "logs"
 
 # Chrome worker isolation
@@ -74,6 +85,37 @@ def get_chrome_path() -> str:
     )
 
 
+def get_claude_path() -> str:
+    """Find Claude Code CLI, including the project-local npm install."""
+    env_path = os.environ.get("CLAUDE_PATH")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    found = shutil.which("claude") or shutil.which("claude.exe") or shutil.which("claude.cmd")
+    if found:
+        return found
+
+    project_root = PACKAGE_DIR.parent.parent
+    if platform.system() == "Windows":
+        candidates = [
+            project_root / ".tools/claude/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+            project_root / ".tools/claude/node_modules/@anthropic-ai/claude-code-win32-x64/claude.exe",
+            project_root / ".tools/claude/node_modules/.bin/claude.cmd",
+        ]
+    else:
+        candidates = [
+            project_root / ".tools/claude/node_modules/.bin/claude",
+        ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    raise FileNotFoundError(
+        "Claude Code CLI not found. Install from https://claude.ai/code or set CLAUDE_PATH."
+    )
+
+
 def get_chrome_user_data() -> Path:
     """Default Chrome user data directory, cross-platform."""
     system = platform.system()
@@ -87,7 +129,17 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        APP_DIR,
+        TAILORED_DIR,
+        COVER_LETTER_DIR,
+        JOB_EXPORT_DIR,
+        SCORE_AUDIT_DIR,
+        APPLICATION_EXPORT_DIR,
+        LOG_DIR,
+        CHROME_WORKER_DIR,
+        APPLY_WORKER_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -111,6 +163,23 @@ def load_search_config() -> dict:
             return yaml.safe_load(example.read_text(encoding="utf-8"))
         return {}
     return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def load_resume_strategy() -> dict:
+    """Load optional resume positioning rules used by tailoring/cover prompts."""
+    import yaml
+    if not RESUME_STRATEGY_PATH.exists():
+        return {}
+    return yaml.safe_load(RESUME_STRATEGY_PATH.read_text(encoding="utf-8")) or {}
+
+
+def load_preference_profile() -> dict | None:
+    """Load optional human-labeled job preference profile for score calibration."""
+    import json
+    path = _path_from_env("APPLYPILOT_PREFERENCE_PROFILE_PATH", PREFERENCE_PROFILE_PATH)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def load_sites_config() -> dict:
@@ -163,6 +232,7 @@ def load_base_urls() -> dict[str, str | None]:
 
 DEFAULTS = {
     "min_score": 7,
+    "generation_batch_size": 900,
     "max_apply_attempts": 3,
     "max_tailor_attempts": 5,
     "poll_interval": 60,
@@ -206,11 +276,15 @@ def get_tier() -> int:
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
+    try:
+        get_claude_path()
+        has_claude = True
+    except FileNotFoundError:
+        has_claude = False
     try:
         get_chrome_path()
         has_chrome = True
@@ -238,10 +312,12 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
+        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY or DEEPSEEK_API_KEY")
     if required >= 3:
-        if not shutil.which("claude"):
+        try:
+            get_claude_path()
+        except FileNotFoundError:
             missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
         try:
             get_chrome_path()

@@ -14,6 +14,15 @@ chrome-workers/
 apply-workers/
 apply_logs/
 logs/
+.applypilot/
+.conda-env/
+.conda-pkgs/
+.conda-temp/
+.codex-temp/
+.npm-cache/
+.playwright-browsers/
+.tools/
+.venv/
 
 # MCP configs (per-machine)
 .mcp*.json

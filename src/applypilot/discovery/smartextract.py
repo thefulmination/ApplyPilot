@@ -14,23 +14,22 @@ placeholders replaced from the user's search configuration.
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import quote_plus
 
-import httpx
 import yaml
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import init_db, get_stats
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -46,14 +45,77 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _cfg_int(cfg: dict, key: str, default: int) -> int:
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cfg_bool(cfg: dict, key: str, default: bool) -> bool:
+    value = cfg.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+SMART_GOTO_TIMEOUT_MS = _env_int("APPLYPILOT_SMART_GOTO_TIMEOUT_MS", 30000)
+SMART_ACTION_TIMEOUT_MS = _env_int("APPLYPILOT_SMART_ACTION_TIMEOUT_MS", 8000)
+SMART_NETWORK_IDLE_TIMEOUT_MS = _env_int("APPLYPILOT_SMART_NETWORK_IDLE_TIMEOUT_MS", 5000)
+SMART_WAIT_FOR_NETWORK_IDLE = _env_bool("APPLYPILOT_SMART_WAIT_FOR_NETWORK_IDLE", False)
+SMART_HEADFUL_RETRY = _env_bool("APPLYPILOT_SMART_HEADFUL_RETRY", False)
+SMART_BLOCK_RESOURCES = _env_bool("APPLYPILOT_SMART_BLOCK_RESOURCES", True)
+SMART_MAX_RESPONSE_BYTES = _env_int("APPLYPILOT_SMART_MAX_RESPONSE_BYTES", 2_000_000)
+
+
+def _apply_smart_config(smart_cfg: dict) -> None:
+    """Apply per-run Smart Extract settings from searches.yaml."""
+    global SMART_GOTO_TIMEOUT_MS
+    global SMART_ACTION_TIMEOUT_MS
+    global SMART_NETWORK_IDLE_TIMEOUT_MS
+    global SMART_WAIT_FOR_NETWORK_IDLE
+    global SMART_HEADFUL_RETRY
+    global SMART_BLOCK_RESOURCES
+    global SMART_MAX_RESPONSE_BYTES
+
+    SMART_GOTO_TIMEOUT_MS = _cfg_int(smart_cfg, "goto_timeout_ms", SMART_GOTO_TIMEOUT_MS)
+    SMART_ACTION_TIMEOUT_MS = _cfg_int(smart_cfg, "action_timeout_ms", SMART_ACTION_TIMEOUT_MS)
+    SMART_NETWORK_IDLE_TIMEOUT_MS = _cfg_int(
+        smart_cfg, "network_idle_timeout_ms", SMART_NETWORK_IDLE_TIMEOUT_MS
+    )
+    SMART_WAIT_FOR_NETWORK_IDLE = _cfg_bool(
+        smart_cfg, "wait_for_network_idle", SMART_WAIT_FOR_NETWORK_IDLE
+    )
+    SMART_HEADFUL_RETRY = _cfg_bool(smart_cfg, "headful_retry", SMART_HEADFUL_RETRY)
+    SMART_BLOCK_RESOURCES = _cfg_bool(smart_cfg, "block_resources", SMART_BLOCK_RESOURCES)
+    SMART_MAX_RESPONSE_BYTES = _cfg_int(
+        smart_cfg, "max_response_bytes", SMART_MAX_RESPONSE_BYTES
+    )
+
+
 # -- Location filtering -------------------------------------------------------
 
 def _load_location_filter(search_cfg: dict | None = None):
     """Load location accept/reject lists from search config."""
     if search_cfg is None:
         search_cfg = config.load_search_config()
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
+    location_cfg = search_cfg.get("location", {}) or {}
+    accept = search_cfg.get("location_accept") or location_cfg.get("accept_patterns", [])
+    reject = search_cfg.get("location_reject_non_remote") or location_cfg.get("reject_patterns", [])
     return accept, reject
 
 
@@ -85,6 +147,38 @@ def load_sites() -> list[dict]:
     return data.get("sites", [])
 
 
+def _list_config(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return []
+
+
+def _filter_sites(sites: list[dict], smart_cfg: dict) -> list[dict]:
+    include = {item.lower() for item in _list_config(smart_cfg.get("include_sites"))}
+    exclude = {item.lower() for item in _list_config(smart_cfg.get("exclude_sites"))}
+    include_search = _cfg_bool(smart_cfg, "include_search_sites", True)
+    include_static = _cfg_bool(smart_cfg, "include_static_sites", True)
+
+    filtered: list[dict] = []
+    for site in sites:
+        name = str(site.get("name", "")).lower()
+        site_type = site.get("type", "static")
+        if include and name not in include:
+            continue
+        if name in exclude:
+            continue
+        if site_type == "search" and not include_search:
+            continue
+        if site_type != "search" and not include_static:
+            continue
+        filtered.append(site)
+    return filtered
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -108,10 +202,16 @@ def _store_jobs_filtered(
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO jobs (
+                    url, title, salary, description, location, site,
+                    company, source_board, strategy, discovered_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), job.get("company") or site,
+                 job.get("company") or site, site, strategy, now),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -147,7 +247,12 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             return
         if "json" in ct or "/api/" in rurl or "algolia" in rurl or "graphql" in rurl:
             try:
+                content_length = response.headers.get("content-length")
+                if content_length and int(content_length) > SMART_MAX_RESPONSE_BYTES:
+                    return
                 body = response.text()
+                if len(body) > SMART_MAX_RESPONSE_BYTES:
+                    return
                 try:
                     data = json.loads(body)
                 except Exception:
@@ -162,33 +267,66 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(user_agent=UA)
-        page.on("response", on_response)
+        browser = None
+        launch_opts: dict = {"headless": headless}
+        try:
+            launch_opts["executable_path"] = config.get_chrome_path()
+        except FileNotFoundError:
+            pass
+        try:
+            browser = p.chromium.launch(**launch_opts)
+            context = browser.new_context(user_agent=UA)
+            page = context.new_page()
+            page.set_default_timeout(SMART_ACTION_TIMEOUT_MS)
+            page.set_default_navigation_timeout(SMART_GOTO_TIMEOUT_MS)
 
-        page.goto(url, timeout=60000)
-        page.wait_for_load_state("networkidle")
+            if SMART_BLOCK_RESOURCES:
+                def _route_static_assets(route):
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet"}:
+                        return route.abort()
+                    return route.continue_()
 
-        intel["page_title"] = page.title()
+                page.route("**/*", _route_static_assets)
 
-        # 1. JSON-LD
-        for el in page.query_selector_all('script[type="application/ld+json"]'):
+            page.on("response", on_response)
+
             try:
-                data = json.loads(el.inner_text())
-                intel["json_ld"].append(data)
-            except Exception:
-                pass
+                page.goto(url, timeout=SMART_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            except PlaywrightTimeoutError:
+                log.warning(
+                    "Page load timed out after %dms; continuing with current DOM",
+                    SMART_GOTO_TIMEOUT_MS,
+                )
 
-        # 2. __NEXT_DATA__
-        next_data = page.query_selector("script#__NEXT_DATA__")
-        if next_data:
-            try:
-                intel["next_data"] = json.loads(next_data.inner_text())
-            except Exception:
-                pass
+            if SMART_WAIT_FOR_NETWORK_IDLE and SMART_NETWORK_IDLE_TIMEOUT_MS > 0:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=SMART_NETWORK_IDLE_TIMEOUT_MS)
+                except PlaywrightTimeoutError:
+                    log.warning(
+                        "Network did not go idle after %dms; continuing",
+                        SMART_NETWORK_IDLE_TIMEOUT_MS,
+                    )
 
-        # 3. data-testid attributes
-        intel["data_testids"] = page.evaluate("""
+            intel["page_title"] = page.title()
+
+            # 1. JSON-LD
+            for el in page.query_selector_all('script[type="application/ld+json"]'):
+                try:
+                    data = json.loads(el.inner_text())
+                    intel["json_ld"].append(data)
+                except Exception:
+                    pass
+
+            # 2. __NEXT_DATA__
+            next_data = page.query_selector("script#__NEXT_DATA__")
+            if next_data:
+                try:
+                    intel["next_data"] = json.loads(next_data.inner_text())
+                except Exception:
+                    pass
+
+            # 3. data-testid attributes
+            intel["data_testids"] = page.evaluate("""
             () => {
                 const els = document.querySelectorAll('[data-testid]');
                 const results = [];
@@ -203,8 +341,8 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             }
         """)
 
-        # 4. DOM stats
-        intel["dom_stats"] = page.evaluate("""
+            # 4. DOM stats
+            intel["dom_stats"] = page.evaluate("""
             () => {
                 const body = document.body;
                 return {
@@ -219,8 +357,8 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             }
         """)
 
-        # 5. Find repeating card-like elements
-        intel["card_candidates"] = page.evaluate("""
+            # 5. Find repeating card-like elements
+            intel["card_candidates"] = page.evaluate("""
             () => {
                 const candidates = [];
                 const allParents = document.querySelectorAll('*');
@@ -279,10 +417,11 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
             }
         """)
 
-        # Capture full rendered HTML
-        intel["full_html"] = page.content()
-
-        browser.close()
+            # Capture full rendered HTML
+            intel["full_html"] = page.content()
+        finally:
+            if browser is not None:
+                browser.close()
 
     # Process API responses
     for resp in captured_responses:
@@ -424,7 +563,7 @@ def format_strategy_briefing(intel: dict) -> str:
             sections.append(f"\nJSON-LD: {len(job_postings)} JobPosting entries found (usable!)")
             sections.append(f"First JobPosting:\n{json.dumps(job_postings[0], indent=2)[:3000]}")
         else:
-            sections.append(f"\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
+            sections.append("\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
         if other:
             types = [j.get("@type", "?") if isinstance(j, dict) else "?" for j in other]
             sections.append(f"Other JSON-LD types (NOT job data): {types}")
@@ -855,7 +994,11 @@ def _run_one_site(name: str, url: str) -> dict:
     # Step 1: Collect intelligence
     log.info("[1] Collecting page intelligence...")
     t0 = time.time()
-    intel = collect_page_intelligence(url)
+    try:
+        intel = collect_page_intelligence(url)
+    except Exception as e:
+        log.error("COLLECT_ERROR: %s", e)
+        return {"name": name, "status": "COLLECT_ERROR", "error": str(e), "jobs": []}
     collect_time = time.time() - t0
     log.info("Done in %.1fs | JSON-LD: %d | API: %d | testids: %d | cards: %d",
              collect_time, len(intel["json_ld"]), len(intel["api_responses"]),
@@ -867,12 +1010,15 @@ def _run_one_site(name: str, url: str) -> dict:
     _captcha_signals = ["captcha", "are you a human", "verify you", "unusual requests",
                         "access denied", "please verify", "bot detection"]
     _is_captcha = any(s in full_html.lower() for s in _captcha_signals) if full_html else False
-    if len(cleaned_check) < 5000 and full_html and not _is_captcha:
+    if SMART_HEADFUL_RETRY and len(cleaned_check) < 5000 and full_html and not _is_captcha:
         log.info("Cleaned HTML only %s chars -- retrying headful...", f"{len(cleaned_check):,}")
-        intel = collect_page_intelligence(url, headless=False)
-        collect_time = time.time() - t0
-        log.info("Headful done in %.1fs | JSON-LD: %d | API: %d",
-                 collect_time, len(intel["json_ld"]), len(intel["api_responses"]))
+        try:
+            intel = collect_page_intelligence(url, headless=False)
+            collect_time = time.time() - t0
+            log.info("Headful done in %.1fs | JSON-LD: %d | API: %d",
+                     collect_time, len(intel["json_ld"]), len(intel["api_responses"]))
+        except Exception as e:
+            log.warning("Headful retry failed: %s", e)
     elif _is_captcha:
         log.warning("CAPTCHA/rate-limit detected -- skipping headful retry")
 
@@ -959,6 +1105,7 @@ def _run_one_site(name: str, url: str) -> dict:
 def build_scrape_targets(
     sites: list[dict] | None = None,
     search_cfg: dict | None = None,
+    smart_cfg: dict | None = None,
 ) -> list[dict]:
     """Build the full list of (name, url) targets from sites + search config queries.
 
@@ -974,9 +1121,13 @@ def build_scrape_targets(
         sites = load_sites()
     if search_cfg is None:
         search_cfg = config.load_search_config()
+    smart_cfg = smart_cfg or {}
 
     queries_cfg = search_cfg.get("queries", [])
     queries = [q["query"] for q in queries_cfg]
+    max_search_queries = _cfg_int(smart_cfg, "max_search_queries", 0)
+    if max_search_queries > 0:
+        queries = queries[:max_search_queries]
     locs = search_cfg.get("locations", [])
     default_location = locs[0]["location"] if locs else ""
 
@@ -1006,6 +1157,10 @@ def build_scrape_targets(
                 "url": expanded_url,
                 "query": None,
             })
+
+    max_targets = _cfg_int(smart_cfg, "max_targets", 0)
+    if max_targets > 0:
+        targets = targets[:max_targets]
 
     return targets
 
@@ -1052,7 +1207,11 @@ def _run_all(
             }
             for future in as_completed(future_to_target):
                 target = future_to_target[future]
-                r = future.result()
+                try:
+                    r = future.result()
+                except Exception as e:
+                    log.error("%s failed: %s", target["name"], e)
+                    r = {"name": target["name"], "status": "ERROR", "error": str(e), "jobs": []}
                 results.append(r)
                 _process_result(r, target)
     else:
@@ -1063,7 +1222,11 @@ def _run_all(
                 label = f"{target['name']} [{target['query']}]"
             log.info("[%d/%d] %s", i + 1, len(targets), label)
 
-            r = _run_one_site(target["name"], target["url"])
+            try:
+                r = _run_one_site(target["name"], target["url"])
+            except Exception as e:
+                log.error("%s failed: %s", target["name"], e)
+                r = {"name": target["name"], "status": "ERROR", "error": str(e), "jobs": []}
             results.append(r)
             _process_result(r, target)
 
@@ -1102,17 +1265,36 @@ def run_smart_extract(
         Dict with stats: total_new, total_existing, passed, total.
     """
     search_cfg = config.load_search_config()
+    smart_cfg = search_cfg.get("smartextract") or search_cfg.get("smart_extract") or {}
+    smart_enabled = smart_cfg.get("enabled", True) if isinstance(smart_cfg, dict) else True
+    if isinstance(smart_enabled, str):
+        smart_enabled = smart_enabled.lower() not in {"0", "false", "no", "off"}
+    if not smart_enabled:
+        log.info("Smart extract disabled in searches.yaml")
+        return {"total_new": 0, "total_existing": 0, "passed": 0, "total": 0}
+    if not isinstance(smart_cfg, dict):
+        smart_cfg = {}
+
+    _apply_smart_config(smart_cfg)
+
     accept_locs, reject_locs = _load_location_filter(search_cfg)
 
-    targets = build_scrape_targets(sites=sites, search_cfg=search_cfg)
+    selected_sites = _filter_sites(sites or load_sites(), smart_cfg)
+    targets = build_scrape_targets(sites=selected_sites, search_cfg=search_cfg, smart_cfg=smart_cfg)
 
     if not targets:
         log.warning("No scrape targets configured. Create config/sites.yaml and searches.yaml.")
         return {"total_new": 0, "total_existing": 0, "passed": 0, "total": 0}
 
-    search_sites = sum(1 for s in (sites or load_sites()) if s.get("type") == "search")
-    static_sites = sum(1 for s in (sites or load_sites()) if s.get("type") != "search")
+    search_sites = sum(1 for s in selected_sites if s.get("type") == "search")
+    static_sites = sum(1 for s in selected_sites if s.get("type") != "search")
     log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
              search_sites, static_sites, len(targets), workers)
+    log.info(
+        "Smart extract timeouts: goto=%dms action=%dms networkidle=%s",
+        SMART_GOTO_TIMEOUT_MS,
+        SMART_ACTION_TIMEOUT_MS,
+        SMART_NETWORK_IDLE_TIMEOUT_MS if SMART_WAIT_FOR_NETWORK_IDLE else "off",
+    )
 
     return _run_all(targets, accept_locs, reject_locs, workers=workers)

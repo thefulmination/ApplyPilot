@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from pathlib import Path
+from typing import Mapping, Optional
 
 import typer
 from rich.console import Console
@@ -26,7 +27,7 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
-VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+VALID_STAGES = ("discover", "enrich", "score", "audit", "diagnose", "tailor", "cover", "pdf")
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,34 @@ def _version_callback(value: bool) -> None:
     if value:
         console.print(f"[bold]applypilot[/bold] {__version__}")
         raise typer.Exit()
+
+
+def _llm_status_from_env(env: Mapping[str, str]) -> tuple[str, str]:
+    """Return a normalized provider status for doctor output."""
+    provider = (env.get("LLM_PROVIDER") or "").strip().lower()
+    model = (env.get("LLM_MODEL") or "").strip()
+
+    if env.get("DEEPSEEK_API_KEY") and (provider == "deepseek" or model.lower().startswith("deepseek")):
+        return "ok", f"DeepSeek ({model or 'deepseek-chat'})"
+    if env.get("GEMINI_API_KEY"):
+        return "ok", f"Gemini ({model or 'gemini-2.0-flash'})"
+    if env.get("OPENAI_API_KEY"):
+        return "ok", f"OpenAI ({model or 'gpt-4o-mini'})"
+    if env.get("LLM_URL"):
+        return "ok", f"Local: {env.get('LLM_URL')}"
+    return "missing", "Set GEMINI_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY, or LLM_URL in ~/.applypilot/.env"
+
+
+def _site_rows_for_status(
+    rows: list[tuple[str, int]],
+    *,
+    top_sites: int,
+    all_sites: bool,
+) -> tuple[list[tuple[str, int]], int]:
+    """Limit source rows for readable status output."""
+    if all_sites or top_sites <= 0:
+        return rows, 0
+    return rows[:top_sites], max(0, len(rows) - top_sites)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +113,11 @@ def run(
         ),
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    batch_size: int = typer.Option(
+        900,
+        "--batch-size",
+        help="Maximum jobs per tailor/cover/pdf stage run. Use 0 for all eligible jobs.",
+    ),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
@@ -97,8 +131,18 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    discover_mode: str = typer.Option(
+        "safe",
+        "--discover-mode",
+        help=(
+            "Discovery breadth/concurrency mode. "
+            "safe: source-level parallelism with conservative high-risk sources. "
+            "fast: daily mode that narrows expensive company-watchlist crawls. "
+            "full: broad crawl using configured source breadth."
+        ),
+    ),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
+    """Run pipeline stages: discover, enrich, score, audit, diagnose, tailor, cover, pdf."""
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
@@ -115,7 +159,7 @@ def run(
             raise typer.Exit(code=1)
 
     # Gate AI stages behind Tier 2
-    llm_stages = {"score", "tailor", "cover"}
+    llm_stages = {"score", "diagnose", "tailor", "cover"}
     if any(s in stage_list for s in llm_stages) or "all" in stage_list:
         from applypilot.config import check_tier
         check_tier(2, "AI scoring/tailoring")
@@ -128,18 +172,57 @@ def run(
             f"Choose from: {', '.join(valid_modes)}"
         )
         raise typer.Exit(code=1)
+    if batch_size < 0:
+        console.print("[red]Invalid --batch-size:[/red] use 0 or a positive number.")
+        raise typer.Exit(code=1)
+    valid_discover_modes = ("safe", "fast", "full")
+    if discover_mode not in valid_discover_modes:
+        console.print(
+            f"[red]Invalid --discover-mode value:[/red] '{discover_mode}'. "
+            f"Choose from: {', '.join(valid_discover_modes)}"
+        )
+        raise typer.Exit(code=1)
 
     result = run_pipeline(
         stages=stage_list,
         min_score=min_score,
+        batch_size=batch_size,
         dry_run=dry_run,
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        discover_mode=discover_mode,
     )
 
     if result.get("errors"):
         raise typer.Exit(code=1)
+
+
+@app.command("rescore-jobs")
+def rescore_jobs(
+    limit: int = typer.Option(
+        100,
+        "--limit",
+        "-l",
+        help="Maximum already-scored jobs to rescore with the current LLM and preference profile. Use 0 for all.",
+    ),
+) -> None:
+    """Re-score existing jobs, useful after updating the human preference profile."""
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    from applypilot.scoring.scorer import run_scoring
+
+    check_tier(2, "AI scoring")
+    if limit < 0:
+        console.print("[red]Invalid --limit:[/red] use 0 or a positive number.")
+        raise typer.Exit(code=1)
+
+    result = run_scoring(limit=limit, rescore=True)
+    console.print("\n[bold green]Preference-aware rescore complete[/bold green]")
+    console.print(f"  Jobs rescored: {result['scored']}")
+    console.print(f"  Errors:        {result['errors']}")
+    console.print(f"  Time:          {result['elapsed']:.1f}s")
 
 
 @app.command()
@@ -211,7 +294,7 @@ def apply(
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -222,7 +305,7 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually:[/bold]")
         console.print(
             f"  claude --model {model} -p "
             f"--mcp-config {mcp_path} "
@@ -257,7 +340,10 @@ def apply(
 
 
 @app.command()
-def status() -> None:
+def status(
+    top_sites: int = typer.Option(50, "--top-sites", help="Maximum source rows to show. Use 0 for all."),
+    all_sites: bool = typer.Option(False, "--all-sites", help="Show every source row."),
+) -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()
 
@@ -277,6 +363,11 @@ def status() -> None:
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
     summary.add_row("Scored by LLM", str(stats["scored"]))
+    summary.add_row("Audited/reranked", str(stats.get("audited", 0)))
+    summary.add_row("Recommended after audit", str(stats.get("recommended", 0)))
+    summary.add_row("Excluded by audit", str(stats.get("audit_excluded", 0)))
+    summary.add_row("Diagnosed fits", str(stats.get("diagnosed", 0)))
+    summary.add_row("Pending diagnosis", str(stats.get("undiagnosed", 0)))
     summary.add_row("Pending scoring", str(stats["unscored"]))
     summary.add_row("Tailored resumes", str(stats["tailored"]))
     summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
@@ -284,6 +375,10 @@ def status() -> None:
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
+    summary.add_row("Tracked applications", str(stats.get("applications_tracked", 0)))
+    summary.add_row("Interviews active", str(stats.get("interviews", 0)))
+    summary.add_row("Follow-ups due", str(stats.get("followups_due", 0)))
+    summary.add_row("Rejections", str(stats.get("rejections", 0)))
 
     console.print(summary)
 
@@ -314,11 +409,160 @@ def status() -> None:
         site_table.add_column("Site")
         site_table.add_column("Count", justify="right")
 
-        for site, count in stats["by_site"]:
+        visible_sites, hidden_sites = _site_rows_for_status(stats["by_site"], top_sites=top_sites, all_sites=all_sites)
+        for site, count in visible_sites:
             site_table.add_row(site or "Unknown", str(count))
 
         console.print(site_table)
+        if hidden_sites:
+            console.print(f"[dim]Showing top {len(visible_sites)} sources; {hidden_sites} hidden. Use --all-sites to show every source.[/dim]")
 
+    console.print()
+
+
+def _print_tracker(rows: list[dict], title: str) -> None:
+    table = Table(title=title, show_header=True, header_style="bold cyan")
+    table.add_column("Status")
+    table.add_column("Applied")
+    table.add_column("Follow-up")
+    table.add_column("Score", justify="right")
+    table.add_column("Company")
+    table.add_column("Role")
+    table.add_column("Channel")
+    table.add_column("URL")
+
+    for row in rows:
+        table.add_row(
+            str(row.get("status") or ""),
+            str(row.get("applied_at") or "")[:10],
+            str(row.get("next_follow_up_at") or "")[:10],
+            str(row.get("score") if row.get("score") is not None else ""),
+            str(row.get("company") or row.get("site") or ""),
+            str(row.get("title") or "")[:50],
+            str(row.get("channel") or ""),
+            str(row.get("application_url") or row.get("url") or row.get("job_url") or "")[:70],
+        )
+    console.print(table)
+
+
+@app.command("track")
+def track_command(
+    ready: bool = typer.Option(False, "--ready", help="Show jobs ready to apply instead of tracked applications."),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by tracker status, such as applied or recruiter_screen."),
+    active: bool = typer.Option(True, "--active/--all", help="Show active tracked applications by default."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum score for --ready jobs."),
+    limit: int = typer.Option(50, "--limit", "-l", help="Maximum rows to show. Use 0 for all."),
+) -> None:
+    """Show application tracker rows or the ready-to-apply queue."""
+    _bootstrap()
+
+    from applypilot.applications import list_applications, list_ready_to_apply
+
+    if ready:
+        rows = list_ready_to_apply(min_score=min_score, limit=limit)
+        _print_tracker(rows, f"Ready to Apply (score >= {min_score})")
+        return
+
+    rows = list_applications(status=status, active_only=active and status is None, limit=limit)
+    _print_tracker(rows, "Application Tracker")
+
+
+@app.command("mark-applied")
+def mark_applied_command(
+    job_ref: str = typer.Argument(..., help="Job URL or application URL to mark as applied."),
+    channel: str = typer.Option("manual", "--channel", help="Where you applied: company_site, linkedin, email, referral, applypilot, manual."),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Optional note to save with the application."),
+    follow_up: Optional[str] = typer.Option(None, "--follow-up", help="Optional follow-up date, YYYY-MM-DD."),
+) -> None:
+    """Mark a job as applied and save the applied date in the tracker."""
+    _bootstrap()
+
+    from applypilot.applications import record_application
+
+    row = record_application(
+        job_ref,
+        status="applied",
+        channel=channel,
+        notes=notes,
+        next_follow_up_at=follow_up,
+    )
+    console.print("[green]Application tracked.[/green]")
+    console.print(f"  Applied: {row.get('applied_at')}")
+    console.print(f"  Role:    {row.get('title')} @ {row.get('company')}")
+
+
+@app.command("update-application")
+def update_application_command(
+    job_ref: str = typer.Argument(..., help="Job URL or application URL to update."),
+    status: str = typer.Option(..., "--status", help="New status, such as followed_up, recruiter_screen, rejected, offer."),
+    channel: str = typer.Option("manual", "--channel", help="Where the update happened."),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Optional note to save."),
+    follow_up: Optional[str] = typer.Option(None, "--follow-up", help="Optional next follow-up date, YYYY-MM-DD."),
+    contact_name: Optional[str] = typer.Option(None, "--contact-name", help="Recruiter or hiring contact name."),
+    contact_email: Optional[str] = typer.Option(None, "--contact-email", help="Recruiter or hiring contact email."),
+    contact_url: Optional[str] = typer.Option(None, "--contact-url", help="Recruiter LinkedIn/profile URL."),
+) -> None:
+    """Update a tracked application's status, notes, contact, or follow-up date."""
+    _bootstrap()
+
+    from applypilot.applications import record_application
+
+    row = record_application(
+        job_ref,
+        status=status,
+        channel=channel,
+        notes=notes,
+        next_follow_up_at=follow_up,
+        contact_name=contact_name,
+        contact_email=contact_email,
+        contact_url=contact_url,
+    )
+    console.print("[green]Application updated.[/green]")
+    console.print(f"  Status: {row.get('status')}")
+    console.print(f"  Role:   {row.get('title')} @ {row.get('company')}")
+
+
+@app.command("application-history")
+def application_history_command(
+    job_ref: str = typer.Argument(..., help="Job URL or application URL."),
+    limit: int = typer.Option(25, "--limit", "-l", help="Maximum history rows to show."),
+) -> None:
+    """Show status history for one application."""
+    _bootstrap()
+
+    from applypilot.applications import application_events
+
+    rows = application_events(job_ref, limit=limit)
+    table = Table(title="Application History", show_header=True, header_style="bold cyan")
+    table.add_column("When")
+    table.add_column("Status")
+    table.add_column("Channel")
+    table.add_column("Notes")
+    for row in rows:
+        table.add_row(
+            str(row.get("happened_at") or ""),
+            str(row.get("status") or ""),
+            str(row.get("channel") or ""),
+            str(row.get("notes") or "")[:90],
+        )
+    console.print(table)
+
+
+@app.command("export-applications")
+def export_applications_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped application_exports folder."),
+) -> None:
+    """Export the application tracker to CSV and JSONL."""
+    _bootstrap()
+
+    from applypilot.applications import export_applications
+
+    result = export_applications(output_dir=output)
+    console.print("\n[bold green]Application export complete[/bold green]")
+    console.print(f"  Applications exported: {result['applications_exported']}")
+    console.print(f"  Folder:                {result['output_dir']}")
+    console.print(f"  CSV:                   {result['csv_path']}")
+    console.print(f"  JSONL:                 {result['jsonl_path']}")
     console.print()
 
 
@@ -332,13 +576,136 @@ def dashboard() -> None:
     open_dashboard()
 
 
+@app.command("export-jobs")
+def export_jobs_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped job_exports folder."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Only export jobs at or above this score. Omit for all jobs."),
+    scored_only: bool = typer.Option(False, "--scored-only", help="Only export jobs that already have a fit score."),
+    full_description_only: bool = typer.Option(False, "--full-description-only", help="Only export jobs with a full saved description."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Maximum jobs to export. 0 means all matching jobs."),
+    descriptions: bool = typer.Option(True, "--descriptions/--no-descriptions", help="Write one readable text file per job."),
+) -> None:
+    """Export saved jobs, scores, and descriptions for review."""
+    _bootstrap()
+
+    from applypilot.export_jobs import export_jobs
+
+    result = export_jobs(
+        output_dir=output,
+        min_score=min_score,
+        scored_only=scored_only,
+        full_description_only=full_description_only,
+        limit=limit,
+        write_descriptions=descriptions,
+    )
+
+    console.print("\n[bold green]Export complete[/bold green]")
+    console.print(f"  Jobs exported:      {result['jobs_exported']}")
+    console.print(f"  Description files:  {result['description_files']}")
+    console.print(f"  Folder:             {result['output_dir']}")
+    console.print(f"  CSV:                {result['csv_path']}")
+    console.print(f"  JSONL:              {result['jsonl_path']}")
+    console.print(f"  Summary:            {result['summary_path']}")
+    console.print()
+
+
+@app.command("audit-scores")
+def audit_scores_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped score_audits folder."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Only audit jobs at or above this original LLM score."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Maximum jobs to audit. 0 means all scored jobs."),
+    reaudit: bool = typer.Option(False, "--reaudit", help="Re-audit already current scores instead of only pending/stale audit rows."),
+) -> None:
+    """Audit scored jobs and rerank them by target-role fit."""
+    _bootstrap()
+
+    from applypilot.scoring.audit import run_score_audit
+
+    result = run_score_audit(output_dir=output, min_score=min_score, limit=limit, reaudit=reaudit)
+
+    console.print("\n[bold green]Score audit complete[/bold green]")
+    console.print(f"  Jobs audited:          {result['audited']}")
+    console.print(f"  Recommended/review:    {result['recommended_review']}")
+    console.print(f"  False positives:       {result['false_positives']}")
+    console.print(f"  Missed priority roles: {result['missed_priority_roles']}")
+    console.print(f"  Folder:                {result['output_dir']}")
+    console.print(f"  Review CSV:            {result['recommended_review_csv']}")
+    console.print(f"  False positives CSV:   {result['false_positives_csv']}")
+    console.print()
+
+
+@app.command("diagnose-fits")
+def diagnose_fits_command(
+    limit: int = typer.Option(900, "--limit", "-l", help="Maximum jobs to diagnose. Use 0 for all pending jobs."),
+    rediagnose: bool = typer.Option(False, "--rediagnose", help="Re-run diagnosis even when a job already has one."),
+) -> None:
+    """Explain why scored jobs are strong, weak, fixable, or wrong-lane."""
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    from applypilot.scoring.diagnosis import run_diagnostics
+
+    check_tier(2, "fit diagnosis")
+    result = run_diagnostics(limit=limit, rediagnose=rediagnose)
+
+    console.print("\n[bold green]Fit diagnosis complete[/bold green]")
+    console.print(f"  Jobs diagnosed: {result['diagnosed']}")
+    console.print(f"  Errors:         {result['errors']}")
+    if result.get("labels"):
+        table = Table(title="Recommended Actions", show_header=True, header_style="bold cyan")
+        table.add_column("Action")
+        table.add_column("Count", justify="right")
+        for action, count in sorted(result["labels"].items(), key=lambda item: item[0]):
+            table.add_row(action, str(count))
+        console.print(table)
+    console.print()
+
+
+@app.command("reset-generated")
+def reset_generated_command(
+    min_score: int = typer.Option(7, "--min-score", help="Minimum audited score / fit score to reset."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show how many jobs would be reset without changing the DB."),
+) -> None:
+    """Reset generated resumes and cover letters so they can be regenerated."""
+    _bootstrap()
+
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    where = (
+        "COALESCE(audit_score, fit_score, 0) >= ? "
+        "AND applied_at IS NULL "
+        "AND (tailored_resume_path IS NOT NULL OR cover_letter_path IS NOT NULL)"
+    )
+    count = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {where}", (min_score,)).fetchone()[0]
+    if dry_run:
+        console.print(f"[yellow]Dry run:[/yellow] would reset {count} generated job package(s).")
+        return
+
+    conn.execute(
+        f"""
+        UPDATE jobs
+        SET tailored_resume_path = NULL,
+            tailored_at = NULL,
+            tailor_attempts = 0,
+            cover_letter_path = NULL,
+            cover_letter_at = NULL,
+            cover_attempts = 0
+        WHERE {where}
+        """,
+        (min_score,),
+    )
+    conn.commit()
+    console.print(f"[green]Reset {count} generated job package(s).[/green]")
+
+
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        SEARCH_CONFIG_PATH, get_chrome_path, get_claude_path,
     )
 
     load_env()
@@ -380,27 +747,18 @@ def doctor() -> None:
 
     # --- Tier 2 checks ---
     import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+    llm_status, llm_note = _llm_status_from_env(os.environ)
+    if llm_status == "ok":
+        results.append(("LLM API key", ok_mark, llm_note))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("LLM API key", fail_mark, f"{llm_note} (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
-    claude_bin = shutil.which("claude")
-    if claude_bin:
+    try:
+        claude_bin = get_claude_path()
         results.append(("Claude Code CLI", ok_mark, claude_bin))
-    else:
+    except FileNotFoundError:
         results.append(("Claude Code CLI", fail_mark,
                         "Install from https://claude.ai/code (needed for auto-apply)"))
 

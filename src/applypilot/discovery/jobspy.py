@@ -8,6 +8,7 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -81,8 +82,9 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
 
     Falls back to sensible defaults if not defined in the YAML.
     """
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
+    location_cfg = search_cfg.get("location", {}) or {}
+    accept = search_cfg.get("location_accept") or location_cfg.get("accept_patterns", [])
+    reject = search_cfg.get("location_reject_non_remote") or location_cfg.get("reject_patterns", [])
     return accept, reject
 
 
@@ -97,18 +99,29 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
     loc = location.lower()
 
+    def pattern_matches(pattern: str) -> bool:
+        needle = pattern.strip().lower()
+        if not needle:
+            return False
+        # Short region codes like CA/US must match as standalone tokens.
+        # Otherwise "CA" accidentally accepts "Canada" and "US" accepts words
+        # that merely contain those letters.
+        if len(needle) <= 3 and needle.replace(".", "").isalpha():
+            return re.search(rf"(?<![a-z]){re.escape(needle)}(?![a-z])", loc) is not None
+        return needle in loc
+
     # Remote jobs always OK
     if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
         return True
 
     # Reject non-remote matches
     for r in reject:
-        if r.lower() in loc:
+        if pattern_matches(r):
             return False
 
     # Accept matches
     for a in accept:
-        if a.lower() in loc:
+        if pattern_matches(a):
             return True
 
     # No match -- reject unknown
@@ -150,7 +163,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         site_name = str(row.get("site", source_label))
         is_remote = row.get("is_remote", False)
 
-        site_label = f"{site_name}"
+        # jobs.site is the employer display field in ApplyPilot. Keep the
+        # source board only as a fallback when JobSpy does not return company.
+        site_label = company or f"{site_name}"
         if is_remote:
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
 
@@ -169,10 +184,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "company, source_board, full_description, application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                 company, site_name, full_description, apply_url, detail_scraped_at),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -461,7 +476,7 @@ def run_discovery(cfg: dict | None = None) -> dict:
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
+    sites = cfg.get("sites") or cfg.get("boards")
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")

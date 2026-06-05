@@ -23,8 +23,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
-from applypilot.config import DB_PATH
-from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.database import init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -54,9 +53,25 @@ def _load_base_urls() -> dict[str, str | None]:
     return load_base_urls()
 
 
+def _is_non_navigable_url(raw_url: str) -> bool:
+    """Return True for href values that cannot represent job detail pages."""
+    url = raw_url.strip().lower()
+    return (
+        not url
+        or url.startswith("#")
+        or url.startswith("javascript:")
+        or url.startswith("mailto:")
+        or url.startswith("tel:")
+    )
+
+
 def resolve_url(raw_url: str, site: str) -> str | None:
     """Resolve a stored URL to an absolute URL."""
     if not raw_url:
+        return None
+
+    raw_url = raw_url.strip()
+    if _is_non_navigable_url(raw_url):
         return None
 
     if raw_url.startswith("http://") or raw_url.startswith("https://"):
@@ -97,7 +112,26 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
         new_url = resolve_url(url, site)
         if new_url and new_url != url:
             try:
-                conn.execute("UPDATE jobs SET url = ? WHERE url = ?", (new_url, url))
+                conn.execute(
+                    """
+                    UPDATE jobs
+                       SET url = ?,
+                           detail_error = CASE
+                               WHEN detail_error LIKE '%invalid URL%'
+                                    AND full_description IS NULL
+                               THEN NULL
+                               ELSE detail_error
+                           END,
+                           detail_scraped_at = CASE
+                               WHEN detail_error LIKE '%invalid URL%'
+                                    AND full_description IS NULL
+                               THEN NULL
+                               ELSE detail_scraped_at
+                           END
+                     WHERE url = ?
+                    """,
+                    (new_url, url),
+                )
                 resolved += 1
             except sqlite3.IntegrityError:
                 conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
@@ -144,7 +178,12 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
                 pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        launch_opts: dict = {"headless": True}
+        try:
+            launch_opts["executable_path"] = config.get_chrome_path()
+        except FileNotFoundError:
+            pass
+        browser = p.chromium.launch(**launch_opts)
         page = browser.new_page(user_agent=UA)
         page.on("response", capture_algolia)
         page.goto(
@@ -634,6 +673,10 @@ def scrape_site_batch(
     try:
         with sync_playwright() as p:
             launch_opts: dict = {"headless": True}
+            try:
+                launch_opts["executable_path"] = config.get_chrome_path()
+            except FileNotFoundError:
+                pass
             if _PROXY_CONFIG:
                 launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
             browser = p.chromium.launch(**launch_opts)

@@ -1,4 +1,4 @@
-"""Text-to-PDF conversion for tailored resumes and cover letters.
+﻿"""Text-to-PDF conversion for tailored resumes and cover letters.
 
 Parses the structured text resume format, renders via an HTML/CSS template,
 and exports to PDF using headless Chromium via Playwright.
@@ -7,12 +7,13 @@ and exports to PDF using headless Chromium via Playwright.
 import logging
 from pathlib import Path
 
+from applypilot import config
 from applypilot.config import TAILORED_DIR
 
 log = logging.getLogger(__name__)
 
 
-# ── Resume Parser ────────────────────────────────────────────────────────
+# â”€â”€ Resume Parser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def parse_resume(text: str) -> dict:
     """Parse a structured text resume into sections.
@@ -146,7 +147,7 @@ def parse_entries(text: str) -> list[dict]:
     return entries
 
 
-# ── HTML Template ────────────────────────────────────────────────────────
+# â”€â”€ HTML Template â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_html(resume: dict) -> str:
     """Build professional resume HTML from parsed data.
@@ -331,7 +332,7 @@ li {{
 </html>"""
 
 
-# ── PDF Renderer ─────────────────────────────────────────────────────────
+# â”€â”€ PDF Renderer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_pdf(html: str, output_path: str) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
@@ -343,7 +344,12 @@ def render_pdf(html: str, output_path: str) -> None:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        launch_opts: dict = {}
+        try:
+            launch_opts["executable_path"] = config.get_chrome_path()
+        except FileNotFoundError:
+            pass
+        browser = p.chromium.launch(**launch_opts)
         page = browser.new_page()
         page.set_content(html, wait_until="networkidle")
         page.pdf(
@@ -355,7 +361,7 @@ def render_pdf(html: str, output_path: str) -> None:
         browser.close()
 
 
-# ── Public API ───────────────────────────────────────────────────────────
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def convert_to_pdf(
     text_path: Path, output_path: Path | None = None, html_only: bool = False
@@ -390,14 +396,14 @@ def convert_to_pdf(
     return out
 
 
-def batch_convert(limit: int = 50) -> int:
+def batch_convert(limit: int = 900) -> int:
     """Convert .txt files in TAILORED_DIR that don't have corresponding PDFs.
 
     Scans for .txt files (excluding _JOB.txt and _REPORT.json), checks if a
     .pdf with the same stem already exists, and converts any that are missing.
 
     Args:
-        limit: Maximum number of files to convert.
+        limit: Maximum number of files to convert. 0 means no limit.
 
     Returns:
         Number of PDFs generated.
@@ -420,7 +426,7 @@ def batch_convert(limit: int = 50) -> int:
         pdf_path = f.with_suffix(".pdf")
         if not pdf_path.exists():
             to_convert.append(f)
-        if len(to_convert) >= limit:
+        if limit > 0 and len(to_convert) >= limit:
             break
 
     if not to_convert:
@@ -438,3 +444,4 @@ def batch_convert(limit: int = 50) -> int:
 
     log.info("Done: %d/%d PDFs generated in %s", converted, len(to_convert), TAILORED_DIR)
     return converted
+

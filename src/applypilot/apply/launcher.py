@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
+from applypilot.applications import record_application
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
@@ -65,7 +66,7 @@ if platform.system() != "Windows":
 
 def _make_mcp_config(cdp_port: int) -> dict:
     """Build MCP config dict for a specific CDP port."""
-    return {
+    mcp_config = {
         "mcpServers": {
             "playwright": {
                 "command": "npx",
@@ -74,13 +75,15 @@ def _make_mcp_config(cdp_port: int) -> dict:
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
+            }
         }
     }
+    if os.environ.get("APPLYPILOT_ENABLE_GMAIL_MCP", "").lower() in {"1", "true", "yes", "on"}:
+        mcp_config["mcpServers"]["gmail"] = {
+            "command": "npx",
+            "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+        }
+    return mcp_config
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +96,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
-        min_score: Minimum fit_score threshold.
+        min_score: Minimum audited score / fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
 
     Returns:
@@ -107,7 +110,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, audit_score, audit_label, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
@@ -129,15 +132,15 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, audit_score, audit_label, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
+                  AND COALESCE(audit_score, fit_score) >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY COALESCE(audit_score, fit_score) DESC, fit_score DESC, url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -194,6 +197,21 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
+
+    tracker_status = "applied" if status == "applied" else "failed"
+    tracker_notes = error
+    if task_id:
+        tracker_notes = f"{tracker_notes or status} | task_id={task_id}"
+    try:
+        record_application(
+            url,
+            status=tracker_status,
+            channel="applypilot",
+            notes=tracker_notes,
+            update_job=False,
+        )
+    except Exception:
+        logger.debug("Application tracker update failed for %s", url, exc_info=True)
 
 
 def release_lock(url: str) -> None:
@@ -270,6 +288,17 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
+    try:
+        record_application(
+            url,
+            status="applied" if status == "applied" else "failed",
+            channel="manual",
+            notes=reason,
+            applied_at=now if status == "applied" else None,
+            update_job=False,
+        )
+    except Exception:
+        logger.debug("Application tracker update failed for %s", url, exc_info=True)
 
 
 def reset_failed() -> int:
@@ -323,7 +352,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Build claude command
     cmd = [
-        "claude",
+        config.get_claude_path(),
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
@@ -349,18 +378,20 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     worker_dir = reset_worker_dir(worker_id)
 
+    display_score = job.get("audit_score") if job.get("audit_score") is not None else job.get("fit_score", 0)
     update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 company=job.get("site", ""), score=display_score,
                  start_time=time.time(), actions=0, last_action="starting")
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    llm_score_note = f" (LLM {job.get('fit_score')}/10)" if job.get("audit_score") is not None else ""
     log_header = (
         f"\n{'=' * 60}\n"
         f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
         f"URL: {job.get('application_url') or job['url']}\n"
-        f"Score: {job.get('fit_score', 'N/A')}/10\n"
+        f"Score: {display_score}/10{llm_score_note}\n"
         f"{'=' * 60}\n"
     )
 

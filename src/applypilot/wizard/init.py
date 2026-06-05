@@ -13,7 +13,6 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -26,6 +25,7 @@ from applypilot.config import (
     RESUME_PDF_PATH,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
+    get_claude_path,
 )
 
 console = Console()
@@ -101,7 +101,6 @@ def _setup_profile() -> dict:
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
-        "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
 
     # -- Work Authorization --
@@ -292,9 +291,10 @@ def _setup_auto_apply() -> None:
         return
 
     # Check for Claude Code CLI
-    if shutil.which("claude"):
+    try:
+        get_claude_path()
         console.print("[green]Claude Code CLI detected.[/green]")
-    else:
+    except FileNotFoundError:
         console.print(
             "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
             "Install it from: [bold]https://claude.ai/code[/bold]\n"

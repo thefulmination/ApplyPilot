@@ -13,16 +13,27 @@ Usage (via CLI):
 from __future__ import annotations
 
 import logging
+import inspect
+import copy
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.config import DEFAULTS, load_env, ensure_dirs
+from applypilot.database import (
+    create_pipeline_run,
+    finish_pipeline_run,
+    finish_pipeline_stage,
+    get_connection,
+    get_stats,
+    init_db,
+    start_pipeline_stage,
+)
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -32,12 +43,14 @@ console = Console()
 # Stage definitions
 # ---------------------------------------------------------------------------
 
-STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+STAGE_ORDER = ("discover", "enrich", "score", "audit", "diagnose", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
+    "discover": {"desc": "Job discovery (JobSpy + public boards + HiringCafe + corporate ATS + Workday + smart extract)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
+    "audit":    {"desc": "Score audit and reranking"},
+    "diagnose": {"desc": "Fit diagnosis (why weak/strong, resume gap analysis)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
     "cover":    {"desc": "Cover letter generation"},
     "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
@@ -49,7 +62,9 @@ _UPSTREAM: dict[str, str | None] = {
     "discover": None,
     "enrich":   "discover",
     "score":    "enrich",
-    "tailor":   "score",
+    "audit":    "score",
+    "diagnose": "audit",
+    "tailor":   "diagnose",
     "cover":    "tailor",
     "pdf":      "cover",
 }
@@ -59,42 +74,219 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
-
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
+def _configured_workers(search_cfg: dict, section_name: str, fallback: int) -> int:
+    """Return source-specific worker count from searches.yaml, with CLI fallback."""
+    section = search_cfg.get(section_name, {}) or {}
+    value = None
+    if isinstance(section, dict):
+        value = section.get("workers")
+    if value is None:
+        value = search_cfg.get(f"{section_name}_workers")
+    if value is None:
+        value = fallback
     try:
-        from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return max(1, int(fallback))
 
-    # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
 
-    # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
+def _cfg_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _cfg_int_value(value, default: int) -> int:
     try:
-        from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _discovery_config(search_cfg: dict) -> dict:
+    section = search_cfg.get("discovery", {}) or {}
+    return section if isinstance(section, dict) else {}
+
+
+def _source_enabled(search_cfg: dict, section_name: str, default: bool = True) -> bool:
+    section = search_cfg.get(section_name, {}) or {}
+    if isinstance(section, dict) and "enabled" in section:
+        return _cfg_bool(section.get("enabled"), default)
+    return default
+
+
+def _fast_discovery_cfg(search_cfg: dict) -> dict:
+    """Narrow expensive broad crawls for daily fast discovery."""
+    cfg = copy.deepcopy(search_cfg)
+    hiring_cfg = cfg.setdefault("hiring_cafe", {})
+    if isinstance(hiring_cfg, dict):
+        hiring_cfg["company_watchlist_enabled"] = False
+        hiring_cfg["max_pages"] = min(_cfg_int_value(hiring_cfg.get("max_pages"), 2), 1)
+        hiring_cfg["results_per_site"] = min(_cfg_int_value(hiring_cfg.get("results_per_site"), 50), 30)
+    cfg["workday_max_pages"] = min(_cfg_int_value(cfg.get("workday_max_pages"), 10), 5)
+    cfg["workday_max_results_per_employer_query"] = min(
+        _cfg_int_value(cfg.get("workday_max_results_per_employer_query"), 150),
+        100,
+    )
+    return cfg
+
+
+def _discover_source_tasks(search_cfg: dict, workers: int, discover_mode: str = "safe") -> list[dict]:
+    """Build source-level discovery tasks with source-specific risk controls."""
+    mode = (discover_mode or "safe").strip().lower()
+    if mode not in {"safe", "fast", "full"}:
+        mode = "safe"
+
+    base_cfg = _fast_discovery_cfg(search_cfg) if mode == "fast" else copy.deepcopy(search_cfg)
+    discovery_cfg = _discovery_config(base_cfg)
+    ats_fallback = 8 if mode in {"safe", "fast"} else workers
+    workday_fallback = 4 if mode in {"safe", "fast"} else min(workers, 4)
+
+    def task(name: str, label: str, enabled: bool, serial: bool, runner, cfg: dict, source_workers: int = 1) -> dict:
+        return {
+            "name": name,
+            "label": label,
+            "enabled": enabled,
+            "serial": serial,
+            "runner": runner,
+            "cfg": cfg,
+            "workers": max(1, source_workers),
+        }
+
+    tasks: list[dict] = []
+
+    tasks.append(task(
+        "jobspy",
+        "JobSpy full crawl",
+        _source_enabled(base_cfg, "jobspy", True),
+        True,
+        lambda cfg=base_cfg: __import__(
+            "applypilot.discovery.jobspy", fromlist=["run_discovery"]
+        ).run_discovery(cfg=cfg),
+        base_cfg,
+        1,
+    ))
+    tasks.append(task(
+        "public_boards",
+        "Public job-board APIs",
+        _source_enabled(base_cfg, "public_boards", True),
+        False,
+        lambda cfg=base_cfg: __import__(
+            "applypilot.discovery.public_boards", fromlist=["run_public_boards_discovery"]
+        ).run_public_boards_discovery(cfg=cfg),
+        base_cfg,
+        1,
+    ))
+    tasks.append(task(
+        "hiringcafe",
+        "HiringCafe crawl",
+        _source_enabled(base_cfg, "hiring_cafe", True),
+        False,
+        lambda cfg=base_cfg: __import__(
+            "applypilot.discovery.hiringcafe", fromlist=["run_hiringcafe_discovery"]
+        ).run_hiringcafe_discovery(cfg=cfg),
+        base_cfg,
+        1,
+    ))
+    ats_workers = _configured_workers(base_cfg, "corporate_ats", ats_fallback)
+    tasks.append(task(
+        "corporate_ats",
+        "Corporate ATS crawl (Greenhouse + Lever + Ashby)",
+        _source_enabled(base_cfg, "corporate_ats", True),
+        False,
+        lambda cfg=base_cfg, ats_workers=ats_workers: __import__(
+            "applypilot.discovery.corporate_ats", fromlist=["run_corporate_ats_discovery"]
+        ).run_corporate_ats_discovery(cfg=cfg, workers=ats_workers),
+        base_cfg,
+        ats_workers,
+    ))
+    workday_workers = _configured_workers(base_cfg, "workday", workday_fallback)
+    tasks.append(task(
+        "workday",
+        "Workday corporate scraper",
+        True,
+        False,
+        lambda workday_workers=workday_workers: __import__(
+            "applypilot.discovery.workday", fromlist=["run_workday_discovery"]
+        ).run_workday_discovery(workers=workday_workers),
+        base_cfg,
+        workday_workers,
+    ))
+    tasks.append(task(
+        "smartextract",
+        "Smart extract (AI-powered scraping)",
+        _source_enabled(base_cfg, "smartextract", True),
+        True,
+        lambda smart_workers=_configured_workers(base_cfg, "smartextract", 1): __import__(
+            "applypilot.discovery.smartextract", fromlist=["run_smart_extract"]
+        ).run_smart_extract(workers=smart_workers),
+        base_cfg,
+        _configured_workers(base_cfg, "smartextract", 1),
+    ))
+
+    include = discovery_cfg.get("include_sources") or []
+    exclude = set(discovery_cfg.get("exclude_sources") or [])
+    if include:
+        include_set = set(str(name).strip() for name in include)
+        tasks = [t for t in tasks if t["name"] in include_set]
+    if exclude:
+        tasks = [t for t in tasks if t["name"] not in exclude]
+
+    return tasks
+
+
+def _discover_parallelism(search_cfg: dict, workers: int, discover_mode: str) -> int:
+    discovery_cfg = _discovery_config(search_cfg)
+    configured = discovery_cfg.get("source_parallelism")
+    if configured is None:
+        configured = 3 if discover_mode in {"safe", "fast"} else min(4, workers)
+    return max(1, min(6, _cfg_int_value(configured, 3)))
+
+
+def _run_discover_task(task: dict) -> tuple[str, str]:
+    name = task["name"]
+    label = task.get("label") or name
+    console.print(f"  [cyan]{label}...[/cyan]")
+    try:
+        result = task["runner"]()
+        status = "ok"
+        if isinstance(result, dict):
+            status = str(result.get("status") or "ok")
+            if status == "ok" and int(result.get("errors") or 0) > 0:
+                status = "partial"
+        return name, status
     except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
+        log.error("%s failed: %s", label, e)
+        console.print(f"  [red]{label} error:[/red] {e}")
+        return name, f"error: {e}"
+
+
+def _run_discover(workers: int = 1, discover_mode: str = "safe", search_cfg: dict | None = None) -> dict:
+    """Stage: Job discovery with source-level scheduling and risk controls."""
+    from applypilot import config
+
+    search_cfg = search_cfg or config.load_search_config()
+    mode = (discover_mode or "safe").strip().lower()
+    tasks = [task for task in _discover_source_tasks(search_cfg, workers, mode) if task.get("enabled", True)]
+    serial_tasks = [task for task in tasks if task.get("serial")]
+    parallel_tasks = [task for task in tasks if not task.get("serial")]
+    source_parallelism = _discover_parallelism(search_cfg, workers, mode)
+    stats: dict[str, str] = {}
+
+    console.print(f"  [dim]Discovery mode:[/dim] {mode} | source parallelism: {source_parallelism}")
+
+    for task in serial_tasks:
+        name, status = _run_discover_task(task)
+        stats[name] = status
+
+    if parallel_tasks:
+        with ThreadPoolExecutor(max_workers=min(source_parallelism, len(parallel_tasks))) as pool:
+            futures = {pool.submit(_run_discover_task, task): task for task in parallel_tasks}
+            for future in as_completed(futures):
+                name, status = future.result()
+                stats[name] = status
 
     return stats
 
@@ -110,44 +302,89 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_score() -> dict:
+def _run_score(workers: int = 1) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring()
+        run_scoring(workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _accepts_kwarg(fn: callable, name: str) -> bool:
+    """Return true when a stage runner can receive a keyword argument."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _run_audit() -> dict:
+    """Stage: Score audit — demote false positives and promote target-lane roles."""
+    try:
+        from applypilot.scoring.audit import run_score_audit
+        run_score_audit(write_reports=False)
+        return {"status": "ok"}
+    except Exception as e:
+        log.error("Score audit failed: %s", e)
+        return {"status": f"error: {e}"}
+
+
+def _run_diagnose(batch_size: int | None = None) -> dict:
+    """Stage: Fit diagnosis — explain gaps and whether they are resume-fixable."""
+    try:
+        from applypilot.scoring.diagnosis import run_diagnostics
+        limit = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
+        run_diagnostics(limit=limit)
+        return {"status": "ok"}
+    except Exception as e:
+        log.error("Fit diagnosis failed: %s", e)
+        return {"status": f"error: {e}"}
+
+
+def _run_tailor(
+    min_score: int = 7,
+    validation_mode: str = "normal",
+    batch_size: int | None = None,
+) -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
     try:
         from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        limit = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
+        run_tailoring(min_score=min_score, limit=limit, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_cover(
+    min_score: int = 7,
+    validation_mode: str = "normal",
+    batch_size: int | None = None,
+) -> dict:
     """Stage: Cover letter generation."""
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
+        limit = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
+        run_cover_letters(min_score=min_score, limit=limit, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_pdf() -> dict:
+def _run_pdf(batch_size: int | None = None) -> dict:
     """Stage: PDF conversion — convert tailored resumes and cover letters to PDF."""
     try:
         from applypilot.scoring.pdf import batch_convert
-        batch_convert()
+        limit = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
+        batch_convert(limit=limit)
         return {"status": "ok"}
     except Exception as e:
         log.error("PDF conversion failed: %s", e)
@@ -159,6 +396,8 @@ _STAGE_RUNNERS: dict[str, callable] = {
     "discover": _run_discover,
     "enrich":   _run_enrich,
     "score":    _run_score,
+    "audit":    _run_audit,
+    "diagnose": _run_diagnose,
     "tailor":   _run_tailor,
     "cover":    _run_cover,
     "pdf":      _run_pdf,
@@ -223,14 +462,25 @@ class _StageTracker:
 _PENDING_SQL: dict[str, str] = {
     "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
     "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
+    "audit":  (
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL "
+        "AND (audited_at IS NULL OR (scored_at IS NOT NULL AND audited_at < scored_at))"
+    ),
+    "diagnose": (
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND full_description IS NOT NULL "
+        "AND (diagnosed_at IS NULL "
+        "OR (scored_at IS NOT NULL AND diagnosed_at < scored_at) "
+        "OR (audited_at IS NOT NULL AND diagnosed_at < audited_at))"
+    ),
     "tailor": (
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
+        "SELECT COUNT(*) FROM jobs WHERE COALESCE(audit_score, fit_score) >= ? "
         "AND full_description IS NOT NULL "
         "AND tailored_resume_path IS NULL "
         "AND COALESCE(tailor_attempts, 0) < 5"
     ),
     "cover": (
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        "SELECT COUNT(*) FROM jobs WHERE COALESCE(audit_score, fit_score) >= ? "
+        "AND tailored_resume_path IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < 5"
     ),
@@ -260,8 +510,11 @@ def _run_stage_streaming(
     tracker: _StageTracker,
     stop_event: threading.Event,
     min_score: int = 7,
+    batch_size: int | None = None,
     workers: int = 1,
     validation_mode: str = "normal",
+    discover_mode: str = "safe",
+    run_id: int | None = None,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -270,12 +523,27 @@ def _run_stage_streaming(
     and repeats until upstream is done and no pending work remains.
     """
     runner = _STAGE_RUNNERS[stage]
+    conn = get_connection() if run_id is not None else None
+    pending_before = _count_pending(stage, min_score) if run_id is not None else None
+    stage_run_id = (
+        start_pipeline_stage(conn, run_id, stage, pending_before=pending_before)
+        if run_id is not None
+        else None
+    )
+    stage_start = time.time()
+    stage_status = "ok"
+    stage_error: str | None = None
     kwargs: dict = {}
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
         kwargs["validation_mode"] = validation_mode
-    if stage in ("discover", "enrich"):
+        kwargs["batch_size"] = batch_size
+    if stage in ("diagnose", "pdf"):
+        kwargs["batch_size"] = batch_size
+    if stage in ("discover", "enrich", "score") and _accepts_kwarg(runner, "workers"):
         kwargs["workers"] = workers
+    if stage == "discover" and _accepts_kwarg(runner, "discover_mode"):
+        kwargs["discover_mode"] = discover_mode
 
     upstream = _UPSTREAM[stage]
 
@@ -283,14 +551,35 @@ def _run_stage_streaming(
         # Discover runs once (its sub-scrapers already do their full crawl)
         try:
             result = runner(**kwargs)
+            if isinstance(result, dict):
+                sub_errors = [
+                    f"{k}: {v}" for k, v in result.items()
+                    if isinstance(v, str) and v.startswith("error")
+                ]
+                if sub_errors:
+                    stage_status = "partial"
+                    stage_error = "; ".join(sub_errors)
             tracker.mark_done(stage, result)
         except Exception as e:
             log.exception("Stage '%s' crashed", stage)
-            tracker.mark_done(stage, {"status": f"error: {e}"})
+            stage_status = f"error: {e}"
+            stage_error = str(e)
+            tracker.mark_done(stage, {"status": stage_status})
+        finally:
+            if stage_run_id is not None:
+                finish_pipeline_stage(
+                    conn,
+                    stage_run_id,
+                    status=stage_status,
+                    pending_after=_count_pending(stage, min_score),
+                    elapsed_seconds=time.time() - stage_start,
+                    error=stage_error,
+                )
         return
 
     # For downstream stages: loop until upstream done + no pending work
     passes = 0
+    errors: list[str] = []
     while not stop_event.is_set():
         # Wait for upstream to start producing work (first pass only)
         if passes == 0 and upstream and not tracker.is_done(upstream):
@@ -301,10 +590,17 @@ def _run_stage_streaming(
 
         if pending > 0:
             try:
-                runner(**kwargs)
+                result = runner(**kwargs)
+                if isinstance(result, dict):
+                    status = result.get("status", "ok")
+                    if status not in ("ok", "partial"):
+                        errors.append(status)
+                    elif status == "partial":
+                        errors.append("partial")
                 passes += 1
             except Exception as e:
                 log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
+                errors.append(str(e))
                 passes += 1
         else:
             # No work right now
@@ -316,19 +612,39 @@ def _run_stage_streaming(
             if stop_event.wait(timeout=_STREAM_POLL_INTERVAL):
                 break  # Stop requested
 
-    tracker.mark_done(stage, {"status": "ok", "passes": passes})
+    if errors:
+        stage_status = "partial"
+        stage_error = "; ".join(errors[-3:])
+    tracker.mark_done(stage, {"status": stage_status, "passes": passes})
+    if stage_run_id is not None:
+        finish_pipeline_stage(
+            conn,
+            stage_run_id,
+            status=stage_status,
+            pending_after=_count_pending(stage, min_score),
+            elapsed_seconds=time.time() - stage_start,
+            error=stage_error,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
-def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+def _run_sequential(
+    ordered: list[str],
+    min_score: int,
+    batch_size: int | None = None,
+    workers: int = 1,
+    validation_mode: str = "normal",
+    discover_mode: str = "safe",
+    run_id: int | None = None,
+) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
     pipeline_start = time.time()
+    checkpoint_conn = get_connection() if run_id is not None else None
 
     for name in ordered:
         meta = STAGE_META[name]
@@ -339,18 +655,30 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
         t0 = time.time()
         runner = _STAGE_RUNNERS[name]
+        pending_before = _count_pending(name, min_score) if run_id is not None else None
+        stage_run_id = (
+            start_pipeline_stage(checkpoint_conn, run_id, name, pending_before=pending_before)
+            if run_id is not None
+            else None
+        )
+        status = "ok"
+        error_text: str | None = None
 
         try:
             kwargs: dict = {}
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["validation_mode"] = validation_mode
-            if name in ("discover", "enrich"):
+                kwargs["batch_size"] = batch_size
+            if name in ("diagnose", "pdf"):
+                kwargs["batch_size"] = batch_size
+            if name in ("discover", "enrich", "score") and _accepts_kwarg(runner, "workers"):
                 kwargs["workers"] = workers
+            if name == "discover" and _accepts_kwarg(runner, "discover_mode"):
+                kwargs["discover_mode"] = discover_mode
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
-            status = "ok"
             if isinstance(result, dict):
                 status = result.get("status", "ok")
                 if name == "discover":
@@ -360,12 +688,26 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                     ]
                     if sub_errors:
                         status = "partial"
+                        error_text = "; ".join(sub_errors)
+                elif status not in ("ok", "partial"):
+                    error_text = status
 
         except Exception as e:
             elapsed = time.time() - t0
             status = f"error: {e}"
+            error_text = str(e)
             log.exception("Stage '%s' crashed", name)
             console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
+        finally:
+            if stage_run_id is not None:
+                finish_pipeline_stage(
+                    checkpoint_conn,
+                    stage_run_id,
+                    status=status,
+                    pending_after=_count_pending(name, min_score),
+                    elapsed_seconds=time.time() - t0,
+                    error=error_text,
+                )
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
         if status not in ("ok", "partial"):
@@ -377,14 +719,21 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
 
 
-def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+def _run_streaming(
+    ordered: list[str],
+    min_score: int,
+    batch_size: int | None = None,
+    workers: int = 1,
+    validation_mode: str = "normal",
+    discover_mode: str = "safe",
+    run_id: int | None = None,
+) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
     pipeline_start = time.time()
 
-    console.print(f"\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
+    console.print("\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
     console.print(f"  Poll interval: {_STREAM_POLL_INTERVAL}s\n")
 
     # Mark stages NOT in `ordered` as done so downstream doesn't wait for them
@@ -400,7 +749,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            args=(name, tracker, stop_event, min_score, batch_size, workers, validation_mode, discover_mode, run_id),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -444,19 +793,23 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
 def run_pipeline(
     stages: list[str] | None = None,
     min_score: int = 7,
+    batch_size: int | None = None,
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,
     validation_mode: str = "normal",
+    discover_mode: str = "safe",
 ) -> dict:
     """Run pipeline stages.
 
     Args:
         stages: List of stage names, or None / ["all"] for full pipeline.
         min_score: Minimum fit score for tailor/cover stages.
+        batch_size: Maximum jobs per tailor/cover/pdf stage run. 0 means all.
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.
+        discover_mode: Discovery breadth mode: safe, fast, or full.
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -464,7 +817,7 @@ def run_pipeline(
     # Bootstrap
     load_env()
     ensure_dirs()
-    init_db()
+    conn = init_db()
 
     # Resolve stages
     if stages is None:
@@ -473,13 +826,18 @@ def run_pipeline(
 
     # Banner
     mode = "streaming" if stream else "sequential"
+    effective_batch_size = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
     console.print()
     console.print(Panel.fit(
         f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
         border_style="blue",
     ))
     console.print(f"  Min score:  {min_score}")
+    console.print(
+        f"  Batch size: {'all' if effective_batch_size == 0 else effective_batch_size}"
+    )
     console.print(f"  Workers:    {workers}")
+    console.print(f"  Discovery:  {discover_mode}")
     console.print(f"  Validation: {validation_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
@@ -492,16 +850,33 @@ def run_pipeline(
         for name in ordered:
             meta = STAGE_META[name]
             console.print(f"    {name:<12s}  {meta['desc']}")
-        console.print(f"\n  No changes made.")
+        console.print("\n  No changes made.")
         return {"stages": [], "errors": {}, "elapsed": 0.0}
 
     # Execute
-    if stream:
-        result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
-    else:
-        result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+    run_id = create_pipeline_run(
+        conn,
+        stages=ordered,
+        mode=mode,
+        min_score=min_score,
+        batch_size=effective_batch_size,
+        workers=workers,
+        validation_mode=validation_mode,
+    )
+    try:
+        if stream:
+            result = _run_streaming(ordered, min_score, batch_size=effective_batch_size, workers=workers,
+                                    validation_mode=validation_mode, discover_mode=discover_mode, run_id=run_id)
+        else:
+            result = _run_sequential(ordered, min_score, batch_size=effective_batch_size, workers=workers,
+                                     validation_mode=validation_mode, discover_mode=discover_mode, run_id=run_id)
+        stage_statuses = [stage_result.get("status") for stage_result in result.get("stages", [])]
+        run_status = "partial" if result.get("errors") or any(s == "partial" for s in stage_statuses) else "ok"
+        run_error = "; ".join(f"{stage}: {error}" for stage, error in result.get("errors", {}).items()) or None
+        finish_pipeline_run(conn, run_id, status=run_status, error=run_error)
+    except Exception as e:
+        finish_pipeline_run(conn, run_id, status="error", error=str(e))
+        raise
 
     # Summary table
     console.print(f"\n{'=' * 70}")
@@ -527,10 +902,12 @@ def run_pipeline(
 
     # Final DB stats
     final = get_stats()
-    console.print(f"\n  [bold]DB Final State:[/bold]")
+    console.print("\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
     console.print(f"    With desc:      {final['with_description']}")
     console.print(f"    Scored:         {final['scored']}")
+    console.print(f"    Audited:        {final.get('audited', 0)}")
+    console.print(f"    Diagnosed:      {final.get('diagnosed', 0)}")
     console.print(f"    Tailored:       {final['tailored']}")
     console.print(f"    Cover letters:  {final['with_cover_letter']}")
     console.print(f"    Ready to apply: {final['ready_to_apply']}")
