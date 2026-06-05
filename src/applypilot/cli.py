@@ -236,6 +236,8 @@ def apply(
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
+    preflight: bool = typer.Option(True, "--preflight/--skip-preflight", help="Run readiness checks before launching the apply agent."),
+    stale_days: int = typer.Option(21, "--stale-days", help="Preflight warning threshold for stale jobs."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
@@ -316,6 +318,28 @@ def apply(
     from applypilot.apply.launcher import main as apply_main
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
+
+    if preflight:
+        from applypilot.apply.readiness import collect_preapply_checks, summarize_checks
+
+        preflight_limit = effective_limit if effective_limit > 0 else 25
+        checks = collect_preapply_checks(
+            min_score=min_score,
+            limit=preflight_limit,
+            stale_days=stale_days,
+            job_ref=url,
+        )
+        _print_preapply_checks(checks, "Auto-Apply Preflight")
+        summary = summarize_checks(checks)
+        if summary["checked"] == 0:
+            console.print("[red]No matching ready-to-apply jobs passed the queue filters.[/red]")
+            raise typer.Exit(code=1)
+        if summary["blocked"]:
+            console.print(
+                "\n[red]Preflight found blocked job(s).[/red] "
+                "Fix them, choose a specific --url, or use --skip-preflight if you intentionally want to proceed."
+            )
+            raise typer.Exit(code=1)
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
@@ -445,6 +469,42 @@ def _print_tracker(rows: list[dict], title: str) -> None:
     console.print(table)
 
 
+def _print_preapply_checks(checks: list[dict], title: str) -> None:
+    from applypilot.apply.readiness import summarize_checks
+
+    summary = summarize_checks(checks)
+    console.print(f"\n[bold]{title}[/bold]")
+    console.print(
+        "  Checked: {checked} | Ready: {ready} | Warnings: {warnings} | Blocked: {blocked}".format(**summary)
+    )
+
+    if summary["issue_counts"]:
+        issue_text = ", ".join(f"{code}={count}" for code, count in summary["issue_counts"].items())
+        console.print(f"  Issues:  {issue_text}")
+
+    table = Table(title="Pre-Apply Findings", show_header=True, header_style="bold cyan")
+    table.add_column("State")
+    table.add_column("Score", justify="right")
+    table.add_column("Company")
+    table.add_column("Role")
+    table.add_column("Issues")
+    table.add_column("URL")
+
+    for row in checks:
+        issues = ", ".join(issue["code"] for issue in row.get("issues", []))
+        state = str(row.get("severity") or "")
+        style = "red" if state == "blocked" else "yellow" if state == "warning" else "green"
+        table.add_row(
+            f"[{style}]{state}[/{style}]",
+            str(row.get("score") if row.get("score") is not None else ""),
+            str(row.get("company") or "")[:28],
+            str(row.get("title") or "")[:44],
+            issues[:60],
+            str(row.get("application_url") or row.get("url") or "")[:70],
+        )
+    console.print(table)
+
+
 @app.command("track")
 def track_command(
     ready: bool = typer.Option(False, "--ready", help="Show jobs ready to apply instead of tracked applications."),
@@ -465,6 +525,25 @@ def track_command(
 
     rows = list_applications(status=status, active_only=active and status is None, limit=limit)
     _print_tracker(rows, "Application Tracker")
+
+
+@app.command("preapply-check")
+def preapply_check_command(
+    min_score: int = typer.Option(7, "--min-score", help="Minimum score for ready jobs."),
+    limit: int = typer.Option(50, "--limit", "-l", help="Maximum ready jobs to inspect. Use 0 for all."),
+    stale_days: int = typer.Option(21, "--stale-days", help="Warn when a job was discovered more than this many days ago."),
+    url: Optional[str] = typer.Option(None, "--url", help="Inspect one job URL or application URL."),
+) -> None:
+    """Audit the ready-to-apply queue before launching browser automation."""
+    _bootstrap()
+
+    from applypilot.apply.readiness import collect_preapply_checks, summarize_checks
+
+    checks = collect_preapply_checks(min_score=min_score, limit=limit, stale_days=stale_days, job_ref=url)
+    _print_preapply_checks(checks, "Pre-Apply Readiness")
+    summary = summarize_checks(checks)
+    if summary["blocked"]:
+        raise typer.Exit(code=1)
 
 
 @app.command("mark-applied")
