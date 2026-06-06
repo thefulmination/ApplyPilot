@@ -31,7 +31,7 @@
 - Modify: `src/applypilot/discovery/smartextract.py`
 - Test: `tests/test_smartextract_hardening.py`
 
-- [ ] **Step 1: Write failing tests for Smart Extract job validation**
+- [x] **Step 1: Write failing tests for Smart Extract job validation**
 
 Add tests that import `applypilot.discovery.smartextract` and assert:
 
@@ -54,7 +54,7 @@ def test_validate_smart_jobs_rejects_junk_and_relative_urls():
     assert counts["duplicate_url"] == 1
 ```
 
-- [ ] **Step 2: Run test and verify it fails**
+- [x] **Step 2: Run test and verify it fails**
 
 Run:
 
@@ -64,11 +64,11 @@ Run:
 
 Expected: fails because `validate_smart_jobs` does not exist.
 
-- [ ] **Step 3: Implement validation helpers**
+- [x] **Step 3: Implement validation helpers**
 
 Add `validate_smart_jobs(jobs)` and `_is_valid_smart_title(title)` to `smartextract.py`. Validation must require absolute `http` or `https` URLs, reject blank/navigation/action titles, and dedupe URLs within the batch.
 
-- [ ] **Step 4: Run validation tests**
+- [x] **Step 4: Run validation tests**
 
 Run:
 
@@ -86,7 +86,7 @@ Expected: validation test passes or only later-task tests fail.
 - Modify: `src/applypilot/discovery/smartextract.py`
 - Test: `tests/test_smartextract_hardening.py`
 
-- [ ] **Step 1: Write failing health tests**
+- [x] **Step 1: Write failing health tests**
 
 Add tests that monkeypatch `smartextract.SMART_HEALTH_PATH` to a temp file and assert:
 
@@ -133,7 +133,7 @@ def test_health_success_resets_consecutive_failures(tmp_path, monkeypatch):
     assert health["Board"]["last_successful_strategy"] == "http_probe"
 ```
 
-- [ ] **Step 2: Run tests and verify they fail**
+- [x] **Step 2: Run tests and verify they fail**
 
 Run:
 
@@ -143,11 +143,11 @@ Run:
 
 Expected: fails because health functions do not exist.
 
-- [ ] **Step 3: Implement health helpers**
+- [x] **Step 3: Implement health helpers**
 
 Add `SMART_HEALTH_PATH = config.APP_DIR / "smartextract_health.json"`, `load_smart_health()`, `save_smart_health(health)`, `record_source_health(...)`, and `should_skip_source(...)`. Use ISO timestamps and average runtime smoothing.
 
-- [ ] **Step 4: Run health tests**
+- [x] **Step 4: Run health tests**
 
 Run:
 
@@ -165,7 +165,7 @@ Expected: validation and health tests pass or only later-task tests fail.
 - Modify: `src/applypilot/discovery/smartextract.py`
 - Test: `tests/test_smartextract_hardening.py`
 
-- [ ] **Step 1: Write failing HTTP probe test**
+- [x] **Step 1: Write failing HTTP probe test**
 
 Add a test that monkeypatches `requests.get` to return HTML with JSON-LD:
 
@@ -197,7 +197,7 @@ def test_http_probe_extracts_json_ld_job(monkeypatch):
     assert result["jobs"][0]["url"] == "https://example.com/jobs/chief"
 ```
 
-- [ ] **Step 2: Run test and verify it fails**
+- [x] **Step 2: Run test and verify it fails**
 
 Run:
 
@@ -207,11 +207,11 @@ Run:
 
 Expected: fails because `requests` and `http_probe_target` are not available in `smartextract.py`.
 
-- [ ] **Step 3: Implement HTTP probe**
+- [x] **Step 3: Implement HTTP probe**
 
 Import `requests` and `urljoin`. Add `http_probe_target(name, url)` that fetches HTML with the existing user agent, extracts JSON-LD `JobPosting` entries, normalizes title/description/location/url, validates jobs, and returns a Smart Extract-style result dict. If there are no valid jobs, return `{"status": "FAIL", "strategy": "http_probe", "jobs": [], ...}` without raising.
 
-- [ ] **Step 4: Run HTTP probe tests**
+- [x] **Step 4: Run HTTP probe tests**
 
 Run:
 
@@ -229,7 +229,7 @@ Expected: tests pass or only integration-summary tests fail.
 - Modify: `src/applypilot/discovery/smartextract.py`
 - Test: `tests/test_smartextract_hardening.py`
 
-- [ ] **Step 1: Write integration-style unit test for skipped source summary**
+- [x] **Step 1: Write integration-style unit test for skipped source summary**
 
 Add a test that calls `should_skip_source` and verifies skipped counts are represented by a result dict from a new helper:
 
@@ -243,7 +243,7 @@ def test_skip_result_shape_contains_reason():
     assert result["jobs"] == []
 ```
 
-- [ ] **Step 2: Run test and verify it fails**
+- [x] **Step 2: Run test and verify it fails**
 
 Run:
 
@@ -253,7 +253,7 @@ Run:
 
 Expected: fails because `make_skip_result` does not exist.
 
-- [ ] **Step 3: Implement integration**
+- [x] **Step 3: Implement integration**
 
 Update `_apply_smart_config` to read:
 
@@ -272,7 +272,7 @@ Update `_run_all` so each target:
 - records health after each target
 - logs skipped and validation counts in the summary
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run:
 
@@ -291,7 +291,7 @@ Expected: all hardening tests pass.
 - Add: `tests/test_smartextract_hardening.py`
 - Update: `docs/superpowers/plans/2026-06-06-smart-extract-hardening.md`
 
-- [ ] **Step 1: Run full tests**
+- [x] **Step 1: Run full tests**
 
 Run:
 
@@ -301,7 +301,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 2: Run lint**
+- [x] **Step 2: Run lint**
 
 Run:
 
@@ -311,7 +311,7 @@ Run:
 
 Expected: all checks pass.
 
-- [ ] **Step 3: Run compile check**
+- [x] **Step 3: Run compile check**
 
 Run:
 
@@ -321,7 +321,7 @@ Run:
 
 Expected: exit code 0.
 
-- [ ] **Step 4: Run doctor**
+- [x] **Step 4: Run doctor**
 
 Run:
 
@@ -331,7 +331,7 @@ Run:
 
 Expected: LLM provider and Chrome remain OK.
 
-- [ ] **Step 5: Commit code changes**
+- [x] **Step 5: Commit code changes**
 
 Run:
 
@@ -341,4 +341,3 @@ git commit -m "Harden Smart Extract discovery"
 ```
 
 Expected: commit succeeds.
-
