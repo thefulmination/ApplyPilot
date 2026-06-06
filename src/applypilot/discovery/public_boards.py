@@ -12,6 +12,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -29,7 +30,16 @@ USER_AGENT = (
 )
 REQUEST_TIMEOUT = 25
 
-DEFAULT_SOURCES = ["the_muse", "remotejobs_org", "remotive", "arbeitnow"]
+DEFAULT_SOURCES = [
+    "the_muse",
+    "remotejobs_org",
+    "remotive",
+    "arbeitnow",
+    "hacker_news",
+    "yc_jobs",
+    "builtin",
+    "chief_of_staff_jobs",
+]
 DEFAULT_THE_MUSE_CATEGORIES = [
     "Business Operations",
     "Data and Analytics",
@@ -52,6 +62,13 @@ DEFAULT_REMOTIVE_CATEGORIES = [
     "Product",
     "Project Management",
     "Sales",
+]
+DEFAULT_BUILTIN_PATHS = [
+    "/jobs/remote/operations",
+    "/jobs/remote/sales",
+    "/jobs/remote/product",
+    "/jobs/remote/data-analytics",
+    "/jobs/remote/finance",
 ]
 
 
@@ -85,7 +102,16 @@ def _job_matches_queries(job: dict, query_terms: list[str]) -> bool:
         str(job.get(key) or "")
         for key in ("title", "description", "full_description")
     ).lower()
-    return any(term.lower() in text for term in query_terms)
+    for term in query_terms:
+        normalized = term.lower().strip()
+        if not normalized:
+            continue
+        if normalized in text:
+            return True
+        words = [word for word in re.split(r"\W+", normalized) if word]
+        if words and all(word in text for word in words):
+            return True
+    return False
 
 
 def _search_queries(cfg: dict) -> list[str]:
@@ -158,6 +184,17 @@ def _fetch_json(session: requests.Session, url: str, params: dict | None = None)
     resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
+
+
+def _fetch_html(session: requests.Session, url: str, params: dict | None = None) -> str:
+    resp = session.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+        headers={"Accept": "text/html,application/xhtml+xml"},
+    )
+    resp.raise_for_status()
+    return resp.text
 
 
 def _from_the_muse(raw: dict) -> dict | None:
@@ -371,11 +408,227 @@ def _discover_arbeitnow(
     return jobs
 
 
+def _from_simple_link(
+    *,
+    url: str,
+    title: str,
+    source_board: str,
+    site: str,
+    company: str | None = None,
+    location: str | None = None,
+    description: str | None = None,
+) -> dict | None:
+    title = re.sub(r"\s+", " ", title).strip()
+    if not url or not title:
+        return None
+    return {
+        "url": url,
+        "title": title,
+        "salary": None,
+        "description": (description or title)[:500],
+        "full_description": description,
+        "location": location,
+        "site": company or site,
+        "company": company or site,
+        "source_board": source_board,
+        "strategy": f"public_board:{source_board}",
+        "application_url": url,
+    }
+
+
+def _discover_hacker_news(
+    session: requests.Session,
+    cfg: dict,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("hacker_news_results", board_cfg.get("results_per_source", 300)) or 300)
+    query_terms = _search_queries(cfg)
+    html = _fetch_html(session, "https://news.ycombinator.com/jobs")
+    soup = BeautifulSoup(html, "html.parser")
+    jobs: list[dict] = []
+    seen: set[str] = set()
+
+    for titleline in soup.select(".titleline"):
+        link = titleline.find("a", href=True)
+        if not link:
+            continue
+        href = urljoin("https://news.ycombinator.com/", link["href"])
+        title = link.get_text(" ", strip=True)
+        if href in seen:
+            continue
+        seen.add(href)
+        job = _from_simple_link(
+            url=href,
+            title=title,
+            source_board="hacker_news",
+            site="Hacker News Jobs",
+            company="Hacker News Jobs",
+            location="Remote",
+            description=title,
+        )
+        if not job:
+            continue
+        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+            continue
+        if not _job_matches_queries(job, query_terms):
+            continue
+        jobs.append(job)
+        if len(jobs) >= per_source:
+            break
+    return jobs
+
+
+def _discover_yc_jobs(
+    session: requests.Session,
+    cfg: dict,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("yc_jobs_results", board_cfg.get("results_per_source", 300)) or 300)
+    query_terms = _search_queries(cfg)
+    jobs: list[dict] = []
+    seen: set[str] = set()
+
+    for query in query_terms or [""]:
+        url = "https://www.ycombinator.com/jobs"
+        if query:
+            url = f"{url}?query={quote(query.lower())}"
+        html = _fetch_html(session, url)
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if not re.search(r"/companies/[^/]+/jobs/", href):
+                continue
+            full_url = urljoin("https://www.ycombinator.com/", href)
+            if full_url in seen:
+                continue
+            seen.add(full_url)
+            title = link.get_text(" ", strip=True)
+            company_match = re.search(r"/companies/([^/]+)/jobs/", href)
+            company = (company_match.group(1).replace("-", " ").title() if company_match else "Y Combinator")
+            job = _from_simple_link(
+                url=full_url,
+                title=title,
+                source_board="yc_jobs",
+                site=company,
+                company=company,
+                location="Remote",
+                description=f"{title} at {company}",
+            )
+            if not job:
+                continue
+            if not _location_ok(job.get("location"), accept_locs, reject_locs):
+                continue
+            if not _job_matches_queries(job, query_terms):
+                continue
+            jobs.append(job)
+            if len(jobs) >= per_source:
+                return jobs
+        time.sleep(0.2)
+    return jobs
+
+
+def _discover_builtin(
+    session: requests.Session,
+    cfg: dict,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    paths = board_cfg.get("builtin_paths") or DEFAULT_BUILTIN_PATHS
+    per_source = int(board_cfg.get("builtin_results", board_cfg.get("results_per_source", 300)) or 300)
+    query_terms = _search_queries(cfg)
+    jobs: list[dict] = []
+    seen: set[str] = set()
+
+    for path in paths:
+        html = _fetch_html(session, urljoin("https://builtin.com/", path))
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if not re.match(r"^/job/[^/]+/\d+", href):
+                continue
+            full_url = urljoin("https://builtin.com/", href)
+            if full_url in seen:
+                continue
+            seen.add(full_url)
+            title = link.get_text(" ", strip=True)
+            job = _from_simple_link(
+                url=full_url,
+                title=title,
+                source_board="builtin",
+                site="Built In",
+                company="Built In",
+                location="Remote",
+                description=title,
+            )
+            if not job:
+                continue
+            if not _location_ok(job.get("location"), accept_locs, reject_locs):
+                continue
+            if not _job_matches_queries(job, query_terms):
+                continue
+            jobs.append(job)
+            if len(jobs) >= per_source:
+                return jobs
+        time.sleep(0.2)
+    return jobs
+
+
+def _discover_chief_of_staff_jobs(
+    session: requests.Session,
+    cfg: dict,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("chief_of_staff_jobs_results", board_cfg.get("results_per_source", 300)) or 300)
+    html = _fetch_html(session, "https://www.chiefofstaffjob.com/")
+    soup = BeautifulSoup(html, "html.parser")
+    jobs: list[dict] = []
+    seen: set[str] = set()
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        if not href.startswith("/jobs/"):
+            continue
+        full_url = urljoin("https://www.chiefofstaffjob.com/", href)
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        text = link.get_text(" ", strip=True)
+        location = "Remote" if re.search(r"\bremote\b", text, re.I) else text
+        job = _from_simple_link(
+            url=full_url,
+            title=text,
+            source_board="chief_of_staff_jobs",
+            site="ChiefOfStaffJob.com",
+            company="ChiefOfStaffJob.com",
+            location=location,
+            description=text,
+        )
+        if not job:
+            continue
+        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+            continue
+        jobs.append(job)
+        if len(jobs) >= per_source:
+            return jobs
+    return jobs
+
+
 DISCOVERERS = {
     "the_muse": _discover_the_muse,
     "remotejobs_org": _discover_remotejobs_org,
     "remotive": _discover_remotive,
     "arbeitnow": _discover_arbeitnow,
+    "hacker_news": _discover_hacker_news,
+    "yc_jobs": _discover_yc_jobs,
+    "builtin": _discover_builtin,
+    "chief_of_staff_jobs": _discover_chief_of_staff_jobs,
 }
 
 

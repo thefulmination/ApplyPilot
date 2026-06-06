@@ -316,7 +316,7 @@ class LLMClient:
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
+            except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer â€” switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "

@@ -134,6 +134,10 @@ public_boards:
     - remotejobs_org
     - remotive
     - arbeitnow
+    - hacker_news
+    - yc_jobs
+    - builtin
+    - chief_of_staff_jobs
   max_pages: 3
   results_per_source: 300
   the_muse_categories:
@@ -156,6 +160,12 @@ public_boards:
     - Product
     - "Project Management"
     - Sales
+  builtin_paths:
+    - /jobs/remote/operations
+    - /jobs/remote/sales
+    - /jobs/remote/product
+    - /jobs/remote/data-analytics
+    - /jobs/remote/finance
 
 # HiringCafe source settings.
 # Set company_watchlist_path to a text file with one company name per line.

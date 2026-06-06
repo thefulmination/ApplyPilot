@@ -6,7 +6,6 @@ profile at runtime. No hardcoded personal information.
 """
 
 import hashlib
-import json
 import logging
 import os
 import re
@@ -14,7 +13,7 @@ import time
 from datetime import datetime, timezone
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile, load_resume_strategy
-from applypilot.database import get_connection, get_jobs_by_stage
+from applypilot.database import get_connection
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
