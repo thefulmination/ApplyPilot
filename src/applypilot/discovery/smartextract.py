@@ -31,7 +31,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import init_db, get_stats
+from applypilot.database import init_db, get_stats, insert_discovered_job
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -176,6 +176,25 @@ def _is_valid_smart_title(title: object) -> bool:
     return True
 
 
+def _coerce_db_scalar(value):
+    """Coerce a value to something SQLite can store (str/int/float/None).
+
+    JSON-LD fields such as ``baseSalary`` are frequently structured objects or
+    lists. Storing a dict/list directly raises ``sqlite3.InterfaceError`` and,
+    because the insert is not individually guarded, aborts the entire discovery
+    run. Stringify containers (and any other non-scalar) so one odd posting
+    can't take down the batch.
+    """
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)[:500]
+        except Exception:
+            return str(value)[:500]
+    return str(value)[:500]
+
+
 def validate_smart_jobs(jobs: list[dict]) -> tuple[list[dict], dict[str, int]]:
     """Reject malformed Smart Extract jobs before they enter the database."""
     counts: Counter[str] = Counter()
@@ -202,6 +221,13 @@ def validate_smart_jobs(jobs: list[dict]) -> tuple[list[dict], dict[str, int]]:
         normalized = dict(job)
         normalized["title"] = title
         normalized["url"] = url
+        # Ensure DB-storable scalars: structured salary/location objects would
+        # otherwise raise sqlite3.InterfaceError on insert. Only touch keys that
+        # are present so we don't invent fields the caller didn't supply.
+        if "salary" in normalized:
+            normalized["salary"] = _coerce_db_scalar(normalized["salary"])
+        if "location" in normalized:
+            normalized["location"] = _coerce_db_scalar(normalized["location"])
         valid.append(normalized)
         counts["accepted"] += 1
 
@@ -212,6 +238,48 @@ def validate_smart_jobs(jobs: list[dict]) -> tuple[list[dict], dict[str, int]]:
 
 def make_skip_result(name: str, reason: str) -> dict:
     return {"name": name, "status": "SKIPPED", "skip_reason": reason, "jobs": []}
+
+
+def detect_page_issue(html: str | None, url: str = "") -> dict | None:
+    """Classify known anti-bot/challenge pages before spending browser or LLM time."""
+    text = (html or "").lower()
+    if not text:
+        return None
+
+    cloudflare_signals = (
+        "just a moment...",
+        "enable javascript and cookies to continue",
+        "/cdn-cgi/challenge-platform/",
+        "__cf_chl_",
+        "cf_chl_",
+        "cf-ray",
+        "challenges.cloudflare.com",
+    )
+    if any(signal in text for signal in cloudflare_signals):
+        return {
+            "type": "cloudflare_challenge",
+            "label": "Cloudflare challenge",
+            "detail": "Cloudflare or JavaScript/cookie verification page detected",
+        }
+
+    captcha_signals = (
+        "captcha",
+        "are you a human",
+        "verify you are human",
+        "verify you",
+        "please verify",
+        "bot detection",
+        "unusual requests",
+        "access denied",
+    )
+    if any(signal in text for signal in captcha_signals):
+        return {
+            "type": "captcha_challenge",
+            "label": "Captcha or bot challenge",
+            "detail": "Captcha, bot verification, or access-denied page detected",
+        }
+
+    return None
 
 
 def load_smart_health() -> dict:
@@ -249,6 +317,7 @@ def should_skip_source(
     *,
     skip_after_failures: int,
     cooldown_hours: int,
+    now: datetime | None = None,
 ) -> tuple[bool, str]:
     if skip_after_failures <= 0 or cooldown_hours <= 0:
         return False, ""
@@ -259,7 +328,7 @@ def should_skip_source(
     last_checked = _parse_iso(entry.get("last_checked_at"))
     if not last_checked:
         return True, f"health cooldown: {failures} failures"
-    elapsed = datetime.now(timezone.utc) - last_checked
+    elapsed = (now or datetime.now(timezone.utc)) - last_checked
     if elapsed.total_seconds() < cooldown_hours * 3600:
         return True, f"health cooldown: {failures} failures"
     return False, ""
@@ -276,6 +345,8 @@ def record_source_health(
     elapsed_seconds: float,
     hard_failure: bool,
     timeout: bool = False,
+    issue_type: str | None = None,
+    challenge: bool = False,
 ) -> None:
     entry = dict(health.get(name) or {})
     runs = int(entry.get("runs") or 0) + 1
@@ -294,6 +365,11 @@ def record_source_health(
         "average_runtime_seconds": round(average_runtime, 3),
     })
     entry["timeout_count"] = int(entry.get("timeout_count") or 0) + (1 if timeout else 0)
+    entry["challenge_count"] = int(entry.get("challenge_count") or 0) + (1 if challenge else 0)
+    if issue_type:
+        entry["last_issue_type"] = issue_type
+    elif not hard_failure:
+        entry["last_issue_type"] = ""
     if hard_failure:
         entry["consecutive_failures"] = int(entry.get("consecutive_failures") or 0) + 1
     else:
@@ -301,6 +377,45 @@ def record_source_health(
         if strategy:
             entry["last_successful_strategy"] = strategy
     health[name] = entry
+
+
+def summarize_smart_health(
+    health: dict,
+    *,
+    now: datetime | None = None,
+    skip_after_failures: int | None = None,
+    cooldown_hours: int | None = None,
+) -> list[dict]:
+    """Return source-health rows suitable for CLI display."""
+    now = now or datetime.now(timezone.utc)
+    skip_after_failures = SMART_SKIP_AFTER_FAILURES if skip_after_failures is None else skip_after_failures
+    cooldown_hours = SMART_SKIP_COOLDOWN_HOURS if cooldown_hours is None else cooldown_hours
+
+    rows: list[dict] = []
+    for name, entry in sorted((health or {}).items()):
+        failures = int(entry.get("consecutive_failures") or 0)
+        should_skip, reason = should_skip_source(
+            health,
+            name,
+            skip_after_failures=skip_after_failures,
+            cooldown_hours=cooldown_hours,
+            now=now,
+        )
+        rows.append({
+            "source": entry.get("source") or name,
+            "status": entry.get("last_status") or "",
+            "issue_type": entry.get("last_issue_type") or "",
+            "failures": failures,
+            "timeouts": int(entry.get("timeout_count") or 0),
+            "challenges": int(entry.get("challenge_count") or 0),
+            "last_jobs_found": int(entry.get("last_jobs_found") or 0),
+            "average_runtime_seconds": float(entry.get("average_runtime_seconds") or 0.0),
+            "cooling_down": bool(should_skip),
+            "cooldown_reason": reason,
+            "last_url": entry.get("last_url") or "",
+        })
+
+    return rows
 
 
 # -- HTTP probe ---------------------------------------------------------------
@@ -369,7 +484,7 @@ def _extract_json_ld_jobs(html: str, base_url: str) -> list[dict]:
             url = _clean_text(entry.get("url")) or base_url
             jobs.append({
                 "title": _clean_text(entry.get("title")),
-                "salary": entry.get("baseSalary"),
+                "salary": _coerce_db_scalar(entry.get("baseSalary")),
                 "description": _clean_text(entry.get("description")),
                 "location": _location_from_jobposting(entry),
                 "url": urljoin(base_url, url),
@@ -416,6 +531,21 @@ def http_probe_target(name: str, url: str) -> dict:
             },
             timeout=max(5, min(SMART_GOTO_TIMEOUT_MS / 1000, 20)),
         )
+        raw_text = resp.text or ""
+        issue = detect_page_issue(raw_text, resp.url or url)
+        if issue:
+            return {
+                "name": name,
+                "status": "CHALLENGE",
+                "strategy": "http_probe",
+                "issue_type": issue["type"],
+                "error": issue["detail"],
+                "challenge": True,
+                "jobs": [],
+                "validation_counts": {},
+                "validated": True,
+                "elapsed_seconds": time.time() - t0,
+            }
         resp.raise_for_status()
     except Exception as e:
         return {
@@ -544,21 +674,23 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
+        # Guard each insert: a single malformed job (e.g. a value SQLite can't
+        # bind) must not abort the whole batch.
         try:
-            conn.execute(
-                """
-                INSERT INTO jobs (
-                    url, title, salary, description, location, site,
-                    company, source_board, strategy, discovered_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), job.get("company") or site,
-                 job.get("company") or site, site, strategy, now),
+            status = insert_discovered_job(
+                conn,
+                job,
+                site=job.get("company") or site,
+                strategy=strategy,
+                source_board=site,
+                discovered_at=now,
             )
+        except Exception as e:
+            log.warning("Skipping un-storable job %s: %s", str(url)[:80], e)
+            continue
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     if filtered:
@@ -1176,7 +1308,7 @@ def resolve_json_path_raw(data, path: str):
             else:
                 current = current[part]
         return current
-    except (KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError, ValueError):
         return None
 
 
@@ -1203,7 +1335,7 @@ def resolve_json_path(data, path: str):
                 return ", ".join(str(item.get("name", item.get("text", ""))) for item in current[:3])
             return ", ".join(str(x) for x in current[:3])
         return str(current) if current else None
-    except (KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError, ValueError):
         return None
 
 
@@ -1351,10 +1483,19 @@ def _run_one_site(name: str, url: str) -> dict:
     # Headful retry if page content is tiny
     full_html = intel.get("full_html", "")
     cleaned_check = clean_page_html(full_html) if full_html else ""
-    _captcha_signals = ["captcha", "are you a human", "verify you", "unusual requests",
-                        "access denied", "please verify", "bot detection"]
-    _is_captcha = any(s in full_html.lower() for s in _captcha_signals) if full_html else False
-    if SMART_HEADFUL_RETRY and len(cleaned_check) < 5000 and full_html and not _is_captcha:
+    issue = detect_page_issue(full_html, url)
+    if issue:
+        log.warning("%s detected for %s -- skipping extraction", issue["label"], name)
+        return {
+            "name": name,
+            "status": "CHALLENGE",
+            "strategy": "page_intelligence",
+            "issue_type": issue["type"],
+            "error": issue["detail"],
+            "challenge": True,
+            "jobs": [],
+        }
+    if SMART_HEADFUL_RETRY and len(cleaned_check) < 5000 and full_html:
         log.info("Cleaned HTML only %s chars -- retrying headful...", f"{len(cleaned_check):,}")
         try:
             intel = collect_page_intelligence(url, headless=False)
@@ -1363,8 +1504,6 @@ def _run_one_site(name: str, url: str) -> dict:
                      collect_time, len(intel["json_ld"]), len(intel["api_responses"]))
         except Exception as e:
             log.warning("Headful retry failed: %s", e)
-    elif _is_captcha:
-        log.warning("CAPTCHA/rate-limit detected -- skipping headful retry")
 
     # Step 1.5: Judge filters API responses
     if intel["api_responses"]:
@@ -1390,6 +1529,14 @@ def _run_one_site(name: str, url: str) -> dict:
     except Exception as e:
         log.error("PARSE_ERROR: %s | raw: %s", e, raw[:500])
         return {"name": name, "status": "PARSE_ERROR", "error": str(e), "raw": raw}
+
+    if not isinstance(plan, dict):
+        # A non-object payload (list/str) would raise AttributeError on .get
+        # below, outside the try -- classify it as a parse error and keep raw.
+        log.error("PARSE_ERROR: strategy plan was %s, not an object | raw: %s",
+                  type(plan).__name__, raw[:500])
+        return {"name": name, "status": "PARSE_ERROR",
+                "error": f"plan is {type(plan).__name__}, expected object", "raw": raw}
 
     strategy = plan.get("strategy", "?")
     reasoning = plan.get("reasoning", "?")
@@ -1469,10 +1616,29 @@ def _run_target_with_fallback(target: dict) -> dict:
 
 def _is_hard_failure(result: dict) -> bool:
     status = str(result.get("status") or "").upper()
-    if status in {"COLLECT_ERROR", "LLM_ERROR", "PARSE_ERROR", "EXEC_ERROR", "ERROR"}:
+    if status in {"CHALLENGE", "COLLECT_ERROR", "LLM_ERROR", "PARSE_ERROR", "EXEC_ERROR", "ERROR"}:
         return True
     error = str(result.get("error") or "").lower()
     return "timeout" in error or "timed out" in error or "browser" in error
+
+
+def _result_issue_type(result: dict) -> str:
+    issue_type = str(result.get("issue_type") or "").strip()
+    if issue_type:
+        return issue_type
+    if _is_timeout_result(result):
+        return "timeout"
+    status = str(result.get("status") or "").lower()
+    if "http" in status:
+        return "http_error"
+    if _is_hard_failure(result):
+        return "extract_error"
+    return ""
+
+
+def _is_challenge_result(result: dict) -> bool:
+    issue_type = _result_issue_type(result)
+    return bool(result.get("challenge")) or "challenge" in issue_type
 
 
 def _is_timeout_result(result: dict) -> bool:
@@ -1605,6 +1771,8 @@ def _run_all(
             elapsed_seconds=float(r.get("elapsed_seconds") or 0.0),
             hard_failure=_is_hard_failure(r),
             timeout=_is_timeout_result(r),
+            issue_type=_result_issue_type(r),
+            challenge=_is_challenge_result(r),
         )
 
     def _prepare_target(target: dict) -> dict | None:
@@ -1616,6 +1784,7 @@ def _run_all(
             target["name"],
             skip_after_failures=SMART_SKIP_AFTER_FAILURES,
             cooldown_hours=SMART_SKIP_COOLDOWN_HOURS,
+            now=datetime.now(timezone.utc),
         )
         if not should_skip:
             return None
@@ -1686,6 +1855,27 @@ def _run_all(
         ))
     if total_skipped:
         log.info("Skipped %d source target(s) due to Smart Extract health cooldown", total_skipped)
+    if SMART_HEALTH_ENABLED:
+        problem_rows = [
+            row for row in summarize_smart_health(health)
+            if row["cooling_down"] or row["issue_type"] or row["timeouts"] or row["challenges"]
+        ]
+        if problem_rows:
+            log.warning("Smart Extract source health issues:")
+            for row in problem_rows[:10]:
+                issue = row["issue_type"] or row["status"] or "issue"
+                cooldown = " cooling_down" if row["cooling_down"] else ""
+                log.warning(
+                    "  %s: %s, failures=%d, timeouts=%d, challenges=%d%s",
+                    row["source"],
+                    issue,
+                    row["failures"],
+                    row["timeouts"],
+                    row["challenges"],
+                    cooldown,
+                )
+            if len(problem_rows) > 10:
+                log.warning("  ... %d more source health issue(s)", len(problem_rows) - 10)
     log.info("%d/%d PASS", passed, len(results))
 
     return {"total_new": total_new, "total_existing": total_existing,

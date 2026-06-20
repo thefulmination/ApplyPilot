@@ -23,7 +23,7 @@ import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, insert_discovered_job
 
 log = logging.getLogger(__name__)
 
@@ -457,8 +457,9 @@ def search_employer(
 
         offset += page_size
         page_num = offset // page_size
-        if offset >= total:
-            break
+        # Terminate on an empty page (handled above) or page_cap/max_results --
+        # NOT on a once-captured `total`, which can be a stale 0 on the first
+        # response and would truncate the crawl to a single page.
         if page_cap > 0 and page_num >= page_cap:
             log.info("%s: capped at %d pages (%d results scanned)", employer["name"], page_cap, offset)
             break
@@ -545,16 +546,28 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         site = job.get("employer_name", "Corporate")
         strategy = "workday_api"
 
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
-                "discovered_at, company, source_board, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), None, short_desc, job.get("location"),
-                 site, strategy, now, site, "workday", full_description, url, detail_scraped_at, detail_error),
-            )
+        status = insert_discovered_job(
+            conn,
+            {
+                "url": url,
+                "title": job.get("title"),
+                "salary": None,
+                "description": short_desc,
+                "location": job.get("location"),
+                "company": site,
+                "full_description": full_description,
+                "application_url": url,
+                "detail_scraped_at": detail_scraped_at,
+                "detail_error": detail_error,
+            },
+            site=site,
+            strategy=strategy,
+            source_board="workday",
+            discovered_at=now,
+        )
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()
@@ -601,8 +614,10 @@ def _process_one(
     new, existing = store_results(conn, jobs, employers)
     log.info("%s: %d new, %d already in DB", emp["name"], new, existing)
 
+    detail_errors = sum(1 for j in jobs if j.get("detail_error"))
     return {"employer": emp["name"], "query": search_text,
-            "found": len(jobs), "new": new, "existing": existing}
+            "found": len(jobs), "new": new, "existing": existing,
+            "detail_errors": detail_errors}
 
 
 # -- Main orchestrator -------------------------------------------------------
@@ -639,6 +654,7 @@ def scrape_employers(
     total_new = 0
     total_existing = 0
     total_found = 0
+    total_detail_errors = 0
     errors = 0
     t0 = time.time()
 
@@ -661,6 +677,7 @@ def scrape_employers(
                 total_new += result["new"]
                 total_existing += result["existing"]
                 total_found += result["found"]
+                total_detail_errors += result.get("detail_errors", 0)
                 if "error" in result:
                     errors += 1
 
@@ -680,6 +697,7 @@ def scrape_employers(
             total_new += result["new"]
             total_existing += result["existing"]
             total_found += result["found"]
+            total_detail_errors += result.get("detail_errors", 0)
             if "error" in result:
                 errors += 1
 
@@ -689,10 +707,11 @@ def scrape_employers(
                          search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
 
     elapsed = time.time() - t0
-    log.info("[%s] Done: %d found, %d new, %d dupes in %.0fs",
-             search_text, total_found, total_new, total_existing, elapsed)
+    log.info("[%s] Done: %d found, %d new, %d dupes, %d detail errors in %.0fs",
+             search_text, total_found, total_new, total_existing, total_detail_errors, elapsed)
 
-    return {"found": total_found, "new": total_new, "existing": total_existing}
+    return {"found": total_found, "new": total_new, "existing": total_existing,
+            "detail_errors": total_detail_errors}
 
 
 # -- Public entry point ------------------------------------------------------
@@ -762,6 +781,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     grand_new = 0
     grand_existing = 0
     grand_found = 0
+    grand_detail_errors = 0
 
     for i, query in enumerate(queries, 1):
         log.info("Query %d/%d: \"%s\"", i, len(queries), query)
@@ -778,13 +798,15 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
         grand_new += result["new"]
         grand_existing += result["existing"]
         grand_found += result["found"]
+        grand_detail_errors += result.get("detail_errors", 0)
 
-    log.info("Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
-             grand_found, grand_new, grand_existing, len(queries), len(employers))
+    log.info("Workday crawl done: %d found, %d new, %d existing, %d detail errors across %d queries x %d employers",
+             grand_found, grand_new, grand_existing, grand_detail_errors, len(queries), len(employers))
 
     return {
         "found": grand_found,
         "new": grand_new,
         "existing": grand_existing,
+        "detail_errors": grand_detail_errors,
         "queries": len(queries),
     }

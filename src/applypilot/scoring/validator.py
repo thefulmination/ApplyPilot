@@ -180,8 +180,9 @@ def validate_json_fields(
         strategy_projects = resume_strategy.get("required_projects", []) or []
     if resume_facts.get("preserved_projects") or strategy_projects:
         required_keys.append("projects")
-    else:
-        data.setdefault("projects", [])
+    # Use a local for the optional projects list rather than mutating the
+    # caller's dict via setdefault.
+    projects = data.get("projects") or []
 
     for key in required_keys:
         if key not in data or not data[key]:
@@ -247,11 +248,11 @@ def validate_json_fields(
 
     # Projects: collect bullets. If strategy projects are configured, blank
     # projects are a quality failure, not a valid "minimal" resume.
-    if isinstance(data["projects"], list):
-        for entry in data["projects"]:
+    if isinstance(projects, list):
+        for entry in projects:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
-    if strategy_projects and not data.get("projects"):
+    if strategy_projects and not projects:
         errors.append("Projects section is empty despite configured required projects")
 
     # Education: preserved school must be present (always enforced)
@@ -392,7 +393,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
 # â”€â”€ Cover Letter Validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def validate_cover_letter(text: str, mode: str = "normal") -> dict:
+def validate_cover_letter(text: str, mode: str = "normal", profile: dict | None = None) -> dict:
     """Programmatic validation of a cover letter.
 
     Args:
@@ -401,6 +402,9 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
               strict  â†’ banned words are errors (trigger retries); word limit enforced
               normal  â†’ banned words are warnings; word limit is soft (+25 words)
               lenient â†’ banned words ignored; word count not checked
+        profile: Optional user profile. When provided, the cover letter is also
+              scanned for fabricated tools (the "FABRICATION = INSTANT REJECTION"
+              rule the prompt promises but nothing enforced).
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -440,5 +444,19 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     stripped = text.strip()
     if not stripped.lower().startswith("dear"):
         errors.append("Must start with 'Dear Hiring Manager,'")
+
+    # 6. Fabrication scan (only when a profile is supplied). The generation
+    #    prompt promises "FABRICATION = INSTANT REJECTION" but nothing enforced
+    #    it for cover letters. Use a strict non-alphanumeric boundary so prose
+    #    words ("offspring", "trust", "scalable") don't false-positive.
+    if profile is not None:
+        allowed_skills = _build_skills_set(profile)
+        for fake in FABRICATION_WATCHLIST:
+            if len(fake) <= 2:
+                continue
+            pattern = r"(?<![a-z0-9])" + re.escape(fake) + r"(?![a-z0-9])"
+            if re.search(pattern, text_lower) and not _is_allowed_skill_token(fake, allowed_skills):
+                errors.append(f"Fabricated tool in cover letter: '{fake}'")
+                break
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

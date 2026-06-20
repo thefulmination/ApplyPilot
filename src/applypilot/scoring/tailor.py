@@ -375,14 +375,20 @@ def extract_json(raw: str) -> dict:
             except json.JSONDecodeError:
                 continue
 
-    # Find outermost { ... }
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end > start:
+    # Scan each '{' and let raw_decode consume exactly one JSON object, ignoring
+    # trailing prose. Trying every '{' also tolerates leading prose that happens
+    # to contain a stray '{' before the real object -- both cases the old
+    # find/rfind heuristic mishandled (rfind grabbed a '}' inside trailing text).
+    decoder = json.JSONDecoder()
+    idx = raw.find("{")
+    while idx != -1:
         try:
-            return json.loads(raw[start:end + 1])
+            obj, _ = decoder.raw_decode(raw[idx:])
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
+        idx = raw.find("{", idx + 1)
 
     raise ValueError("No valid JSON found in LLM response")
 

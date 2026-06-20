@@ -36,16 +36,16 @@ def generate_dashboard(output_path: str | None = None) -> str:
     conn = get_connection()
 
     # Stats
-    total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM jobs WHERE duplicate_of_url IS NULL").fetchone()[0]
     ready = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL"
+        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
     scored = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
     high_fit = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
+        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7 AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     # Score distribution
@@ -53,7 +53,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     if scored:
         rows = conn.execute(
             "SELECT fit_score, COUNT(*) FROM jobs "
-            "WHERE fit_score IS NOT NULL "
+            "WHERE fit_score IS NOT NULL AND duplicate_of_url IS NULL "
             "GROUP BY fit_score ORDER BY fit_score DESC"
         ).fetchall()
         for r in rows:
@@ -68,7 +68,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
                SUM(CASE WHEN fit_score < 5 AND fit_score IS NOT NULL THEN 1 ELSE 0 END) as low_fit,
                SUM(CASE WHEN fit_score IS NULL THEN 1 ELSE 0 END) as unscored,
                ROUND(AVG(fit_score), 1) as avg_score
-        FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
+        FROM jobs
+        WHERE duplicate_of_url IS NULL
+        GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
     # All scored jobs (5+), ordered by score desc
@@ -77,7 +79,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
                full_description, application_url, detail_error,
                fit_score, score_reasoning
         FROM jobs
-        WHERE fit_score >= 5
+        WHERE fit_score >= 5 AND duplicate_of_url IS NULL
         ORDER BY fit_score DESC, site, title
     """).fetchall()
 

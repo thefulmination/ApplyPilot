@@ -204,7 +204,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
 
 
 def _pending_jobs_sql(rediagnose: bool) -> str:
-    where = "fit_score IS NOT NULL AND full_description IS NOT NULL"
+    where = "fit_score IS NOT NULL AND full_description IS NOT NULL AND duplicate_of_url IS NULL"
     if not rediagnose:
         where += (
             " AND (diagnosed_at IS NULL "

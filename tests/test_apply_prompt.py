@@ -58,3 +58,86 @@ def test_auto_apply_prompt_does_not_include_saved_password(tmp_path: Path, monke
 
     assert "do-not-leak-this-password" not in text
     assert "Use browser-stored credentials/session" in text
+
+
+def _make_profile() -> dict:
+    return {
+        "personal": {
+            "full_name": "Jane Candidate",
+            "preferred_name": "Jane",
+            "email": "jane@example.com",
+            "phone": "555-0100",
+            "city": "New York",
+            "province_state": "NY",
+            "country": "US",
+            "postal_code": "10001",
+            "address": "",
+        },
+        "work_authorization": {
+            "legally_authorized_to_work": True,
+            "require_sponsorship": False,
+            "work_permit_type": "US Citizen",
+        },
+        "compensation": {
+            "salary_expectation": "120000",
+            "salary_currency": "USD",
+            "salary_range_min": "120000",
+            "salary_range_max": "160000",
+        },
+        "experience": {
+            "years_of_experience_total": "6",
+            "education_level": "Bachelor's",
+            "target_role": "Chief of Staff",
+        },
+    }
+
+
+def _patch_prompt_config(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(prompt.config, "load_profile", _make_profile)
+    monkeypatch.setattr(prompt.config, "load_search_config",
+                        lambda: {"location": {"accept_patterns": ["New York"]}})
+    monkeypatch.setattr(prompt.config, "load_blocked_sso", lambda: ["accounts.google.com"])
+    monkeypatch.setattr(prompt.config, "APPLY_WORKER_DIR", tmp_path / "apply_worker")
+
+
+def test_build_prompt_stages_uploads_per_worker(tmp_path: Path, monkeypatch) -> None:
+    # Parallel workers must not share one upload path, or they overwrite each
+    # other's tailored resume between the copy and the agent's upload.
+    tailored_txt = tmp_path / "tailored.txt"
+    tailored_txt.write_text("Tailored resume text", encoding="utf-8")
+    tailored_txt.with_suffix(".pdf").write_bytes(b"%PDF-1.4\n")
+
+    _patch_prompt_config(monkeypatch, tmp_path)
+    job = {
+        "url": "https://example.com/job",
+        "title": "Chief of Staff",
+        "site": "ExampleCo",
+        "fit_score": 9,
+        "tailored_resume_path": str(tailored_txt),
+    }
+
+    text0 = prompt.build_prompt(job, "Tailored resume text", worker_id=0)
+    text3 = prompt.build_prompt(job, "Tailored resume text", worker_id=3)
+
+    assert "worker-0" in text0 and "worker-3" not in text0
+    assert "worker-3" in text3 and "worker-0" not in text3
+
+
+def test_build_prompt_dry_run_emits_dry_run_code(tmp_path: Path, monkeypatch) -> None:
+    tailored_txt = tmp_path / "tailored.txt"
+    tailored_txt.write_text("Tailored resume text", encoding="utf-8")
+    tailored_txt.with_suffix(".pdf").write_bytes(b"%PDF-1.4\n")
+
+    _patch_prompt_config(monkeypatch, tmp_path)
+    job = {
+        "url": "https://example.com/job",
+        "title": "Chief of Staff",
+        "site": "ExampleCo",
+        "fit_score": 9,
+        "tailored_resume_path": str(tailored_txt),
+    }
+
+    text = prompt.build_prompt(job, "Tailored resume text", dry_run=True)
+
+    assert "RESULT:DRY_RUN" in text
+    assert "Do NOT output RESULT:APPLIED" in text

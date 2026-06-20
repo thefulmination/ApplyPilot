@@ -189,9 +189,12 @@ def _strip_preamble(text: str) -> str:
     similar meta-commentary before the actual letter text. Strip everything
     before the first occurrence of "Dear" so the validator's start-check passes.
     """
-    dear_idx = text.lower().find("dear")
-    if dear_idx > 0:
-        return text[dear_idx:]
+    # Prefer a line-anchored greeting ("Dear ...") so a stray "dear" inside the
+    # preamble prose can't truncate the letter mid-sentence. Fall back to the
+    # first standalone "dear" only if no anchored match exists.
+    m = re.search(r"(?im)^\s*dear\b", text) or re.search(r"\bdear\b", text, re.IGNORECASE)
+    if m and m.start() > 0:
+        return text[m.start():].lstrip()
     return text
 
 
@@ -256,7 +259,7 @@ def generate_cover_letter(
             letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
             letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 
-            validation = validate_cover_letter(letter, mode=validation_mode)
+            validation = validate_cover_letter(letter, mode=validation_mode, profile=profile)
             if validation["passed"]:
                 if model_entry["role"] != "primary":
                     log.info(
@@ -298,6 +301,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 900,
     query = (
         "SELECT * FROM jobs "
         "WHERE COALESCE(audit_score, fit_score) >= ? AND tailored_resume_path IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < ? "

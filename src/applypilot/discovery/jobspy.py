@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, insert_discovered_job
 
 log = logging.getLogger(__name__)
 
@@ -181,16 +181,27 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
 
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "company, source_board, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
-                 company, site_name, full_description, apply_url, detail_scraped_at),
-            )
+        status = insert_discovered_job(
+            conn,
+            {
+                "url": url,
+                "title": title,
+                "salary": salary,
+                "description": description,
+                "location": location_str,
+                "company": company,
+                "full_description": full_description,
+                "application_url": apply_url,
+                "detail_scraped_at": detail_scraped_at,
+            },
+            site=site_label,
+            strategy=strategy,
+            source_board=site_name,
+            discovered_at=now,
+        )
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()
@@ -364,7 +375,9 @@ def search_jobs(
     log.info("Stored: %d new, %d already in DB", new, existing)
 
     db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL").fetchone()[0]
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL"
+    ).fetchone()[0]
     log.info("DB total: %d jobs, %d pending detail scrape", db_total, pending)
 
     return {"total": total, "new": new, "existing": existing}

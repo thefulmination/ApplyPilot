@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +15,9 @@ from applypilot.database import get_connection
 
 BLOCKER_CODES = {
     "invalid_application_url",
+    "unsafe_application_url",
     "manual_ats",
+    "auth_gate",
     "missing_resume_pdf",
     "already_applied",
     "duplicate_application_target",
@@ -30,6 +33,30 @@ def _is_http_url(value: str | None) -> bool:
         return False
     parsed = urlparse(value.strip())
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _targets_internal_host(value: str | None) -> bool:
+    """True when the URL host is a LITERAL private/loopback/link-local IP.
+
+    No DNS resolution here -- this is a fast, deterministic DB-time gate. The
+    enrichment scraper does full hostname resolution before it navigates.
+    """
+    if not value:
+        return False
+    try:
+        host = urlparse(value.strip()).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_unspecified
+    )
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -62,6 +89,7 @@ def _query_candidates(
     params: list[Any] = []
     where = [
         "j.tailored_resume_path IS NOT NULL",
+        "j.duplicate_of_url IS NULL",
         "j.applied_at IS NULL",
         "(j.apply_status IS NULL OR j.apply_status IN ('failed', 'resume_ready', 'shortlisted'))",
     ]
@@ -107,9 +135,18 @@ def evaluate_candidate(
 
     if not _is_http_url(target):
         issues.append(_issue("blocker", "invalid_application_url", "Application URL is missing or not absolute."))
+    elif _targets_internal_host(target):
+        issues.append(_issue("blocker", "unsafe_application_url", "Application URL points at an internal/loopback address."))
 
     if config.is_manual_ats(target):
         issues.append(_issue("blocker", "manual_ats", "Configured as manual ATS."))
+
+    if config.is_auth_gated_application(target):
+        issues.append(_issue(
+            "blocker",
+            "auth_gate",
+            "Likely requires login, account creation, email verification, or 2FA; use assisted apply.",
+        ))
 
     pdf_path = _resume_pdf_path(row)
     if not pdf_path or not pdf_path.exists():

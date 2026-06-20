@@ -25,9 +25,12 @@ dependencies = [
     "playwright>=1.40",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
-    "python-jobspy==1.1.82",
+    # python-jobspy is intentionally NOT listed here: its metadata pins an exact
+    # numpy that breaks pip's resolver. It is installed separately with
+    # `pip install --no-deps python-jobspy` (see README / `applypilot doctor`).
+    # We declare jobspy's import-time runtime deps so the second install step is
+    # minimal. numpy is left to pandas to resolve (no exact pin -> 3.13 installs).
     "markdownify>=0.13.1,<0.14.0",
-    "numpy==1.26.3",
     "pandas>=2.1,<3.0",
     "pydantic>=2.13,<2.14",
     "regex>=2024.4.28,<2025.0.0",

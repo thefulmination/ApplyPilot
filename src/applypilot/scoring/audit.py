@@ -256,7 +256,10 @@ def run_score_audit(
     search_cfg = config.load_search_config()
     conn = get_connection()
 
-    where = "fit_score IS NOT NULL"
+    # Skip rows decided by the external recommendation engine: their audit_score
+    # is authoritative and must not be overwritten by ApplyPilot's own audit.
+    # (The score stage still runs on them, preserving fit_score as a benchmark.)
+    where = "fit_score IS NOT NULL AND duplicate_of_url IS NULL AND decision_source IS NULL"
     params: list[Any] = []
     if not reaudit:
         where += " AND (audited_at IS NULL OR (scored_at IS NOT NULL AND audited_at < scored_at))"

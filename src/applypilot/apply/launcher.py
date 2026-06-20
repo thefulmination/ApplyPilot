@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -39,6 +39,17 @@ from applypilot.apply.dashboard import (
 
 logger = logging.getLogger(__name__)
 
+AUTH_REQUIRED_REASONS: set[str] = {
+    "auth_required",
+    "login_issue",
+    "sso_required",
+    "account_required",
+    "email_verification_required",
+    "two_factor_required",
+    "2fa_required",
+    "mfa_required",
+}
+
 # Blocked sites loaded from config/sites.yaml
 def _load_blocked():
     from applypilot.config import load_blocked_sites
@@ -46,6 +57,19 @@ def _load_blocked():
 
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
+
+# Wall-clock budget for a single apply agent run. The stdout read loop runs in a
+# daemon thread; if it does not finish within this many seconds the Claude
+# process is killed and the job is marked failed:timeout. This bounds a hung
+# session (which would otherwise block the worker forever, since the old
+# proc.wait() only ran AFTER stdout reached EOF).
+AGENT_TIMEOUT_SECONDS = 900
+
+# A worker claims a job by setting apply_status='in_progress'. If the process is
+# hard-killed before writing a terminal result the lease is never released.
+# Leases older than this (which must exceed AGENT_TIMEOUT_SECONDS) are reclaimed
+# at startup.
+STALE_LEASE_SECONDS = 1800
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
@@ -114,9 +138,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
+                  AND duplicate_of_url IS NULL
                   AND apply_status != 'in_progress'
+                ORDER BY CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END
                 LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, (target_url, target_url, like, like, target_url, target_url)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
@@ -135,6 +161,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                        fit_score, audit_score, audit_label, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
+                  AND duplicate_of_url IS NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND COALESCE(audit_score, fit_score) >= ?
@@ -189,16 +216,25 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
     else:
+        db_status = "auth_required" if _is_auth_required_result(error or status) else status
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
+        """, (db_status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
 
-    tracker_status = "applied" if status == "applied" else "failed"
+    if status == "applied":
+        tracker_status = "applied"
+        tracker_channel = "applypilot"
+    elif _is_auth_required_result(error or status):
+        tracker_status = "auth_required"
+        tracker_channel = "assisted"
+    else:
+        tracker_status = "failed"
+        tracker_channel = "applypilot"
     tracker_notes = error
     if task_id:
         tracker_notes = f"{tracker_notes or status} | task_id={task_id}"
@@ -206,7 +242,7 @@ def mark_result(url: str, status: str, error: str | None = None,
         record_application(
             url,
             status=tracker_status,
-            channel="applypilot",
+            channel=tracker_channel,
             notes=tracker_notes,
             update_job=False,
         )
@@ -222,6 +258,48 @@ def release_lock(url: str) -> None:
         (url,),
     )
     conn.commit()
+
+
+def reclaim_stale_leases(ttl_seconds: int = STALE_LEASE_SECONDS) -> int:
+    """Reset apply leases stranded 'in_progress' by workers that died mid-job.
+
+    If an apply process is hard-killed (or the machine reboots) between claiming
+    a job and writing a terminal result, the job stays 'in_progress' forever and
+    is never retried. At startup we reclaim leases older than ttl_seconds, which
+    must exceed the per-job agent timeout so a live, in-flight job is never
+    stolen.
+
+    Returns:
+        Number of leases reclaimed.
+    """
+    conn = get_connection()
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)).isoformat()
+    cursor = conn.execute(
+        """
+        UPDATE jobs SET apply_status = NULL, agent_id = NULL
+        WHERE apply_status = 'in_progress'
+          AND (last_attempted_at IS NULL OR last_attempted_at < ?)
+        """,
+        (cutoff,),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace secret values with placeholders before persisting text to disk.
+
+    Used for the --gen debug prompt file, which otherwise writes the CapSolver
+    API key (and any other configured keys interpolated into the prompt) to a
+    plaintext file under the logs directory.
+    """
+    config.load_env()
+    redacted = text
+    for var in ("CAPSOLVER_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+        val = os.environ.get(var)
+        if val and len(val) >= 6:
+            redacted = redacted.replace(val, f"***{var}_REDACTED***")
+    return redacted
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +333,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
     config.ensure_dirs()
     site_slug = (job.get("site") or "unknown")[:20].replace(" ", "_")
     prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
-    prompt_file.write_text(prompt, encoding="utf-8")
+    prompt_file.write_text(_redact_secrets(prompt), encoding="utf-8")
 
     # Write MCP config for reference
     port = BASE_CDP_PORT + worker_id
@@ -339,11 +417,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
+    # Reset the worker's isolated working directory FIRST. build_prompt stages
+    # upload files under worker-{id}/current and reset_worker_dir wipes
+    # worker-{id}, so the reset must happen before the prompt is built (else the
+    # freshly-copied resume/cover-letter would be deleted out from under it).
+    worker_dir = reset_worker_dir(worker_id)
+
     # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        worker_id=worker_id,
     )
 
     # Write per-worker MCP config
@@ -359,6 +444,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         "--permission-mode", "bypassPermissions",
         "--no-session-persistence",
         "--disallowedTools", (
+            # Lock the agent out of the host. It runs with bypassPermissions and
+            # reads attacker-influenceable page content, so a prompt-injected
+            # page must NOT be able to read local files (exfil profile.json/.env),
+            # write/execute, or browse outside the Playwright browser it drives.
+            # disallowedTools is honored even under bypassPermissions. The agent
+            # only needs the Playwright MCP tools (and optionally gmail) -- it
+            # never legitimately uses these built-ins.
+            "Bash,BashOutput,KillShell,Read,Write,Edit,MultiEdit,NotebookEdit,"
+            "WebFetch,WebSearch,Glob,Grep,Task,"
             "mcp__gmail__draft_email,mcp__gmail__modify_email,"
             "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
             "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
@@ -375,8 +469,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
-    worker_dir = reset_worker_dir(worker_id)
 
     display_score = job.get("audit_score") if job.get("audit_score") is not None else job.get("fit_score", 0)
     update_state(worker_id, status="applying", job_title=job["title"],
@@ -414,72 +506,124 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs[worker_id] = proc
 
-        proc.stdin.write(agent_prompt)
-        proc.stdin.close()
-
         text_parts: list[str] = []
-        with open(worker_log, "a", encoding="utf-8") as lf:
-            lf.write(log_header)
+        final_result_text: list[str] = []  # text from the final 'result' message
+        stats_holder: dict = {}
 
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                    msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        for block in msg.get("message", {}).get("content", []):
-                            bt = block.get("type")
-                            if bt == "text":
-                                text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
-                            elif bt == "tool_use":
-                                name = (
-                                    block.get("name", "")
-                                    .replace("mcp__playwright__", "")
-                                    .replace("mcp__gmail__", "gmail:")
-                                )
-                                inp = block.get("input", {})
-                                if "url" in inp:
-                                    desc = f"{name} {inp['url'][:60]}"
-                                elif "ref" in inp:
-                                    desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                elif "fields" in inp:
-                                    desc = f"{name} ({len(inp['fields'])} fields)"
-                                elif "paths" in inp:
-                                    desc = f"{name} upload"
-                                else:
-                                    desc = name
+        def _consume_stream() -> None:
+            """Read the agent's stream-json stdout to EOF.
 
-                                lf.write(f"  >> {desc}\n")
-                                ws = get_state(worker_id)
-                                cur_actions = ws.actions if ws else 0
-                                update_state(worker_id,
-                                             actions=cur_actions + 1,
-                                             last_action=desc[:35])
-                    elif msg_type == "result":
-                        stats = {
-                            "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
-                            "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
-                            "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
-                            "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
-                            "cost_usd": msg.get("total_cost_usd", 0),
-                            "turns": msg.get("num_turns", 0),
-                        }
-                        text_parts.append(msg.get("result", ""))
-                except json.JSONDecodeError:
-                    text_parts.append(line)
-                    lf.write(line + "\n")
+            Runs in a daemon thread so the parent can bound a hung session with a
+            wall-clock join() timeout instead of blocking on ``for line in
+            proc.stdout`` forever.
+            """
+            with open(worker_log, "a", encoding="utf-8") as lf:
+                lf.write(log_header)
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                        msg_type = msg.get("type")
+                        if msg_type == "assistant":
+                            for block in msg.get("message", {}).get("content", []):
+                                bt = block.get("type")
+                                if bt == "text":
+                                    text_parts.append(block["text"])
+                                    lf.write(block["text"] + "\n")
+                                elif bt == "tool_use":
+                                    name = (
+                                        block.get("name", "")
+                                        .replace("mcp__playwright__", "")
+                                        .replace("mcp__gmail__", "gmail:")
+                                    )
+                                    inp = block.get("input", {})
+                                    if "url" in inp:
+                                        desc = f"{name} {inp['url'][:60]}"
+                                    elif "ref" in inp:
+                                        desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
+                                    elif "fields" in inp:
+                                        desc = f"{name} ({len(inp['fields'])} fields)"
+                                    elif "paths" in inp:
+                                        desc = f"{name} upload"
+                                    else:
+                                        desc = name
 
-        proc.wait(timeout=300)
+                                    lf.write(f"  >> {desc}\n")
+                                    ws = get_state(worker_id)
+                                    cur_actions = ws.actions if ws else 0
+                                    update_state(worker_id,
+                                                 actions=cur_actions + 1,
+                                                 last_action=desc[:35])
+                        elif msg_type == "result":
+                            stats_holder.update({
+                                "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
+                                "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
+                                "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
+                                "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
+                                "cost_usd": msg.get("total_cost_usd", 0),
+                                "turns": msg.get("num_turns", 0),
+                            })
+                            rt = msg.get("result", "")
+                            text_parts.append(rt)
+                            final_result_text.append(rt)
+                    except json.JSONDecodeError:
+                        text_parts.append(line)
+                        lf.write(line + "\n")
+
+        # Start reading BEFORE writing the prompt so a large prompt can't deadlock
+        # against a full stdout pipe.
+        reader = threading.Thread(target=_consume_stream,
+                                  name=f"apply-reader-{worker_id}", daemon=True)
+        reader.start()
+
+        try:
+            proc.stdin.write(agent_prompt)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            # Claude exited before reading the prompt (e.g. a launch error). Let
+            # the reader drain whatever was emitted and fall through to result
+            # parsing, which will classify the (likely missing) RESULT line.
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        # Bound the whole run by a wall-clock timeout. The old code only timed out
+        # the post-EOF wait(), so a session that stopped emitting output but never
+        # exited would hang the worker forever.
+        reader.join(timeout=AGENT_TIMEOUT_SECONDS)
+        if reader.is_alive():
+            _kill_process_tree(proc.pid)
+            reader.join(timeout=15)
+            elapsed = int(time.time() - start)
+            add_event(f"[W{worker_id}] TIMEOUT/hung ({elapsed}s)")
+            update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
+            return "failed:timeout", int((time.time() - start) * 1000)
+
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc.pid)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
         returncode = proc.returncode
+        stats = stats_holder
         proc = None
 
         if returncode and returncode < 0:
             return "skipped", int((time.time() - start) * 1000)
 
         output = "\n".join(text_parts)
+        # Prefer the agent's FINAL result message for the RESULT code; only fall
+        # back to scanning the full transcript when the final message has none.
+        # This stops a page that merely contains the literal text
+        # "RESULT:APPLIED" from spoofing the outcome.
+        final_text = "\n".join(t for t in final_result_text if t).strip()
+        result_source = final_text if "RESULT:" in final_text else output
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
@@ -496,15 +640,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
-            if f"RESULT:{result_status}" in output:
+        # Dry run: the agent reviewed/filled the form but intentionally did NOT
+        # submit. Never let this be recorded as 'applied'.
+        if "RESULT:DRY_RUN" in result_source:
+            add_event(f"[W{worker_id}] DRY-RUN OK ({elapsed}s): {job['title'][:30]}")
+            update_state(worker_id, status="dry_run", last_action=f"DRY-RUN ({elapsed}s)")
+            return "dry_run", duration_ms
+
+        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "AUTH_REQUIRED"]:
+            if f"RESULT:{result_status}" in result_source:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
                 return result_status.lower(), duration_ms
 
-        if "RESULT:FAILED" in output:
-            for out_line in output.split("\n"):
+        if "RESULT:FAILED" in result_source:
+            for out_line in result_source.split("\n"):
                 if "RESULT:FAILED" in out_line:
                     reason = (
                         out_line.split("RESULT:FAILED:")[-1].strip()
@@ -512,7 +663,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         else "unknown"
                     )
                     reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
+                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue", "auth_required"}
                     if reason in PROMOTE_TO_STATUS:
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
@@ -551,7 +702,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 PERMANENT_FAILURES: set[str] = {
-    "expired", "captcha", "login_issue",
+    "expired", "captcha", "login_issue", "auth_required",
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
@@ -560,6 +711,15 @@ PERMANENT_FAILURES: set[str] = {
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
+
+
+def _is_auth_required_result(result: str | None) -> bool:
+    """Return True when a result should be routed to assisted/manual login."""
+    if not result:
+        return False
+    reason = result.split(":", 1)[-1] if ":" in result else result
+    normalized = reason.strip().lower()
+    return normalized in AUTH_REQUIRED_REASONS
 
 
 def _is_permanent_failure(result: str) -> bool:
@@ -639,6 +799,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
+            elif dry_run:
+                # Dry run NEVER writes apply_status -- just release the lease so
+                # the job stays available for a real apply later. This is the
+                # load-bearing guard: even if the agent mistakenly emitted
+                # RESULT:APPLIED, we do not record it as applied.
+                release_lock(job["url"])
+                if result in ("dry_run", "applied"):
+                    applied += 1
+                    add_event(f"[W{worker_id}] DRY-RUN OK: {job['title'][:30]}")
+                else:
+                    failed += 1
+                update_state(worker_id, jobs_applied=applied, jobs_failed=failed,
+                             jobs_done=applied + failed)
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
@@ -704,6 +877,15 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+
+    # Reclaim any leases stranded 'in_progress' by a previous run that was
+    # hard-killed mid-job, so those jobs become eligible again.
+    try:
+        reclaimed = reclaim_stale_leases()
+        if reclaimed:
+            console.print(f"[dim]Reclaimed {reclaimed} stale in-progress lease(s) from a previous run[/dim]")
+    except Exception:
+        logger.debug("Stale lease reclaim failed", exc_info=True)
 
     if continuous:
         effective_limit = 0

@@ -112,7 +112,7 @@ def run(
             "Defaults to 'all' if omitted."
         ),
     ),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for tailor/cover stages. Defaults to APPLYPILOT_MIN_SCORE or 7."),
     batch_size: int = typer.Option(
         900,
         "--batch-size",
@@ -145,7 +145,11 @@ def run(
     """Run pipeline stages: discover, enrich, score, audit, diagnose, tailor, cover, pdf."""
     _bootstrap()
 
+    from applypilot import config
     from applypilot.pipeline import run_pipeline
+
+    if min_score is None:
+        min_score = config.get_min_score()
 
     stage_list = stages if stages else ["all"]
 
@@ -225,11 +229,84 @@ def rescore_jobs(
     console.print(f"  Time:          {result['elapsed']:.1f}s")
 
 
+@app.command("dedupe-jobs")
+def dedupe_jobs_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview duplicate markings without changing the database."),
+) -> None:
+    """Mark same-job duplicates across different source URLs."""
+    _bootstrap()
+
+    from applypilot.database import dedupe_existing_jobs
+
+    result = dedupe_existing_jobs(dry_run=dry_run)
+    title = "Same-job duplicate preview" if dry_run else "Same-job duplicate pass complete"
+    console.print(f"\n[bold green]{title}[/bold green]")
+    console.print(f"  Jobs processed:      {result['processed']}")
+    console.print(f"  Jobs with key:       {result['keys']}")
+    console.print(f"  Duplicate groups:    {result['groups']}")
+    console.print(f"  Duplicates marked:   {result['duplicates']}")
+    if dry_run:
+        console.print("\n[yellow]Dry run only.[/yellow] Run without --dry-run to write duplicate markers.")
+
+
+@app.command("smart-health")
+def smart_health_command(
+    all_sites: bool = typer.Option(False, "--all", help="Show healthy sources too."),
+) -> None:
+    """Show Smart Extract source issues, cooldowns, timeouts, and challenge pages."""
+    _bootstrap()
+
+    from applypilot.discovery import smartextract
+
+    health = smartextract.load_smart_health()
+    rows = smartextract.summarize_smart_health(health)
+    if not all_sites:
+        rows = [
+            row for row in rows
+            if row["cooling_down"] or row["issue_type"] or row["failures"] or row["timeouts"] or row["challenges"]
+        ]
+
+    if not rows:
+        console.print("[green]No Smart Extract source health issues recorded.[/green]")
+        console.print(f"Health file: {smartextract.SMART_HEALTH_PATH}")
+        return
+
+    table = Table(title="Smart Extract Source Health")
+    table.add_column("Source")
+    table.add_column("Status")
+    table.add_column("Issue")
+    table.add_column("Failures", justify="right")
+    table.add_column("Timeouts", justify="right")
+    table.add_column("Challenges", justify="right")
+    table.add_column("Cooldown")
+    table.add_column("Jobs", justify="right")
+    table.add_column("Avg s", justify="right")
+    table.add_column("URL")
+
+    for row in rows:
+        cooldown = "yes" if row["cooling_down"] else ""
+        table.add_row(
+            str(row["source"]),
+            str(row["status"]),
+            str(row["issue_type"]),
+            str(row["failures"]),
+            str(row["timeouts"]),
+            str(row["challenges"]),
+            cooldown,
+            str(row["last_jobs_found"]),
+            f"{row['average_runtime_seconds']:.1f}",
+            str(row["last_url"])[:80],
+        )
+
+    console.print(table)
+    console.print(f"Health file: {smartextract.SMART_HEALTH_PATH}")
+
+
 @app.command()
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for job selection. Defaults to APPLYPILOT_MIN_SCORE or 7."),
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
@@ -246,8 +323,12 @@ def apply(
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
+    from applypilot import config
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
+
+    if min_score is None:
+        min_score = config.get_min_score()
 
     # --- Utility modes (no Chrome/Claude needed) ---
 
@@ -286,7 +367,8 @@ def apply(
     if not (gen and url):
         conn = get_connection()
         ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
+            "SELECT COUNT(*) FROM jobs "
+            "WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL AND duplicate_of_url IS NULL"
         ).fetchone()[0]
         if ready == 0:
             console.print(
@@ -383,6 +465,8 @@ def status(
     summary.add_column("Count", justify="right")
 
     summary.add_row("Total jobs discovered", str(stats["total"]))
+    summary.add_row("Same-job duplicates", str(stats.get("duplicates", 0)))
+    summary.add_row("Active jobs", str(stats.get("active_total", stats["total"])))
     summary.add_row("With full description", str(stats["with_description"]))
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
@@ -546,6 +630,40 @@ def preapply_check_command(
         raise typer.Exit(code=1)
 
 
+@app.command("assist-apply")
+def assist_apply_command(
+    job_ref: str = typer.Argument(..., help="Job URL or application URL to finish manually."),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the application URL in the default browser."),
+    mark_auth_required: bool = typer.Option(True, "--mark/--no-mark", help="Track this job as auth_required before handoff."),
+) -> None:
+    """Prepare a manual handoff for login/account/2FA-gated applications."""
+    _bootstrap()
+
+    import webbrowser
+    from applypilot.applications import get_application_handoff, record_application
+
+    handoff = get_application_handoff(job_ref)
+    if mark_auth_required:
+        record_application(
+            job_ref,
+            status="auth_required",
+            channel="assisted",
+            notes="Manual login/account/2FA handoff prepared.",
+        )
+
+    console.print("\n[bold]Assisted Application Handoff[/bold]")
+    console.print(f"  Role:        {handoff.get('title')} @ {handoff.get('company')}")
+    console.print(f"  Score:       {handoff.get('score')}")
+    console.print(f"  URL:         {handoff.get('application_url')}")
+    console.print(f"  Resume PDF:  {handoff.get('resume_pdf_path') or handoff.get('resume_path') or 'missing'}")
+    console.print(f"  Cover PDF:   {handoff.get('cover_letter_pdf_path') or handoff.get('cover_letter_path') or 'missing'}")
+    console.print("\nAfter you finish the site login/2FA and submit:")
+    console.print(f"  .\\run-applypilot.ps1 mark-applied \"{handoff.get('job_url')}\" --channel company_site")
+
+    if open_browser and handoff.get("application_url"):
+        webbrowser.open(str(handoff["application_url"]))
+
+
 @app.command("mark-applied")
 def mark_applied_command(
     job_ref: str = typer.Argument(..., help="Job URL or application URL to mark as applied."),
@@ -688,6 +806,93 @@ def export_jobs_command(
     console.print()
 
 
+@app.command("import-decisions")
+def import_decisions_command(
+    path: Path = typer.Argument(..., help="Apply-decision export from the recommendation engine (.jsonl or .json)."),
+    scale: str = typer.Option("auto", "--scale", help="Score scale of the input: auto, ten (1-10), unit (0-1), or percent (0-100)."),
+    source: str = typer.Option("brainstorm", "--source", help="Tag written to decision_source when a record omits one."),
+) -> None:
+    """Import a curated apply list from the recommendation engine.
+
+    Approved jobs become authoritative for the apply gate (their verdict is
+    written into audit_score and they skip ApplyPilot's own audit). The LLM
+    fit_score is kept as a benchmark alongside external_decision_score.
+    """
+    _bootstrap()
+
+    from applypilot.import_decisions import import_decisions
+
+    if scale not in {"auto", "ten", "unit", "percent"}:
+        console.print(f"[red]Invalid --scale '{scale}'.[/red] Use one of: auto, ten, unit, percent.")
+        raise typer.Exit(1)
+
+    r = import_decisions(path, scale=scale, default_source=source)
+
+    console.print("\n[bold green]Decisions imported[/bold green]")
+    console.print(f"  Records read:          {r['records']}")
+    console.print(f"  Approved:              {r['approved']}")
+    console.print(f"  Updated (existing):    {r['updated']}")
+    console.print(f"  Inserted (new):        {r['inserted']}")
+    if r["skipped_not_approved"]:
+        console.print(f"  [dim]Skipped (not approved): {r['skipped_not_approved']}[/dim]")
+    if r["skipped_already_applied"]:
+        console.print(f"  [dim]Skipped (already applied): {r['skipped_already_applied']}[/dim]")
+    if r["skipped_duplicate"]:
+        console.print(f"  [yellow]Skipped (duplicate of another job): {r['skipped_duplicate']}[/yellow]")
+    if r["not_found_insufficient_metadata"]:
+        console.print(f"  [yellow]Approved but not in DB and no title to insert: {r['not_found_insufficient_metadata']}[/yellow]")
+    if r["skipped_no_url"] or r["skipped_no_score"]:
+        console.print(f"  [yellow]Skipped (missing url/score): {r['skipped_no_url'] + r['skipped_no_score']}[/yellow]")
+    if r["below_apply_threshold"]:
+        console.print(
+            f"  [yellow]Approved but scored below apply threshold {r['apply_threshold']}: "
+            f"{r['below_apply_threshold']}[/yellow] (won't apply unless you lower --min-score)"
+        )
+    if r["manual_ats"]:
+        console.print(
+            f"  [yellow]Approved but point at a manual ATS: {r['manual_ats']}[/yellow] "
+            "(the apply worker will skip these)"
+        )
+    enrich_hint = " enrich" if r.get("inserted") else ""
+    console.print(
+        f"\n[dim]Run 'applypilot run{enrich_hint} tailor cover pdf' then 'applypilot apply' "
+        "to apply to the approved jobs"
+        + (" (newly-inserted jobs need enrich first to fetch their description).[/dim]\n"
+           if r.get("inserted") else ".[/dim]\n")
+    )
+
+
+@app.command("reenrich")
+def reenrich_command(
+    min_chars: int = typer.Option(200, "--min-chars", help="Re-scrape jobs whose stored description is shorter than this."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Max jobs to re-enrich. 0 = all eligible."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel site-batch workers."),
+) -> None:
+    """Re-fetch descriptions for jobs with a missing or too-thin description.
+
+    Normal enrichment marks a job done even when it only captured a title/stub,
+    so the job is never retried and gets dropped (or pollutes the recommendation
+    engine's fit map) for lack of a real description. This gives those jobs a
+    fresh scrape so good ones aren't lost.
+    """
+    _bootstrap()
+
+    from applypilot.enrichment.detail import reenrich_thin_descriptions
+
+    r = reenrich_thin_descriptions(min_chars=min_chars, limit=limit, workers=workers)
+
+    console.print("\n[bold green]Re-enrichment complete[/bold green]")
+    console.print(f"  Eligible (thin/missing):     {r['eligible']}")
+    console.print(f"  Re-enriched this run:        {r['reenriched']}")
+    console.print(f"  Now have a real description: {r['improved']}")
+    if r["still_thin"]:
+        console.print(
+            f"  [yellow]Still thin after retry: {r['still_thin']}[/yellow] "
+            "(source likely only provides a stub; will stop retrying after a few attempts)"
+        )
+    console.print()
+
+
 @app.command("audit-scores")
 def audit_scores_command(
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped score_audits folder."),
@@ -753,6 +958,7 @@ def reset_generated_command(
     conn = get_connection()
     where = (
         "COALESCE(audit_score, fit_score, 0) >= ? "
+        "AND duplicate_of_url IS NULL "
         "AND applied_at IS NULL "
         "AND (tailored_resume_path IS NOT NULL OR cover_letter_path IS NOT NULL)"
     )
@@ -785,6 +991,7 @@ def doctor() -> None:
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
         SEARCH_CONFIG_PATH, get_chrome_path, get_claude_path,
+        load_preference_profile, PREFERENCE_PROFILE_PATH, KNOWLEDGE_GRAPH_PROMPT_PATH,
     )
 
     load_env()
@@ -864,6 +1071,31 @@ def doctor() -> None:
     else:
         results.append(("CapSolver API key", "[dim]optional[/dim]",
                         "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+
+    # --- Recommendation calibration (optional) ---
+    # These files are produced by the external recommendation engine
+    # ("brainstorm") and consumed by the scorer to calibrate fit scores.
+    if PREFERENCE_PROFILE_PATH.exists():
+        prof = load_preference_profile()  # robust: returns None if malformed
+        if prof is None:
+            results.append(("preference profile", warn_mark,
+                            f"Present but unreadable/invalid JSON: {PREFERENCE_PROFILE_PATH}"))
+        else:
+            from applypilot.scoring.scorer import _PREFERENCE_FIELDS
+            if any(prof.get(k) for k in _PREFERENCE_FIELDS):
+                results.append(("preference profile", ok_mark, "Scoring calibration loaded"))
+            else:
+                results.append(("preference profile", warn_mark,
+                                "Loaded but no known fields — check recommendation engine schema"))
+    else:
+        results.append(("preference profile", "[dim]optional[/dim]",
+                        "Drop job_preference_profile.json to calibrate scoring"))
+
+    if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
+        results.append(("knowledge graph", ok_mark, "Scoring calibration loaded"))
+    else:
+        results.append(("knowledge graph", "[dim]optional[/dim]",
+                        "Drop job_knowledge_graph_prompt.md to calibrate scoring"))
 
     # --- Render results ---
     console.print()

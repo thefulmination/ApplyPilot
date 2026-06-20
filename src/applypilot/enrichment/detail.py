@@ -10,14 +10,16 @@ Three-tier extraction cascade (cheapest first):
   Tier 3: LLM-assisted extraction (1 LLM call)
 """
 
+import ipaddress
 import json
 import logging
 import re
+import socket
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -63,6 +65,51 @@ def _is_non_navigable_url(raw_url: str) -> bool:
         or url.startswith("mailto:")
         or url.startswith("tel:")
     )
+
+
+def _ip_is_internal(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def is_safe_public_url(url: str) -> bool:
+    """Reject URLs that point at loopback/link-local/private hosts (SSRF guard).
+
+    Scraped or LLM-suggested URLs are navigated by a real browser, so a crafted
+    posting pointing at http://169.254.169.254/ (cloud metadata) or an internal
+    address must not be fetched. Literal IPs are checked directly; hostnames are
+    resolved and rejected if they map to an internal address. If resolution
+    fails here we allow it through and let the navigation attempt fail normally
+    (so a transient DNS hiccup doesn't permanently poison a legitimate job).
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+
+    try:
+        return not _ip_is_internal(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # not a literal IP -- resolve the hostname below
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return True  # can't resolve here; let page.goto handle the failure
+    for info in infos:
+        try:
+            if _ip_is_internal(ipaddress.ip_address(info[4][0])):
+                return False
+        except ValueError:
+            continue
+    return True
 
 
 def resolve_url(raw_url: str, site: str) -> str | None:
@@ -566,6 +613,15 @@ SITE_DELAYS = {
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 PERMANENT_FAILURES = {404, 410, 451}
 
+# How many times a retryable (rate-limited / 5xx) detail page is re-attempted
+# across passes before it is marked done so it can't be reprocessed forever.
+MAX_DETAIL_ATTEMPTS = 3
+
+# A stored description shorter than this is considered too thin to be a usable
+# job description (matches the brainstorm JD-validity gate + jobspy's own
+# full_description promotion threshold).
+MIN_GOOD_DESCRIPTION_CHARS = 200
+
 
 def scrape_detail_page(page, url: str) -> dict:
     """Full cascade for one detail page."""
@@ -575,13 +631,25 @@ def scrape_detail_page(page, url: str) -> dict:
         "status": "error",
         "tier_used": None,
         "error": None,
+        "retryable": False,
     }
     t0 = time.time()
 
+    if not is_safe_public_url(url):
+        result["error"] = "blocked_unsafe_url"
+        result["elapsed"] = time.time() - t0
+        return result
+
     try:
         resp = page.goto(url, timeout=45000)
-        if resp and resp.status in PERMANENT_FAILURES:
+        # Any HTTP error must short-circuit BEFORE the extraction cascade --
+        # otherwise a 403/429/5xx page burns a paid LLM call and is recorded as
+        # a misleading "no data extracted" instead of the real status. 5xx and
+        # 429/408 are transient (retryable); everything else (403, 404, ...) is
+        # treated as permanent.
+        if resp and resp.status >= 400:
             result["error"] = f"HTTP {resp.status}"
+            result["retryable"] = resp.status in RETRYABLE_STATUSES
             result["elapsed"] = time.time() - t0
             return result
         page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -706,10 +774,30 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
+                    fd = result.get("full_description")
+                    # Keep the LONGER description: a re-scrape that yields a
+                    # shorter stub must not clobber a good description already
+                    # stored (relevant when re-enriching thin descriptions).
                     conn.execute(
-                        "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                        "UPDATE jobs SET full_description = CASE "
+                        "  WHEN ? IS NOT NULL AND LENGTH(?) >= LENGTH(COALESCE(full_description, '')) "
+                        "  THEN ? ELSE full_description END, "
+                        "application_url = ?, detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
+                        (fd, fd, fd, result.get("application_url"), now, url),
+                    )
+                elif result.get("retryable"):
+                    # Transient failure (429/5xx): record the error and bump the
+                    # attempt counter, but only mark the job done once attempts
+                    # are exhausted, so it is retried on a later pass without
+                    # being reprocessed forever.
+                    stats["error"] += 1
+                    conn.execute(
+                        "UPDATE jobs SET detail_error = ?, "
+                        "detail_attempts = COALESCE(detail_attempts, 0) + 1, "
+                        "detail_scraped_at = CASE "
+                        "  WHEN COALESCE(detail_attempts, 0) + 1 >= ? THEN ? ELSE NULL END "
+                        "WHERE url = ?",
+                        (result.get("error", "unknown"), MAX_DETAIL_ATTEMPTS, now, url),
                     )
                 else:
                     stats["error"] += 1
@@ -746,7 +834,7 @@ def _run_detail_scraper(
     Returns aggregate stats dict.
     """
     skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
-    where = f"WHERE detail_scraped_at IS NULL AND {skip_filter}"
+    where = f"WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL AND {skip_filter}"
     rows = conn.execute(
         f"SELECT url, title, site FROM jobs {where} ORDER BY site"
     ).fetchall()
@@ -797,7 +885,12 @@ def _run_detail_scraper(
         with ThreadPoolExecutor(max_workers=min(workers, len(order))) as pool:
             futures = {pool.submit(_scrape_site, site): site for site in order}
             for future in as_completed(futures):
-                _merge_stats(future.result())
+                # Per-job DB commits already persist scraped data; guard the
+                # stats merge so one site's crash can't abort the whole run.
+                try:
+                    _merge_stats(future.result())
+                except Exception as e:
+                    log.error("%s: site batch failed: %s", futures[future], e)
     else:
         # Sequential mode (default)
         for site in order:
@@ -860,7 +953,7 @@ def stream_detail(
             skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
             rows = conn.execute(
                 "SELECT url, title, site FROM jobs "
-                f"WHERE detail_scraped_at IS NULL AND {skip_filter} "
+                f"WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL AND {skip_filter} "
                 "ORDER BY site LIMIT 200"
             ).fetchall()
 
@@ -935,3 +1028,79 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
     stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers)
 
     return stats
+
+
+def _full_description_len(conn: sqlite3.Connection, url: str) -> int:
+    row = conn.execute("SELECT LENGTH(full_description) FROM jobs WHERE url = ?", (url,)).fetchone()
+    return int(row[0]) if row and row[0] else 0
+
+
+def reenrich_thin_descriptions(
+    min_chars: int = MIN_GOOD_DESCRIPTION_CHARS,
+    limit: int = 0,
+    workers: int = 1,
+) -> dict:
+    """Re-attempt enrichment for already-scraped jobs whose description is missing
+    or too thin to be usable.
+
+    Normal enrichment marks a job ``detail_scraped_at`` even when it only managed
+    to capture a title/stub, so the job is never retried -- and downstream it gets
+    dropped (or pollutes the fit map) for lack of a real description. This pass
+    re-selects those jobs, resets them for a fresh scrape (bumping detail_attempts
+    so it can't loop forever), and runs the detail cascade again.
+
+    Returns counts: eligible / reenriched / improved / still_thin.
+    """
+    conn = init_db()
+    skip_filter = " AND ".join("site != ?" for _ in SKIP_DETAIL_SITES)
+    rows = conn.execute(
+        f"""
+        SELECT url, title, site FROM jobs
+         WHERE duplicate_of_url IS NULL
+           AND detail_scraped_at IS NOT NULL
+           AND (full_description IS NULL OR LENGTH(full_description) < ?)
+           AND COALESCE(detail_attempts, 0) < ?
+           {("AND " + skip_filter) if skip_filter else ""}
+         ORDER BY site
+        """,
+        (min_chars, MAX_DETAIL_ATTEMPTS, *SKIP_DETAIL_SITES),
+    ).fetchall()
+
+    eligible = [(r[0], r[1], r[2]) for r in rows]
+    if limit and limit > 0:
+        eligible = eligible[:limit]
+    if not eligible:
+        log.info("No thin/missing descriptions eligible for re-enrichment.")
+        return {"eligible": 0, "reenriched": 0, "improved": 0, "still_thin": 0}
+
+    urls = [e[0] for e in eligible]
+    # Bump attempts up front so a source that only ever returns a stub eventually
+    # stops being retried (detail_attempts is the shared bound for both transient
+    # HTTP retries and thin re-enrichment).
+    conn.executemany(
+        "UPDATE jobs SET detail_attempts = COALESCE(detail_attempts, 0) + 1, "
+        "detail_error = NULL WHERE url = ?",
+        [(u,) for u in urls],
+    )
+    conn.commit()
+
+    # Re-scrape EXACTLY these jobs (grouped by site) -- NOT the whole pending
+    # queue, so we don't drag in unrelated newly-discovered jobs.
+    site_jobs: dict[str, list[tuple]] = {}
+    for url, title, site in eligible:
+        site_jobs.setdefault(site, []).append((url, title))
+
+    log.info("Re-enriching %d thin/missing descriptions across %d site(s)...", len(urls), len(site_jobs))
+    for site, jobs in site_jobs.items():
+        try:
+            scrape_site_batch(conn, site, jobs, delay=SITE_DELAYS.get(site, 2.0))
+        except Exception as e:
+            log.error("%s: re-enrich batch failed: %s", site, e)
+
+    improved = sum(1 for u in urls if _full_description_len(conn, u) >= min_chars)
+    return {
+        "eligible": len(rows),
+        "reenriched": len(urls),
+        "improved": improved,
+        "still_thin": len(urls) - improved,
+    }

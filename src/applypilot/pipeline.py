@@ -288,6 +288,20 @@ def _run_discover(workers: int = 1, discover_mode: str = "safe", search_cfg: dic
                 name, status = future.result()
                 stats[name] = status
 
+    # Finalize: run the authoritative dedupe pass. Insert-time dedupe is
+    # best-effort (parallel discovery threads can race, and a higher-quality row
+    # can arrive after the row that became canonical). This reconciles the whole
+    # table so downstream stages never enrich/score/apply to a duplicate.
+    try:
+        from applypilot.database import dedupe_existing_jobs, get_connection
+        dd = dedupe_existing_jobs(get_connection())
+        if dd.get("duplicates"):
+            console.print(
+                f"  [dim]Dedupe: {dd['duplicates']} duplicate(s) across {dd['groups']} group(s)[/dim]"
+            )
+    except Exception as e:
+        log.warning("Dedupe finalize failed: %s", e)
+
     return stats
 
 
@@ -460,14 +474,20 @@ class _StageTracker:
 
 # SQL to count pending work for each stage
 _PENDING_SQL: dict[str, str] = {
-    "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
-    "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
+    "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL",
+    "score": (
+        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL "
+        "AND fit_score IS NULL AND duplicate_of_url IS NULL"
+    ),
     "audit":  (
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
+        "AND decision_source IS NULL "
         "AND (audited_at IS NULL OR (scored_at IS NOT NULL AND audited_at < scored_at))"
     ),
     "diagnose": (
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND full_description IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND (diagnosed_at IS NULL "
         "OR (scored_at IS NOT NULL AND diagnosed_at < scored_at) "
         "OR (audited_at IS NOT NULL AND diagnosed_at < audited_at))"
@@ -475,17 +495,20 @@ _PENDING_SQL: dict[str, str] = {
     "tailor": (
         "SELECT COUNT(*) FROM jobs WHERE COALESCE(audit_score, fit_score) >= ? "
         "AND full_description IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND tailored_resume_path IS NULL "
         "AND COALESCE(tailor_attempts, 0) < 5"
     ),
     "cover": (
         "SELECT COUNT(*) FROM jobs WHERE COALESCE(audit_score, fit_score) >= ? "
         "AND tailored_resume_path IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < 5"
     ),
     "pdf": (
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND tailored_resume_path LIKE '%.txt'"
     ),
 }
@@ -586,31 +609,46 @@ def _run_stage_streaming(
             # Wait a bit for upstream to produce some work before first run
             tracker.wait(upstream, timeout=_STREAM_POLL_INTERVAL)
 
-        pending = _count_pending(stage, min_score)
+        pending_before = _count_pending(stage, min_score)
+        upstream_done = upstream is None or tracker.is_done(upstream)
 
-        if pending > 0:
-            try:
-                result = runner(**kwargs)
-                if isinstance(result, dict):
-                    status = result.get("status", "ok")
-                    if status not in ("ok", "partial"):
-                        errors.append(status)
-                    elif status == "partial":
-                        errors.append("partial")
-                passes += 1
-            except Exception as e:
-                log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
-                errors.append(str(e))
-                passes += 1
-        else:
-            # No work right now
-            upstream_done = upstream is None or tracker.is_done(upstream)
+        if pending_before <= 0:
+            # No work right now.
             if upstream_done:
-                # No work and upstream is done — this stage is finished
+                # No work and upstream is done — this stage is finished.
                 break
-            # Upstream still running, wait and retry
+            # Upstream still running, wait and retry.
             if stop_event.wait(timeout=_STREAM_POLL_INTERVAL):
                 break  # Stop requested
+            continue
+
+        # There is pending work — run one pass.
+        try:
+            result = runner(**kwargs)
+            if isinstance(result, dict):
+                status = result.get("status", "ok")
+                if status not in ("ok", "partial"):
+                    errors.append(status)
+                elif status == "partial":
+                    errors.append("partial")
+            passes += 1
+        except Exception as e:
+            log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
+            errors.append(str(e))
+            passes += 1
+
+        # No-progress guard. The pending counter can include rows the runner
+        # intentionally skips (e.g. enrich skips SKIP_DETAIL_SITES that this
+        # SQL still counts). Without this guard, pending stays > 0 forever, the
+        # loop never reaches the sleeping branch, and the stage spins at 100%
+        # CPU and never terminates. If a pass fails to reduce the backlog, back
+        # off — and if upstream is already done, stop rather than loop forever.
+        pending_after = _count_pending(stage, min_score)
+        if pending_after >= pending_before:
+            if upstream_done:
+                break
+            if stop_event.wait(timeout=_STREAM_POLL_INTERVAL):
+                break
 
     if errors:
         stage_status = "partial"
@@ -904,6 +942,7 @@ def run_pipeline(
     final = get_stats()
     console.print("\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
+    console.print(f"    Duplicates:     {final.get('duplicates', 0)}")
     console.print(f"    With desc:      {final['with_description']}")
     console.print(f"    Scored:         {final['scored']}")
     console.print(f"    Audited:        {final.get('audited', 0)}")

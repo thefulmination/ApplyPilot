@@ -9,7 +9,17 @@ def test_jobs_schema_tracks_company_source_and_retryable_score_errors(tmp_path: 
     conn = database.init_db(tmp_path / "applypilot.db")
 
     columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    assert {"company", "source_board", "score_error", "score_error_at", "score_attempts"} <= columns
+    assert {
+        "company",
+        "source_board",
+        "score_error",
+        "score_error_at",
+        "score_attempts",
+        "dedupe_key",
+        "duplicate_of_url",
+        "duplicate_reason",
+        "duplicate_detected_at",
+    } <= columns
 
     indexes = {row[1] for row in conn.execute("PRAGMA index_list(jobs)").fetchall()}
     assert {
@@ -18,6 +28,8 @@ def test_jobs_schema_tracks_company_source_and_retryable_score_errors(tmp_path: 
         "idx_jobs_pending_score",
         "idx_jobs_pending_tailor",
         "idx_jobs_discovered_at",
+        "idx_jobs_dedupe_key",
+        "idx_jobs_duplicate_of_url",
     } <= indexes
 
 

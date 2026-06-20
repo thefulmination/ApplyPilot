@@ -107,7 +107,8 @@ def test_scoring_persists_each_job_before_a_later_crash(tmp_path: Path, monkeypa
 
     calls = 0
 
-    def fake_score_job(_resume_text: str, job: dict, preference_profile: dict | None = None) -> dict:
+    # antigravity: test-crash-resume-fix-1
+    def fake_score_job(_resume_text: str, job: dict, preference_profile: dict | None = None, **kwargs) -> dict:
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -141,7 +142,8 @@ def test_llm_score_errors_remain_retryable(tmp_path: Path, monkeypatch: pytest.M
 
     from applypilot.scoring import scorer
 
-    def fake_score_job(_resume_text: str, _job: dict, preference_profile: dict | None = None) -> dict:
+    # antigravity: test-crash-resume-fix-2
+    def fake_score_job(_resume_text: str, _job: dict, preference_profile: dict | None = None, **kwargs) -> dict:
         return {"score": 0, "keywords": "", "reasoning": "LLM error: provider unavailable", "error": "provider unavailable"}
 
     monkeypatch.setattr(scorer, "RESUME_PATH", resume_path)

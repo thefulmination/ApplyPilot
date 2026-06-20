@@ -12,7 +12,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from applypilot.config import RESUME_PATH, load_preference_profile
+# antigravity: python-scorer-integration-v1
+from applypilot.config import RESUME_PATH, load_preference_profile, KNOWLEDGE_GRAPH_PROMPT_PATH
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
@@ -45,9 +46,24 @@ KEYWORDS: [comma-separated ATS keywords from the job description that match or c
 REASONING: [2-3 sentences explaining the score]"""
 
 
+# Recommendation calibration is produced by an external engine ("brainstorm"),
+# so treat its content defensively: cap sizes and tolerate wrong-typed fields.
+_MAX_PREFERENCE_CHARS = 12000
+_MAX_KNOWLEDGE_GRAPH_CHARS = 16000
+# Fields the scorer calibrates on; used to detect a present-but-empty profile
+# (a likely schema mismatch with the recommendation engine).
+_PREFERENCE_FIELDS = ("promptSummary", "summary", "positiveSignals",
+                      "negativeSignals", "fitMapRules", "examples")
+
+
+def _as_list(value) -> list:
+    """Return value if it is a list, else an empty list (tolerate bad input)."""
+    return value if isinstance(value, list) else []
+
+
 def _preference_profile_prompt(preference_profile: dict | None) -> str:
     """Render saved human review preferences for the scorer prompt."""
-    if not preference_profile:
+    if not isinstance(preference_profile, dict):
         return ""
 
     prompt_summary = preference_profile.get("promptSummary")
@@ -56,9 +72,9 @@ def _preference_profile_prompt(preference_profile: dict | None) -> str:
     else:
         compact = {
             "summary": preference_profile.get("summary", {}),
-            "positiveSignals": preference_profile.get("positiveSignals", [])[:12],
-            "negativeSignals": preference_profile.get("negativeSignals", [])[:12],
-            "fitMapRules": preference_profile.get("fitMapRules", [])[:14],
+            "positiveSignals": _as_list(preference_profile.get("positiveSignals"))[:12],
+            "negativeSignals": _as_list(preference_profile.get("negativeSignals"))[:12],
+            "fitMapRules": _as_list(preference_profile.get("fitMapRules"))[:14],
             "examples": preference_profile.get("examples", {}),
         }
         import json
@@ -71,8 +87,8 @@ def _preference_profile_prompt(preference_profile: dict | None) -> str:
             "It should adjust scoring when it conflicts with keyword overlap.\n"
             f"{text}"
         )
-    if len(text) > 12000:
-        text = f"{text[:12000]}\n...[truncated]"
+    if len(text) > _MAX_PREFERENCE_CHARS:
+        text = f"{text[:_MAX_PREFERENCE_CHARS]}\n...[truncated]"
     return text
 
 
@@ -105,12 +121,19 @@ def _parse_score_response(response: str) -> dict:
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
-def score_job(resume_text: str, job: dict, preference_profile: dict | None = None) -> dict:
+def score_job(
+    resume_text: str,
+    job: dict,
+    preference_profile: dict | None = None,
+    knowledge_graph_prompt: str | None = None
+) -> dict:
     """Score a single job against the resume.
 
     Args:
         resume_text: The candidate's full resume text.
         job: Job dict with keys: title, site, location, full_description.
+        preference_profile: Human preference calibration data.
+        knowledge_graph_prompt: Factual knowledge graph prompt pack.
 
     Returns:
         {"score": int, "keywords": str, "reasoning": str}
@@ -126,10 +149,21 @@ def score_job(resume_text: str, job: dict, preference_profile: dict | None = Non
     user_parts = [f"RESUME:\n{resume_text}"]
     if preference_prompt:
         user_parts.append(preference_prompt)
+    if knowledge_graph_prompt:
+        user_parts.append(knowledge_graph_prompt)
     user_parts.append(f"JOB POSTING:\n{job_text}")
 
+    system_content = SCORE_PROMPT
+    if knowledge_graph_prompt:
+        system_content += (
+            "\n\nKNOWLEDGE GRAPH INSTRUCTIONS:\n"
+            "- Use the provided KNOWLEDGE GRAPH to calibrate factual background.\n"
+            "- Cite specific graph node IDs (e.g., education:stevens-quantitative-finance-bs or context:ggg:...) in your reasoning for how requirements are met.\n"
+            "- Classify requirements as qualified (direct/high-confidence evidence), transferable (adjacent evidence), stretch (plausible but indirect with limits), missing (no evidence or gap), or unclear."
+        )
+
     messages = [
-        {"role": "system", "content": SCORE_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": "\n\n---\n\n".join(user_parts)},
     ]
 
@@ -210,15 +244,54 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    # load_preference_profile() already guarantees a dict-or-None (it tolerates
+    # malformed recommendation-engine output), so the .get chains below are safe.
     preference_profile = load_preference_profile()
     if preference_profile:
-        source = preference_profile.get("source", {})
-        reviewed = preference_profile.get("summary", {}).get("reviewedJobs") or source.get("reviewedJobs")
+        summary = preference_profile.get("summary")
+        source = preference_profile.get("source")
+        reviewed = None
+        if isinstance(summary, dict):
+            reviewed = summary.get("reviewedJobs")
+        if reviewed is None and isinstance(source, dict):
+            reviewed = source.get("reviewedJobs")
         log.info("Loaded human preference profile for scoring (%s reviewed jobs).", reviewed or "unknown")
+        # Present but with none of the fields we calibrate on => likely a schema
+        # mismatch with the recommendation engine. Surface it rather than
+        # silently scoring as if uncalibrated.
+        if not any(preference_profile.get(k) for k in _PREFERENCE_FIELDS):
+            log.warning(
+                "Preference profile has none of the expected fields %s; "
+                "check the recommendation engine output schema.", _PREFERENCE_FIELDS,
+            )
+
+    # antigravity: python-scorer-integration-v1
+    knowledge_graph_prompt = None
+    if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
+        try:
+            knowledge_graph_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
+            if len(knowledge_graph_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
+                log.warning(
+                    "Knowledge graph prompt is %d chars; truncating to %d to control "
+                    "token cost (it is injected into every scoring call).",
+                    len(knowledge_graph_prompt), _MAX_KNOWLEDGE_GRAPH_CHARS,
+                )
+                knowledge_graph_prompt = (
+                    knowledge_graph_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
+                )
+            if not knowledge_graph_prompt.strip():
+                knowledge_graph_prompt = None
+            else:
+                log.info("Loaded job knowledge graph prompt for scoring calibration (%d chars).",
+                         len(knowledge_graph_prompt))
+        except Exception as e:
+            log.warning("Could not read knowledge graph prompt from %s: %s", KNOWLEDGE_GRAPH_PROMPT_PATH, e)
+            knowledge_graph_prompt = None
+
     conn = get_connection()
 
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL AND duplicate_of_url IS NULL"
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
@@ -241,8 +314,14 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
     errors = 0
     results: list[dict] = []
 
+    # antigravity: python-scorer-integration-v1
     def score_one(job: dict) -> tuple[dict, dict]:
-        result = score_job(resume_text, job, preference_profile=preference_profile)
+        result = score_job(
+            resume_text,
+            job,
+            preference_profile=preference_profile,
+            knowledge_graph_prompt=knowledge_graph_prompt
+        )
         result["url"] = job["url"]
         return job, result
 

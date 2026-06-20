@@ -32,6 +32,37 @@ blocked_sso:
   - "auth0.com"
   - "sso.cisco.com"
 
+# ── Auth-gated application portals ───────────────────────────────────────
+# These are valid targets, but often require account creation, saved
+# credentials, email verification, or 2FA. ApplyPilot routes them into the
+# assisted workflow instead of burning retries in full auto-apply.
+auth_gated:
+  domains:
+    - "myworkdayjobs.com"
+    - "myworkdaysite.com"
+    - "workdayjobs.com"
+    - "taleo.net"
+    - "successfactors.com"
+    - "icims.com"
+    - "brassring.com"
+    - "adp.com"
+    - "oraclecloud.com"
+    - "oracle.com/cloud/cx/taleo"
+    - "eightfold.ai"
+    - "phenompeople.com"
+  url_patterns:
+    - "/login"
+    - "/signin"
+    - "/sign-in"
+    - "/account"
+    - "/candidate"
+    - "/candidatehome"
+    - "/createaccount"
+    - "/register"
+    - "/sso"
+    - "2fa"
+    - "mfa"
+
 # ── Base URLs for URL resolution ─────────────────────────────────────────
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.
@@ -49,6 +80,7 @@ base_urls:
   "Nodesk": "https://nodesk.co"
   "Talent.com": "https://www.talent.com"
   "SimplyHired": "https://www.simplyhired.com"
+  "TrueUp Jobs": "https://www.trueup.io"
   "JustRemote": "https://justremote.co"
   "Arc.dev": "https://arc.dev"
   "Himalayas": "https://himalayas.app"
@@ -152,6 +184,10 @@ sites:
 
   - name: "BuiltIn Remote"
     url: "https://builtin.com/jobs/remote/dev-engineering"
+    type: static
+
+  - name: "TrueUp Jobs"
+    url: "https://www.trueup.io/jobs"
     type: static
 
   - name: "Wellfound"

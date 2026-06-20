@@ -18,7 +18,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from applypilot import config
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, insert_discovered_job
 from applypilot.discovery.jobspy import _load_location_config, _location_ok
 
 log = logging.getLogger(__name__)
@@ -151,49 +151,74 @@ def _store_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
         url = job.get("url")
         if not url:
             continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "company, source_board, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    url,
-                    job.get("title"),
-                    job.get("salary"),
-                    job.get("description"),
-                    job.get("location"),
-                    job.get("company") or job.get("site"),
-                    job.get("strategy"),
-                    now,
-                    job.get("company") or job.get("site"),
-                    job.get("source_board") or job.get("site"),
-                    job.get("full_description"),
-                    job.get("application_url"),
-                    now if job.get("full_description") else None,
-                ),
-            )
+        status = insert_discovered_job(
+            conn,
+            {**job, "detail_scraped_at": now if job.get("full_description") else None},
+            site=job.get("company") or job.get("site"),
+            strategy=job.get("strategy"),
+            source_board=job.get("source_board") or job.get("site"),
+            discovered_at=now,
+        )
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()
     return new, existing
 
 
+_FETCH_RETRIES = 3
+_FETCH_BACKOFF = 2.0
+_FETCH_RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def _request_with_retries(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> requests.Response:
+    """GET with bounded retry on transient failures (timeouts, 429, 5xx).
+
+    Honors Retry-After. A single bad page no longer abandons the whole source.
+    Raises the last error after retries are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _FETCH_RETRIES + 1):
+        try:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT, headers=headers)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            if attempt < _FETCH_RETRIES:
+                time.sleep(_FETCH_BACKOFF * attempt)
+                continue
+            raise
+        if resp.status_code in _FETCH_RETRY_STATUS and attempt < _FETCH_RETRIES:
+            ra = resp.headers.get("Retry-After")
+            try:
+                wait = float(ra) if ra else _FETCH_BACKOFF * attempt
+            except (TypeError, ValueError):
+                wait = _FETCH_BACKOFF * attempt
+            time.sleep(min(max(_FETCH_BACKOFF, wait), 60.0))
+            continue
+        resp.raise_for_status()
+        return resp
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"request failed after {_FETCH_RETRIES} attempts: {url}")
+
+
 def _fetch_json(session: requests.Session, url: str, params: dict | None = None) -> dict:
-    resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+    resp = _request_with_retries(session, url, params=params, headers={"Accept": "application/json"})
     return resp.json()
 
 
 def _fetch_html(session: requests.Session, url: str, params: dict | None = None) -> str:
-    resp = session.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-        headers={"Accept": "text/html,application/xhtml+xml"},
+    resp = _request_with_retries(
+        session, url, params=params, headers={"Accept": "text/html,application/xhtml+xml"}
     )
-    resp.raise_for_status()
     return resp.text
 
 

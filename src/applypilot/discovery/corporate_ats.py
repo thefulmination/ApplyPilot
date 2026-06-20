@@ -26,7 +26,7 @@ import yaml
 from bs4 import BeautifulSoup
 
 from applypilot import config
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, insert_discovered_job
 from applypilot.discovery.jobspy import _load_location_config, _location_ok
 
 log = logging.getLogger(__name__)
@@ -359,10 +359,13 @@ def _request_json(url: str, request_options: dict) -> tuple[int, dict | list | N
         if status in NOT_FOUND_STATUS_CODES:
             return status, None
         if status in RETRY_STATUS_CODES and attempt < attempts:
-            wait = rate_limit_backoff if status == 429 else backoff * attempt
-            wait = min(_retry_after_seconds(resp, wait), rate_limit_backoff if status == 429 else wait)
-            if wait > 0:
-                time.sleep(wait)
+            base_wait = rate_limit_backoff if status == 429 else backoff * attempt
+            # Honor Retry-After but FLOOR at the computed backoff so a server
+            # sending "Retry-After: 0" (or a past date) can't collapse the delay
+            # to zero and trigger a tight retry loop; cap it so an absurd value
+            # can't stall the crawl.
+            wait = min(max(base_wait, _retry_after_seconds(resp, base_wait)), 120.0)
+            time.sleep(wait)
             continue
         if status >= 400:
             message = resp.text[:240].replace("\n", " ").strip()
@@ -744,29 +747,17 @@ def _store_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
         url = job.get("url")
         if not url:
             continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "company, source_board, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    url,
-                    job.get("title"),
-                    job.get("salary"),
-                    job.get("description"),
-                    job.get("location"),
-                    job.get("company") or "Corporate",
-                    job.get("strategy") or "corporate_ats_api",
-                    now,
-                    job.get("company") or "Corporate",
-                    "corporate_ats",
-                    job.get("full_description"),
-                    job.get("application_url"),
-                    now if job.get("full_description") else None,
-                ),
-            )
+        status = insert_discovered_job(
+            conn,
+            {**job, "detail_scraped_at": now if job.get("full_description") else None},
+            site=job.get("company") or "Corporate",
+            strategy=job.get("strategy") or "corporate_ats_api",
+            source_board="corporate_ats",
+            discovered_at=now,
+        )
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()

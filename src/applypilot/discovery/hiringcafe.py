@@ -19,7 +19,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from applypilot import config
-from applypilot.database import get_connection, init_db
+from applypilot.database import get_connection, init_db, insert_discovered_job
 from applypilot.discovery.jobspy import _load_location_config, _location_ok
 
 log = logging.getLogger(__name__)
@@ -316,29 +316,17 @@ def _store_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
     existing = 0
 
     for job in jobs:
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "company, source_board, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    job["url"],
-                    job.get("title"),
-                    job.get("salary"),
-                    job.get("description"),
-                    job.get("location"),
-                    job.get("company") or "HiringCafe",
-                    "hiringcafe_next_data",
-                    now,
-                    job.get("company"),
-                    "hiringcafe",
-                    job.get("full_description"),
-                    job.get("application_url"),
-                    now if job.get("full_description") else None,
-                ),
-            )
+        status = insert_discovered_job(
+            conn,
+            {**job, "detail_scraped_at": now if job.get("full_description") else None},
+            site=job.get("company") or "HiringCafe",
+            strategy="hiringcafe_next_data",
+            source_board="hiringcafe",
+            discovered_at=now,
+        )
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()

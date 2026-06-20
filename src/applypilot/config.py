@@ -22,6 +22,8 @@ RESUME_PDF_PATH = _path_from_env("APPLYPILOT_RESUME_PDF_PATH", APP_DIR / "resume
 SEARCH_CONFIG_PATH = _path_from_env("APPLYPILOT_SEARCH_CONFIG_PATH", APP_DIR / "searches.yaml")
 RESUME_STRATEGY_PATH = _path_from_env("APPLYPILOT_RESUME_STRATEGY_PATH", APP_DIR / "resume_strategy.yaml")
 PREFERENCE_PROFILE_PATH = _path_from_env("APPLYPILOT_PREFERENCE_PROFILE_PATH", APP_DIR / "job_preference_profile.json")
+# antigravity: python-scorer-integration-v1
+KNOWLEDGE_GRAPH_PROMPT_PATH = _path_from_env("APPLYPILOT_KNOWLEDGE_GRAPH_PROMPT_PATH", APP_DIR / "job_knowledge_graph_prompt.md")
 ENV_PATH = _path_from_env("APPLYPILOT_ENV_PATH", APP_DIR / ".env")
 
 # Generated output
@@ -174,12 +176,36 @@ def load_resume_strategy() -> dict:
 
 
 def load_preference_profile() -> dict | None:
-    """Load optional human-labeled job preference profile for score calibration."""
+    """Load optional human-labeled job preference profile for score calibration.
+
+    This file is produced by an external recommendation engine ("brainstorm").
+    Because it crosses a project boundary, malformed or wrong-shaped input must
+    NOT crash scoring -- on any problem we warn and return None so scoring
+    proceeds without calibration rather than aborting the whole stage.
+    """
     import json
+    import logging
+
     path = _path_from_env("APPLYPILOT_PREFERENCE_PROFILE_PATH", PREFERENCE_PROFILE_PATH)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    log = logging.getLogger(__name__)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning(
+            "Ignoring preference profile at %s: could not read/parse it (%s). "
+            "Scoring will proceed without recommendation calibration.",
+            path, e,
+        )
+        return None
+    if not isinstance(data, dict):
+        log.warning(
+            "Ignoring preference profile at %s: expected a JSON object, got %s.",
+            path, type(data).__name__,
+        )
+        return None
+    return data
 
 
 def load_sites_config() -> dict:
@@ -199,6 +225,22 @@ def is_manual_ats(url: str | None) -> bool:
     domains = sites_cfg.get("manual_ats", [])
     url_lower = url.lower()
     return any(domain in url_lower for domain in domains)
+
+
+def is_auth_gated_application(url: str | None) -> bool:
+    """Check if an application URL is likely to require login, account setup, or 2FA."""
+    if not url:
+        return False
+    sites_cfg = load_sites_config()
+    auth_cfg = sites_cfg.get("auth_gated", {}) or {}
+    domains = auth_cfg.get("domains", [])
+    patterns = auth_cfg.get("url_patterns", [])
+    url_lower = url.lower()
+    return (
+        any(domain.lower() in url_lower for domain in domains)
+        or any(pattern.lower() in url_lower for pattern in patterns)
+        or any(domain.lower() in url_lower for domain in load_blocked_sso())
+    )
 
 
 def load_blocked_sites() -> tuple[set[str], list[str]]:
@@ -239,6 +281,22 @@ DEFAULTS = {
     "apply_timeout": 300,
     "viewport": "1280x900",
 }
+
+
+def get_min_score() -> int:
+    """Default minimum score for tailor/cover/apply selection.
+
+    Reads ``APPLYPILOT_MIN_SCORE`` (e.g. set in ~/.applypilot/.env) so the floor
+    can be configured once instead of passing --min-score every run; falls back
+    to DEFAULTS['min_score']. Call after load_env() so .env values are visible.
+    """
+    raw = os.environ.get("APPLYPILOT_MIN_SCORE")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULTS["min_score"]
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULTS["min_score"]
 
 
 def load_env():

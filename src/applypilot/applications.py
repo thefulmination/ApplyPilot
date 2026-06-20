@@ -20,6 +20,8 @@ from applypilot.database import get_connection
 VALID_STATUSES = {
     "shortlisted",
     "resume_ready",
+    "auth_required",
+    "assisted",
     "applied",
     "followed_up",
     "recruiter_screen",
@@ -36,6 +38,8 @@ VALID_STATUSES = {
 ACTIVE_STATUSES = {
     "shortlisted",
     "resume_ready",
+    "auth_required",
+    "assisted",
     "applied",
     "followed_up",
     "recruiter_screen",
@@ -81,6 +85,11 @@ def _normalize_status(status: str) -> str:
         "hiring_manager_screen": "hiring_manager",
         "follow_up": "followed_up",
         "followup": "followed_up",
+        "login_required": "auth_required",
+        "account_required": "auth_required",
+        "2fa_required": "auth_required",
+        "mfa_required": "auth_required",
+        "manual_required": "assisted",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in VALID_STATUSES:
@@ -104,9 +113,11 @@ def _find_job(conn, job_ref: str) -> dict[str, Any] | None:
            OR application_url = ?
            OR url LIKE ?
            OR application_url LIKE ?
-        ORDER BY COALESCE(audit_score, fit_score) DESC NULLS LAST, discovered_at DESC
+        ORDER BY
+            CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END,
+            COALESCE(audit_score, fit_score) DESC NULLS LAST, discovered_at DESC
         LIMIT 1
-    """, (ref, ref, like, like)).fetchone()
+    """, (ref, ref, like, like, ref, ref)).fetchone()
     return _row_to_dict(row) if row else None
 
 
@@ -163,7 +174,8 @@ def record_application(
                 updated_at = ?
             WHERE job_url = ?
         """, (
-            job.get("title"), job.get("site"), job.get("site"), job.get("url"),
+            job.get("title"), job.get("company") or job.get("site"),
+            job.get("source_board") or job.get("site"), job.get("url"),
             job.get("application_url"), status, channel, final_applied_at, now,
             next_follow_up_at, job.get("tailored_resume_path"), job.get("cover_letter_path"),
             contact_name, contact_email, contact_url, notes, notes, notes, notes,
@@ -179,7 +191,8 @@ def record_application(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            job["url"], job.get("title"), job.get("site"), job.get("site"),
+            job["url"], job.get("title"), job.get("company") or job.get("site"),
+            job.get("source_board") or job.get("site"),
             job.get("url"), job.get("application_url"), status, channel,
             final_applied_at, now, next_follow_up_at, job.get("tailored_resume_path"),
             job.get("cover_letter_path"), contact_name, contact_email, contact_url,
@@ -242,6 +255,27 @@ def get_application(job_ref: str) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
+def get_application_handoff(job_ref: str) -> dict[str, Any]:
+    """Return the data needed to finish a gated application manually."""
+    conn = get_connection()
+    job = _find_job(conn, job_ref)
+    if not job:
+        raise ValueError(f"No job found for: {job_ref}")
+    return {
+        "job_url": job.get("url"),
+        "application_url": job.get("application_url") or job.get("url"),
+        "title": job.get("title"),
+        "company": job.get("company") or job.get("site"),
+        "score": _score(job),
+        "resume_path": job.get("tailored_resume_path"),
+        "resume_pdf_path": str(Path(job["tailored_resume_path"]).with_suffix(".pdf"))
+        if job.get("tailored_resume_path") else None,
+        "cover_letter_path": job.get("cover_letter_path"),
+        "cover_letter_pdf_path": str(Path(job["cover_letter_path"]).with_suffix(".pdf"))
+        if job.get("cover_letter_path") else None,
+    }
+
+
 def list_applications(
     status: str | None = None,
     active_only: bool = False,
@@ -289,6 +323,7 @@ def list_ready_to_apply(min_score: int = 7, limit: int = 50) -> list[dict[str, A
         FROM jobs j
         LEFT JOIN applications a ON a.job_url = j.url
         WHERE j.tailored_resume_path IS NOT NULL
+          AND j.duplicate_of_url IS NULL
           AND j.applied_at IS NULL
           AND (j.apply_status IS NULL OR j.apply_status IN ('failed', 'resume_ready', 'shortlisted'))
           AND COALESCE(j.audit_score, j.fit_score, 0) >= ?

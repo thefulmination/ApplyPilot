@@ -5,10 +5,13 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import re
 import sqlite3
 import threading
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 from applypilot.config import DB_PATH
 
@@ -103,6 +106,10 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             source_board          TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
+            dedupe_key            TEXT,
+            duplicate_of_url      TEXT,
+            duplicate_reason      TEXT,
+            duplicate_detected_at TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -187,11 +194,16 @@ _ALL_COLUMNS: dict[str, str] = {
     "source_board": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    "dedupe_key": "TEXT",
+    "duplicate_of_url": "TEXT",
+    "duplicate_reason": "TEXT",
+    "duplicate_detected_at": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
     "detail_scraped_at": "TEXT",
     "detail_error": "TEXT",
+    "detail_attempts": "INTEGER DEFAULT 0",
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
@@ -208,6 +220,14 @@ _ALL_COLUMNS: dict[str, str] = {
     "audit_flags": "TEXT",
     "audit_reason": "TEXT",
     "audited_at": "TEXT",
+    # External recommendation-engine decision ("brainstorm"). When present, the
+    # decision is authoritative for the apply gate (written into audit_score),
+    # ApplyPilot's own audit stage skips the row, and its LLM fit_score is kept
+    # as a benchmark datapoint to compare against external_decision_score.
+    "decision_source": "TEXT",
+    "decision_verdict": "TEXT",
+    "external_decision_score": "REAL",
+    "decision_at": "TEXT",
     # Fit diagnosis / gap analysis
     "fit_gap_category": "TEXT",
     "fit_gap_severity": "TEXT",
@@ -374,11 +394,13 @@ def ensure_job_indexes(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_source_board ON jobs(source_board)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_discovered_at ON jobs(discovered_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe_key ON jobs(dedupe_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_duplicate_of_url ON jobs(duplicate_of_url)")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_jobs_pending_score
             ON jobs(discovered_at)
-         WHERE full_description IS NOT NULL AND fit_score IS NULL
+         WHERE full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of_url IS NULL
         """
     )
     conn.execute(
@@ -388,13 +410,14 @@ def ensure_job_indexes(conn: sqlite3.Connection | None = None) -> None:
          WHERE full_description IS NOT NULL
            AND tailored_resume_path IS NULL
            AND COALESCE(tailor_attempts, 0) < 5
+           AND duplicate_of_url IS NULL
         """
     )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_jobs_ready_to_apply
             ON jobs(COALESCE(audit_score, fit_score), discovered_at)
-         WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL
+         WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL AND duplicate_of_url IS NULL
         """
     )
     conn.commit()
@@ -526,6 +549,307 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_stage ON pipeline_stage_runs(stage)")
     conn.commit()
+
+
+_COMPANY_SUFFIXES = {
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "inc",
+    "incorporated",
+    "llc",
+    "llp",
+    "lp",
+    "ltd",
+    "limited",
+    "plc",
+}
+_STATE_NAMES = {
+    "alabama": "al",
+    "alaska": "ak",
+    "arizona": "az",
+    "arkansas": "ar",
+    "california": "ca",
+    "colorado": "co",
+    "connecticut": "ct",
+    "delaware": "de",
+    "florida": "fl",
+    "georgia": "ga",
+    "hawaii": "hi",
+    "idaho": "id",
+    "illinois": "il",
+    "indiana": "in",
+    "iowa": "ia",
+    "kansas": "ks",
+    "kentucky": "ky",
+    "louisiana": "la",
+    "maine": "me",
+    "maryland": "md",
+    "massachusetts": "ma",
+    "michigan": "mi",
+    "minnesota": "mn",
+    "mississippi": "ms",
+    "missouri": "mo",
+    "montana": "mt",
+    "nebraska": "ne",
+    "nevada": "nv",
+    "new hampshire": "nh",
+    "new jersey": "nj",
+    "new mexico": "nm",
+    "new york": "ny",
+    "north carolina": "nc",
+    "north dakota": "nd",
+    "ohio": "oh",
+    "oklahoma": "ok",
+    "oregon": "or",
+    "pennsylvania": "pa",
+    "rhode island": "ri",
+    "south carolina": "sc",
+    "south dakota": "sd",
+    "tennessee": "tn",
+    "texas": "tx",
+    "utah": "ut",
+    "vermont": "vt",
+    "virginia": "va",
+    "washington": "wa",
+    "west virginia": "wv",
+    "wisconsin": "wi",
+    "wyoming": "wy",
+}
+_LOCATION_ALIASES = {
+    "nyc": "new york ny",
+    "new york city": "new york ny",
+    "new york ny": "new york ny",
+    "sf": "san francisco ca",
+    "bay area": "san francisco ca",
+    "san francisco ca": "san francisco ca",
+}
+_DUPLICATE_REASON = "same_company_title_location"
+
+
+def _fold_ascii(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def _normalize_tokens(value: Any) -> list[str]:
+    text = _fold_ascii(value)
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return [token for token in text.split() if token]
+
+
+def _normalize_company(value: Any) -> str:
+    tokens = _normalize_tokens(value)
+    while tokens and tokens[-1] in _COMPANY_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _normalize_title(value: Any) -> str:
+    return " ".join(_normalize_tokens(value))
+
+
+def _normalize_location(value: Any) -> str:
+    tokens = _normalize_tokens(value)
+    if not tokens:
+        return "unknown"
+    if "remote" in tokens:
+        return "remote"
+
+    text = " ".join(token for token in tokens if token not in {"usa", "us", "united", "states"})
+    if text in _LOCATION_ALIASES:
+        return _LOCATION_ALIASES[text]
+
+    for state_name, abbr in sorted(_STATE_NAMES.items(), key=lambda item: len(item[0]), reverse=True):
+        text = re.sub(rf"\b{re.escape(state_name)}\b", abbr, text)
+    text = _LOCATION_ALIASES.get(text, text)
+    return re.sub(r"\s+", " ", text).strip() or "unknown"
+
+
+def build_job_dedupe_key(job: Mapping[str, Any]) -> str | None:
+    """Build a conservative same-job fingerprint from company, title, and location."""
+    title = _normalize_title(job.get("title"))
+    company = _normalize_company(job.get("company") or job.get("site"))
+    if not title or not company:
+        return None
+    location = _normalize_location(job.get("location"))
+    return f"v1|{company}|{title}|{location}"
+
+
+def _row_quality(row: Mapping[str, Any]) -> tuple[int, int, str, str]:
+    has_application = 0 if row.get("application_url") else 1
+    has_description = 0 if row.get("full_description") else 1
+    return has_application, has_description, str(row.get("discovered_at") or ""), str(row.get("url") or "")
+
+
+def _canonical_duplicate(
+    conn: sqlite3.Connection,
+    dedupe_key: str,
+    *,
+    exclude_url: str | None = None,
+) -> sqlite3.Row | None:
+    params: list[Any] = [dedupe_key]
+    where = "dedupe_key = ? AND duplicate_of_url IS NULL"
+    if exclude_url:
+        where += " AND url != ?"
+        params.append(exclude_url)
+    return conn.execute(
+        f"""
+        SELECT *
+          FROM jobs
+         WHERE {where}
+         ORDER BY
+              CASE WHEN application_url IS NULL OR application_url = '' THEN 1 ELSE 0 END,
+              CASE WHEN full_description IS NULL OR full_description = '' THEN 1 ELSE 0 END,
+              discovered_at,
+              url
+         LIMIT 1
+        """,
+        params,
+    ).fetchone()
+
+
+def insert_discovered_job(
+    conn: sqlite3.Connection,
+    job: Mapping[str, Any],
+    *,
+    site: str | None = None,
+    strategy: str | None = None,
+    source_board: str | None = None,
+    discovered_at: str | None = None,
+) -> str:
+    """Insert one discovered job and mark same-job duplicates non-destructively.
+
+    Returns one of: "new", "duplicate", "existing", or "skipped".
+    """
+    url = str(job.get("url") or "").strip()
+    if not url:
+        return "skipped"
+
+    now = discovered_at or datetime.now(timezone.utc).isoformat()
+    site_value = site or job.get("site") or job.get("company")
+    company = job.get("company") or site_value
+    board = source_board or job.get("source_board") or site_value
+    dedupe_key = build_job_dedupe_key({**dict(job), "site": site_value, "company": company})
+    canonical = _canonical_duplicate(conn, dedupe_key, exclude_url=url) if dedupe_key else None
+    duplicate_of_url = canonical["url"] if canonical else None
+    duplicate_reason = _DUPLICATE_REASON if canonical else None
+    duplicate_detected_at = now if canonical else None
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                url, title, salary, description, location, site,
+                company, source_board, strategy, discovered_at,
+                dedupe_key, duplicate_of_url, duplicate_reason, duplicate_detected_at,
+                full_description, application_url, detail_scraped_at, detail_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                url,
+                job.get("title"),
+                job.get("salary"),
+                job.get("description"),
+                job.get("location"),
+                site_value,
+                company,
+                board,
+                strategy or job.get("strategy"),
+                now,
+                dedupe_key,
+                duplicate_of_url,
+                duplicate_reason,
+                duplicate_detected_at,
+                job.get("full_description"),
+                job.get("application_url"),
+                job.get("detail_scraped_at"),
+                job.get("detail_error"),
+            ),
+        )
+    except sqlite3.IntegrityError:
+        if dedupe_key:
+            conn.execute(
+                "UPDATE jobs SET dedupe_key = COALESCE(dedupe_key, ?) WHERE url = ?",
+                (dedupe_key, url),
+            )
+        return "existing"
+
+    return "duplicate" if duplicate_of_url else "new"
+
+
+def dedupe_existing_jobs(conn: sqlite3.Connection | None = None, *, dry_run: bool = False) -> dict[str, int | bool]:
+    """Recompute dedupe keys and mark same-job duplicates already in the DB."""
+    if conn is None:
+        conn = get_connection()
+
+    rows = [dict(row) for row in conn.execute("SELECT * FROM jobs ORDER BY discovered_at, url").fetchall()]
+    desired: dict[str, dict[str, str | None]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+
+    for row in rows:
+        key = build_job_dedupe_key(row)
+        desired[row["url"]] = {
+            "dedupe_key": key,
+            "duplicate_of_url": None,
+            "duplicate_reason": None,
+            "duplicate_detected_at": None,
+        }
+        if key:
+            groups.setdefault(key, []).append(row)
+
+    duplicate_groups = 0
+    duplicate_count = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for key, group in groups.items():
+        if len(group) <= 1:
+            continue
+        duplicate_groups += 1
+        canonical = sorted(group, key=_row_quality)[0]
+        for row in group:
+            if row["url"] == canonical["url"]:
+                continue
+            desired[row["url"]] = {
+                "dedupe_key": key,
+                "duplicate_of_url": canonical["url"],
+                "duplicate_reason": _DUPLICATE_REASON,
+                "duplicate_detected_at": row.get("duplicate_detected_at") or now,
+            }
+            duplicate_count += 1
+
+    if not dry_run:
+        for url, values in desired.items():
+            conn.execute(
+                """
+                UPDATE jobs
+                   SET dedupe_key = ?,
+                       duplicate_of_url = ?,
+                       duplicate_reason = ?,
+                       duplicate_detected_at = ?
+                 WHERE url = ?
+                """,
+                (
+                    values["dedupe_key"],
+                    values["duplicate_of_url"],
+                    values["duplicate_reason"],
+                    values["duplicate_detected_at"],
+                    url,
+                ),
+            )
+        conn.commit()
+
+    return {
+        "processed": len(rows),
+        "keys": sum(1 for values in desired.values() if values["dedupe_key"]),
+        "duplicates": duplicate_count,
+        "groups": duplicate_groups,
+        "dry_run": dry_run,
+    }
 
 
 def create_pipeline_run(
@@ -671,12 +995,19 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     # Total jobs
     stats["total"] = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    stats["duplicates"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE duplicate_of_url IS NOT NULL"
+    ).fetchone()[0]
+    stats["active_total"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE duplicate_of_url IS NULL"
+    ).fetchone()[0]
 
     # By site breakdown
     rows = conn.execute(
         """
         SELECT COALESCE(source_board, strategy, site, 'Unknown') AS source, COUNT(*) as cnt
           FROM jobs
+         WHERE duplicate_of_url IS NULL
          GROUP BY COALESCE(source_board, strategy, site, 'Unknown')
          ORDER BY cnt DESC
         """
@@ -685,55 +1016,56 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     # Enrichment stage
     stats["pending_detail"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL"
+        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["with_description"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["detail_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_error IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE detail_error IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     # Scoring stage
     stats["scored"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["unscored"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND fit_score IS NULL"
+        "WHERE full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     # Score distribution
     dist_rows = conn.execute(
         "SELECT fit_score, COUNT(*) as cnt FROM jobs "
-        "WHERE fit_score IS NOT NULL "
+        "WHERE fit_score IS NOT NULL AND duplicate_of_url IS NULL "
         "GROUP BY fit_score ORDER BY fit_score DESC"
     ).fetchall()
     stats["score_distribution"] = [(row[0], row[1]) for row in dist_rows]
 
     stats["audited"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE audited_at IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE audited_at IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["recommended"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE audit_label IN ('priority', 'recommended')"
+        "WHERE audit_label IN ('priority', 'recommended') AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["audit_excluded"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE audit_label = 'exclude'"
+        "SELECT COUNT(*) FROM jobs WHERE audit_label = 'exclude' AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["diagnosed"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE diagnosed_at IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE diagnosed_at IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["undiagnosed"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE fit_score IS NOT NULL AND full_description IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND (diagnosed_at IS NULL "
         "OR (scored_at IS NOT NULL AND diagnosed_at < scored_at) "
         "OR (audited_at IS NOT NULL AND diagnosed_at < audited_at))"
@@ -741,44 +1073,46 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     # Tailoring stage
     stats["tailored"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE COALESCE(audit_score, fit_score) >= 7 AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL"
+        "AND duplicate_of_url IS NULL AND tailored_resume_path IS NULL"
     ).fetchone()[0]
 
     stats["tailor_exhausted"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE COALESCE(tailor_attempts, 0) >= 5 "
-        "AND tailored_resume_path IS NULL"
+        "AND tailored_resume_path IS NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     # Cover letter stage
     stats["with_cover_letter"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["cover_exhausted"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE COALESCE(cover_attempts, 0) >= 5 "
+        "AND duplicate_of_url IS NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '')"
     ).fetchone()[0]
 
     # Application stage
     stats["applied"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["apply_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
+        "AND duplicate_of_url IS NULL "
         "AND applied_at IS NULL "
         "AND (apply_status IS NULL OR apply_status = 'failed') "
         "AND COALESCE(audit_score, fit_score, 0) >= 7"
@@ -810,7 +1144,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
 def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                site: str, strategy: str) -> tuple[int, int]:
-    """Store discovered jobs, skipping duplicates by URL.
+    """Store discovered jobs, skipping exact URLs and marking same-job duplicates.
 
     Args:
         conn: Database connection.
@@ -821,38 +1155,14 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     Returns:
         Tuple of (new_count, duplicate_count).
     """
-    now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
 
     for job in jobs:
-        url = job.get("url")
-        if not url:
-            continue
-        try:
-            conn.execute(
-                """
-                INSERT INTO jobs (
-                    url, title, salary, description, location, site,
-                    company, source_board, strategy, discovered_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    url,
-                    job.get("title"),
-                    job.get("salary"),
-                    job.get("description"),
-                    job.get("location"),
-                    job.get("company") or site,
-                    job.get("company") or site,
-                    job.get("source_board") or site,
-                    strategy,
-                    now,
-                ),
-            )
+        status = insert_discovered_job(conn, job, site=job.get("company") or site, strategy=strategy)
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()
@@ -879,27 +1189,30 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
 
     conditions = {
         "discovered": "1=1",
-        "pending_detail": "detail_scraped_at IS NULL",
-        "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
-        "scored": "fit_score IS NOT NULL",
+        "pending_detail": "detail_scraped_at IS NULL AND duplicate_of_url IS NULL",
+        "enriched": "full_description IS NOT NULL AND duplicate_of_url IS NULL",
+        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of_url IS NULL",
+        "scored": "fit_score IS NOT NULL AND duplicate_of_url IS NULL",
         "pending_diagnosis": (
             "fit_score IS NOT NULL AND full_description IS NOT NULL "
+            "AND duplicate_of_url IS NULL "
             "AND (diagnosed_at IS NULL "
             "OR (scored_at IS NOT NULL AND diagnosed_at < scored_at) "
             "OR (audited_at IS NOT NULL AND diagnosed_at < audited_at))"
         ),
         "pending_tailor": (
             "COALESCE(audit_score, fit_score) >= ? AND full_description IS NOT NULL "
+            "AND duplicate_of_url IS NULL "
             "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
         ),
-        "tailored": "tailored_resume_path IS NOT NULL",
+        "tailored": "tailored_resume_path IS NOT NULL AND duplicate_of_url IS NULL",
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
+            "AND duplicate_of_url IS NULL "
             "AND (apply_status IS NULL OR apply_status = 'failed') "
             "AND COALESCE(audit_score, fit_score, 0) >= 7"
         ),
-        "applied": "applied_at IS NOT NULL",
+        "applied": "applied_at IS NOT NULL AND duplicate_of_url IS NULL",
     }
 
     where = conditions.get(stage, "1=1")

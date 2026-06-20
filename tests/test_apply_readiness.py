@@ -42,6 +42,7 @@ def test_preapply_readiness_blocks_missing_resume_pdf(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(readiness, "get_connection", lambda: conn)
     monkeypatch.setattr(readiness.config, "is_manual_ats", lambda _url: False)
+    monkeypatch.setattr(readiness.config, "is_auth_gated_application", lambda _url: False)
 
     checks = readiness.collect_preapply_checks(min_score=7, limit=10, stale_days=0)
     summary = readiness.summarize_checks(checks)
@@ -80,9 +81,35 @@ def test_preapply_readiness_flags_duplicate_application_targets(tmp_path: Path, 
 
     monkeypatch.setattr(readiness, "get_connection", lambda: conn)
     monkeypatch.setattr(readiness.config, "is_manual_ats", lambda _url: False)
+    monkeypatch.setattr(readiness.config, "is_auth_gated_application", lambda _url: False)
 
     checks = readiness.collect_preapply_checks(min_score=7, limit=10, stale_days=0)
     summary = readiness.summarize_checks(checks)
 
     assert summary["blocked"] == 2
     assert summary["issue_counts"]["duplicate_application_target"] == 2
+
+
+def test_preapply_readiness_blocks_auth_gated_applications(tmp_path: Path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    resume_path = tmp_path / "resume.txt"
+    resume_path.write_text("resume text", encoding="utf-8")
+    resume_path.with_suffix(".pdf").write_bytes(b"%PDF-1.4\n")
+    _insert_ready_job(
+        conn,
+        url="https://example.com/job/3",
+        title="COO",
+        application_url="https://company.myworkdayjobs.com/login",
+        resume_path=str(resume_path),
+    )
+
+    monkeypatch.setattr(readiness, "get_connection", lambda: conn)
+    monkeypatch.setattr(readiness.config, "is_manual_ats", lambda _url: False)
+    monkeypatch.setattr(readiness.config, "is_auth_gated_application", lambda _url: True)
+
+    checks = readiness.collect_preapply_checks(min_score=7, limit=10, stale_days=0)
+    summary = readiness.summarize_checks(checks)
+
+    assert summary["blocked"] == 1
+    assert checks[0]["severity"] == "blocked"
+    assert "auth_gate" in {issue["code"] for issue in checks[0]["issues"]}

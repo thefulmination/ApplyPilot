@@ -129,6 +129,10 @@ _TIMEOUT = 120  # seconds
 # Keep the first retry long enough for provider-side quota windows to recover.
 _RATE_LIMIT_BASE_WAIT = 10
 
+# HTTP statuses worth retrying with backoff: rate limits + transient 5xx.
+# (403/404 are NOT here -- they are permanent and must not loop.)
+_RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504}
+
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -150,6 +154,9 @@ class LLMClient:
         self._client = httpx.Client(timeout=_TIMEOUT)
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
+        # Minimum output budget for native Gemini calls (raised when the compat
+        # layer returns empty content). 0 = use the caller's max_tokens as-is.
+        self._native_output_floor: int = 0
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
         self._is_deepseek: bool = base_url.startswith(_DEEPSEEK_BASE)
         self.last_usage: dict | None = None
@@ -312,12 +319,15 @@ class LLMClient:
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
+                    native_max = max(max_tokens, self._native_output_floor) if self._native_output_floor else max_tokens
+                    return self._chat_native_gemini(messages, temperature, native_max)
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
             except _GeminiCompatForbidden:
-                # Model not available on OpenAI-compat layer â€” switch to native.
+                # Model not available on OpenAI-compat layer â€” switch to native
+                # and retry via the loop so the native call also gets backoff
+                # handling (a native 429/503 must not escape un-retried).
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
                     "Switching to native generateContent API. "
@@ -325,15 +335,7 @@ class LLMClient:
                     self.model,
                 )
                 self._use_native_gemini = True
-                # Retry immediately with native â€” don't count as a rate-limit wait
-                try:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
-                except httpx.HTTPStatusError as native_exc:
-                    raise RuntimeError(
-                        f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
-                        f"Native: {native_exc.response.status_code} â€” "
-                        f"{native_exc.response.text[:200]}"
-                    ) from native_exc
+                continue
 
             except _GeminiCompatNoContent:
                 log.warning(
@@ -342,15 +344,12 @@ class LLMClient:
                     self.model,
                 )
                 self._use_native_gemini = True
-                return self._chat_native_gemini(
-                    messages,
-                    temperature,
-                    max(max_tokens, _native_min_output_tokens()),
-                )
+                self._native_output_floor = max(self._native_output_floor, _native_min_output_tokens())
+                continue
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
+                if resp.status_code in _RETRYABLE_HTTP and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
                         resp.headers.get("Retry-After")
@@ -365,9 +364,9 @@ class LLMClient:
                         wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
 
                     log.warning(
-                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
-                        "Paid API tiers can still throttle; lower batch size/workers "
-                        "or wait for quota to recover.",
+                        "LLM request failed (HTTP %s). Waiting %ds before retry %d/%d. "
+                        "Transient 5xx and rate limits are retried; lower batch "
+                        "size/workers if 429s persist.",
                         resp.status_code, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
