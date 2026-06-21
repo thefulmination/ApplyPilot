@@ -255,7 +255,7 @@ def generate_cover_letter(
                 )},
             ]
 
-            letter = client.chat(messages, max_tokens=4096, temperature=0.7)
+            letter = client.chat(messages, max_tokens=4096, temperature=0.7, stage="cover")
             letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
             letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 

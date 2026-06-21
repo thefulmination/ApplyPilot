@@ -893,6 +893,74 @@ def reenrich_command(
     console.print()
 
 
+@app.command("usage")
+def usage_command() -> None:
+    """Report LLM token usage and estimated cost per stage and model."""
+    _bootstrap()
+
+    from applypilot.database import get_llm_usage_summary, init_db
+    from rich.table import Table
+
+    init_db()
+    s = get_llm_usage_summary()
+    if not s["total_calls"]:
+        console.print("\n[dim]No LLM usage recorded yet. Run scoring/tailoring/etc. with this build to start tracking.[/dim]\n")
+        return
+
+    table = Table(title="LLM usage by stage", show_header=True, header_style="bold")
+    table.add_column("Stage")
+    for col in ("Calls", "Prompt", "Completion", "Total tokens", "Est. cost"):
+        table.add_column(col, justify="right")
+    for r in s["by_stage"]:
+        cost = f"${r['cost']:.4f}" if r.get("cost") else "-"
+        table.add_row(r["stage"], f"{r['calls']:,}", f"{(r['prompt'] or 0):,}",
+                      f"{(r['completion'] or 0):,}", f"{(r['total'] or 0):,}", cost)
+    console.print()
+    console.print(table)
+    console.print(
+        f"\n[bold]Totals:[/bold] {s['total_calls']:,} calls, {s['total_tokens']:,} tokens, "
+        f"est. ${s['total_cost_usd']:.4f}"
+    )
+    console.print("[dim](Cost is a rough estimate from public list prices; free-tier usage is $0. Token counts are exact.)[/dim]\n")
+
+
+@app.command("analytics")
+def analytics_command() -> None:
+    """Apply funnel, success rate by site, failure reasons, and outcome tracker."""
+    _bootstrap()
+
+    from applypilot.database import get_apply_analytics, init_db
+
+    init_db()
+    a = get_apply_analytics()
+
+    console.print("\n[bold]Apply funnel[/bold]")
+    for status, n in sorted(a["funnel"].items(), key=lambda kv: -kv[1]):
+        console.print(f"  {status:<16} {n:,}")
+
+    if a["success_rate"] is not None:
+        console.print(
+            f"\n[bold]Success rate:[/bold] {a['applied']:,}/{a['attempted']:,} = "
+            f"{a['success_rate'] * 100:.1f}%"
+        )
+    if a["avg_apply_seconds"]:
+        console.print(f"[bold]Avg apply time:[/bold] {a['avg_apply_seconds']:.0f}s")
+
+    if a["by_site"]:
+        console.print("\n[bold]By site (applied / failed)[/bold]")
+        for r in a["by_site"]:
+            console.print(f"  {(r['site'] or '?')[:30]:<30} {r['applied'] or 0:>4} / {r['failed'] or 0}")
+    if a["fail_reasons"]:
+        console.print("\n[bold]Top failure reasons[/bold]")
+        for r in a["fail_reasons"]:
+            console.print(f"  {r['count']:>4}  {(r['reason'] or '?')[:55]}")
+    if a["outcomes"]:
+        console.print("\n[bold]Outcome tracker[/bold]")
+        for status, n in sorted(a["outcomes"].items(), key=lambda kv: -kv[1]):
+            console.print(f"  {status:<16} {n:,}")
+    console.print()
+
+
 @app.command("audit-scores")
 def audit_scores_command(
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped score_audits folder."),

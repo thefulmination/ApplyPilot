@@ -39,6 +39,10 @@ DEFAULT_SOURCES = [
     "yc_jobs",
     "builtin",
     "chief_of_staff_jobs",
+    "remoteok",
+    "himalayas",
+    "jobicy",
+    "weworkremotely",
 ]
 DEFAULT_THE_MUSE_CATEGORIES = [
     "Business Operations",
@@ -645,6 +649,227 @@ def _discover_chief_of_staff_jobs(
     return jobs
 
 
+# -- Remote-board feeds: RemoteOK / Himalayas / Jobicy (JSON) + WeWorkRemotely (RSS) --
+
+def _fmt_range(lo: Any, hi: Any, prefix: str = "$") -> str | None:
+    """Format a (min,max) pair as a salary string, or None if not numeric."""
+    try:
+        if lo and hi:
+            return f"{prefix}{int(lo):,}-{prefix}{int(hi):,}"
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _from_remoteok(raw: dict) -> dict | None:
+    # RemoteOK's /api returns a list whose first element is a legal notice
+    # (no id/position) -- skip it.
+    if not isinstance(raw, dict) or not raw.get("id") or not raw.get("position"):
+        return None
+    url = raw.get("url") or raw.get("apply_url")
+    if not url:
+        return None
+    full = _plain_text(raw.get("description"))
+    company = raw.get("company")
+    return {
+        "url": url,
+        "title": raw.get("position"),
+        "salary": _fmt_range(raw.get("salary_min"), raw.get("salary_max")),
+        "description": (full or "")[:500] if full else None,
+        "full_description": full,
+        "location": raw.get("location") or "Remote",
+        "site": company or "RemoteOK",
+        "company": company,
+        "source_board": "remoteok",
+        "strategy": "public_board:remoteok",
+        "application_url": raw.get("apply_url") or url,
+    }
+
+
+def _discover_remoteok(session, cfg, accept_locs, reject_locs) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("results_per_source", 300) or 300)
+    query_terms = _search_queries(cfg)
+    data = _fetch_json(session, "https://remoteok.com/api")
+    items = data if isinstance(data, list) else []
+    jobs: list[dict] = []
+    for raw in items:
+        job = _from_remoteok(raw)
+        if not job:
+            continue
+        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+            continue
+        if not _job_matches_queries(job, query_terms):
+            continue
+        jobs.append(job)
+        if len(jobs) >= per_source:
+            break
+    return jobs
+
+
+def _from_himalayas(raw: dict) -> dict | None:
+    url = raw.get("guid") or raw.get("applicationLink") or raw.get("url")
+    if not url:
+        return None
+    full = _plain_text(raw.get("description")) or _plain_text(raw.get("excerpt"))
+    locs = raw.get("locationRestrictions")
+    location = ", ".join(str(x) for x in locs) if isinstance(locs, list) and locs else "Remote"
+    company = raw.get("companyName")
+    return {
+        "url": url,
+        "title": raw.get("title"),
+        "salary": _fmt_range(raw.get("minSalary"), raw.get("maxSalary")),
+        "description": (full or "")[:500] if full else None,
+        "full_description": full,
+        "location": location,
+        "site": company or "Himalayas",
+        "company": company,
+        "source_board": "himalayas",
+        "strategy": "public_board:himalayas",
+        "application_url": raw.get("applicationLink") or url,
+    }
+
+
+def _discover_himalayas(session, cfg, accept_locs, reject_locs) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("results_per_source", 300) or 300)
+    query_terms = _search_queries(cfg)
+    data = _fetch_json(session, "https://himalayas.app/jobs/api", params={"limit": min(per_source, 100)})
+    jobs: list[dict] = []
+    for raw in data.get("jobs") or []:
+        job = _from_himalayas(raw)
+        if not job:
+            continue
+        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+            continue
+        if not _job_matches_queries(job, query_terms):
+            continue
+        jobs.append(job)
+        if len(jobs) >= per_source:
+            break
+    return jobs
+
+
+def _from_jobicy(raw: dict) -> dict | None:
+    url = raw.get("url")
+    if not url:
+        return None
+    full = _plain_text(raw.get("jobDescription")) or _plain_text(raw.get("jobExcerpt"))
+    company = raw.get("companyName")
+    return {
+        "url": url,
+        "title": raw.get("jobTitle"),
+        "salary": _fmt_range(raw.get("annualSalaryMin"), raw.get("annualSalaryMax"),
+                             prefix=f"{raw.get('salaryCurrency') or 'USD'} ".replace("USD ", "$")),
+        "description": (full or "")[:500] if full else None,
+        "full_description": full,
+        "location": raw.get("jobGeo") or "Remote",
+        "site": company or "Jobicy",
+        "company": company,
+        "source_board": "jobicy",
+        "strategy": "public_board:jobicy",
+        "application_url": url,
+    }
+
+
+def _discover_jobicy(session, cfg, accept_locs, reject_locs) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("results_per_source", 300) or 300)
+    query_terms = _search_queries(cfg)
+    data = _fetch_json(session, "https://jobicy.com/api/v2/remote-jobs", params={"count": min(per_source, 50)})
+    jobs: list[dict] = []
+    for raw in data.get("jobs") or []:
+        job = _from_jobicy(raw)
+        if not job:
+            continue
+        if not _location_ok(job.get("location"), accept_locs, reject_locs):
+            continue
+        if not _job_matches_queries(job, query_terms):
+            continue
+        jobs.append(job)
+        if len(jobs) >= per_source:
+            break
+    return jobs
+
+
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
+_WWR_ITEM_RE = re.compile(r"<item>(.*?)</item>", re.S | re.I)
+DEFAULT_WWR_CATEGORIES = [
+    "remote-management-and-finance-jobs",
+    "remote-business-jobs",
+    "remote-sales-and-marketing-jobs",
+    "remote-product-jobs",
+]
+
+
+def _rss_field(block: str, tag: str) -> str | None:
+    """Extract one RSS element's text (CDATA-aware) without an XML parser
+    (BeautifulSoup's html.parser treats <link> as void, which breaks RSS)."""
+    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", block, re.S | re.I)
+    if not m:
+        return None
+    val = m.group(1)
+    cd = _CDATA_RE.search(val)
+    if cd:
+        val = cd.group(1)
+    return val.strip() or None
+
+
+def _from_wwr_block(block: str) -> dict | None:
+    url = _rss_field(block, "link")
+    raw_title = _rss_field(block, "title")
+    if not url or not raw_title:
+        return None
+    # WeWorkRemotely titles are "Company: Position".
+    company, sep, position = raw_title.partition(":")
+    company, position = company.strip(), position.strip()
+    if not sep or not position:
+        position, company = raw_title.strip(), ""
+    full = _plain_text(_rss_field(block, "description"))
+    return {
+        "url": url,
+        "title": position,
+        "salary": None,
+        "description": (full or position)[:500],
+        "full_description": full,
+        "location": _rss_field(block, "region") or "Remote",
+        "site": company or "WeWorkRemotely",
+        "company": company or None,
+        "source_board": "weworkremotely",
+        "strategy": "public_board:weworkremotely",
+        "application_url": url,
+    }
+
+
+def _discover_weworkremotely(session, cfg, accept_locs, reject_locs) -> list[dict]:
+    board_cfg = cfg.get("public_boards", {}) or {}
+    per_source = int(board_cfg.get("results_per_source", 300) or 300)
+    categories = board_cfg.get("weworkremotely_categories") or DEFAULT_WWR_CATEGORIES
+    query_terms = _search_queries(cfg)
+    jobs: list[dict] = []
+    seen: set[str] = set()
+    for category in categories:
+        try:
+            xml = _fetch_html(session, f"https://weworkremotely.com/categories/{category}.rss")
+        except Exception as e:
+            log.warning("[public:weworkremotely] %s failed: %s", category, e)
+            continue
+        for block in _WWR_ITEM_RE.findall(xml):
+            job = _from_wwr_block(block)
+            if not job or job["url"] in seen:
+                continue
+            seen.add(job["url"])
+            if not _location_ok(job.get("location"), accept_locs, reject_locs):
+                continue
+            if not _job_matches_queries(job, query_terms):
+                continue
+            jobs.append(job)
+            if len(jobs) >= per_source:
+                return jobs
+        time.sleep(0.2)
+    return jobs
+
+
 DISCOVERERS = {
     "the_muse": _discover_the_muse,
     "remotejobs_org": _discover_remotejobs_org,
@@ -654,6 +879,10 @@ DISCOVERERS = {
     "yc_jobs": _discover_yc_jobs,
     "builtin": _discover_builtin,
     "chief_of_staff_jobs": _discover_chief_of_staff_jobs,
+    "remoteok": _discover_remoteok,
+    "himalayas": _discover_himalayas,
+    "jobicy": _discover_jobicy,
+    "weworkremotely": _discover_weworkremotely,
 }
 
 

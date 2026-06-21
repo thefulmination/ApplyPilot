@@ -169,7 +169,7 @@ def score_job(
 
     try:
         client = get_client(stage="score")
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.chat(messages, max_tokens=512, temperature=0.2, stage="score")
         parsed = _parse_score_response(response)
         parsed["model"] = client.model
         parsed["provider"] = client.provider_name

@@ -505,7 +505,7 @@ def judge_tailored_resume(
     ]
 
     client = get_client(stage="judge")
-    response = client.chat(messages, max_tokens=2048, temperature=0.1)
+    response = client.chat(messages, max_tokens=2048, temperature=0.1, stage="tailor")
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -590,7 +590,7 @@ def tailor_resume(
             ]
 
             try:
-                raw = client.chat(messages, max_tokens=8192, temperature=0.4)
+                raw = client.chat(messages, max_tokens=8192, temperature=0.4, stage="tailor")
             except Exception as exc:
                 report["model_attempts"].append(
                     {

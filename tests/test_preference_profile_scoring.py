@@ -89,7 +89,7 @@ def test_score_job_survives_malformed_preference_profile(monkeypatch) -> None:
         model = "m"
         provider_name = "p"
 
-        def chat(self, messages, max_tokens, temperature):
+        def chat(self, messages, max_tokens, temperature, stage=None):
             return "SCORE: 6\nKEYWORDS: x\nREASONING: ok"
 
     monkeypatch.setattr(scorer, "get_client", lambda stage: FakeClient())
@@ -109,7 +109,7 @@ def test_score_job_includes_preference_profile_in_llm_prompt(monkeypatch) -> Non
         model = "test-model"
         provider_name = "test-provider"
 
-        def chat(self, messages: list[dict], max_tokens: int, temperature: float) -> str:
+        def chat(self, messages: list[dict], max_tokens: int, temperature: float, stage: str | None = None) -> str:
             captured_messages.extend(messages)
             return "SCORE: 8\nKEYWORDS: chief of staff, partnerships\nREASONING: Strong preference fit."
 
@@ -143,7 +143,7 @@ def test_score_job_includes_knowledge_graph_in_llm_prompt(monkeypatch) -> None:
         model = "test-model"
         provider_name = "test-provider"
 
-        def chat(self, messages: list[dict], max_tokens: int, temperature: float) -> str:
+        def chat(self, messages: list[dict], max_tokens: int, temperature: float, stage: str | None = None) -> str:
             captured_messages.extend(messages)
             return "SCORE: 7\nKEYWORDS: quantitative finance\nREASONING: Factual match citing education:stevens-quantitative-finance-bs."
 

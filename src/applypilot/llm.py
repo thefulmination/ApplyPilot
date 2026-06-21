@@ -301,13 +301,29 @@ class LLMClient:
 
     # -- public API ---------------------------------------------------------
 
+    def _record_usage(self, stage: str | None) -> None:
+        """Persist the last call's token usage (best-effort, never raises)."""
+        if not stage or not self.last_usage:
+            return
+        try:
+            from applypilot.database import record_llm_usage
+            record_llm_usage(stage, self.model, self.provider_name, self.last_usage,
+                             est_cost_usd=_estimate_cost(self.model, self.last_usage))
+        except Exception:
+            pass
+
     def chat(
         self,
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        stage: str | None = None,
     ) -> str:
-        """Send a chat completion request and return the assistant message text."""
+        """Send a chat completion request and return the assistant message text.
+
+        If `stage` is given, the call's token usage is persisted to the llm_usage
+        table for cost reporting (`applypilot usage`).
+        """
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
         # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
@@ -320,9 +336,13 @@ class LLMClient:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
                     native_max = max(max_tokens, self._native_output_floor) if self._native_output_floor else max_tokens
-                    return self._chat_native_gemini(messages, temperature, native_max)
+                    result = self._chat_native_gemini(messages, temperature, native_max)
+                    self._record_usage(stage)
+                    return result
 
-                return self._chat_compat(messages, temperature, max_tokens)
+                result = self._chat_compat(messages, temperature, max_tokens)
+                self._record_usage(stage)
+                return result
 
             except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer â€” switch to native
@@ -447,6 +467,34 @@ def _normalize_gemini_usage(usage: dict) -> dict:
         "thinking_tokens": usage.get("thoughtsTokenCount"),
         "total_tokens": usage.get("totalTokenCount"),
     }
+
+
+# Approximate USD per 1M tokens (input, output) -- for cost ESTIMATION only.
+# Free-tier usage is really $0; these let `applypilot usage` show a rough paid
+# cost. Matched by substring; unknown models report tokens but no cost.
+_MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-2.5-pro": (1.25, 10.0),
+    "gemini-1.5-pro": (1.25, 5.0),
+    "deepseek": (0.27, 1.10),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.0),
+    "gpt-5": (1.25, 10.0),
+}
+
+
+def _estimate_cost(model: str | None, usage: dict | None) -> float | None:
+    if not model or not usage:
+        return None
+    m = model.lower()
+    rate = next((p for key, p in _MODEL_PRICES.items() if key in m), None)
+    if rate is None:
+        return None
+    pin = float(usage.get("prompt_tokens") or 0)
+    pout = float(usage.get("completion_tokens") or 0) + float(usage.get("thinking_tokens") or 0)
+    return round(pin / 1e6 * rate[0] + pout / 1e6 * rate[1], 6)
 
 
 # ---------------------------------------------------------------------------

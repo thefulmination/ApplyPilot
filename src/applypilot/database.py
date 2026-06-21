@@ -544,11 +544,174 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
             FOREIGN KEY(run_id) REFERENCES pipeline_runs(id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            stage                 TEXT,
+            model                 TEXT,
+            provider              TEXT,
+            prompt_tokens         INTEGER DEFAULT 0,
+            completion_tokens     INTEGER DEFAULT 0,
+            thinking_tokens       INTEGER DEFAULT 0,
+            total_tokens          INTEGER DEFAULT 0,
+            est_cost_usd          REAL,
+            created_at            TEXT NOT NULL
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started_at ON pipeline_runs(started_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_stage ON pipeline_stage_runs(stage)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_stage ON llm_usage(stage)")
     conn.commit()
+
+
+def record_llm_usage(
+    stage: str | None,
+    model: str | None,
+    provider: str | None,
+    usage: dict | None,
+    est_cost_usd: float | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Persist one LLM call's token usage (best-effort; never raises).
+
+    `usage` is the LLMClient.last_usage dict (prompt/completion/thinking/total).
+    """
+    if not usage:
+        return
+    if conn is None:
+        conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO llm_usage (stage, model, provider, prompt_tokens,
+                completion_tokens, thinking_tokens, total_tokens, est_cost_usd, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stage, model, provider,
+                int(usage.get("prompt_tokens") or 0),
+                int(usage.get("completion_tokens") or 0),
+                int(usage.get("thinking_tokens") or 0),
+                int(usage.get("total_tokens") or 0),
+                est_cost_usd,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass  # usage logging must never break a real LLM call
+
+
+def get_llm_usage_summary(conn: sqlite3.Connection | None = None) -> dict:
+    """Aggregate LLM token usage and estimated cost by stage and by model."""
+    if conn is None:
+        conn = get_connection()
+    by_stage = [
+        dict(zip(("stage", "calls", "prompt", "completion", "thinking", "total", "cost"), row))
+        for row in conn.execute(
+            """
+            SELECT COALESCE(stage, '?'), COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+                   SUM(thinking_tokens), SUM(total_tokens), SUM(est_cost_usd)
+              FROM llm_usage GROUP BY stage ORDER BY SUM(total_tokens) DESC
+            """
+        ).fetchall()
+    ]
+    by_model = [
+        dict(zip(("model", "calls", "total", "cost"), row))
+        for row in conn.execute(
+            """
+            SELECT COALESCE(model, '?'), COUNT(*), SUM(total_tokens), SUM(est_cost_usd)
+              FROM llm_usage GROUP BY model ORDER BY SUM(total_tokens) DESC
+            """
+        ).fetchall()
+    ]
+    totals = conn.execute(
+        "SELECT COUNT(*), SUM(total_tokens), SUM(est_cost_usd) FROM llm_usage"
+    ).fetchone()
+    return {
+        "by_stage": by_stage,
+        "by_model": by_model,
+        "total_calls": totals[0] or 0,
+        "total_tokens": totals[1] or 0,
+        "total_cost_usd": totals[2] or 0.0,
+    }
+
+
+def get_apply_analytics(conn: sqlite3.Connection | None = None) -> dict:
+    """Apply funnel + success-rate analytics from the jobs/applications tables."""
+    if conn is None:
+        conn = get_connection()
+
+    funnel = {
+        (row[0] or "(unattempted)"): row[1]
+        for row in conn.execute(
+            "SELECT apply_status, COUNT(*) FROM jobs WHERE duplicate_of_url IS NULL GROUP BY apply_status"
+        ).fetchall()
+    }
+    applied = funnel.get("applied", 0)
+    terminal_fail = sum(
+        n for s, n in funnel.items()
+        if s not in ("applied", "in_progress", "(unattempted)", "manual")
+    )
+    attempted = applied + terminal_fail
+    success_rate = (applied / attempted) if attempted else None
+
+    by_site = [
+        dict(zip(("site", "applied", "failed"), row))
+        for row in conn.execute(
+            """
+            SELECT site,
+                   SUM(CASE WHEN apply_status = 'applied' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN apply_status IS NOT NULL AND apply_status NOT IN
+                            ('applied', 'in_progress', 'manual') THEN 1 ELSE 0 END)
+              FROM jobs
+             WHERE apply_status IS NOT NULL AND apply_status != 'in_progress'
+             GROUP BY site
+             ORDER BY 2 DESC, 3 DESC
+             LIMIT 15
+            """
+        ).fetchall()
+    ]
+    fail_reasons = [
+        dict(zip(("reason", "count"), row))
+        for row in conn.execute(
+            """
+            SELECT COALESCE(apply_error, 'unknown'), COUNT(*)
+              FROM jobs
+             WHERE apply_status IS NOT NULL
+               AND apply_status NOT IN ('applied', 'in_progress', 'manual')
+             GROUP BY apply_error ORDER BY 2 DESC LIMIT 12
+            """
+        ).fetchall()
+    ]
+    avg_ms = conn.execute(
+        "SELECT AVG(apply_duration_ms) FROM jobs WHERE apply_duration_ms IS NOT NULL"
+    ).fetchone()[0]
+
+    # Outcome funnel from the application tracker (interview/offer/rejected/...)
+    outcomes: dict[str, int] = {}
+    try:
+        outcomes = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT status, COUNT(*) FROM applications GROUP BY status"
+            ).fetchall()
+        }
+    except sqlite3.OperationalError:
+        pass  # applications table may not exist yet
+
+    return {
+        "funnel": funnel,
+        "applied": applied,
+        "attempted": attempted,
+        "success_rate": success_rate,
+        "by_site": by_site,
+        "fail_reasons": fail_reasons,
+        "avg_apply_seconds": (avg_ms / 1000.0) if avg_ms else None,
+        "outcomes": outcomes,
+    }
 
 
 _COMPANY_SUFFIXES = {

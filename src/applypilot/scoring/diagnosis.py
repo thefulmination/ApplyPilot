@@ -188,7 +188,7 @@ def diagnose_job(resume_text: str, job: dict[str, Any]) -> FitDiagnosis:
 
     try:
         client = get_client(stage="diagnose")
-        response = client.chat(messages, max_tokens=1400, temperature=0.1)
+        response = client.chat(messages, max_tokens=1400, temperature=0.1, stage="diagnose")
         return _normalize_diagnosis(
             _json_from_response(response),
             model=client.model,
