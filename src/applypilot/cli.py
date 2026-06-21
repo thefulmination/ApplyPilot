@@ -763,6 +763,31 @@ def export_applications_command(
     console.print()
 
 
+@app.command("export-outcomes")
+def export_outcomes_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped application_exports folder."),
+) -> None:
+    """Export per-job application outcomes (keyed by url) for the recommendation engine.
+
+    This is the learning loop's return leg: feed outcomes.jsonl back into brainstorm
+    so it can correlate its scores with which jobs actually reached interview/offer.
+    """
+    _bootstrap()
+
+    from applypilot.applications import export_outcomes
+
+    result = export_outcomes(output_dir=output)
+    console.print("\n[bold green]Outcomes export complete[/bold green]")
+    console.print(f"  Outcomes exported: {result['outcomes_exported']}")
+    for stage, n in result["by_stage"].items():
+        console.print(f"    {stage:<16} {n}")
+    console.print(f"  JSONL: {result['jsonl_path']}")
+    console.print(
+        "\n[dim]In brainstorm: npm run applypilot:outcomes -- "
+        f"--outcomes={result['jsonl_path']}[/dim]\n"
+    )
+
+
 @app.command()
 def dashboard() -> None:
     """Generate and open the HTML dashboard in your browser."""

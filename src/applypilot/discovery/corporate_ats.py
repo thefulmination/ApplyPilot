@@ -32,7 +32,7 @@ from applypilot.discovery.jobspy import _load_location_config, _location_ok
 log = logging.getLogger(__name__)
 _CACHE_LOCK = threading.Lock()
 
-DEFAULT_SOURCES = ["greenhouse", "lever", "ashby"]
+DEFAULT_SOURCES = ["greenhouse", "lever", "ashby", "smartrecruiters", "workable"]
 DEFAULT_TIMEOUT = 12
 DEFAULT_WORKERS = 6
 DEFAULT_RESULTS_PER_COMPANY = 80
@@ -525,6 +525,95 @@ def _fetch_ashby(
     return True, jobs
 
 
+def _fetch_smartrecruiters(
+    company: str,
+    token: str,
+    request_options: dict,
+    results_limit: int,
+) -> tuple[bool, list[dict]]:
+    limit_param = max(1, min(int(results_limit) or 100, 100))
+    url = (
+        f"https://api.smartrecruiters.com/v1/companies/{quote(token)}/postings"
+        f"?limit={limit_param}"
+    )
+    status, data = _request_json(url, request_options)
+    if status in NOT_FOUND_STATUS_CODES or not isinstance(data, dict):
+        return False, []
+
+    jobs: list[dict] = []
+    for item in data.get("content", [])[:results_limit]:
+        if not isinstance(item, dict):
+            continue
+        posting_id = item.get("id")
+        loc = item.get("location") or {}
+        parts = [loc.get("city"), loc.get("region"), loc.get("country")]
+        if loc.get("remote"):
+            parts.append("Remote")
+        location = ", ".join(str(p) for p in parts if p) or None
+        department = item.get("department")
+        if isinstance(department, dict):
+            department = department.get("label")
+        # The list endpoint omits the body; enrich fills full_description later.
+        public_url = f"https://jobs.smartrecruiters.com/{quote(token)}/{posting_id}"
+        jobs.append({
+            "url": public_url,
+            "title": item.get("name"),
+            "salary": None,
+            "description": None,
+            "full_description": None,
+            "location": location,
+            "application_url": public_url,
+            "company": company,
+            "department": department,
+            "strategy": "smartrecruiters_api",
+        })
+    return True, jobs
+
+
+def _fetch_workable(
+    company: str,
+    token: str,
+    request_options: dict,
+    results_limit: int,
+) -> tuple[bool, list[dict]]:
+    url = f"https://apply.workable.com/api/v1/widget/accounts/{quote(token)}?details=true"
+    status, data = _request_json(url, request_options)
+    if status in NOT_FOUND_STATUS_CODES or not isinstance(data, dict):
+        return False, []
+
+    jobs: list[dict] = []
+    for item in data.get("jobs", [])[:results_limit]:
+        if not isinstance(item, dict):
+            continue
+        body = _html_to_text(item.get("description"))
+        reqs = _html_to_text(item.get("requirements"))
+        full_description = "\n\n".join(p for p in (body, reqs) if p) or None
+        loc = item.get("location") or {}
+        parts = [loc.get("city"), loc.get("region"), loc.get("country")]
+        if loc.get("telecommuting") or str(loc.get("workplace", "")).lower() == "remote":
+            parts.append("Remote")
+        location = ", ".join(str(p) for p in parts if p) or None
+        shortcode = item.get("shortcode")
+        public_url = (
+            item.get("url")
+            or item.get("application_url")
+            or f"https://apply.workable.com/{quote(token)}/j/{shortcode}/"
+        )
+        jobs.append({
+            "url": public_url,
+            "title": item.get("title"),
+            "salary": None,
+            "description": full_description[:500] if full_description else None,
+            "full_description": full_description,
+            "location": location,
+            "application_url": item.get("application_url") or public_url,
+            "company": company,
+            "department": item.get("department"),
+            "strategy": "workable_api",
+        })
+    return True, jobs
+
+
 def _load_cache(ats_cfg: dict) -> dict:
     if not _truthy_config(ats_cfg.get("cache_enabled", True)):
         return {"entries": {}}
@@ -643,6 +732,10 @@ def _fetch_source(
         return _fetch_lever(company, token, request_options, results_limit, eu=True)
     if source == "ashby":
         return _fetch_ashby(company, token, request_options, results_limit)
+    if source == "smartrecruiters":
+        return _fetch_smartrecruiters(company, token, request_options, results_limit)
+    if source == "workable":
+        return _fetch_workable(company, token, request_options, results_limit)
     raise ValueError(f"Unsupported corporate ATS source: {source}")
 
 

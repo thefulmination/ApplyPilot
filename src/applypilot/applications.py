@@ -354,6 +354,98 @@ def application_events(job_ref: str, limit: int = 25) -> list[dict[str, Any]]:
     return [_row_to_dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
+# Map fine-grained tracker statuses to a coarse outcome stage for the
+# brainstorm learning loop (so it can correlate its scores with real results).
+_OUTCOME_STAGE = {
+    "applied": "applied",
+    "followed_up": "applied",
+    "auth_required": "applied",
+    "assisted": "applied",
+    "recruiter_screen": "interview",
+    "hiring_manager": "interview",
+    "assessment": "interview",
+    "final": "interview",
+    "offer": "offer",
+    "rejected": "rejected",
+    "closed": "rejected",
+    "withdrawn": "rejected",
+}
+
+
+def _outcome_stage(tracker_status: str | None, apply_status: str | None) -> str:
+    if tracker_status and tracker_status in _OUTCOME_STAGE:
+        return _OUTCOME_STAGE[tracker_status]
+    if apply_status == "applied":
+        return "applied"
+    if apply_status and apply_status not in ("in_progress", "manual"):
+        return "failed_to_apply"
+    return "unknown"
+
+
+def export_outcomes(output_dir: str | Path | None = None) -> dict[str, Any]:
+    """Export per-job application OUTCOMES (keyed by url) for the brainstorm
+    learning loop. This is the return leg: brainstorm joins these back by
+    sourceUrl to learn which of the jobs it scored/approved actually advanced to
+    interview/offer vs were rejected.
+    """
+    conn = get_connection()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    destination = Path(output_dir) if output_dir else APPLICATION_EXPORT_DIR / timestamp
+    destination.mkdir(parents=True, exist_ok=True)
+    now = _now()
+
+    rows = conn.execute(
+        """
+        SELECT j.url, j.application_url, j.apply_status, j.applied_at,
+               j.fit_score, j.audit_score, j.external_decision_score,
+               j.decision_source, j.decision_verdict,
+               a.status AS tracker_status, a.last_status_at
+          FROM jobs j
+          LEFT JOIN applications a ON a.job_url = j.url
+         WHERE j.apply_status IS NOT NULL OR a.status IS NOT NULL
+        """
+    ).fetchall()
+
+    records: list[dict[str, Any]] = []
+    stage_counts: dict[str, int] = {}
+    for row in rows:
+        r = _row_to_dict(row)
+        stage = _outcome_stage(r.get("tracker_status"), r.get("apply_status"))
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+        records.append({
+            "url": r.get("url"),
+            "application_url": r.get("application_url"),
+            "outcome": stage,
+            "apply_status": r.get("apply_status"),
+            "tracker_status": r.get("tracker_status"),
+            "applied_at": r.get("applied_at"),
+            "last_status_at": r.get("last_status_at"),
+            "fit_score": r.get("fit_score"),
+            "audit_score": r.get("audit_score"),
+            "external_decision_score": r.get("external_decision_score"),
+            "decision_source": r.get("decision_source"),
+            "decision_verdict": r.get("decision_verdict"),
+            "observed_at": now,
+        })
+
+    jsonl_path = destination / "outcomes.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    summary = {
+        "exported_at": now,
+        "outcomes_exported": len(records),
+        "by_stage": dict(sorted(stage_counts.items(), key=lambda kv: -kv[1])),
+        "jsonl_path": str(jsonl_path),
+        "output_dir": str(destination),
+    }
+    (destination / "outcomes_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    return summary
+
+
 def export_applications(output_dir: str | Path | None = None) -> dict[str, Any]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     destination = Path(output_dir) if output_dir else APPLICATION_EXPORT_DIR / timestamp

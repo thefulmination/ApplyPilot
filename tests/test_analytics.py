@@ -52,3 +52,31 @@ def test_apply_analytics(tmp_path):
     assert sites["LinkedIn"]["applied"] == 1 and sites["LinkedIn"]["failed"] == 1
     reasons = {r["reason"] for r in a["fail_reasons"]}
     assert "captcha" in reasons and "auth_required" in reasons
+
+
+def test_export_outcomes(tmp_path, monkeypatch):
+    import json
+    from applypilot import database, applications
+
+    conn = database.init_db(tmp_path / "c.db")
+    monkeypatch.setattr(applications, "get_connection", lambda: conn)
+
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, apply_status, applied_at, fit_score, "
+        "audit_score, external_decision_score, decision_source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("https://x/1", "T", "Co", "applied", "2026-06-01", 7, 9.0, 9.0, "brainstorm"),
+    )
+    conn.commit()
+    # Advance the tracker to a recruiter screen (an interview-stage outcome).
+    applications.record_application("https://x/1", status="recruiter_screen",
+                                    channel="manual", update_job=False)
+
+    out = applications.export_outcomes(output_dir=tmp_path / "exp")
+
+    assert out["outcomes_exported"] == 1
+    assert out["by_stage"]["interview"] == 1
+    recs = [json.loads(line) for line in (tmp_path / "exp" / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert recs[0]["url"] == "https://x/1"
+    assert recs[0]["outcome"] == "interview"           # recruiter_screen -> interview
+    assert recs[0]["external_decision_score"] == 9.0   # carries brainstorm's score for correlation
