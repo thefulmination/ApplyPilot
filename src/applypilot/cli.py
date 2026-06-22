@@ -1052,7 +1052,21 @@ def usage_command() -> None:
         f"\n[bold]Totals:[/bold] {s['total_calls']:,} calls, {s['total_tokens']:,} tokens, "
         f"est. ${s['total_cost_usd']:.4f}"
     )
-    console.print("[dim](Cost is a rough estimate from public list prices; free-tier usage is $0. Token counts are exact.)[/dim]\n")
+    console.print("[dim](Cost is a rough estimate from public list prices; free-tier usage is $0. Token counts are exact.)[/dim]")
+
+    if s.get("by_variant"):
+        vtable = Table(title="Prompt variant tracking (MAB)", show_header=True, header_style="bold cyan")
+        vtable.add_column("Variant")
+        vtable.add_column("Stage")
+        for col in ("Calls", "Total tokens", "Est. cost"):
+            vtable.add_column(col, justify="right")
+        for r in s["by_variant"]:
+            cost = f"${r['cost']:.4f}" if r.get("cost") else "-"
+            vtable.add_row(r["variant"], r["stage"], f"{r['calls']:,}",
+                           f"{(r['total'] or 0):,}", cost)
+        console.print()
+        console.print(vtable)
+    console.print()
 
 
 @app.command("analytics")
@@ -1060,7 +1074,8 @@ def analytics_command() -> None:
     """Apply funnel, success rate by site, failure reasons, and outcome tracker."""
     _bootstrap()
 
-    from applypilot.database import get_apply_analytics, init_db
+    from applypilot.database import get_apply_analytics, get_scrape_quality_report, init_db
+    from rich.table import Table
 
     init_db()
     a = get_apply_analytics()
@@ -1089,6 +1104,34 @@ def analytics_command() -> None:
         console.print("\n[bold]Outcome tracker[/bold]")
         for status, n in sorted(a["outcomes"].items(), key=lambda kv: -kv[1]):
             console.print(f"  {status:<16} {n:,}")
+
+    try:
+        sqr = get_scrape_quality_report()
+        boards_with_issues = [b for b in sqr["boards"] if b["null_rate"] > 0]
+        if boards_with_issues:
+            qtable = Table(title="Scrape quality by board (null rate)", show_header=True, header_style="bold yellow")
+            qtable.add_column("Board")
+            qtable.add_column("Total", justify="right")
+            qtable.add_column("Null rate", justify="right")
+            qtable.add_column("Missing title", justify="right")
+            qtable.add_column("Missing desc", justify="right")
+            qtable.add_column("Missing loc", justify="right")
+            qtable.add_column("Missing co", justify="right")
+            for b in boards_with_issues[:20]:
+                rate_str = f"{b['null_rate'] * 100:.1f}%"
+                style = "red" if b["null_rate"] >= 0.20 else "yellow" if b["null_rate"] >= 0.05 else ""
+                nc = b["null_counts"]
+                qtable.add_row(
+                    b["board"], f"{b['total']:,}",
+                    f"[{style}]{rate_str}[/{style}]" if style else rate_str,
+                    str(nc.get("title", 0)), str(nc.get("full_description", 0)),
+                    str(nc.get("location", 0)), str(nc.get("company", 0)),
+                )
+            console.print()
+            console.print(qtable)
+            console.print("[dim](Null rate >= 20% may indicate selector drift or anti-bot substitution.)[/dim]")
+    except Exception:
+        pass
     console.print()
 
 

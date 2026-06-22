@@ -301,14 +301,15 @@ class LLMClient:
 
     # -- public API ---------------------------------------------------------
 
-    def _record_usage(self, stage: str | None) -> None:
+    def _record_usage(self, stage: str | None, prompt_variant: str | None = None) -> None:
         """Persist the last call's token usage (best-effort, never raises)."""
         if not stage or not self.last_usage:
             return
         try:
             from applypilot.database import record_llm_usage
             record_llm_usage(stage, self.model, self.provider_name, self.last_usage,
-                             est_cost_usd=_estimate_cost(self.model, self.last_usage))
+                             est_cost_usd=_estimate_cost(self.model, self.last_usage),
+                             prompt_variant=prompt_variant)
         except Exception:
             pass
 
@@ -318,11 +319,13 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 4096,
         stage: str | None = None,
+        prompt_variant: str | None = None,
     ) -> str:
         """Send a chat completion request and return the assistant message text.
 
         If `stage` is given, the call's token usage is persisted to the llm_usage
         table for cost reporting (`applypilot usage`).
+        `prompt_variant` tags which A/B prompt template was used (MAB tracking).
         """
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
         # reasoning, saving tokens on structured extraction tasks.
@@ -337,11 +340,11 @@ class LLMClient:
                 if self._use_native_gemini:
                     native_max = max(max_tokens, self._native_output_floor) if self._native_output_floor else max_tokens
                     result = self._chat_native_gemini(messages, temperature, native_max)
-                    self._record_usage(stage)
+                    self._record_usage(stage, prompt_variant)
                     return result
 
                 result = self._chat_compat(messages, temperature, max_tokens)
-                self._record_usage(stage)
+                self._record_usage(stage, prompt_variant)
                 return result
 
             except _GeminiCompatForbidden:

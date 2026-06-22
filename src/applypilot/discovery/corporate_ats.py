@@ -28,6 +28,8 @@ from bs4 import BeautifulSoup
 from applypilot import config
 from applypilot.database import get_connection, init_db, insert_discovered_job
 from applypilot.discovery.jobspy import _load_location_config, _location_ok
+from applypilot.discovery.resilience import get_board_breaker, jitter_backoff
+from applypilot.discovery.schema import validate_jobs
 
 log = logging.getLogger(__name__)
 _CACHE_LOCK = threading.Lock()
@@ -351,7 +353,7 @@ def _request_json(url: str, request_options: dict) -> tuple[int, dict | list | N
         except (requests.Timeout, requests.ConnectionError) as e:
             last_error = e
             if attempt < attempts:
-                time.sleep(backoff * attempt)
+                time.sleep(jitter_backoff(attempt, base=backoff))
                 continue
             raise CorporateAtsRequestError(str(e), retryable=True) from e
 
@@ -359,7 +361,7 @@ def _request_json(url: str, request_options: dict) -> tuple[int, dict | list | N
         if status in NOT_FOUND_STATUS_CODES:
             return status, None
         if status in RETRY_STATUS_CODES and attempt < attempts:
-            base_wait = rate_limit_backoff if status == 429 else backoff * attempt
+            base_wait = rate_limit_backoff if status == 429 else jitter_backoff(attempt, base=backoff)
             # Honor Retry-After but FLOOR at the computed backoff so a server
             # sending "Retry-After: 0" (or a past date) can't collapse the delay
             # to zero and trigger a tight retry loop; cap it so an absurd value
@@ -773,8 +775,13 @@ def _process_company(
             expanded_sources.append("lever_eu")
 
     for source in expanded_sources:
+        breaker = get_board_breaker(f"ats:{source}")
+        if breaker.is_open():
+            log.warning("[Corporate ATS] %s: circuit open for %s — skipping", company, source)
+            continue
         cache_source = source
         token_source = source.replace("_eu", "")
+        source_had_retryable_error = False
         for token in _prioritized_source_tokens(
             company, token_source, cache_source, exact_boards, candidate_limit,
             cache, ttl_days,
@@ -793,12 +800,14 @@ def _process_company(
                 kind = f"http_{e.status_code}" if e.status_code else "network"
                 if e.retryable:
                     kind += "_retryable"
+                    source_had_retryable_error = True
                 record_error(kind)
                 log.warning("[Corporate ATS] %s %s/%s request error: %s", company, source, token, e)
                 continue
             except Exception as e:
                 errors += 1
                 record_error(type(e).__name__)
+                source_had_retryable_error = True
                 log.warning("[Corporate ATS] %s %s/%s error: %s", company, source, token, e)
                 continue
 
@@ -808,6 +817,7 @@ def _process_company(
 
             matched_boards += 1
             seen += len(found)
+            breaker.record_success()
             for job in found:
                 if not _location_ok(job.get("location"), accept_locs, reject_locs):
                     filtered += 1
@@ -817,6 +827,9 @@ def _process_company(
                     continue
                 jobs.append(job)
             break
+
+        if source_had_retryable_error:
+            breaker.record_failure()
 
     return {
         "company": company,
@@ -832,11 +845,12 @@ def _process_company(
 
 
 def _store_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
+    valid_jobs, _report = validate_jobs(jobs, board="corporate_ats")
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
 
-    for job in jobs:
+    for job in valid_jobs:
         url = job.get("url")
         if not url:
             continue

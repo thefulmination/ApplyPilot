@@ -20,6 +20,8 @@ from bs4 import BeautifulSoup
 from applypilot import config
 from applypilot.database import get_connection, init_db, insert_discovered_job
 from applypilot.discovery.jobspy import _load_location_config, _location_ok
+from applypilot.discovery.resilience import get_board_breaker, jitter_backoff
+from applypilot.discovery.schema import validate_jobs
 
 log = logging.getLogger(__name__)
 
@@ -146,12 +148,13 @@ def _locations(cfg: dict) -> list[str]:
     return [str(default_loc)] if default_loc else ["Remote"]
 
 
-def _store_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
+def _store_jobs(conn: sqlite3.Connection, jobs: list[dict], board: str = "unknown") -> tuple[int, int]:
+    valid_jobs, _report = validate_jobs(jobs, board=board)
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
 
-    for job in jobs:
+    for job in valid_jobs:
         url = job.get("url")
         if not url:
             continue
@@ -186,8 +189,9 @@ def _request_with_retries(
 ) -> requests.Response:
     """GET with bounded retry on transient failures (timeouts, 429, 5xx).
 
-    Honors Retry-After. A single bad page no longer abandons the whole source.
-    Raises the last error after retries are exhausted.
+    Uses jittered exponential backoff instead of fixed linear sleeps to avoid
+    synchronised retry bursts when multiple boards are slow simultaneously.
+    Honors Retry-After. Raises the last error after retries are exhausted.
     """
     last_exc: Exception | None = None
     for attempt in range(1, _FETCH_RETRIES + 1):
@@ -196,15 +200,16 @@ def _request_with_retries(
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
             if attempt < _FETCH_RETRIES:
-                time.sleep(_FETCH_BACKOFF * attempt)
+                time.sleep(jitter_backoff(attempt, base=_FETCH_BACKOFF))
                 continue
             raise
         if resp.status_code in _FETCH_RETRY_STATUS and attempt < _FETCH_RETRIES:
             ra = resp.headers.get("Retry-After")
             try:
-                wait = float(ra) if ra else _FETCH_BACKOFF * attempt
+                explicit_wait = float(ra) if ra else None
             except (TypeError, ValueError):
-                wait = _FETCH_BACKOFF * attempt
+                explicit_wait = None
+            wait = explicit_wait if explicit_wait is not None else jitter_backoff(attempt, base=_FETCH_BACKOFF)
             time.sleep(min(max(_FETCH_BACKOFF, wait), 60.0))
             continue
         resp.raise_for_status()
@@ -914,14 +919,21 @@ def run_public_boards_discovery(cfg: dict | None = None) -> dict:
             log.warning("Unknown public job-board source: %s", source)
             continue
         seen_sources += 1
+        breaker = get_board_breaker(f"public:{source}")
+        if breaker.is_open():
+            log.warning("[public:%s] circuit open — skipping this run", source)
+            errors += 1
+            continue
         try:
             jobs = discoverer(session, cfg, accept_locs, reject_locs)
-            new, existing = _store_jobs(conn, jobs)
+            new, existing = _store_jobs(conn, jobs, board=source)
             total_new += new
             total_existing += existing
             log.info("[public:%s] %d kept -> %d new, %d dupes", source, len(jobs), new, existing)
+            breaker.record_success()
         except Exception as e:
             errors += 1
+            breaker.record_failure()
             log.error("[public:%s] failed: %s", source, e)
 
     return {

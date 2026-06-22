@@ -120,6 +120,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Scoring stage (job_scorer)
             fit_score             INTEGER,
             score_reasoning       TEXT,
+            fit_verdict           TEXT,
             score_error           TEXT,
             score_error_at        TEXT,
             score_attempts        INTEGER DEFAULT 0,
@@ -207,6 +208,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
+    "fit_verdict": "TEXT",
     "score_error": "TEXT",
     "score_error_at": "TEXT",
     "score_attempts": "INTEGER DEFAULT 0",
@@ -555,6 +557,7 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
             thinking_tokens       INTEGER DEFAULT 0,
             total_tokens          INTEGER DEFAULT 0,
             est_cost_usd          REAL,
+            prompt_variant        TEXT,
             created_at            TEXT NOT NULL
         )
     """)
@@ -563,6 +566,13 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_stage ON pipeline_stage_runs(stage)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_stage ON llm_usage(stage)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_variant ON llm_usage(prompt_variant)")
+
+    # Forward-migrate prompt_variant into existing llm_usage tables
+    existing_llm_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_usage)").fetchall()}
+    if "prompt_variant" not in existing_llm_cols:
+        conn.execute("ALTER TABLE llm_usage ADD COLUMN prompt_variant TEXT")
+
     conn.commit()
 
 
@@ -573,10 +583,12 @@ def record_llm_usage(
     usage: dict | None,
     est_cost_usd: float | None = None,
     conn: sqlite3.Connection | None = None,
+    prompt_variant: str | None = None,
 ) -> None:
     """Persist one LLM call's token usage (best-effort; never raises).
 
     `usage` is the LLMClient.last_usage dict (prompt/completion/thinking/total).
+    `prompt_variant` identifies which A/B prompt template was used (MAB tracking).
     """
     if not usage:
         return
@@ -586,8 +598,9 @@ def record_llm_usage(
         conn.execute(
             """
             INSERT INTO llm_usage (stage, model, provider, prompt_tokens,
-                completion_tokens, thinking_tokens, total_tokens, est_cost_usd, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                completion_tokens, thinking_tokens, total_tokens, est_cost_usd,
+                prompt_variant, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 stage, model, provider,
@@ -596,6 +609,7 @@ def record_llm_usage(
                 int(usage.get("thinking_tokens") or 0),
                 int(usage.get("total_tokens") or 0),
                 est_cost_usd,
+                prompt_variant,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -605,7 +619,7 @@ def record_llm_usage(
 
 
 def get_llm_usage_summary(conn: sqlite3.Connection | None = None) -> dict:
-    """Aggregate LLM token usage and estimated cost by stage and by model."""
+    """Aggregate LLM token usage and estimated cost by stage, model, and prompt variant."""
     if conn is None:
         conn = get_connection()
     by_stage = [
@@ -627,15 +641,103 @@ def get_llm_usage_summary(conn: sqlite3.Connection | None = None) -> dict:
             """
         ).fetchall()
     ]
+    by_variant = [
+        dict(zip(("variant", "stage", "calls", "total", "cost"), row))
+        for row in conn.execute(
+            """
+            SELECT COALESCE(prompt_variant, '(default)'), COALESCE(stage, '?'),
+                   COUNT(*), SUM(total_tokens), SUM(est_cost_usd)
+              FROM llm_usage
+             WHERE prompt_variant IS NOT NULL
+             GROUP BY prompt_variant, stage
+             ORDER BY prompt_variant, SUM(total_tokens) DESC
+            """
+        ).fetchall()
+    ]
     totals = conn.execute(
         "SELECT COUNT(*), SUM(total_tokens), SUM(est_cost_usd) FROM llm_usage"
     ).fetchone()
     return {
         "by_stage": by_stage,
         "by_model": by_model,
+        "by_variant": by_variant,
         "total_calls": totals[0] or 0,
         "total_tokens": totals[1] or 0,
         "total_cost_usd": totals[2] or 0.0,
+    }
+
+
+def get_scrape_quality_report(conn: sqlite3.Connection | None = None) -> dict:
+    """Per-board null-rate report computed from the live jobs table.
+
+    Null rate = fraction of non-duplicate jobs on that board that are missing
+    at least one of: title, full_description, location, company.  High null
+    rates indicate selector drift or anti-bot placeholder substitution.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    signal_fields = ("title", "full_description", "location", "company")
+    boards = [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT DISTINCT COALESCE(source_board, strategy, site, 'unknown')
+              FROM jobs
+             WHERE duplicate_of_url IS NULL
+            """
+        ).fetchall()
+    ]
+
+    reports = []
+    for board in boards:
+        total = conn.execute(
+            """
+            SELECT COUNT(*) FROM jobs
+             WHERE COALESCE(source_board, strategy, site, 'unknown') = ?
+               AND duplicate_of_url IS NULL
+            """,
+            (board,),
+        ).fetchone()[0]
+        if total == 0:
+            continue
+
+        null_counts: dict[str, int] = {}
+        for field in signal_fields:
+            null_counts[field] = conn.execute(
+                f"""
+                SELECT COUNT(*) FROM jobs
+                 WHERE COALESCE(source_board, strategy, site, 'unknown') = ?
+                   AND duplicate_of_url IS NULL
+                   AND ({field} IS NULL OR trim({field}) = '')
+                """,
+                (board,),
+            ).fetchone()[0]
+
+        with_any_null = conn.execute(
+            """
+            SELECT COUNT(*) FROM jobs
+             WHERE COALESCE(source_board, strategy, site, 'unknown') = ?
+               AND duplicate_of_url IS NULL
+               AND (
+                   title IS NULL OR trim(title) = '' OR
+                   full_description IS NULL OR trim(full_description) = '' OR
+                   location IS NULL OR trim(location) = '' OR
+                   company IS NULL OR trim(company) = ''
+               )
+            """,
+            (board,),
+        ).fetchone()[0]
+
+        reports.append({
+            "board": board,
+            "total": total,
+            "null_rate": round(with_any_null / total, 4) if total else 0.0,
+            "null_counts": null_counts,
+        })
+
+    return {
+        "boards": sorted(reports, key=lambda r: r["null_rate"], reverse=True),
     }
 
 
