@@ -912,6 +912,7 @@ def run_public_boards_discovery(cfg: dict | None = None) -> dict:
     total_existing = 0
     errors = 0
     seen_sources = 0
+    by_source: dict[str, dict] = {}
 
     for source in source_names:
         discoverer = DISCOVERERS.get(source)
@@ -923,6 +924,7 @@ def run_public_boards_discovery(cfg: dict | None = None) -> dict:
         if breaker.is_open():
             log.warning("[public:%s] circuit open — skipping this run", source)
             errors += 1
+            by_source[source] = {"status": "circuit_open", "new": 0, "existing": 0}
             continue
         try:
             jobs = discoverer(session, cfg, accept_locs, reject_locs)
@@ -931,14 +933,17 @@ def run_public_boards_discovery(cfg: dict | None = None) -> dict:
             total_existing += existing
             log.info("[public:%s] %d kept -> %d new, %d dupes", source, len(jobs), new, existing)
             breaker.record_success()
+            by_source[source] = {"status": "ok", "new": new, "existing": existing}
         except Exception as e:
             errors += 1
             breaker.record_failure()
             log.error("[public:%s] failed: %s", source, e)
+            by_source[source] = {"status": f"error: {e}", "new": 0, "existing": 0}
 
     return {
         "new": total_new,
         "existing": total_existing,
         "errors": errors,
         "sources": seen_sources,
+        "by_source": by_source,
     }

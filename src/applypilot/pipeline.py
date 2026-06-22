@@ -302,6 +302,23 @@ def _run_discover(workers: int = 1, discover_mode: str = "safe", search_cfg: dic
     except Exception as e:
         log.warning("Dedupe finalize failed: %s", e)
 
+    # Scrape quality check: warn on boards with high null rates so selector
+    # drift is surfaced immediately in the same run that caused it.
+    try:
+        from applypilot.database import get_scrape_quality_report, get_connection
+        qr = get_scrape_quality_report(get_connection())
+        warn_boards = [
+            b for b in qr.get("boards", [])
+            if b.get("null_rate", 0) >= 0.20 and b.get("total", 0) >= 5
+        ]
+        if warn_boards:
+            console.print("  [yellow]Scrape quality warnings (≥20% null rate):[/yellow]")
+            for b in warn_boards:
+                pct = round(b["null_rate"] * 100)
+                console.print(f"    [yellow]• {b['board']}: {pct}% of {b['total']} jobs missing a signal field[/yellow]")
+    except Exception as e:
+        log.warning("Scrape quality check failed: %s", e)
+
     return stats
 
 

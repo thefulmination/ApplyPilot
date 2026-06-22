@@ -673,67 +673,48 @@ def get_scrape_quality_report(conn: sqlite3.Connection | None = None) -> dict:
     Null rate = fraction of non-duplicate jobs on that board that are missing
     at least one of: title, full_description, location, company.  High null
     rates indicate selector drift or anti-bot placeholder substitution.
+
+    Implemented as a single GROUP BY query to avoid N+1 database round-trips.
     """
     if conn is None:
         conn = get_connection()
 
-    signal_fields = ("title", "full_description", "location", "company")
-    boards = [
-        row[0]
-        for row in conn.execute(
-            """
-            SELECT DISTINCT COALESCE(source_board, strategy, site, 'unknown')
-              FROM jobs
-             WHERE duplicate_of_url IS NULL
-            """
-        ).fetchall()
-    ]
+    rows = conn.execute(
+        """
+        SELECT
+            COALESCE(source_board, strategy, site, 'unknown') AS board,
+            COUNT(*)                                           AS total,
+            SUM(CASE WHEN title IS NULL OR trim(title) = ''                         THEN 1 ELSE 0 END) AS null_title,
+            SUM(CASE WHEN full_description IS NULL OR trim(full_description) = ''   THEN 1 ELSE 0 END) AS null_full_description,
+            SUM(CASE WHEN location IS NULL OR trim(location) = ''                   THEN 1 ELSE 0 END) AS null_location,
+            SUM(CASE WHEN company IS NULL OR trim(company) = ''                     THEN 1 ELSE 0 END) AS null_company,
+            SUM(CASE WHEN
+                    title IS NULL OR trim(title) = '' OR
+                    full_description IS NULL OR trim(full_description) = '' OR
+                    location IS NULL OR trim(location) = '' OR
+                    company IS NULL OR trim(company) = ''
+                THEN 1 ELSE 0 END)                           AS with_any_null
+          FROM jobs
+         WHERE duplicate_of_url IS NULL
+         GROUP BY COALESCE(source_board, strategy, site, 'unknown')
+        """
+    ).fetchall()
 
     reports = []
-    for board in boards:
-        total = conn.execute(
-            """
-            SELECT COUNT(*) FROM jobs
-             WHERE COALESCE(source_board, strategy, site, 'unknown') = ?
-               AND duplicate_of_url IS NULL
-            """,
-            (board,),
-        ).fetchone()[0]
-        if total == 0:
+    for row in rows:
+        board, total, n_title, n_desc, n_loc, n_co, with_any_null = row
+        if not total:
             continue
-
-        null_counts: dict[str, int] = {}
-        for field in signal_fields:
-            null_counts[field] = conn.execute(
-                f"""
-                SELECT COUNT(*) FROM jobs
-                 WHERE COALESCE(source_board, strategy, site, 'unknown') = ?
-                   AND duplicate_of_url IS NULL
-                   AND ({field} IS NULL OR trim({field}) = '')
-                """,
-                (board,),
-            ).fetchone()[0]
-
-        with_any_null = conn.execute(
-            """
-            SELECT COUNT(*) FROM jobs
-             WHERE COALESCE(source_board, strategy, site, 'unknown') = ?
-               AND duplicate_of_url IS NULL
-               AND (
-                   title IS NULL OR trim(title) = '' OR
-                   full_description IS NULL OR trim(full_description) = '' OR
-                   location IS NULL OR trim(location) = '' OR
-                   company IS NULL OR trim(company) = ''
-               )
-            """,
-            (board,),
-        ).fetchone()[0]
-
         reports.append({
             "board": board,
             "total": total,
-            "null_rate": round(with_any_null / total, 4) if total else 0.0,
-            "null_counts": null_counts,
+            "null_rate": round(with_any_null / total, 4),
+            "null_counts": {
+                "title": n_title or 0,
+                "full_description": n_desc or 0,
+                "location": n_loc or 0,
+                "company": n_co or 0,
+            },
         })
 
     return {

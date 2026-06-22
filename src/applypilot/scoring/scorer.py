@@ -43,7 +43,8 @@ IMPORTANT FACTORS:
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
-REASONING: [2-3 sentences explaining the score]"""
+VERDICT: [ONE plain-English sentence beginning with "Good fit -", "Partial fit -", or "Not a fit -", stating the single most important reason for the score: the decisive strength or the decisive gap.]
+REASONING: [2-3 sentences in plain English: what matches, what is missing, and why the score lands where it does.]"""
 
 
 # Recommendation calibration is produced by an external engine ("brainstorm"),
@@ -95,30 +96,55 @@ def _preference_profile_prompt(preference_profile: dict | None) -> str:
 def _parse_score_response(response: str) -> dict:
     """Parse the LLM's score response into structured data.
 
+    Tolerant of the model omitting labels, reordering them, or wrapping a
+    field across multiple lines.
+
     Args:
         response: Raw LLM response text.
 
     Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+        {"score": int, "keywords": str, "verdict": str, "reasoning": str}
     """
     score = 0
     keywords = ""
-    reasoning = response
+    verdict = ""
+    reasoning_parts: list[str] = []
+    field = None  # the multi-line field currently being accumulated
 
-    for line in response.split("\n"):
-        line = line.strip()
-        if line.startswith("SCORE:"):
+    for raw in response.split("\n"):
+        line = raw.strip()
+        head = line.lstrip("-*# \t").upper()
+        if head.startswith("SCORE:"):
+            field = None
             try:
-                score = int(re.search(r"\d+", line).group())
-                score = max(1, min(10, score))
+                score = max(1, min(10, int(re.search(r"\d+", line).group())))
             except (AttributeError, ValueError):
                 score = 0
-        elif line.startswith("KEYWORDS:"):
-            keywords = line.replace("KEYWORDS:", "").strip()
-        elif line.startswith("REASONING:"):
-            reasoning = line.replace("REASONING:", "").strip()
+        elif head.startswith("KEYWORDS:"):
+            field = None
+            keywords = line.split(":", 1)[1].strip()
+        elif head.startswith("VERDICT:"):
+            field = "verdict"
+            verdict = line.split(":", 1)[1].strip()
+        elif head.startswith("REASONING:"):
+            field = "reasoning"
+            reasoning_parts.append(line.split(":", 1)[1].strip())
+        elif field == "reasoning":
+            reasoning_parts.append(line)
+        elif field == "verdict" and line:
+            verdict = f"{verdict} {line}".strip()
 
-    return {"score": score, "keywords": keywords, "reasoning": reasoning}
+    reasoning = " ".join(p for p in (s.strip() for s in reasoning_parts) if p).strip()
+
+    # Fallbacks when the model ignores the format entirely.
+    if not reasoning:
+        leftover = [l.strip() for l in response.split("\n")
+                    if l.strip() and not re.match(r"(?i)^[-*#\s]*(SCORE|KEYWORDS|VERDICT)\s*:", l)]
+        reasoning = " ".join(leftover).strip() or response.strip()
+    if not verdict and reasoning:
+        verdict = re.split(r"(?<=[.!?])\s+", reasoning, maxsplit=1)[0][:300]
+
+    return {"score": score, "keywords": keywords, "verdict": verdict, "reasoning": reasoning}
 
 
 def score_job(
@@ -169,7 +195,8 @@ def score_job(
 
     try:
         client = get_client(stage="score")
-        response = client.chat(messages, max_tokens=512, temperature=0.2, stage="score")
+        prompt_variant = os.getenv("SCORE_PROMPT_VARIANT")
+        response = client.chat(messages, max_tokens=512, temperature=0.2, stage="score", prompt_variant=prompt_variant)
         parsed = _parse_score_response(response)
         parsed["model"] = client.model
         parsed["provider"] = client.provider_name
@@ -204,6 +231,7 @@ def _persist_score(conn, result: dict, job_url: str) -> None:
         UPDATE jobs
            SET fit_score = ?,
                score_reasoning = ?,
+               fit_verdict = ?,
                score_error = NULL,
                score_error_at = NULL,
                score_attempts = COALESCE(score_attempts, 0) + 1,
@@ -215,6 +243,7 @@ def _persist_score(conn, result: dict, job_url: str) -> None:
         (
             score,
             f"{result['keywords']}\n{result['reasoning']}",
+            result.get("verdict") or "",
             result.get("model"),
             result.get("provider"),
             now,
