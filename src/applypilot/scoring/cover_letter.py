@@ -343,7 +343,9 @@ def run_cover_letters(min_score: int = 7, limit: int = 900,
             prefix = _safe_job_prefix(job)
 
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
-            cl_path.write_text(letter, encoding="utf-8")
+            tmp = cl_path.with_suffix(".tmp")
+            tmp.write_text(letter, encoding="utf-8")
+            os.replace(tmp, cl_path)
 
             # Generate PDF (best-effort)
             pdf_path = None

@@ -400,6 +400,13 @@ def ensure_job_indexes(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_duplicate_of_url ON jobs(duplicate_of_url)")
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS idx_jobs_pending_enrich
+            ON jobs(site, discovered_at)
+         WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_jobs_pending_score
             ON jobs(discovered_at)
          WHERE full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of_url IS NULL

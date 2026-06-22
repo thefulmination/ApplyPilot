@@ -227,8 +227,8 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
         if "algolia.net" in response.url and "/queries" in response.url:
             try:
                 algolia_data["response"] = json.loads(response.text())
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("WTTJ: failed to parse Algolia response: %s", e)
 
     with sync_playwright() as p:
         launch_opts: dict = {"headless": True}
@@ -839,10 +839,12 @@ def _run_detail_scraper(
 
     Returns aggregate stats dict.
     """
-    skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
-    where = f"WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL AND {skip_filter}"
+    skip_ph = ",".join("?" * len(SKIP_DETAIL_SITES))
     rows = conn.execute(
-        f"SELECT url, title, site FROM jobs {where} ORDER BY site"
+        f"SELECT url, title, site FROM jobs "
+        f"WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL "
+        f"AND site NOT IN ({skip_ph}) ORDER BY site",
+        tuple(SKIP_DETAIL_SITES),
     ).fetchall()
 
     if not rows:
@@ -956,11 +958,12 @@ def stream_detail(
 
     try:
         while True:
-            skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
+            skip_ph = ",".join("?" * len(SKIP_DETAIL_SITES))
             rows = conn.execute(
-                "SELECT url, title, site FROM jobs "
-                f"WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL AND {skip_filter} "
-                "ORDER BY site LIMIT 200"
+                f"SELECT url, title, site FROM jobs "
+                f"WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL "
+                f"AND site NOT IN ({skip_ph}) ORDER BY site LIMIT 200",
+                tuple(SKIP_DETAIL_SITES),
             ).fetchall()
 
             if rows:

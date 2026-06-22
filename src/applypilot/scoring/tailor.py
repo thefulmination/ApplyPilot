@@ -744,9 +744,12 @@ def run_tailoring(min_score: int = 7, limit: int = 900,
             # Build safe filename prefix
             prefix = _safe_job_prefix(job)
 
-            # Save tailored resume text
+            # Save tailored resume text (write to .tmp then rename so a crash
+            # mid-write never leaves a partial file at the final path)
             txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
+            tmp = txt_path.with_suffix(".tmp")
+            tmp.write_text(tailored, encoding="utf-8")
+            os.replace(tmp, txt_path)
 
             # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
@@ -758,11 +761,15 @@ def run_tailoring(min_score: int = 7, limit: int = 900,
                 f"URL: {job['url']}\n\n"
                 f"{job.get('full_description', '')}"
             )
-            job_path.write_text(job_desc, encoding="utf-8")
+            tmp = job_path.with_suffix(".tmp")
+            tmp.write_text(job_desc, encoding="utf-8")
+            os.replace(tmp, job_path)
 
             # Save validation report
             report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            tmp = report_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            os.replace(tmp, report_path)
 
             # Generate PDF for approved resumes (best-effort)
             pdf_path = None
