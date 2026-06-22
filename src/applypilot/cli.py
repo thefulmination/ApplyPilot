@@ -788,6 +788,112 @@ def export_outcomes_command(
     )
 
 
+@app.command("scan-gmail")
+def scan_gmail_command(
+    days: int = typer.Option(30, "--days", "-d", help="How many days back to search."),
+    min_confidence: str = typer.Option(
+        "medium", "--min-confidence",
+        help="Minimum confidence to display/apply: low | medium | high",
+    ),
+    credentials: Optional[Path] = typer.Option(
+        None, "--credentials",
+        help="Path to gmail_credentials.json. Defaults to ~/.applypilot/gmail_credentials.json",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="Write detected outcomes to the tracker. Default is dry-run (show only).",
+    ),
+) -> None:
+    """[Standalone] Scan Gmail for application outcomes (interview / offer / rejection).
+
+    NOT part of the main pipeline — run manually when you want to sync email outcomes.
+
+    One-time setup (required):
+      pip install google-auth-oauthlib google-api-python-client
+      # Download OAuth credentials from Google Cloud Console (Desktop app)
+      # Save as ~/.applypilot/gmail_credentials.json
+      # First run opens a browser for read-only consent
+
+    Dry-run by default — add --apply to write outcomes to the tracker.
+    """
+    _bootstrap()
+
+    try:
+        from applypilot.gmail_outcomes import scan_inbox, apply_outcomes
+    except ImportError as exc:
+        console.print(f"[red]Import error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    dry_run = not apply
+    tag = " [dim](dry-run — add --apply to write)[/dim]" if dry_run else " [bold green](writing to tracker)[/bold green]"
+    console.print(f"\n[bold]Gmail outcome scan[/bold]{tag}")
+    console.print(f"  Scanning last [bold]{days}[/bold] day(s)  •  min confidence: {min_confidence}\n")
+
+    try:
+        outcomes = scan_inbox(
+            days=days,
+            credentials_path=credentials,
+            min_confidence=min_confidence,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[red]Setup required:[/red]\n{exc}")
+        raise typer.Exit(1)
+    except ImportError as exc:
+        console.print(f"[red]Missing dependencies:[/red] {exc}")
+        raise typer.Exit(1)
+
+    if not outcomes:
+        console.print("[dim]No application-related emails found in the search window.[/dim]\n")
+        return
+
+    _COLORS = {"offer": "green", "interview": "cyan", "rejected": "red"}
+
+    table = Table(
+        title=f"Detected outcomes ({len(outcomes)})",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Outcome", style="bold")
+    table.add_column("Conf.")
+    table.add_column("Matched job", max_width=35)
+    table.add_column("Method")
+    table.add_column("Subject", max_width=50)
+
+    for o in outcomes:
+        color = _COLORS.get(o.outcome, "white")
+        matched = o.matched_job_title or "[dim]unmatched[/dim]"
+        table.add_row(
+            f"[{color}]{o.outcome}[/{color}]",
+            o.confidence,
+            matched,
+            o.match_method or "-",
+            o.subject,
+        )
+
+    console.print(table)
+
+    unmatched = sum(1 for o in outcomes if not o.matched_job_url)
+    if unmatched:
+        console.print(
+            f"\n[yellow]{unmatched} email(s) could not be matched to an applied job.[/yellow] "
+            "[dim](company may be tracked under a different name, or the job was never imported)[/dim]"
+        )
+
+    counts = apply_outcomes(outcomes, dry_run=dry_run)
+
+    verb = "Would write" if dry_run else "Wrote"
+    console.print(f"\n{verb}: [bold]{counts['written']}[/bold] outcome(s)")
+    if counts["skipped_no_match"]:
+        console.print(f"  Skipped (no job match):  {counts['skipped_no_match']}")
+    if counts["skipped_ambiguous"]:
+        console.print(f"  Skipped (ambiguous):     {counts['skipped_ambiguous']}")
+    if counts.get("errors"):
+        console.print(f"  [red]Errors:[/red]              {counts['errors']}")
+    if dry_run:
+        console.print("\n[dim]Re-run with --apply to write these outcomes to the tracker.[/dim]")
+    console.print()
+
+
 @app.command()
 def dashboard() -> None:
     """Generate and open the HTML dashboard in your browser."""
