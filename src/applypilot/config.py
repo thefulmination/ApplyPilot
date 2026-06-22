@@ -294,9 +294,17 @@ def get_min_score() -> int:
     if raw is None or str(raw).strip() == "":
         return DEFAULTS["min_score"]
     try:
-        return int(float(raw))
+        value = int(float(raw))
     except (TypeError, ValueError):
         return DEFAULTS["min_score"]
+    if not (1 <= value <= 10):
+        import logging
+        logging.getLogger(__name__).warning(
+            "APPLYPILOT_MIN_SCORE=%r is outside 1-10; using default %d",
+            raw, DEFAULTS["min_score"],
+        )
+        return DEFAULTS["min_score"]
+    return value
 
 
 def load_env():

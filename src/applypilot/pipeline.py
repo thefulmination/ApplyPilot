@@ -87,6 +87,10 @@ def _configured_workers(search_cfg: dict, section_name: str, fallback: int) -> i
     try:
         return max(1, int(value))
     except (TypeError, ValueError):
+        log.warning(
+            "searches.yaml: %r workers value %r is not an integer; using fallback %d",
+            section_name, value, fallback,
+        )
         return max(1, int(fallback))
 
 

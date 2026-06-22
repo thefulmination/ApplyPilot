@@ -112,8 +112,12 @@ def is_safe_public_url(url: str) -> bool:
     return True
 
 
-def resolve_url(raw_url: str, site: str) -> str | None:
-    """Resolve a stored URL to an absolute URL."""
+def resolve_url(raw_url: str, site: str, base_urls: dict | None = None) -> str | None:
+    """Resolve a stored URL to an absolute URL.
+
+    Pass ``base_urls`` (from ``_load_base_urls()``) when calling in a tight
+    loop to avoid re-reading sites.yaml from disk on every iteration.
+    """
     if not raw_url:
         return None
 
@@ -133,7 +137,8 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     if site == "4DayWeek" and raw_url in ("/", "/jobs"):
         return None
 
-    base = _load_base_urls().get(site)
+    _base_urls = base_urls if base_urls is not None else _load_base_urls()
+    base = _base_urls.get(site)
     if not base:
         return None
 
@@ -145,6 +150,7 @@ def resolve_url(raw_url: str, site: str) -> str | None:
 
 def resolve_all_urls(conn: sqlite3.Connection) -> dict:
     """Resolve all relative URLs in the database. Returns stats."""
+    base_urls = _load_base_urls()  # load once; passed into resolve_url to avoid per-row disk reads
     rows = conn.execute("SELECT url, site FROM jobs").fetchall()
     resolved = 0
     failed = 0
@@ -156,7 +162,7 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
             already_absolute += 1
             continue
 
-        new_url = resolve_url(url, site)
+        new_url = resolve_url(url, site, base_urls=base_urls)
         if new_url and new_url != url:
             try:
                 conn.execute(
@@ -195,7 +201,7 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
     ).fetchall()
     for row in rows:
         url, site, app_url = row[0], row[1], row[2]
-        new_app = resolve_url(app_url, site)
+        new_app = resolve_url(app_url, site, base_urls=base_urls)
         if new_app and new_app != app_url:
             conn.execute("UPDATE jobs SET application_url = ? WHERE url = ?", (new_app, url))
             app_resolved += 1
@@ -302,8 +308,8 @@ def collect_detail_intelligence(page) -> dict:
         try:
             data = json.loads(el.inner_text())
             intel["json_ld"].append(data)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("JSON-LD parse failed on %s: %s", page.url, e)
 
     return intel
 
