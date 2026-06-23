@@ -120,7 +120,8 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0, exclude_linkedin: bool = False) -> dict | None:
+                worker_id: int = 0, exclude_linkedin: bool = False,
+                exclude_urls: set[str] | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
@@ -130,6 +131,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         exclude_linkedin: When True, skip LinkedIn-lane (Easy-Apply) jobs in queue
             selection so the run keeps flowing on the offsite ATS lane. Set by the
             worker loop when the LinkedIn daily cap or same-day halt is in effect.
+        exclude_urls: URLs already attempted in THIS run; excluded from selection so
+            a fast-failing job (e.g. no_result) isn't re-acquired immediately and
+            doesn't burn the run's --limit on a single job. Cross-run retry still
+            works (the set is per-run/in-memory; failed jobs stay eligible later).
 
     Returns:
         Job dict or None if the queue is empty.
@@ -184,6 +189,12 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 # LinkedIn lane gating: when the daily cap / same-day halt is in
                 # effect, skip Easy-Apply jobs so the run keeps flowing offsite.
                 li_clause = f"AND NOT {_LINKEDIN_LANE_SQL}" if exclude_linkedin else ""
+                # Per-run exclusion: don't re-acquire a job already attempted this
+                # run, so one fast-failing job can't consume the whole --limit.
+                seen_clause = ""
+                if exclude_urls:
+                    seen_clause = f"AND url NOT IN ({','.join('?' * len(exclude_urls))})"
+                    params.extend(exclude_urls)
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
                            fit_score, audit_score, audit_label, location, full_description, cover_letter_path
@@ -199,6 +210,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       {site_clause}
                       {url_clauses}
                       {li_clause}
+                      {seen_clause}
                     ORDER BY COALESCE(audit_score, fit_score) DESC,
                              (audit_flags LIKE '%"chief_of_staff"%') DESC,
                              (audit_flags LIKE '%"strategy_ops"%'
@@ -919,6 +931,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     # LinkedIn daily cap read at runtime so a --linkedin-daily-cap CLI flag (env set
     # after import) is honored; falls back to the module default. 0 = no cap.
     li_cap = int(os.environ.get("APPLYPILOT_LINKEDIN_DAILY_CAP") or LINKEDIN_DAILY_CAP)
+    # URLs attempted this run -> excluded from re-acquisition so a fast-failing job
+    # can't be re-picked and burn the whole --limit on one job (canary surfaced this).
+    attempted_urls: set[str] = set()
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -945,7 +960,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                     logger.debug("LinkedIn cap check failed", exc_info=True)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id, exclude_linkedin=exclude_li)
+                          worker_id=worker_id, exclude_linkedin=exclude_li,
+                          exclude_urls=attempted_urls if not target_url else None)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -962,6 +978,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+        attempted_urls.add(job["url"])
 
         # Account-safety throttle: respect the per-host gap before launching
         # (skipped in dry-run so canary tests stay fast).
