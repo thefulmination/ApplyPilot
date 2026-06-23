@@ -63,7 +63,10 @@ def _build_profile_summary(profile: dict) -> str:
 
     # Compensation
     currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    # salary_expectation is often "" in profile.json -> fall back to range_min,
+    # then a sane default, so we never emit "Salary Expectation: $ USD".
+    salary_floor = comp.get("salary_expectation") or comp.get("salary_range_min") or "110000"
+    lines.append(f"Salary Expectation: ${salary_floor} {currency}")
 
     # Experience
     if exp.get("years_of_experience_total"):
@@ -127,9 +130,12 @@ def _build_salary_section(profile: dict) -> str:
     """
     comp = profile["compensation"]
     currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
-    range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
+    # Guard the empty-string case (salary_expectation is often "" in profile.json):
+    # fall back to the populated salary_range_min, then a sane default. str() keeps
+    # the .isdigit()/int() paths below safe even when a value is present.
+    floor = str(comp.get("salary_expectation") or comp.get("salary_range_min") or "110000")
+    range_min = comp.get("salary_range_min") or floor
+    range_max = comp.get("salary_range_max") or (str(int(floor) + 20000) if floor.isdigit() else floor)
     conversion_note = comp.get("currency_conversion_note", "")
 
     # Compute example hourly rates at 3 salary levels

@@ -139,6 +139,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
                   AND duplicate_of_url IS NULL
+                  AND COALESCE(liveness_status, '') != 'dead'
+                  AND COALESCE(apply_status, '') != 'applied'
                   AND apply_status != 'in_progress'
                 ORDER BY CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END
                 LIMIT 1
@@ -168,7 +170,14 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND COALESCE(audit_score, fit_score) >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY COALESCE(audit_score, fit_score) DESC, fit_score DESC, url
+                ORDER BY COALESCE(audit_score, fit_score) DESC,
+                         (audit_flags LIKE '%"chief_of_staff"%') DESC,
+                         (audit_flags LIKE '%"strategy_ops"%'
+                           OR audit_flags LIKE '%"gtm_ops"%'
+                           OR audit_flags LIKE '%"operations_leadership"%') DESC,
+                         role_fit_score DESC,
+                         (COALESCE(liveness_status, '') = 'live') DESC,
+                         fit_score DESC, url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -709,6 +718,8 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    # A dead/404/removed posting won't come back on retry -> don't burn 3x900s.
+    "page_error",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
