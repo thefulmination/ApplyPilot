@@ -128,94 +128,106 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         Job dict or None if the queue is empty.
     """
     conn = get_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    from applypilot.config import is_manual_ats
 
-        # --base-resume mode drops the per-job tailored-resume requirement so
-        # jobs become applyable with the base resume (build_prompt/run_job then
-        # fall back to RESUME_PATH/RESUME_PDF_PATH; no AI tailoring).
-        tailored_clause = "" if config.base_resume_enabled() else "AND tailored_resume_path IS NOT NULL"
+    # --base-resume mode drops the per-job tailored-resume requirement so jobs
+    # become applyable with the base resume (build_prompt/run_job fall back to
+    # RESUME_PATH/RESUME_PDF_PATH; no AI tailoring).
+    tailored_clause = "" if config.base_resume_enabled() else "AND tailored_resume_path IS NOT NULL"
+    blocked_sites: list = []
+    blocked_patterns: list = []
+    if not target_url:
+        blocked_sites, blocked_patterns = _load_blocked()
 
-        if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, audit_score, audit_label, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  {tailored_clause}
-                  AND duplicate_of_url IS NULL
-                  AND COALESCE(liveness_status, '') != 'dead'
-                  AND COALESCE(apply_status, '') != 'applied'
-                  AND apply_status != 'in_progress'
-                ORDER BY CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END
-                LIMIT 1
-            """, (target_url, target_url, like, like, target_url, target_url)).fetchone()
-        else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, audit_score, audit_label, location, full_description, cover_letter_path
-                FROM jobs
-                WHERE duplicate_of_url IS NULL
-                  {tailored_clause}
-                  AND COALESCE(liveness_status, '') != 'dead'
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND COALESCE(audit_score, fit_score) >= ?
-                  {site_clause}
-                  {url_clauses}
-                ORDER BY COALESCE(audit_score, fit_score) DESC,
-                         (audit_flags LIKE '%"chief_of_staff"%') DESC,
-                         (audit_flags LIKE '%"strategy_ops"%'
-                           OR audit_flags LIKE '%"gtm_ops"%'
-                           OR audit_flags LIKE '%"operations_leadership"%') DESC,
-                         role_fit_score DESC,
-                         (COALESCE(liveness_status, '') = 'live') DESC,
-                         fit_score DESC, url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+    # Loop so that hitting a manual-ATS row SKIPS it (marks it + moves on) rather
+    # than returning None: worker_loop treats None as "queue empty" and would
+    # otherwise abandon the entire rest of the queue the instant a manual-ATS job
+    # (~25% of the eligible queue) sorted to the top.
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
 
-        if not row:
-            conn.rollback()
-            return None
+            if target_url:
+                like = f"%{target_url.split('?')[0].rstrip('/')}%"
+                row = conn.execute(f"""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, audit_score, audit_label, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                      {tailored_clause}
+                      AND duplicate_of_url IS NULL
+                      AND COALESCE(liveness_status, '') != 'dead'
+                      AND COALESCE(apply_status, '') != 'applied'
+                      AND apply_status != 'in_progress'
+                    ORDER BY CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END
+                    LIMIT 1
+                """, (target_url, target_url, like, like, target_url, target_url)).fetchone()
+            else:
+                # Build parameterized filters to avoid SQL injection
+                params: list = [min_score]
+                site_clause = ""
+                if blocked_sites:
+                    placeholders = ",".join("?" * len(blocked_sites))
+                    site_clause = f"AND site NOT IN ({placeholders})"
+                    params.extend(blocked_sites)
+                url_clauses = ""
+                if blocked_patterns:
+                    url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
+                    params.extend(blocked_patterns)
+                row = conn.execute(f"""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, audit_score, audit_label, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE duplicate_of_url IS NULL
+                      {tailored_clause}
+                      AND COALESCE(liveness_status, '') != 'dead'
+                      AND (apply_status IS NULL OR apply_status = 'failed')
+                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                      AND COALESCE(audit_score, fit_score) >= ?
+                      {site_clause}
+                      {url_clauses}
+                    ORDER BY COALESCE(audit_score, fit_score) DESC,
+                             (audit_flags LIKE '%"chief_of_staff"%') DESC,
+                             (audit_flags LIKE '%"strategy_ops"%'
+                               OR audit_flags LIKE '%"gtm_ops"%'
+                               OR audit_flags LIKE '%"operations_leadership"%') DESC,
+                             role_fit_score DESC,
+                             (COALESCE(liveness_status, '') = 'live') DESC,
+                             fit_score DESC, url
+                    LIMIT 1
+                """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
-        from applypilot.config import is_manual_ats
-        apply_url = row["application_url"] or row["url"]
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
+            if not row:
+                conn.rollback()
+                return None
+
+            # Skip manual ATS sites (unsolvable CAPTCHAs): mark + continue to the
+            # next candidate rather than returning None.
+            apply_url = row["application_url"] or row["url"]
+            if is_manual_ats(apply_url):
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                logger.info("Skipping manual ATS: %s", row["url"][:80])
+                if target_url:
+                    return None  # the explicitly targeted URL is manual; nothing to apply
+                continue  # re-select the next candidate (this row is now excluded)
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'in_progress',
+                               agent_id = ?,
+                               last_attempted_at = ?
+                WHERE url = ?
+            """, (f"worker-{worker_id}", now, row["url"]))
             conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
 
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
-                           last_attempted_at = ?
-            WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
-        conn.commit()
-
-        return dict(row)
-    except Exception:
-        conn.rollback()
-        raise
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -233,7 +245,10 @@ def mark_result(url: str, status: str, error: str | None = None,
         """, (now, duration_ms, task_id, url))
     else:
         db_status = "auth_required" if _is_auth_required_result(error or status) else status
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
+        # A timeout (hung agent/page) is one-shot: a retry just burns another
+        # ~15 min on the same hang, so mark attempts exhausted on the first timeout.
+        _r = (error or status or "").lower()
+        attempts = 99 if (permanent or "timeout" in _r) else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
@@ -733,6 +748,10 @@ PERMANENT_FAILURES: set[str] = {
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
     # A dead/404/removed posting won't come back on retry -> don't burn 3x900s.
     "page_error",
+    # An unfillable/injected page or a hung agent won't fix on retry either.
+    "stuck", "suspicious_page",
+    # LinkedIn (or any site) reporting an application/Easy-Apply limit -> permanent.
+    "linkedin_rate_limited", "rate_limited",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
