@@ -449,9 +449,11 @@ def build_prompt(job: dict, tailored_resume: str,
     personal = profile["personal"]
 
     # --- Resolve resume PDF path ---
-    resume_path = job.get("tailored_resume_path")
+    # In --base-resume mode this falls back to the hand-made base resume for
+    # jobs with no tailored file (no AI tailoring); otherwise it's the per-job file.
+    resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
+        raise ValueError(f"No resume available for job: {job.get('title', 'unknown')}")
 
     src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
     if not src_pdf.exists():

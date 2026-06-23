@@ -366,6 +366,7 @@ def apply(
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
+    base_resume: bool = typer.Option(False, "--base-resume", help="Apply with the base resume as-is (no per-job tailoring); jobs lacking a tailored resume fall back to .applypilot/resume.pdf."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     preflight: bool = typer.Option(True, "--preflight/--skip-preflight", help="Run readiness checks before launching the apply agent."),
@@ -384,6 +385,12 @@ def apply(
 
     if min_score is None:
         min_score = config.get_min_score()
+
+    # --base-resume: process-level flag read by acquire_job / build_prompt /
+    # readiness so jobs without a tailored resume apply with the base resume.
+    if base_resume:
+        import os
+        os.environ["APPLYPILOT_BASE_RESUME"] = "1"
 
     # --- Utility modes (no Chrome/Claude needed) ---
 
@@ -418,19 +425,28 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # Check 3: resume readiness (skip for --gen with --url)
     if not (gen and url):
-        conn = get_connection()
-        ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs "
-            "WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL AND duplicate_of_url IS NULL"
-        ).fetchone()[0]
-        if ready == 0:
-            console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
-            )
-            raise typer.Exit(code=1)
+        if base_resume:
+            if not config.RESUME_PDF_PATH.exists():
+                console.print(
+                    f"[red]Base resume PDF not found:[/red] {config.RESUME_PDF_PATH}\n"
+                    "Place your resume (PDF) at that path to use --base-resume."
+                )
+                raise typer.Exit(code=1)
+        else:
+            conn = get_connection()
+            ready = conn.execute(
+                "SELECT COUNT(*) FROM jobs "
+                "WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL AND duplicate_of_url IS NULL"
+            ).fetchone()[0]
+            if ready == 0:
+                console.print(
+                    "[red]No tailored resumes ready.[/red]\n"
+                    "Run [bold]applypilot run score tailor[/bold] first to prepare applications,\n"
+                    "or pass [bold]--base-resume[/bold] to apply with your base resume as-is."
+                )
+                raise typer.Exit(code=1)
 
     if gen:
         from applypilot.apply.launcher import gen_prompt

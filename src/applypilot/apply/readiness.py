@@ -71,6 +71,9 @@ def _parse_datetime(value: str | None) -> datetime | None:
 def _resume_pdf_path(row: dict[str, Any]) -> Path | None:
     resume_path = row.get("tailored_resume_path")
     if not resume_path:
+        # --base-resume mode: jobs without a tailored file use the base resume PDF.
+        if config.base_resume_enabled() and config.RESUME_PDF_PATH.exists():
+            return config.RESUME_PDF_PATH
         return None
     return Path(resume_path).with_suffix(".pdf")
 
@@ -88,11 +91,12 @@ def _query_candidates(
     conn = get_connection()
     params: list[Any] = []
     where = [
-        "j.tailored_resume_path IS NOT NULL",
         "j.duplicate_of_url IS NULL",
         "j.applied_at IS NULL",
         "(j.apply_status IS NULL OR j.apply_status IN ('failed', 'resume_ready', 'shortlisted'))",
     ]
+    if not config.base_resume_enabled():
+        where.insert(0, "j.tailored_resume_path IS NOT NULL")
 
     if job_ref:
         ref = job_ref.strip()

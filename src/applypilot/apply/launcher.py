@@ -130,14 +130,19 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     try:
         conn.execute("BEGIN IMMEDIATE")
 
+        # --base-resume mode drops the per-job tailored-resume requirement so
+        # jobs become applyable with the base resume (build_prompt/run_job then
+        # fall back to RESUME_PATH/RESUME_PDF_PATH; no AI tailoring).
+        tailored_clause = "" if config.base_resume_enabled() else "AND tailored_resume_path IS NOT NULL"
+
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
+            row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, audit_score, audit_label, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
+                  {tailored_clause}
                   AND duplicate_of_url IS NULL
                   AND COALESCE(liveness_status, '') != 'dead'
                   AND COALESCE(apply_status, '') != 'applied'
@@ -162,8 +167,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, audit_score, audit_label, location, full_description, cover_letter_path
                 FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND duplicate_of_url IS NULL
+                WHERE duplicate_of_url IS NULL
+                  {tailored_clause}
                   AND COALESCE(liveness_status, '') != 'dead'
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
@@ -328,7 +333,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
         return None
 
     # Read resume text
-    resume_path = job.get("tailored_resume_path")
+    resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
     resume_text = ""
     if txt_path and txt_path.exists():
@@ -421,7 +426,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'failed:reason', or 'skipped'.
     """
     # Read tailored resume text
-    resume_path = job.get("tailored_resume_path")
+    resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
     resume_text = ""
     if txt_path and txt_path.exists():

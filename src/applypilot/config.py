@@ -26,6 +26,31 @@ PREFERENCE_PROFILE_PATH = _path_from_env("APPLYPILOT_PREFERENCE_PROFILE_PATH", A
 KNOWLEDGE_GRAPH_PROMPT_PATH = _path_from_env("APPLYPILOT_KNOWLEDGE_GRAPH_PROMPT_PATH", APP_DIR / "job_knowledge_graph_prompt.md")
 ENV_PATH = _path_from_env("APPLYPILOT_ENV_PATH", APP_DIR / ".env")
 
+
+def base_resume_enabled() -> bool:
+    """True when apply should use the base resume (no per-job tailoring).
+
+    Set by `applypilot apply --base-resume` via APPLYPILOT_BASE_RESUME. In this
+    mode the apply flow falls back to RESUME_PATH / RESUME_PDF_PATH for any job
+    that has no tailored resume of its own -- so the owner applies with his
+    hand-made base resume as-is, never an AI-tailored rewrite.
+    """
+    return os.environ.get("APPLYPILOT_BASE_RESUME", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_resume_stem(tailored_resume_path: str | None) -> str | None:
+    """Resume stem whose .pdf/.txt siblings the apply flow uploads/reads.
+
+    Returns the per-job tailored path if present; otherwise the base resume
+    stem when --base-resume mode is on and the base PDF exists; otherwise None.
+    """
+    if tailored_resume_path:
+        return tailored_resume_path
+    if base_resume_enabled() and RESUME_PDF_PATH.exists():
+        return str(RESUME_PATH)
+    return None
+
+
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR = APP_DIR / "cover_letters"
