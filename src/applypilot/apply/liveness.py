@@ -346,8 +346,8 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), max_age_days: int = 
         f"""SELECT url, application_url, liveness_status, last_verified_live
               FROM jobs
              WHERE audit_label IN ({placeholders})
-               AND application_url LIKE 'http%'
-               AND duplicate_of_url IS NULL""",
+               AND duplicate_of_url IS NULL
+               AND (application_url LIKE 'http%' OR url LIKE 'http%')""",
         list(tiers),
     ).fetchall()
 
@@ -357,7 +357,13 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), max_age_days: int = 
         if max_age_days > 0 and is_recent(r["last_verified_live"], max_age_days):
             skipped_fresh += 1
             continue
-        todo.append((r["url"], r["application_url"]))
+        # Probe the EFFECTIVE apply target — mirror acquire_job's
+        # `application_url or url` fallback so jobs whose only usable link is in
+        # `url` (e.g. linkedin.com/jobs/view/<id>, talent.com/view?id=...) are
+        # covered too, not silently left unchecked.
+        app = r["application_url"]
+        effective = app if (app or "").startswith(("http://", "https://")) else r["url"]
+        todo.append((r["url"], effective))
     if limit > 0:
         todo = todo[:limit]
 
