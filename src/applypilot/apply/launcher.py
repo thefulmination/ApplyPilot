@@ -49,6 +49,7 @@ AUTH_REQUIRED_REASONS: set[str] = {
     "two_factor_required",
     "2fa_required",
     "mfa_required",
+    "linkedin_challenge",
 }
 
 # Blocked sites loaded from config/sites.yaml
@@ -786,6 +787,9 @@ def _is_permanent_failure(result: str) -> bool:
 APPLY_MIN_DELAY = float(os.environ.get("APPLYPILOT_APPLY_MIN_DELAY", "15"))
 APPLY_MAX_DELAY = float(os.environ.get("APPLYPILOT_APPLY_MAX_DELAY", "40"))
 APPLY_HOST_GAP = float(os.environ.get("APPLYPILOT_APPLY_HOST_GAP", "90"))
+# LinkedIn is the owner's real account AND ~44% of the queue -> a wider gap than
+# a tiny board (balanced default 120s; tune via APPLYPILOT_LINKEDIN_HOST_GAP).
+LINKEDIN_HOST_GAP = float(os.environ.get("APPLYPILOT_LINKEDIN_HOST_GAP", "120"))
 _last_apply_by_host: dict[str, float] = {}
 _throttle_lock = threading.Lock()
 
@@ -796,14 +800,20 @@ def _throttle_host(url: str) -> str:
     return h[4:] if h.startswith("www.") else h
 
 
+def _host_gap(host: str) -> float:
+    """Per-host minimum gap; LinkedIn gets a wider one for account safety."""
+    return LINKEDIN_HOST_GAP if "linkedin" in host else APPLY_HOST_GAP
+
+
 def _throttle_before_apply(url: str) -> None:
     """Wait out the per-host minimum gap before hitting the same host again."""
     host = _throttle_host(url)
-    if not host or APPLY_HOST_GAP <= 0:
+    gap = _host_gap(host)
+    if not host or gap <= 0:
         return
     with _throttle_lock:
         last = _last_apply_by_host.get(host, 0.0)
-    wait = APPLY_HOST_GAP - (time.monotonic() - last)
+    wait = gap - (time.monotonic() - last)
     if wait > 0:
         _stop_event.wait(timeout=wait)
 
