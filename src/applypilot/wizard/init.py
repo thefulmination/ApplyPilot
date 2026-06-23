@@ -27,6 +27,7 @@ from applypilot.config import (
     SEARCH_CONFIG_PATH,
     ensure_dirs,
     get_claude_path,
+    get_codex_path,
 )
 
 console = Console()
@@ -310,27 +311,39 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (requires Claude or Codex CLI)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using Claude Code or Codex as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
+    # Check for at least one apply-agent CLI
+    found_agent = False
     try:
         get_claude_path()
         console.print("[green]Claude Code CLI detected.[/green]")
+        found_agent = True
     except FileNotFoundError:
         console.print(
             "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "Install it from: [bold]https://claude.ai/code[/bold], or use Codex."
         )
+    try:
+        get_codex_path()
+        console.print("[green]Codex CLI detected.[/green]")
+        found_agent = True
+    except FileNotFoundError:
+        console.print(
+            "[yellow]Codex CLI not found on PATH.[/yellow]\n"
+            "Install Codex CLI or set CODEX_PATH if you want to use --agent codex."
+        )
+    if not found_agent:
+        console.print("[yellow]Auto-apply needs Claude Code CLI or Codex CLI before it can run.[/yellow]")
 
     # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
@@ -387,7 +400,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply (agent CLI detection)
     _setup_auto_apply()
     console.print()
 
@@ -411,7 +424,7 @@ def run_wizard() -> None:
     if tier == 1:
         unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI or Codex CLI + Chrome.[/dim]"
 
     console.print(
         Panel.fit(

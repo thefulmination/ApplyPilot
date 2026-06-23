@@ -448,7 +448,8 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(2, "--workers", "-w", help="Number of parallel browser workers. Account-safe: the LinkedIn daily cap and per-host throttle are process-global, shared across workers."),
     min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for job selection. Defaults to APPLYPILOT_MIN_SCORE or 7."),
-    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model name. sonnet is the reliable default for form-filling; use haiku only for cheap dry-runs."),
+    agent: str = typer.Option("claude", "--agent", help="Apply agent CLI to run: claude or codex."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Apply-agent model name. Defaults to sonnet for Claude; Codex uses its configured default when omitted."),
     poll_interval: int = typer.Option(15, "--poll-interval", help="Seconds a worker waits between DB polls when the queue is empty."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
@@ -474,6 +475,12 @@ def apply(
 
     if min_score is None:
         min_score = config.get_min_score()
+    agent = agent.strip().lower()
+    if agent not in {"claude", "codex"}:
+        console.print("[red]--agent must be either 'claude' or 'codex'.[/red]")
+        raise typer.Exit(code=1)
+    if not model and agent == "claude":
+        model = "sonnet"
 
     # --base-resume: process-level flag read by acquire_job / build_prompt /
     # readiness so jobs without a tailored resume apply with the base resume.
@@ -487,7 +494,7 @@ def apply(
         import os
         os.environ["APPLYPILOT_LINKEDIN_DAILY_CAP"] = str(linkedin_daily_cap)
 
-    # --- Utility modes (no Chrome/Claude needed) ---
+    # --- Utility modes (no Chrome/apply-agent needed) ---
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
@@ -509,7 +516,7 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (Claude Code CLI or Codex CLI + Chrome)
     check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
@@ -544,7 +551,8 @@ def apply(
                 raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt
+        from applypilot.apply.launcher import BASE_CDP_PORT, build_apply_agent_command, gen_prompt
+        import subprocess as _sp
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -554,13 +562,15 @@ def apply(
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
+        cmd = build_apply_agent_command(
+            agent=agent,
+            model=model,
+            mcp_config_path=mcp_path,
+            cdp_port=BASE_CDP_PORT,
+        )
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print("\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        console.print(f"  {_sp.list2cmdline(cmd)} < {prompt_file}")
         return
 
     from applypilot.apply.launcher import main as apply_main
@@ -589,20 +599,21 @@ def apply(
             )
             raise typer.Exit(code=1)
 
-    # Pre-flight AUTH canary: the apply agent spawns the Claude CLI to drive the
-    # browser; if it isn't authenticated, every job dies in seconds with "Not logged
-    # in" and the whole run is wasted (observed). `claude --version` is NOT enough
-    # (it exits 0 logged-out), so probe with a minimal `-p` query. Skipped for --gen.
+    # Pre-flight AUTH canary: the apply runner spawns an agent CLI to drive the
+    # browser; if it isn't authenticated, every job dies in seconds and the whole
+    # run is wasted. Version checks are not enough, so probe with a minimal query.
+    # Skipped for --gen.
     if not gen:
         import os as _os
         import subprocess as _sp
+        from applypilot.apply.launcher import build_agent_canary_command
         _env = _os.environ.copy()
         _env.pop("CLAUDECODE", None)
         _env.pop("CLAUDE_CODE_ENTRYPOINT", None)
         try:
+            canary_cmd = build_agent_canary_command(agent, model)
             _r = _sp.run(
-                [config.get_claude_path(), "--model", model, "-p",
-                 "--no-session-persistence", "Reply with the single word READY."],
+                canary_cmd,
                 capture_output=True, text=True, timeout=90, env=_env,
             )
             _out = ((_r.stdout or "") + (_r.stderr or "")).lower()
@@ -612,16 +623,16 @@ def apply(
             console.print(
                 f"[red]Apply agent CLI not authenticated — aborting before wasting a run.[/red]\n"
                 f"  detail: {e}\n"
-                f"  The apply agent spawns the Claude CLI ([dim]{config.get_claude_path()}[/dim]) to drive\n"
-                f"  the browser. Authenticate it once: run [bold]claude[/bold] then [bold]/login[/bold], or put\n"
-                f"  [bold]ANTHROPIC_API_KEY[/bold] in .applypilot/.env — then retry."
+                f"  The apply runner is configured for [bold]{agent}[/bold]. Authenticate that CLI once, or set\n"
+                f"  [bold]{'ANTHROPIC_API_KEY' if agent == 'claude' else 'CODEX_PATH and Codex auth'}[/bold] correctly — then retry."
             )
             raise typer.Exit(code=1)
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Agent:    {agent}")
+    console.print(f"  Model:    {model or 'codex default'}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -638,6 +649,7 @@ def apply(
         continuous=continuous,
         workers=workers,
         poll_interval=poll_interval,
+        agent=agent,
     )
 
 
@@ -1428,7 +1440,7 @@ def doctor() -> None:
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, get_chrome_path, get_claude_path,
+        SEARCH_CONFIG_PATH, get_chrome_path, get_claude_path, get_codex_path,
         load_preference_profile, PREFERENCE_PROFILE_PATH, KNOWLEDGE_GRAPH_PROMPT_PATH,
     )
 
@@ -1478,13 +1490,20 @@ def doctor() -> None:
         results.append(("LLM API key", fail_mark, f"{llm_note} (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
+    # Apply agent CLIs
     try:
         claude_bin = get_claude_path()
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     except FileNotFoundError:
         results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+                        "Install from https://claude.ai/code or use --agent codex"))
+
+    try:
+        codex_bin = get_codex_path()
+        results.append(("Codex CLI", ok_mark, codex_bin))
+    except FileNotFoundError:
+        results.append(("Codex CLI", warn_mark,
+                        "Install Codex CLI or set CODEX_PATH to use --agent codex"))
 
     # Chrome
     try:
@@ -1553,9 +1572,9 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI or Codex CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI or Codex CLI + Chrome + Node.js)[/dim]")
 
     console.print()
 

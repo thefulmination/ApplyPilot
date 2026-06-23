@@ -3,6 +3,7 @@
 import os
 import platform
 import shutil
+import subprocess
 from pathlib import Path
 
 # User data directory — all user-specific files live here
@@ -148,6 +149,43 @@ def get_claude_path() -> str:
 
     raise FileNotFoundError(
         "Claude Code CLI not found. Install from https://claude.ai/code or set CLAUDE_PATH."
+    )
+
+
+def get_codex_path() -> str:
+    """Find Codex CLI for the auto-apply agent."""
+    def _is_runnable(path: str | Path) -> bool:
+        try:
+            subprocess.run(
+                [str(path), "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    env_path = os.environ.get("CODEX_PATH")
+    if env_path and Path(env_path).exists() and _is_runnable(env_path):
+        return env_path
+
+    found = shutil.which("codex") or shutil.which("codex.exe") or shutil.which("codex.cmd")
+    if found and _is_runnable(found):
+        return found
+
+    project_root = PACKAGE_DIR.parent.parent
+    candidates = [
+        project_root / ".tools/codex/node_modules/.bin/codex.cmd",
+        project_root / ".tools/codex/node_modules/.bin/codex",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and _is_runnable(candidate):
+            return str(candidate)
+
+    raise FileNotFoundError(
+        "Codex CLI not found. Install Codex CLI or set CODEX_PATH."
     )
 
 
@@ -371,7 +409,7 @@ def get_tier() -> int:
 
     Tier 1 (Discovery):            Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 3 (Full Auto-Apply):       + Claude Code CLI or Codex CLI + Chrome
     """
     load_env()
 
@@ -379,18 +417,21 @@ def get_tier() -> int:
     if not has_llm:
         return 1
 
-    try:
-        get_claude_path()
-        has_claude = True
-    except FileNotFoundError:
-        has_claude = False
+    has_apply_agent = False
+    for get_agent_path in (get_claude_path, get_codex_path):
+        try:
+            get_agent_path()
+            has_apply_agent = True
+            break
+        except FileNotFoundError:
+            pass
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_apply_agent and has_chrome:
         return 3
 
     return 2
@@ -414,10 +455,16 @@ def check_tier(required: int, feature: str) -> None:
     if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
         missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY or DEEPSEEK_API_KEY")
     if required >= 3:
-        try:
-            get_claude_path()
-        except FileNotFoundError:
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        has_apply_agent = False
+        for get_agent_path in (get_claude_path, get_codex_path):
+            try:
+                get_agent_path()
+                has_apply_agent = True
+                break
+            except FileNotFoundError:
+                pass
+        if not has_apply_agent:
+            missing.append("Claude Code CLI or Codex CLI — install one, or set CLAUDE_PATH/CODEX_PATH")
         try:
             get_chrome_path()
         except FileNotFoundError:
