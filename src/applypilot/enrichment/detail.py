@@ -187,7 +187,14 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
                 )
                 resolved += 1
             except sqlite3.IntegrityError:
-                conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
+                # new_url already exists -> keep the old row, mark it a duplicate
+                # of the canonical row (never delete a job; retain for training).
+                conn.execute(
+                    "UPDATE jobs SET duplicate_of_url = ?, "
+                    "duplicate_reason = 'url_resolved_collision', "
+                    "duplicate_detected_at = ? WHERE url = ?",
+                    (new_url, datetime.now(timezone.utc).isoformat(), url),
+                )
                 resolved += 1
         else:
             failed += 1
@@ -275,7 +282,14 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
                 )
                 updated += 1
             except sqlite3.IntegrityError:
-                conn.execute("DELETE FROM jobs WHERE url = ?", (old_url,))
+                # canonical url already exists -> keep the old row as a duplicate
+                # (never delete a job; retain for training).
+                conn.execute(
+                    "UPDATE jobs SET duplicate_of_url = ?, "
+                    "duplicate_reason = 'url_resolved_collision', "
+                    "duplicate_detected_at = ? WHERE url = ?",
+                    (match["url"], datetime.now(timezone.utc).isoformat(), old_url),
+                )
                 updated += 1
         else:
             for s, data in slug_map.items():
@@ -287,7 +301,12 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
                         )
                         updated += 1
                     except sqlite3.IntegrityError:
-                        conn.execute("DELETE FROM jobs WHERE url = ?", (old_url,))
+                        conn.execute(
+                            "UPDATE jobs SET duplicate_of_url = ?, "
+                            "duplicate_reason = 'url_resolved_collision', "
+                            "duplicate_detected_at = ? WHERE url = ?",
+                            (data["url"], datetime.now(timezone.utc).isoformat(), old_url),
+                        )
                         updated += 1
                     break
 
