@@ -624,8 +624,9 @@ This is the owner's REAL LinkedIn account -- protect it above all else:
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
-11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
-12. Output your result.
+11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission.
+12. CONFIRMATION REQUIRED before RESULT:APPLIED. Only claim success if you actually SEE positive confirmation: a "thank you" / "application received" / "application submitted" / "we've received your application" message, a confirmation or reference number, OR the form is replaced by a clear success state. If the form is still showing, shows validation errors, or the page looks unchanged, the submit did NOT go through -- fix any errors and retry Submit ONCE. If you still cannot see confirmation, output RESULT:FAILED:no_confirmation. NEVER output RESULT:APPLIED without observed confirmation -- a false "applied" is worse than a failure.
+13. Output your result.
 
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
@@ -636,7 +637,9 @@ RESULT:LOGIN_ISSUE -- could not sign in or create account
 RESULT:AUTH_REQUIRED -- login, account creation, email verification, SSO, or 2FA requires human action
 RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
+RESULT:FAILED:no_confirmation -- clicked Submit but could not confirm the application actually went through
 RESULT:FAILED:reason -- any other failure (brief reason)
+Output EXACTLY one RESULT: line as the LAST line of your response, using only the codes above. Do not invent new codes.
 
 == BROWSER EFFICIENCY ==
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
@@ -661,7 +664,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 {captcha_section}
 
 == WHEN TO GIVE UP ==
-- Same page after 3 attempts with no progress -> RESULT:FAILED:stuck
+- LOOP GUARD: track the pages/steps you visit. If you reach the same page/step a 3rd time, OR take 5+ actions with no visible progress toward submission -> RESULT:FAILED:stuck. Don't repeat the same action expecting a different result.
 - Job is closed/expired/page says "no longer accepting" -> RESULT:EXPIRED
 - Page is broken/500 error/blank -> RESULT:FAILED:page_error
 Stop immediately. Output your RESULT code. Do not loop."""

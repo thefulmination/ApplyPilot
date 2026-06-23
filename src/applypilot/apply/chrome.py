@@ -245,10 +245,30 @@ def launch_chrome(worker_id: int, port: int | None = None,
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
-    logger.info("[worker-%d] Chrome started on port %d (pid %d)",
-                worker_id, port, proc.pid)
+    # Poll the CDP endpoint instead of a blind sleep(3): return as soon as Chrome's
+    # debug port actually accepts connections (usually <1s when warm), and cap the
+    # wait so a slow first-run profile clone can't false-start the agent (which then
+    # connects to a not-yet-ready port and dies as no_result). Read-only probe.
+    import os as _os
+    import urllib.request as _urlreq
+    deadline = time.time() + float(_os.environ.get("APPLYPILOT_CDP_READY_TIMEOUT") or 15)
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break  # Chrome exited; let the caller's run fail with diagnostics
+        try:
+            with _urlreq.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as r:
+                if r.status == 200:
+                    ready = True
+                    break
+        except Exception:
+            time.sleep(0.2)
+    if ready:
+        logger.info("[worker-%d] Chrome CDP ready on port %d (pid %d)",
+                    worker_id, port, proc.pid)
+    else:
+        logger.warning("[worker-%d] Chrome CDP NOT confirmed ready on port %d after wait (pid %d)",
+                       worker_id, port, proc.pid)
     return proc
 
 

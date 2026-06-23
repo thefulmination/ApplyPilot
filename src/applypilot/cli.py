@@ -446,9 +446,10 @@ def smart_health_command(
 @app.command()
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
+    workers: int = typer.Option(2, "--workers", "-w", help="Number of parallel browser workers. Account-safe: the LinkedIn daily cap and per-host throttle are process-global, shared across workers."),
     min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for job selection. Defaults to APPLYPILOT_MIN_SCORE or 7."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model name. sonnet is the reliable default for form-filling; use haiku only for cheap dry-runs."),
+    poll_interval: int = typer.Option(15, "--poll-interval", help="Seconds a worker waits between DB polls when the queue is empty."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -588,6 +589,35 @@ def apply(
             )
             raise typer.Exit(code=1)
 
+    # Pre-flight AUTH canary: the apply agent spawns the Claude CLI to drive the
+    # browser; if it isn't authenticated, every job dies in seconds with "Not logged
+    # in" and the whole run is wasted (observed). `claude --version` is NOT enough
+    # (it exits 0 logged-out), so probe with a minimal `-p` query. Skipped for --gen.
+    if not gen:
+        import os as _os
+        import subprocess as _sp
+        _env = _os.environ.copy()
+        _env.pop("CLAUDECODE", None)
+        _env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        try:
+            _r = _sp.run(
+                [config.get_claude_path(), "--model", model, "-p",
+                 "--no-session-persistence", "Reply with the single word READY."],
+                capture_output=True, text=True, timeout=90, env=_env,
+            )
+            _out = ((_r.stdout or "") + (_r.stderr or "")).lower()
+            if _r.returncode != 0 or "not logged in" in _out or "/login" in _out or "please run" in _out:
+                raise RuntimeError(((_r.stdout or "") or (_r.stderr or "") or f"exit {_r.returncode}").strip()[:160])
+        except Exception as e:
+            console.print(
+                f"[red]Apply agent CLI not authenticated — aborting before wasting a run.[/red]\n"
+                f"  detail: {e}\n"
+                f"  The apply agent spawns the Claude CLI ([dim]{config.get_claude_path()}[/dim]) to drive\n"
+                f"  the browser. Authenticate it once: run [bold]claude[/bold] then [bold]/login[/bold], or put\n"
+                f"  [bold]ANTHROPIC_API_KEY[/bold] in .applypilot/.env — then retry."
+            )
+            raise typer.Exit(code=1)
+
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
@@ -607,6 +637,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        poll_interval=poll_interval,
     )
 
 

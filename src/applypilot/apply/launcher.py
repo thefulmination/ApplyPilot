@@ -801,6 +801,9 @@ PERMANENT_FAILURES: set[str] = {
     "no_result_line",
     # No valid http(s) apply URL -> can't be applied; don't waste a launch retrying.
     "bad_application_url",
+    # Submit clicked but unconfirmed: auto-retrying risks a DOUBLE submission, so
+    # don't -- surface it in the run-summary fail reasons for manual review instead.
+    "no_confirmation",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
