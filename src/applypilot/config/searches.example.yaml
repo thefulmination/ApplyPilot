@@ -178,6 +178,10 @@ hiring_cafe:
   company_watchlist_limit: 0  # 0 means search the full list
   company_max_pages: 1
   company_results_per_site: 20
+  request_delay_seconds: 0.35
+  company_request_delay_seconds: 0.75
+  rate_limit_backoff_seconds: 90
+  max_consecutive_rate_limits: 3
 
 # Corporate ATS source settings.
 # Uses public Greenhouse, Lever, and Ashby job-board APIs.

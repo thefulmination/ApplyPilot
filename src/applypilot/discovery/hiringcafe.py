@@ -12,6 +12,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -29,6 +30,10 @@ REQUEST_TIMEOUT = 30
 DEFAULT_MAX_PAGES = 2
 DEFAULT_COMPANY_MAX_PAGES = 1
 DEFAULT_COMPANY_RESULTS_PER_SITE = 20
+DEFAULT_REQUEST_DELAY_SECONDS = 0.35
+DEFAULT_COMPANY_REQUEST_DELAY_SECONDS = 0.75
+DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 90.0
+DEFAULT_MAX_CONSECUTIVE_RATE_LIMITS = 3
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -88,6 +93,16 @@ STATE_NAMES = {
     "wv": "west-virginia",
     "wy": "wyoming",
 }
+
+
+class HiringCafeRateLimitError(RuntimeError):
+    """Raised when HiringCafe returns HTTP 429 and the crawl should back off."""
+
+    def __init__(self, url: str, retry_after_seconds: float | None = None) -> None:
+        self.url = url
+        self.retry_after_seconds = retry_after_seconds
+        suffix = f"; retry after {retry_after_seconds:g}s" if retry_after_seconds is not None else ""
+        super().__init__(f"HTTP 429 Too Many Requests for {url}{suffix}")
 
 KNOWN_LOCATION_SLUGS = {
     "remote": "united-states",
@@ -162,6 +177,39 @@ def _truthy_config(value) -> bool:
     return bool(value)
 
 
+def _float_config(value, default: float) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_config(value, default: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
 def _load_company_watchlist(cfg: dict) -> list[str]:
     """Load optional company names from a user-maintained text file."""
     hiring_cfg = cfg.get("hiring_cafe", {}) or {}
@@ -208,6 +256,8 @@ def _load_company_watchlist(cfg: dict) -> list[str]:
 
 def _fetch_page(session: requests.Session, url: str) -> dict:
     resp = session.get(url, timeout=REQUEST_TIMEOUT)
+    if resp.status_code == 429:
+        raise HiringCafeRateLimitError(url, _parse_retry_after(resp.headers.get("Retry-After")))
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -346,12 +396,22 @@ def _run_one_search(
     all_jobs: list[dict] = []
     total_seen = 0
     filtered = 0
+    errors = 0
+    rate_limited = False
+    retry_after_seconds: float | None = None
 
     for page_num in range(max_pages):
         url = base_url if page_num == 0 else f"{base_url}?page={page_num}"
         try:
             page = _fetch_page(session, url)
+        except HiringCafeRateLimitError as e:
+            errors += 1
+            rate_limited = True
+            retry_after_seconds = e.retry_after_seconds
+            log.warning("[HiringCafe] %s in %s page %d rate limited: %s", query, location, page_num + 1, e)
+            break
         except Exception as e:
+            errors += 1
             log.error("[HiringCafe] %s in %s page %d failed: %s", query, location, page_num + 1, e)
             break
 
@@ -374,7 +434,15 @@ def _run_one_search(
 
     if not all_jobs:
         log.info("[HiringCafe] \"%s\" in %s: %d seen, 0 kept, %d filtered", query, location, total_seen, filtered)
-        return {"new": 0, "existing": 0, "seen": total_seen, "filtered": filtered}
+        return {
+            "new": 0,
+            "existing": 0,
+            "seen": total_seen,
+            "filtered": filtered,
+            "errors": errors,
+            "rate_limited": rate_limited,
+            "retry_after_seconds": retry_after_seconds,
+        }
 
     conn = get_connection()
     new, existing = _store_jobs(conn, all_jobs)
@@ -387,7 +455,15 @@ def _run_one_search(
         existing,
         filtered,
     )
-    return {"new": new, "existing": existing, "seen": total_seen, "filtered": filtered}
+    return {
+        "new": new,
+        "existing": existing,
+        "seen": total_seen,
+        "filtered": filtered,
+        "errors": errors,
+        "rate_limited": rate_limited,
+        "retry_after_seconds": retry_after_seconds,
+    }
 
 
 def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
@@ -434,6 +510,22 @@ def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
         hiring_cfg.get("company_results_per_site") or min(results_per_site, DEFAULT_COMPANY_RESULTS_PER_SITE)
     )
     company_max_pages = int(hiring_cfg.get("company_max_pages", DEFAULT_COMPANY_MAX_PAGES))
+    request_delay_seconds = _float_config(
+        hiring_cfg.get("request_delay_seconds"),
+        DEFAULT_REQUEST_DELAY_SECONDS,
+    )
+    company_request_delay_seconds = _float_config(
+        hiring_cfg.get("company_request_delay_seconds"),
+        max(request_delay_seconds, DEFAULT_COMPANY_REQUEST_DELAY_SECONDS),
+    )
+    rate_limit_backoff_seconds = _float_config(
+        hiring_cfg.get("rate_limit_backoff_seconds"),
+        DEFAULT_RATE_LIMIT_BACKOFF_SECONDS,
+    )
+    max_consecutive_rate_limits = _int_config(
+        hiring_cfg.get("max_consecutive_rate_limits"),
+        DEFAULT_MAX_CONSECUTIVE_RATE_LIMITS,
+    )
     accept_locs, reject_locs = _load_location_config(cfg)
 
     init_db()
@@ -446,10 +538,14 @@ def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
     total_seen = 0
     errors = 0
     completed = 0
+    rate_limit_hits = 0
+    consecutive_rate_limits = 0
+    stopped_for_rate_limit = False
 
     log.info(
         "HiringCafe crawl: %d search combinations (%d role, %d company) | "
-        "Results/search: role %d, company %d | Max pages: role %d, company %d",
+        "Results/search: role %d, company %d | Max pages: role %d, company %d | "
+        "Delay: role %.2fs, company %.2fs | 429 backoff %.1fs, stop after %d consecutive",
         len(search_terms) * len(locations),
         sum(1 for term in search_terms if term["kind"] == "role"),
         sum(1 for term in search_terms if term["kind"] == "company"),
@@ -457,6 +553,10 @@ def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
         company_results_per_site,
         max_pages,
         company_max_pages,
+        request_delay_seconds,
+        company_request_delay_seconds,
+        rate_limit_backoff_seconds,
+        max_consecutive_rate_limits,
     )
 
     for term in search_terms:
@@ -465,6 +565,7 @@ def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
         search_max_pages = company_max_pages if term["kind"] == "company" else max_pages
         for loc_cfg in locations:
             location = loc_cfg.get("location") or cfg.get("defaults", {}).get("location", "United States")
+            result = {"rate_limited": False}
             try:
                 result = _run_one_search(
                     session,
@@ -479,18 +580,48 @@ def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
                 total_existing += result["existing"]
                 total_filtered += result["filtered"]
                 total_seen += result["seen"]
+                errors += int(result.get("errors", 0) or 0)
+                if result.get("rate_limited"):
+                    rate_limit_hits += 1
+                    consecutive_rate_limits += 1
+                    if max_consecutive_rate_limits and consecutive_rate_limits >= max_consecutive_rate_limits:
+                        stopped_for_rate_limit = True
+                        log.warning(
+                            "HiringCafe stopping early after %d consecutive HTTP 429 responses; "
+                            "rerun later to resume from remaining configured searches.",
+                            consecutive_rate_limits,
+                        )
+                    else:
+                        retry_after = result.get("retry_after_seconds")
+                        backoff = max(
+                            rate_limit_backoff_seconds,
+                            float(retry_after) if retry_after is not None else 0.0,
+                        )
+                        if backoff > 0:
+                            log.warning("HiringCafe HTTP 429 backoff: waiting %.1fs before next request", backoff)
+                            time.sleep(backoff)
+                else:
+                    consecutive_rate_limits = 0
             except Exception as e:
                 errors += 1
                 log.exception("[HiringCafe] \"%s\" in %s failed: %s", query, location, e)
             completed += 1
+            if stopped_for_rate_limit:
+                break
+            delay = company_request_delay_seconds if term["kind"] == "company" else request_delay_seconds
+            if delay > 0 and not result.get("rate_limited"):
+                time.sleep(delay)
+        if stopped_for_rate_limit:
+            break
 
     log.info(
-        "HiringCafe complete: %d new | %d dupes | %d filtered | %d seen | %d errors",
+        "HiringCafe complete: %d new | %d dupes | %d filtered | %d seen | %d errors | %d rate limits",
         total_new,
         total_existing,
         total_filtered,
         total_seen,
         errors,
+        rate_limit_hits,
     )
 
     return {
@@ -499,5 +630,8 @@ def run_hiringcafe_discovery(cfg: dict | None = None) -> dict:
         "filtered": total_filtered,
         "seen": total_seen,
         "errors": errors,
+        "rate_limited": rate_limit_hits > 0,
+        "stopped_for_rate_limit": stopped_for_rate_limit,
+        "rate_limit_hits": rate_limit_hits,
         "queries": completed,
     }

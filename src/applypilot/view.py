@@ -77,7 +77,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning, fit_verdict
         FROM jobs
         WHERE fit_score >= 5 AND duplicate_of_url IS NULL
         ORDER BY fit_score DESC, site, title
@@ -160,6 +160,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         reasoning_lines = reasoning_raw.split("\n")
         keywords = reasoning_lines[0][:120] if reasoning_lines else ""
         reasoning = reasoning_lines[1][:200] if len(reasoning_lines) > 1 else ""
+        verdict = escape((j["fit_verdict"] or "")[:300])
 
         desc_preview = escape(j["full_description"] or "")[:300]
         full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
@@ -186,6 +187,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             <a href="{url}" class="job-title" target="_blank">{title}</a>
           </div>
           <div class="meta-row">{meta_html}</div>
+          {f'<div class="verdict-row">{verdict}</div>' if verdict else ''}
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
           <p class="desc-preview">{desc_preview}...</p>
@@ -274,6 +276,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .meta-tag.location {{ background: #1e3a5f; color: #93c5fd; }}
 
   .keywords-row {{ font-size: 0.75rem; color: #10b981; margin-bottom: 0.3rem; line-height: 1.4; }}
+  .verdict-row {{ font-size: 0.82rem; color: #e2e8f0; font-weight: 600; margin-bottom: 0.4rem; line-height: 1.4; }}
   .reasoning-row {{ font-size: 0.75rem; color: #94a3b8; margin-bottom: 0.5rem; font-style: italic; line-height: 1.4; }}
 
   .desc-preview {{ font-size: 0.8rem; color: #64748b; line-height: 1.5; margin-bottom: 0.75rem; max-height: 3.6em; overflow: hidden; }}
