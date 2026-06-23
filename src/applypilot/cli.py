@@ -416,6 +416,7 @@ def apply(
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     base_resume: bool = typer.Option(False, "--base-resume", help="Apply with the base resume as-is (no per-job tailoring); jobs lacking a tailored resume fall back to .applypilot/resume.pdf."),
     max_cost_usd: float = typer.Option(0.0, "--max-cost-usd", help="Stop the run once estimated apply cost reaches this USD amount (0 = no cap)."),
+    linkedin_daily_cap: int = typer.Option(-1, "--linkedin-daily-cap", help="Rolling-24h cap on LinkedIn Easy-Apply submissions; offsite lane keeps flowing after the cap. -1 = use default (20), 0 = no cap."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     preflight: bool = typer.Option(True, "--preflight/--skip-preflight", help="Run readiness checks before launching the apply agent."),
@@ -443,6 +444,9 @@ def apply(
     if max_cost_usd and max_cost_usd > 0:
         import os
         os.environ["APPLYPILOT_APPLY_MAX_COST"] = str(max_cost_usd)
+    if linkedin_daily_cap >= 0:
+        import os
+        os.environ["APPLYPILOT_LINKEDIN_DAILY_CAP"] = str(linkedin_daily_cap)
 
     # --- Utility modes (no Chrome/Claude needed) ---
 

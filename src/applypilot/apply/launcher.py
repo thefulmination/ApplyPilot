@@ -97,7 +97,10 @@ def _make_mcp_config(cdp_port: int) -> dict:
             "playwright": {
                 "command": "npx",
                 "args": [
-                    "@playwright/mcp@latest",
+                    # Pinned (NOT @latest): a silent Playwright-MCP upgrade could
+                    # change CDP behavior or the automation surface under a live run.
+                    # Bump deliberately after testing. (npm i -g for cache warmth.)
+                    "@playwright/mcp@0.0.76",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
@@ -117,13 +120,16 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+                worker_id: int = 0, exclude_linkedin: bool = False) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
         min_score: Minimum audited score / fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
+        exclude_linkedin: When True, skip LinkedIn-lane (Easy-Apply) jobs in queue
+            selection so the run keeps flowing on the offsite ATS lane. Set by the
+            worker loop when the LinkedIn daily cap or same-day halt is in effect.
 
     Returns:
         Job dict or None if the queue is empty.
@@ -175,6 +181,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 if blocked_patterns:
                     url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                     params.extend(blocked_patterns)
+                # LinkedIn lane gating: when the daily cap / same-day halt is in
+                # effect, skip Easy-Apply jobs so the run keeps flowing offsite.
+                li_clause = f"AND NOT {_LINKEDIN_LANE_SQL}" if exclude_linkedin else ""
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
                            fit_score, audit_score, audit_label, location, full_description, cover_letter_path
@@ -189,6 +198,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       AND COALESCE(audit_score, fit_score) >= ?
                       {site_clause}
                       {url_clauses}
+                      {li_clause}
                     ORDER BY COALESCE(audit_score, fit_score) DESC,
                              (audit_flags LIKE '%"chief_of_staff"%') DESC,
                              (audit_flags LIKE '%"strategy_ops"%'
@@ -792,8 +802,46 @@ APPLY_HOST_GAP = float(os.environ.get("APPLYPILOT_APPLY_HOST_GAP", "90"))
 # LinkedIn is the owner's real account AND ~44% of the queue -> a wider gap than
 # a tiny board (balanced default 120s; tune via APPLYPILOT_LINKEDIN_HOST_GAP).
 LINKEDIN_HOST_GAP = float(os.environ.get("APPLYPILOT_LINKEDIN_HOST_GAP", "120"))
+# Per-host gap JITTER: a fixed 90s/120s cadence is itself a machine signature, so
+# multiply the gap by a random factor on every wait. Default band [0.7, 1.4] (mean
+# ~1.05 -> slightly conservative). Set HI <= LO to disable.
+GAP_JITTER_LO = float(os.environ.get("APPLYPILOT_GAP_JITTER_LO", "0.7"))
+GAP_JITTER_HI = float(os.environ.get("APPLYPILOT_GAP_JITTER_HI", "1.4"))
 _last_apply_by_host: dict[str, float] = {}
 _throttle_lock = threading.Lock()
+
+# --- LinkedIn lane gating (account-safety) -------------------------------------
+# LinkedIn Easy-Apply daily cap, ROLLING 24h, derived from the DB so it is durable
+# AND process-global: running the apply twice in a day can't blow the real ceiling.
+# Counts only submissions whose EFFECTIVE apply host is LinkedIn (offsite redirects
+# do NOT count). 0 = no cap. Conservative default 20 -- well under LinkedIn's ~30/day
+# soft throttle; raise once a first real run shows headroom.
+LINKEDIN_DAILY_CAP = int(os.environ.get("APPLYPILOT_LINKEDIN_DAILY_CAP", "20"))
+# Same-day hard stop for the LinkedIn lane after a pause/challenge/auth failure:
+# stop ACQUIRING LinkedIn-lane jobs (no retry-storm) while the offsite lane keeps
+# flowing. Tripped in worker_loop, read in acquire_job. Per-process (one run).
+_linkedin_halt = threading.Event()
+_li_cap_announced = threading.Event()
+LINKEDIN_PAUSE_REASONS = {
+    "linkedin_rate_limited", "linkedin_challenge", "linkedin_pause",
+    "rate_limited", "captcha", "login_issue", "auth_required",
+}
+# Effective-apply-host LinkedIn test, shared by the cap COUNT and the acquire
+# exclusion clause: a real http application_url (offsite ATS) wins over the url.
+_LINKEDIN_LANE_SQL = (
+    "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) "
+    "LIKE '%linkedin.com%'"
+)
+
+
+def _linkedin_today(conn) -> int:
+    """Rolling-24h count of applied jobs whose effective apply host is LinkedIn."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    return conn.execute(
+        f"SELECT COUNT(*) FROM jobs WHERE apply_status = 'applied' "
+        f"AND applied_at >= ? AND {_LINKEDIN_LANE_SQL}",
+        (since,),
+    ).fetchone()[0]
 
 
 def _throttle_host(url: str) -> str:
@@ -824,6 +872,8 @@ def _throttle_before_apply(url: str) -> None:
     gap = _host_gap(host)
     if not host or gap <= 0:
         return
+    if GAP_JITTER_HI > GAP_JITTER_LO > 0:
+        gap *= random.uniform(GAP_JITTER_LO, GAP_JITTER_HI)
     with _throttle_lock:
         last = _last_apply_by_host.get(host, 0.0)
     wait = gap - (time.monotonic() - last)
@@ -866,6 +916,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
+    # LinkedIn daily cap read at runtime so a --linkedin-daily-cap CLI flag (env set
+    # after import) is honored; falls back to the module default. 0 = no cap.
+    li_cap = int(os.environ.get("APPLYPILOT_LINKEDIN_DAILY_CAP") or LINKEDIN_DAILY_CAP)
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -874,8 +927,25 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         update_state(worker_id, status="idle", job_title="", company="",
                      last_action="waiting for job", actions=0)
 
+        # LinkedIn lane gating: stop ACQUIRING LinkedIn Easy-Apply jobs once a
+        # pause/challenge tripped the halt or the rolling-24h cap is hit -- the
+        # offsite ATS lane keeps flowing either way. Skipped for single-URL applies.
+        exclude_li = False
+        if not target_url:
+            exclude_li = _linkedin_halt.is_set()
+            if not exclude_li and li_cap > 0:
+                try:
+                    if _linkedin_today(get_connection()) >= li_cap:
+                        exclude_li = True
+                        if not _li_cap_announced.is_set():
+                            _li_cap_announced.set()
+                            add_event(f"[W{worker_id}] LinkedIn daily cap "
+                                      f"{li_cap} reached -- continuing offsite lane only")
+                except Exception:
+                    logger.debug("LinkedIn cap check failed", exc_info=True)
+
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, exclude_linkedin=exclude_li)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -939,6 +1009,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
+                # Same-day LinkedIn halt: a pause/challenge/auth failure on a
+                # LinkedIn-lane job stops the LinkedIn lane for the rest of this run
+                # (no retry-storm); the offsite lane keeps going.
+                if (reason in LINKEDIN_PAUSE_REASONS
+                        and "linkedin" in _throttle_host(_apply_target(job))
+                        and not _linkedin_halt.is_set()):
+                    _linkedin_halt.set()
+                    add_event(f"[W{worker_id}] LinkedIn {reason} -- halting LinkedIn "
+                              f"lane for this run; offsite continues")
 
         except KeyboardInterrupt:
             release_lock(job["url"])
