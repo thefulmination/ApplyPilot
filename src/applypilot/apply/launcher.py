@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import platform
+import random
 import re
 import signal
 import subprocess
@@ -753,6 +754,45 @@ def _is_permanent_failure(result: str) -> bool:
 # Worker loop
 # ---------------------------------------------------------------------------
 
+# Inter-job apply throttle (account safety): space out real submissions so a
+# bulk run doesn't hammer one host (esp. LinkedIn) from a single browser profile.
+# Tunable via env; set APPLYPILOT_APPLY_MAX_DELAY=0 to disable the inter-job delay.
+APPLY_MIN_DELAY = float(os.environ.get("APPLYPILOT_APPLY_MIN_DELAY", "15"))
+APPLY_MAX_DELAY = float(os.environ.get("APPLYPILOT_APPLY_MAX_DELAY", "40"))
+APPLY_HOST_GAP = float(os.environ.get("APPLYPILOT_APPLY_HOST_GAP", "90"))
+_last_apply_by_host: dict[str, float] = {}
+_throttle_lock = threading.Lock()
+
+
+def _throttle_host(url: str) -> str:
+    from urllib.parse import urlparse
+    h = (urlparse(url or "").hostname or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def _throttle_before_apply(url: str) -> None:
+    """Wait out the per-host minimum gap before hitting the same host again."""
+    host = _throttle_host(url)
+    if not host or APPLY_HOST_GAP <= 0:
+        return
+    with _throttle_lock:
+        last = _last_apply_by_host.get(host, 0.0)
+    wait = APPLY_HOST_GAP - (time.monotonic() - last)
+    if wait > 0:
+        _stop_event.wait(timeout=wait)
+
+
+def _throttle_after_apply(url: str) -> None:
+    """Record the apply time and sleep a randomized inter-job delay so the
+    submission cadence isn't robotic. Interruptible via the stop event."""
+    host = _throttle_host(url)
+    with _throttle_lock:
+        _last_apply_by_host[host] = time.monotonic()
+    hi = max(APPLY_MIN_DELAY, APPLY_MAX_DELAY)
+    if hi > 0:
+        _stop_event.wait(timeout=random.uniform(min(APPLY_MIN_DELAY, APPLY_MAX_DELAY), hi))
+
+
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
@@ -803,6 +843,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+
+        # Account-safety throttle: respect the per-host gap before launching
+        # (skipped in dry-run so canary tests stay fast).
+        if not dry_run:
+            _throttle_before_apply(job["url"])
+            if _stop_event.is_set():
+                release_lock(job["url"])
+                break
 
         chrome_proc = None
         try:
@@ -858,6 +906,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         finally:
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
+
+        # Randomized inter-job delay after a real submission (account safety).
+        if not dry_run and not target_url:
+            _throttle_after_apply(job["url"])
 
         jobs_done += 1
         if target_url:
