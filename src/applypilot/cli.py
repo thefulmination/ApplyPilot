@@ -304,6 +304,54 @@ def verify_live_command(
         console.print("\n[yellow]Dry run only.[/yellow] Run without --dry-run to write liveness_status.")
 
 
+@app.command("linkedin-split")
+def linkedin_split_command() -> None:
+    """LinkedIn apply split: offsite (external ATS, fast lane) vs Easy-Apply/unresolved
+    (LinkedIn-paced). Watch the offsite count climb as the extractor resolves links."""
+    _bootstrap()
+    from urllib.parse import urlparse
+    from applypilot.database import get_connection
+
+    def _host(u: str) -> str:
+        h = (urlparse(u or "").hostname or "").lower()
+        return h[4:] if h.startswith("www.") else h
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT url, application_url, audit_label FROM jobs "
+        "WHERE (lower(site)='linkedin' OR url LIKE '%linkedin.com/jobs%') "
+        "AND duplicate_of_url IS NULL "
+        "AND COALESCE(liveness_status,'') != 'dead' "
+        "AND applied_at IS NULL"
+    ).fetchall()
+    offsite = easyapply = band_offsite = band_total = 0
+    for r in rows:
+        au = r["application_url"] or ""
+        is_offsite = au.startswith("http") and "linkedin" not in _host(au)
+        if is_offsite:
+            offsite += 1
+        else:
+            easyapply += 1
+        if r["audit_label"] in ("priority", "recommended"):
+            band_total += 1
+            if is_offsite:
+                band_offsite += 1
+    console.print("\n[bold]LinkedIn apply split[/bold] (live, not-yet-applied)")
+    console.print(f"  total LinkedIn jobs:                       {len(rows)}")
+    console.print(f"  [green]offsite (fast external lane):[/green]              {offsite}")
+    console.print(f"  [yellow]Easy-Apply / unresolved (LinkedIn-paced):[/yellow]  {easyapply}")
+    console.print(
+        f"  apply-band (priority/recommended): {band_total}   "
+        f"(offsite there: {band_offsite})"
+    )
+    if offsite == 0:
+        console.print(
+            "[dim]No offsite URLs resolved yet — have the extractor emit companyApplyUrl, "
+            "then re-run sync_linkedin_picks.py to backfill application_url.[/dim]"
+        )
+    conn.close()
+
+
 @app.command("smart-health")
 def smart_health_command(
     all_sites: bool = typer.Option(False, "--all", help="Show healthy sources too."),
@@ -367,6 +415,7 @@ def apply(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     base_resume: bool = typer.Option(False, "--base-resume", help="Apply with the base resume as-is (no per-job tailoring); jobs lacking a tailored resume fall back to .applypilot/resume.pdf."),
+    max_cost_usd: float = typer.Option(0.0, "--max-cost-usd", help="Stop the run once estimated apply cost reaches this USD amount (0 = no cap)."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     preflight: bool = typer.Option(True, "--preflight/--skip-preflight", help="Run readiness checks before launching the apply agent."),
@@ -391,6 +440,9 @@ def apply(
     if base_resume:
         import os
         os.environ["APPLYPILOT_BASE_RESUME"] = "1"
+    if max_cost_usd and max_cost_usd > 0:
+        import os
+        os.environ["APPLYPILOT_APPLY_MAX_COST"] = str(max_cost_usd)
 
     # --- Utility modes (no Chrome/Claude needed) ---
 

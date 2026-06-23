@@ -182,6 +182,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     WHERE duplicate_of_url IS NULL
                       {tailored_clause}
                       AND COALESCE(liveness_status, '') != 'dead'
+                      AND COALESCE(application_url, url) NOT IN (
+                            SELECT COALESCE(application_url, url) FROM jobs WHERE apply_status = 'applied')
                       AND (apply_status IS NULL OR apply_status = 'failed')
                       AND (apply_attempts IS NULL OR apply_attempts < ?)
                       AND COALESCE(audit_score, fit_score) >= ?
@@ -954,6 +956,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
 
+        # Cost-budget guard: stop the whole run once accumulated apply cost hits
+        # the cap (APPLYPILOT_APPLY_MAX_COST / --max-cost-usd; 0 = no cap). Read at
+        # runtime so the CLI flag (set after import) is honored.
+        _maxc = float(os.environ.get("APPLYPILOT_APPLY_MAX_COST") or 0)
+        if _maxc > 0 and get_totals().get("cost", 0) >= _maxc:
+            add_event(f"[W{worker_id}] Cost budget ${_maxc:.2f} reached -- stopping run")
+            _stop_event.set()
+            break
+
         # Randomized inter-job delay after a real submission (account safety).
         if not dry_run and not target_url:
             _throttle_after_apply(_apply_target(job))
@@ -1114,6 +1125,30 @@ def main(limit: int = 1, target_url: str | None = None,
             f"\n[bold]Done: {total_applied} applied, {total_failed} failed "
             f"(${totals['cost']:.3f})[/bold]"
         )
+        # Auto-surfaced run summary: funnel + applied-by-channel + top hosts +
+        # fail reasons, so a large run ends with a real report, not just "Done".
+        try:
+            from applypilot.database import get_apply_analytics, get_connection
+            a = get_apply_analytics()
+            sr = a.get("success_rate")
+            console.print(
+                f"[bold]Apply funnel:[/bold] {a['applied']} applied / {a['attempted']} attempted"
+                + (f" ({sr * 100:.0f}% success)" if sr is not None else "")
+            )
+            ch = get_connection().execute(
+                "SELECT channel, COUNT(*) FROM applications WHERE status='applied' "
+                "GROUP BY channel ORDER BY 2 DESC"
+            ).fetchall()
+            if ch:
+                console.print("  applied by channel: " + ", ".join(f"{c[0] or '?'}={c[1]}" for c in ch))
+            if a.get("by_site"):
+                console.print("  top hosts: " + ", ".join(
+                    f"{s['site']}({s['applied']}a/{s['failed']}f)" for s in a["by_site"][:6]))
+            if a.get("fail_reasons"):
+                console.print("  top fail reasons: " + ", ".join(
+                    f"{r['reason']}={r['count']}" for r in a["fail_reasons"][:6]))
+        except Exception:
+            logger.debug("Run-summary analytics failed", exc_info=True)
         console.print(f"Logs: {config.LOG_DIR}")
 
     except KeyboardInterrupt:
