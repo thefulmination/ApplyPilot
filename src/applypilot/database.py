@@ -45,9 +45,13 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
         except sqlite3.ProgrammingError:
             pass
 
-    conn = sqlite3.connect(path, timeout=30)
+    conn = sqlite3.connect(path, timeout=60)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    # Tolerate write contention from parallel stages/workers and OneDrive sync
+    # locking the DB file: wait up to 60s for the writer lock instead of failing
+    # with "database is locked". synchronous=NORMAL is WAL-safe and cuts fsync churn.
+    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
     _local.connections[path] = conn
     return conn

@@ -378,9 +378,20 @@ def extract_from_json_ld(intel: dict) -> dict | None:
         if not apply_url:
             apply_url = posting.get("url")
 
+        org = posting.get("hiringOrganization")
+        if isinstance(org, dict):
+            company = org.get("name")
+        elif isinstance(org, str):
+            company = org
+        elif isinstance(org, list) and org:
+            company = org[0].get("name") if isinstance(org[0], dict) else (
+                org[0] if isinstance(org[0], str) else None)
+        else:
+            company = None
         return {
             "full_description": desc_clean,
             "application_url": apply_url,
+            "company": (company or "").strip() or None,
         }
 
     return None
