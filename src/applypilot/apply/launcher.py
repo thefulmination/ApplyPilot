@@ -242,15 +242,22 @@ def mark_result(url: str, status: str, error: str | None = None,
         """, (db_status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
 
+    # Tag the channel by source so LinkedIn (and Indeed) applies are tracked
+    # distinctly (channel='linkedin') instead of lumped into a generic
+    # 'applypilot' -- lets us report/cap/diagnose LinkedIn applies on their own.
+    from urllib.parse import urlparse
+    _host = (urlparse(url or "").hostname or "").lower()
+    _src_channel = "linkedin" if "linkedin" in _host else (
+        "indeed" if "indeed" in _host else "applypilot")
     if status == "applied":
         tracker_status = "applied"
-        tracker_channel = "applypilot"
+        tracker_channel = _src_channel
     elif _is_auth_required_result(error or status):
         tracker_status = "auth_required"
         tracker_channel = "assisted"
     else:
         tracker_status = "failed"
-        tracker_channel = "applypilot"
+        tracker_channel = _src_channel
     tracker_notes = error
     if task_id:
         tracker_notes = f"{tracker_notes or status} | task_id={task_id}"
