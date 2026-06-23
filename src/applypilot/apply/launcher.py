@@ -57,21 +57,28 @@ def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
 
-# How often to poll the DB when the queue is empty (seconds)
-POLL_INTERVAL = config.DEFAULTS["poll_interval"]
+# How often to poll the DB when the queue is empty (seconds). Tunable via
+# APPLYPILOT_POLL_INTERVAL / --poll-interval (lower = a worker idles less between
+# empty polls; only matters once the queue drains).
+POLL_INTERVAL = int(os.environ.get("APPLYPILOT_POLL_INTERVAL") or config.DEFAULTS["poll_interval"])
 
 # Wall-clock budget for a single apply agent run. The stdout read loop runs in a
 # daemon thread; if it does not finish within this many seconds the Claude
 # process is killed and the job is marked failed:timeout. This bounds a hung
 # session (which would otherwise block the worker forever, since the old
 # proc.wait() only ran AFTER stdout reached EOF).
-AGENT_TIMEOUT_SECONDS = 900
+AGENT_TIMEOUT_SECONDS = int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or 900)
 
 # A worker claims a job by setting apply_status='in_progress'. If the process is
 # hard-killed before writing a terminal result the lease is never released.
 # Leases older than this (which must exceed AGENT_TIMEOUT_SECONDS) are reclaimed
-# at startup.
-STALE_LEASE_SECONDS = 1800
+# at startup AND periodically during the run (periodic reclaim thread). 1200s
+# (was 1800) tightens the crash dead-window while staying clear of the 900s job
+# timeout. Tunable via APPLYPILOT_STALE_LEASE_SECONDS.
+STALE_LEASE_SECONDS = max(
+    AGENT_TIMEOUT_SECONDS + 120,
+    int(os.environ.get("APPLYPILOT_STALE_LEASE_SECONDS") or 1200),
+)
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
@@ -121,7 +128,8 @@ def _make_mcp_config(cdp_port: int) -> dict:
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0, exclude_linkedin: bool = False,
-                exclude_urls: set[str] | None = None) -> dict | None:
+                exclude_urls: set[str] | None = None,
+                exclude_hosts: set[str] | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
@@ -195,6 +203,14 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 if exclude_urls:
                     seen_clause = f"AND url NOT IN ({','.join('?' * len(exclude_urls))})"
                     params.extend(exclude_urls)
+                # Offsite circuit breaker: skip jobs whose effective apply host has
+                # been halted this run (repeated host-faults), so the worker keeps
+                # flowing on healthy hosts instead of re-picking the flaky one.
+                host_clause = ""
+                if exclude_hosts:
+                    eff = "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END)"
+                    host_clause = " ".join(f"AND {eff} NOT LIKE ?" for _ in exclude_hosts)
+                    params.extend(f"%{h}%" for h in exclude_hosts)
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
                            fit_score, audit_score, audit_label, location, full_description, cover_letter_path
@@ -211,6 +227,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       {url_clauses}
                       {li_clause}
                       {seen_clause}
+                      {host_clause}
                     ORDER BY COALESCE(audit_score, fit_score) DESC,
                              (audit_flags LIKE '%"chief_of_staff"%') DESC,
                              (audit_flags LIKE '%"strategy_ops"%'
@@ -777,6 +794,13 @@ PERMANENT_FAILURES: set[str] = {
     "stuck", "suspicious_page",
     # LinkedIn (or any site) reporting an application/Easy-Apply limit -> permanent.
     "linkedin_rate_limited", "rate_limited",
+    # A missing RESULT: line means the agent crashed/hung/exited without doing the
+    # job (e.g. auth dead, CDP not ready). It won't fix itself on retry, and the
+    # auth pre-flight + CDP-readiness poll + sonnet default remove the transient
+    # causes -> mark permanent so it can't burn the retry budget cross-run.
+    "no_result_line",
+    # No valid http(s) apply URL -> can't be applied; don't waste a launch retrying.
+    "bad_application_url",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -856,6 +880,25 @@ def _linkedin_today(conn) -> int:
     ).fetchone()[0]
 
 
+# --- Offsite per-host circuit breaker -----------------------------------------
+from applypilot.discovery.resilience import get_board_breaker  # noqa: E402
+
+# After this many CONSECUTIVE host-fault failures on one offsite host, trip it out
+# of the run: the host is excluded from acquisition for the rest of the run so the
+# worker stops wasting launches on a flaky/blocking ATS. This is the offsite
+# analogue of the LinkedIn same-day halt; LinkedIn is EXEMPT (it has its own halt).
+# Failure counting is shared across workers via the resilience registry.
+_HOST_BREAKER_THRESHOLD = int(os.environ.get("APPLYPILOT_HOST_BREAKER_THRESHOLD") or 3)
+_HOST_BREAKER_RESET = 120.0
+HOST_FAULT_REASONS = {
+    "page_error", "timeout", "stuck", "suspicious_page",
+    "cloudflare_blocked", "blocked_by_cloudflare", "site_blocked",
+    "rate_limited", "auth_required", "login_issue",
+}
+_offsite_halted_hosts: set[str] = set()
+_host_halt_lock = threading.Lock()
+
+
 def _throttle_host(url: str) -> str:
     from urllib.parse import urlparse
     h = (urlparse(url or "").hostname or "").lower()
@@ -902,6 +945,32 @@ def _throttle_after_apply(url: str) -> None:
     hi = max(APPLY_MIN_DELAY, APPLY_MAX_DELAY)
     if hi > 0:
         _stop_event.wait(timeout=random.uniform(min(APPLY_MIN_DELAY, APPLY_MAX_DELAY), hi))
+
+
+def _update_host_breaker(job: dict, ok: bool, reason: str | None, worker_id: int) -> None:
+    """Offsite per-host circuit breaker. A clean apply (or a job-specific failure
+    that proves the host responded, e.g. not_eligible_salary) resets the host's
+    breaker; a HOST-fault failure (page_error/timeout/cloudflare/...) increments it.
+    After _HOST_BREAKER_THRESHOLD consecutive host-faults the host is halted for the
+    rest of the run. No-op for LinkedIn (it has the dedicated same-day halt)."""
+    host = _throttle_host(_apply_target(job))
+    if not host or "linkedin" in host:
+        return
+    breaker = get_board_breaker(
+        f"apply:{host}",
+        failure_threshold=_HOST_BREAKER_THRESHOLD,
+        reset_timeout=_HOST_BREAKER_RESET,
+    )
+    if ok or (reason not in HOST_FAULT_REASONS):
+        breaker.record_success()
+        return
+    breaker.record_failure()
+    if breaker.is_open():
+        with _host_halt_lock:
+            newly = host not in _offsite_halted_hosts
+            _offsite_halted_hosts.add(host)
+        if newly:
+            add_event(f"[W{worker_id}] Host {host} faulting ({reason}) -- skipping it for the rest of this run")
 
 
 def worker_loop(worker_id: int = 0, limit: int = 1,
@@ -959,9 +1028,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 except Exception:
                     logger.debug("LinkedIn cap check failed", exc_info=True)
 
+        _excl_hosts = None
+        if not target_url:
+            with _host_halt_lock:
+                _excl_hosts = set(_offsite_halted_hosts) or None
+
         job = acquire_job(target_url=target_url, min_score=min_score,
                           worker_id=worker_id, exclude_linkedin=exclude_li,
-                          exclude_urls=attempted_urls if not target_url else None)
+                          exclude_urls=attempted_urls if not target_url else None,
+                          exclude_hosts=_excl_hosts)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -979,6 +1054,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         empty_polls = 0
         attempted_urls.add(job["url"])
+
+        # Fail-fast pre-launch guard: never spend a Chrome launch + agent run on a
+        # job with no valid http(s) apply target. Mark permanent so it's not re-acquired.
+        if not dry_run:
+            from urllib.parse import urlparse as _urlparse
+            _pp = _urlparse(_apply_target(job))
+            if _pp.scheme not in ("http", "https") or not _pp.netloc:
+                mark_result(job["url"], "failed", "bad_application_url", permanent=True)
+                failed += 1
+                update_state(worker_id, jobs_failed=failed, jobs_done=applied + failed)
+                add_event(f"[W{worker_id}] Skip (no valid apply URL): {job['title'][:30]}")
+                jobs_done += 1
+                continue
 
         # Account-safety throttle: respect the per-host gap before launching
         # (skipped in dry-run so canary tests stay fast).
@@ -1018,6 +1106,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+                _update_host_breaker(job, ok=True, reason=None, worker_id=worker_id)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
@@ -1035,6 +1124,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                     _linkedin_halt.set()
                     add_event(f"[W{worker_id}] LinkedIn {reason} -- halting LinkedIn "
                               f"lane for this run; offsite continues")
+                # Offsite per-host circuit breaker (no-op for LinkedIn).
+                _update_host_breaker(job, ok=False, reason=reason, worker_id=worker_id)
 
         except KeyboardInterrupt:
             release_lock(job["url"])
@@ -1095,8 +1186,14 @@ def main(limit: int = 1, target_url: str | None = None,
         workers: Number of parallel workers (default 1).
     """
     global POLL_INTERVAL
-    POLL_INTERVAL = poll_interval
+    POLL_INTERVAL = int(os.environ.get("APPLYPILOT_POLL_INTERVAL") or poll_interval)
     _stop_event.clear()
+    # Reset per-run lane-gating state (these module-level objects persist across
+    # main() calls within one process, e.g. tests / a wrapper that re-invokes).
+    _linkedin_halt.clear()
+    _li_cap_announced.clear()
+    with _host_halt_lock:
+        _offsite_halted_hosts.clear()
 
     config.ensure_dirs()
     console = Console()
@@ -1109,6 +1206,19 @@ def main(limit: int = 1, target_url: str | None = None,
             console.print(f"[dim]Reclaimed {reclaimed} stale in-progress lease(s) from a previous run[/dim]")
     except Exception:
         logger.debug("Stale lease reclaim failed", exc_info=True)
+
+    # Periodic lease reclaim DURING the run: a worker that hard-crashes mid-job
+    # leaves its job 'in_progress' (invisible to acquire) until the next startup.
+    # Reclaim every 5 min so an orphan recovers within one TTL window, not 24h later.
+    def _periodic_reclaim() -> None:
+        while not _stop_event.wait(timeout=300):
+            try:
+                n = reclaim_stale_leases()
+                if n:
+                    add_event(f"[reclaim] recovered {n} stale in-progress lease(s) mid-run")
+            except Exception:
+                logger.debug("Periodic lease reclaim failed", exc_info=True)
+    threading.Thread(target=_periodic_reclaim, daemon=True, name="lease-reclaim").start()
 
     if continuous:
         effective_limit = 0
