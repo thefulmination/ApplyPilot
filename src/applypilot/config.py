@@ -38,6 +38,14 @@ def base_resume_enabled() -> bool:
     return os.environ.get("APPLYPILOT_BASE_RESUME", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def cos_rescue_enabled() -> bool:
+    """Opt-in: floor audit_score for title-certain Chief-of-Staff / Strategy-&-Ops
+    roles with very high role_fit, so the LLM's pivot-penalized base_score can't
+    bury them below the apply gate. Default OFF; benchmark-sensitive (changes labels).
+    """
+    return os.environ.get("APPLYPILOT_COS_RESCUE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def resolve_resume_stem(tailored_resume_path: str | None) -> str | None:
     """Resume stem whose .pdf/.txt siblings the apply flow uploads/reads.
 

@@ -182,6 +182,13 @@ def audit_job(job: dict[str, Any], search_cfg: dict | None = None) -> ScoreAudit
         adjusted = min(adjusted, 3.0)
     elif priority_title:
         adjusted = max(adjusted, min(8.0, base_score + 0.8))
+        # Rescue title-certain Chief-of-Staff / Strategy-&-Ops roles the LLM
+        # base_score under-rates against the owner's pivot. Double-gated (lane
+        # flag + role_fit>=90) and below the hard_negative branch, so it cannot
+        # promote off-lane specialists. Opt-in + benchmark-sensitive.
+        if config.cos_rescue_enabled() and role_fit >= 90 and (
+                "chief_of_staff" in flags or "strategy_ops" in flags):
+            adjusted = max(adjusted, 7.0)
     elif "query_title_match" in flags:
         adjusted = max(adjusted, min(7.5, base_score + 0.4))
 
