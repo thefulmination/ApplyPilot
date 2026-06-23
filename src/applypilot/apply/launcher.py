@@ -805,6 +805,17 @@ def _host_gap(host: str) -> float:
     return LINKEDIN_HOST_GAP if "linkedin" in host else APPLY_HOST_GAP
 
 
+def _apply_target(job: dict) -> str:
+    """The URL the apply actually hits: the external application_url when it is a
+    real http link, else the source url. Pacing keys on this so a LinkedIn job
+    whose apply redirects OFFSITE throttles by the external ATS host (fast,
+    unrestricted), while only true Easy-Apply / unresolved LinkedIn jobs get the
+    wider LinkedIn gap. Activates the Easy-Apply-vs-offsite split as soon as the
+    extractor backfills companyApplyUrl into application_url."""
+    au = job.get("application_url") or ""
+    return au if au.startswith("http") else (job.get("url") or "")
+
+
 def _throttle_before_apply(url: str) -> None:
     """Wait out the per-host minimum gap before hitting the same host again."""
     host = _throttle_host(url)
@@ -883,7 +894,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         # Account-safety throttle: respect the per-host gap before launching
         # (skipped in dry-run so canary tests stay fast).
         if not dry_run:
-            _throttle_before_apply(job["url"])
+            _throttle_before_apply(_apply_target(job))
             if _stop_event.is_set():
                 release_lock(job["url"])
                 break
@@ -945,7 +956,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         # Randomized inter-job delay after a real submission (account safety).
         if not dry_run and not target_url:
-            _throttle_after_apply(job["url"])
+            _throttle_after_apply(_apply_target(job))
 
         jobs_done += 1
         if target_url:
