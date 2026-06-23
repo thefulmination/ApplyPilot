@@ -10,6 +10,13 @@ $NodeBin = "C:\Program Files\nodejs"
 New-Item -ItemType Directory -Force -Path $ApplyPilotDir | Out-Null
 
 $env:APPLYPILOT_DIR = $ApplyPilotDir
+# Activate the tuned search config. This MUST be set in the process environment here:
+# config.py freezes SEARCH_CONFIG_PATH at import, before .applypilot/.env is loaded,
+# so the .env override alone is ignored. Mirrors run-applypilot-sales.ps1.
+$env:APPLYPILOT_SEARCH_CONFIG_PATH = Join-Path $ApplyPilotDir "searches_tuned.yaml"
+# Floor title-certain Chief-of-Staff / Strategy-&-Ops roles (role_fit>=90) above the
+# apply gate so the LLM's pivot-penalized base_score can't bury them. See audit.py.
+$env:APPLYPILOT_COS_RESCUE = "1"
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $ProjectRoot ".playwright-browsers"
 $Chromium = Get-ChildItem -Path $env:PLAYWRIGHT_BROWSERS_PATH -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue |
     Sort-Object Name -Descending |
