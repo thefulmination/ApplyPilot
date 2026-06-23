@@ -1034,6 +1034,60 @@ def _linkedin_today(conn) -> int:
     ).fetchone()[0]
 
 
+# --- Cross-process LinkedIn safety (DB-derived, so it holds across parallel -----
+# agents/processes -- the in-memory _linkedin_halt + per-host gap only cover ONE
+# process). These reuse existing columns (apply_status/apply_error/last_attempted_at);
+# no new schema. The daily cap (_linkedin_today) is already DB-derived/shared.
+# Cooldown after a LinkedIn challenge/rate-limit/auth failure during which EVERY
+# process stops acquiring LinkedIn jobs. LinkedIn restrictions are serious -> back
+# off hard. Tunable via APPLYPILOT_LINKEDIN_HALT_COOLDOWN (seconds; 0 disables).
+LINKEDIN_HALT_COOLDOWN = int(os.environ.get("APPLYPILOT_LINKEDIN_HALT_COOLDOWN") or 21600)
+LINKEDIN_HALT_REASONS = {
+    "linkedin_rate_limited", "linkedin_challenge", "linkedin_pause",
+    "rate_limited", "auth_required", "login_issue",
+}
+
+
+def _linkedin_halt_active(conn) -> bool:
+    """True if any LinkedIn-lane job failed with a halt-reason within the cooldown.
+    SHARED across all processes/workers: if one agent hits a LinkedIn challenge,
+    every agent pauses the LinkedIn lane. mark_result already persists apply_error,
+    so no extra write is needed to trip this."""
+    if LINKEDIN_HALT_COOLDOWN <= 0:
+        return False
+    since = (datetime.now(timezone.utc) - timedelta(seconds=LINKEDIN_HALT_COOLDOWN)).isoformat()
+    ph = ",".join("?" * len(LINKEDIN_HALT_REASONS))
+    return conn.execute(
+        f"SELECT 1 FROM jobs WHERE {_LINKEDIN_LANE_SQL} AND apply_status = 'failed' "
+        f"AND apply_error IN ({ph}) AND last_attempted_at >= ? LIMIT 1",
+        (*LINKEDIN_HALT_REASONS, since),
+    ).fetchone() is not None
+
+
+def _linkedin_gap_wait(conn, exclude_url: str) -> float:
+    """Cross-process LinkedIn pacing: seconds to wait so this apply lands at least
+    the jittered LINKEDIN_HOST_GAP after the most recent OTHER LinkedIn attempt by
+    ANY process (read from last_attempted_at). Stops two parallel agents from
+    bursting LinkedIn even though their in-memory throttles can't see each other."""
+    row = conn.execute(
+        f"SELECT MAX(last_attempted_at) FROM jobs WHERE {_LINKEDIN_LANE_SQL} "
+        f"AND last_attempted_at IS NOT NULL AND url != ?",
+        (exclude_url,),
+    ).fetchone()
+    if not row or not row[0]:
+        return 0.0
+    try:
+        last = datetime.fromisoformat(row[0])
+    except (ValueError, TypeError):
+        return 0.0
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    gap = LINKEDIN_HOST_GAP
+    if GAP_JITTER_HI > GAP_JITTER_LO > 0:
+        gap *= random.uniform(GAP_JITTER_LO, GAP_JITTER_HI)
+    return max(0.0, gap - (datetime.now(timezone.utc) - last).total_seconds())
+
+
 # --- Offsite per-host circuit breaker -----------------------------------------
 from applypilot.discovery.resilience import get_board_breaker  # noqa: E402
 
@@ -1173,16 +1227,25 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         exclude_li = False
         if not target_url:
             exclude_li = _linkedin_halt.is_set()
-            if not exclude_li and li_cap > 0:
+            if not exclude_li:
                 try:
-                    if _linkedin_today(get_connection()) >= li_cap:
+                    _conn = get_connection()
+                    if _linkedin_halt_active(_conn):
+                        # Shared halt: some process hit a LinkedIn challenge/rate-limit
+                        # recently -> every process pauses the LinkedIn lane.
+                        exclude_li = True
+                        if not _li_cap_announced.is_set():
+                            _li_cap_announced.set()
+                            add_event(f"[W{worker_id}] LinkedIn paused (recent challenge/rate-limit, "
+                                      f"shared across agents) -- offsite lane continues")
+                    elif li_cap > 0 and _linkedin_today(_conn) >= li_cap:
                         exclude_li = True
                         if not _li_cap_announced.is_set():
                             _li_cap_announced.set()
                             add_event(f"[W{worker_id}] LinkedIn daily cap "
                                       f"{li_cap} reached -- continuing offsite lane only")
                 except Exception:
-                    logger.debug("LinkedIn cap check failed", exc_info=True)
+                    logger.debug("LinkedIn gating check failed", exc_info=True)
 
         _excl_hosts = None
         if not target_url:
@@ -1227,7 +1290,18 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         # Account-safety throttle: respect the per-host gap before launching
         # (skipped in dry-run so canary tests stay fast).
         if not dry_run:
-            _throttle_before_apply(_apply_target(job))
+            _tgt = _apply_target(job)
+            _throttle_before_apply(_tgt)
+            # Cross-process LinkedIn pacing on top of the in-memory per-host gap: wait
+            # out the gap relative to the most recent LinkedIn attempt by ANY agent/
+            # process (the in-memory throttle can't see other processes).
+            if "linkedin" in _throttle_host(_tgt):
+                try:
+                    _lw = _linkedin_gap_wait(get_connection(), job["url"])
+                    if _lw > 0:
+                        _stop_event.wait(timeout=_lw)
+                except Exception:
+                    logger.debug("LinkedIn cross-process gap wait failed", exc_info=True)
             if _stop_event.is_set():
                 release_lock(job["url"])
                 break
@@ -1329,7 +1403,7 @@ def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str | None = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
-         agent: str = "claude") -> None:
+         agent: str = "claude", agents: list[str] | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -1337,12 +1411,17 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Apply-agent model name.
+        model: Apply-agent model name (claude only; codex uses its default).
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
-        agent: Apply-agent CLI to run: claude or codex.
+        agent: Apply-agent CLI for all workers when `agents` is not given.
+        agents: Optional per-worker agent list (e.g. ["claude", "codex"]), assigned
+            round-robin across workers so claude and codex run concurrently in ONE
+            process -- which keeps the per-host throttle, jitter, and offsite breaker
+            (all in-memory) SHARED across the mixed agents. The shared queue lease
+            still guarantees each job is taken by exactly one worker.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = int(os.environ.get("APPLYPILOT_POLL_INTERVAL") or poll_interval)
@@ -1355,6 +1434,18 @@ def main(limit: int = 1, target_url: str | None = None,
         _offsite_halted_hosts.clear()
 
     agent = _normalize_agent(agent)
+    # Per-worker agent assignment: round-robin the `agents` list across workers so
+    # e.g. --agents claude,codex runs worker 0 on claude and worker 1 on codex in
+    # ONE process (shared throttle/breaker). Falls back to a single agent for all.
+    if agents:
+        worker_agents = [_normalize_agent(agents[i % len(agents)]) for i in range(workers)]
+    else:
+        worker_agents = [agent] * workers
+
+    def _worker_model(wa: str) -> str | None:
+        # claude uses the chosen model (sonnet default); codex uses its own default.
+        return model if wa == "claude" else None
+
     config.ensure_dirs()
     console = Console()
 
@@ -1392,9 +1483,11 @@ def main(limit: int = 1, target_url: str | None = None,
         init_worker(i)
 
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
+    _agent_label = "+".join(sorted(set(worker_agents)))
     console.print(
         f"Launching apply pipeline ({mode_label}, {worker_label}, "
-        f"{agent} agent, poll every {POLL_INTERVAL}s)..."
+        f"{_agent_label} agent{'s' if len(set(worker_agents)) > 1 else ''}, "
+        f"poll every {POLL_INTERVAL}s)..."
     )
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
@@ -1444,9 +1537,9 @@ def main(limit: int = 1, target_url: str | None = None,
                     target_url=target_url,
                     min_score=min_score,
                     headless=headless,
-                    model=model,
+                    model=_worker_model(worker_agents[0]),
                     dry_run=dry_run,
-                    agent=agent,
+                    agent=worker_agents[0],
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1468,9 +1561,9 @@ def main(limit: int = 1, target_url: str | None = None,
                             target_url=target_url,
                             min_score=min_score,
                             headless=headless,
-                            model=model,
+                            model=_worker_model(worker_agents[i]),
                             dry_run=dry_run,
-                            agent=agent,
+                            agent=worker_agents[i],
                         ): i
                         for i in range(workers)
                     }

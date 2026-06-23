@@ -62,6 +62,68 @@ def test_linkedin_cap_is_db_derived_and_excludes_lane(tmp_path, monkeypatch):
     assert job2 is not None and "linkedin.com" in job2["url"]
 
 
+def test_linkedin_halt_is_db_shared_across_processes(tmp_path, monkeypatch):
+    """A LinkedIn challenge/rate-limit recorded by ONE process must halt the lane for
+    ALL processes — so the halt is derived from the DB, not in-memory per-process."""
+    conn = database.init_db(tmp_path / "applypilot.db")
+    from applypilot.apply import launcher as L
+
+    now = datetime.now(timezone.utc).isoformat()
+    assert L._linkedin_halt_active(conn) is False  # nothing failed yet
+
+    # Process A records a LinkedIn challenge failure (mark_result persists apply_error).
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, apply_status, apply_error, last_attempted_at) "
+        "VALUES ('https://www.linkedin.com/jobs/view/777', 'x', 'TestCo', 'failed', 'linkedin_challenge', ?)",
+        (now,),
+    )
+    conn.commit()
+
+    # Process B (same DB) now sees the halt — no shared memory needed.
+    assert L._linkedin_halt_active(conn) is True
+
+    # A non-halt failure (e.g. salary) does NOT trip it.
+    conn.execute("DELETE FROM jobs")
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, apply_status, apply_error, last_attempted_at) "
+        "VALUES ('https://www.linkedin.com/jobs/view/888', 'x', 'TestCo', 'failed', 'not_eligible_salary', ?)",
+        (now,),
+    )
+    conn.commit()
+    assert L._linkedin_halt_active(conn) is False
+
+
+def test_linkedin_gap_wait_paces_against_other_processes(tmp_path, monkeypatch):
+    """The cross-process gap waits relative to the most recent OTHER LinkedIn attempt,
+    excluding the current job's own row."""
+    conn = database.init_db(tmp_path / "applypilot.db")
+    from applypilot.apply import launcher as L
+    monkeypatch.setattr(L, "GAP_JITTER_HI", 1.0)
+    monkeypatch.setattr(L, "GAP_JITTER_LO", 1.0)  # disable jitter for a deterministic assert
+    monkeypatch.setattr(L, "LINKEDIN_HOST_GAP", 120.0)
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Another worker/process just touched LinkedIn 'now'.
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, last_attempted_at) "
+        "VALUES ('https://www.linkedin.com/jobs/view/other', 'x', 'TestCo', ?)",
+        (now,),
+    )
+    conn.commit()
+    wait = L._linkedin_gap_wait(conn, "https://www.linkedin.com/jobs/view/mine")
+    assert 100.0 <= wait <= 120.0  # ~full gap, since the other attempt was just now
+
+    # Excluding the current job's own row: only that row exists -> no wait.
+    conn.execute("DELETE FROM jobs")
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, last_attempted_at) "
+        "VALUES ('https://www.linkedin.com/jobs/view/mine', 'x', 'TestCo', ?)",
+        (now,),
+    )
+    conn.commit()
+    assert L._linkedin_gap_wait(conn, "https://www.linkedin.com/jobs/view/mine") == 0.0
+
+
 def test_linkedin_today_counts_only_linkedin_lane_applies(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     from applypilot.apply import launcher as L

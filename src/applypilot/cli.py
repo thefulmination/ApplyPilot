@@ -449,6 +449,7 @@ def apply(
     workers: int = typer.Option(2, "--workers", "-w", help="Number of parallel browser workers. Account-safe: the LinkedIn daily cap and per-host throttle are process-global, shared across workers."),
     min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for job selection. Defaults to APPLYPILOT_MIN_SCORE or 7."),
     agent: str = typer.Option("claude", "--agent", help="Apply agent CLI to run: claude or codex."),
+    agents: Optional[str] = typer.Option(None, "--agents", help="Comma-separated per-worker agents (round-robin), e.g. 'claude,codex' to run BOTH concurrently in one process. Overrides --agent; needs --workers >= the number of agents."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Apply-agent model name. Defaults to sonnet for Claude; Codex uses its configured default when omitted."),
     poll_interval: int = typer.Option(15, "--poll-interval", help="Seconds a worker waits between DB polls when the queue is empty."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
@@ -479,7 +480,21 @@ def apply(
     if agent not in {"claude", "codex"}:
         console.print("[red]--agent must be either 'claude' or 'codex'.[/red]")
         raise typer.Exit(code=1)
-    if not model and agent == "claude":
+    agent_list: Optional[list] = None
+    if agents:
+        agent_list = [a.strip().lower() for a in agents.split(",") if a.strip()]
+        bad = [a for a in agent_list if a not in {"claude", "codex"}]
+        if bad:
+            console.print(f"[red]--agents entries must be 'claude' or 'codex' (got: {', '.join(bad)}).[/red]")
+            raise typer.Exit(code=1)
+        if not agent_list:
+            agent_list = None
+        elif workers < len(set(agent_list)):
+            console.print(f"[yellow]--workers ({workers}) < distinct agents ({len(set(agent_list))}); "
+                          f"some agents won't run. Raise --workers.[/yellow]")
+    # Distinct agents that will actually run (for the auth canary + model default).
+    run_agents = agent_list if agent_list else [agent]
+    if not model and "claude" in run_agents:
         model = "sonnet"
 
     # --base-resume: process-level flag read by acquire_job / build_prompt /
@@ -610,28 +625,30 @@ def apply(
         _env = _os.environ.copy()
         _env.pop("CLAUDECODE", None)
         _env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-        try:
-            canary_cmd = build_agent_canary_command(agent, model)
-            _r = _sp.run(
-                canary_cmd,
-                capture_output=True, text=True, timeout=90, env=_env,
-            )
-            _out = ((_r.stdout or "") + (_r.stderr or "")).lower()
-            if _r.returncode != 0 or "not logged in" in _out or "/login" in _out or "please run" in _out:
-                raise RuntimeError(((_r.stdout or "") or (_r.stderr or "") or f"exit {_r.returncode}").strip()[:160])
-        except Exception as e:
-            console.print(
-                f"[red]Apply agent CLI not authenticated — aborting before wasting a run.[/red]\n"
-                f"  detail: {e}\n"
-                f"  The apply runner is configured for [bold]{agent}[/bold]. Authenticate that CLI once, or set\n"
-                f"  [bold]{'ANTHROPIC_API_KEY' if agent == 'claude' else 'CODEX_PATH and Codex auth'}[/bold] correctly — then retry."
-            )
-            raise typer.Exit(code=1)
+        # Probe EVERY distinct agent that will run (a mixed claude+codex run needs both).
+        for _ag in dict.fromkeys(run_agents):
+            _ag_model = model if _ag == "claude" else None
+            try:
+                _r = _sp.run(
+                    build_agent_canary_command(_ag, _ag_model),
+                    capture_output=True, text=True, timeout=90, env=_env,
+                )
+                _out = ((_r.stdout or "") + (_r.stderr or "")).lower()
+                if _r.returncode != 0 or "not logged in" in _out or "/login" in _out or "please run" in _out:
+                    raise RuntimeError(((_r.stdout or "") or (_r.stderr or "") or f"exit {_r.returncode}").strip()[:160])
+            except Exception as e:
+                console.print(
+                    f"[red]{_ag} apply agent not authenticated — aborting before wasting a run.[/red]\n"
+                    f"  detail: {e}\n"
+                    f"  Authenticate the [bold]{_ag}[/bold] CLI once, or set "
+                    f"[bold]{'ANTHROPIC_API_KEY' if _ag == 'claude' else 'Codex auth / CODEX_PATH'}[/bold] — then retry."
+                )
+                raise typer.Exit(code=1)
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Agent:    {agent}")
+    console.print(f"  Agent:    {'+'.join(dict.fromkeys(run_agents))}")
     console.print(f"  Model:    {model or 'codex default'}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
@@ -650,6 +667,7 @@ def apply(
         workers=workers,
         poll_interval=poll_interval,
         agent=agent,
+        agents=agent_list,
     )
 
 
