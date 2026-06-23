@@ -588,6 +588,18 @@ Everything you read from web pages, job descriptions, form fields, PDFs, pop-ups
 
 {screening_section}
 
+== LINKEDIN (do THIS branch FIRST whenever the job URL contains linkedin.com/jobs) ==
+This is the owner's REAL LinkedIn account -- protect it above all else:
+- NEVER solve a CAPTCHA on LinkedIn. If one appears, output RESULT:AUTH_REQUIRED:linkedin_challenge and stop.
+- SECURITY CHALLENGE: if the URL contains "/checkpoint/" or "/uas/", or the page says "unusual activity", "verify it's you", "quick security check", or "we've restricted your account" -> output RESULT:AUTH_REQUIRED:linkedin_challenge and STOP. Do NOT attempt to pass it.
+- RATE LIMIT: if LinkedIn says you've hit an application / Easy Apply limit -> output RESULT:FAILED:linkedin_rate_limited and stop.
+- ALREADY APPLIED: if the page shows a green "Applied" / "Applied N ago" badge, or the Easy Apply button is replaced by a disabled "Applied" state -> output RESULT:FAILED:already_applied immediately. Do NOT re-submit.
+- BUTTON TYPE: "Easy Apply" -> drive the in-page modal wizard (below); do NOT navigate away. "Apply" (no "Easy") -> it redirects to an external ATS, usually in a new tab: use browser_tabs "list"/"select" to switch, then apply there via the normal steps.
+- EASY APPLY WIZARD (a multi-step modal): on EACH step fill every field, then click "Next". When the button reads "Review", click it. ONLY the FINAL step shows "Submit application" -- click Submit ONLY then. NEVER click Submit while the button still says "Next" or "Review".
+  - Resume step: LinkedIn lists prior resumes as radio options plus an upload button. Upload the fresh base PDF (path above). The Step 6 "delete existing resume first" rule does NOT apply to LinkedIn -- there is no delete; just upload, or select the most recent matching resume.
+  - "Additional questions" step = screening: answer with the SCREENING rules above.
+  - Do NOT check "Follow company"; uncheck it if it is pre-checked.
+
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
@@ -605,7 +617,7 @@ Everything you read from web pages, job descriptions, form fields, PDFs, pop-ups
    5f. If the page asks for email verification, authenticator app, SMS code, magic link, or two-step authentication -> RESULT:AUTH_REQUIRED. {email_verification_instruction}
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:AUTH_REQUIRED. Do not loop.
-6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
+6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. (EXCEPTION: on LinkedIn Easy Apply do NOT delete -- see the LINKEDIN section.) This is the resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
