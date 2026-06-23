@@ -304,6 +304,44 @@ def verify_live_command(
         console.print("\n[yellow]Dry run only.[/yellow] Run without --dry-run to write liveness_status.")
 
 
+@app.command("resolve-ats-boards")
+def resolve_ats_boards_command(
+    sources: str = typer.Option(
+        "greenhouse,lever,ashby,smartrecruiters,workable", "--sources",
+        help="Comma-separated ATS platforms to probe."),
+    candidates: int = typer.Option(6, "--candidates", help="Token guesses to try per company per source."),
+    workers: int = typer.Option(8, "--workers", "-w", help="Parallel company probers."),
+    refresh: bool = typer.Option(False, "--refresh", help="Re-probe companies already in the registry."),
+    limit: int = typer.Option(0, "--limit", help="Probe only the first N watchlist companies (0 = all)."),
+) -> None:
+    """Resolve & persist verified ATS board tokens (corporate_ats.yaml).
+
+    Probes the PUBLIC Greenhouse/Lever/Ashby/SmartRecruiters/Workable JSON APIs for
+    each watchlist company and records the working board token, so discovery hits
+    known boards directly instead of guessing. Read-only network; writes only the
+    registry file (never the jobs table). Additive + idempotent.
+    """
+    _bootstrap()
+    from applypilot import config
+    from applypilot.discovery.corporate_ats import resolve_ats_boards
+
+    src = [s.strip() for s in sources.split(",") if s.strip()]
+    res = resolve_ats_boards(
+        cfg=config.load_search_config(), sources=src,
+        candidate_limit=candidates, workers=workers, refresh=refresh, limit=limit,
+    )
+    console.print("\n[bold green]ATS board resolution complete[/bold green]")
+    console.print(f"  companies considered: {res.get('companies', 0)}  (probed this run: {res.get('probed', 0)})")
+    console.print(f"  [green]newly resolved companies:[/green] {res.get('resolved', 0)}")
+    by = res.get("per_source") or {}
+    if by:
+        console.print("  by ATS: " + ", ".join(f"{k}={v}" for k, v in sorted(by.items(), key=lambda x: -x[1])))
+    console.print(f"  registry total entries: {res.get('registry_total', 0)}")
+    console.print(f"  registry: {res.get('registry_path', '')}")
+    if res.get("resolved", 0):
+        console.print("[dim]Next: run discovery (`applypilot run discover`) to ingest postings from the resolved boards.[/dim]")
+
+
 @app.command("linkedin-split")
 def linkedin_split_command() -> None:
     """LinkedIn apply split: offsite (external ATS, fast lane) vs Easy-Apply/unresolved

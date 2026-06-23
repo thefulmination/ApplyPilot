@@ -906,6 +906,153 @@ def _write_run_report(report: dict, ats_cfg: dict) -> str | None:
         return None
 
 
+def _registry_path(ats_cfg: dict) -> Path:
+    """Path to the exact-board registry (corporate_ats.yaml)."""
+    path_value = ats_cfg.get("exact_boards_path")
+    return Path(path_value).expanduser() if path_value else config.APP_DIR / "corporate_ats.yaml"
+
+
+def _probe_company_boards(
+    company: str,
+    sources: list[str],
+    candidate_limit: int,
+    request_options: dict,
+    results_probe: int,
+) -> dict[str, tuple[str, int]]:
+    """Probe each source's token candidates; return {source: (token, n_jobs)} for
+    the FIRST source+token that yields >=1 posting (one board suffices to surface
+    a company's jobs, so we stop at the first hit to keep probing polite)."""
+    found: dict[str, tuple[str, int]] = {}
+    for source in sources:
+        breaker = get_board_breaker(f"ats:{source}")
+        if breaker.is_open():
+            continue
+        for token in _token_candidates(company, candidate_limit):
+            try:
+                valid, jobs = _fetch_source(source, company, token, request_options, results_probe)
+            except CorporateAtsRequestError:
+                continue
+            except Exception:  # noqa: BLE001 - a bad token must not abort the sweep
+                continue
+            if valid and jobs:
+                found[source] = (token, len(jobs))
+                breaker.record_success()
+                break
+        if found:
+            break
+    return found
+
+
+def resolve_ats_boards(
+    cfg: dict | None = None,
+    sources: list[str] | None = None,
+    candidate_limit: int = 6,
+    workers: int = 8,
+    refresh: bool = False,
+    limit: int = 0,
+) -> dict:
+    """Resolve & persist verified ATS board tokens for the company watchlist.
+
+    Probes the PUBLIC ATS JSON APIs (read-only network; never touches the jobs
+    table) for each watchlist company and writes confirmed board tokens to the
+    exact-board registry (corporate_ats.yaml). Populating that registry turns the
+    discovery crawl from "guess 4 token variants per company every run" into
+    "hit the known token directly" -- higher resolution + faster runs + more real
+    offsite apply URLs. Additive + idempotent: existing entries are preserved and
+    fully-resolved companies are skipped unless refresh=True.
+    """
+    if cfg is None:
+        cfg = config.load_search_config()
+    ats_cfg = cfg.get("corporate_ats", {}) or {}
+    src = [str(s).lower() for s in (sources or DEFAULT_SOURCES) if str(s).lower() in DEFAULT_SOURCES]
+    companies = _load_company_watchlist(cfg, ats_cfg)
+    if limit and limit > 0:
+        companies = companies[:limit]
+    if not companies or not src:
+        return {"companies": 0, "probed": 0, "resolved": 0, "boards": 0}
+
+    reg_path = _registry_path(ats_cfg)
+    try:
+        existing = yaml.safe_load(reg_path.read_text(encoding="utf-8")) if reg_path.exists() else None
+    except (OSError, yaml.YAMLError) as e:
+        log.warning("Could not read existing ATS registry %s: %s", reg_path, e)
+        existing = None
+    existing = existing if isinstance(existing, dict) else {}
+    registry: dict = dict(existing.get("companies") or {})
+
+    request_options = _request_options(ats_cfg)
+    results_probe = 5  # we only need to confirm the board exists + has postings
+
+    def needs_probe(company: str) -> bool:
+        if refresh:
+            return True
+        entry = registry.get(_company_key(company))
+        return not (isinstance(entry, dict) and any(entry.get(s) for s in src))
+
+    todo = [c for c in companies if needs_probe(c)]
+    log.info(
+        "ATS board resolve: %d companies (%d need probing) | sources=%s | candidates=%d",
+        len(companies), len(todo), ", ".join(src), candidate_limit,
+    )
+
+    def work(company: str) -> tuple[str, dict[str, tuple[str, int]]]:
+        return company, _probe_company_boards(company, src, candidate_limit, request_options, results_probe)
+
+    results: list[tuple[str, dict]] = []
+    if workers > 1 and len(todo) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as pool:
+            futures = [pool.submit(work, c) for c in todo]
+            for i, fut in enumerate(as_completed(futures), 1):
+                results.append(fut.result())
+                if i % 25 == 0 or i == len(futures):
+                    log.info("ATS board resolve: %d/%d probed", i, len(futures))
+    else:
+        for c in todo:
+            results.append(work(c))
+
+    resolved_companies = 0
+    total_boards = 0
+    per_source: dict[str, int] = {}
+    for company, found in results:
+        if not found:
+            continue
+        key = _company_key(company)
+        entry = dict(registry.get(key) or {})
+        entry["name"] = company
+        for source, (token, _count) in found.items():
+            entry[source] = token
+            per_source[source] = per_source.get(source, 0) + 1
+            total_boards += 1
+        registry[key] = entry
+        resolved_companies += 1
+
+    out = dict(existing)
+    out["companies"] = registry
+    header = (
+        "# Verified corporate ATS board tokens (auto-resolved by "
+        "`applypilot resolve-ats-boards`).\n"
+        "# Maps company keys -> exact Greenhouse/Lever/Ashby/SmartRecruiters/Workable\n"
+        "# tokens so discovery hits known boards directly instead of guessing.\n\n"
+    )
+    try:
+        reg_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = reg_path.with_suffix(reg_path.suffix + ".tmp")
+        tmp.write_text(header + yaml.safe_dump(out, sort_keys=True, allow_unicode=True), encoding="utf-8")
+        tmp.replace(reg_path)
+    except OSError as e:
+        log.warning("Could not write ATS registry %s: %s", reg_path, e)
+
+    return {
+        "companies": len(companies),
+        "probed": len(todo),
+        "resolved": resolved_companies,
+        "boards": total_boards,
+        "per_source": per_source,
+        "registry_total": len(registry),
+        "registry_path": str(reg_path),
+    }
+
+
 def run_corporate_ats_discovery(cfg: dict | None = None, workers: int | None = None) -> dict:
     """Run corporate ATS discovery across Greenhouse, Lever, and Ashby."""
     if cfg is None:
