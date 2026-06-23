@@ -258,6 +258,11 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Pre-apply posting-liveness gate (additive; NEVER deletes rows — dead jobs
+    # stay in the DB with full JD/scores + this close-marker, for future training)
+    "liveness_status": "TEXT",        # live | dead | uncertain (NULL = unchecked)
+    "last_verified_live": "TEXT",     # ISO8601 timestamp of last liveness probe
+    "liveness_reason": "TEXT",        # signal that produced the verdict
 }
 
 
@@ -573,12 +578,15 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_stage ON pipeline_stage_runs(stage)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_stage ON llm_usage(stage)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_variant ON llm_usage(prompt_variant)")
 
-    # Forward-migrate prompt_variant into existing llm_usage tables
+    # Forward-migrate prompt_variant into existing llm_usage tables BEFORE
+    # indexing it: an older DB's llm_usage predates this column, so creating the
+    # index first throws "no such column: prompt_variant" and aborts init_db.
     existing_llm_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_usage)").fetchall()}
     if "prompt_variant" not in existing_llm_cols:
         conn.execute("ALTER TABLE llm_usage ADD COLUMN prompt_variant TEXT")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_variant ON llm_usage(prompt_variant)")
 
     conn.commit()
 

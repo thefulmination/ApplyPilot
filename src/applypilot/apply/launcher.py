@@ -162,6 +162,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND duplicate_of_url IS NULL
+                  AND COALESCE(liveness_status, '') != 'dead'
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND COALESCE(audit_score, fit_score) >= ?

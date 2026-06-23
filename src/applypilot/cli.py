@@ -249,6 +249,61 @@ def dedupe_jobs_command(
         console.print("\n[yellow]Dry run only.[/yellow] Run without --dry-run to write duplicate markers.")
 
 
+@app.command("verify-live")
+def verify_live_command(
+    tiers: str = typer.Option(
+        "priority,recommended", "--tiers",
+        help="Comma-separated audit_label tiers to verify.",
+    ),
+    max_age_days: int = typer.Option(
+        7, "--max-age-days",
+        help="Skip jobs already verified within this many days (0 = re-check all).",
+    ),
+    limit: int = typer.Option(0, "--limit", "-l", help="Max jobs to probe. 0 = all eligible."),
+    workers: int = typer.Option(
+        16, "--workers", "-w",
+        help="Concurrent probe threads (per-host throttling still applies).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Probe and report without writing liveness columns."),
+) -> None:
+    """Verify scored postings are still open (READ-ONLY) and mark dead ones so apply skips them.
+
+    Never deletes jobs: dead postings stay in the DB with their full description
+    and scores (plus the close-marker) for future training. Apply selection
+    simply excludes liveness_status = 'dead'; uncertain/unchecked still apply.
+    """
+    _bootstrap()
+
+    from applypilot.apply import liveness
+    from applypilot.database import get_connection
+
+    if limit < 0:
+        console.print("[red]Invalid --limit:[/red] use 0 or a positive number.")
+        raise typer.Exit(code=1)
+
+    tier_list = [t.strip() for t in tiers.split(",") if t.strip()]
+    conn = get_connection()
+
+    def _progress(done: int, total: int, _results: list) -> None:
+        console.print(f"  probed {done}/{total}…", end="\r")
+
+    result = liveness.verify_jobs(
+        conn, tiers=tier_list, max_age_days=max_age_days,
+        limit=limit, workers=workers, dry_run=dry_run, progress=_progress,
+    )
+    by = result["by_status"]
+    title = "Liveness check (dry run)" if dry_run else "Liveness check complete"
+    console.print(f"\n[bold green]{title}[/bold green]")
+    console.print(f"  Candidates:   {result['candidates']}  (skipped fresh: {result['skipped_fresh']})")
+    console.print(f"  Probed:       {result['checked']}")
+    console.print(f"  Live:         {by.get('live', 0)}")
+    console.print(f"  Uncertain:    {by.get('uncertain', 0)}  (kept — apply still considers these)")
+    console.print(f"  [red]Dead:         {by.get('dead', 0)}[/red]  (apply will skip; rows retained in DB)")
+    if dry_run:
+        console.print("\n[yellow]Dry run only.[/yellow] Run without --dry-run to write liveness_status.")
+
+
 @app.command("smart-health")
 def smart_health_command(
     all_sites: bool = typer.Option(False, "--all", help="Show healthy sources too."),
