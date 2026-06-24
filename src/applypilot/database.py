@@ -179,6 +179,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     repair_retryable_score_errors(conn)
     ensure_job_indexes(conn)
     ensure_application_tables(conn)
+    ensure_inbox_auth_tables(conn)
     ensure_pipeline_tables(conn)
 
     return conn
@@ -520,6 +521,58 @@ def ensure_application_tables(conn: sqlite3.Connection | None = None) -> None:
             )
             VALUES (?, 'applied', 'backfill', 'legacy', ?, 'Backfilled from jobs.applied_at')
         """, (row["url"], applied_at))
+    conn.commit()
+
+
+def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create durable inbox event and auth challenge tracking tables."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inbox_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id            TEXT NOT NULL UNIQUE,
+            thread_id             TEXT,
+            sender                TEXT,
+            sender_domain         TEXT,
+            subject               TEXT,
+            received_at           TEXT,
+            event_type            TEXT NOT NULL,
+            confidence            TEXT NOT NULL,
+            matched_job_url       TEXT,
+            matched_company       TEXT,
+            matched_method        TEXT,
+            snippet               TEXT,
+            created_at            TEXT NOT NULL,
+            FOREIGN KEY(matched_job_url) REFERENCES jobs(url)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_challenges (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_url               TEXT NOT NULL,
+            application_url       TEXT,
+            provider              TEXT,
+            challenge_type        TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            requested_at          TEXT NOT NULL,
+            expires_at            TEXT NOT NULL,
+            resolved_at           TEXT,
+            inbox_event_id        INTEGER,
+            attempt_count         INTEGER NOT NULL DEFAULT 0,
+            last_error            TEXT,
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL,
+            FOREIGN KEY(job_url) REFERENCES jobs(url),
+            FOREIGN KEY(inbox_event_id) REFERENCES inbox_events(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_events_job_url ON inbox_events(matched_job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_events_received_at ON inbox_events(received_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_status ON auth_challenges(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_job_url ON auth_challenges(job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)")
     conn.commit()
 
 
