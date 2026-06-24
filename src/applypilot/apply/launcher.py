@@ -1323,6 +1323,21 @@ def _trip_systemic_breaker(worker_id: int) -> None:
     _stop_event.set()
 
 
+def _duration_watchdog(max_seconds: float) -> None:
+    """Wall-clock bound for a timed continuous run ("run for 5 hours"). After
+    max_seconds -- unless the run already stopped for another reason -- set the stop
+    event so workers finish their in-flight job and exit cleanly (we let the current
+    application complete rather than abandon a half-filled form). Module-level so it's
+    unit-testable. No-op for max_seconds <= 0."""
+    if max_seconds <= 0:
+        return
+    if _stop_event.wait(timeout=max_seconds):
+        return  # already stopped by another path (cost cap / breaker / Ctrl+C / drained)
+    add_event(f"[run] max duration {max_seconds:.0f}s ({max_seconds / 3600:.1f}h) reached -- "
+              f"stopping after the in-flight job finishes")
+    _stop_event.set()
+
+
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
@@ -1717,6 +1732,16 @@ def main(limit: int = 1, target_url: str | None = None,
             except Exception:
                 logger.debug("Periodic backup failed", exc_info=True)
     threading.Thread(target=_periodic_backup, daemon=True, name="db-backup").start()
+
+    # Wall-clock bound for a timed continuous run (e.g. "run for 5 hours"). Without it,
+    # --continuous only stops on cost cap / queue exhaustion / breaker / Ctrl+C. This
+    # daemon sets _stop_event after APPLYPILOT_MAX_DURATION_SECONDS (0 = no bound); the
+    # workers then finish their in-flight job and exit cleanly (we deliberately let the
+    # current application complete rather than abandoning a half-filled form).
+    _max_dur = int(os.environ.get("APPLYPILOT_MAX_DURATION_SECONDS") or 0)
+    if _max_dur > 0:
+        threading.Thread(target=_duration_watchdog, args=(_max_dur,),
+                         daemon=True, name="max-duration").start()
 
     if continuous:
         effective_limit = 0
