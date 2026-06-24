@@ -71,7 +71,7 @@ _AUTH_CODE_AFTER_RE = re.compile(
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_PREFIX_RE = re.compile(
-    r"\b(?:zip|postal|job|reference|support)\s*(?:id|code|number|#)?\s*(?:is|:|#)?\s*$",
+    r"\b(?:zip|postal|job|reference|support|contact|contacting)\s*(?:id|code|number|#)?\s*(?:is|:|#)?\s*$",
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_SUFFIX_RE = re.compile(

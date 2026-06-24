@@ -144,6 +144,7 @@ def test_ignores_labeled_non_auth_codes_with_punctuation() -> None:
         "job ID: 123456",
         "Reference code: 123456",
         "support # 123456",
+        "Contact code: 123456",
     ]
 
     for body in bodies:
