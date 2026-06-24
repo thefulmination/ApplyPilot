@@ -553,6 +553,11 @@ def apply(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     base_resume: bool = typer.Option(False, "--base-resume", help="Apply with the base resume as-is (no per-job tailoring); jobs lacking a tailored resume fall back to .applypilot/resume.pdf."),
+    inbox_auth: bool | None = typer.Option(
+        None,
+        "--inbox-auth/--no-inbox-auth",
+        help="Enable or disable Gmail inbox auth code automation during apply retries."
+    ),
     max_cost_usd: float = typer.Option(0.0, "--max-cost-usd", help="Stop the run once estimated apply cost reaches this USD amount (0 = no cap)."),
     linkedin_daily_cap: int = typer.Option(-1, "--linkedin-daily-cap", help="Rolling-24h cap on LinkedIn Easy-Apply submissions; offsite lane keeps flowing after the cap. -1 = use default (20), 0 = no cap."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
@@ -617,6 +622,12 @@ def apply(
     if linkedin_daily_cap >= 0:
         import os
         os.environ["APPLYPILOT_LINKEDIN_DAILY_CAP"] = str(linkedin_daily_cap)
+    if inbox_auth is True:
+        import os
+        os.environ["APPLYPILOT_INBOX_AUTH"] = "1"
+    elif inbox_auth is False:
+        import os
+        os.environ["APPLYPILOT_INBOX_AUTH"] = "0"
 
     # --- Utility modes (no Chrome/apply-agent needed) ---
 

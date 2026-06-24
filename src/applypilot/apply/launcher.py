@@ -28,6 +28,7 @@ from applypilot import config
 from applypilot.applications import record_application
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
+from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -610,10 +611,15 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             # skip them at acquire time so the apply never wastes a Chrome launch + agent
             # run reaching a login wall it can only bounce. Mark auth_required (permanent)
             # so they surface in `apply-failures --manual` for a manual pass. The run then
-            # spends its launches on jobs that are actually applyable. Off via
-            # APPLYPILOT_SKIP_AUTH_GATED=0.
+            # spends its launches on jobs that are actually applyable.
+            #
+            # Assisted inbox auth is opt-in and handles common verification-style walls.
+            # When enabled, allow auth-gated rows to flow to the runtime retry path.
+            # Off via APPLYPILOT_SKIP_AUTH_GATED=1 (default) or use --no-inbox-auth.
+            assisted = os.environ.get("APPLYPILOT_INBOX_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}
             if (os.environ.get("APPLYPILOT_SKIP_AUTH_GATED", "1").strip().lower()
                     not in ("0", "false", "no", "off")
+                    and not assisted
                     and config.is_auth_gated_application(apply_url)):
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'auth_required', apply_error = 'auth_gate', "
@@ -890,7 +896,7 @@ def reset_failed() -> int:
 
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str | None = "sonnet", dry_run: bool = False,
-            agent: str = "claude") -> tuple[str, int]:
+            agent: str = "claude", inbox_auth_hint: str | None = None) -> tuple[str, int]:
     """Spawn an apply-agent session for one job application.
 
     Returns:
@@ -917,6 +923,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         tailored_resume=resume_text,
         dry_run=dry_run,
         worker_id=worker_id,
+        inbox_auth_hint=inbox_auth_hint,
     )
 
     # Write per-worker MCP config
@@ -1244,6 +1251,98 @@ def _is_permanent_failure(result: str) -> bool:
         or reason in PERMANENT_FAILURES
         or any(reason.startswith(p) for p in PERMANENT_PREFIXES)
     )
+
+
+def _inbox_auth_enabled() -> bool:
+    """Return True when authenticated inbox automation should be used."""
+    return os.environ.get("APPLYPILOT_INBOX_AUTH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
+    if match.candidate.kind == "magic_link":
+        return f"magic_link={match.candidate.value}\nreason={'; '.join(match.reasons)}"
+    return (
+        f"code={match.candidate.value}\n"
+        f"sender={match.sender}\n"
+        f"subject={match.subject}\n"
+        f"received_at={match.received_at or 'unknown'}\n"
+        f"reason={'; '.join(match.reasons)}"
+    )
+
+
+def _poll_inbox_auth_hint(job: dict) -> str | None:
+    """Poll Gmail once for a likely verification code/magic-link for a given job."""
+    try:
+        from urllib.parse import urlparse
+
+        from applypilot.gmail_outcomes import build_gmail_service
+
+        if not _inbox_auth_enabled():
+            return None
+
+        apply_target = job.get("application_url") or job["url"]
+        host = (urlparse(apply_target).hostname or "").lower()
+        provider = host if host else "unknown"
+        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
+        poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        max_errors = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_ERRORS", "3"))
+        minutes = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MINUTES", "15"))
+        max_messages = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "25"))
+        challenge_type = os.environ.get("APPLYPILOT_INBOX_AUTH_CHALLENGE_TYPE", "email_code").strip().lower()
+        if challenge_type not in {"email_code", "magic_link"}:
+            logger.debug(
+                "Unsupported inbox auth challenge type %s; defaulting to email_code",
+                challenge_type,
+            )
+            challenge_type = "email_code"
+        challenge_id = inbox_auth.create_auth_challenge(
+            job_url=job["url"],
+            application_url=apply_target,
+            provider=provider,
+            challenge_type=challenge_type,
+        )
+        inbox_auth.set_auth_challenge_status(challenge_id, "watching")
+        inbox_auth.mark_auth_challenge_attempt(challenge_id, "polling")
+        inbox_auth.expire_stale_challenges()
+
+        service = build_gmail_service()
+        match = inbox_auth.watch_gmail_for_auth_code(
+            service=service,
+            timeout_seconds=timeout,
+            poll_seconds=poll,
+            max_errors=max_errors,
+            minutes=minutes,
+            max_messages=max_messages,
+        )
+        if not match:
+            return None
+        try:
+            event_id = inbox_auth.record_inbox_event(
+                message_id=match.message_id,
+                thread_id=match.thread_id,
+                sender=match.sender,
+                subject=match.subject,
+                event_type="auth_code",
+                confidence=match.candidate.confidence,
+                matched_job_url=job["url"],
+                matched_company=job.get("company"),
+                matched_method=match.candidate.kind,
+                snippet=match.snippet,
+                received_at=match.received_at,
+            )
+            inbox_auth.resolve_auth_challenge(challenge_id=challenge_id, inbox_event_id=event_id)
+        except Exception:
+            logger.debug("Failed to persist inbox auth event/challenge resolution", exc_info=True)
+
+        return _format_inbox_auth_hint(match)
+    except Exception:
+        logger.debug("Inbox auth polling failed", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1722,6 +1821,25 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run,
                                             agent=agent)
+
+            if (
+                not dry_run
+                and _is_auth_required_result(result)
+                and _inbox_auth_enabled()
+            ):
+                add_event(f"[W{worker_id}] AUTH_REQUIRED detected; polling inbox for verification hint")
+                inbox_hint = _poll_inbox_auth_hint(job)
+                if inbox_hint:
+                    add_event(f"[W{worker_id}] Inbox hint found; retrying with assistance")
+                    result, duration_ms = run_job(
+                        job,
+                        port=port,
+                        worker_id=worker_id,
+                        model=model,
+                        dry_run=dry_run,
+                        agent=agent,
+                        inbox_auth_hint=inbox_hint,
+                    )
 
             if result == "skipped":
                 release_lock(job["url"])

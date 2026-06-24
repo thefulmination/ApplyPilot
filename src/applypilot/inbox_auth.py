@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
 import re
+import sqlite3
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
+
+from applypilot.database import get_connection
 
 Confidence = Literal["low", "medium", "high"]
 CandidateKind = Literal["code", "magic_link"]
@@ -126,6 +131,18 @@ class _CandidateDraft:
     value: str
     reasons: tuple[str, ...]
     position: int
+
+
+@dataclass(frozen=True)
+class AuthEmailMatch:
+    message_id: str
+    thread_id: str | None
+    sender: str
+    subject: str
+    received_at: str | None
+    snippet: str
+    candidate: VerificationCandidate
+    reasons: tuple[str, ...]
 
 
 def now_utc() -> str:
@@ -404,3 +421,369 @@ def _confidence_for(kind: CandidateKind, reasons: tuple[str, ...], single_candid
 def _candidate_sort_key(candidate: VerificationCandidate) -> tuple[int, int, int, str]:
     kind_order = 0 if candidate.kind == "code" else 1
     return (-_CONFIDENCE_ORDER[candidate.confidence], kind_order, candidate.position, candidate.value)
+
+
+ACTIVE_CHALLENGE_STATUSES = ("pending", "watching")
+FINAL_CHALLENGE_STATUSES = ("resolved", "expired", "failed")
+
+
+def _headers(payload: dict[str, Any]) -> dict[str, str]:
+    return {h["name"].lower(): h.get("value", "") for h in payload.get("headers", []) if h.get("name")}
+
+
+def _payload_text(payload: dict[str, Any]) -> str:
+    mime = payload.get("mimeType", "")
+    body = payload.get("body", {}).get("data", "")
+
+    if mime == "text/plain" and body:
+        padded = body + "=" * ((4 - len(body) % 4) % 4)
+        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+
+    if mime == "text/html" and body:
+        padded = body + "=" * ((4 - len(body) % 4) % 4)
+        raw = base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+        return re.sub(r"<[^>]+>", " ", raw)
+
+    pieces: list[str] = []
+    for part in payload.get("parts", []):
+        extracted = _payload_text(part)
+        if extracted:
+            pieces.append(extracted)
+    return "\n".join(pieces)
+
+
+def scan_gmail_for_auth_codes(
+    *,
+    service,
+    minutes: int = 10,
+    max_messages: int = 25,
+) -> list[AuthEmailMatch]:
+    window_minutes = max(1, int(minutes))
+    max_older_days = max(1, (window_minutes + 1439) // 1440)
+    query = (
+        f'newer_than:{max_older_days}d (verification OR verify OR code OR "one-time" '
+        f'OR "one time" OR "confirm your email" OR "magic link")'
+    )
+    messages = (
+        service.users()
+        .messages()
+        .list(userId="me", q=query, maxResults=max_messages)
+        .execute()
+        .get("messages", [])
+    )
+
+    matches: list[AuthEmailMatch] = []
+    seen_threads: set[str] = set()
+    for ref in messages:
+        thread_id = ref.get("threadId", ref["id"])
+        if thread_id in seen_threads:
+            continue
+        seen_threads.add(thread_id)
+
+        msg = (
+            service.users()
+            .messages()
+            .get(userId="me", id=ref["id"], format="full")
+            .execute()
+        )
+        payload = msg.get("payload", {})
+        hdrs = _headers(payload)
+        subject = hdrs.get("subject", "")
+        sender = hdrs.get("from", "")
+        received_at = hdrs.get("date")
+        body = _payload_text(payload)
+        candidates = extract_verification_candidates(subject, body, sender)
+
+        for candidate in candidates:
+            if candidate.confidence != "high":
+                continue
+
+            matches.append(
+                AuthEmailMatch(
+                    message_id=ref["id"],
+                    thread_id=ref.get("threadId"),
+                    sender=sender,
+                    subject=subject,
+                    received_at=received_at,
+                    snippet=body[:240].replace("\n", " ").strip(),
+                    candidate=candidate,
+                    reasons=candidate.reasons,
+                )
+            )
+
+    return matches
+
+
+def watch_gmail_for_auth_code(
+    *,
+    service,
+    timeout_seconds: int = 300,
+    poll_seconds: int = 5,
+    max_errors: int = 3,
+    minutes: int = 10,
+    max_messages: int = 25,
+) -> AuthEmailMatch | None:
+    deadline = time.monotonic() + timeout_seconds
+    errors = 0
+    while time.monotonic() < deadline:
+        try:
+            matches = scan_gmail_for_auth_codes(
+                service=service,
+                minutes=minutes,
+                max_messages=max_messages,
+            )
+            if matches:
+                return matches[0]
+            errors = 0
+        except Exception:
+            errors += 1
+            if errors >= max_errors:
+                return None
+        time.sleep(max(0.0, poll_seconds))
+    return None
+
+
+def create_auth_challenge(
+    job_url: str,
+    application_url: str,
+    provider: str,
+    challenge_type: str = "email_code",
+    ttl_seconds: int = 300,
+) -> int:
+    """Create or reuse an active auth challenge and return its row id.
+
+    If an active challenge already exists for the same job/application/provider/type,
+    return the existing row id so repeated retries do not create duplicates.
+    """
+    conn = get_connection()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=ttl_seconds)
+
+    existing = conn.execute(
+        """
+        SELECT id FROM auth_challenges
+        WHERE job_url = ?
+          AND application_url = ?
+          AND provider = ?
+          AND challenge_type = ?
+          AND status IN (?, ?)
+        ORDER BY requested_at DESC
+        LIMIT 1
+        """,
+        (job_url, application_url, provider, challenge_type, *ACTIVE_CHALLENGE_STATUSES),
+    ).fetchone()
+    if existing is not None:
+        return int(existing[0])
+
+    cursor = conn.execute(
+        """
+        INSERT INTO auth_challenges (
+            job_url, application_url, provider, challenge_type, status,
+            requested_at, expires_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+        """,
+        (
+            job_url,
+            application_url,
+            provider,
+            challenge_type,
+            now.isoformat(),
+            expires.isoformat(),
+            now.isoformat(),
+            now.isoformat(),
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def list_auth_challenges(
+    status: str | None = None,
+    job_url: str | None = None,
+    provider: str | None = None,
+    limit: int = 0,
+) -> list[dict[str, Any]]:
+    """Return challenge rows, optionally filtered, ordered by requested time."""
+    conn = get_connection()
+    clauses = ["1 = 1"]
+    params: list[Any] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if job_url:
+        clauses.append("job_url = ?")
+        params.append(job_url)
+    if provider:
+        clauses.append("provider = ?")
+        params.append(provider)
+
+    sql = (
+        """
+        SELECT id, job_url, application_url, provider, challenge_type, status,
+               requested_at, expires_at, resolved_at, attempt_count,
+               inbox_event_id, last_error, created_at, updated_at
+        FROM auth_challenges
+        WHERE """
+        + " AND ".join(clauses)
+        + " ORDER BY requested_at DESC"
+    )
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def set_auth_challenge_status(
+    challenge_id: int,
+    status: str,
+    last_error: str | None = None,
+) -> bool:
+    """Update a challenge status and timestamps; return True when a row changes."""
+    now = now_utc()
+    conn = get_connection()
+    if status == "resolved":
+        cursor = conn.execute(
+            """
+            UPDATE auth_challenges
+               SET status = ?,
+                   resolved_at = ?,
+                   last_error = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (status, now, last_error, now, challenge_id),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            UPDATE auth_challenges
+               SET status = ?,
+                   last_error = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (status, last_error, now, challenge_id),
+        )
+    conn.commit()
+    return int(cursor.rowcount or 0) == 1
+
+
+def mark_auth_challenge_attempt(
+    challenge_id: int,
+    last_error: str | None = None,
+) -> bool:
+    """Increment attempt_count and persist the latest observation error."""
+    conn = get_connection()
+    now = now_utc()
+    cursor = conn.execute(
+        """
+        UPDATE auth_challenges
+           SET attempt_count = attempt_count + 1,
+               last_error = COALESCE(?, last_error),
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (last_error, now, challenge_id),
+    )
+    conn.commit()
+    return int(cursor.rowcount or 0) == 1
+
+
+def record_inbox_event(
+    message_id: str,
+    thread_id: str | None = None,
+    sender: str | None = None,
+    subject: str | None = None,
+    event_type: str = "auth_code",
+    confidence: Confidence = "low",
+    matched_job_url: str | None = None,
+    matched_company: str | None = None,
+    matched_method: str | None = None,
+    snippet: str | None = None,
+    received_at: str | None = None,
+) -> int:
+    """Record an inbox verification event by message id.
+
+    Repeated calls with the same message_id are idempotent and return the same row id.
+    """
+    conn = get_connection()
+    created_at = now_utc()
+    normalized_sender_domain = sender_domain(sender or "")
+
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO inbox_events (
+                message_id, thread_id, sender, sender_domain, subject,
+                received_at, event_type, confidence, matched_job_url,
+                matched_company, matched_method, snippet, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                thread_id,
+                sender,
+                normalized_sender_domain,
+                subject,
+                received_at or now_utc(),
+                event_type,
+                confidence,
+                matched_job_url,
+                matched_company,
+                matched_method,
+                snippet,
+                created_at,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    except sqlite3.IntegrityError:
+        row = conn.execute(
+            "SELECT id FROM inbox_events WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise
+        return int(row[0])
+
+
+def resolve_auth_challenge(challenge_id: int, inbox_event_id: int) -> bool:
+    """Resolve a challenge only if it's still awaiting completion."""
+    conn = get_connection()
+    now = now_utc()
+    cursor = conn.execute(
+        """
+        UPDATE auth_challenges
+           SET status = 'resolved',
+               resolved_at = ?,
+               inbox_event_id = ?,
+               updated_at = ?,
+               last_error = NULL
+         WHERE id = ? AND status IN ('pending', 'watching')
+        """,
+        (now, inbox_event_id, now, challenge_id),
+    )
+    conn.commit()
+    return int(cursor.rowcount or 0) == 1
+
+
+def expire_stale_challenges() -> int:
+    """Mark expired pending/watching challenges as expired."""
+    conn = get_connection()
+    now = now_utc()
+    cursor = conn.execute(
+        """
+        UPDATE auth_challenges
+           SET status = 'expired',
+               updated_at = ?,
+               last_error = COALESCE(last_error, 'expired')
+         WHERE status IN ('pending', 'watching')
+           AND expires_at <= ?
+        """,
+        (now, now),
+    )
+    conn.commit()
+    return int(cursor.rowcount or 0)
