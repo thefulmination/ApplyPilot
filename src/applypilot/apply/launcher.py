@@ -1493,6 +1493,41 @@ def main(limit: int = 1, target_url: str | None = None,
                 logger.debug("Periodic lease reclaim failed", exc_info=True)
     threading.Thread(target=_periodic_reclaim, daemon=True, name="lease-reclaim").start()
 
+    # Periodic DB safeguard: a continuous run only backs up on exit, so a corruption
+    # mid-run (the 2026-06-23 incident: SQLite 'disk I/O error' under sustained writes,
+    # likely AV touching the -wal) could destroy hours of progress AND keep the run
+    # limping on a broken DB. Every APPLYPILOT_BACKUP_INTERVAL seconds (default 600,
+    # 0=off): integrity-check the live DB; if CLEAN, write a rolling online backup; if
+    # CORRUPT, HALT the run immediately so it can't do more damage or waste launches.
+    def _periodic_backup() -> None:
+        interval = int(os.environ.get("APPLYPILOT_BACKUP_INTERVAL") or 600)
+        if interval <= 0:
+            return
+        import sqlite3
+        bdir = config.DB_PATH.parent / "backups"
+        try:
+            bdir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        while not _stop_event.wait(timeout=interval):
+            try:
+                src = get_connection()
+                qc = src.execute("PRAGMA quick_check").fetchone()[0]
+                if qc != "ok":
+                    add_event(f"[backup] DB INTEGRITY FAILED ({str(qc)[:40]}) -- stopping run to "
+                              f"prevent further corruption; restore from backups/ or .applypilot")
+                    _stop_event.set()
+                    break
+                tmp = bdir / "rolling.db.tmp"
+                dest = sqlite3.connect(str(tmp))
+                src.backup(dest)
+                dest.close()
+                tmp.replace(bdir / "rolling.db")
+                add_event("[backup] integrity OK; rolling backup written")
+            except Exception:
+                logger.debug("Periodic backup failed", exc_info=True)
+    threading.Thread(target=_periodic_backup, daemon=True, name="db-backup").start()
+
     if continuous:
         effective_limit = 0
         mode_label = "continuous"
