@@ -277,14 +277,24 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
 # the same employer board as an already-applied role AND their titles share enough
 # significant tokens, treat it as a re-post and skip it.
 NEAR_DUP_MIN_SHARED = int(os.environ.get("APPLYPILOT_NEAR_DUP_MIN_SHARED_TOKENS") or 3)
-# ATS hosts whose first real path segment identifies the EMPLOYER. Generic boards
-# (linkedin/indeed/hiring.cafe/themuse/chiefofstaffjob) are excluded -- their slug is
-# not the employer, so a board-slug match there would falsely merge distinct companies.
+# ATS hosts whose FIRST PATH segment reliably identifies the employer
+# (greenhouse.io/<company>/jobs/<id>). Restricted on purpose: hosts that put the
+# employer in a SUBDOMAIN (workday/bamboohr/recruitee/teamtailor/pinpoint) or in an
+# inconsistent path (workable /view) are EXCLUDED -- a wrong slug there could falsely
+# merge two different companies. Those are covered by the company field instead (see
+# _same_employer). Generic boards (linkedin/indeed/hiring.cafe/...) never encode an
+# employer in the URL, so a slug match there can't falsely merge distinct companies.
 _EMPLOYER_BOARD_HOSTS = (
     "greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com",
-    "workable.com", "myworkdayjobs.com", "rippling.com", "jobvite.com",
-    "bamboohr.com", "recruitee.com", "teamtailor.com", "pinpointhq.com",
+    "jobvite.com", "rippling.com",
 )
+# Path segments that are board routing words, NOT the employer -> skipped when
+# extracting the employer slug (so we never read 'jobs'/'view'/'apply' as a company).
+_BOARD_PATH_NOISE = frozenset({
+    "jobs", "job", "careers", "career", "o", "embed", "view", "j", "p", "apply",
+    "en", "en-us", "us", "search", "listing", "listings", "opening", "openings",
+    "position", "positions", "role", "roles", "vacancy", "vacancies",
+})
 # Stopwords + employment-type/location boilerplate that aggregator titles tack on, so
 # token overlap reflects the actual ROLE, not "Full Time United States" noise.
 _TITLE_STOP = frozenset({
@@ -292,24 +302,49 @@ _TITLE_STOP = frozenset({
     "full", "part", "time", "remote", "hybrid", "onsite", "contract", "intern",
     "internship", "united", "states", "us", "usa", "new", "york", "san", "ny", "ca",
     "sf", "senior", "sr", "junior", "jr",
+    # Region / locale tokens are pure noise -- they must not bridge two different roles
+    # (Asana "Marketing Operations Manager, AMER" vs "Head of Revenue Strategy & Ops AMER").
+    "amer", "emea", "apac", "anz", "latam", "americas", "america", "north", "global",
+    "international", "worldwide", "ww",
 })
+# The aggregator pseudo-company / generic-board names are NOT real employers, so they
+# must never be used as an employer identity (they'd merge many distinct companies).
+_NON_EMPLOYER_COMPANIES = frozenset({"chiefofstaffjob.com", "hiringcafe", "linkedin"})
 
 
 def _employer_board_slug(url: str | None) -> str | None:
-    """Return 'host/employer' for ATS boards that encode the employer in the path
-    (greenhouse.io/amaehealth), else None for generic boards / unknown hosts."""
+    """'baseATS/employer' for boards that encode the employer in the FIRST path segment
+    (greenhouse.io/amaehealth). None for subdomain-employer boards, generic aggregators,
+    or unknown hosts -- so a board-slug match never falsely merges distinct companies."""
     from urllib.parse import urlparse
     u = urlparse(url or "")
     host = (u.hostname or "").lower()
     host = host[4:] if host.startswith("www.") else host
-    # Normalize to the base ATS domain so subdomain variants of the same board
-    # (boards.greenhouse.io vs job-boards.greenhouse.io) collapse to one employer key.
+    # Normalize to the base ATS domain so subdomain variants (boards. vs job-boards.
+    # greenhouse.io) collapse to one key.
     base = next((h for h in _EMPLOYER_BOARD_HOSTS if host == h or host.endswith("." + h)), None)
     if not base:
         return None
-    parts = [s for s in (u.path or "").split("/")
-             if s and s.lower() not in ("jobs", "job", "careers", "career", "o", "embed")]
+    parts = [s for s in (u.path or "").split("/") if s and s.lower() not in _BOARD_PATH_NOISE]
     return f"{base}/{parts[0].lower()}" if parts else None
+
+
+def _norm_company(company: str | None) -> str:
+    """Normalized employer name, or '' for empty / the aggregator pseudo-company."""
+    co = (company or "").strip().lower()
+    return "" if co in _NON_EMPLOYER_COMPANIES else co
+
+
+def _same_employer(url_a, co_a, url_b, co_b) -> bool:
+    """True if two postings are from the same EMPLOYER -- matched by real company name
+    (robust, no URL parsing) OR by a reliable path-employer ATS board slug. Either
+    signal alone suffices, so e.g. a greenhouse row and a LinkedIn row for one company
+    still match via the company field."""
+    ca, cb = _norm_company(co_a), _norm_company(co_b)
+    if ca and ca == cb:
+        return True
+    sa, sb = _employer_board_slug(url_a), _employer_board_slug(url_b)
+    return bool(sa and sa == sb)
 
 
 def _sig_title_tokens(title: str | None) -> set[str]:
@@ -320,21 +355,23 @@ def _sig_title_tokens(title: str | None) -> set[str]:
     }
 
 
-def _find_near_duplicate_applied(conn, apply_url: str, title: str) -> str | None:
-    """If an already-applied role is the same posting re-listed (same employer ATS
-    board + >= NEAR_DUP_MIN_SHARED shared significant title tokens), return its title;
-    else None. Conservative: a too-generic candidate title (< the threshold of
-    significant tokens, e.g. 'Chief of Staff') never triggers a near-dup skip."""
-    cslug = _employer_board_slug(apply_url)
-    if not cslug:
-        return None  # generic board / unknown host -> can't identify the employer
+def _find_near_duplicate_applied(conn, apply_url: str, title: str,
+                                 company: str | None = None) -> str | None:
+    """If an already-applied role is the same posting re-listed -- same EMPLOYER
+    (company OR reliable board slug) AND >= NEAR_DUP_MIN_SHARED shared significant title
+    tokens -- return its title, else None. Conservative: a too-generic candidate title
+    (< the threshold of significant tokens, e.g. 'Chief of Staff') never triggers it,
+    and an unidentifiable employer never triggers it."""
+    if not (_norm_company(company) or _employer_board_slug(apply_url)):
+        return None  # can't identify the employer -> don't risk a false near-dup skip
     ctoks = _sig_title_tokens(title)
     if len(ctoks) < NEAR_DUP_MIN_SHARED:
         return None
     for r in conn.execute(
-        "SELECT title, COALESCE(application_url, url) AS tgt FROM jobs WHERE apply_status = 'applied'"
+        "SELECT title, company, COALESCE(application_url, url) AS tgt "
+        "FROM jobs WHERE apply_status = 'applied'"
     ):
-        if _employer_board_slug(r["tgt"]) != cslug:
+        if not _same_employer(apply_url, company, r["tgt"], r["company"]):
             continue
         if len(ctoks & _sig_title_tokens(r["title"])) >= NEAR_DUP_MIN_SHARED:
             return r["title"]
@@ -356,15 +393,9 @@ def audit_duplicate_applications(conn=None) -> list[dict]:
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
             a, b = rows[i], rows[j]
-            aslug, bslug = _employer_board_slug(a["tgt"]), _employer_board_slug(b["tgt"])
-            aco = (a["company"] or "").strip().lower()
-            bco = (b["company"] or "").strip().lower()
-            # The aggregator pseudo-company is not a real employer -> ignore it.
-            aco = "" if aco in ("", "chiefofstaffjob.com") else aco
-            bco = "" if bco in ("", "chiefofstaffjob.com") else bco
-            same_employer = (aslug and aslug == bslug) or (aco and aco == bco)
-            if not same_employer:
+            if not _same_employer(a["tgt"], a["company"], b["tgt"], b["company"]):
                 continue
+            aco = _norm_company(a["company"])
             if a["tgt"] == b["tgt"]:
                 kind, shared = "exact-target", []
             else:
@@ -373,7 +404,7 @@ def audit_duplicate_applications(conn=None) -> list[dict]:
                     continue
                 kind = "near-duplicate"
             out.append({
-                "kind": kind, "employer": aslug or aco,
+                "kind": kind, "employer": _employer_board_slug(a["tgt"]) or aco,
                 "title_a": a["title"], "title_b": b["title"],
                 "url_a": a["url"], "url_b": b["url"],
                 "applied_a": a["applied_at"], "applied_b": b["applied_at"],
@@ -431,7 +462,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 like = f"%{target_url.split('?')[0].rstrip('/')}%"
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
-                           fit_score, audit_score, audit_label, location, full_description, cover_letter_path
+                           fit_score, audit_score, audit_label, location, full_description, cover_letter_path, company
                     FROM jobs
                     WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                       {tailored_clause}
@@ -486,7 +517,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     params.append(_cut)
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
-                           fit_score, audit_score, audit_label, location, full_description, cover_letter_path
+                           fit_score, audit_score, audit_label, location, full_description, cover_letter_path, company
                     FROM jobs
                     WHERE duplicate_of_url IS NULL
                       {tailored_clause}
@@ -603,7 +634,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             # ".../Growth & Partnership Operations" on greenhouse.io/amaehealth). Skip it.
             # Off via APPLYPILOT_NEAR_DUP_MIN_SHARED_TOKENS=0.
             if not target_url and NEAR_DUP_MIN_SHARED >= 1:
-                _dup_of = _find_near_duplicate_applied(conn, apply_url, row["title"] or "")
+                _dup_of = _find_near_duplicate_applied(
+                    conn, apply_url, row["title"] or "", row["company"])
                 if _dup_of:
                     conn.execute(
                         "UPDATE jobs SET apply_status = 'deferred', "
@@ -2049,6 +2081,20 @@ def main(limit: int = 1, target_url: str | None = None,
                     f"{r['reason']}={r['count']}" for r in a["fail_reasons"][:6]))
         except Exception:
             logger.debug("Run-summary analytics failed", exc_info=True)
+        # Auto-monitor: surface any likely-duplicate applications right at the end of
+        # the run, so a double-apply that slipped the live guard is caught immediately
+        # (not weeks later via a "Duplicate Application Received" email).
+        try:
+            dups = audit_duplicate_applications()
+            if dups:
+                console.print(
+                    f"\n[bold yellow]⚠ {len(dups)} possible DUPLICATE application(s) detected[/bold yellow] "
+                    f"-- review with [bold]applypilot audit-duplicates[/bold]:")
+                for d in dups[:8]:
+                    console.print(f"  [yellow]{d['employer']}[/yellow]: "
+                                  f"\"{d['title_a'][:40]}\" vs \"{d['title_b'][:40]}\"")
+        except Exception:
+            logger.debug("Duplicate audit failed", exc_info=True)
         console.print(f"Logs: {config.LOG_DIR}")
 
     except KeyboardInterrupt:

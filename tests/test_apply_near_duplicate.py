@@ -25,6 +25,43 @@ def test_employer_board_slug():
     assert L._employer_board_slug("https://hiring.cafe/viewjob/x") is None
 
 
+def test_slug_none_for_subdomain_and_ambiguous_ats():
+    # These previously produced BOGUS employer slugs (workable.com/view, bamboohr.com/123,
+    # the workday site segment) that could falsely merge two different companies. Now None,
+    # so those employers are matched by the company field instead -- never by a bad slug.
+    assert L._employer_board_slug("https://jobs.workable.com/view/xyz") is None
+    assert L._employer_board_slug("https://co.bamboohr.com/careers/123") is None
+    assert L._employer_board_slug("https://equinix.wd1.myworkdayjobs.com/External/job/x") is None
+    assert L._employer_board_slug("https://acme.recruitee.com/o/role") is None
+
+
+def test_same_employer_by_company_or_slug_no_false_merge():
+    # Same real company -> same employer even across boards (robust, no URL parsing).
+    assert L._same_employer("https://www.linkedin.com/jobs/view/1", "Amae Health",
+                            "https://job-boards.greenhouse.io/amaehealth/jobs/2", "Amae Health") is True
+    # Same greenhouse board with no company -> same employer via the reliable slug.
+    assert L._same_employer("https://job-boards.greenhouse.io/amaehealth/jobs/1", "",
+                            "https://job-boards.greenhouse.io/amaehealth/jobs/2", "") is True
+    # DIFFERENT companies with no reliable slug must NOT be merged (the false-positive
+    # the slug bug would have caused).
+    assert L._same_employer("https://jobs.workable.com/view/a", "Acme",
+                            "https://jobs.workable.com/view/b", "Globex") is False
+    # The aggregator pseudo-company is not an employer -> never merges its listings.
+    assert L._same_employer("https://chiefofstaffjob.com/jobs/a", "ChiefOfStaffJob.com",
+                            "https://chiefofstaffjob.com/jobs/b", "ChiefOfStaffJob.com") is False
+
+
+def test_near_dup_cross_board_same_company(conn):
+    # Amae applied via greenhouse; a LinkedIn re-list of the same role (no resolved ATS
+    # url, but company='Amae Health') must still be caught via the company signal.
+    _ins(conn, "https://hiring.cafe/v/gh", "Founder Associate, Growth & Partnership Operations",
+         company="Amae Health", app_url="https://job-boards.greenhouse.io/amaehealth/jobs/1", status="applied")
+    dup = L._find_near_duplicate_applied(
+        conn, "https://www.linkedin.com/jobs/view/999",
+        "Founder Associate, Growth & Partnership Operations", "Amae Health")
+    assert dup is not None
+
+
 def test_sig_title_tokens_drops_boilerplate():
     toks = L._sig_title_tokens("Chief of Staff On-Site Full Time United States 26")
     assert "chief" in toks and "staff" in toks
