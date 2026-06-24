@@ -1746,6 +1746,8 @@ def main(limit: int = 1, target_url: str | None = None,
     # current application complete rather than abandoning a half-filled form).
     _max_dur = int(os.environ.get("APPLYPILOT_MAX_DURATION_SECONDS") or 0)
     if _max_dur > 0:
+        console.print(f"[dim]Max duration armed: {_max_dur / 3600:.1f}h "
+                      f"(run self-stops after the in-flight job; cost cap is the backstop)[/dim]")
         threading.Thread(target=_duration_watchdog, args=(_max_dur,),
                          daemon=True, name="max-duration").start()
 
