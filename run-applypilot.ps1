@@ -17,6 +17,15 @@ $env:APPLYPILOT_DIR = $ApplyPilotDir
 $LocalDbDir = Join-Path $env:LOCALAPPDATA "ApplyPilot"
 New-Item -ItemType Directory -Force -Path $LocalDbDir | Out-Null
 $env:APPLYPILOT_DB_PATH = Join-Path $LocalDbDir "applypilot.db"
+$OneDriveDbBackup = Join-Path $ApplyPilotDir "applypilot.db"
+if (Test-Path -LiteralPath $OneDriveDbBackup) {
+    $BackupDb = Get-Item -LiteralPath $OneDriveDbBackup
+    $LiveDb = Get-Item -LiteralPath $env:APPLYPILOT_DB_PATH -ErrorAction SilentlyContinue
+    if (-not $LiveDb -or ($BackupDb.Length -gt 1048576 -and $LiveDb.Length -lt ($BackupDb.Length / 2))) {
+        Copy-Item -LiteralPath $OneDriveDbBackup -Destination $env:APPLYPILOT_DB_PATH -Force
+        Write-Host "[run-applypilot] Seeded local DB from OneDrive backup."
+    }
+}
 # Activate the tuned search config. This MUST be set in the process environment here:
 # config.py freezes SEARCH_CONFIG_PATH at import, before .applypilot/.env is loaded,
 # so the .env override alone is ignored. Mirrors run-applypilot-sales.ps1.
@@ -37,6 +46,13 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:Path = "$PythonScripts;$ClaudeExeBin;$ClaudeBin;$NodeBin;$env:Path"
 
+# The apply agent must use the AUTHENTICATED global claude (npm -g install), NOT the
+# .tools\claude copy that the PATH prepend above resolves to -- that copy isn't logged
+# in, so the auth canary aborts. config.get_claude_path() honors CLAUDE_PATH first, so
+# pin it. (Codex resolves via config.get_codex_path -> .tools\codex, unaffected.)
+$GlobalClaude = Join-Path $env:APPDATA "npm\claude.cmd"
+if (Test-Path -LiteralPath $GlobalClaude) { $env:CLAUDE_PATH = $GlobalClaude }
+
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 & (Join-Path $PythonScripts "applypilot.exe") @args
@@ -49,7 +65,12 @@ $WriteCmds = @("run","apply","discover","enrich","score","audit","diagnose","tai
                "verify-live","resolve-ats-boards","dedupe-jobs","rescore-jobs","scan-gmail")
 if ($args.Count -gt 0 -and $WriteCmds -contains $args[0]) {
     try {
-        Copy-Item -LiteralPath $env:APPLYPILOT_DB_PATH -Destination (Join-Path $ApplyPilotDir "applypilot.db") -Force -ErrorAction Stop
+        $LiveDb = Get-Item -LiteralPath $env:APPLYPILOT_DB_PATH -ErrorAction Stop
+        $BackupDb = Get-Item -LiteralPath $OneDriveDbBackup -ErrorAction SilentlyContinue
+        if ($BackupDb -and $BackupDb.Length -gt 1048576 -and $LiveDb.Length -lt ($BackupDb.Length / 2)) {
+            throw "Refusing to overwrite larger OneDrive DB backup ($($BackupDb.Length) bytes) with much smaller live DB ($($LiveDb.Length) bytes)."
+        }
+        Copy-Item -LiteralPath $env:APPLYPILOT_DB_PATH -Destination $OneDriveDbBackup -Force -ErrorAction Stop
         Write-Host "[run-applypilot] DB backed up to OneDrive."
     } catch { Write-Warning "[run-applypilot] DB backup to OneDrive failed: $_" }
 }
