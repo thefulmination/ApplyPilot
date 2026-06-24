@@ -404,9 +404,14 @@ def audit_duplicate_applications(conn=None) -> list[dict]:
     exact dedup can't catch -- the monitor for the 'why is it double-applying' question.
     Read-only."""
     conn = conn or get_connection()
-    rows = [dict(r) for r in conn.execute(
+    # Build dicts from cursor.description so this works whether or not the caller's
+    # connection has row_factory=sqlite3.Row, and without mutating it (zip() handles both
+    # plain tuples and sqlite3.Row, which is iterable).
+    cur = conn.execute(
         "SELECT url, title, company, COALESCE(application_url, url) AS tgt, applied_at "
-        "FROM jobs WHERE apply_status = 'applied'")]
+        "FROM jobs WHERE apply_status = 'applied'")
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     out: list[dict] = []
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):

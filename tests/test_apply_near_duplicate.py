@@ -153,3 +153,20 @@ def test_audit_flags_amae_excludes_aggregator(conn):
     assert len(dups) == 1
     assert dups[0]["employer"] == "greenhouse.io/amaehealth"
     assert dups[0]["kind"] == "near-duplicate"
+
+
+def test_audit_works_with_plain_connection(tmp_path):
+    # audit_duplicate_applications must not assume the caller's connection has
+    # row_factory=sqlite3.Row -- a plain sqlite3 connection used to crash with
+    # "ValueError: dictionary update sequence element #0 has length N; 2 is required".
+    import sqlite3
+    database.init_db(tmp_path / "applypilot.db")
+    plain = sqlite3.connect(str(tmp_path / "applypilot.db"))  # NO row_factory set
+    plain.execute(
+        "INSERT INTO jobs (url, title, site, company, application_url, apply_status, applied_at) "
+        "VALUES ('https://hiring.cafe/x', 'Chief of Staff', 'X', 'Acme', "
+        "'https://job-boards.greenhouse.io/acme/jobs/1', 'applied', '2026-06-24T00:00:00+00:00')"
+    )
+    plain.commit()
+    result = L.audit_duplicate_applications(plain)  # must not raise
+    assert isinstance(result, list)
