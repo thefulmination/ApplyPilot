@@ -48,7 +48,7 @@ _AUTH_CODE_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_PREFIX_RE = re.compile(
-    r"\b(?:zip|postal|job|reference|support)\s+(?:id\s+)?(?:code|number|id|#)?\s*$",
+    r"\b(?:zip|postal|job|reference|support)\s*(?:id|code|number|#)?\s*(?:is|:|#)?\s*$",
     re.IGNORECASE,
 )
 _MAGIC_LINK_CONTEXT_RE = re.compile(
@@ -65,12 +65,8 @@ _GOOGLE_ACCOUNT_DOMAINS = {"accounts.google.com"}
 _GOOGLE_SECURITY_WORDS = (
     "security alert",
     "passkey",
-    "2-step verification",
-    "2 step verification",
-    "two-step verification",
-    "two step verification",
-    "2fa",
     "suspicious",
+    "suspicious login",
     "new sign-in",
     "new sign in",
 )
@@ -138,8 +134,9 @@ def extract_verification_candidates(subject: str, body: str, sender: str) -> lis
     text = _combined_text(subject, body)
     sender_is_known_ats = is_known_ats_domain(sender_domain(sender))
     has_verification_language = _has_verification_language(text)
+    url_spans = [(match.start(), match.end()) for match in _URL_RE.finditer(text)]
 
-    drafts = _extract_code_drafts(text, sender_is_known_ats, has_verification_language)
+    drafts = _extract_code_drafts(text, sender_is_known_ats, has_verification_language, url_spans)
     drafts.extend(_extract_magic_link_drafts(text, sender_is_known_ats, has_verification_language))
     drafts = _dedupe_drafts(drafts)
 
@@ -161,10 +158,13 @@ def _extract_code_drafts(
     text: str,
     sender_is_known_ats: bool,
     has_verification_language: bool,
+    url_spans: list[tuple[int, int]],
 ) -> list[_CandidateDraft]:
     drafts: list[_CandidateDraft] = []
     for match in _CODE_RE.finditer(text):
         value = match.group(0)
+        if _span_inside(match.start(), match.end(), url_spans):
+            continue
         if _looks_like_year(value):
             continue
 
@@ -198,7 +198,7 @@ def _extract_magic_link_drafts(
 
         domain = url_domain(value)
         known_ats_link = is_known_ats_domain(domain)
-        if _is_tracking_or_click_wrapper(value, domain) and not known_ats_link:
+        if _is_tracking_or_click_wrapper(value, domain):
             continue
 
         window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
@@ -248,6 +248,10 @@ def _is_tracking_or_click_wrapper(url: str, domain: str) -> bool:
     return bool(_TRACKING_PATH_RE.search(path_query))
 
 
+def _span_inside(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(span_start <= start and end <= span_end for span_start, span_end in spans)
+
+
 def _looks_like_year(value: str) -> bool:
     return len(value) == 4 and (value.startswith("19") or value.startswith("20"))
 
@@ -292,6 +296,6 @@ def _confidence_for(reasons: tuple[str, ...], single_candidate: bool) -> Confide
     return "low"
 
 
-def _candidate_sort_key(candidate: VerificationCandidate) -> tuple[int, int, str]:
+def _candidate_sort_key(candidate: VerificationCandidate) -> tuple[int, int, int, str]:
     kind_order = 0 if candidate.kind == "code" else 1
-    return (-_CONFIDENCE_ORDER[candidate.confidence], candidate.position, kind_order, candidate.value)
+    return (-_CONFIDENCE_ORDER[candidate.confidence], kind_order, candidate.position, candidate.value)
