@@ -226,7 +226,10 @@ def test_ignores_support_contact_and_reference_codes_after_number() -> None:
 def test_accepts_common_auth_code_phrasings() -> None:
     cases = [
         ("", "Your security code is 123456"),
+        ("", "Your verification code is: 123456"),
+        ("", "Your security code is: 123456"),
         ("", "Your one-time passcode is 123456"),
+        ("", "123456 is your verification code"),
         ("", "Enter 123456 to verify your email"),
         ("", "To verify your email, enter 123456"),
     ]

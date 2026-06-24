@@ -58,16 +58,20 @@ _REJECTED_MAGIC_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _AUTH_CODE_BEFORE_RE = re.compile(
-    r"\b(?:verification|security|authentication|one[- ]time)\s+(?:code|passcode)\s*(?:is|:)?\s*$"
-    r"|\b(?:otp|passcode)\s*(?:is|:)?\s*$"
+    r"\b(?:verification|security|authentication|one[- ]time)\s+(?:code|passcode)\s*(?:is\s*:?|:)?\s*$"
+    r"|\b(?:otp|passcode)\s*(?:is\s*:?|:)?\s*$"
     r"|\b(?:to\s+)?(?:verify|confirm)\s+your\s+email,?\s*(?:please\s+)?(?:enter|use)\s*$",
     re.IGNORECASE,
 )
 _CODE_COMMAND_BEFORE_RE = re.compile(r"\b(?:enter|use)\s*$", re.IGNORECASE)
-_PLAIN_CODE_BEFORE_RE = re.compile(r"\b(?:your\s+)?code\s*(?:is|:)?\s*$", re.IGNORECASE)
+_PLAIN_CODE_BEFORE_RE = re.compile(r"\b(?:your\s+)?code\s*(?:is\s*:?|:)?\s*$", re.IGNORECASE)
 _AUTH_CODE_AFTER_RE = re.compile(
     r"^\s*(?:to\s+)?(?:verify|confirm)\s+your\s+email\b"
     r"|^\s*(?:to\s+)?(?:sign\s+in|continue\s+your\s+application)\b",
+    re.IGNORECASE,
+)
+_AUTH_CODE_FIRST_AFTER_RE = re.compile(
+    r"^\s*is\s+your\s+(?:verification|security|authentication|one[- ]time)\s+(?:code|passcode)\b",
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_PREFIX_RE = re.compile(
@@ -274,6 +278,8 @@ def _has_auth_code_context(
         return True
     if _PLAIN_CODE_BEFORE_RE.search(prefix):
         return sender_is_known_ats and has_verification_language
+    if _AUTH_CODE_FIRST_AFTER_RE.search(suffix):
+        return True
     return bool(_CODE_COMMAND_BEFORE_RE.search(prefix) and _AUTH_CODE_AFTER_RE.search(suffix))
 
 
