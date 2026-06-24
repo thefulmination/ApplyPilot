@@ -43,6 +43,26 @@ def _applied_count() -> int:
         return -1
 
 
+def _apply_cost_total() -> float:
+    """Durable cumulative apply-AGENT cost (USD) across all runs (llm_usage, stage=
+    'apply_agent'). Each apply subprocess persists its real per-job agent cost there, so
+    this survives crashes/restarts and lets the supervisor track ACTUAL session spend
+    (snapshot-at-start delta) instead of estimating from applied-count. Returns -1.0 if
+    unavailable (old DB / no rows yet) so callers fall back to the estimate."""
+    import sqlite3
+    try:
+        c = sqlite3.connect(str(config.DB_PATH), timeout=10)
+        try:
+            row = c.execute(
+                "SELECT COALESCE(SUM(est_cost_usd), 0) FROM llm_usage "
+                "WHERE stage = 'apply_agent'").fetchone()
+            return float(row[0] or 0.0)
+        finally:
+            c.close()
+    except Exception:
+        return -1.0
+
+
 def _cleanup_orphans(log) -> None:
     """Between attempts: free the CDP port (kill any leftover Chrome) and kill orphaned
     Playwright-MCP node servers so a fresh agent can't be hijacked. A hard-killed run
@@ -130,11 +150,23 @@ def supervise(
             pass
 
     baseline = _applied_count()
+    baseline_cost = _apply_cost_total()  # durable spend snapshot for ACTUAL session cost
+
+    def session_spend(applied_n: int) -> float:
+        """USD spent THIS session. Prefers ACTUAL apply-agent cost (durable, includes
+        failed/expired launches the applied-count estimate misses); falls back to the
+        applied-count estimate and takes the MAX so a budget run never overspends while
+        actual cost is still ramping (or an old apply build isn't recording it yet)."""
+        cn = _apply_cost_total()
+        actual = max(0.0, cn - baseline_cost) if (cn >= 0 and baseline_cost >= 0) else 0.0
+        est = max(0, applied_n - baseline) * est_cost_per_apply
+        return max(actual, est)
+
     start = time.monotonic()
     attempt = 0
     log(f"SUPERVISOR start: total_budget=${total_cost_usd:.0f}, baseline_applied={baseline}, "
-        f"stall={stall_minutes}m, max_attempts={max_attempts}, max_hours={max_hours}, "
-        f"est_cost_per_apply=${est_cost_per_apply}")
+        f"baseline_cost=${max(0.0, baseline_cost):.2f}, stall={stall_minutes}m, "
+        f"max_attempts={max_attempts}, max_hours={max_hours}, est_cost_per_apply=${est_cost_per_apply}")
     offsite_backup(force=True)  # capture an off-machine copy before anything runs
 
     while True:
@@ -145,17 +177,17 @@ def supervise(
             log(f"STOP: hit max_hours={max_hours:.1f}"); break
 
         applied_now = _applied_count()
-        spent_est = max(0, applied_now - baseline) * est_cost_per_apply
+        spent = session_spend(applied_now)
         if target_applied > 0:
             if applied_now >= target_applied:
                 log(f"STOP: applied target {target_applied} reached (applied={applied_now})")
                 write_done(f"target {target_applied} reached"); break
             remaining = max(est_cost_per_apply, (target_applied - applied_now) * est_cost_per_apply)
         else:
-            remaining = total_cost_usd - spent_est
+            remaining = total_cost_usd - spent
             if remaining <= max(0.5, est_cost_per_apply):
                 log(f"STOP: budget ~${total_cost_usd:.0f} reached "
-                    f"({applied_now - baseline} applies, est ${spent_est:.0f})")
+                    f"({applied_now - baseline} applies, spent ${spent:.2f})")
                 write_done("budget reached"); break
 
         attempt += 1
@@ -186,7 +218,7 @@ def supervise(
             # postings before they burn a Chrome launch.
             child_env["APPLYPILOT_PREFLIGHT_LIVENESS"] = "1"
 
-        log(f"ATTEMPT {attempt}: launching apply (est spent ${spent_est:.0f}, "
+        log(f"ATTEMPT {attempt}: launching apply (spent ${spent:.2f}, "
             f"per-attempt cap ${remaining:.2f}, applied={applied_now})")
         out_path = config.LOG_DIR / f"supervised_attempt_{attempt}.out"
         with open(out_path, "w", encoding="utf-8") as out:
@@ -205,9 +237,10 @@ def supervise(
             if cur > last_applied:
                 last_applied = cur
                 last_progress = time.monotonic()
-            # Mid-attempt stop (absolute applied target, or estimated budget spent).
+            # Mid-attempt stop (absolute applied target, or budget spent -- actual cost
+            # when available, estimate as a floor).
             done = (cur >= target_applied) if target_applied > 0 else \
-                   (max(0, cur - baseline) * est_cost_per_apply >= total_cost_usd)
+                   (session_spend(cur) >= total_cost_usd)
             if done:
                 log(f"STOP reached mid-attempt (applied={cur}) -- stopping run")
                 _kill_tree(proc)

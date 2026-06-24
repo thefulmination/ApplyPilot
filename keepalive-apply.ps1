@@ -38,7 +38,12 @@ if ($running -gt 0) { Log "supervisor already running ($running) -- skip"; exit 
 Log "LAUNCH supervisor (target_applied=$TargetApplied)"
 # Synchronous: when the supervisor dies, this guard exits and the task restarts it in
 # <= 3 min. The supervisor restarts the apply on each crash and stops at the target.
+# Merge all streams (2>&1) and append as UTF-8. PowerShell's `*>>` redirect writes
+# UTF-16LE under Windows PowerShell 5.1 (the Task Scheduler host), which made these logs
+# awkward to read/grep; Out-File -Encoding utf8 keeps them plain UTF-8. $LASTEXITCODE
+# still reflects python's exit code after the pipe (Out-File doesn't change it).
 & $py -m applypilot.cli supervise-apply --target-applied $TargetApplied --max-cost-usd 90 `
     --linkedin-daily-cap 20 --max-job-age-days 45 --stall-minutes 20 `
-    --max-attempts 100 --max-hours 48 *>> $superOut
+    --max-attempts 100 --max-hours 48 2>&1 |
+    Out-File -FilePath $superOut -Append -Encoding utf8
 Log "supervisor exited code=$LASTEXITCODE"

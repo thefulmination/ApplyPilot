@@ -1254,6 +1254,27 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             ws = get_state(worker_id)
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
+            # Persist the apply-agent's REAL per-job cost durably (stage='apply_agent').
+            # The agent runs via the claude CLI -- its cost is otherwise only kept in
+            # in-process worker state, which resets on every crash/restart. Recording it
+            # to the durable llm_usage table lets the supervisor compute ACTUAL
+            # cross-crash spend (snapshot-at-start delta) instead of estimating from
+            # applied-count, and surfaces apply cost in the usage reports. Best-effort.
+            if cost:
+                try:
+                    from applypilot.database import record_llm_usage
+                    record_llm_usage(
+                        stage="apply_agent", model=model, provider="claude-cli",
+                        usage={
+                            "prompt_tokens": stats.get("input_tokens") or 0,
+                            "completion_tokens": stats.get("output_tokens") or 0,
+                            "total_tokens": (stats.get("input_tokens") or 0)
+                                            + (stats.get("output_tokens") or 0),
+                        },
+                        est_cost_usd=float(cost),
+                    )
+                except Exception:
+                    logger.debug("apply-agent usage record failed", exc_info=True)
 
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
