@@ -192,3 +192,51 @@ def test_accepts_workday_two_step_verification_code() -> None:
     assert candidates
     assert candidates[0].kind == "code"
     assert candidates[0].value == "123456"
+
+
+def test_rejects_known_ats_interview_scheduling_token_link() -> None:
+    candidates = extract_verification_candidates(
+        subject="Confirm your interview",
+        body="Schedule at https://boards.greenhouse.io/interviews/schedule?token=abc123.",
+        sender="no-reply@greenhouse.io",
+    )
+
+    assert candidates == []
+
+
+def test_ignores_support_contact_and_reference_codes_after_number() -> None:
+    bodies = [
+        "Use code 123456 when contacting support about this application.",
+        "Enter 123456 when contacting support about this application.",
+        "Use code 123456 as your reference when contacting support.",
+    ]
+
+    for body in bodies:
+        assert (
+            extract_verification_candidates(
+                subject="Your verification code",
+                body=body,
+                sender="no-reply@greenhouse.io",
+            )
+            == []
+        )
+
+
+def test_accepts_common_auth_code_phrasings() -> None:
+    cases = [
+        ("", "Your security code is 123456"),
+        ("", "Your one-time passcode is 123456"),
+        ("", "Enter 123456 to verify your email"),
+        ("", "To verify your email, enter 123456"),
+    ]
+
+    for subject, body in cases:
+        candidates = extract_verification_candidates(
+            subject=subject,
+            body=body,
+            sender="no-reply@myworkday.com",
+        )
+
+        assert candidates
+        assert candidates[0].kind == "code"
+        assert candidates[0].value == "123456"

@@ -26,33 +26,56 @@ KNOWN_ATS_DOMAINS = {
 
 VERIFY_WORDS = {
     "verification",
+    "verification code",
     "verify",
-    "code",
+    "verify your email",
+    "confirm your email",
+    "security code",
+    "authentication code",
     "one-time",
     "one time",
+    "one-time code",
+    "one time code",
+    "one-time passcode",
+    "one time passcode",
+    "passcode",
     "otp",
-    "confirm",
-    "confirmation",
     "magic link",
+    "sign in",
     "continue your application",
 }
 
 _CODE_RE = re.compile(r"(?<![A-Za-z0-9-])\d{4,8}(?![A-Za-z0-9-])")
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
-_URL_VERIFY_TOKENS = ("verify", "confirm", "token", "magic", "continue")
-_AUTH_CODE_CONTEXT_RE = re.compile(
-    r"\b(?:verification|one[- ]time|authentication)\s+code\b"
-    r"|\b(?:enter|use)\s+(?:this\s+)?code\b"
-    r"|\byour\s+code\s+is\b"
-    r"|\botp\b",
+_AUTH_URL_PATH_RE = re.compile(
+    r"(^|[/?&_.=-])(?:verify|verification|magic|magic-link|signin|sign-in|login|continue)([/?&_.=-]|$)",
+    re.IGNORECASE,
+)
+_REJECTED_MAGIC_PATH_RE = re.compile(
+    r"(^|[/?&_.=-])"
+    r"(?:interview|interviews|schedule|scheduling|job|jobs|posting|postings|role|roles|detail|details)"
+    r"([/?&_.=-]|$)",
+    re.IGNORECASE,
+)
+_AUTH_CODE_BEFORE_RE = re.compile(
+    r"\b(?:verification|security|authentication|one[- ]time)\s+(?:code|passcode)\s*(?:is|:)?\s*$"
+    r"|\b(?:otp|passcode)\s*(?:is|:)?\s*$"
+    r"|\b(?:to\s+)?(?:verify|confirm)\s+your\s+email,?\s*(?:please\s+)?(?:enter|use)\s*$",
+    re.IGNORECASE,
+)
+_CODE_COMMAND_BEFORE_RE = re.compile(r"\b(?:enter|use)\s*$", re.IGNORECASE)
+_AUTH_CODE_AFTER_RE = re.compile(
+    r"^\s*(?:to\s+)?(?:verify|confirm)\s+your\s+email\b"
+    r"|^\s*(?:to\s+)?(?:sign\s+in|continue\s+your\s+application)\b",
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_PREFIX_RE = re.compile(
     r"\b(?:zip|postal|job|reference|support)\s*(?:id|code|number|#)?\s*(?:is|:|#)?\s*$",
     re.IGNORECASE,
 )
+_NEGATIVE_CODE_CONTEXT_RE = re.compile(r"\b(?:support|contact|contacting|reference)\b", re.IGNORECASE)
 _MAGIC_LINK_CONTEXT_RE = re.compile(
-    r"\b(?:verify|verification|confirm|confirmation|magic link|continue your application)\b",
+    r"\b(?:verify your email|confirm your email|magic link|sign in|sign-in|continue your application)\b",
     re.IGNORECASE,
 )
 _TRACKING_DOMAIN_LABELS = {"click", "track", "tracking", "trk", "link", "links"}
@@ -168,11 +191,10 @@ def _extract_code_drafts(
         if _looks_like_year(value):
             continue
 
-        window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
         prefix = text[max(0, match.start() - 40) : match.start()]
         if _NEGATIVE_CODE_PREFIX_RE.search(prefix):
             continue
-        if not _has_auth_code_context(window):
+        if not _has_auth_code_context(text, match.start(), match.end()):
             continue
 
         reasons = ["numeric_code", "nearby_verification_language", "auth_code_context"]
@@ -192,17 +214,15 @@ def _extract_magic_link_drafts(
     drafts: list[_CandidateDraft] = []
     for match in _URL_RE.finditer(text):
         value = _clean_url(match.group(0))
-        lowered = value.lower()
-        if not any(token in lowered for token in _URL_VERIFY_TOKENS):
-            continue
-
         domain = url_domain(value)
         known_ats_link = is_known_ats_domain(domain)
         if _is_tracking_or_click_wrapper(value, domain):
             continue
+        if _is_rejected_magic_link_path(value):
+            continue
 
         window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
-        if not known_ats_link and not _has_magic_link_context(window):
+        if not (_has_auth_url_path(value) or _has_magic_link_context(window)):
             continue
 
         reasons = ["magic_link"]
@@ -229,12 +249,31 @@ def _has_verification_language(text: str) -> bool:
     return any(word in lowered for word in VERIFY_WORDS)
 
 
-def _has_auth_code_context(text: str) -> bool:
-    return bool(_AUTH_CODE_CONTEXT_RE.search(text))
+def _has_auth_code_context(text: str, start: int, end: int) -> bool:
+    prefix = text[max(0, start - 120) : start]
+    suffix = text[end : min(len(text), end + 120)]
+    nearby = f"{prefix} {suffix}"
+    if _NEGATIVE_CODE_CONTEXT_RE.search(nearby):
+        return False
+    if _AUTH_CODE_BEFORE_RE.search(prefix):
+        return True
+    return bool(_CODE_COMMAND_BEFORE_RE.search(prefix) and _AUTH_CODE_AFTER_RE.search(suffix))
 
 
 def _has_magic_link_context(text: str) -> bool:
     return bool(_MAGIC_LINK_CONTEXT_RE.search(text))
+
+
+def _has_auth_url_path(url: str) -> bool:
+    parsed = urlparse(url)
+    path_query = f"{parsed.path}?{parsed.query}".lower()
+    return bool(_AUTH_URL_PATH_RE.search(path_query))
+
+
+def _is_rejected_magic_link_path(url: str) -> bool:
+    parsed = urlparse(url)
+    path_query = f"{parsed.path}?{parsed.query}".lower()
+    return bool(_REJECTED_MAGIC_PATH_RE.search(path_query))
 
 
 def _is_tracking_or_click_wrapper(url: str, domain: str) -> bool:
