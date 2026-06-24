@@ -390,6 +390,102 @@ def linkedin_split_command() -> None:
     conn.close()
 
 
+@app.command("apply-failures")
+def apply_failures_command(
+    reason: Optional[str] = typer.Option(None, "--reason", help="Filter to one reason (e.g. captcha, auth_required, expired, no_result_line)."),
+    manual: bool = typer.Option(False, "--manual", help="Only the recoverable 'apply by hand' candidates (auth/login/captcha)."),
+    limit: int = typer.Option(40, "--limit", "-l", help="Max rows to list. 0 = all."),
+    export: Optional[str] = typer.Option(None, "--export", help="Write all matching failures to a CSV at this path."),
+) -> None:
+    """Review WHY apply attempts bounced, grouped, with an 'apply by hand' shortlist.
+
+    Every bounce is persisted on the jobs table (apply_status + apply_error, never
+    deleted), so this reflects all runs. Categories: recoverable (login/captcha walls
+    you can clear by hand), dead (gone/ineligible -- skip), agent (pipeline hiccup),
+    blocked (rate-limited/blocked -- retry later).
+    """
+    _bootstrap()
+    from collections import Counter
+    from applypilot import config
+    from applypilot.database import get_connection
+
+    RECOVERABLE = {"auth_required", "login_issue", "sso_required", "account_required",
+                   "email_verification_required", "two_factor_required", "2fa_required",
+                   "mfa_required", "captcha", "linkedin_challenge"}
+    DEAD = {"expired", "page_error", "not_eligible_location", "not_eligible_salary",
+            "not_eligible_work_auth", "already_applied", "not_a_job_application",
+            "bad_application_url", "unsafe_permissions", "unsafe_verification"}
+    BLOCKED = {"linkedin_rate_limited", "rate_limited", "site_blocked",
+               "cloudflare_blocked", "blocked_by_cloudflare"}
+    AGENT = {"no_result_line", "timeout", "stuck", "suspicious_page", "unknown"}
+
+    def category(r: str) -> str:
+        if r in RECOVERABLE: return "recoverable"
+        if r in DEAD: return "dead"
+        if r in BLOCKED: return "blocked"
+        if r in AGENT: return "agent"
+        return "other"
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT COALESCE(apply_error, apply_status) AS reason, apply_status, "
+        "       site, company, title, COALESCE(application_url, url) AS url, "
+        "       substr(last_attempted_at, 1, 19) AS at "
+        "FROM jobs "
+        "WHERE apply_status IS NOT NULL AND apply_status NOT IN ('applied','in_progress','manual') "
+        "  AND duplicate_of_url IS NULL "
+        "ORDER BY last_attempted_at DESC"
+    ).fetchall()
+    conn.close()
+
+    items = [dict(r) for r in rows]
+    for it in items:
+        it["category"] = category((it["reason"] or "").strip())
+    if reason:
+        items = [it for it in items if (it["reason"] or "") == reason]
+    if manual:
+        items = [it for it in items if it["category"] == "recoverable"]
+
+    if not items:
+        console.print("[green]No matching apply failures recorded.[/green]")
+        return
+
+    by_cat = Counter(it["category"] for it in items)
+    by_reason = Counter((it["reason"] or "?") for it in items)
+    console.print(f"\n[bold]Apply failures: {len(items)} recorded[/bold]  "
+                  f"({', '.join(f'{c}={n}' for c, n in by_cat.most_common())})")
+    console.print("  by reason: " + ", ".join(f"{r}={n}" for r, n in by_reason.most_common()))
+
+    recov = [it for it in items if it["category"] == "recoverable"]
+    if recov and not reason:
+        console.print(f"\n[bold yellow]Apply by hand ({len(recov)}) — login/captcha walls; use `assist-apply` or apply manually:[/bold yellow]")
+        for it in recov[: (limit or len(recov))]:
+            console.print(f"  [{it['reason']}] {(it['company'] or it['site'] or '?')[:22]:22} | "
+                          f"{(it['title'] or '')[:38]:38} | {it['url']}")
+
+    console.print("\n[bold]All matching (newest first):[/bold]")
+    for it in items[: (limit or len(items))]:
+        console.print(f"  {it['at']} | {it['category']:11} | {(it['reason'] or '?'):18} | "
+                      f"{(it['company'] or it['site'] or '?')[:18]:18} | {(it['title'] or '')[:30]}")
+    if limit and len(items) > limit:
+        console.print(f"  [dim]... +{len(items) - limit} more — raise --limit or --export to CSV[/dim]")
+
+    console.print(f"\n[dim]Full per-job agent reasoning: {config.LOG_DIR}\\{{claude,codex}}_<ts>_<company>.txt[/dim]")
+
+    if export:
+        import csv
+        from pathlib import Path
+        p = Path(export)
+        with p.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["last_attempted_at", "reason", "category", "apply_status",
+                        "company", "site", "title", "url"])
+            for it in items:
+                w.writerow([it["at"], it["reason"], it["category"], it["apply_status"],
+                            it["company"], it["site"], it["title"], it["url"]])
+        console.print(f"[green]Wrote {len(items)} failures to {p}[/green]")
+
+
 @app.command("smart-health")
 def smart_health_command(
     all_sites: bool = typer.Option(False, "--all", help="Show healthy sources too."),
