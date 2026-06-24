@@ -72,6 +72,7 @@ def supervise(
     linkedin_daily_cap: int = 20,
     base_resume: bool = True,
     max_job_age_days: int = 0,
+    lane_filter: bool = True,
     workers: int = 1,
     stall_minutes: float = 20.0,
     max_attempts: int = 30,
@@ -150,6 +151,10 @@ def supervise(
         child_env = dict(os.environ)
         if max_job_age_days > 0:
             child_env["APPLYPILOT_MAX_JOB_AGE_DAYS"] = str(max_job_age_days)
+        if lane_filter:
+            # Off-lane drift guard (see launcher.acquire_job / config.load_lane_filter):
+            # keep a drained on-lane queue from drifting into IC-sales/AE postings.
+            child_env["APPLYPILOT_LANE_FILTER"] = "1"
 
         log(f"ATTEMPT {attempt}: launching apply (est spent ${spent_est:.0f}, "
             f"per-attempt cap ${remaining:.2f}, applied={applied_now})")

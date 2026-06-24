@@ -1145,6 +1145,10 @@ def supervise_apply_command(
     base_resume: bool = typer.Option(True, "--base-resume/--no-base-resume"),
     max_job_age_days: int = typer.Option(0, "--max-job-age-days",
         help="Freshness filter: skip postings older than N days (0 = off)."),
+    lane_filter: bool = typer.Option(True, "--lane-filter/--no-lane-filter",
+        help="Skip clearly off-lane roles (IC-sales/AE) so a drained on-lane queue "
+             "doesn't drift; on-lane audit flags override. On by default for the "
+             "supervised/production run."),
     stall_minutes: float = typer.Option(20.0, "--stall-minutes",
         help="Kill + restart if no output AND no new apply for this long."),
     max_attempts: int = typer.Option(30, "--max-attempts"),
@@ -1166,7 +1170,7 @@ def supervise_apply_command(
     from applypilot.apply.supervisor import supervise
     supervise(
         total_cost_usd=max_cost_usd, model=model, linkedin_daily_cap=linkedin_daily_cap,
-        base_resume=base_resume, max_job_age_days=max_job_age_days,
+        base_resume=base_resume, max_job_age_days=max_job_age_days, lane_filter=lane_filter,
         stall_minutes=stall_minutes, max_attempts=max_attempts, max_hours=max_hours,
         est_cost_per_apply=est_cost_per_apply, target_applied=target_applied,
     )

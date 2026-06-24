@@ -538,6 +538,34 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     fresh_clause = ("AND (discovered_at IS NULL OR discovered_at >= ? "
                                     "OR COALESCE(liveness_status, '') = 'live')")
                     params.append(_cut)
+                # Lane filter (off-lane drift guard): the ORDER BY ranks on-lane roles
+                # first but never EXCLUDES off-lane ones, so a drained on-lane queue
+                # drifts into pure IC-sales/AE postings that still score >=7 (the user
+                # saw "Sales Engineer-Flooring", "Enterprise AE") -- wrong lane for a
+                # finance/operator candidate. When APPLYPILOT_LANE_FILTER is on, drop a
+                # candidate if it was LLM-diagnosed wrong-lane/ignore, OR its TITLE matches
+                # an off-lane needle AND it has NO on-lane audit flag (the flag is a
+                # positive override). Off by default; the supervised/production run turns
+                # it on. See config.load_lane_filter for the (tunable) needle list.
+                lane_clause = ""
+                if os.environ.get("APPLYPILOT_LANE_FILTER", "").strip().lower() in (
+                        "1", "true", "yes", "on"):
+                    off_needles, on_tags = config.load_lane_filter()
+                    lane_parts = [
+                        "AND COALESCE(fit_gap_category, '') != 'wrong_role_lane'",
+                        "AND COALESCE(recommended_action, '') != 'ignore'",
+                    ]
+                    if off_needles:
+                        tnorm = "LOWER(' ' || COALESCE(title, '') || ' ')"
+                        title_or = " OR ".join(f"{tnorm} LIKE ?" for _ in off_needles)
+                        params.extend(f"%{n}%" for n in off_needles)
+                        flag_guard = ""
+                        if on_tags:
+                            flag_guard = " AND " + " AND ".join(
+                                "COALESCE(audit_flags, '') NOT LIKE ?" for _ in on_tags)
+                            params.extend(f'%"{t}"%' for t in on_tags)
+                        lane_parts.append(f"AND NOT (({title_or}){flag_guard})")
+                    lane_clause = "\n                      ".join(lane_parts)
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
                            fit_score, audit_score, audit_label, location, full_description, cover_letter_path, company
@@ -583,6 +611,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       {seen_clause}
                       {host_clause}
                       {fresh_clause}
+                      {lane_clause}
                     ORDER BY COALESCE(audit_score, fit_score) DESC,
                              (audit_flags LIKE '%"chief_of_staff"%') DESC,
                              (audit_flags LIKE '%"strategy_ops"%'

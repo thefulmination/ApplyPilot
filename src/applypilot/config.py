@@ -421,6 +421,41 @@ def load_base_urls() -> dict[str, str | None]:
     return cfg.get("base_urls", {})
 
 
+def load_lane_filter() -> tuple[list[str], list[str]]:
+    """Off-lane title-filter config for acquire_job (issue: off-lane drift).
+
+    The apply ORDER BY ranks on-lane roles (Chief of Staff / strategy & ops / GTM
+    ops / operations leadership) first but never EXCLUDES off-lane ones, so once the
+    on-lane queue drains, a run drifts down to pure IC-sales postings that still
+    score >=7 (the user saw "Sales Engineer-Flooring", "Enterprise AE") -- the wrong
+    lane for a finance/operator candidate. When APPLYPILOT_LANE_FILTER is on,
+    acquire_job excludes a candidate whose TITLE matches an off-lane needle UNLESS it
+    carries an on-lane audit flag (the flag is a positive override, so a real "Chief
+    of Staff to the CRO" with a chief_of_staff flag still passes).
+
+    Returns (off_lane_title_needles, on_lane_audit_tags). Needles are matched against
+    a SPACE-PADDED lowercased title, so short abbreviations are stored WITH surrounding
+    spaces (" ae ") for word-boundary safety (won't fire inside another word). Both
+    lists are overridable via sites.yaml `lane_filter.off_lane_title_patterns` /
+    `.on_lane_audit_tags`.
+    """
+    cfg = load_sites_config().get("lane_filter", {}) or {}
+    off = cfg.get("off_lane_title_patterns")
+    on = cfg.get("on_lane_audit_tags")
+    if off is None:
+        off = [
+            "account executive", " ae ", " aes ",
+            " sdr ", " sdrs ", " bdr ", " bdrs ",
+            "sales development representative", "business development representative",
+            "sales representative", " sales rep ",
+            "sales engineer",
+            "inside sales", "outside sales", "field sales", "regional sales", "territory",
+        ]
+    if on is None:
+        on = ["chief_of_staff", "strategy_ops", "gtm_ops", "operations_leadership"]
+    return [str(x).lower() for x in off], [str(x) for x in on]
+
+
 # ---------------------------------------------------------------------------
 # Default values — referenced across modules instead of magic numbers
 # ---------------------------------------------------------------------------
