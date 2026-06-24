@@ -73,6 +73,7 @@ def supervise(
     base_resume: bool = True,
     max_job_age_days: int = 0,
     lane_filter: bool = True,
+    preflight_liveness: bool = True,
     workers: int = 1,
     stall_minutes: float = 20.0,
     max_attempts: int = 30,
@@ -155,6 +156,10 @@ def supervise(
             # Off-lane drift guard (see launcher.acquire_job / config.load_lane_filter):
             # keep a drained on-lane queue from drifting into IC-sales/AE postings.
             child_env["APPLYPILOT_LANE_FILTER"] = "1"
+        if preflight_liveness:
+            # Pre-launch closure probe (see launcher.worker_loop): skip dead-on-visit
+            # postings before they burn a Chrome launch.
+            child_env["APPLYPILOT_PREFLIGHT_LIVENESS"] = "1"
 
         log(f"ATTEMPT {attempt}: launching apply (est spent ${spent_est:.0f}, "
             f"per-attempt cap ${remaining:.2f}, applied={applied_now})")

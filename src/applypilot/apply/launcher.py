@@ -777,6 +777,29 @@ def mark_result(url: str, status: str, error: str | None = None,
         logger.debug("Application tracker update failed for %s", url, exc_info=True)
 
 
+def _preflight_liveness_enabled() -> bool:
+    """Whether to HTTP-probe each candidate for closure before launching Chrome.
+    Off by default (adds a per-job request); the supervised/production run turns it
+    on via APPLYPILOT_PREFLIGHT_LIVENESS=1 to avoid burning launches on dead postings."""
+    return os.environ.get("APPLYPILOT_PREFLIGHT_LIVENESS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _stamp_liveness_dead(url: str, reason: str) -> None:
+    """Record a confirmed-closed posting as a LIVENESS fact (liveness_status='dead'),
+    not just an apply_error -- so the closure is authoritative for the acquire liveness
+    filter, the freshness filter, reporting, and the separate liveness tooling. Retains
+    the row (never deletes) per the training-retention rule. Best-effort; never raises."""
+    try:
+        conn = get_connection()
+        conn.execute(
+            "UPDATE jobs SET liveness_status = 'dead', liveness_reason = ? WHERE url = ?",
+            (str(reason)[:120], url))
+        conn.commit()
+    except Exception:
+        logger.debug("liveness dead-stamp failed for %s", (url or "")[:60], exc_info=True)
+
+
 def release_lock(url: str) -> None:
     """Release the in_progress lock without changing status."""
     conn = get_connection()
@@ -1247,6 +1270,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 # Permanent failure classification
 # ---------------------------------------------------------------------------
+
+# Outcomes that prove the posting itself is CLOSED (not a transient/env failure) ->
+# also recorded as liveness_status='dead'. 'expired' = the agent saw "closed / no
+# longer accepting". 'page_error' (500/blank) is deliberately NOT here -- it can be
+# transient. Used to feed apply-time closures back into the liveness signal.
+DEAD_ON_VISIT_REASONS: set[str] = {"expired"}
 
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue", "auth_required",
@@ -1820,6 +1849,32 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 jobs_done += 1
                 continue
 
+        # Pre-launch liveness probe (off by default; the supervised/production run sets
+        # APPLYPILOT_PREFLIGHT_LIVENESS=1). A closed-but-HTTP-200 posting (role
+        # filled/closed but the page still renders) otherwise burns a full Chrome
+        # launch + agent run (~$1.50) before the agent reaches RESULT:EXPIRED. The
+        # liveness classifier already catches many of these with ONE read-only GET
+        # (closure-text phrases + ATS JSON-API 404s) and is CONSERVATIVE -- 401/403/
+        # 429/999/5xx -> UNCERTAIN, so a LinkedIn/Cloudflare wall never false-skips.
+        # Only a strong DEAD signal skips the launch; the row is parked dead (retained
+        # for training, never re-acquired). LIVE/UNCERTAIN proceed.
+        if not dry_run and not target_url and _preflight_liveness_enabled():
+            try:
+                from applypilot.apply.liveness import probe_url as _probe_url, DEAD as _LV_DEAD
+                _ls, _lr = _probe_url(_apply_target(job))
+            except Exception:
+                _ls, _lr = "uncertain", "probe_import_error"
+            if _ls == _LV_DEAD:
+                mark_result(job["url"], "failed", "expired", permanent=True)
+                _stamp_liveness_dead(job["url"], f"preflight_{_lr}")
+                failed += 1
+                update_state(worker_id, jobs_failed=failed, jobs_done=applied + failed)
+                add_event(f"[W{worker_id}] Preflight DEAD ({str(_lr)[:24]}); "
+                          f"skipped, saved a launch: {job['title'][:30]}")
+                jobs_done += 1
+                _note_healthy_outcome()  # a definitive closed signal = env is fine
+                continue
+
         # Account-safety throttle: respect the per-host gap before launching
         # (skipped in dry-run so canary tests stay fast).
         if not dry_run:
@@ -1912,6 +1967,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms)
+                # Closed-on-visit -> also record as a liveness fact so the closure
+                # carries beyond this row's apply_error (freshness/liveness/reporting).
+                if reason in DEAD_ON_VISIT_REASONS:
+                    _stamp_liveness_dead(job["url"], f"apply_{reason}")
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)

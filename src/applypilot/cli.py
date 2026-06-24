@@ -1149,6 +1149,10 @@ def supervise_apply_command(
         help="Skip clearly off-lane roles (IC-sales/AE) so a drained on-lane queue "
              "doesn't drift; on-lane audit flags override. On by default for the "
              "supervised/production run."),
+    preflight_liveness: bool = typer.Option(True, "--preflight-liveness/--no-preflight-liveness",
+        help="HTTP-probe each posting for closure before launching Chrome (one read-only "
+             "GET); skip dead-on-visit postings so they don't burn a ~$1.50 launch. "
+             "Conservative -- only a strong DEAD signal skips. On by default."),
     stall_minutes: float = typer.Option(20.0, "--stall-minutes",
         help="Kill + restart if no output AND no new apply for this long."),
     max_attempts: int = typer.Option(30, "--max-attempts"),
@@ -1171,6 +1175,7 @@ def supervise_apply_command(
     supervise(
         total_cost_usd=max_cost_usd, model=model, linkedin_daily_cap=linkedin_daily_cap,
         base_resume=base_resume, max_job_age_days=max_job_age_days, lane_filter=lane_filter,
+        preflight_liveness=preflight_liveness,
         stall_minutes=stall_minutes, max_attempts=max_attempts, max_hours=max_hours,
         est_cost_per_apply=est_cost_per_apply, target_applied=target_applied,
     )
