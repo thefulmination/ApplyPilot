@@ -150,6 +150,21 @@ Handle these cases explicitly:
 - Code entry fails: retry once if a newer matching email arrives, otherwise mark `failed`.
 - Magic link opens a different account/security flow: stop and mark `manual_required`.
 
+## Resilience Requirements
+
+The inbox-auth workflow must be resumable and safe across crashes, retries, duplicate emails, and partial apply attempts:
+
+- Gmail message processing must be idempotent by `message_id`; the same email cannot create duplicate inbox events.
+- Auth challenges must have explicit statuses: `pending`, `watching`, `resolved`, `expired`, `manual_required`, and `failed`.
+- A stale `watching` challenge older than its expiry must be recoverable on the next run by marking it `expired`.
+- The Gmail watcher must use bounded retries with backoff for transient Gmail API failures and must not block the entire apply run indefinitely.
+- The apply worker must be able to fail closed: if inbox auth cannot start, cannot refresh Gmail OAuth, or cannot find a code in time, the job becomes `auth_required` rather than looping or falsely marking the job applied.
+- Magic links and auth codes must be single-use in the workflow: once a challenge is resolved, later matching emails must be recorded as inbox events but must not be auto-applied to that resolved challenge.
+- The database writes for inbox events and challenge state changes must commit before the apply worker attempts to use a code/link, so a crash leaves an auditable state.
+- The tracker must preserve enough metadata to explain what happened without storing raw email bodies or permanent auth codes.
+- Concurrent apply workers must not resolve the same challenge twice. Challenge resolution should update by `id` and current expected status.
+- The CLI must expose recovery views for `pending`, `watching`, `expired`, `manual_required`, and `failed` auth challenges.
+
 ## Security Boundaries
 
 - Read-only Gmail only.
