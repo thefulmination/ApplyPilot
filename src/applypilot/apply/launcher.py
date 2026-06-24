@@ -443,6 +443,24 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     return None  # the explicitly targeted URL is auth-gated; skip
                 continue  # re-select the next candidate (this row is now excluded)
 
+            # Defer UNRESOLVED-AGGREGATOR rows (e.g. chiefofstaffjob.com): their apply
+            # target is the aggregator's own page, so the real ATS + company are only
+            # revealed at runtime. The posting-level dedup can't tell if such a row
+            # duplicates a job already applied elsewhere -> double-submit risk (a real
+            # one: an aggregator Picogrid CoS listing for a Picogrid role already applied
+            # via Ashby). Park it (retained, reversible) until enrichment resolves the
+            # real target; then the effective host changes and it becomes applyable.
+            if config.is_unresolved_aggregator(apply_url):
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'deferred', "
+                    "apply_error = 'aggregator_unresolved_target' WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                if target_url:
+                    return None  # the explicitly targeted URL is an unresolved aggregator
+                continue  # re-select the next candidate (this row is now excluded)
+
             now = datetime.now(timezone.utc).isoformat()
             conn.execute("""
                 UPDATE jobs SET apply_status = 'in_progress',

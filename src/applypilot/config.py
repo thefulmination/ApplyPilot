@@ -381,6 +381,21 @@ def is_auth_gated_application(url: str | None) -> bool:
     )
 
 
+def is_unresolved_aggregator(url: str | None) -> bool:
+    """True if a URL's host is a job-board AGGREGATOR whose apply target is the
+    aggregator's own page -- the real ATS + company are revealed only at runtime when
+    the agent follows the Apply link. Such rows can't be deduped at acquire (the real
+    target is unknown), so acquire defers them to avoid double-submits. Once enrichment
+    resolves application_url to the real ATS, the effective apply host changes and this
+    returns False, so the row becomes applyable again. Config: sites.yaml
+    `unresolved_aggregators`."""
+    if not url:
+        return False
+    aggs = load_sites_config().get("unresolved_aggregators", []) or []
+    url_lower = url.lower()
+    return any(str(a).lower() in url_lower for a in aggs)
+
+
 def load_blocked_sites() -> tuple[set[str], list[str]]:
     """Load blocked sites and URL patterns from sites.yaml.
 

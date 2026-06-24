@@ -92,6 +92,27 @@ def test_applications_ledger_blocks_relisted_after_status_lost(conn):
     assert L.acquire_job(min_score=7) is None
 
 
+def test_unresolved_aggregator_row_is_deferred(conn):
+    # An aggregator row whose apply target is the aggregator's OWN page (the real ATS +
+    # company are revealed only at runtime) is deferred at acquire -- never applied -- so
+    # it can't double-submit a job already applied elsewhere. (This is the chiefofstaffjob
+    # -> Picogrid-via-Ashby double-submit class.)
+    _seed(conn, "https://www.chiefofstaffjob.com/jobs/aggx", company="ChiefOfStaffJob.com",
+          application_url="https://www.chiefofstaffjob.com/jobs/aggx")
+    assert L.acquire_job(min_score=7) is None
+    row = conn.execute("SELECT apply_status, apply_error FROM jobs WHERE url LIKE '%/jobs/aggx'").fetchone()
+    assert row[0] == "deferred" and row[1] == "aggregator_unresolved_target"
+
+
+def test_resolved_aggregator_row_is_applyable(conn):
+    # Same aggregator source, but enrichment RESOLVED application_url to the real ATS ->
+    # effective host is greenhouse (not the aggregator), dedup works, so it's applyable.
+    _seed(conn, "https://www.chiefofstaffjob.com/jobs/aggy", company="RealCo",
+          application_url="https://boards.greenhouse.io/realco/1")
+    job = L.acquire_job(min_score=7)
+    assert job is not None and job["url"].endswith("/jobs/aggy")
+
+
 def test_dedup_does_not_over_exclude(conn):
     # A DIFFERENT role at the same company is still acquirable (distinct title), and an
     # empty-company row is never excluded by the company+title arm.

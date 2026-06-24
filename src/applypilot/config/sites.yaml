@@ -24,6 +24,20 @@ blocked:
     - "%accenture%"
     - "%workopolis.com/out%"
 
+# ── Unresolved aggregators — opaque apply targets, undedupable until resolved ──
+# Job-board aggregators that list a role but whose application_url is the
+# aggregator's OWN page (the real ATS + company are only revealed at runtime when
+# the agent follows the Apply link). Because the real target+company are unknown at
+# acquire time, the posting-level dedup CANNOT tell whether the row duplicates a job
+# already applied elsewhere -> double-submit risk (a real one: an aggregator
+# "Chief of Staff @ Picogrid" listing for a Picogrid CoS role already applied via
+# Ashby). Rows whose EFFECTIVE apply host is one of these are deferred at acquire
+# (apply_status='deferred', apply_error='aggregator_unresolved_target') until an
+# enrichment pass resolves application_url to the real ATS -- then the effective host
+# changes and the row becomes applyable + safely dedupable again.
+unresolved_aggregators:
+  - "chiefofstaffjob.com"
+
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:
   - "accounts.google.com"
