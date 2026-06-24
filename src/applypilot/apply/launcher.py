@@ -351,6 +351,19 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     eff = "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END)"
                     host_clause = " ".join(f"AND {eff} NOT LIKE ?" for _ in exclude_hosts)
                     params.extend(f"%{h}%" for h in exclude_hosts)
+                # Optional freshness filter: skip very-stale postings (discovered_at older
+                # than APPLYPILOT_MAX_JOB_AGE_DAYS) that aren't liveness-confirmed -- they
+                # have a much higher expired-on-visit rate, so applying to them wastes a
+                # Chrome launch + agent run. 0 (default) = off, so normal runs are
+                # unaffected; liveness_status='live' rows are kept regardless of age, and
+                # rows with no discovered_at are kept (unknown age, don't penalize).
+                fresh_clause = ""
+                _max_age = int(os.environ.get("APPLYPILOT_MAX_JOB_AGE_DAYS") or 0)
+                if _max_age > 0:
+                    _cut = (datetime.now(timezone.utc) - timedelta(days=_max_age)).isoformat()
+                    fresh_clause = ("AND (discovered_at IS NULL OR discovered_at >= ? "
+                                    "OR COALESCE(liveness_status, '') = 'live')")
+                    params.append(_cut)
                 row = conn.execute(f"""
                     SELECT url, title, site, application_url, tailored_resume_path,
                            fit_score, audit_score, audit_label, location, full_description, cover_letter_path
@@ -395,6 +408,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       {li_clause}
                       {seen_clause}
                       {host_clause}
+                      {fresh_clause}
                     ORDER BY COALESCE(audit_score, fit_score) DESC,
                              (audit_flags LIKE '%"chief_of_staff"%') DESC,
                              (audit_flags LIKE '%"strategy_ops"%'

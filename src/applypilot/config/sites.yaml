@@ -64,6 +64,12 @@ auth_gated:
     - "oracle.com/cloud/cx/taleo"
     - "eightfold.ai"
     - "phenompeople.com"
+    # Added 2026-06-24 from a live run's auth-wall hits -- all require a candidate
+    # account to apply (auto-apply can't create one), so pre-filter instead of
+    # burning a Chrome launch. amazon.jobs alone is ~331 pending pool rows.
+    - "amazon.jobs"
+    - "ultipro.com"        # UKG/UltiPro candidate portal (recruiting*.ultipro.com)
+    - "paycomonline.net"   # Paycom candidate portal
   url_patterns:
     - "/login"
     - "/signin"

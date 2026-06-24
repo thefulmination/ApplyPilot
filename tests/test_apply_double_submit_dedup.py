@@ -124,3 +124,45 @@ def test_dedup_does_not_over_exclude(conn):
           application_url="https://boards.greenhouse.io/bigco/2", apply_status=None)
     job = L.acquire_job(min_score=7)
     assert job is not None and job["url"].endswith("/cos-ceo")
+
+
+# --- Freshness filter (APPLYPILOT_MAX_JOB_AGE_DAYS) ---------------------------
+
+def _seed_age(conn, url, days_old, *, live=None, company="Acme", title="Chief of Staff"):
+    import datetime as _dt
+    disc = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days_old)).isoformat()
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, tailored_resume_path, fit_score, "
+        "audit_score, discovered_at, liveness_status) VALUES (?, ?, 'X', ?, 'x', 8, 9.0, ?, ?)",
+        (url, title, company, disc, live),
+    )
+    conn.commit()
+
+
+def test_freshness_filter_off_by_default_keeps_stale(conn):
+    # No env set -> filter off -> a 60-day-old posting is still acquirable (unchanged behavior).
+    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/1", 60)
+    assert L.acquire_job(min_score=7) is not None
+
+
+def test_freshness_filter_skips_stale_unverified(conn, monkeypatch):
+    # With a 45-day bound, a stale posting with no liveness confirmation is skipped --
+    # these have a much higher expired-on-visit rate, so we don't waste a launch.
+    monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
+    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/2", 60)
+    assert L.acquire_job(min_score=7) is None
+
+
+def test_freshness_filter_keeps_stale_but_liveness_confirmed(conn, monkeypatch):
+    # Age alone doesn't disqualify -- a liveness_status='live' row is kept even if old.
+    monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
+    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/3", 60, live="live")
+    job = L.acquire_job(min_score=7)
+    assert job is not None and job["url"].endswith("/jobs/3")
+
+
+def test_freshness_filter_keeps_fresh(conn, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
+    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/4", 5)
+    job = L.acquire_job(min_score=7)
+    assert job is not None and job["url"].endswith("/jobs/4")
