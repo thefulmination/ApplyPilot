@@ -1185,7 +1185,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 model: str | None = "sonnet", dry_run: bool = False,
-                agent: str = "claude") -> tuple[int, int]:
+                agent: str = "claude", browser: str | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -1197,6 +1197,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         model: Apply-agent model name.
         dry_run: Don't click Submit.
         agent: Apply-agent CLI to run: claude or codex.
+        browser: Browser to drive (chrome/edge/...). A browser whose profile lacks the
+            LinkedIn session (e.g. edge) is auto-restricted to the offsite lane.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -1210,6 +1212,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     # LinkedIn daily cap read at runtime so a --linkedin-daily-cap CLI flag (env set
     # after import) is honored; falls back to the module default. 0 = no cap.
     li_cap = int(os.environ.get("APPLYPILOT_LINKEDIN_DAILY_CAP") or LINKEDIN_DAILY_CAP)
+    # Whether this worker's browser holds the LinkedIn session. Chrome-family clones
+    # carry it; Edge can't decrypt Chrome's cookies, so an edge worker is offsite-only
+    # (it would just bounce LinkedIn jobs auth_required). Tunable via env -- add 'edge'
+    # if you've logged into LinkedIn in real Edge so the clone carries that session.
+    _li_browsers = {b.strip().lower() for b in
+                    (os.environ.get("APPLYPILOT_LINKEDIN_BROWSERS") or "chrome,cft,chromium,default").split(",")
+                    if b.strip()}
+    browser_li_ok = (browser or "chrome").strip().lower() in _li_browsers
     # URLs attempted this run -> excluded from re-acquisition so a fast-failing job
     # can't be re-picked and burn the whole --limit on one job (canary surfaced this).
     attempted_urls: set[str] = set()
@@ -1226,7 +1236,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         # offsite ATS lane keeps flowing either way. Skipped for single-URL applies.
         exclude_li = False
         if not target_url:
-            exclude_li = _linkedin_halt.is_set()
+            # Browser without the LinkedIn session (e.g. edge) -> offsite lane only,
+            # so it never grabs a LinkedIn job it can't finish. Else the shared
+            # halt/cap gate below decides.
+            exclude_li = (not browser_li_ok) or _linkedin_halt.is_set()
             if not exclude_li:
                 try:
                     _conn = get_connection()
@@ -1309,7 +1322,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         chrome_proc = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            chrome_proc = launch_chrome(worker_id, port=port, headless=headless, browser=browser)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run,
@@ -1403,7 +1416,8 @@ def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str | None = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
-         agent: str = "claude", agents: list[str] | None = None) -> None:
+         agent: str = "claude", agents: list[str] | None = None,
+         browsers: list[str] | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -1441,6 +1455,14 @@ def main(limit: int = 1, target_url: str | None = None,
         worker_agents = [_normalize_agent(agents[i % len(agents)]) for i in range(workers)]
     else:
         worker_agents = [agent] * workers
+
+    # Per-worker BROWSER assignment (round-robin), mirroring agents: e.g.
+    # browsers=["chrome","edge"] runs worker 0 on Chrome, worker 1 on Edge in ONE
+    # process. None -> every worker uses the default (CHROME_PATH / get_chrome_path).
+    if browsers:
+        worker_browsers = [browsers[i % len(browsers)].strip().lower() for i in range(workers)]
+    else:
+        worker_browsers = [None] * workers
 
     def _worker_model(wa: str) -> str | None:
         # claude uses the chosen model (sonnet default); codex uses its own default.
@@ -1540,6 +1562,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     model=_worker_model(worker_agents[0]),
                     dry_run=dry_run,
                     agent=worker_agents[0],
+                    browser=worker_browsers[0],
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1564,6 +1587,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=_worker_model(worker_agents[i]),
                             dry_run=dry_run,
                             agent=worker_agents[i],
+                            browser=worker_browsers[i],
                         ): i
                         for i in range(workers)
                     }

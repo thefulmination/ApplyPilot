@@ -546,6 +546,7 @@ def apply(
     min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for job selection. Defaults to APPLYPILOT_MIN_SCORE or 7."),
     agent: str = typer.Option("claude", "--agent", help="Apply agent CLI to run: claude or codex."),
     agents: Optional[str] = typer.Option(None, "--agents", help="Comma-separated per-worker agents (round-robin), e.g. 'claude,codex' to run BOTH concurrently in one process. Overrides --agent; needs --workers >= the number of agents."),
+    browsers: Optional[str] = typer.Option(None, "--browsers", help="Comma-separated per-worker browsers (round-robin), e.g. 'chrome,edge' to run real Chrome + real Edge. Edge has no Chrome LinkedIn session -> auto-restricted to the offsite lane."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Apply-agent model name. Defaults to sonnet for Claude; Codex uses its configured default when omitted."),
     poll_interval: int = typer.Option(15, "--poll-interval", help="Seconds a worker waits between DB polls when the queue is empty."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
@@ -588,6 +589,18 @@ def apply(
         elif workers < len(set(agent_list)):
             console.print(f"[yellow]--workers ({workers}) < distinct agents ({len(set(agent_list))}); "
                           f"some agents won't run. Raise --workers.[/yellow]")
+    browser_list: Optional[list] = None
+    if browsers:
+        browser_list = [b.strip().lower() for b in browsers.split(",") if b.strip()]
+        bad_b = [b for b in browser_list if b not in {"chrome", "edge", "cft", "chromium", "default"}]
+        if bad_b:
+            console.print(f"[red]--browsers entries must be chrome/edge (got: {', '.join(bad_b)}).[/red]")
+            raise typer.Exit(code=1)
+        if not browser_list:
+            browser_list = None
+        elif workers < len(set(browser_list)):
+            console.print(f"[yellow]--workers ({workers}) < distinct browsers ({len(set(browser_list))}); "
+                          f"some browsers won't run. Raise --workers.[/yellow]")
     # Distinct agents that will actually run (for the auth canary + model default).
     run_agents = agent_list if agent_list else [agent]
     if not model and "claude" in run_agents:
@@ -745,6 +758,7 @@ def apply(
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
     console.print(f"  Agent:    {'+'.join(dict.fromkeys(run_agents))}")
+    console.print(f"  Browser:  {'+'.join(dict.fromkeys(browser_list)) if browser_list else 'default (Chrome for Testing)'}")
     console.print(f"  Model:    {model or 'codex default'}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
@@ -764,6 +778,7 @@ def apply(
         poll_interval=poll_interval,
         agent=agent,
         agents=agent_list,
+        browsers=browser_list,
     )
 
 

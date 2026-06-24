@@ -200,6 +200,64 @@ def get_chrome_user_data() -> Path:
         return Path.home() / ".config" / "google-chrome"
 
 
+def resolve_browser_path(browser: str | None) -> str:
+    """Resolve a browser NAME to its executable, for per-worker browser assignment
+    (e.g. one worker on Chrome, one on Edge). 'chrome'/'edge' find the REAL installed
+    browser; anything else (None/'default'/'cft'/'chromium') falls back to
+    get_chrome_path() (which honors CHROME_PATH / the Playwright build)."""
+    name = (browser or "").strip().lower()
+    win = platform.system() == "Windows"
+
+    def _first(cands: list) -> str | None:
+        for c in cands:
+            if c and Path(c).exists():
+                return str(c)
+        return None
+
+    if name in ("edge", "msedge", "microsoft-edge"):
+        if win:
+            hit = _first([
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe",
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Microsoft/Edge/Application/msedge.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/Edge/Application/msedge.exe",
+            ])
+        else:
+            hit = shutil.which("microsoft-edge") or shutil.which("msedge")
+        if hit:
+            return hit
+        raise FileNotFoundError("Microsoft Edge executable not found")
+
+    if name in ("chrome", "google-chrome", "google chrome"):
+        if win:
+            hit = _first([
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+            ])
+        else:
+            hit = shutil.which("google-chrome") or shutil.which("google-chrome-stable") or shutil.which("chromium")
+        if hit:
+            return hit
+        raise FileNotFoundError("Google Chrome executable not found")
+
+    return get_chrome_path()
+
+
+def get_browser_user_data(browser: str | None) -> Path:
+    """Real user-data dir for a named browser, so a worker profile can be cloned from
+    it (carrying that browser's saved sessions/logins). Edge for 'edge', else Chrome."""
+    name = (browser or "").strip().lower()
+    system = platform.system()
+    if name in ("edge", "msedge", "microsoft-edge"):
+        if system == "Windows":
+            return Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data"
+        elif system == "Darwin":
+            return Path.home() / "Library" / "Application Support" / "Microsoft Edge"
+        else:
+            return Path.home() / ".config" / "microsoft-edge"
+    return get_chrome_user_data()
+
+
 def ensure_dirs():
     """Create all required directories."""
     for d in [

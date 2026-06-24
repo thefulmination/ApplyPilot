@@ -97,34 +97,43 @@ def _kill_on_port(port: int) -> None:
 # Worker profile management
 # ---------------------------------------------------------------------------
 
-def setup_worker_profile(worker_id: int) -> Path:
-    """Create an isolated Chrome profile for a worker.
+def _browser_profile_suffix(browser: str | None) -> str:
+    """Profile-dir suffix per browser so Chrome and Edge workers don't share/corrupt a
+    Chromium user-data dir. Chrome/default keep the bare worker-{id} (back-compat)."""
+    name = (browser or "chrome").strip().lower()
+    return "" if name in ("", "chrome", "google-chrome", "cft", "chromium", "default") else f"-{name}"
 
-    On first run, clones from an existing worker profile (preferred, since
-    it already has session cookies) or from the user's real Chrome profile.
-    Subsequent runs reuse the existing worker profile.
+
+def setup_worker_profile(worker_id: int, browser: str | None = "chrome") -> Path:
+    """Create an isolated browser profile for a worker.
+
+    On first run, clones from an existing SAME-BROWSER worker profile (preferred,
+    since it already has session cookies) or from the user's real profile for that
+    browser (Chrome for chrome, Edge for edge -- so the worker inherits the logins/
+    saved passwords from the matching real browser). Subsequent runs reuse it.
 
     Args:
         worker_id: Numeric worker identifier.
+        browser: Browser name (chrome/edge/...) -- selects the clone source + dir.
 
     Returns:
-        Path to the worker's Chrome user-data directory.
+        Path to the worker's user-data directory.
     """
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+    suffix = _browser_profile_suffix(browser)
+    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}{suffix}"
     if (profile_dir / "Default").exists():
         return profile_dir  # Already initialized
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
+    # Source: prefer an existing SAME-BROWSER worker (has session cookies that decrypt
+    # in this browser), else the user's real profile for this browser.
     source: Path | None = None
     for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
+        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}{suffix}"
+        if candidate != profile_dir and (candidate / "Default").exists():
             source = candidate
             break
     if source is None:
-        source = config.get_chrome_user_data()
+        source = config.get_browser_user_data(browser)
 
     logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
                 worker_id, source.name)
@@ -187,29 +196,32 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
-    """Launch a Chrome instance with remote debugging for a worker.
+                  headless: bool = False, browser: str | None = None) -> subprocess.Popen:
+    """Launch a Chromium-family browser with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
-        headless: Run Chrome in headless mode (no visible window).
+        headless: Run headless (no visible window).
+        browser: Browser name (chrome/edge/...) for per-worker browser assignment.
+            Edge is Chromium too, so the same CDP flags apply. None -> default
+            (get_chrome_path / CHROME_PATH).
 
     Returns:
-        subprocess.Popen handle for the Chrome process.
+        subprocess.Popen handle for the browser process.
     """
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id)
+    profile_dir = setup_worker_profile(worker_id, browser)
 
-    # Kill any zombie Chrome from a previous run on this port
+    # Kill any zombie browser from a previous run on this port
     _kill_on_port(port)
 
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
 
-    chrome_exe = config.get_chrome_path()
+    chrome_exe = config.resolve_browser_path(browser)
 
     cmd = [
         chrome_exe,
