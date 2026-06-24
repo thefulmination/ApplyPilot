@@ -78,12 +78,16 @@ def supervise(
     max_hours: float = 14.0,
     est_cost_per_apply: float = 1.5,
     poll_seconds: float = 30.0,
+    target_applied: int = 0,
 ) -> None:
-    """Run `applypilot apply` under crash/stall auto-restart until the (estimated) total
-    budget is spent or a safety bound is hit. est_cost_per_apply maps applied-count
-    progress (the only signal that survives a crash) to an approximate dollar spend."""
+    """Run `applypilot apply` under crash/stall auto-restart until the budget is spent (or
+    an ABSOLUTE applied target is reached) or a safety bound is hit. target_applied > 0
+    uses an absolute "stop when COUNT(applied) >= target" -- this composes across
+    restarts (an outer keep-alive task can relaunch this and it picks up where it left
+    off), and on reaching it writes a done-marker the task watches to stop relaunching."""
     log_path = config.LOG_DIR / "supervisor.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    done_marker = config.DB_PATH.parent / "keepalive.done"
 
     def log(msg: str) -> None:
         line = f"{datetime.now(timezone.utc).isoformat()}  {msg}"
@@ -91,6 +95,12 @@ def supervise(
         try:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+        except Exception:
+            pass
+
+    def write_done(reason: str) -> None:
+        try:
+            done_marker.write_text(f"{datetime.now(timezone.utc).isoformat()}  {reason}", encoding="utf-8")
         except Exception:
             pass
 
@@ -110,10 +120,17 @@ def supervise(
 
         applied_now = _applied_count()
         spent_est = max(0, applied_now - baseline) * est_cost_per_apply
-        remaining = total_cost_usd - spent_est
-        if remaining <= max(0.5, est_cost_per_apply):
-            log(f"STOP: budget ~${total_cost_usd:.0f} reached "
-                f"({applied_now - baseline} applies, est ${spent_est:.0f})"); break
+        if target_applied > 0:
+            if applied_now >= target_applied:
+                log(f"STOP: applied target {target_applied} reached (applied={applied_now})")
+                write_done(f"target {target_applied} reached"); break
+            remaining = max(est_cost_per_apply, (target_applied - applied_now) * est_cost_per_apply)
+        else:
+            remaining = total_cost_usd - spent_est
+            if remaining <= max(0.5, est_cost_per_apply):
+                log(f"STOP: budget ~${total_cost_usd:.0f} reached "
+                    f"({applied_now - baseline} applies, est ${spent_est:.0f})")
+                write_done("budget reached"); break
 
         attempt += 1
         _cleanup_orphans(log)
@@ -153,11 +170,14 @@ def supervise(
             if cur > last_applied:
                 last_applied = cur
                 last_progress = time.monotonic()
-            # Mid-attempt budget stop.
-            if max(0, cur - baseline) * est_cost_per_apply >= total_cost_usd:
-                log(f"BUDGET reached mid-attempt ({cur - baseline} applies) -- stopping run")
+            # Mid-attempt stop (absolute applied target, or estimated budget spent).
+            done = (cur >= target_applied) if target_applied > 0 else \
+                   (max(0, cur - baseline) * est_cost_per_apply >= total_cost_usd)
+            if done:
+                log(f"STOP reached mid-attempt (applied={cur}) -- stopping run")
                 _kill_tree(proc)
-                log("SUPERVISOR done (budget).")
+                write_done("target/budget reached mid-attempt")
+                log("SUPERVISOR done.")
                 return
             # Stall: no output for stall_minutes AND no new apply -> stuck, kill + restart.
             try:
