@@ -358,8 +358,35 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     WHERE duplicate_of_url IS NULL
                       {tailored_clause}
                       AND COALESCE(liveness_status, '') != 'dead'
+                      -- Posting-level dedup (anti-double-submit). One company role often
+                      -- exists as SEVERAL job rows -- e.g. two hiring.cafe listings + a
+                      -- LinkedIn row that all resolve to the same ATS form. The old guard
+                      -- only excluded rows matching an *applied* effective-url, so applying
+                      -- one row left its siblings acquirable -> double submit. Now exclude a
+                      -- candidate if the SAME posting is already applied, currently
+                      -- in_progress (stops two parallel workers grabbing different rows of
+                      -- one posting at once), or was submitted-but-unconfirmed
+                      -- (no_confirmation = the agent did click submit). Matched two ways:
+                      -- (a) effective apply target -- also cross-checked against the durable
+                      --     applications ledger so a lost jobs.apply_status can't re-open it;
+                      -- (b) company+title -- catches siblings whose application_url differs
+                      --     or isn't resolved yet (only when company is known).
                       AND COALESCE(application_url, url) NOT IN (
-                            SELECT COALESCE(application_url, url) FROM jobs WHERE apply_status = 'applied')
+                            SELECT COALESCE(application_url, url) FROM jobs
+                            WHERE apply_status IN ('applied', 'in_progress')
+                               OR apply_error = 'no_confirmation'
+                            UNION
+                            SELECT COALESCE(NULLIF(application_url, ''), job_url)
+                            FROM applications WHERE status = 'applied')
+                      AND (
+                            TRIM(COALESCE(company, '')) = ''
+                            OR LOWER(TRIM(company)) || '|' || LOWER(TRIM(title)) NOT IN (
+                                  SELECT LOWER(TRIM(company)) || '|' || LOWER(TRIM(title))
+                                  FROM jobs
+                                  WHERE TRIM(COALESCE(company, '')) != ''
+                                    AND (apply_status IN ('applied', 'in_progress')
+                                         OR apply_error = 'no_confirmation'))
+                      )
                       AND (apply_status IS NULL OR apply_status = 'failed')
                       AND (apply_attempts IS NULL OR apply_attempts < ?)
                       AND COALESCE(audit_score, fit_score) >= ?
