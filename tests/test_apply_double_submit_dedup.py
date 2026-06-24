@@ -167,3 +167,38 @@ def test_freshness_filter_keeps_fresh(conn, monkeypatch):
     _seed_age(conn, "https://boards.greenhouse.io/a/jobs/4", 5)
     job = L.acquire_job(min_score=7)
     assert job is not None and job["url"].endswith("/jobs/4")
+
+
+# --- Crash-stranded lease handling (anti double-submit) -----------------------
+
+def test_reclaim_parks_hardkill_strand_not_retryable(conn):
+    # A job left 'in_progress' past the stale-lease TTL = a hard-killed worker that may
+    # have already submitted. It must be PARKED (crash_unconfirmed, attempts=99), not
+    # silently re-offered -- re-applying would risk a double.
+    import datetime as _dt
+    old = (_dt.datetime.now(_dt.timezone.utc)
+           - _dt.timedelta(seconds=L.STALE_LEASE_SECONDS + 60)).isoformat()
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
+        "fit_score, audit_score, apply_status, last_attempted_at) VALUES "
+        "('https://hiring.cafe/strand', 'Chief of Staff', 'X', 'Acme', "
+        "'https://job-boards.greenhouse.io/acme/jobs/1', 'x', 8, 9.0, 'in_progress', ?)", (old,))
+    conn.commit()
+    assert L.reclaim_stale_leases() == 1
+    r = conn.execute("SELECT apply_status, apply_error, apply_attempts FROM jobs "
+                     "WHERE url LIKE '%/strand'").fetchone()
+    assert r[0] == "failed" and r[1] == "crash_unconfirmed" and r[2] == 99
+    assert L.acquire_job(min_score=7) is None  # not re-acquired
+
+
+def test_crash_unconfirmed_blocks_sibling(conn):
+    # A crash_unconfirmed job (may have submitted) blocks a SIBLING listing of the same
+    # role -- so a re-listed posting isn't applied when the original might have gone out.
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, application_url, apply_status, "
+        "apply_error, apply_attempts) VALUES ('https://hiring.cafe/cu', 'Chief of Staff', "
+        "'X', 'Acme', 'https://job-boards.greenhouse.io/acme/jobs/1', 'failed', "
+        "'crash_unconfirmed', 99)")
+    conn.commit()
+    _seed(conn, "https://www.linkedin.com/jobs/view/9", company="Acme", title="Chief of Staff")
+    assert L.acquire_job(min_score=7) is None

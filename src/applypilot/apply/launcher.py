@@ -561,7 +561,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       AND COALESCE(application_url, url) NOT IN (
                             SELECT COALESCE(application_url, url) FROM jobs
                             WHERE apply_status IN ('applied', 'in_progress')
-                               OR apply_error = 'no_confirmation'
+                               OR apply_error IN ('no_confirmation', 'crash_unconfirmed')
                             UNION
                             SELECT COALESCE(NULLIF(application_url, ''), job_url)
                             FROM applications WHERE status = 'applied')
@@ -572,7 +572,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                                   FROM jobs
                                   WHERE TRIM(COALESCE(company, '')) != ''
                                     AND (apply_status IN ('applied', 'in_progress')
-                                         OR apply_error = 'no_confirmation'))
+                                         OR apply_error IN ('no_confirmation', 'crash_unconfirmed')))
                       )
                       AND (apply_status IS NULL OR apply_status = 'failed')
                       AND (apply_attempts IS NULL OR apply_attempts < ?)
@@ -759,22 +759,30 @@ def release_lock(url: str) -> None:
 
 
 def reclaim_stale_leases(ttl_seconds: int = STALE_LEASE_SECONDS) -> int:
-    """Reset apply leases stranded 'in_progress' by workers that died mid-job.
+    """Park leases stranded 'in_progress' by a HARD-killed worker (OOM / crash / reboot).
 
-    If an apply process is hard-killed (or the machine reboots) between claiming
-    a job and writing a terminal result, the job stays 'in_progress' forever and
-    is never retried. At startup we reclaim leases older than ttl_seconds, which
-    must exceed the per-job agent timeout so a live, in-flight job is never
-    stolen.
+    A clean stop releases the in-flight lease (release_lock / mark_result), so a job left
+    'in_progress' past ttl_seconds means the process was hard-killed mid-job -- and the
+    agent may already have CLICKED SUBMIT before dying (a submit happens near the end of
+    the run). Silently re-offering it would risk a DOUBLE submission, which is exactly
+    what the posting-level dedup CANNOT see (the row isn't applied / no_confirmation / in
+    the applications ledger -- mark_result never ran). So instead of clearing the lease,
+    park it as failed/crash_unconfirmed (attempts=99 so it is NOT auto-retried): it
+    surfaces in `apply-failures` for a manual decision, and the dedup treats it as
+    possibly-submitted so its siblings aren't applied either. Only fires past ttl_seconds
+    (> the agent timeout) so a live in-flight job is never touched. NOTE: this trades a
+    few unneeded holds (a job killed in the brief pre-launch window never submitted) for a
+    hard guarantee against crash-induced double-submits, per the owner's priority.
 
     Returns:
-        Number of leases reclaimed.
+        Number of leases parked for review.
     """
     conn = get_connection()
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)).isoformat()
     cursor = conn.execute(
         """
-        UPDATE jobs SET apply_status = NULL, agent_id = NULL
+        UPDATE jobs SET apply_status = 'failed', apply_error = 'crash_unconfirmed',
+                        apply_attempts = 99, agent_id = NULL
         WHERE apply_status = 'in_progress'
           AND (last_attempted_at IS NULL OR last_attempted_at < ?)
         """,
