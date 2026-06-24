@@ -337,8 +337,17 @@ def load_preference_profile() -> dict | None:
     return data
 
 
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=1)
 def load_sites_config() -> dict:
-    """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.)."""
+    """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.).
+
+    Memoized: is_manual_ats / is_auth_gated_application / load_blocked_* call this on
+    EVERY invocation, and acquire_job calls those per candidate row -- without the
+    cache, draining a top-of-queue of auth-gated jobs re-parses the YAML hundreds of
+    times. sites.yaml is static during a run, so a maxsize=1 cache is safe."""
     import yaml
     path = CONFIG_DIR / "sites.yaml"
     if not path.exists():

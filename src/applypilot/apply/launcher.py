@@ -397,6 +397,25 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     return None  # the explicitly targeted URL is manual; nothing to apply
                 continue  # re-select the next candidate (this row is now excluded)
 
+            # Pre-filter auth-gated applications (login/account/2FA the agent won't do):
+            # skip them at acquire time so the apply never wastes a Chrome launch + agent
+            # run reaching a login wall it can only bounce. Mark auth_required (permanent)
+            # so they surface in `apply-failures --manual` for a manual pass. The run then
+            # spends its launches on jobs that are actually applyable. Off via
+            # APPLYPILOT_SKIP_AUTH_GATED=0.
+            if (os.environ.get("APPLYPILOT_SKIP_AUTH_GATED", "1").strip().lower()
+                    not in ("0", "false", "no", "off")
+                    and config.is_auth_gated_application(apply_url)):
+                conn.execute(
+                    "UPDATE jobs SET apply_status = 'auth_required', apply_error = 'auth_gate', "
+                    "apply_attempts = 99 WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                if target_url:
+                    return None  # the explicitly targeted URL is auth-gated; skip
+                continue  # re-select the next candidate (this row is now excluded)
+
             now = datetime.now(timezone.utc).isoformat()
             conn.execute("""
                 UPDATE jobs SET apply_status = 'in_progress',
