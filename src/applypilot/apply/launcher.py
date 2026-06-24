@@ -2116,6 +2116,19 @@ def main(limit: int = 1, target_url: str | None = None,
 
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # Capture an uncaught crash to a file with a full traceback -- the Rich Live
+        # console can otherwise swallow it, leaving a silent death that's hard to
+        # diagnose. (An OOM/external kill produces no exception; the supervisor catches
+        # that via the subprocess dying.)
+        import traceback as _tb
+        try:
+            with open(config.LOG_DIR / "apply_crash.log", "a", encoding="utf-8") as _f:
+                _f.write(f"\n=== apply crash {datetime.now(timezone.utc).isoformat()} ===\n")
+                _tb.print_exc(file=_f)
+        except Exception:
+            pass
+        raise
     finally:
         _stop_event.set()
         kill_all_chrome()

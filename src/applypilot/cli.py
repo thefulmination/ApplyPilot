@@ -1125,6 +1125,39 @@ def export_outcomes_command(
     )
 
 
+@app.command("supervise-apply")
+def supervise_apply_command(
+    max_cost_usd: float = typer.Option(..., "--max-cost-usd",
+        help="TOTAL cost budget (USD) across all auto-restarts."),
+    model: str = typer.Option("sonnet", "--model", "-m"),
+    linkedin_daily_cap: int = typer.Option(20, "--linkedin-daily-cap"),
+    base_resume: bool = typer.Option(True, "--base-resume/--no-base-resume"),
+    max_job_age_days: int = typer.Option(0, "--max-job-age-days",
+        help="Freshness filter: skip postings older than N days (0 = off)."),
+    stall_minutes: float = typer.Option(20.0, "--stall-minutes",
+        help="Kill + restart if no output AND no new apply for this long."),
+    max_attempts: int = typer.Option(30, "--max-attempts"),
+    max_hours: float = typer.Option(14.0, "--max-hours"),
+    est_cost_per_apply: float = typer.Option(1.5, "--est-cost-per-apply",
+        help="Used to estimate spend from applied-count across crashes."),
+) -> None:
+    """Run apply under a crash/stall SUPERVISOR that auto-restarts until the budget is spent.
+
+    The apply run is heavy and can be OOM-killed on a contended machine -- a silent death
+    it can't recover from. This supervisor is a separate lightweight process: it detects a
+    crash within ~30s (and a stall after --stall-minutes), cleans up orphaned Chrome / MCP
+    servers, and relaunches with the remaining budget. Logs to <LOG_DIR>/supervisor.log.
+    """
+    _bootstrap()
+    from applypilot.apply.supervisor import supervise
+    supervise(
+        total_cost_usd=max_cost_usd, model=model, linkedin_daily_cap=linkedin_daily_cap,
+        base_resume=base_resume, max_job_age_days=max_job_age_days,
+        stall_minutes=stall_minutes, max_attempts=max_attempts, max_hours=max_hours,
+        est_cost_per_apply=est_cost_per_apply,
+    )
+
+
 @app.command("audit-duplicates")
 def audit_duplicates_command() -> None:
     """Report likely DUPLICATE applications (the same role applied more than once).
