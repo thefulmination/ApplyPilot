@@ -169,12 +169,20 @@ Decision tree:
 
 
 def _build_screening_section(profile: dict) -> str:
-    """Build the screening questions guidance section."""
+    """Build the screening questions guidance section.
+
+    Domain-neutral and truthful. The old version was hard-templated for a
+    software engineer ("software engineers learn tools fast -> answer YES to
+    DevOps/ML/cloud") -- which both mis-described this candidate and actively
+    biased over-claiming on a domain that isn't his. Screening answers come from
+    the profile/resume, period; behavioral answers use real resume experiences
+    and never invent specifics.
+    """
     personal = profile["personal"]
     exp = profile.get("experience", {})
     city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
-    target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
+    target_role = exp.get("target_role") or personal.get("current_job_title") or "this role"
     work_auth = profile["work_authorization"]
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
@@ -184,9 +192,11 @@ Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
 
-Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
+Skills and tools -> be confident but TRUTHFUL. This candidate is targeting {target_role} with {years} years of experience. Answer "Do you have experience with X?" YES when X is something the resume/profile actually shows -- the exact tool, or one so close the resume backs it up (a named competitor of a listed tool, a skill plainly demonstrated by the work described). Don't undersell real experience. But do NOT claim a skill the resume doesn't support just because it's adjacent or learnable -- "could pick it up" is not "have experience with." If the profile doesn't back it, answer honestly (No, or the real level).
 
-Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
+Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a REAL achievement that actually appears in the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
+
+Behavioral / "tell me about a time" questions -> Use ONLY real experiences from the resume. Pick an actual role or achievement that appears there and describe it plainly. NEVER invent a situation, metric, company, team, or outcome that is not in the resume. If no resume experience fits the question, answer with the closest real one and keep it honest -- do not manufacture a story. Fabricating specifics is a hard failure, not a stylistic choice.
 
 EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
 

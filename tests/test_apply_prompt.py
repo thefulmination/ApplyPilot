@@ -123,6 +123,33 @@ def test_build_prompt_stages_uploads_per_worker(tmp_path: Path, monkeypatch) -> 
     assert "worker-3" in text3 and "worker-0" not in text3
 
 
+def test_screening_section_is_truthful_not_swe_templated() -> None:
+    # The screening guidance used to be hard-templated for a software engineer and
+    # told the agent to answer YES to any DevOps/ML/cloud tool because "software
+    # engineers learn tools fast" -- wrong domain for this candidate AND a bias to
+    # over-claim. It must now be domain-neutral and truthful.
+    section = prompt._build_screening_section(_make_profile())
+    low = section.lower()
+    assert "software engineers learn tools fast" not in low
+    assert "devops, backend, ml, cloud" not in low
+    # Targets the candidate's real role, confidently but truthfully.
+    assert "Chief of Staff" in section
+    assert "truthful" in low and "could pick it up" in low  # don't claim merely-learnable skills
+    # Behavioral answers must never be fabricated.
+    assert "tell me about a time" in low
+    assert "never invent" in low and "resume" in low
+
+
+def test_screening_target_role_no_swe_default() -> None:
+    # With no target_role/current_job_title, the fallback must NOT be "software engineer".
+    profile = _make_profile()
+    profile["experience"].pop("target_role", None)
+    profile["personal"].pop("current_job_title", None)
+    section = prompt._build_screening_section(profile)
+    assert "software engineer" not in section.lower()
+    assert "this role" in section
+
+
 def test_build_prompt_dry_run_emits_dry_run_code(tmp_path: Path, monkeypatch) -> None:
     tailored_txt = tmp_path / "tailored.txt"
     tailored_txt.write_text("Tailored resume text", encoding="utf-8")
