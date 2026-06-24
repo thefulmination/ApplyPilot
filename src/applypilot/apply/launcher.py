@@ -800,6 +800,54 @@ def _stamp_liveness_dead(url: str, reason: str) -> None:
         logger.debug("liveness dead-stamp failed for %s", (url or "")[:60], exc_info=True)
 
 
+def mirror_db_offsite(log=None) -> bool:
+    """Copy the local authoritative DB to the OneDrive-synced APP_DIR (OFF-MACHINE backup).
+
+    The authoritative DB lives in %LOCALAPPDATA% (APPLYPILOT_DB_PATH) and the periodic
+    rolling backup is written next to it -- BOTH on the same local disk. If that disk /
+    the LOCALAPPDATA dir is lost, neither survives. This mirrors the DB into the
+    OneDrive-synced config.APP_DIR so an off-machine copy exists. Integrity-checked first
+    so a corrupt DB never overwrites a good offsite copy. No-op when the DB already IS the
+    synced copy (no APPLYPILOT_DB_PATH override) or backups are disabled. Uses the SQLite
+    online-backup API, so it's safe while the apply process writes (WAL reader snapshot).
+    Best-effort; never raises. Returns True only when a fresh offsite copy was written."""
+    if (os.environ.get("APPLYPILOT_BACKUP_INTERVAL") or "600").strip() == "0":
+        return False
+    import sqlite3
+
+    def _log(m: str) -> None:
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+
+    try:
+        dest_path = config.APP_DIR / "applypilot.db"
+        if not config.DB_PATH.exists() or dest_path.resolve() == config.DB_PATH.resolve():
+            return False  # DB already lives in the synced dir -> nothing to mirror
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        src = sqlite3.connect(str(config.DB_PATH), timeout=30)
+        try:
+            if src.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                _log("[offsite-backup] live DB integrity not OK -- offsite copy left intact")
+                return False
+            tmp = dest_path.with_suffix(".db.offsite.tmp")
+            dest = sqlite3.connect(str(tmp))
+            try:
+                src.backup(dest)
+            finally:
+                dest.close()
+            tmp.replace(dest_path)
+            return True
+        finally:
+            src.close()
+    except Exception:
+        logger.debug("offsite DB mirror failed", exc_info=True)
+        _log("[offsite-backup] failed (will retry next cycle)")
+        return False
+
+
 def release_lock(url: str) -> None:
     """Release the in_progress lock without changing status."""
     conn = get_connection()
@@ -2156,7 +2204,12 @@ def main(limit: int = 1, target_url: str | None = None,
                 src.backup(dest)
                 dest.close()
                 tmp.replace(bdir / "rolling.db")
-                add_event("[backup] integrity OK; rolling backup written")
+                # Also refresh the OFF-MACHINE (OneDrive-synced) copy. The local rolling
+                # backup shares a disk with the authoritative DB; this survives a local-
+                # disk loss. No-op when the DB already lives in the synced dir.
+                offsite = mirror_db_offsite()
+                add_event("[backup] integrity OK; rolling backup written"
+                          + ("; offsite mirror refreshed" if offsite else ""))
             except Exception:
                 logger.debug("Periodic backup failed", exc_info=True)
     threading.Thread(target=_periodic_backup, daemon=True, name="db-backup").start()

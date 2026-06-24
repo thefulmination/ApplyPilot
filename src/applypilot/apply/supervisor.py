@@ -106,12 +106,36 @@ def supervise(
         except Exception:
             pass
 
+    # Off-machine DB backup. The keep-alive runs this supervisor DIRECTLY, and the
+    # authoritative DB + its rolling backup both live on the LOCAL disk -- a local-disk
+    # loss would take both. The supervisor is the durable process (it outlives every
+    # apply-subprocess crash), so it mirrors the DB into the OneDrive-synced dir on a
+    # cadence that survives crash-looping (an apply subprocess that dies before its own
+    # 10-min backup never produces an offsite copy). Time-gated to APPLYPILOT_BACKUP_INTERVAL.
+    _last_offsite = [0.0]
+
+    def offsite_backup(force: bool = False) -> None:
+        interval = float(os.environ.get("APPLYPILOT_BACKUP_INTERVAL") or 600)
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        if not force and (now - _last_offsite[0]) < interval:
+            return
+        _last_offsite[0] = now
+        try:
+            from applypilot.apply.launcher import mirror_db_offsite
+            if mirror_db_offsite(log):
+                log("OFFSITE-BACKUP: OneDrive-synced DB copy refreshed")
+        except Exception:
+            pass
+
     baseline = _applied_count()
     start = time.monotonic()
     attempt = 0
     log(f"SUPERVISOR start: total_budget=${total_cost_usd:.0f}, baseline_applied={baseline}, "
         f"stall={stall_minutes}m, max_attempts={max_attempts}, max_hours={max_hours}, "
         f"est_cost_per_apply=${est_cost_per_apply}")
+    offsite_backup(force=True)  # capture an off-machine copy before anything runs
 
     while True:
         elapsed_h = (time.monotonic() - start) / 3600.0
@@ -136,6 +160,7 @@ def supervise(
 
         attempt += 1
         _cleanup_orphans(log)
+        offsite_backup()  # periodic off-machine backup at each restart boundary
         # Reclaim any lease stranded by the previous crash so its job is retryable.
         try:
             from applypilot.apply.launcher import reclaim_stale_leases
@@ -187,6 +212,7 @@ def supervise(
                 log(f"STOP reached mid-attempt (applied={cur}) -- stopping run")
                 _kill_tree(proc)
                 write_done("target/budget reached mid-attempt")
+                offsite_backup(force=True)  # final off-machine backup on stop
                 log("SUPERVISOR done.")
                 return
             # Stall: no output for stall_minutes AND no new apply -> stuck, kill + restart.
@@ -201,6 +227,7 @@ def supervise(
                 _kill_tree(proc)
                 break
 
+    offsite_backup(force=True)  # final off-machine backup on stop
     log(f"SUPERVISOR done: {_applied_count() - baseline} applies this session "
         f"over {attempt} attempt(s), {elapsed_h:.1f}h.")
 
