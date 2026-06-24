@@ -1256,10 +1256,16 @@ def _update_host_breaker(job: dict, ok: bool, reason: str | None, worker_id: int
 # shows the agent+browser actually worked -- captcha, salary, etc.) resets the streak.
 # After SYSTEMIC_FAIL_BREAKER in a row, halt the run AND un-burn the streak (those jobs
 # were almost certainly good). This is the process-wide analogue of the offsite breaker.
-SYSTEMIC_FAIL_BREAKER = int(os.environ.get("APPLYPILOT_SYSTEMIC_FAIL_BREAKER") or 5)
+SYSTEMIC_FAIL_BREAKER = int(os.environ.get("APPLYPILOT_SYSTEMIC_FAIL_BREAKER")
+                            or os.environ.get("APPLYPILOT_GLOBAL_FAIL_BREAKER") or 5)
 # Failure reasons that mean the agent never proved it could drive the browser this run
-# -> likely the environment (auth/API/CDP), not the specific posting.
-SYSTEMIC_FAIL_REASONS = {"no_result_line", "timeout"}
+# -> likely the environment (auth/API/CDP/Chrome), not the specific posting. A streak
+# of these trips the breaker; any proof-of-life outcome resets it. browser_crashed /
+# browser_unavailable were observed in a live run -- a one-off is harmless (resets on
+# the next success), but a sustained streak means Chrome/CDP is broken, not the jobs.
+SYSTEMIC_FAIL_REASONS = {
+    "no_result_line", "timeout", "browser_crashed", "browser_unavailable",
+}
 _systemic_fail_count = 0
 _systemic_recent: list[str] = []
 _systemic_fail_lock = threading.Lock()

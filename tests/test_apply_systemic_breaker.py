@@ -110,3 +110,45 @@ def test_trip_unburns_the_streak(tmp_path, monkeypatch):
         assert status is None
         assert attempts == 0
         assert err == "systemic_halt"
+
+
+def test_five_consecutive_no_result_halts_and_keeps_jobs_retryable(tmp_path, monkeypatch):
+    """The exact systemic-outage scenario: 5 consecutive no_result_line failures (auth/
+    API/CDP dead) must HALT the run and leave those good jobs RETRYABLE -- NOT permanently
+    burned to attempts=99 -- so they're picked up again once the environment recovers."""
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(L, "get_connection", lambda: conn)
+    monkeypatch.setattr(L, "SYSTEMIC_FAIL_BREAKER", 5)
+    L._stop_event.clear()
+
+    urls = [f"https://job-boards.greenhouse.io/co/jobs/{i}" for i in range(5)]
+    # no_result_line is in PERMANENT_FAILURES, so the outage marked each attempts=99.
+    for u in urls:
+        conn.execute("INSERT INTO jobs (url, title, site, apply_status, apply_error, apply_attempts) "
+                     "VALUES (?, 'CoS', 'X', 'failed', 'no_result_line', 99)", (u,))
+    conn.commit()
+
+    tripped_on = None
+    for i, u in enumerate(urls):
+        assert L._is_systemic_failure("failed:no_result_line") is True  # the run_job code
+        if L._note_systemic_failure(u):
+            tripped_on = i
+            L._trip_systemic_breaker(worker_id=0)
+            break
+    assert tripped_on == 4          # trips on the 5th consecutive, not before
+    assert L._stop_event.is_set()   # run halted
+    L._stop_event.clear()
+
+    # Every job is back to retryable (NOT permanent) -> the outage cost zero good jobs.
+    for status, attempts in conn.execute("SELECT apply_status, apply_attempts FROM jobs"):
+        assert status is None and attempts == 0
+
+
+def test_browser_failures_are_systemic_and_env_alias_documented():
+    # browser_crashed / browser_unavailable (seen live) count toward the breaker so a
+    # broken Chrome halts a long run; a one-off resets on the next success.
+    assert L._is_systemic_failure("browser_crashed") is True
+    assert L._is_systemic_failure("failed:browser_unavailable") is True
+    # job-specific outcomes still reset the streak (not systemic).
+    assert L._is_systemic_failure("captcha") is False
+    assert L._is_systemic_failure("not_eligible_location") is False
