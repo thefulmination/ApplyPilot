@@ -47,8 +47,16 @@ VERIFY_WORDS = {
 
 _CODE_RE = re.compile(r"(?<![A-Za-z0-9-])\d{4,8}(?![A-Za-z0-9-])")
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
-_AUTH_URL_PATH_RE = re.compile(
-    r"(^|[/?&_.=-])(?:verify|verification|magic|magic-link|signin|sign-in|login|continue)([/?&_.=-]|$)",
+_STRONG_AUTH_URL_PATH_RE = re.compile(
+    r"(^|[/?&_.=-])(?:verify|verification|magic|magic-link|continue)([/?&_.=-]|$)",
+    re.IGNORECASE,
+)
+_GENERIC_AUTH_URL_PATH_RE = re.compile(
+    r"(^|[/?&_.=-])(?:signin|sign-in|login)([/?&_.=-]|$)",
+    re.IGNORECASE,
+)
+_AUTH_URL_QUERY_RE = re.compile(
+    r"(^|[&;])(?:token|verification_token|magic_token|code|otp)=",
     re.IGNORECASE,
 )
 _REJECTED_MAGIC_PATH_RE = re.compile(
@@ -79,7 +87,7 @@ _NEGATIVE_CODE_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_SUFFIX_RE = re.compile(
-    r"^\s*(?:when|for|as)\b.{0,60}\b(?:support|contact|contacting|reference)\b",
+    r"^\s*(?:when\s+contacting\s+support\b|for\s+(?:support|contact)\b|as\s+your\s+reference\b)",
     re.IGNORECASE,
 )
 _MAGIC_LINK_CONTEXT_RE = re.compile(
@@ -236,10 +244,17 @@ def _extract_magic_link_drafts(
             continue
 
         window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
-        if not (_has_auth_url_path(value) or _has_magic_link_context(window)):
+        strong_auth_link = _has_strong_auth_url_signal(value)
+        generic_auth_link = _has_generic_auth_url_path(value)
+        has_context = _has_magic_link_context(window)
+        if not (strong_auth_link or has_context):
             continue
 
         reasons = ["magic_link"]
+        if strong_auth_link:
+            reasons.append("strong_auth_link")
+        if generic_auth_link:
+            reasons.append("generic_auth_link")
         if sender_is_known_ats:
             reasons.append("known_ats_sender")
         if known_ats_link:
@@ -287,13 +302,27 @@ def _has_magic_link_context(text: str) -> bool:
     return bool(_MAGIC_LINK_CONTEXT_RE.search(text))
 
 
-def _has_auth_url_path(url: str) -> bool:
+def _has_strong_auth_url_signal(url: str) -> bool:
+    return _has_strong_auth_url_path(url) or _has_auth_url_query(url)
+
+
+def _has_strong_auth_url_path(url: str) -> bool:
     parsed = urlparse(url)
-    return bool(_AUTH_URL_PATH_RE.search(parsed.path.lower()))
+    return bool(_STRONG_AUTH_URL_PATH_RE.search(parsed.path.lower()))
+
+
+def _has_auth_url_query(url: str) -> bool:
+    parsed = urlparse(url)
+    return bool(_AUTH_URL_QUERY_RE.search(parsed.query.lower()))
+
+
+def _has_generic_auth_url_path(url: str) -> bool:
+    parsed = urlparse(url)
+    return bool(_GENERIC_AUTH_URL_PATH_RE.search(parsed.path.lower()))
 
 
 def _is_rejected_magic_link_path(url: str) -> bool:
-    if _has_auth_url_path(url):
+    if _has_strong_auth_url_path(url):
         return False
     parsed = urlparse(url)
     return bool(_REJECTED_MAGIC_PATH_RE.search(parsed.path.lower()))
@@ -344,7 +373,12 @@ def _dedupe_drafts(drafts: list[_CandidateDraft]) -> list[_CandidateDraft]:
 def _confidence_for(kind: CandidateKind, reasons: tuple[str, ...], single_candidate: bool) -> Confidence:
     reason_set = set(reasons)
     if kind == "magic_link":
-        if "known_ats_link" in reason_set and "verification_language" in reason_set and single_candidate:
+        if (
+            "known_ats_link" in reason_set
+            and "strong_auth_link" in reason_set
+            and "verification_language" in reason_set
+            and single_candidate
+        ):
             return "high"
         if "verification_language" in reason_set and ("known_ats_sender" in reason_set or "known_ats_link" in reason_set):
             return "medium"

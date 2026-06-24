@@ -223,6 +223,21 @@ def test_ignores_support_contact_and_reference_codes_after_number() -> None:
         )
 
 
+def test_accepts_real_auth_code_with_support_help_text_afterward() -> None:
+    candidates = extract_verification_candidates(
+        subject="Your Greenhouse verification code",
+        body=(
+            "Use verification code 123456 when prompted. "
+            "If you did not request this code, contact support."
+        ),
+        sender="no-reply@greenhouse.io",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+
+
 def test_accepts_common_auth_code_phrasings() -> None:
     cases = [
         ("", "Your security code is 123456"),
@@ -255,6 +270,18 @@ def test_non_ats_magic_link_from_known_ats_sender_is_not_high_confidence() -> No
 
     if candidates:
         assert candidates[0].confidence != "high"
+
+
+def test_known_ats_generic_login_link_is_not_high_confidence() -> None:
+    candidates = extract_verification_candidates(
+        subject="",
+        body="Sign in at https://boards.greenhouse.io/login to view your application.",
+        sender="no-reply@greenhouse.io",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "magic_link"
+    assert candidates[0].confidence != "high"
 
 
 def test_accepts_known_ats_verify_link_with_job_query_param() -> None:
