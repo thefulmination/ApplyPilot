@@ -102,12 +102,28 @@ def test_distinct_role_same_board_not_flagged(conn):
         conn, "https://job-boards.greenhouse.io/amaehealth/jobs/9999", "Clinic Director") is None
 
 
-def test_short_title_never_near_dup(conn):
-    # 'Chief of Staff' (2 significant tokens) must never trigger a near-dup skip.
+def test_identical_title_same_employer_is_dup(conn):
+    # Two IDENTICAL 'Chief of Staff' listings at the same company ARE a duplicate
+    # (Jaccard 1.0) -- apply once.
     _ins(conn, "https://hiring.cafe/v/3", "Chief of Staff", company="Acme",
          app_url="https://job-boards.greenhouse.io/acme/jobs/1", status="applied")
     assert L._find_near_duplicate_applied(
-        conn, "https://job-boards.greenhouse.io/acme/jobs/2", "Chief of Staff") is None
+        conn, "https://job-boards.greenhouse.io/acme/jobs/2", "Chief of Staff", "Acme") is not None
+
+
+def test_different_roles_same_employer_released(conn):
+    # The user's rule: "if they aren't identical roles then they aren't duplicates."
+    # Different roles at one company share a word or two but stay below the ratio.
+    _ins(conn, "https://hiring.cafe/v/g", "GTM Strategy and Operations", company="Acme",
+         app_url="https://job-boards.greenhouse.io/acme/jobs/1", status="applied")
+    _ins(conn, "https://hiring.cafe/v/bd", "Business Development Associate", company="Acme",
+         app_url="https://job-boards.greenhouse.io/acme/jobs/2", status="applied")
+    # "Pricing Strategy and Operations" vs "GTM Strategy and Operations" -> 0.50 < 0.55
+    assert L._find_near_duplicate_applied(
+        conn, "https://job-boards.greenhouse.io/acme/jobs/3", "Pricing Strategy and Operations", "Acme") is None
+    # "Business Development Representative" vs "...Associate" -> 0.50 < 0.55 (different role)
+    assert L._find_near_duplicate_applied(
+        conn, "https://job-boards.greenhouse.io/acme/jobs/4", "Business Development Representative", "Acme") is None
 
 
 def test_acquire_skips_near_duplicate(conn):

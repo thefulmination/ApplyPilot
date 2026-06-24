@@ -277,6 +277,15 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
 # the same employer board as an already-applied role AND their titles share enough
 # significant tokens, treat it as a re-post and skip it.
 NEAR_DUP_MIN_SHARED = int(os.environ.get("APPLYPILOT_NEAR_DUP_MIN_SHARED_TOKENS") or 3)
+# Two titles at the SAME employer are the same role re-listed (a duplicate) only when
+# their significant-token sets are >= this Jaccard-similar. 0.55 catches Amae ("Founder
+# Associate, Growth & Partnership Operations" vs "Business Development Associate, ..."
+# -> 0.57) and identical re-lists (1.0), while RELEASING genuinely DIFFERENT roles at
+# one company ("Pricing Strategy & Operations" vs "GTM Strategy & Operations" -> 0.50;
+# "BD Associate" vs "BD Representative" -> 0.50) -- different roles are NOT duplicates,
+# so apply to both. A token COUNT can't separate these (a 3-word identical title and a
+# 5-word different-role title can share the same count); the ratio can. 0 disables it.
+NEAR_DUP_JACCARD = float(os.environ.get("APPLYPILOT_NEAR_DUP_JACCARD") or 0.55)
 # ATS hosts whose FIRST PATH segment reliably identifies the employer
 # (greenhouse.io/<company>/jobs/<id>). Restricted on purpose: hosts that put the
 # employer in a SUBDOMAIN (workday/bamboohr/recruitee/teamtailor/pinpoint) or in an
@@ -355,25 +364,33 @@ def _sig_title_tokens(title: str | None) -> set[str]:
     }
 
 
+def _title_jaccard(a: str | None, b: str | None) -> float:
+    """Jaccard similarity (0..1) of two titles' significant role tokens. 1.0 = same
+    role words; ~0.55+ = a re-list of the same role; <0.5 = a different role."""
+    ta, tb = _sig_title_tokens(a), _sig_title_tokens(b)
+    return len(ta & tb) / len(ta | tb) if (ta | tb) else 0.0
+
+
 def _find_near_duplicate_applied(conn, apply_url: str, title: str,
                                  company: str | None = None) -> str | None:
-    """If an already-applied role is the same posting re-listed -- same EMPLOYER
-    (company OR reliable board slug) AND >= NEAR_DUP_MIN_SHARED shared significant title
-    tokens -- return its title, else None. Conservative: a too-generic candidate title
-    (< the threshold of significant tokens, e.g. 'Chief of Staff') never triggers it,
-    and an unidentifiable employer never triggers it."""
+    """If an already-applied role is the SAME ROLE re-listed -- same EMPLOYER (company OR
+    reliable board slug) AND title Jaccard >= NEAR_DUP_JACCARD -- return its title, else
+    None. Different roles at one company (low similarity) are NOT duplicates and are
+    never flagged; an unidentifiable employer or a 1-word generic title never triggers
+    it either."""
+    if NEAR_DUP_JACCARD <= 0:
+        return None
     if not (_norm_company(company) or _employer_board_slug(apply_url)):
         return None  # can't identify the employer -> don't risk a false near-dup skip
-    ctoks = _sig_title_tokens(title)
-    if len(ctoks) < NEAR_DUP_MIN_SHARED:
-        return None
+    if len(_sig_title_tokens(title)) < 2:
+        return None  # too generic a title to judge
     for r in conn.execute(
         "SELECT title, company, COALESCE(application_url, url) AS tgt "
         "FROM jobs WHERE apply_status = 'applied'"
     ):
         if not _same_employer(apply_url, company, r["tgt"], r["company"]):
             continue
-        if len(ctoks & _sig_title_tokens(r["title"])) >= NEAR_DUP_MIN_SHARED:
+        if _title_jaccard(title, r["title"]) >= NEAR_DUP_JACCARD:
             return r["title"]
     return None
 
@@ -399,9 +416,9 @@ def audit_duplicate_applications(conn=None) -> list[dict]:
             if a["tgt"] == b["tgt"]:
                 kind, shared = "exact-target", []
             else:
-                shared = sorted(_sig_title_tokens(a["title"]) & _sig_title_tokens(b["title"]))
-                if len(shared) < NEAR_DUP_MIN_SHARED:
+                if _title_jaccard(a["title"], b["title"]) < NEAR_DUP_JACCARD:
                     continue
+                shared = sorted(_sig_title_tokens(a["title"]) & _sig_title_tokens(b["title"]))
                 kind = "near-duplicate"
             out.append({
                 "kind": kind, "employer": _employer_board_slug(a["tgt"]) or aco,
@@ -633,7 +650,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             # "Founder Associate" and a "Business Development Associate" listing, both
             # ".../Growth & Partnership Operations" on greenhouse.io/amaehealth). Skip it.
             # Off via APPLYPILOT_NEAR_DUP_MIN_SHARED_TOKENS=0.
-            if not target_url and NEAR_DUP_MIN_SHARED >= 1:
+            if not target_url and NEAR_DUP_JACCARD > 0:
                 _dup_of = _find_near_duplicate_applied(
                     conn, apply_url, row["title"] or "", row["company"])
                 if _dup_of:

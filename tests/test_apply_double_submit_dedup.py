@@ -114,16 +114,17 @@ def test_resolved_aggregator_row_is_applyable(conn):
 
 
 def test_dedup_does_not_over_exclude(conn):
-    # A DIFFERENT role at the same company is still acquirable (distinct title), and an
-    # empty-company row is never excluded by the company+title arm.
+    # A genuinely DIFFERENT role at the same company is still acquirable (the user's
+    # rule: different roles are not duplicates). "Chief of Staff" and "VP of Marketing"
+    # share no role words -> low similarity -> not a near-dup.
     _seed(conn, "https://hiring.cafe/viewjob/cos", company="BigCo",
           title="Chief of Staff", application_url="https://boards.greenhouse.io/bigco/1",
           apply_status="applied")
-    _seed(conn, "https://hiring.cafe/viewjob/cos-ceo", company="BigCo",
-          title="Chief of Staff to the CEO",
+    _seed(conn, "https://hiring.cafe/viewjob/vpmkt", company="BigCo",
+          title="VP of Marketing",
           application_url="https://boards.greenhouse.io/bigco/2", apply_status=None)
     job = L.acquire_job(min_score=7)
-    assert job is not None and job["url"].endswith("/cos-ceo")
+    assert job is not None and job["url"].endswith("/vpmkt")
 
 
 # --- Freshness filter (APPLYPILOT_MAX_JOB_AGE_DAYS) ---------------------------
