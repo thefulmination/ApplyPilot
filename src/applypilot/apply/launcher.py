@@ -1200,6 +1200,84 @@ def _update_host_breaker(job: dict, ok: bool, reason: str | None, worker_id: int
             add_event(f"[W{worker_id}] Host {host} faulting ({reason}) -- skipping it for the rest of this run")
 
 
+# --- Global systemic-failure circuit breaker ----------------------------------
+# A mid-run auth/API/CDP outage makes EVERY job fail the SAME way -- the agent emits
+# no RESULT line (no_result_line) or hangs past the timeout (timeout). The offsite
+# per-host breaker can't catch this (no_result_line isn't a host-fault, and it spans
+# many hosts), and no_result_line/timeout are PERMANENT failures, so without a global
+# brake an unattended continuous run would mark the ENTIRE applyable queue permanently
+# failed before anyone noticed. So: count CONSECUTIVE systemic-suspect failures across
+# ALL workers; ANY proof-of-life outcome (an applied, or a job-specific failure that
+# shows the agent+browser actually worked -- captcha, salary, etc.) resets the streak.
+# After SYSTEMIC_FAIL_BREAKER in a row, halt the run AND un-burn the streak (those jobs
+# were almost certainly good). This is the process-wide analogue of the offsite breaker.
+SYSTEMIC_FAIL_BREAKER = int(os.environ.get("APPLYPILOT_SYSTEMIC_FAIL_BREAKER") or 5)
+# Failure reasons that mean the agent never proved it could drive the browser this run
+# -> likely the environment (auth/API/CDP), not the specific posting.
+SYSTEMIC_FAIL_REASONS = {"no_result_line", "timeout"}
+_systemic_fail_count = 0
+_systemic_recent: list[str] = []
+_systemic_fail_lock = threading.Lock()
+
+
+def _is_systemic_failure(reason: str | None) -> bool:
+    """True if a failure reason signals a likely environment outage (not job-specific)."""
+    r = (reason or "").split(":", 1)[-1].strip().lower()
+    return r in SYSTEMIC_FAIL_REASONS
+
+
+def _note_systemic_failure(url: str | None) -> bool:
+    """Record one systemic-suspect failure; return True if the global breaker just
+    tripped (caller should halt the run)."""
+    global _systemic_fail_count
+    with _systemic_fail_lock:
+        _systemic_fail_count += 1
+        if url:
+            _systemic_recent.append(url)
+            # Only the current streak matters (a trip clears it); bound the list so a
+            # disabled breaker (=0) can't grow it without limit over a long run.
+            keep = max(SYSTEMIC_FAIL_BREAKER, 1)
+            if len(_systemic_recent) > keep * 2:
+                del _systemic_recent[:-keep]
+        return SYSTEMIC_FAIL_BREAKER > 0 and _systemic_fail_count >= SYSTEMIC_FAIL_BREAKER
+
+
+def _note_healthy_outcome() -> None:
+    """Any proof-of-life outcome (applied, or a job-specific failure) resets the
+    systemic-failure streak -- so only an UNBROKEN run of pure outage-failures trips."""
+    global _systemic_fail_count
+    with _systemic_fail_lock:
+        _systemic_fail_count = 0
+        _systemic_recent.clear()
+
+
+def _trip_systemic_breaker(worker_id: int) -> None:
+    """Halt the run and un-burn the recent systemic-failure streak: a string of pure
+    no-result/timeout failures means the environment died (auth/API/CDP), not the
+    postings, so reset those jobs to retryable instead of leaving them burned to
+    attempts=99. Then stop so nobody has to babysit a run that's silently failing."""
+    with _systemic_fail_lock:
+        urls = list(_systemic_recent)
+        _systemic_recent.clear()
+    try:
+        conn = get_connection()
+        for u in urls:
+            conn.execute(
+                "UPDATE jobs SET apply_status = NULL, apply_error = 'systemic_halt', "
+                "apply_attempts = 0, agent_id = NULL WHERE url = ?",
+                (u,),
+            )
+        conn.commit()
+    except Exception:
+        logger.debug("systemic-streak un-burn failed", exc_info=True)
+    add_event(
+        f"[W{worker_id}] SYSTEMIC FAILURE BREAKER tripped ({SYSTEMIC_FAIL_BREAKER} consecutive "
+        f"no-result/timeout) -- almost certainly an auth/API/CDP outage, not the jobs. "
+        f"Halting and keeping {len(urls)} job(s) retryable. Check the apply agent's login/auth."
+    )
+    _stop_event.set()
+
+
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
@@ -1298,6 +1376,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                          last_action=f"polling ({empty_polls})")
             if empty_polls == 1:
                 add_event(f"[W{worker_id}] Queue empty, polling every {POLL_INTERVAL}s...")
+            # Optional clean exhaustion-exit for an UNATTENDED run: if nothing is
+            # acquirable for APPLYPILOT_EXIT_AFTER_EMPTY_POLLS consecutive polls, stop
+            # instead of spinning forever. This also breaks the all-lanes-paused case
+            # (LinkedIn capped/halted AND every offsite host breaker-halted -> acquire
+            # returns None every poll). 0 (default) keeps the classic "wait forever for
+            # new jobs" behavior, so an attended run polling for fresh discovery is
+            # unaffected.
+            _exit_after = int(os.environ.get("APPLYPILOT_EXIT_AFTER_EMPTY_POLLS") or 0)
+            if _exit_after > 0 and empty_polls >= _exit_after:
+                add_event(f"[W{worker_id}] Nothing acquirable for {empty_polls} polls "
+                          f"(~{empty_polls * POLL_INTERVAL}s) -- exiting continuous run")
+                update_state(worker_id, status="done", last_action="queue drained")
+                break
             # Use Event.wait for interruptible sleep
             if _stop_event.wait(timeout=POLL_INTERVAL):
                 break  # Stop was requested during wait
@@ -1338,6 +1429,22 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 release_lock(job["url"])
                 break
 
+        # Re-stamp the lease clock at LAUNCH time (after the pre-launch throttle +
+        # LinkedIn pacing waits, which can add minutes). The periodic reclaimer keys
+        # on last_attempted_at; without this, a long throttle wait + the full agent
+        # timeout could push lease-age past STALE_LEASE and let the reclaimer steal a
+        # still-live lease -> DOUBLE SUBMIT. Re-stamping bounds lease-age to the agent
+        # runtime (<= AGENT_TIMEOUT), comfortably under STALE_LEASE. It also tightens
+        # cross-process LinkedIn pacing, which reads last_attempted_at as a submit proxy.
+        if not dry_run:
+            try:
+                _lc = get_connection()
+                _lc.execute("UPDATE jobs SET last_attempted_at = ? WHERE url = ?",
+                            (datetime.now(timezone.utc).isoformat(), job["url"]))
+                _lc.commit()
+            except Exception:
+                logger.debug("[W%d] lease re-stamp failed", worker_id, exc_info=True)
+
         chrome_proc = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
@@ -1370,6 +1477,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
                 _update_host_breaker(job, ok=True, reason=None, worker_id=worker_id)
+                _note_healthy_outcome()  # proof-of-life: reset the systemic streak
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
@@ -1378,6 +1486,16 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
+                # Global systemic-failure breaker: a string of pure no-result/timeout
+                # failures means the environment died (auth/API/CDP), not the jobs --
+                # halt before the whole queue is burned and keep the streak retryable.
+                # Any other failure is proof-of-life (the agent reached the page) -> reset.
+                if _is_systemic_failure(reason):
+                    if _note_systemic_failure(job["url"]):
+                        _trip_systemic_breaker(worker_id)
+                        break
+                else:
+                    _note_healthy_outcome()
                 # Same-day LinkedIn halt: a pause/challenge/auth failure on a
                 # LinkedIn-lane job stops the LinkedIn lane for the rest of this run
                 # (no retry-storm); the offsite lane keeps going.
@@ -1399,9 +1517,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
+            release_lock(job["url"])  # keeps the job retryable
             failed += 1
             update_state(worker_id, jobs_failed=failed)
+            # A launcher error (Chrome/CDP failed to come up) is systemic, not job-
+            # specific -> feed the global breaker so a broken browser halts the run.
+            if _note_systemic_failure(job["url"]):
+                _trip_systemic_breaker(worker_id)
         finally:
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
@@ -1465,6 +1587,10 @@ def main(limit: int = 1, target_url: str | None = None,
     _li_cap_announced.clear()
     with _host_halt_lock:
         _offsite_halted_hosts.clear()
+    global _systemic_fail_count
+    with _systemic_fail_lock:
+        _systemic_fail_count = 0
+        _systemic_recent.clear()
 
     agent = _normalize_agent(agent)
     # Per-worker agent assignment: round-robin the `agents` list across workers so
