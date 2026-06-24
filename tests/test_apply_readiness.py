@@ -90,7 +90,9 @@ def test_preapply_readiness_flags_duplicate_application_targets(tmp_path: Path, 
     assert summary["issue_counts"]["duplicate_application_target"] == 2
 
 
-def test_preapply_readiness_blocks_auth_gated_applications(tmp_path: Path, monkeypatch) -> None:
+def test_preapply_readiness_warns_not_blocks_auth_gated_applications(tmp_path: Path, monkeypatch) -> None:
+    """auth_gate is a WARNING, not a blocker: one auth-gated job must not abort the
+    whole batch (the apply agent emits AUTH_REQUIRED -> permanent skip if it can't)."""
     conn = database.init_db(tmp_path / "applypilot.db")
     resume_path = tmp_path / "resume.txt"
     resume_path.write_text("resume text", encoding="utf-8")
@@ -110,6 +112,6 @@ def test_preapply_readiness_blocks_auth_gated_applications(tmp_path: Path, monke
     checks = readiness.collect_preapply_checks(min_score=7, limit=10, stale_days=0)
     summary = readiness.summarize_checks(checks)
 
-    assert summary["blocked"] == 1
-    assert checks[0]["severity"] == "blocked"
+    assert summary["blocked"] == 0  # auth_gate no longer aborts the batch
+    assert checks[0]["severity"] == "warning"
     assert "auth_gate" in {issue["code"] for issue in checks[0]["issues"]}

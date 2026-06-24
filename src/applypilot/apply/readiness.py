@@ -17,7 +17,8 @@ BLOCKER_CODES = {
     "invalid_application_url",
     "unsafe_application_url",
     "manual_ats",
-    "auth_gate",
+    # auth_gate intentionally NOT a blocker: one auth-gated job shouldn't abort the
+    # whole batch. Apply handles it (RESULT:AUTH_REQUIRED -> permanent skip).
     "missing_resume_pdf",
     "already_applied",
     "duplicate_application_target",
@@ -146,10 +147,15 @@ def evaluate_candidate(
         issues.append(_issue("blocker", "manual_ats", "Configured as manual ATS."))
 
     if config.is_auth_gated_application(target):
+        # WARNING, not a blocker: a single auth-gated job in the batch must not abort
+        # the whole run. The apply agent handles an auth wall gracefully -> emits
+        # RESULT:AUTH_REQUIRED, which is a PERMANENT failure (one-shot, no retry-storm)
+        # so the job is skipped without burning the run. (LinkedIn, auth-gated but
+        # applied via the cloned logged-in profile, still applies normally.)
         issues.append(_issue(
-            "blocker",
+            "warning",
             "auth_gate",
-            "Likely requires login, account creation, email verification, or 2FA; use assisted apply.",
+            "Likely requires login/account/2FA; agent will try and emit AUTH_REQUIRED (skipped) if it can't.",
         ))
 
     pdf_path = _resume_pdf_path(row)
