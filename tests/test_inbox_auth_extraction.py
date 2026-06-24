@@ -240,3 +240,39 @@ def test_accepts_common_auth_code_phrasings() -> None:
         assert candidates
         assert candidates[0].kind == "code"
         assert candidates[0].value == "123456"
+
+
+def test_non_ats_magic_link_from_known_ats_sender_is_not_high_confidence() -> None:
+    candidates = extract_verification_candidates(
+        subject="Your Greenhouse verification code",
+        body="Sign in at https://example.com/login to continue.",
+        sender="no-reply@greenhouse.io",
+    )
+
+    if candidates:
+        assert candidates[0].confidence != "high"
+
+
+def test_accepts_known_ats_verify_link_with_job_query_param() -> None:
+    candidates = extract_verification_candidates(
+        subject="Verify your email",
+        body="Click https://boards.greenhouse.io/verify?token=abc123&job=987 to continue.",
+        sender="no-reply@greenhouse.io",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "magic_link"
+    assert candidates[0].value.startswith("https://boards.greenhouse.io/verify?token=abc123&job=987")
+
+
+def test_accepts_plain_code_phrasing_with_strong_ats_verification_context() -> None:
+    for body in ("Your code is 123456", "Code: 123456"):
+        candidates = extract_verification_candidates(
+            subject="Your Greenhouse verification code",
+            body=body,
+            sender="no-reply@greenhouse.io",
+        )
+
+        assert candidates
+        assert candidates[0].kind == "code"
+        assert candidates[0].value == "123456"

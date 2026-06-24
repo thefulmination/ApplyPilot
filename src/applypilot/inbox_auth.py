@@ -64,6 +64,7 @@ _AUTH_CODE_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 _CODE_COMMAND_BEFORE_RE = re.compile(r"\b(?:enter|use)\s*$", re.IGNORECASE)
+_PLAIN_CODE_BEFORE_RE = re.compile(r"\b(?:your\s+)?code\s*(?:is|:)?\s*$", re.IGNORECASE)
 _AUTH_CODE_AFTER_RE = re.compile(
     r"^\s*(?:to\s+)?(?:verify|confirm)\s+your\s+email\b"
     r"|^\s*(?:to\s+)?(?:sign\s+in|continue\s+your\s+application)\b",
@@ -73,7 +74,10 @@ _NEGATIVE_CODE_PREFIX_RE = re.compile(
     r"\b(?:zip|postal|job|reference|support)\s*(?:id|code|number|#)?\s*(?:is|:|#)?\s*$",
     re.IGNORECASE,
 )
-_NEGATIVE_CODE_CONTEXT_RE = re.compile(r"\b(?:support|contact|contacting|reference)\b", re.IGNORECASE)
+_NEGATIVE_CODE_SUFFIX_RE = re.compile(
+    r"^\s*(?:when|for|as)\b.{0,60}\b(?:support|contact|contacting|reference)\b",
+    re.IGNORECASE,
+)
 _MAGIC_LINK_CONTEXT_RE = re.compile(
     r"\b(?:verify your email|confirm your email|magic link|sign in|sign-in|continue your application)\b",
     re.IGNORECASE,
@@ -168,7 +172,7 @@ def extract_verification_candidates(subject: str, body: str, sender: str) -> lis
         VerificationCandidate(
             kind=draft.kind,
             value=draft.value,
-            confidence=_confidence_for(draft.reasons, single_candidate),
+            confidence=_confidence_for(draft.kind, draft.reasons, single_candidate),
             reasons=draft.reasons,
             position=draft.position,
         )
@@ -194,7 +198,13 @@ def _extract_code_drafts(
         prefix = text[max(0, match.start() - 40) : match.start()]
         if _NEGATIVE_CODE_PREFIX_RE.search(prefix):
             continue
-        if not _has_auth_code_context(text, match.start(), match.end()):
+        if not _has_auth_code_context(
+            text,
+            match.start(),
+            match.end(),
+            sender_is_known_ats,
+            has_verification_language,
+        ):
             continue
 
         reasons = ["numeric_code", "nearby_verification_language", "auth_code_context"]
@@ -249,14 +259,21 @@ def _has_verification_language(text: str) -> bool:
     return any(word in lowered for word in VERIFY_WORDS)
 
 
-def _has_auth_code_context(text: str, start: int, end: int) -> bool:
+def _has_auth_code_context(
+    text: str,
+    start: int,
+    end: int,
+    sender_is_known_ats: bool,
+    has_verification_language: bool,
+) -> bool:
     prefix = text[max(0, start - 120) : start]
     suffix = text[end : min(len(text), end + 120)]
-    nearby = f"{prefix} {suffix}"
-    if _NEGATIVE_CODE_CONTEXT_RE.search(nearby):
+    if _NEGATIVE_CODE_SUFFIX_RE.search(suffix):
         return False
     if _AUTH_CODE_BEFORE_RE.search(prefix):
         return True
+    if _PLAIN_CODE_BEFORE_RE.search(prefix):
+        return sender_is_known_ats and has_verification_language
     return bool(_CODE_COMMAND_BEFORE_RE.search(prefix) and _AUTH_CODE_AFTER_RE.search(suffix))
 
 
@@ -266,14 +283,14 @@ def _has_magic_link_context(text: str) -> bool:
 
 def _has_auth_url_path(url: str) -> bool:
     parsed = urlparse(url)
-    path_query = f"{parsed.path}?{parsed.query}".lower()
-    return bool(_AUTH_URL_PATH_RE.search(path_query))
+    return bool(_AUTH_URL_PATH_RE.search(parsed.path.lower()))
 
 
 def _is_rejected_magic_link_path(url: str) -> bool:
+    if _has_auth_url_path(url):
+        return False
     parsed = urlparse(url)
-    path_query = f"{parsed.path}?{parsed.query}".lower()
-    return bool(_REJECTED_MAGIC_PATH_RE.search(path_query))
+    return bool(_REJECTED_MAGIC_PATH_RE.search(parsed.path.lower()))
 
 
 def _is_tracking_or_click_wrapper(url: str, domain: str) -> bool:
@@ -318,8 +335,17 @@ def _dedupe_drafts(drafts: list[_CandidateDraft]) -> list[_CandidateDraft]:
     return list(by_key.values())
 
 
-def _confidence_for(reasons: tuple[str, ...], single_candidate: bool) -> Confidence:
+def _confidence_for(kind: CandidateKind, reasons: tuple[str, ...], single_candidate: bool) -> Confidence:
     reason_set = set(reasons)
+    if kind == "magic_link":
+        if "known_ats_link" in reason_set and "verification_language" in reason_set and single_candidate:
+            return "high"
+        if "verification_language" in reason_set and ("known_ats_sender" in reason_set or "known_ats_link" in reason_set):
+            return "medium"
+        if "verification_language" in reason_set:
+            return "medium"
+        return "low"
+
     if "known_ats_sender" in reason_set and "verification_language" in reason_set and single_candidate:
         return "high"
     if "known_ats_link" in reason_set and "verification_language" in reason_set and single_candidate:
