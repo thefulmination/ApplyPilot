@@ -37,9 +37,29 @@ VERIFY_WORDS = {
     "continue your application",
 }
 
-_CODE_RE = re.compile(r"(?<![\d-])\d{4,8}(?![\d-])")
+_CODE_RE = re.compile(r"(?<![A-Za-z0-9-])\d{4,8}(?![A-Za-z0-9-])")
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _URL_VERIFY_TOKENS = ("verify", "confirm", "token", "magic", "continue")
+_AUTH_CODE_CONTEXT_RE = re.compile(
+    r"\b(?:verification|one[- ]time|authentication)\s+code\b"
+    r"|\b(?:enter|use)\s+(?:this\s+)?code\b"
+    r"|\byour\s+code\s+is\b"
+    r"|\botp\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_CODE_PREFIX_RE = re.compile(
+    r"\b(?:zip|postal|job|reference|support)\s+(?:id\s+)?(?:code|number|id|#)?\s*$",
+    re.IGNORECASE,
+)
+_MAGIC_LINK_CONTEXT_RE = re.compile(
+    r"\b(?:verify|verification|confirm|confirmation|magic link|continue your application)\b",
+    re.IGNORECASE,
+)
+_TRACKING_DOMAIN_LABELS = {"click", "track", "tracking", "trk", "link", "links"}
+_TRACKING_PATH_RE = re.compile(
+    r"(^|[/?&_.=-])(unsubscribe|unsub|pixel|tracking|track|click|redirect|open)([/?&_.=-]|$)",
+    re.IGNORECASE,
+)
 _CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 _GOOGLE_ACCOUNT_DOMAINS = {"accounts.google.com"}
 _GOOGLE_SECURITY_WORDS = (
@@ -62,6 +82,7 @@ class VerificationCandidate:
     value: str
     confidence: Confidence
     reasons: tuple[str, ...]
+    position: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,8 +93,8 @@ class _CandidateDraft:
     position: int
 
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def sender_domain(sender: str) -> str:
@@ -107,7 +128,7 @@ def is_google_security_prompt(subject: str, body: str, sender: str) -> bool:
         return True
 
     text = _combined_text(subject, body).lower()
-    return "google" in text and any(word in text for word in _GOOGLE_SECURITY_WORDS)
+    return any(word in text for word in _GOOGLE_SECURITY_WORDS)
 
 
 def extract_verification_candidates(subject: str, body: str, sender: str) -> list[VerificationCandidate]:
@@ -129,6 +150,7 @@ def extract_verification_candidates(subject: str, body: str, sender: str) -> lis
             value=draft.value,
             confidence=_confidence_for(draft.reasons, single_candidate),
             reasons=draft.reasons,
+            position=draft.position,
         )
         for draft in drafts
     ]
@@ -147,10 +169,13 @@ def _extract_code_drafts(
             continue
 
         window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
-        if not _has_verification_language(window):
+        prefix = text[max(0, match.start() - 40) : match.start()]
+        if _NEGATIVE_CODE_PREFIX_RE.search(prefix):
+            continue
+        if not _has_auth_code_context(window):
             continue
 
-        reasons = ["numeric_code", "nearby_verification_language"]
+        reasons = ["numeric_code", "nearby_verification_language", "auth_code_context"]
         if sender_is_known_ats:
             reasons.append("known_ats_sender")
         if has_verification_language:
@@ -171,10 +196,19 @@ def _extract_magic_link_drafts(
         if not any(token in lowered for token in _URL_VERIFY_TOKENS):
             continue
 
+        domain = url_domain(value)
+        known_ats_link = is_known_ats_domain(domain)
+        if _is_tracking_or_click_wrapper(value, domain) and not known_ats_link:
+            continue
+
+        window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
+        if not known_ats_link and not _has_magic_link_context(window):
+            continue
+
         reasons = ["magic_link"]
         if sender_is_known_ats:
             reasons.append("known_ats_sender")
-        if is_known_ats_domain(url_domain(value)):
+        if known_ats_link:
             reasons.append("known_ats_link")
         if has_verification_language:
             reasons.append("verification_language")
@@ -193,6 +227,25 @@ def _normalize_domain(domain: str) -> str:
 def _has_verification_language(text: str) -> bool:
     lowered = text.lower()
     return any(word in lowered for word in VERIFY_WORDS)
+
+
+def _has_auth_code_context(text: str) -> bool:
+    return bool(_AUTH_CODE_CONTEXT_RE.search(text))
+
+
+def _has_magic_link_context(text: str) -> bool:
+    return bool(_MAGIC_LINK_CONTEXT_RE.search(text))
+
+
+def _is_tracking_or_click_wrapper(url: str, domain: str) -> bool:
+    normalized_domain = _normalize_domain(domain)
+    labels = set(normalized_domain.split("."))
+    if labels & _TRACKING_DOMAIN_LABELS:
+        return True
+
+    parsed = urlparse(url)
+    path_query = f"{parsed.path}?{parsed.query}".lower()
+    return bool(_TRACKING_PATH_RE.search(path_query))
 
 
 def _looks_like_year(value: str) -> bool:
@@ -241,4 +294,4 @@ def _confidence_for(reasons: tuple[str, ...], single_candidate: bool) -> Confide
 
 def _candidate_sort_key(candidate: VerificationCandidate) -> tuple[int, int, str]:
     kind_order = 0 if candidate.kind == "code" else 1
-    return (-_CONFIDENCE_ORDER[candidate.confidence], kind_order, candidate.value)
+    return (-_CONFIDENCE_ORDER[candidate.confidence], candidate.position, kind_order, candidate.value)
