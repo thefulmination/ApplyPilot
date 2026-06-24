@@ -367,8 +367,55 @@ def get_applied_jobs() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Gmail scanning (Google API imported lazily — only called from scan-gmail CLI)
+# Gmail service helper and scanning (Google API imported lazily — only called from scan-gmail CLI)
 # ---------------------------------------------------------------------------
+
+def build_gmail_service(
+    credentials_path: Path | None = None,
+    token_path: Path | None = None,
+):
+    """Build a gmail service instance using read-only OAuth credentials."""
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise ImportError(
+            "Gmail scanning requires optional dependencies:\n"
+            "  pip install google-auth-oauthlib google-api-python-client\n"
+            "Then set up credentials — run `applypilot scan-gmail --help`."
+        ) from exc
+
+    from applypilot.config import APP_DIR
+
+    creds_path = credentials_path or (APP_DIR / "gmail_credentials.json")
+    tok_path = token_path or (APP_DIR / "gmail_token.json")
+
+    if not creds_path.exists():
+        raise FileNotFoundError(
+            f"Gmail credentials not found: {creds_path}\n\n"
+            "One-time setup:\n"
+            "  1. console.cloud.google.com → APIs & Services → Enable APIs → Gmail API\n"
+            "  2. Credentials → Create OAuth 2.0 Client ID (Desktop app)\n"
+            "  3. Download JSON → save as:\n"
+            f"     {creds_path}"
+        )
+
+    creds = None
+    if tok_path.exists():
+        creds = Credentials.from_authorized_user_file(str(tok_path), GMAIL_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        tok_path.write_text(creds.to_json(), encoding="utf-8")
+        log.info("Gmail token saved to %s", tok_path)
+
+    return build("gmail", "v1", credentials=creds)
+
 
 def _get_text_body(payload: dict[str, Any]) -> str:
     """Recursively extract plain text from a Gmail message payload."""
@@ -431,47 +478,10 @@ def scan_inbox(
     Returns:
         List of EmailOutcome objects (one per thread).
     """
-    try:
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from googleapiclient.discovery import build
-    except ImportError as exc:
-        raise ImportError(
-            "Gmail scanning requires optional dependencies:\n"
-            "  pip install google-auth-oauthlib google-api-python-client\n"
-            "Then set up credentials — run `applypilot scan-gmail --help`."
-        ) from exc
-
-    from applypilot.config import APP_DIR
-
-    creds_path = credentials_path or (APP_DIR / "gmail_credentials.json")
-    tok_path = token_path or (APP_DIR / "gmail_token.json")
-
-    if not creds_path.exists():
-        raise FileNotFoundError(
-            f"Gmail credentials not found: {creds_path}\n\n"
-            "One-time setup:\n"
-            "  1. console.cloud.google.com → APIs & Services → Enable APIs → Gmail API\n"
-            "  2. Credentials → Create OAuth 2.0 Client ID (Desktop app)\n"
-            "  3. Download JSON → save as:\n"
-            f"     {creds_path}"
-        )
-
-    # Auth — refresh existing token or run OAuth flow
-    creds = None
-    if tok_path.exists():
-        creds = Credentials.from_authorized_user_file(str(tok_path), GMAIL_SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), GMAIL_SCOPES)
-            creds = flow.run_local_server(port=0)
-        tok_path.write_text(creds.to_json(), encoding="utf-8")
-        log.info("Gmail token saved to %s", tok_path)
-
-    service = build("gmail", "v1", credentials=creds)
+    service = build_gmail_service(
+        credentials_path=credentials_path,
+        token_path=token_path,
+    )
 
     query = _search_query(days)
     log.info("Gmail query: %s", query)

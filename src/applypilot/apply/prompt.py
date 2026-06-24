@@ -425,7 +425,8 @@ If CapSolver genuinely failed (errorId > 0):
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False,
-                 worker_id: int = 0) -> str:
+                 worker_id: int = 0,
+                 inbox_auth_hint: str | None = None) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -540,6 +541,18 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         email_only_instruction = "Output RESULT:FAILED:email_application_requires_gmail_mcp. Gmail MCP is not enabled."
         email_verification_instruction = "Need email verification? Output RESULT:FAILED:email_verification_required. Gmail MCP is not enabled."
+
+    if inbox_auth_hint:
+        inbox_hint_section = f"""
+== INBOX AUTH HINT ==
+Use the inbox hint below BEFORE requesting a new verification step:
+{inbox_auth_hint}
+
+If the page asks for a verification code, enter this code exactly.
+If this is a link, open it and continue immediately.
+If the hint is rejected, stop and output RESULT:AUTH_REQUIRED so manual review can take over."""
+    else:
+        inbox_hint_section = ""
 
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
@@ -662,6 +675,8 @@ Output EXACTLY one RESULT: line as the LAST line of your response, using only th
 - Format-sensitive fields: read the placeholder text, match it exactly.
 
 {captcha_section}
+
+{inbox_hint_section}
 
 == WHEN TO GIVE UP ==
 - LOOP GUARD: track the pages/steps you visit. If you reach the same page/step a 3rd time, OR take 5+ actions with no visible progress toward submission -> RESULT:FAILED:stuck. Don't repeat the same action expecting a different result.
