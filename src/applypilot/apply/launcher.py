@@ -263,6 +263,126 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Near-duplicate reposting guard
+# ---------------------------------------------------------------------------
+# A company sometimes posts the SAME role twice with slightly different titles AND
+# different ATS job IDs -- e.g. Amae Health "Founder Associate, Growth & Partnership
+# Operations" (greenhouse job 4259921009) and "Business Development Associate, Growth
+# & Partnership Operations" (greenhouse job 4288094009), both on greenhouse.io/
+# amaehealth -> the applicant gets two confirmation emails for what's effectively one
+# role. Exact (company,title) + effective-url dedup MISS this: both the title and the
+# job ID differ. The reliable shared signal is the EMPLOYER's ATS board slug
+# (greenhouse.io/amaehealth), which both postings share and which generic aggregators
+# (chiefofstaffjob.com, hiring.cafe, linkedin) do NOT encode. So: if a candidate is on
+# the same employer board as an already-applied role AND their titles share enough
+# significant tokens, treat it as a re-post and skip it.
+NEAR_DUP_MIN_SHARED = int(os.environ.get("APPLYPILOT_NEAR_DUP_MIN_SHARED_TOKENS") or 3)
+# ATS hosts whose first real path segment identifies the EMPLOYER. Generic boards
+# (linkedin/indeed/hiring.cafe/themuse/chiefofstaffjob) are excluded -- their slug is
+# not the employer, so a board-slug match there would falsely merge distinct companies.
+_EMPLOYER_BOARD_HOSTS = (
+    "greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com",
+    "workable.com", "myworkdayjobs.com", "rippling.com", "jobvite.com",
+    "bamboohr.com", "recruitee.com", "teamtailor.com", "pinpointhq.com",
+)
+# Stopwords + employment-type/location boilerplate that aggregator titles tack on, so
+# token overlap reflects the actual ROLE, not "Full Time United States" noise.
+_TITLE_STOP = frozenset({
+    "of", "the", "to", "a", "an", "and", "for", "in", "at", "with", "or", "on", "by",
+    "full", "part", "time", "remote", "hybrid", "onsite", "contract", "intern",
+    "internship", "united", "states", "us", "usa", "new", "york", "san", "ny", "ca",
+    "sf", "senior", "sr", "junior", "jr",
+})
+
+
+def _employer_board_slug(url: str | None) -> str | None:
+    """Return 'host/employer' for ATS boards that encode the employer in the path
+    (greenhouse.io/amaehealth), else None for generic boards / unknown hosts."""
+    from urllib.parse import urlparse
+    u = urlparse(url or "")
+    host = (u.hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    # Normalize to the base ATS domain so subdomain variants of the same board
+    # (boards.greenhouse.io vs job-boards.greenhouse.io) collapse to one employer key.
+    base = next((h for h in _EMPLOYER_BOARD_HOSTS if host == h or host.endswith("." + h)), None)
+    if not base:
+        return None
+    parts = [s for s in (u.path or "").split("/")
+             if s and s.lower() not in ("jobs", "job", "careers", "career", "o", "embed")]
+    return f"{base}/{parts[0].lower()}" if parts else None
+
+
+def _sig_title_tokens(title: str | None) -> set[str]:
+    """Significant role tokens of a title (drop stopwords, boilerplate, digits)."""
+    return {
+        w for w in re.split(r"[^a-z0-9]+", (title or "").lower())
+        if w and len(w) > 1 and not w.isdigit() and w not in _TITLE_STOP
+    }
+
+
+def _find_near_duplicate_applied(conn, apply_url: str, title: str) -> str | None:
+    """If an already-applied role is the same posting re-listed (same employer ATS
+    board + >= NEAR_DUP_MIN_SHARED shared significant title tokens), return its title;
+    else None. Conservative: a too-generic candidate title (< the threshold of
+    significant tokens, e.g. 'Chief of Staff') never triggers a near-dup skip."""
+    cslug = _employer_board_slug(apply_url)
+    if not cslug:
+        return None  # generic board / unknown host -> can't identify the employer
+    ctoks = _sig_title_tokens(title)
+    if len(ctoks) < NEAR_DUP_MIN_SHARED:
+        return None
+    for r in conn.execute(
+        "SELECT title, COALESCE(application_url, url) AS tgt FROM jobs WHERE apply_status = 'applied'"
+    ):
+        if _employer_board_slug(r["tgt"]) != cslug:
+            continue
+        if len(ctoks & _sig_title_tokens(r["title"])) >= NEAR_DUP_MIN_SHARED:
+            return r["title"]
+    return None
+
+
+def audit_duplicate_applications(conn=None) -> list[dict]:
+    """Report likely DUPLICATE applications already in the DB: pairs of applied jobs
+    that are the same role re-listed -- same employer (ATS board slug, or same real
+    non-aggregator company) with the same effective target OR overlapping titles. This
+    surfaces near-duplicate company repostings (different job ID + tweaked title) that
+    exact dedup can't catch -- the monitor for the 'why is it double-applying' question.
+    Read-only."""
+    conn = conn or get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT url, title, company, COALESCE(application_url, url) AS tgt, applied_at "
+        "FROM jobs WHERE apply_status = 'applied'")]
+    out: list[dict] = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = rows[i], rows[j]
+            aslug, bslug = _employer_board_slug(a["tgt"]), _employer_board_slug(b["tgt"])
+            aco = (a["company"] or "").strip().lower()
+            bco = (b["company"] or "").strip().lower()
+            # The aggregator pseudo-company is not a real employer -> ignore it.
+            aco = "" if aco in ("", "chiefofstaffjob.com") else aco
+            bco = "" if bco in ("", "chiefofstaffjob.com") else bco
+            same_employer = (aslug and aslug == bslug) or (aco and aco == bco)
+            if not same_employer:
+                continue
+            if a["tgt"] == b["tgt"]:
+                kind, shared = "exact-target", []
+            else:
+                shared = sorted(_sig_title_tokens(a["title"]) & _sig_title_tokens(b["title"]))
+                if len(shared) < NEAR_DUP_MIN_SHARED:
+                    continue
+                kind = "near-duplicate"
+            out.append({
+                "kind": kind, "employer": aslug or aco,
+                "title_a": a["title"], "title_b": b["title"],
+                "url_a": a["url"], "url_b": b["url"],
+                "applied_a": a["applied_at"], "applied_b": b["applied_at"],
+                "shared_tokens": shared,
+            })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Database operations
 # ---------------------------------------------------------------------------
 
@@ -474,6 +594,26 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 if target_url:
                     return None  # the explicitly targeted URL is an unresolved aggregator
                 continue  # re-select the next candidate (this row is now excluded)
+
+            # Near-duplicate reposting guard: same employer ATS board + a highly similar
+            # title to an already-applied role means the company re-posted one role
+            # (different job ID + tweaked title) -- exact dedup can't see it, and applying
+            # again sends a SECOND application to the same role (the Amae Health case: a
+            # "Founder Associate" and a "Business Development Associate" listing, both
+            # ".../Growth & Partnership Operations" on greenhouse.io/amaehealth). Skip it.
+            # Off via APPLYPILOT_NEAR_DUP_MIN_SHARED_TOKENS=0.
+            if not target_url and NEAR_DUP_MIN_SHARED >= 1:
+                _dup_of = _find_near_duplicate_applied(conn, apply_url, row["title"] or "")
+                if _dup_of:
+                    conn.execute(
+                        "UPDATE jobs SET apply_status = 'deferred', "
+                        "apply_error = 'near_duplicate_role' WHERE url = ?",
+                        (row["url"],),
+                    )
+                    conn.commit()
+                    logger.info("Skipping near-duplicate of applied '%s': %s",
+                                _dup_of[:40], (row["title"] or "")[:40])
+                    continue  # re-select the next candidate
 
             now = datetime.now(timezone.utc).isoformat()
             conn.execute("""

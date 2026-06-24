@@ -1125,6 +1125,33 @@ def export_outcomes_command(
     )
 
 
+@app.command("audit-duplicates")
+def audit_duplicates_command() -> None:
+    """Report likely DUPLICATE applications (the same role applied more than once).
+
+    Catches near-duplicate company repostings -- one role listed twice with a tweaked
+    title + a new ATS job ID (e.g. Amae Health "Founder Associate" and "Business
+    Development Associate", both ".../Growth & Partnership Operations" on
+    greenhouse.io/amaehealth) -- which exact (company,title)+url dedup cannot see.
+    Read-only; run it anytime to spot double-applies the live guard may have missed.
+    """
+    _bootstrap()
+    from applypilot.apply.launcher import audit_duplicate_applications
+
+    dups = audit_duplicate_applications()
+    if not dups:
+        console.print("[green]No duplicate applications detected.[/green]")
+        return
+    console.print(f"\n[bold yellow]{len(dups)} likely-duplicate application pair(s):[/bold yellow]\n")
+    for d in dups:
+        console.print(f"  [bold]{d['employer']}[/bold]  [dim]({d['kind']})[/dim]")
+        console.print(f"     - {d['title_a']}  [dim]{(d['applied_a'] or '')[:19]}[/dim]")
+        console.print(f"     - {d['title_b']}  [dim]{(d['applied_b'] or '')[:19]}[/dim]")
+        if d["shared_tokens"]:
+            console.print(f"       [dim]shared role tokens: {', '.join(d['shared_tokens'])}[/dim]")
+    console.print()
+
+
 @app.command("scan-gmail")
 def scan_gmail_command(
     days: int = typer.Option(30, "--days", "-d", help="How many days back to search."),
