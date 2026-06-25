@@ -195,6 +195,8 @@ _ACK_SUBJECT = [
     "thank you for applying", "thanks for applying", "thank you for your application",
     "application received", "application confirmation", "we received your application",
     "we've received your application", "received your application", "application submitted",
+    # LinkedIn Easy Apply confirmation ("Jonathan, your application was sent to X")
+    "application was sent", "your application was sent",
 ]
 _ACK_BODY = [
     "thank you for applying", "thanks for applying", "we have received your application",
@@ -205,7 +207,7 @@ _ACK_BODY = [
     "we appreciate your interest", "thank you for your interest in",
     "received and we will", "application is being reviewed",
     "review every application", "if your background", "we'll be in touch",
-    "will be in touch",
+    "will be in touch", "application was sent", "your application was sent",
 ]
 
 # Known ATS sender domains — high-confidence job emails. Includes the *-mail.* sending
@@ -460,6 +462,8 @@ def _extract_company_from_subject(subject: str) -> str | None:
     # (pattern, is_company_first) -- company-first patterns reject boilerplate captures.
     patterns = [
         (r"^(.{2,45}?)\s*[|│:—–]\s*\S", True),                            # "<Company> | / — / : ..."
+        # "your application was sent to <Company>" (LinkedIn) / "your application to <Co>"
+        (r"application (?:was |is |has been )?(?:sent|submitted) to\s+(.+?)(?:\s+for\b.*)?$", False),
         (r"(?:opening|role|position|job|team)\s+at\s+(.+?)(?:\s+for\b.*)?(?:[!?.]|$)", False),
         # "applying to/at/with <Company>" -- stop at " for <role>".
         (r"appl(?:ying|ied|ication)\s+(?:to|at|with)\s+(?:the\s+)?(.+?)(?:\s+for\b.*)?$", False),
@@ -533,6 +537,18 @@ def _job_board_slug(job: dict[str, Any]) -> str | None:
     return None
 
 
+# --- LinkedIn job-id matching --------------------------------------------------
+# LinkedIn Easy Apply confirmation emails ("your application was sent to X") carry the
+# job id (.../jobs/view/<id> or currentJobId=<id>), which equals the applied LinkedIn
+# row's job id -> an exact match (no fuzzy company guessing). Pays off once applies go
+# through LinkedIn; harmless otherwise.
+_LINKEDIN_JID_RE = re.compile(r"(?:jobs/view/|currentjobid=)(\d{6,})", re.IGNORECASE)
+
+
+def _linkedin_job_ids(text: str) -> set[str]:
+    return set(_LINKEDIN_JID_RE.findall(text or ""))
+
+
 def _extract_title_from_subject(subject: str) -> str | None:
     """Pull a job title from the subject line."""
     patterns = [
@@ -583,14 +599,22 @@ def match_email_to_job(
         sender_domain.endswith(f".{d}") for d in _ATS_DOMAINS
     )
 
-    # 0. ATS board slug from links in the email -> applied job's application-URL slug.
-    #    Exact employer match (no fuzzy name guessing); the highest-precision signal.
+    # 0a. ATS board slug from links in the email -> applied job's application-URL slug.
+    #     Exact employer match (no fuzzy name guessing); the highest-precision signal.
     email_slugs = _board_slugs(subject) | _board_slugs(body)
     if email_slugs:
         for job in applied_jobs:
             js = _job_board_slug(job)
             if js and js in email_slugs:
                 return job, "board_slug", 1.0
+
+    # 0b. LinkedIn job id from the email -> applied LinkedIn row's job id (exact).
+    email_jids = _linkedin_job_ids(subject + " " + body)
+    if email_jids:
+        for job in applied_jobs:
+            jids = _linkedin_job_ids((job.get("url") or "") + " " + (job.get("application_url") or ""))
+            if jids & email_jids:
+                return job, "linkedin_job_id", 1.0
 
     # Company hints from BOTH subject and body -- try each (a garbage subject hint must
     # not block the body hint).

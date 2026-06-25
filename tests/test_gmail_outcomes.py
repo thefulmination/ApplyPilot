@@ -402,6 +402,38 @@ class TestBoardSlugMatching:
         assert job is not None and method == "board_slug"
 
 
+class TestLinkedIn:
+    """LinkedIn Easy Apply confirmations ('your application was sent to X') -- recognized
+    as acknowledgments, company extracted, and matched by exact job id."""
+
+    def test_application_was_sent_is_acknowledged(self):
+        outcome, _, _ = classify_email_outcome(
+            "Jonathan, your application was sent to Startup Resources",
+            "View your application on LinkedIn.", "jobs-noreply@linkedin.com")
+        assert outcome == "acknowledged"
+
+    def test_company_extracted_from_application_was_sent(self):
+        from applypilot.gmail_outcomes import _extract_company_from_subject
+        assert _extract_company_from_subject(
+            "Jonathan, your application was sent to Jobot") == "Jobot"
+
+    def test_linkedin_job_id_extraction(self):
+        from applypilot.gmail_outcomes import _linkedin_job_ids
+        ids = _linkedin_job_ids("see https://www.linkedin.com/jobs/view/4423505078/ and "
+                                "https://linkedin.com/jobs/collections/x?currentJobId=999888777")
+        assert ids == {"4423505078", "999888777"}
+
+    def test_linkedin_job_id_exact_match(self):
+        jobs = [{"url": "https://www.linkedin.com/jobs/view/4423505078", "title": "Chief of Staff",
+                 "application_url": None, "company": "Startup Resources", "site": "LinkedIn"}]
+        job, method, score = match_email_to_job(
+            sender="jobs-noreply@linkedin.com",
+            subject="Jonathan, your application was sent to Startup Resources",
+            body="Track it: https://www.linkedin.com/jobs/view/4423505078/",
+            applied_jobs=jobs)
+        assert job is not None and method == "linkedin_job_id"
+
+
 # ---------------------------------------------------------------------------
 # match_email_to_job
 # ---------------------------------------------------------------------------
