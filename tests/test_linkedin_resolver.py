@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import pytest
 
 from applypilot import database
 from applypilot import linkedin_resolver
@@ -145,6 +146,36 @@ def test_fetch_candidates_can_include_low_and_refresh_completed_statuses(tmp_pat
     }
 
 
+def test_fetch_candidates_filters_external_application_urls_host_aware(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/query-string",
+        audit_label="priority",
+        application_url="https://jobs.lever.co/acme/1?utm_source=linkedin.com",
+    )
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/linkedin-host",
+        audit_label="priority",
+        application_url="https://www.linkedin.com/jobs/view/123",
+    )
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/blank-host",
+        audit_label="priority",
+    )
+
+    rows = linkedin_resolver.fetch_candidates(limit=10, tiers=("priority",))
+
+    assert [row.url for row in rows] == [
+        "https://www.linkedin.com/jobs/view/linkedin-host",
+        "https://www.linkedin.com/jobs/view/blank-host",
+    ]
+
+
 def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
@@ -193,3 +224,49 @@ def test_record_resolution_does_not_overwrite_existing_offsite_without_refresh(t
         ("https://www.linkedin.com/jobs/view/already",),
     ).fetchone()[0]
     assert app_url == "https://boards.greenhouse.io/acme/jobs/old"
+
+
+def test_record_resolution_raises_when_job_missing(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    with pytest.raises(ValueError, match="Job not found: https://www.linkedin.com/jobs/view/missing"):
+        linkedin_resolver.record_resolution("https://www.linkedin.com/jobs/view/missing", status="easy_apply")
+
+
+def test_record_resolution_does_not_overwrite_with_invalid_or_internal_final_url(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/apply-url",
+        application_url="https://boards.greenhouse.io/acme/jobs/old",
+    )
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/apply-url",
+        status="resolved_offsite",
+        final_url="not a valid url",
+        error="bad final URL",
+    )
+
+    row = conn.execute(
+        """
+        SELECT application_url, linkedin_resolve_status, linkedin_resolve_attempts,
+               linkedin_resolve_final_url, linkedin_resolve_error
+        FROM jobs WHERE url = ?
+        """,
+        ("https://www.linkedin.com/jobs/view/apply-url",),
+    ).fetchone()
+
+    assert row["application_url"] == "https://boards.greenhouse.io/acme/jobs/old"
+    assert row["linkedin_resolve_status"] == "resolved_offsite"
+    assert row["linkedin_resolve_attempts"] == 1
+    assert row["linkedin_resolve_final_url"] == "not a valid url"
+    assert row["linkedin_resolve_error"] == "bad final URL"
+
+
+def test_should_stop_run_respects_stop_statuses():
+    assert linkedin_resolver.should_stop_run("login_required") is True
+    assert linkedin_resolver.should_stop_run("challenge_required") is True
+    assert linkedin_resolver.should_stop_run("easy_apply") is False

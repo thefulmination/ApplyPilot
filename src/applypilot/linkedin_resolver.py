@@ -97,11 +97,6 @@ def fetch_candidates(
            AND duplicate_of_url IS NULL
            AND COALESCE(liveness_status, '') != 'dead'
            AND applied_at IS NULL
-           AND (
-                application_url IS NULL
-             OR application_url = ''
-             OR application_url LIKE '%linkedin.com%'
-           )
            AND COALESCE(audit_label, '') IN ({tier_marks})
     """
 
@@ -120,17 +115,15 @@ def fetch_candidates(
            COALESCE(audit_score, -1) DESC,
            COALESCE(fit_score, -1) DESC,
            COALESCE(discovered_at, '') DESC
-         LIMIT ?
     """
 
     params: list[str | int] = [*wanted_tiers]
     if not refresh:
         params.extend(completed_params)
-    params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
 
-    return [
+    candidates = [
         Candidate(
             url=row["url"],
             title=row["title"],
@@ -141,7 +134,11 @@ def fetch_candidates(
             fit_score=row["fit_score"],
         )
         for row in rows
+        if not row["application_url"]
+        or not is_external_apply_url(row["application_url"])
     ]
+
+    return candidates[:limit]
 
 
 def record_resolution(
@@ -161,6 +158,8 @@ def record_resolution(
         "SELECT application_url FROM jobs WHERE url = ?",
         (url,),
     ).fetchone()
+    if existing is None:
+        raise ValueError(f"Job not found: {url}")
     current_app_url = existing["application_url"] if existing else None
 
     should_set_application = (
