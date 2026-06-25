@@ -215,7 +215,7 @@ def build_apply_agent_command(
                 # disallowedTools is honored even under bypassPermissions. The agent
                 # only needs the Playwright MCP tools (and optionally gmail) -- it
                 # never legitimately uses these built-ins.
-                "Bash,BashOutput,KillShell,Read,Write,Edit,MultiEdit,NotebookEdit,"
+                "Bash,BashOutput,KillShell,Read,Write,Edit,NotebookEdit,"
                 "WebFetch,WebSearch,Glob,Grep,Task,"
                 "mcp__gmail__draft_email,mcp__gmail__modify_email,"
                 "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
@@ -1069,6 +1069,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
+    worker_log.parent.mkdir(parents=True, exist_ok=True)  # belt-and-suspenders: covers the
+    # worker_log (below) AND the per-run job_log -- both live under LOG_DIR. ensure_dirs() is
+    # the primary guard; this makes run_job self-sufficient if a fresh env ever skips it.
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     llm_score_note = f" (LLM {job.get('fit_score')}/10)" if job.get("audit_score") is not None else ""
     log_header = (

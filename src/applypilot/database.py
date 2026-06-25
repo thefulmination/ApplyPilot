@@ -181,6 +181,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     ensure_application_tables(conn)
     ensure_inbox_auth_tables(conn)
     ensure_pipeline_tables(conn)
+    ensure_research_tables(conn)
 
     return conn
 
@@ -215,6 +216,15 @@ _ALL_COLUMNS: dict[str, str] = {
     "linkedin_resolve_error": "TEXT",
     "linkedin_resolve_attempts": "INTEGER DEFAULT 0",
     "linkedin_resolve_final_url": "TEXT",
+    # Cross-source apply URL resolver. This lets LinkedIn rows inherit a real
+    # ATS/company apply URL from an already-discovered matching job.
+    "apply_url_resolved_at": "TEXT",
+    "apply_url_resolution_strategy": "TEXT",
+    "apply_url_resolution_confidence": "REAL",
+    "apply_url_resolution_source": "TEXT",
+    "apply_url_resolution_error": "TEXT",
+    "apply_url_resolution_attempts": "INTEGER DEFAULT 0",
+    "apply_url_resolution_matched_url": "TEXT",
     "detail_attempts": "INTEGER DEFAULT 0",
     # Scoring
     "fit_score": "INTEGER",
@@ -274,6 +284,15 @@ _ALL_COLUMNS: dict[str, str] = {
     "liveness_status": "TEXT",        # live | dead | uncertain (NULL = unchecked)
     "last_verified_live": "TEXT",     # ISO8601 timestamp of last liveness probe
     "liveness_reason": "TEXT",        # signal that produced the verdict
+    # Research advisory scores (denormalized "current best research opinion" written by the
+    # TS KG scorer; detail rows live in research_scores). ADVISORY ONLY -- NEVER folded into
+    # COALESCE(audit_score, fit_score); reaches the apply gate only via owner promotion.
+    # Spec: docs/superpowers/specs/2026-06-25-unified-brain-pipeline-design.md §1b.
+    "research_fit_score": "REAL",
+    "research_decision": "TEXT",
+    "research_model": "TEXT",
+    "research_scored_at": "TEXT",
+    "research_opt_in": "INTEGER DEFAULT 0",
 }
 
 
@@ -579,6 +598,105 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_status ON auth_challenges(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_job_url ON auth_challenges(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)")
+    conn.commit()
+
+
+def ensure_research_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create the research layer the TS KG scorer writes into (unified-brain pipeline,
+    spec 2026-06-25-unified-brain-pipeline-design §1). ADDITIVE + idempotent. Python OWNS this
+    schema; the TS `brainDb.ts` layer only INSERTs into these tables, never issues DDL. ALL of
+    this is ADVISORY -- it never changes the apply gate unless promoted via import-decisions.
+
+    research_labels is a ONE-WAY sink fed by both the JSONL logs and Supabase label_events
+    (deduped by event id; §9.2). KG artifacts/runs version the graph each score was computed
+    against (§5). Keyed to jobs.url."""
+    if conn is None:
+        conn = get_connection()
+
+    # KG artifact + provenance first (research_scores.kg_version references them).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_kg_artifacts (
+            kg_version            TEXT PRIMARY KEY,
+            compact_kg_json       BLOB,
+            built_at              TEXT,
+            input_label_count     INTEGER,
+            inputs_sha            TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_kg_runs (
+            kg_version            TEXT PRIMARY KEY,
+            built_at              TEXT,
+            resume_path           TEXT,
+            resume_sha            TEXT,
+            n_label_events        INTEGER,
+            n_capabilities        INTEGER,
+            compact_kg_path       TEXT,
+            source                TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_scores (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_url                TEXT NOT NULL,
+            item_id                TEXT,
+            provider               TEXT,
+            model                  TEXT,
+            research_fit_score     REAL,
+            research_decision      TEXT,
+            confidence             TEXT,
+            reason                 TEXT,
+            positive_signals_json  TEXT,
+            gaps_json              TEXT,
+            evidence_node_ids_json TEXT,
+            score_source           TEXT,
+            raw_fit_score          REAL,
+            kg_version             TEXT,
+            scored_at              TEXT,
+            ingested_at            TEXT,
+            UNIQUE(job_url, provider, model, scored_at),
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_labels (
+            id                    TEXT PRIMARY KEY,
+            job_url               TEXT,
+            item_id               TEXT,
+            source_project_id     TEXT,
+            decision              TEXT,
+            rating                INTEGER,
+            reason                TEXT,
+            cleaned_reason        TEXT,
+            tags_json             TEXT,
+            method                TEXT,
+            fit_map_feedback_json TEXT,
+            review_queue_json     TEXT,
+            item_status_at_review TEXT,
+            created_at            TEXT,
+            raw_event_json        TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_pairwise_labels (
+            id                    TEXT PRIMARY KEY,
+            left_job_url          TEXT,
+            right_job_url         TEXT,
+            left_item_id          TEXT,
+            right_item_id         TEXT,
+            winner                TEXT,
+            method                TEXT,
+            source_project_id     TEXT,
+            created_at            TEXT,
+            raw_event_json        TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_job_url ON research_scores(job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_model ON research_scores(model)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_scored_at ON research_scores(scored_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_labels_job_url ON research_labels(job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_pairwise_left ON research_pairwise_labels(left_job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_pairwise_right ON research_pairwise_labels(right_job_url)")
     conn.commit()
 
 

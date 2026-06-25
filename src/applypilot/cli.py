@@ -119,6 +119,11 @@ def run(
         help="Maximum jobs per tailor/cover/pdf stage run. Use 0 for all eligible jobs.",
     ),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    generation_workers: int = typer.Option(
+        1,
+        "--generation-workers",
+        help="Parallel LLM workers for tailor/cover stages. Keep modest to avoid rate limits.",
+    ),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
     validation: str = typer.Option(
@@ -179,6 +184,9 @@ def run(
     if batch_size < 0:
         console.print("[red]Invalid --batch-size:[/red] use 0 or a positive number.")
         raise typer.Exit(code=1)
+    if generation_workers < 1:
+        console.print("[red]Invalid --generation-workers:[/red] use 1 or a positive number.")
+        raise typer.Exit(code=1)
     valid_discover_modes = ("safe", "fast", "full")
     if discover_mode not in valid_discover_modes:
         console.print(
@@ -194,6 +202,7 @@ def run(
         dry_run=dry_run,
         stream=stream,
         workers=workers,
+        generation_workers=generation_workers,
         validation_mode=validation,
         discover_mode=discover_mode,
     )
@@ -402,6 +411,7 @@ def linkedin_resolve_apply_urls_command(
     dry_run: bool = typer.Option(False, "--dry-run", help="List candidates without opening LinkedIn."),
     browser: str = typer.Option("chrome", "--browser", help="Browser profile source: chrome, edge, cft, chromium, or default."),
     worker_id: int = typer.Option(80, "--worker-id", help="Resolver browser worker id; keep separate from apply workers."),
+    chunk_size: int = typer.Option(10, "--chunk-size", help="Restart browser after this many LinkedIn pages. 0 disables chunking."),
 ) -> None:
     """Resolve external ATS apply URLs from LinkedIn job pages without applying."""
     _bootstrap()
@@ -418,6 +428,9 @@ def linkedin_resolve_apply_urls_command(
     if browser_name not in {"chrome", "edge", "cft", "chromium", "default"}:
         console.print("[red]--browser must be one of chrome, edge, cft, chromium, or default.[/red]")
         raise typer.Exit(code=1)
+    if chunk_size < 0:
+        console.print("[red]--chunk-size must be 0 or a positive number.[/red]")
+        raise typer.Exit(code=1)
 
     summary = linkedin_resolver.run_resolver(
         linkedin_resolver.ResolverOptions(
@@ -430,6 +443,7 @@ def linkedin_resolve_apply_urls_command(
             delay_max=delay_max,
             browser=browser_name,
             worker_id=worker_id,
+            chunk_size=chunk_size,
         )
     )
 
@@ -445,6 +459,189 @@ def linkedin_resolve_apply_urls_command(
     if summary.stopped_reason:
         console.print(f"  [yellow]stopped:[/yellow] {summary.stopped_reason}")
     console.print("[dim]Next: run `applypilot linkedin-split` to inspect the offsite/Easy Apply split.[/dim]")
+
+
+@app.command("resolve-company-apply-urls")
+def resolve_company_apply_urls_command(
+    limit: int = typer.Option(200, "--limit", help="Maximum unresolved LinkedIn jobs to inspect."),
+    tiers: str = typer.Option("priority,recommended", "--tiers", help="Comma-separated audit labels to include."),
+    include_low: bool = typer.Option(False, "--include-low", help="Also include review and low audit labels."),
+    refresh: bool = typer.Option(False, "--refresh", help="Revisit rows already processed by company matching."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview matches without writing application_url."),
+    min_confidence: float = typer.Option(0.86, "--min-confidence", help="Minimum company/title/location confidence to accept."),
+) -> None:
+    """Resolve LinkedIn jobs by matching them to existing company/ATS rows in the DB."""
+    _bootstrap()
+    from applypilot import company_resolver
+
+    parsed_tiers = tuple(t.strip() for t in tiers.split(",") if t.strip())
+    if not parsed_tiers:
+        console.print("[red]--tiers must include at least one audit label.[/red]")
+        raise typer.Exit(code=1)
+    if limit < 0:
+        console.print("[red]--limit must be 0 or a positive number.[/red]")
+        raise typer.Exit(code=1)
+    if min_confidence <= 0 or min_confidence > 1:
+        console.print("[red]--min-confidence must be between 0 and 1.[/red]")
+        raise typer.Exit(code=1)
+
+    summary = company_resolver.run_resolver(
+        company_resolver.CompanyResolverOptions(
+            limit=limit,
+            tiers=parsed_tiers,
+            include_low=include_low,
+            refresh=refresh,
+            dry_run=dry_run,
+            min_confidence=min_confidence,
+        )
+    )
+
+    console.print("\n[bold]Company apply URL resolver[/bold]")
+    console.print(f"  considered: {summary.considered}")
+    if summary.dry_run:
+        console.print("  mode:       dry run")
+    for status, count in sorted((summary.counts or {}).items()):
+        console.print(f"  {status}: {count}")
+    for url in summary.sample_urls or []:
+        console.print(f"  - {url}")
+    console.print("[dim]Next: run `applypilot linkedin-split`; use LinkedIn browser resolver only for leftovers.[/dim]")
+
+
+@app.command("boost-output")
+def boost_output_command(
+    target_ready: int = typer.Option(300, "--target-ready", help="Build ready-to-apply queue to at least this size."),
+    company_limit: int = typer.Option(2000, "--company-limit", help="LinkedIn rows to try resolving via company/ATS matches."),
+    verify_limit: int = typer.Option(500, "--verify-limit", help="Ready/high-priority jobs to liveness-check before generation. 0 disables."),
+    verify_workers: int = typer.Option(16, "--verify-workers", help="Concurrent liveness probes."),
+    batch_size: int = typer.Option(500, "--batch-size", help="Tailor/cover/pdf batch size per pass."),
+    generation_workers: int = typer.Option(
+        4,
+        "--generation-workers",
+        help="Parallel LLM workers for tailor/cover during queue generation.",
+    ),
+    max_passes: int = typer.Option(5, "--max-passes", help="Maximum generation passes before stopping."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum score for generation/apply. Defaults to config."),
+    validation: str = typer.Option("lenient", "--validation", help="Generation validation mode: strict, normal, or lenient."),
+    start_apply: bool = typer.Option(False, "--start-apply", help="After queue build, start supervised apply."),
+    apply_workers: int = typer.Option(2, "--apply-workers", help="Workers for supervised apply when --start-apply is set."),
+    agents: str = typer.Option("claude,codex", "--agents", help="Reserved for the direct apply command; supervisor currently uses configured apply agent."),
+    model: str = typer.Option("sonnet", "--model", help="Apply-agent model when --start-apply is set."),
+    max_cost_usd: float = typer.Option(90.0, "--max-cost-usd", help="Apply budget when --start-apply is set."),
+    linkedin_daily_cap: int = typer.Option(0, "--linkedin-daily-cap", help="LinkedIn cap for supervised apply. 0 = no cap."),
+    max_job_age_days: int = typer.Option(45, "--max-job-age-days", help="Skip older jobs during supervised apply."),
+) -> None:
+    """Increase application throughput by filling the ready queue before apply."""
+    _bootstrap()
+
+    from applypilot import company_resolver, config
+    from applypilot.apply import liveness
+    from applypilot.database import get_connection, get_stats
+    from applypilot.pipeline import run_pipeline
+
+    if min_score is None:
+        min_score = config.get_min_score()
+    if target_ready < 0:
+        console.print("[red]--target-ready must be 0 or a positive number.[/red]")
+        raise typer.Exit(code=1)
+    if company_limit < 0 or verify_limit < 0 or batch_size < 0 or max_passes < 0:
+        console.print("[red]Limits, batch size, and max passes must be 0 or positive numbers.[/red]")
+        raise typer.Exit(code=1)
+    if validation not in {"strict", "normal", "lenient"}:
+        console.print("[red]--validation must be strict, normal, or lenient.[/red]")
+        raise typer.Exit(code=1)
+    if apply_workers < 1:
+        console.print("[red]--apply-workers must be at least 1.[/red]")
+        raise typer.Exit(code=1)
+    if generation_workers < 1:
+        console.print("[red]--generation-workers must be at least 1.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold]ApplyPilot output boost[/bold]")
+    before = get_stats()
+    console.print(f"  Ready before:        {before.get('ready_to_apply', 0)}")
+    console.print(f"  Target ready:        {target_ready}")
+    console.print(f"  Generation workers:  {generation_workers}")
+
+    if company_limit:
+        res = company_resolver.run_resolver(
+            company_resolver.CompanyResolverOptions(
+                limit=company_limit,
+                tiers=("priority", "recommended"),
+                min_confidence=0.86,
+            )
+        )
+        resolved = (res.counts or {}).get("resolved_company_match", 0)
+        console.print(f"  Company URL matches: {resolved} / {res.considered}")
+
+    if verify_limit:
+        conn = get_connection()
+        live = liveness.verify_jobs(
+            conn,
+            tiers=["priority", "recommended"],
+            max_age_days=7,
+            limit=verify_limit,
+            workers=verify_workers,
+            dry_run=False,
+        )
+        by_status = live.get("by_status", {}) or {}
+        console.print(
+            "  Liveness checked:    "
+            f"{live.get('checked', 0)} "
+            f"(live={by_status.get('live', 0)}, dead={by_status.get('dead', 0)}, "
+            f"uncertain={by_status.get('uncertain', 0)})"
+        )
+
+    passes = 0
+    last_ready = int(get_stats().get("ready_to_apply", 0) or 0)
+    while last_ready < target_ready and passes < max_passes:
+        passes += 1
+        console.print(
+            f"\n  [cyan]Generation pass {passes}/{max_passes}[/cyan] "
+            f"(ready={last_ready}, batch={batch_size})"
+        )
+        result = run_pipeline(
+            stages=["tailor", "cover", "pdf"],
+            min_score=min_score,
+            batch_size=batch_size,
+            workers=1,
+            generation_workers=generation_workers,
+            validation_mode=validation,
+            discover_mode="safe",
+        )
+        if result.get("errors"):
+            console.print(f"[red]Generation stopped with errors:[/red] {result['errors']}")
+            raise typer.Exit(code=1)
+        current_ready = int(get_stats().get("ready_to_apply", 0) or 0)
+        console.print(f"  Ready now:           {current_ready}")
+        if current_ready <= last_ready:
+            console.print("[yellow]Ready queue did not grow this pass; stopping to avoid a loop.[/yellow]")
+            break
+        last_ready = current_ready
+
+    final = get_stats()
+    console.print("\n[bold green]ApplyPilot output boost complete[/bold green]")
+    console.print(f"  Ready to apply:      {final.get('ready_to_apply', 0)}")
+    console.print(f"  Tailored resumes:    {final.get('tailored', 0)}")
+    console.print(f"  Cover letters:       {final.get('with_cover_letter', 0)}")
+    console.print(f"  Applied:             {final.get('applied', 0)}")
+
+    if start_apply:
+        console.print("\n[bold blue]Starting supervised apply[/bold blue]")
+        console.print(f"  Agents hint:         {agents}")
+        from applypilot.apply.supervisor import supervise
+
+        supervise(
+            total_cost_usd=max_cost_usd,
+            model=model,
+            workers=apply_workers,
+            linkedin_daily_cap=linkedin_daily_cap,
+            base_resume=True,
+            max_job_age_days=max_job_age_days,
+            lane_filter=True,
+            preflight_liveness=True,
+        )
+    else:
+        console.print("[dim]Apply was not started. Pass --start-apply after stopping any existing apply worker.[/dim]")
 
 
 @app.command("apply-failures")

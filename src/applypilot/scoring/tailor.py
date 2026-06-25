@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile, load_resume_strategy
@@ -699,13 +700,15 @@ def tailor_resume(
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 900,
-                  validation_mode: str = "normal") -> dict:
+                  validation_mode: str = "normal",
+                  workers: int = 1) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
         limit:           Maximum jobs to process. 0 means all eligible jobs.
         validation_mode: "strict", "normal", or "lenient".
+        workers:         Concurrent LLM generation workers. SQLite writes stay serial.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
@@ -722,7 +725,11 @@ def run_tailoring(min_score: int = 7, limit: int = 900,
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
+    worker_count = max(1, min(int(workers or 1), len(jobs)))
+    log.info(
+        "Tailoring resumes for %d jobs (score >= %d, workers=%d)...",
+        len(jobs), min_score, worker_count,
+    )
     t0 = time.time()
     completed = 0
     results: list[dict] = []
@@ -734,100 +741,118 @@ def run_tailoring(min_score: int = 7, limit: int = 900,
         "error": 0,
     }
 
-    for job in jobs:
-        completed += 1
+    def _generate(job: dict) -> dict:
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              resume_strategy=resume_strategy,
                                              validation_mode=validation_mode)
-
-            # Build safe filename prefix
-            prefix = _safe_job_prefix(job)
-
-            # Save tailored resume text (write to .tmp then rename so a crash
-            # mid-write never leaves a partial file at the final path)
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            tmp = txt_path.with_suffix(".tmp")
-            tmp.write_text(tailored, encoding="utf-8")
-            os.replace(tmp, txt_path)
-
-            # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
-            job_desc = (
-                f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
-                f"Location: {job.get('location', 'N/A')}\n"
-                f"Score: {job.get('fit_score', 'N/A')}\n"
-                f"URL: {job['url']}\n\n"
-                f"{job.get('full_description', '')}"
-            )
-            tmp = job_path.with_suffix(".tmp")
-            tmp.write_text(job_desc, encoding="utf-8")
-            os.replace(tmp, job_path)
-
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            tmp = report_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            os.replace(tmp, report_path)
-
-            # Generate PDF for approved resumes (best-effort)
-            pdf_path = None
-            if report["status"] == "approved":
-                try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
-
-            result = {
+            return {
                 "url": job["url"],
-                "path": str(txt_path),
-                "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
                 "status": report["status"],
                 "attempts": report["attempts"],
                 "model_used": report.get("model_used"),
+                "tailored": tailored,
+                "report": report,
+                "job": job,
             }
         except Exception as e:
-            result = {
+            return {
                 "url": job["url"], "title": job["title"], "site": job["site"],
                 "status": "error", "attempts": 0, "path": None, "pdf_path": None,
                 "model_used": None,
+                "error": str(e),
+                "job": job,
             }
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
-        results.append(result)
-        stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+    futures = []
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(_generate, job) for job in jobs]
 
-        elapsed = time.time() - t0
-        rate = completed / elapsed if elapsed > 0 else 0
-        log.info(
-            "%d/%d [%s] attempts=%s model=%s | %.1f jobs/min | %s",
-            completed, len(jobs),
-            result["status"].upper(),
-            result.get("attempts", "?"),
-            result.get("model_used") or "?",
-            rate * 60,
-            result["title"][:40],
-        )
+        for future in as_completed(futures):
+            completed += 1
+            result = future.result()
+            job = result["job"]
 
-        # Persist after every job so Ctrl+C or a later slow request does not
-        # lose already-generated resumes.
-        now = datetime.now(timezone.utc).isoformat()
-        if result["status"] == "approved":
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (result["path"], now, result["url"]),
+            if result["status"] != "error":
+                # Build safe filename prefix
+                prefix = _safe_job_prefix(job)
+
+                # Save tailored resume text (write to .tmp then rename so a crash
+                # mid-write never leaves a partial file at the final path)
+                txt_path = TAILORED_DIR / f"{prefix}.txt"
+                tmp = txt_path.with_suffix(".tmp")
+                tmp.write_text(result["tailored"], encoding="utf-8")
+                os.replace(tmp, txt_path)
+
+                # Save job description for traceability
+                job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+                job_desc = (
+                    f"Title: {job['title']}\n"
+                    f"Company: {job['site']}\n"
+                    f"Location: {job.get('location', 'N/A')}\n"
+                    f"Score: {job.get('fit_score', 'N/A')}\n"
+                    f"URL: {job['url']}\n\n"
+                    f"{job.get('full_description', '')}"
+                )
+                tmp = job_path.with_suffix(".tmp")
+                tmp.write_text(job_desc, encoding="utf-8")
+                os.replace(tmp, job_path)
+
+                # Save validation report
+                report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+                tmp = report_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(result["report"], indent=2), encoding="utf-8")
+                os.replace(tmp, report_path)
+
+                # Generate PDF for approved resumes (best-effort)
+                pdf_path = None
+                if result["status"] == "approved":
+                    try:
+                        from applypilot.scoring.pdf import convert_to_pdf
+                        pdf_path = str(convert_to_pdf(txt_path))
+                    except Exception:
+                        log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                result["path"] = str(txt_path)
+                result["pdf_path"] = pdf_path
+            else:
+                log.error(
+                    "%d/%d [ERROR] %s -- %s",
+                    completed, len(jobs), job["title"][:40], result.get("error", ""),
+                )
+
+            results.append(result)
+            stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+
+            elapsed = time.time() - t0
+            rate = completed / elapsed if elapsed > 0 else 0
+            log.info(
+                "%d/%d [%s] attempts=%s model=%s | %.1f jobs/min | %s",
+                completed, len(jobs),
+                result["status"].upper(),
+                result.get("attempts", "?"),
+                result.get("model_used") or "?",
+                rate * 60,
+                result["title"][:40],
             )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (result["url"],),
-            )
-        conn.commit()
+
+            # Persist after every job in the caller thread so Ctrl+C or a later
+            # slow request does not lose generated resumes, while SQLite keeps a
+            # single writer.
+            now = datetime.now(timezone.utc).isoformat()
+            if result["status"] == "approved":
+                conn.execute(
+                    "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                    "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                    (result["path"], now, result["url"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                    (result["url"],),
+                )
+            conn.commit()
 
     elapsed = time.time() - t0
     log.info(

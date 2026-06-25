@@ -1,0 +1,17 @@
+# Keep the `railway up` upload lean (the Dockerfile build context is further trimmed by
+# .dockerignore). Exclude big/local/secret dirs from the upload to Railway's builder.
+.git
+.conda-env
+.venv
+.applypilot
+.codex
+.claude
+node_modules
+**/__pycache__
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache
+*.log
+chrome-workers
+apply-workers

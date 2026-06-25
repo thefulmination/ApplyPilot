@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile, load_resume_strategy
@@ -281,13 +282,15 @@ def generate_cover_letter(
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_cover_letters(min_score: int = 7, limit: int = 900,
-                      validation_mode: str = "normal") -> dict:
+                      validation_mode: str = "normal",
+                      workers: int = 1) -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
     Args:
         min_score:       Minimum audited score / fit_score threshold.
         limit:           Maximum jobs to process. 0 means all eligible jobs.
         validation_mode: "strict", "normal", or "lenient".
+        workers:         Concurrent LLM generation workers. SQLite writes stay serial.
 
     Returns:
         {"generated": int, "errors": int, "elapsed": float}
@@ -323,77 +326,93 @@ def run_cover_letters(min_score: int = 7, limit: int = 900,
         jobs = [dict(zip(columns, row)) for row in jobs]
 
     COVER_LETTER_DIR.mkdir(parents=True, exist_ok=True)
+    worker_count = max(1, min(int(workers or 1), len(jobs)))
     log.info(
-        "Generating cover letters for %d jobs (score >= %d)...",
-        len(jobs), min_score,
+        "Generating cover letters for %d jobs (score >= %d, workers=%d)...",
+        len(jobs), min_score, worker_count,
     )
     t0 = time.time()
     completed = 0
     results: list[dict] = []
     error_count = 0
 
-    for job in jobs:
-        completed += 1
+    def _generate(job: dict) -> dict:
         try:
             letter = generate_cover_letter(resume_text, job, profile,
                                           resume_strategy=resume_strategy,
                                           validation_mode=validation_mode)
-
-            # Build safe filename prefix
-            prefix = _safe_job_prefix(job)
-
-            cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
-            tmp = cl_path.with_suffix(".tmp")
-            tmp.write_text(letter, encoding="utf-8")
-            os.replace(tmp, cl_path)
-
-            # Generate PDF (best-effort)
-            pdf_path = None
-            try:
-                from applypilot.scoring.pdf import convert_to_pdf
-                pdf_path = str(convert_to_pdf(cl_path))
-            except Exception:
-                log.debug("PDF generation failed for %s", cl_path, exc_info=True)
-
-            result = {
+            return {
                 "url": job["url"],
-                "path": str(cl_path),
-                "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
+                "letter": letter,
+                "job": job,
             }
-            results.append(result)
-
-            elapsed = time.time() - t0
-            rate = completed / elapsed if elapsed > 0 else 0
-            log.info(
-                "%d/%d [OK] | %.1f jobs/min | %s",
-                completed, len(jobs), rate * 60, result["title"][:40],
-            )
         except Exception as e:
-            result = {
+            return {
                 "url": job["url"], "title": job["title"], "site": job["site"],
                 "path": None, "pdf_path": None, "error": str(e),
+                "job": job,
             }
-            error_count += 1
-            results.append(result)
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
 
-        # Persist after every job so Ctrl+C or a later slow request does not
-        # lose already-generated cover letters.
-        now = datetime.now(timezone.utc).isoformat()
-        if result.get("path"):
-            conn.execute(
-                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
-                "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (result["path"], now, result["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (result["url"],),
-            )
-        conn.commit()
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(_generate, job) for job in jobs]
+
+        for future in as_completed(futures):
+            completed += 1
+            result = future.result()
+            job = result["job"]
+
+            if result.get("letter") is not None:
+                # Build safe filename prefix
+                prefix = _safe_job_prefix(job)
+
+                cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
+                tmp = cl_path.with_suffix(".tmp")
+                tmp.write_text(result["letter"], encoding="utf-8")
+                os.replace(tmp, cl_path)
+
+                # Generate PDF (best-effort)
+                pdf_path = None
+                try:
+                    from applypilot.scoring.pdf import convert_to_pdf
+                    pdf_path = str(convert_to_pdf(cl_path))
+                except Exception:
+                    log.debug("PDF generation failed for %s", cl_path, exc_info=True)
+
+                result["path"] = str(cl_path)
+                result["pdf_path"] = pdf_path
+                elapsed = time.time() - t0
+                rate = completed / elapsed if elapsed > 0 else 0
+                log.info(
+                    "%d/%d [OK] | %.1f jobs/min | %s",
+                    completed, len(jobs), rate * 60, result["title"][:40],
+                )
+            else:
+                error_count += 1
+                log.error(
+                    "%d/%d [ERROR] %s -- %s",
+                    completed, len(jobs), job["title"][:40], result.get("error", ""),
+                )
+
+            results.append(result)
+
+            # Persist after every job in the caller thread so Ctrl+C or a later
+            # slow request does not lose generated cover letters, while SQLite
+            # keeps a single writer.
+            now = datetime.now(timezone.utc).isoformat()
+            if result.get("path"):
+                conn.execute(
+                    "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
+                    "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                    (result["path"], now, result["url"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
+                    (result["url"],),
+                )
+            conn.commit()
 
     elapsed = time.time() - t0
     saved = sum(1 for r in results if r.get("path"))

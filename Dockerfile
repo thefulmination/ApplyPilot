@@ -37,6 +37,7 @@ ENV CLAUDE_PATH=/usr/local/bin/claude \
     ANTHROPIC_BASE_URL=http://127.0.0.1:4000 \
     APPLYPILOT_APPLY_MODEL=deepseek-chat \
     APPLYPILOT_PREFLIGHT_LIVENESS=0 \
+    IS_SANDBOX=1 \
     PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
 # Sealed in Railway, NOT baked into the image: DEEPSEEK_API_KEY, DATABASE_URL.

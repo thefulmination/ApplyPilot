@@ -110,6 +110,7 @@ class ResolverOptions:
     click_timeout_ms: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_CLICK_TIMEOUT") or 20000)
     browser: str = os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_BROWSER") or "chrome"
     worker_id: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_WORKER_ID") or 80)
+    chunk_size: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_CHUNK_SIZE") or 10)
 
 
 @dataclass
@@ -426,7 +427,7 @@ def _run_candidates(
         _sleep_between(options)
 
     return ResolverSummary(
-        considered=len(candidates),
+        considered=sum(counts.values()),
         dry_run=False,
         counts=dict(counts),
         stopped_reason=stopped_reason,
@@ -515,8 +516,9 @@ def _snapshot_page(page) -> PageSnapshot:
 
 
 def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOptions) -> PageDecision:
-    page = context.new_page()
+    page = None
     try:
+        page = context.new_page()
         page.goto(candidate.url, wait_until="domcontentloaded", timeout=options.page_timeout_ms)
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
@@ -533,12 +535,16 @@ def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOp
     except PlaywrightTimeoutError:
         return PageDecision(status="timeout", error="page_timeout")
     except Exception as exc:
+        message = str(exc)
+        if "context or browser has been closed" in message or "target page" in message.lower():
+            return PageDecision(status="browser_error", error="browser_context_closed")
         return PageDecision(status="error", error=str(exc)[:200])
     finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 def _locator_for_control(page, control: ApplyControl):
@@ -627,7 +633,42 @@ def _click_and_capture_external(page, control: ApplyControl, options: ResolverOp
         return PageDecision(status="error", error=str(exc)[:200], control=control)
 
 
+def _merge_summaries(summaries: Sequence[ResolverSummary]) -> ResolverSummary:
+    counts: Counter[str] = Counter()
+    sample_urls: list[str] = []
+    considered = 0
+    stopped_reason = None
+    for summary in summaries:
+        considered += summary.considered
+        counts.update(summary.counts or {})
+        for url in summary.sample_urls or []:
+            if len(sample_urls) < 10:
+                sample_urls.append(url)
+        if summary.stopped_reason:
+            stopped_reason = summary.stopped_reason
+            break
+    return ResolverSummary(
+        considered=considered,
+        dry_run=False,
+        counts=dict(counts),
+        stopped_reason=stopped_reason,
+        sample_urls=sample_urls,
+    )
+
+
 def _run_live_browser(candidates: Sequence[Candidate], options: ResolverOptions) -> ResolverSummary:
+    chunk_size = options.chunk_size if options.chunk_size > 0 else len(candidates)
+    summaries: list[ResolverSummary] = []
+    for start in range(0, len(candidates), chunk_size):
+        chunk = candidates[start:start + chunk_size]
+        summary = _run_live_browser_batch(chunk, options)
+        summaries.append(summary)
+        if summary.stopped_reason:
+            break
+    return _merge_summaries(summaries)
+
+
+def _run_live_browser_batch(candidates: Sequence[Candidate], options: ResolverOptions) -> ResolverSummary:
     port = BASE_CDP_PORT + options.worker_id
     proc = launch_chrome(
         options.worker_id,

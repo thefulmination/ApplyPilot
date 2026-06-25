@@ -261,6 +261,16 @@ def setup_worker_profile(worker_id: int, browser: str | None = "chrome") -> Path
     if source is None:
         source = config.get_browser_user_data(browser)
 
+    # Offsite fleet / fresh container: there is no profile to clone (and no LinkedIn cookies
+    # are needed for ATS applies). Launch with a clean, empty user-data-dir -- Chrome creates
+    # the Default profile itself on first run. Without this guard, a missing source profile
+    # (e.g. /root/.config/google-chrome in the container) crashes on source.iterdir().
+    if source is None or not source.exists():
+        logger.info("[worker-%d] No source profile (%s) -- using a fresh empty profile.",
+                    worker_id, source)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return profile_dir
+
     logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
                 worker_id, source.name)
     profile_dir.mkdir(parents=True, exist_ok=True)

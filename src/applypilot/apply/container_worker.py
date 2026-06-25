@@ -45,7 +45,7 @@ def _setup_env() -> None:
     os.environ.pop("ANTHROPIC_API_KEY", None)                            # force the proxy path
     os.environ.setdefault("CLAUDE_PATH", "/usr/local/bin/claude")
     os.environ["PYTHONUTF8"] = "1"
-    os.environ["APPLYPILOT_PREFLIGHT_LIVENESS"] = "0"                     # queue is pre-filtered
+    os.environ["APPLYPILOT_PREFLIGHT_LIVENESS"] = "1"   # ON: cheap read-only GET skips DEAD postings before launching the agent (jobs expire after queueing)
     os.environ["APPLYPILOT_LANE_FILTER"] = "0"                           # offsite-only already
     os.environ.setdefault("APPLYPILOT_AGENT_TIMEOUT", "300")             # kill runaways (~5 min)
 
@@ -136,13 +136,110 @@ def _real_cost(stats: dict, model: str) -> float:
             + (stats.get("output_tokens", 0) or 0) / 1e6 * rout)   # output
 
 
+def _run_diag(worker_id, model, port, launcher, config) -> None:
+    """One-shot proxy diagnostic (APPLYPILOT_FLEET_DIAG=1): the apply agent reaches the model
+    but HANGS, so probe the in-container LiteLLM proxy DIRECTLY (bypassing claude) to localize
+    the hang: is the DeepSeek key set, does /health answer, does count_tokens answer, does a
+    real /v1/messages completion return or hang/error? Touches NO job in the queue."""
+    import subprocess
+    cp = config.get_claude_path()
+    v = subprocess.run([cp, "--version"], capture_output=True, text=True)
+    _log(f"DIAG claude={v.stdout.strip()!r}")
+    try:
+        import litellm
+        _log(f"DIAG litellm version={getattr(litellm, '__version__', '?')}")
+    except Exception as e:
+        _log(f"DIAG litellm import EXC {type(e).__name__}: {e}")
+
+    key = os.environ.get("DEEPSEEK_API_KEY", "") or ""
+    _log(f"DIAG DEEPSEEK_API_KEY set={bool(key)} len={len(key)} "
+         f"stripped_len={len(key.strip())} prefix={(key[:3] + '...') if key else '<empty>'}")
+
+    import httpx
+    base = "http://127.0.0.1:4000"
+    hdr = {"Authorization": "Bearer sk-litellm", "x-api-key": "sk-litellm",
+           "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    for path, body, tmo in [
+        ("/health/liveliness", None, 10),
+        ("/v1/messages/count_tokens",
+         {"model": model, "messages": [{"role": "user", "content": "hi"}]}, 30),
+        ("/v1/messages",
+         {"model": model, "max_tokens": 16,
+          "messages": [{"role": "user", "content": "Reply with the single word READY."}]}, 45),
+    ]:
+        try:
+            if body is None:
+                r = httpx.get(base + path, timeout=tmo)
+            else:
+                r = httpx.post(base + path, json=body, headers=hdr, timeout=tmo)
+            _log(f"DIAG proxy {path} rc={r.status_code} body={r.text[:450]!r}")
+        except Exception as e:
+            _log(f"DIAG proxy {path} EXC {type(e).__name__}: {str(e)[:200]}")
+    _log("=== DIAG DONE ===")
+
+
+def _run_crash_diag(config, launcher, pgqueue, launch_chrome, cleanup_worker,
+                    worker_id, model, port) -> None:
+    """Reproduce specific applies (DRY-RUN, submits NOTHING) and dump the full agent transcript
+    to STDOUT so railway logs capture WHY a clean ATS crashed (no_result_line / timeout) in the
+    container when it applies fine locally. Default targets the Cursor Ashby job that returned
+    no_result at $0; override with APPLYPILOT_DIAG_JOB_URL (comma-separated job urls)."""
+    import pathlib
+    urls = [u.strip() for u in os.environ.get(
+        "APPLYPILOT_DIAG_JOB_URL",
+        "https://www.linkedin.com/jobs/view/4422701219,https://www.indeed.com/viewjob?jk=3b98044c179cd985").split(",") if u.strip()]
+    models = [m.strip() for m in os.environ.get(
+        "APPLYPILOT_DIAG_MODELS", "deepseek-chat,deepseek-v4-pro").split(",") if m.strip()]
+    pg = pgqueue.connect()
+    for url in urls:
+        cur = pg.cursor()
+        cur.execute("SELECT url, title, company, application_url, score FROM apply_queue WHERE url = %s", (url,))
+        row = cur.fetchone()
+        if not row:
+            _log(f"DIAG-CRASH job not found in queue: {url}"); continue
+        d = dict(row)
+        for mdl in models:
+            job = {
+                "url": d["url"], "title": d.get("title") or "this role", "company": d.get("company"),
+                "site": d.get("company") or "", "application_url": d["application_url"],
+                "audit_score": d.get("score"), "fit_score": None,
+                "tailored_resume_path": None, "cover_letter_path": None, "full_description": "",
+            }
+            _log(f"DIAG-CRASH [{mdl}] (dry_run) {job['title'][:48]} -> {job['application_url']}")
+            proc = launch_chrome(worker_id, port=port, headless=True)
+            try:
+                status, dur = launcher.run_job(job, port, worker_id=worker_id, model=mdl,
+                                               agent="claude", dry_run=True)
+                stats = launcher._last_run_stats.get(worker_id, {})
+                _log(f"DIAG-CRASH [{mdl}] result status={status} dur={dur}ms in={stats.get('input_tokens')} "
+                     f"out={stats.get('output_tokens')} cache={stats.get('cache_read')}")
+            except Exception as e:
+                _log(f"DIAG-CRASH [{mdl}] run_job EXC {type(e).__name__}: {str(e)[:300]}")
+            finally:
+                cleanup_worker(worker_id, proc)
+            wl = pathlib.Path(config.LOG_DIR) / f"worker-{worker_id}.log"
+            if wl.exists():
+                t = wl.read_text(errors="replace")
+                _log(f"DIAG-CRASH [{mdl}] worker_log tail ({len(t)}b):\n{t[-8000:]}")
+                wl.write_text("")  # isolate the next model's transcript
+            else:
+                _log(f"DIAG-CRASH [{mdl}] no worker_log at {wl}")
+    _log("=== DIAG-CRASH DONE ===")
+
+
 def main() -> int:
     _setup_env()
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
 
+    from applypilot import config
     from applypilot.apply import launcher, pgqueue
     from applypilot.apply.chrome import launch_chrome, cleanup_worker
+
+    # Create LOG_DIR + the other APPLYPILOT_DIR subdirs. The home box does this at CLI init
+    # via ensure_dirs(); the worker bypasses the CLI, so without this the first apply crashes
+    # opening /data/applypilot/logs/worker-0.log (the dir never existed in the fresh container).
+    config.ensure_dirs()
 
     worker_id = int(os.environ.get("APPLYPILOT_WORKER_ID", "0"))
     model = os.environ.get("APPLYPILOT_APPLY_MODEL", "deepseek-chat")
@@ -158,6 +255,14 @@ def main() -> int:
     reclaimed = pgqueue.reclaim_stale_leases(pg)       # startup crash sweep
     _log(f"worker {worker_id} up | model={model} agent={agent} | reclaimed {len(reclaimed)} stale leases")
 
+    _diag_mode = os.environ.get("APPLYPILOT_FLEET_DIAG", "")
+    if _diag_mode == "1":
+        _run_diag(worker_id, model, port, launcher, config)
+        return 0
+    if _diag_mode == "crash":
+        _run_crash_diag(config, launcher, pgqueue, launch_chrome, cleanup_worker, worker_id, model, port)
+        return 0
+
     idle_seconds = 0.0
     applied = failed = 0
     while not _STOP["flag"]:
@@ -172,6 +277,23 @@ def main() -> int:
         idle_seconds = 0.0
         job = _job_dict(row)
         _log(f"lease {row['url']} | {job['title'][:48]} @ {job.get('company')}")
+
+        # Preflight liveness: one read-only GET skips DEAD postings BEFORE the expensive agent
+        # launch. The fleet runs its own loop and bypasses launcher's supervised preflight, so
+        # we probe here. Conservative -- only a strong DEAD signal skips; 401/403/429/5xx/live
+        # proceed (a wall never false-skips). Costs ~$0 vs a ~$0.004-0.02 agent run on a 404.
+        try:
+            from applypilot.apply.liveness import probe_url as _probe, DEAD as _DEAD
+            _ls, _lr = _probe(job["application_url"])
+        except Exception as _e:
+            _ls, _lr = "uncertain", f"probe_err:{type(_e).__name__}"
+        if _ls == _DEAD:
+            pgqueue.write_result(pg, str(worker_id), row["url"], status="failed",
+                                 apply_status="expired", apply_error=f"preflight_{_lr}"[:200],
+                                 est_cost_usd=0.0, agent_model=model, apply_duration_ms=0)
+            failed += 1
+            _log(f"preflight DEAD skip ({_lr}) -- saved a launch | applied={applied} other={failed}")
+            continue
 
         proc = launch_chrome(worker_id, port=port, headless=True)
         status, dur_ms, cost = "failed:worker_error", 0, 0.0

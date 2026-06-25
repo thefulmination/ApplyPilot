@@ -843,6 +843,62 @@ def test_click_and_capture_external_fails_closed_on_ambiguous_control():
     assert page.text_locator.clicked is False
 
 
+def test_resolve_one_returns_error_when_browser_context_is_closed_before_page_creation():
+    class ClosedContext:
+        def new_page(self):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    decision = linkedin_resolver._resolve_one_with_context(
+        ClosedContext(),
+        linkedin_resolver.Candidate(
+            url="https://www.linkedin.com/jobs/view/closed-context",
+            title=None,
+            company=None,
+            application_url=None,
+            audit_label="recommended",
+            audit_score=None,
+            fit_score=None,
+        ),
+        linkedin_resolver.ResolverOptions(),
+    )
+
+    assert decision.status == "browser_error"
+    assert decision.error == "browser_context_closed"
+
+
+def test_run_resolver_uses_live_batches(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    for index in range(5):
+        _insert_job(
+            conn,
+            url=f"https://www.linkedin.com/jobs/view/chunk-{index}",
+            audit_label="recommended",
+            discovered_at=f"2026-06-20T00:0{index}:00+00:00",
+        )
+
+    batches: list[list[str]] = []
+
+    def fake_batch(candidates, options):
+        batches.append([candidate.url for candidate in candidates])
+        return linkedin_resolver._run_candidates_for_test(
+            candidates,
+            options,
+            lambda candidate, opts: linkedin_resolver.PageDecision(status="easy_apply"),
+        )
+
+    monkeypatch.setattr(linkedin_resolver, "_run_live_browser_batch", fake_batch)
+    monkeypatch.setattr(linkedin_resolver, "_sleep_between", lambda options: None)
+
+    summary = linkedin_resolver.run_resolver(
+        linkedin_resolver.ResolverOptions(limit=5, chunk_size=2)
+    )
+
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert summary.counts == {"easy_apply": 5}
+    assert summary.considered == 5
+
+
 def test_run_live_browser_cleans_up_when_playwright_connect_fails(monkeypatch):
     launched = object()
     cleaned = []

@@ -386,12 +386,18 @@ def _run_tailor(
     min_score: int = 7,
     validation_mode: str = "normal",
     batch_size: int | None = None,
+    workers: int = 1,
 ) -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
     try:
         from applypilot.scoring.tailor import run_tailoring
         limit = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
-        run_tailoring(min_score=min_score, limit=limit, validation_mode=validation_mode)
+        run_tailoring(
+            min_score=min_score,
+            limit=limit,
+            validation_mode=validation_mode,
+            workers=workers,
+        )
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
@@ -402,12 +408,18 @@ def _run_cover(
     min_score: int = 7,
     validation_mode: str = "normal",
     batch_size: int | None = None,
+    workers: int = 1,
 ) -> dict:
     """Stage: Cover letter generation."""
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
         limit = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
-        run_cover_letters(min_score=min_score, limit=limit, validation_mode=validation_mode)
+        run_cover_letters(
+            min_score=min_score,
+            limit=limit,
+            validation_mode=validation_mode,
+            workers=workers,
+        )
         return {"status": "ok"}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
@@ -556,6 +568,7 @@ def _run_stage_streaming(
     min_score: int = 7,
     batch_size: int | None = None,
     workers: int = 1,
+    generation_workers: int = 1,
     validation_mode: str = "normal",
     discover_mode: str = "safe",
     run_id: int | None = None,
@@ -582,6 +595,7 @@ def _run_stage_streaming(
         kwargs["min_score"] = min_score
         kwargs["validation_mode"] = validation_mode
         kwargs["batch_size"] = batch_size
+        kwargs["workers"] = generation_workers
     if stage in ("diagnose", "pdf"):
         kwargs["batch_size"] = batch_size
     if stage in ("discover", "enrich", "score") and _accepts_kwarg(runner, "workers"):
@@ -695,6 +709,7 @@ def _run_sequential(
     min_score: int,
     batch_size: int | None = None,
     workers: int = 1,
+    generation_workers: int = 1,
     validation_mode: str = "normal",
     discover_mode: str = "safe",
     run_id: int | None = None,
@@ -729,6 +744,7 @@ def _run_sequential(
                 kwargs["min_score"] = min_score
                 kwargs["validation_mode"] = validation_mode
                 kwargs["batch_size"] = batch_size
+                kwargs["workers"] = generation_workers
             if name in ("diagnose", "pdf"):
                 kwargs["batch_size"] = batch_size
             if name in ("discover", "enrich", "score") and _accepts_kwarg(runner, "workers"):
@@ -783,6 +799,7 @@ def _run_streaming(
     min_score: int,
     batch_size: int | None = None,
     workers: int = 1,
+    generation_workers: int = 1,
     validation_mode: str = "normal",
     discover_mode: str = "safe",
     run_id: int | None = None,
@@ -808,7 +825,18 @@ def _run_streaming(
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, batch_size, workers, validation_mode, discover_mode, run_id),
+            args=(
+                name,
+                tracker,
+                stop_event,
+                min_score,
+                batch_size,
+                workers,
+                generation_workers,
+                validation_mode,
+                discover_mode,
+                run_id,
+            ),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -856,6 +884,7 @@ def run_pipeline(
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,
+    generation_workers: int = 1,
     validation_mode: str = "normal",
     discover_mode: str = "safe",
 ) -> dict:
@@ -868,6 +897,7 @@ def run_pipeline(
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.
+        generation_workers: Parallel LLM workers for tailor/cover stages.
         discover_mode: Discovery breadth mode: safe, fast, or full.
 
     Returns:
@@ -886,6 +916,7 @@ def run_pipeline(
     # Banner
     mode = "streaming" if stream else "sequential"
     effective_batch_size = DEFAULTS["generation_batch_size"] if batch_size is None else batch_size
+    effective_generation_workers = max(1, int(generation_workers or 1))
     console.print()
     console.print(Panel.fit(
         f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
@@ -896,6 +927,7 @@ def run_pipeline(
         f"  Batch size: {'all' if effective_batch_size == 0 else effective_batch_size}"
     )
     console.print(f"  Workers:    {workers}")
+    console.print(f"  Gen workers:{effective_generation_workers}")
     console.print(f"  Discovery:  {discover_mode}")
     console.print(f"  Validation: {validation_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
@@ -924,11 +956,27 @@ def run_pipeline(
     )
     try:
         if stream:
-            result = _run_streaming(ordered, min_score, batch_size=effective_batch_size, workers=workers,
-                                    validation_mode=validation_mode, discover_mode=discover_mode, run_id=run_id)
+            result = _run_streaming(
+                ordered,
+                min_score,
+                batch_size=effective_batch_size,
+                workers=workers,
+                generation_workers=effective_generation_workers,
+                validation_mode=validation_mode,
+                discover_mode=discover_mode,
+                run_id=run_id,
+            )
         else:
-            result = _run_sequential(ordered, min_score, batch_size=effective_batch_size, workers=workers,
-                                     validation_mode=validation_mode, discover_mode=discover_mode, run_id=run_id)
+            result = _run_sequential(
+                ordered,
+                min_score,
+                batch_size=effective_batch_size,
+                workers=workers,
+                generation_workers=effective_generation_workers,
+                validation_mode=validation_mode,
+                discover_mode=discover_mode,
+                run_id=run_id,
+            )
         stage_statuses = [stage_result.get("status") for stage_result in result.get("stages", [])]
         run_status = "partial" if result.get("errors") or any(s == "partial" for s in stage_statuses) else "ok"
         run_error = "; ".join(f"{stage}: {error}" for stage, error in result.get("errors", {}).items()) or None
