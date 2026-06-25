@@ -26,6 +26,27 @@ COMPLETED_STATUSES = {
 
 STOP_STATUSES = {"login_required", "challenge_required"}
 
+CHALLENGE_TEXTS = (
+    "security check",
+    "verify it's you",
+    "verify your identity",
+    "unusual activity",
+    "checkpoint",
+)
+
+LOGIN_TEXTS = (
+    "sign in to",
+    "sign in",
+    "log in",
+    "linkedin login",
+)
+
+UNAVAILABLE_TEXTS = (
+    "no longer accepting applications",
+    "no longer accepting applications on linkedin",
+    "this job is no longer accepting applications",
+)
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -36,6 +57,29 @@ class Candidate:
     audit_label: str | None
     audit_score: float | None
     fit_score: int | None
+
+
+@dataclass(frozen=True)
+class ApplyControl:
+    text: str
+    href: str | None
+    selector: str
+
+
+@dataclass(frozen=True)
+class PageSnapshot:
+    url: str
+    text: str
+    controls: tuple[ApplyControl, ...]
+
+
+@dataclass(frozen=True)
+class PageDecision:
+    status: str
+    stop_run: bool = False
+    final_url: str | None = None
+    error: str | None = None
+    control: ApplyControl | None = None
 
 
 def _host(url: str | None) -> str:
@@ -55,6 +99,50 @@ def is_external_apply_url(url: str | None) -> bool:
         return False
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and not is_linkedin_url(url)
+
+
+def _snapshot_text_lower(snapshot: PageSnapshot) -> str:
+    return (snapshot.text or "").lower()
+
+
+def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
+    url = snapshot.url.lower()
+    text = _snapshot_text_lower(snapshot)
+
+    if "/checkpoint/" in url or "/uas/" in url:
+        return PageDecision(status="challenge_required", stop_run=True, error="linkedin_checkpoint")
+
+    if any(token in text for token in CHALLENGE_TEXTS):
+        return PageDecision(status="challenge_required", stop_run=True, error="linkedin_challenge")
+
+    if "linkedin.com/login" in url or any(token in text for token in LOGIN_TEXTS):
+        return PageDecision(status="login_required", stop_run=True, error="linkedin_login")
+
+    if any(token in text for token in UNAVAILABLE_TEXTS):
+        return PageDecision(status="unavailable")
+
+    easy_apply = next(
+        (control for control in snapshot.controls if "easy apply" in control.text.lower()),
+        None,
+    )
+    if easy_apply is not None:
+        return PageDecision(status="easy_apply", control=easy_apply)
+
+    apply_control = next(
+        (control for control in snapshot.controls if "apply" in control.text.lower()),
+        None,
+    )
+    if apply_control is None:
+        return PageDecision(status="no_apply_button")
+
+    if is_external_apply_url(apply_control.href):
+        return PageDecision(
+            status="resolved_offsite",
+            final_url=apply_control.href,
+            control=apply_control,
+        )
+
+    return PageDecision(status="needs_click", control=apply_control)
 
 
 def _normalize_tiers(tiers: Iterable[str] | None, include_low: bool) -> tuple[str, ...]:

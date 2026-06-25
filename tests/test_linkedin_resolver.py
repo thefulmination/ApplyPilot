@@ -63,6 +63,116 @@ def test_url_classification_distinguishes_linkedin_and_offsite():
     assert linkedin_resolver.is_external_apply_url(None) is False
 
 
+def test_classify_snapshot_stops_on_linkedin_challenge():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/checkpoint/challenge",
+        text="Quick security check. Verify it's you.",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "challenge_required"
+    assert decision.stop_run is True
+    assert decision.final_url is None
+
+
+def test_classify_snapshot_stops_on_login_wall():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/login",
+        text="Sign in to view this job",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "login_required"
+    assert decision.stop_run is True
+
+
+def test_classify_snapshot_detects_unavailable_job():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/404",
+        text="This job is no longer accepting applications",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "unavailable"
+    assert decision.stop_run is False
+
+
+def test_classify_snapshot_detects_easy_apply():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Chief of Staff",
+        controls=(
+            linkedin_resolver.ApplyControl(
+                text="Easy Apply",
+                href=None,
+                selector="button",
+            ),
+        ),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "easy_apply"
+    assert decision.stop_run is False
+
+
+def test_classify_snapshot_detects_external_apply_href():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Chief of Staff",
+        controls=(
+            linkedin_resolver.ApplyControl(
+                text="Apply",
+                href="https://jobs.lever.co/acme/123",
+                selector="a[href='https://jobs.lever.co/acme/123']",
+            ),
+        ),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "resolved_offsite"
+    assert decision.final_url == "https://jobs.lever.co/acme/123"
+    assert decision.control is not None
+
+
+def test_classify_snapshot_keeps_generic_apply_control_for_click():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Chief of Staff",
+        controls=(
+            linkedin_resolver.ApplyControl(
+                text="Apply",
+                href="https://www.linkedin.com/jobs/view/123?trk=public_jobs_apply-link-offsite",
+                selector="button",
+            ),
+        ),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "needs_click"
+    assert decision.control is not None
+
+
+def test_classify_snapshot_reports_missing_apply_control():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Chief of Staff",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "no_apply_button"
+
+
 def _insert_job(
     conn,
     *,
