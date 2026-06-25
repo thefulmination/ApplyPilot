@@ -47,6 +47,7 @@ def _setup_env() -> None:
     os.environ["PYTHONUTF8"] = "1"
     os.environ["APPLYPILOT_PREFLIGHT_LIVENESS"] = "0"                     # queue is pre-filtered
     os.environ["APPLYPILOT_LANE_FILTER"] = "0"                           # offsite-only already
+    os.environ.setdefault("APPLYPILOT_AGENT_TIMEOUT", "300")             # kill runaways (~5 min)
 
 
 _STOP = {"flag": False}
