@@ -755,3 +755,123 @@ def test_run_candidates_summary_counts_and_sample_urls(tmp_path, monkeypatch):
         "https://jobs.lever.co/acme/one",
         "https://www.linkedin.com/jobs/view/two",
     ]
+
+
+class _FakeLocator:
+    def __init__(
+        self,
+        *,
+        count: int = 1,
+        text: str = "Apply",
+        href: str | None = None,
+        click_error: Exception | None = None,
+    ):
+        self._count = count
+        self._text = text
+        self._href = href
+        self._click_error = click_error
+        self.clicked = False
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return self._count
+
+    def inner_text(self, **kwargs):
+        return self._text
+
+    def get_attribute(self, name, **kwargs):
+        return self._href if name == "href" else None
+
+    def click(self, **kwargs):
+        self.clicked = True
+        if self._click_error:
+            raise self._click_error
+
+
+class _FakeLocatorPage:
+    url = "https://www.linkedin.com/jobs/view/123"
+
+    def __init__(self, *, selector_count: int, text_count: int):
+        self.selector_locator = _FakeLocator(count=selector_count, text="Apply", href=None)
+        self.text_locator = _FakeLocator(count=text_count, text="Apply", href=None)
+
+    def locator(self, selector):
+        return self.selector_locator
+
+    def get_by_text(self, text, exact=False):
+        return self.text_locator
+
+
+def test_locator_for_control_requires_unique_selector_or_text_match():
+    page = _FakeLocatorPage(selector_count=2, text_count=1)
+
+    locator = linkedin_resolver._locator_for_control(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+    )
+
+    assert locator is page.text_locator
+    assert page.selector_locator.clicked is False
+
+
+def test_locator_for_control_rejects_ambiguous_apply_controls():
+    page = _FakeLocatorPage(selector_count=2, text_count=2)
+
+    with pytest.raises(ValueError, match="ambiguous_apply_control"):
+        linkedin_resolver._locator_for_control(
+            page,
+            linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        )
+
+
+def test_click_and_capture_external_fails_closed_on_ambiguous_control():
+    page = _FakeLocatorPage(selector_count=2, text_count=2)
+
+    decision = linkedin_resolver._click_and_capture_external(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        linkedin_resolver.ResolverOptions(click_timeout_ms=1),
+    )
+
+    assert decision.status == "error"
+    assert decision.error is not None
+    assert "ambiguous_apply_control" in decision.error
+    assert page.selector_locator.clicked is False
+    assert page.text_locator.clicked is False
+
+
+def test_run_live_browser_cleans_up_when_playwright_connect_fails(monkeypatch):
+    launched = object()
+    cleaned = []
+
+    class BrokenPlaywrightContext:
+        def __enter__(self):
+            raise RuntimeError("cdp unavailable")
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(linkedin_resolver, "launch_chrome", lambda *args, **kwargs: launched)
+    monkeypatch.setattr(linkedin_resolver, "cleanup_worker", lambda worker_id, proc: cleaned.append((worker_id, proc)))
+    monkeypatch.setattr(linkedin_resolver, "sync_playwright", lambda: BrokenPlaywrightContext())
+
+    with pytest.raises(RuntimeError, match="cdp unavailable"):
+        linkedin_resolver._run_live_browser(
+            [
+                linkedin_resolver.Candidate(
+                    url="https://www.linkedin.com/jobs/view/cleanup",
+                    title=None,
+                    company=None,
+                    application_url=None,
+                    audit_label="recommended",
+                    audit_score=None,
+                    fit_score=None,
+                )
+            ],
+            linkedin_resolver.ResolverOptions(worker_id=88),
+        )
+
+    assert cleaned == [(88, launched)]

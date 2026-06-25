@@ -477,7 +477,7 @@ def _snapshot_page(page) -> PageSnapshot:
             }
             const parts = [];
             let node = el;
-            while (node && node.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
+            while (node && node.nodeType === Node.ELEMENT_NODE) {
               const tag = node.tagName.toLowerCase();
               const parent = node.parentElement;
               if (!parent) {
@@ -542,15 +542,42 @@ def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOp
 
 
 def _locator_for_control(page, control: ApplyControl):
+    def _matches(locator) -> bool:
+        expected_text = str(control.text or "").strip().lower()
+        expected_href = str(control.href or "").strip()
+        if not expected_text and not expected_href:
+            return True
+        actual_text = ""
+        actual_href = ""
+        try:
+            actual_text = str(locator.inner_text(timeout=1000) or "").strip().lower()
+        except Exception:
+            pass
+        try:
+            actual_href = str(locator.get_attribute("href", timeout=1000) or "").strip()
+        except Exception:
+            pass
+        text_matches = bool(expected_text and expected_text in actual_text)
+        href_matches = bool(expected_href and actual_href and actual_href == expected_href)
+        return text_matches or href_matches
+
     if control.selector:
         try:
-            locator = page.locator(control.selector).first
-            if locator.count() > 0:
-                return locator
+            locator = page.locator(control.selector)
+            if locator.count() == 1:
+                candidate = locator.first
+                if _matches(candidate):
+                    return candidate
         except Exception:
             pass
     control_text = (control.text or "Apply").strip() or "Apply"
-    return page.get_by_text(control_text, exact=False).first
+    text_locator = page.get_by_text(control_text, exact=False)
+    if text_locator.count() == 1:
+        return text_locator.first
+    exact_locator = page.get_by_text(control_text, exact=True)
+    if exact_locator.count() == 1:
+        return exact_locator.first
+    raise ValueError(f"ambiguous_apply_control:{control_text}")
 
 
 def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
@@ -572,8 +599,8 @@ def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
 
 
 def _click_and_capture_external(page, control: ApplyControl, options: ResolverOptions) -> PageDecision:
-    locator = _locator_for_control(page, control)
     try:
+        locator = _locator_for_control(page, control)
         with page.expect_popup(timeout=options.click_timeout_ms) as popup_info:
             locator.click(timeout=options.click_timeout_ms)
         popup = popup_info.value
