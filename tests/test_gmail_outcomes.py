@@ -347,6 +347,61 @@ class TestHelpers:
         assert result == "Chief of Staff"
 
 
+class TestCompanyExtraction:
+    """Company extraction must handle the dominant real ATS subject shapes -- the old
+    extractor only knew 'application/applied' and missed every 'applying to <Company>',
+    which is ~75% of receipts."""
+
+    @pytest.mark.parametrize("subject,expected", [
+        ("Thank you for applying to Justworks", "Justworks"),
+        ("Thank You for Applying to ServiceNow!", "ServiceNow"),
+        ("Thanks for applying to Exa 🚀", "Exa"),                  # emoji stripped
+        ("Thank you for applying at UpEquity", "UpEquity"),
+        ("AeroVect — Thanks for Applying!", "AeroVect"),           # company-first (em dash)
+        ("RZR Global Inc. | Thank you for applying", "RZR Global Inc"),  # company-first pipe
+        ("Crusoe | Application Received", "Crusoe"),
+        ("Novo Nordisk: Thank You for Your Application", "Novo Nordisk"),  # colon
+        ("Thank you for applying to Formic │ Chief of Staff", "Formic"),   # role tail dropped
+        ("Thanks for your interest in Carta, Jonathan", "Carta"),
+        ("Your application at Acme Corp for Chief of Staff", "Acme Corp"),  # stop at " for"
+        ("Interview with Globex for Strategy Manager", "Globex"),
+    ])
+    def test_extract_company(self, subject, expected):
+        from applypilot.gmail_outcomes import _extract_company_from_subject
+        assert _extract_company_from_subject(subject) == expected
+
+    @pytest.mark.parametrize("subject", [
+        "Jonathan, we've received your application",   # greeting must not be captured
+        "Thanks for applying!",                        # no company present
+        "We've Received Your Application | January",    # boilerplate, not a company
+    ])
+    def test_no_false_company(self, subject):
+        from applypilot.gmail_outcomes import _extract_company_from_subject
+        got = _extract_company_from_subject(subject)
+        assert got is None or got.lower() not in ("jonathan", "we've", "we", "your")
+
+
+class TestBoardSlugMatching:
+    """ATS board-slug from links in the email = exact employer match (no fuzzy guessing)."""
+
+    def test_board_slug_extraction(self):
+        from applypilot.gmail_outcomes import _board_slugs
+        slugs = _board_slugs("View it here: https://job-boards.greenhouse.io/justworks/jobs/123")
+        assert "greenhouse.io/justworks" in slugs
+
+    def test_board_slug_matches_applied_job(self):
+        jobs = [{"url": "https://hiring.cafe/x", "title": "Chief of Staff",
+                 "application_url": "https://job-boards.greenhouse.io/justworks/jobs/9",
+                 "company": "Justworks", "site": "Justworks"}]
+        job, method, score = match_email_to_job(
+            sender="no-reply@us.greenhouse-mail.io",
+            subject="Thanks for applying!",   # no company in subject
+            body="We received it. Track it at https://boards.greenhouse.io/justworks/jobs/9",
+            applied_jobs=jobs,
+        )
+        assert job is not None and method == "board_slug"
+
+
 # ---------------------------------------------------------------------------
 # match_email_to_job
 # ---------------------------------------------------------------------------

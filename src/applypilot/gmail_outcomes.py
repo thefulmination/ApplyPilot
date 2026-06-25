@@ -413,37 +413,123 @@ def _token_overlap(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+# Subject/greeting fragments that are never a company name.
+_NOT_A_COMPANY = frozenset({
+    "your application", "the team", "us", "our team", "the role", "the position",
+    "applying", "the company", "your interest", "joining", "the next step",
+    "your candidacy", "this role", "a career", "your future", "the opportunity",
+    "our company", "the following", "your submission", "a position", "this position",
+    "we've", "we have", "we", "your", "you", "re", "fwd", "fw", "fyi", "thank you",
+    "thanks", "hi", "hello", "your team", "the hiring team",
+})
+
+
+def _clean_company(raw: str | None) -> str | None:
+    """Normalize an extracted company hint: drop emoji, a trailing role/recipient, and
+    punctuation. 'Exa 🚀' -> 'Exa'; 'Formic │ Chief of Staff' -> 'Formic';
+    'Carta, Jonathan' -> 'Carta'."""
+    if not raw:
+        return None
+    # Split off a trailing role/recipient FIRST -- the delimiters (│ — – · •) are
+    # non-ASCII, so this must run BEFORE the emoji strip or they'd become spaces.
+    s = re.split(r"\s*[|│·•—–:,]\s*|\.\s+", raw)[0]          # cut " | role" / ", name" / ". Sentence"
+    s = re.sub(r"[^\x00-\x7f]+", " ", s)                    # then strip emoji / non-ASCII
+    s = s.strip().strip("\"'`!?.&()[]").strip()
+    s = re.sub(r"\s+", " ", s)
+    if not (2 <= len(s) <= 50):
+        return None
+    if s.lower() in _NOT_A_COMPANY:
+        return None
+    return s
+
+
+# Boilerplate words: if a "company-first" capture contains one, it's actually the
+# acknowledgment phrase ("Thank you for applying to X | role"), not a company.
+_BOILERPLATE_RE = re.compile(r"thank|apply|your application|received|interest|update on",
+                             re.IGNORECASE)
+
+
 def _extract_company_from_subject(subject: str) -> str | None:
-    """Pull a company name from common ATS subject patterns."""
+    """Pull a company name from common ATS subject patterns. Ordered most- to least-
+    specific; the first that yields a clean hint wins. The dominant ack form is
+    'Thank you for applying to <Company>' -- note 'applying', not 'application'."""
+    # Strip a leading greeting so it isn't captured as the company ("Jonathan, we've
+    # received..." / "Hi Jonathan, ...").
+    s = re.sub(r"^(?:hi|hello|hey|dear|greetings)\b[^,]{0,30},\s*", "", subject, flags=re.I)
+    s = re.sub(r"^[A-Z][a-z]+,\s+", "", s)
+    # (pattern, is_company_first) -- company-first patterns reject boilerplate captures.
     patterns = [
-        r"(?:application|applied)\s+(?:at|to|with)\s+(.+?)(?:\s+for|\s+-|\.|,|$)",
-        r"interview\s+with\s+(.+?)(?:\s+for|\s+-|\.|,|$)",
-        r"(?:update|status)\s+(?:on|for|from)\s+(.+?)(?:\s+application|\s+-|\.|,|$)",
-        r"^(.+?)\s+(?:is reviewing|has received|wants to|would like to)",
-        r"from\s+(.+?)\s+(?:re:|regarding|about)\s",
+        (r"^(.{2,45}?)\s*[|│:—–]\s*\S", True),                            # "<Company> | / — / : ..."
+        (r"(?:opening|role|position|job|team)\s+at\s+(.+?)(?:\s+for\b.*)?(?:[!?.]|$)", False),
+        # "applying to/at/with <Company>" -- stop at " for <role>".
+        (r"appl(?:ying|ied|ication)\s+(?:to|at|with)\s+(?:the\s+)?(.+?)(?:\s+for\b.*)?$", False),
+        (r"interest in\s+(?:joining\s+|a\s+\w+\s+at\s+)?(.+?)(?:\s+for\b.*)?$", False),
+        (r"interview\s+with\s+(.+?)(?:\s+for\b.*)?$", False),
+        (r"(?:update|status)\s+(?:on|for|from)\s+(.+?)(?:'s)?\s+application", False),
+        (r"^(.{2,45}?)\s+(?:application confirmation|has received|is reviewing|received your)", True),
     ]
-    for pat in patterns:
-        m = re.search(pat, subject, re.IGNORECASE)
+    for pat, company_first in patterns:
+        m = re.search(pat, s, re.IGNORECASE)
         if m:
-            company = m.group(1).strip().strip("\"'")
-            if 2 <= len(company) <= 60:
+            cand = m.group(1)
+            if company_first and _BOILERPLATE_RE.search(cand):
+                continue  # captured the boilerplate, not a company name
+            company = _clean_company(cand)
+            if company:
                 return company
     return None
 
 
 def _extract_company_from_body(body: str) -> str | None:
-    """Pull a company name from the first 400 chars of the email body."""
-    snippet = body[:400]
+    """Pull a company name from the first 600 chars of the email body."""
+    snippet = body[:600]
     patterns = [
-        r"at\s+([A-Z][A-Za-z0-9 &.,'-]{1,40}?)(?:\s+for|\s*[,.]|\s+is|\s+has)",
-        r"from\s+([A-Z][A-Za-z0-9 &.,'-]{1,40}?)(?:\s+re:|\s*[,.]|\s+regarding)",
+        # "thanks for applying to <Company>" (the body usually restates it)
+        r"appl(?:ying|ied|ication)\s+(?:to|at|with)\s+(?:the\s+)?"
+        r"([A-Z][A-Za-z0-9 &.,'-]{1,40}?)(?:[!?.\n]|\s+for\b|\s+team\b|\s+is\b|\s+has\b)",
+        r"interest in\s+(?:joining\s+)?([A-Z][A-Za-z0-9 &.,'-]{1,40}?)(?:[!?.\n,]|\s+for\b)",
+        r"\bat\s+([A-Z][A-Za-z0-9 &.,'-]{1,40}?)(?:\s+for\b|\s*[,.]|\s+is\b|\s+has\b)",
+        r"join(?:ing)?\s+([A-Z][A-Za-z0-9 &.,'-]{1,40}?)(?:\s+as\b|[!?.,\n])",
     ]
     for pat in patterns:
         m = re.search(pat, snippet)
         if m:
-            company = m.group(1).strip()
-            if 2 <= len(company) <= 60:
+            company = _clean_company(m.group(1))
+            if company:
                 return company
+    return None
+
+
+# --- ATS board-slug matching (highest precision for ATS emails) ----------------
+# ATS confirmation emails link to the posting on the employer's board; the slug
+# (greenhouse.io/<employer>) equals the applied job's application-URL slug. Matching on
+# it is exact -- no fuzzy name guessing.
+_ATS_SLUG_RE = re.compile(
+    r"(greenhouse\.io|lever\.co|ashbyhq\.com|smartrecruiters\.com|jobvite\.com|"
+    r"rippling\.com|myworkdayjobs\.com|teamtailor\.com)/([A-Za-z0-9][\w-]{1,40})",
+    re.IGNORECASE,
+)
+_SLUG_STOPWORDS = frozenset({
+    "jobs", "job", "o", "careers", "career", "embed", "app", "j", "viewjob", "v",
+    "postings", "en-us", "external", "search", "apply", "p", "s",
+})
+
+
+def _board_slugs(text: str) -> set[str]:
+    """Employer board slugs (e.g. 'greenhouse.io/justworks') from ATS links in `text`."""
+    out: set[str] = set()
+    for host, slug in _ATS_SLUG_RE.findall(text or ""):
+        slug = slug.lower()
+        if slug not in _SLUG_STOPWORDS:
+            out.add(f"{host.lower()}/{slug}")
+    return out
+
+
+def _job_board_slug(job: dict[str, Any]) -> str | None:
+    for key in ("application_url", "url"):
+        slugs = _board_slugs(job.get(key) or "")
+        if slugs:
+            return next(iter(slugs))
     return None
 
 
@@ -497,15 +583,28 @@ def match_email_to_job(
         sender_domain.endswith(f".{d}") for d in _ATS_DOMAINS
     )
 
-    # 1. ATS sender: trust company name extracted from subject/body
+    # 0. ATS board slug from links in the email -> applied job's application-URL slug.
+    #    Exact employer match (no fuzzy name guessing); the highest-precision signal.
+    email_slugs = _board_slugs(subject) | _board_slugs(body)
+    if email_slugs:
+        for job in applied_jobs:
+            js = _job_board_slug(job)
+            if js and js in email_slugs:
+                return job, "board_slug", 1.0
+
+    # Company hints from BOTH subject and body -- try each (a garbage subject hint must
+    # not block the body hint).
+    hints = [h for h in (_extract_company_from_subject(subject),
+                         _extract_company_from_body(body)) if h]
+
+    # 1. ATS sender: trust the company name extracted from subject/body.
     if is_ats:
-        hint = _extract_company_from_subject(subject) or _extract_company_from_body(body)
-        if hint:
+        for hint in hints:
             job, score = _best_name_match(hint, applied_jobs, min_overlap=min_overlap)
             if job:
                 return job, "ats_domain", score
 
-    # 2. Company domain: sender domain matches a job URL domain
+    # 2. Company domain: sender domain matches a job URL domain.
     if sender_domain and sender_domain not in _GENERIC_DOMAINS and not is_ats:
         for job in applied_jobs:
             for url_key in ("url", "application_url"):
@@ -517,9 +616,8 @@ def match_email_to_job(
                 ):
                     return job, "company_domain", 1.0
 
-    # 3. Company name in subject/body → fuzzy name match
-    hint = _extract_company_from_subject(subject) or _extract_company_from_body(body)
-    if hint:
+    # 3. Company name in subject/body → fuzzy name match (any sender).
+    for hint in hints:
         job, score = _best_name_match(hint, applied_jobs, min_overlap=min_overlap)
         if job:
             return job, "company_name", score
