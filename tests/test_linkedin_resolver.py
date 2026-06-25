@@ -654,3 +654,104 @@ def test_should_stop_run_respects_stop_statuses():
     assert linkedin_resolver.should_stop_run("login_required") is True
     assert linkedin_resolver.should_stop_run("challenge_required") is True
     assert linkedin_resolver.should_stop_run("easy_apply") is False
+
+
+def test_run_resolver_dry_run_does_not_record_status_or_launch_browser(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/dry", audit_label="recommended")
+
+    def fail_launch(*args, **kwargs):
+        raise AssertionError("dry run must not launch browser")
+
+    def fail_record(*args, **kwargs):
+        raise AssertionError("dry run must not record resolver status")
+
+    monkeypatch.setattr(linkedin_resolver, "launch_chrome", fail_launch)
+    monkeypatch.setattr(linkedin_resolver, "record_resolution", fail_record)
+
+    summary = linkedin_resolver.run_resolver(
+        linkedin_resolver.ResolverOptions(limit=10, dry_run=True)
+    )
+
+    assert summary.considered == 1
+    assert summary.dry_run is True
+    assert summary.counts == {}
+    assert summary.sample_urls == ["https://www.linkedin.com/jobs/view/dry"]
+    assert conn.execute(
+        "SELECT linkedin_resolve_status FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/dry",),
+    ).fetchone()[0] is None
+
+
+def test_run_resolver_stops_after_login_required_result(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/first", audit_label="recommended")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/second", audit_label="recommended")
+
+    calls = []
+
+    def fake_resolve(candidate, options):
+        calls.append(candidate.url)
+        return linkedin_resolver.PageDecision(
+            status="login_required",
+            stop_run=True,
+            error="linkedin_login",
+        )
+
+    monkeypatch.setattr(
+        linkedin_resolver,
+        "_run_live_browser",
+        lambda candidates, options: linkedin_resolver._run_candidates_for_test(
+            candidates,
+            options,
+            fake_resolve,
+        ),
+    )
+
+    summary = linkedin_resolver.run_resolver(linkedin_resolver.ResolverOptions(limit=10))
+
+    assert calls == ["https://www.linkedin.com/jobs/view/first"]
+    assert summary.stopped_reason == "login_required"
+    assert summary.counts == {"login_required": 1}
+    row = conn.execute(
+        "SELECT linkedin_resolve_status, linkedin_resolve_error FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/first",),
+    ).fetchone()
+    assert row["linkedin_resolve_status"] == "login_required"
+    assert row["linkedin_resolve_error"] == "linkedin_login"
+    assert conn.execute(
+        "SELECT linkedin_resolve_status FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/second",),
+    ).fetchone()[0] is None
+
+
+def test_run_candidates_summary_counts_and_sample_urls(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/one", audit_label="recommended")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/two", audit_label="recommended")
+    monkeypatch.setattr(linkedin_resolver, "_sleep_between", lambda options: None)
+
+    decisions = iter(
+        (
+            linkedin_resolver.PageDecision(
+                status="resolved_offsite",
+                final_url="https://jobs.lever.co/acme/one",
+            ),
+            linkedin_resolver.PageDecision(status="easy_apply"),
+        )
+    )
+
+    summary = linkedin_resolver._run_candidates_for_test(
+        linkedin_resolver.fetch_candidates(limit=10),
+        linkedin_resolver.ResolverOptions(limit=10),
+        lambda candidate, options: next(decisions),
+    )
+
+    assert summary.counts == {"resolved_offsite": 1, "easy_apply": 1}
+    assert summary.sample_urls == [
+        "https://jobs.lever.co/acme/one",
+        "https://www.linkedin.com/jobs/view/two",
+    ]

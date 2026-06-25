@@ -8,12 +8,20 @@ Apply workflows.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
+import random
 import sqlite3
-from typing import Iterable
+import time
+from typing import Callable, Iterable, Sequence
 from urllib.parse import urlparse
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_worker, launch_chrome
 from applypilot.database import get_connection
 
 COMPLETED_STATUSES = {
@@ -87,6 +95,36 @@ class PageDecision:
     final_url: str | None = None
     error: str | None = None
     control: ApplyControl | None = None
+
+
+@dataclass(frozen=True)
+class ResolverOptions:
+    limit: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_LIMIT") or 200)
+    tiers: tuple[str, ...] = ("priority", "recommended")
+    include_low: bool = False
+    refresh: bool = False
+    dry_run: bool = False
+    delay_min: float = float(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_DELAY_MIN") or 8)
+    delay_max: float = float(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_DELAY_MAX") or 20)
+    page_timeout_ms: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_PAGE_TIMEOUT") or 45000)
+    click_timeout_ms: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_CLICK_TIMEOUT") or 20000)
+    browser: str = os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_BROWSER") or "chrome"
+    worker_id: int = int(os.environ.get("APPLYPILOT_LINKEDIN_RESOLVE_WORKER_ID") or 80)
+
+
+@dataclass
+class ResolverSummary:
+    considered: int = 0
+    dry_run: bool = False
+    counts: dict[str, int] | None = None
+    stopped_reason: str | None = None
+    sample_urls: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.counts is None:
+            self.counts = {}
+        if self.sample_urls is None:
+            self.sample_urls = []
 
 
 def _host(url: str | None) -> str:
@@ -345,3 +383,242 @@ def record_resolution(
 
 def should_stop_run(status: str) -> bool:
     return status in STOP_STATUSES
+
+
+def _summary_url(candidate: Candidate, decision: PageDecision) -> str:
+    if decision.status == "resolved_offsite" and decision.final_url:
+        return decision.final_url
+    return candidate.url
+
+
+def _run_candidates_for_test(
+    candidates: Sequence[Candidate],
+    options: ResolverOptions,
+    resolver: Callable[[Candidate, ResolverOptions], PageDecision],
+) -> ResolverSummary:
+    return _run_candidates(candidates, options, resolver)
+
+
+def _run_candidates(
+    candidates: Sequence[Candidate],
+    options: ResolverOptions,
+    resolver: Callable[[Candidate, ResolverOptions], PageDecision],
+) -> ResolverSummary:
+    counts: Counter[str] = Counter()
+    sample_urls: list[str] = []
+    stopped_reason: str | None = None
+
+    for candidate in candidates:
+        decision = resolver(candidate, options)
+        record_resolution(
+            candidate.url,
+            status=decision.status,
+            final_url=decision.final_url,
+            error=decision.error,
+            refresh=options.refresh,
+        )
+        counts[decision.status] += 1
+        if len(sample_urls) < 10:
+            sample_urls.append(_summary_url(candidate, decision))
+        if decision.stop_run or should_stop_run(decision.status):
+            stopped_reason = decision.status
+            break
+        _sleep_between(options)
+
+    return ResolverSummary(
+        considered=len(candidates),
+        dry_run=False,
+        counts=dict(counts),
+        stopped_reason=stopped_reason,
+        sample_urls=sample_urls,
+    )
+
+
+def run_resolver(options: ResolverOptions) -> ResolverSummary:
+    candidates = fetch_candidates(
+        limit=options.limit,
+        tiers=options.tiers,
+        include_low=options.include_low,
+        refresh=options.refresh,
+    )
+    if options.dry_run:
+        return ResolverSummary(
+            considered=len(candidates),
+            dry_run=True,
+            counts={},
+            sample_urls=[candidate.url for candidate in candidates[:10]],
+        )
+    if not candidates:
+        return ResolverSummary(considered=0, dry_run=False, counts={}, sample_urls=[])
+    return _run_live_browser(candidates, options)
+
+
+def _sleep_between(options: ResolverOptions) -> None:
+    delay_hi = max(options.delay_min, options.delay_max)
+    if delay_hi <= 0:
+        return
+    delay = random.uniform(max(0.0, options.delay_min), delay_hi)
+    time.sleep(delay)
+
+
+def _snapshot_page(page) -> PageSnapshot:
+    text = ""
+    try:
+        text = page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        text = ""
+
+    controls_raw = page.evaluate(
+        """
+        () => {
+          const cssPath = (el) => {
+            if (el.id) {
+              return `#${CSS.escape(el.id)}`;
+            }
+            const parts = [];
+            let node = el;
+            while (node && node.nodeType === Node.ELEMENT_NODE && parts.length < 4) {
+              const tag = node.tagName.toLowerCase();
+              const parent = node.parentElement;
+              if (!parent) {
+                parts.unshift(tag);
+                break;
+              }
+              const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+              const index = sameTag.indexOf(node) + 1;
+              parts.unshift(`${tag}:nth-of-type(${index})`);
+              node = parent;
+            }
+            return parts.join(" > ");
+          };
+          return Array.from(document.querySelectorAll('a,button')).map((el) => {
+            const text = (el.innerText || el.getAttribute('aria-label') || el.textContent || '').trim();
+            const href = el.href || el.getAttribute('href') || '';
+            return {text, href, selector: cssPath(el)};
+          }).filter((item) => {
+            const haystack = `${item.text} ${item.href}`.toLowerCase();
+            return haystack.includes('apply');
+          });
+        }
+        """
+    )
+    controls = tuple(
+        ApplyControl(
+            text=str(item.get("text") or ""),
+            href=str(item.get("href") or "") or None,
+            selector=str(item.get("selector") or ""),
+        )
+        for item in controls_raw
+        if isinstance(item, dict)
+    )
+    return PageSnapshot(url=page.url, text=text, controls=controls)
+
+
+def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOptions) -> PageDecision:
+    page = context.new_page()
+    try:
+        page.goto(candidate.url, wait_until="domcontentloaded", timeout=options.page_timeout_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        snapshot = _snapshot_page(page)
+        decision = classify_snapshot(snapshot)
+        if decision.status == "resolved_offsite" and decision.final_url:
+            return decision
+        if decision.status == "needs_click" and decision.control:
+            return _click_and_capture_external(page, decision.control, options)
+        return decision
+    except PlaywrightTimeoutError:
+        return PageDecision(status="timeout", error="page_timeout")
+    except Exception as exc:
+        return PageDecision(status="error", error=str(exc)[:200])
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def _locator_for_control(page, control: ApplyControl):
+    if control.selector:
+        try:
+            locator = page.locator(control.selector).first
+            if locator.count() > 0:
+                return locator
+        except Exception:
+            pass
+    control_text = (control.text or "Apply").strip() or "Apply"
+    return page.get_by_text(control_text, exact=False).first
+
+
+def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=3000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+    if is_external_apply_url(page.url):
+        return PageDecision(status="resolved_offsite", final_url=page.url, control=control)
+
+    decision = classify_snapshot(_snapshot_page(page))
+    if decision.status in {"login_required", "challenge_required", "easy_apply", "unavailable"}:
+        return decision
+    return PageDecision(status="no_apply_button", error=f"same_tab_stayed_on_linkedin:{page.url}", control=control)
+
+
+def _click_and_capture_external(page, control: ApplyControl, options: ResolverOptions) -> PageDecision:
+    locator = _locator_for_control(page, control)
+    try:
+        with page.expect_popup(timeout=options.click_timeout_ms) as popup_info:
+            locator.click(timeout=options.click_timeout_ms)
+        popup = popup_info.value
+        try:
+            popup.wait_for_load_state("domcontentloaded", timeout=options.click_timeout_ms)
+            try:
+                popup.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            if is_external_apply_url(popup.url):
+                return PageDecision(status="resolved_offsite", final_url=popup.url, control=control)
+            popup_decision = classify_snapshot(_snapshot_page(popup))
+            if popup_decision.status in {"login_required", "challenge_required", "easy_apply", "unavailable"}:
+                return popup_decision
+            return PageDecision(status="no_apply_button", error=f"popup_stayed_on_linkedin:{popup.url}", control=control)
+        finally:
+            try:
+                popup.close()
+            except Exception:
+                pass
+    except PlaywrightTimeoutError:
+        return _same_tab_decision_after_click(page, control)
+    except Exception as exc:
+        return PageDecision(status="error", error=str(exc)[:200], control=control)
+
+
+def _run_live_browser(candidates: Sequence[Candidate], options: ResolverOptions) -> ResolverSummary:
+    port = BASE_CDP_PORT + options.worker_id
+    proc = launch_chrome(
+        options.worker_id,
+        port=port,
+        headless=False,
+        browser=options.browser,
+    )
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            try:
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                return _run_candidates(
+                    candidates,
+                    options,
+                    lambda candidate, opts: _resolve_one_with_context(context, candidate, opts),
+                )
+            finally:
+                browser.close()
+    finally:
+        cleanup_worker(options.worker_id, proc)
