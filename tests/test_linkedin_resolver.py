@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 from applypilot import database
+from applypilot import linkedin_resolver
 
 
 def test_schema_adds_linkedin_resolver_columns(tmp_path):
@@ -49,3 +50,146 @@ def test_schema_migrates_legacy_jobs_table(tmp_path):
         "linkedin_resolve_final_url",
     }.issubset(column_names)
     assert defaults["linkedin_resolve_attempts"] == "0"
+
+
+def test_url_classification_distinguishes_linkedin_and_offsite():
+    assert linkedin_resolver.is_linkedin_url("https://www.linkedin.com/jobs/view/123") is True
+    assert linkedin_resolver.is_linkedin_url("https://linkedin.com/jobs/view/123") is True
+    assert linkedin_resolver.is_linkedin_url("https://jobs.lever.co/acme/123") is False
+    assert linkedin_resolver.is_external_apply_url("https://jobs.lever.co/acme/123") is True
+    assert linkedin_resolver.is_external_apply_url("https://www.linkedin.com/jobs/view/123") is False
+    assert linkedin_resolver.is_external_apply_url("") is False
+    assert linkedin_resolver.is_external_apply_url(None) is False
+
+
+def _insert_job(
+    conn,
+    *,
+    url: str,
+    title: str = "Chief of Staff",
+    site: str = "linkedin",
+    application_url: str | None = None,
+    audit_label: str | None = "recommended",
+    audit_score: float | None = 8.5,
+    fit_score: int | None = 8,
+    duplicate_of_url: str | None = None,
+    liveness_status: str | None = None,
+    applied_at: str | None = None,
+    linkedin_resolve_status: str | None = None,
+    discovered_at: str = "2026-06-20T00:00:00+00:00",
+):
+    conn.execute(
+        """
+        INSERT INTO jobs (
+            url, title, site, company, application_url, audit_label, audit_score,
+            fit_score, duplicate_of_url, liveness_status, applied_at,
+            linkedin_resolve_status, discovered_at
+        )
+        VALUES (?, ?, ?, 'Acme', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            url,
+            title,
+            site,
+            application_url,
+            audit_label,
+            audit_score,
+            fit_score,
+            duplicate_of_url,
+            liveness_status,
+            applied_at,
+            linkedin_resolve_status,
+            discovered_at,
+        ),
+    )
+    conn.commit()
+
+
+def test_fetch_candidates_prioritizes_recommended_unresolved_linkedin_rows(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/low", audit_label="low", audit_score=9.9)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/dupe", duplicate_of_url="https://x")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/dead", liveness_status="dead")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/applied", applied_at="2026-06-20T01:00:00+00:00")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/offsite", application_url="https://jobs.lever.co/acme/1")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/easy", linkedin_resolve_status="easy_apply")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/priority", audit_label="priority", audit_score=7.0)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/recommended", audit_label="recommended", audit_score=9.0)
+
+    rows = linkedin_resolver.fetch_candidates(limit=10, tiers=("priority", "recommended"))
+
+    assert [row.url for row in rows] == [
+        "https://www.linkedin.com/jobs/view/priority",
+        "https://www.linkedin.com/jobs/view/recommended",
+    ]
+
+
+def test_fetch_candidates_can_include_low_and_refresh_completed_statuses(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/low", audit_label="low")
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/easy", linkedin_resolve_status="easy_apply")
+
+    rows = linkedin_resolver.fetch_candidates(
+        limit=10,
+        tiers=("priority", "recommended"),
+        include_low=True,
+        refresh=True,
+    )
+
+    assert {row.url for row in rows} == {
+        "https://www.linkedin.com/jobs/view/low",
+        "https://www.linkedin.com/jobs/view/easy",
+    }
+
+
+def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/resolve")
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/resolve",
+        status="resolved_offsite",
+        final_url="https://jobs.ashbyhq.com/acme/resolve",
+    )
+
+    row = conn.execute(
+        """
+        SELECT application_url, linkedin_resolve_status, linkedin_resolve_attempts,
+               linkedin_resolve_final_url, linkedin_resolve_error, linkedin_resolved_at
+        FROM jobs WHERE url = ?
+        """,
+        ("https://www.linkedin.com/jobs/view/resolve",),
+    ).fetchone()
+    assert row["application_url"] == "https://jobs.ashbyhq.com/acme/resolve"
+    assert row["linkedin_resolve_status"] == "resolved_offsite"
+    assert row["linkedin_resolve_attempts"] == 1
+    assert row["linkedin_resolve_final_url"] == "https://jobs.ashbyhq.com/acme/resolve"
+    assert row["linkedin_resolve_error"] is None
+    assert row["linkedin_resolved_at"]
+
+
+def test_record_resolution_does_not_overwrite_existing_offsite_without_refresh(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/already",
+        application_url="https://boards.greenhouse.io/acme/jobs/old",
+    )
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/already",
+        status="resolved_offsite",
+        final_url="https://jobs.lever.co/acme/new",
+        refresh=False,
+    )
+
+    app_url = conn.execute(
+        "SELECT application_url FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/already",),
+    ).fetchone()[0]
+    assert app_url == "https://boards.greenhouse.io/acme/jobs/old"
