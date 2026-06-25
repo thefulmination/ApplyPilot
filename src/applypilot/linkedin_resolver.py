@@ -35,17 +35,13 @@ CHALLENGE_TEXTS = (
     "verify your identity",
     "unusual activity",
     "captcha",
-    "checkpoint",
 )
 
 LOGIN_TEXTS = (
-    "sign in to",
     "sign in to view",
     "sign in to continue",
     "join linkedin",
     "email or phone",
-    "sign in",
-    "log in",
     "linkedin login",
 )
 
@@ -117,8 +113,9 @@ def _snapshot_text_lower(snapshot: PageSnapshot) -> str:
 
 
 def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
-    url = snapshot.url.lower()
+    url = str(snapshot.url or "").lower()
     text = _snapshot_text_lower(snapshot)
+    controls = tuple(snapshot.controls or ())
 
     if "/checkpoint/" in url or "/uas/" in url:
         return PageDecision(status="challenge_required", stop_run=True, error="linkedin_checkpoint")
@@ -133,14 +130,14 @@ def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
         return PageDecision(status="unavailable")
 
     easy_apply = next(
-        (control for control in snapshot.controls if "easy apply" in control.text.lower()),
+        (control for control in controls if "easy apply" in str(control.text or "").lower()),
         None,
     )
     if easy_apply is not None:
         return PageDecision(status="easy_apply", control=easy_apply)
 
     apply_control = next(
-        (control for control in snapshot.controls if "apply" in control.text.lower()),
+        (control for control in controls if "apply" in str(control.text or "").lower()),
         None,
     )
     if apply_control is None:

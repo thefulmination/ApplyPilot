@@ -211,6 +211,72 @@ def test_classify_snapshot_reports_missing_apply_control():
     assert decision.status == "no_apply_button"
 
 
+def test_classify_snapshot_handles_missing_url_and_controls():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url=None,  # type: ignore[arg-type]
+        text="Chief of Staff",
+        controls=None,  # type: ignore[arg-type]
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "no_apply_button"
+
+
+def test_classify_snapshot_handles_control_without_text():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Chief of Staff",
+        controls=(
+            linkedin_resolver.ApplyControl(
+                text=None,  # type: ignore[arg-type]
+                href=None,
+                selector="button",
+            ),
+        ),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "no_apply_button"
+
+
+def test_classify_snapshot_does_not_treat_generic_sign_in_text_as_login_wall():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Sign in to learn more about Acme benefits.",
+        controls=(
+            linkedin_resolver.ApplyControl(
+                text="Easy Apply",
+                href=None,
+                selector="button",
+            ),
+        ),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "easy_apply"
+
+
+def test_classify_snapshot_does_not_treat_generic_checkpoint_text_as_challenge():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Own the checkpoint planning process for quarterly initiatives.",
+        controls=(
+            linkedin_resolver.ApplyControl(
+                text="Apply",
+                href="https://jobs.lever.co/acme/123",
+                selector="a[href='https://jobs.lever.co/acme/123']",
+            ),
+        ),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "resolved_offsite"
+
+
 def _insert_job(
     conn,
     *,
