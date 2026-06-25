@@ -97,6 +97,23 @@ def _map_status(status: str) -> tuple[str, str | None]:
     return "failed", (s[:200] or "unknown")
 
 
+def _hydrate_assets(pg) -> None:
+    """Write profile.json + resume.pdf from Postgres to APPLYPILOT_DIR before the first apply.
+    PII ships through PG (not a Railway volume/secret); skips a file already on disk."""
+    import pathlib
+    from applypilot.apply import pgqueue
+    appdir = pathlib.Path(os.environ.get("APPLYPILOT_DIR", "/data/applypilot"))
+    appdir.mkdir(parents=True, exist_ok=True)
+    for fname in ("profile.json", "resume.pdf"):
+        dest = appdir / fname
+        data = pgqueue.get_asset(pg, fname)
+        if data:
+            dest.write_bytes(data)
+            _log(f"hydrated {fname} ({len(data)} bytes) from Postgres")
+        elif not dest.exists():
+            _log(f"WARNING: {fname} not in Postgres and not on disk -- applies will fail")
+
+
 def main() -> int:
     _setup_env()
     signal.signal(signal.SIGTERM, _on_term)
@@ -115,6 +132,7 @@ def main() -> int:
 
     pg = pgqueue.connect()
     pgqueue.ensure_schema(pg)                          # idempotent; safe under concurrency
+    _hydrate_assets(pg)                                # write profile.json + resume.pdf from PG
     reclaimed = pgqueue.reclaim_stale_leases(pg)       # startup crash sweep
     _log(f"worker {worker_id} up | model={model} agent={agent} | reclaimed {len(reclaimed)} stale leases")
 

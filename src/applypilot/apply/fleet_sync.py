@@ -179,7 +179,8 @@ def _home_conn() -> sqlite3.Connection:
 def _cli() -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="fleet_sync", description="Cloud apply-fleet home ops.")
-    ap.add_argument("cmd", choices=["migrate", "set-cap", "push", "pull", "stats", "pause", "resume"])
+    ap.add_argument("cmd", choices=["migrate", "set-cap", "push", "pull", "stats",
+                                    "pause", "resume", "upload-assets"])
     ap.add_argument("--cap", type=float, default=None, help="spend cap USD (set-cap)")
     ap.add_argument("--score-floor", type=int, default=7, help="min score to push")
     ap.add_argument("--limit", type=int, default=None, help="max jobs to push")
@@ -205,6 +206,16 @@ def _cli() -> int:
             pgqueue.set_paused(pg, True); print("fleet PAUSED (workers will drain + stop)")
         elif a.cmd == "resume":
             pgqueue.set_paused(pg, False); print("fleet resumed")
+        elif a.cmd == "upload-assets":
+            import pathlib
+            appdir = pathlib.Path(str(config.APP_DIR))
+            for fname in ("profile.json", "resume.pdf"):
+                fp = appdir / fname
+                if fp.exists():
+                    pgqueue.put_asset(pg, fname, fp.read_bytes())
+                    print(f"uploaded {fname} ({fp.stat().st_size} bytes)")
+                else:
+                    print(f"MISSING {fp} -- skipped")
     finally:
         pg.close()
     return 0

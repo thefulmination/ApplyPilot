@@ -85,3 +85,12 @@ CREATE TABLE IF NOT EXISTS fleet_config (
 INSERT INTO fleet_config (id, spend_cap_usd, paused)
 VALUES (1, 0, FALSE)
 ON CONFLICT (id) DO NOTHING;
+
+-- Worker assets (profile.json + resume.pdf) shipped THROUGH Postgres, so the fleet needs no
+-- volume/secret juggling for PII: the home box uploads them once, each worker hydrates them to
+-- disk on startup. BYTEA holds the binary resume PDF.
+CREATE TABLE IF NOT EXISTS fleet_assets (
+    name       TEXT        PRIMARY KEY,
+    data       BYTEA       NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

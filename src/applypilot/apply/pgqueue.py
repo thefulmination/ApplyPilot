@@ -343,6 +343,25 @@ FROM apply_queue
 """
 
 
+def put_asset(conn: psycopg.Connection, name: str, data: bytes) -> None:
+    """Store a worker asset (profile.json / resume.pdf) in Postgres for the fleet to hydrate."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_assets (name, data) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = now()",
+            (name, data),
+        )
+    conn.commit()
+
+
+def get_asset(conn: psycopg.Connection, name: str) -> bytes | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT data FROM fleet_assets WHERE name = %s", (name,))
+        row = cur.fetchone()
+    conn.rollback()
+    return bytes(row["data"]) if row else None
+
+
 def queue_stats(conn: psycopg.Connection, *, by_model: bool = False) -> list[dict[str, Any]]:
     """POC metrics (spec S7). by_model=True breaks the numbers down by agent_model for the
     Sonnet-vs-DeepSeek A/B."""
