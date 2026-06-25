@@ -5,6 +5,11 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+# Gmail OAuth secrets (read-only scanner). The real ones live in .applypilot/ (already
+# ignored); these patterns also catch a stray copy left anywhere in the repo.
+gmail_credentials*.json
+gmail_token*.json
+*client_secret*.json
 
 # Runtime artifacts
 *.db

@@ -1266,7 +1266,8 @@ def scan_gmail_command(
         console.print("[dim]No application-related emails found in the search window.[/dim]\n")
         return
 
-    _COLORS = {"offer": "green", "interview": "cyan", "rejected": "red"}
+    _COLORS = {"offer": "green", "interview": "cyan", "rejected": "red",
+               "acknowledged": "blue"}
 
     table = Table(
         title=f"Detected outcomes ({len(outcomes)})",
@@ -1303,6 +1304,8 @@ def scan_gmail_command(
 
     verb = "Would write" if dry_run else "Wrote"
     console.print(f"\n{verb}: [bold]{counts['written']}[/bold] outcome(s)")
+    if counts.get("skipped_acknowledged"):
+        console.print(f"  Acknowledgments (receipts, not written): {counts['skipped_acknowledged']}")
     if counts["skipped_no_match"]:
         console.print(f"  Skipped (no job match):  {counts['skipped_no_match']}")
     if counts["skipped_ambiguous"]:

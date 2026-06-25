@@ -74,13 +74,14 @@ class TestClassifyEmailOutcome:
         )
         assert outcome == "offer"
 
-    def test_ambiguous_acknowledgement(self):
-        # "Application received" should not be classified
+    def test_application_receipt_is_acknowledged_not_ambiguous(self):
+        # An application receipt is now its OWN category (was 'ambiguous', and worse,
+        # often leaked into 'interview' via generic "next steps" body phrases).
         outcome, _, _ = classify_email_outcome(
             subject="We received your application",
             body="Thank you for applying. We will be in touch.",
         )
-        assert outcome == "ambiguous"
+        assert outcome == "acknowledged"
 
     def test_ats_sender_rejection(self):
         outcome, _, _ = classify_email_outcome(
@@ -104,6 +105,200 @@ class TestClassifyEmailOutcome:
         )
         assert outcome == "offer"
         assert confidence in ("high", "medium")
+
+
+class TestNonJobGate:
+    """Promotional / financial / newsletter emails must be dropped, not classified.
+    These are real shapes the broad gmail query pulls in (the loan-"offer" that used to
+    be flagged as a job 'offer')."""
+
+    @pytest.mark.parametrize("subject,body,sender", [
+        ("You have a Citi Personal Loan offer of $40,000",
+         "Apply now for a Citi Personal Loan. View in browser.", "offers@info15.citi.com"),
+        ("Your balance transfer offer ends soon",
+         "Transfer a balance and save on interest. View in browser. Unsubscribe.",
+         "no-reply@info15.citi.com"),
+        ("Jonathan, following up on your student loan refi offer",
+         "Refinance your student loan today.", "hello@hello.earnest.com"),
+        ("Get a $0 Companion Fare offer to use toward your next trip",
+         "And a 60000 bonus point offer.", "deals@email.alaskaair.com"),
+        ("Athletic Shoes: Dick's Sporting Goods In-App Offer",
+         "This deal matches your alert.", "alerts@da.slickdeals.net"),
+        ("Medium daily digest", "Today's highlights for you.", "noreply@medium.com"),
+    ])
+    def test_promotional_emails_dropped(self, subject, body, sender):
+        outcome, _, _ = classify_email_outcome(subject, body, sender)
+        assert outcome == "not_job"
+
+    def test_loan_offer_letter_is_not_a_job_offer(self):
+        # The exact false positive that started this: a finance "offer letter" must NOT
+        # be classified as a job offer.
+        outcome, _, _ = classify_email_outcome(
+            subject="Your pre-selected personal loan offer letter",
+            body="View this offer in browser. Annual percentage rate applies. Unsubscribe.",
+            sender="loans@firsttechfed.com",
+        )
+        assert outcome != "offer"
+        assert outcome == "not_job"
+
+    def test_real_job_offer_survives_the_gate(self):
+        outcome, _, _ = classify_email_outcome(
+            subject="Your job offer from Globex",
+            body="We would like to offer you the position of Chief of Staff. "
+                 "Your annual base salary of $180,000.",
+            sender="people@globex.com",
+        )
+        assert outcome == "offer"
+
+
+class TestAcknowledgedVsInterview:
+    """The core fix: application receipts are 'acknowledged', not 'interview'."""
+
+    @pytest.mark.parametrize("subject,body", [
+        ("Thank you for applying to Socure!",
+         "Hi Jonathan, Thank you for applying to the Chief of Staff opening. "
+         "Your application has been received and we will review it."),
+        ("Thanks for applying to Exa",
+         "We've received your application and will be in touch about next steps."),
+        ("Dyna Robotics Application Confirmation",
+         "Thank you for applying to Dyna! We've received your application. "
+         "We appreciate your patience and wish you the best in your job search."),
+        ("We've received your application to Nooks!",
+         "Thanks Jonathan! We received your application and will review every candidate."),
+    ])
+    def test_receipts_are_acknowledged(self, subject, body):
+        outcome, _, _ = classify_email_outcome(subject, body, sender="no-reply@us.greenhouse-mail.io")
+        assert outcome == "acknowledged"
+
+    def test_receipt_with_boilerplate_next_steps_not_interview(self):
+        # "we'll be in touch about next steps" is boilerplate, NOT an interview request.
+        outcome, _, _ = classify_email_outcome(
+            subject="Thank you for applying to Acme",
+            body="Your application has been received. We'll be in touch about next steps.",
+        )
+        assert outcome == "acknowledged"
+
+    def test_genuine_interview_request_still_wins(self):
+        # A real interview request beats a generic receipt subject.
+        outcome, _, _ = classify_email_outcome(
+            subject="Next steps for your application",
+            body="We would like to move forward. Please schedule a 30-minute video interview.",
+        )
+        assert outcome == "interview"
+
+
+class TestConditionalRejectionIsNotRejection:
+    """ATS acknowledgment boilerplate contains conditional/courtesy phrases that must NOT
+    register as a rejection (the 5 false positives found on the live inbox)."""
+
+    def test_if_not_selected_boilerplate_is_acknowledged(self):
+        # The Lever acknowledgment template (Formic/Xsolla/Hey Jane).
+        outcome, _, _ = classify_email_outcome(
+            subject="Thank you for applying to Formic",
+            body="Thanks for applying. If you are not selected for this position, "
+                 "please keep an eye on our careers page for future openings.",
+            sender="no-reply@hire.lever.co",
+        )
+        assert outcome == "acknowledged"
+
+    def test_wish_you_the_best_courtesy_is_acknowledged(self):
+        outcome, _, _ = classify_email_outcome(
+            subject="Application Confirmation",
+            body="Thank you for applying! We've received your application. "
+                 "We wish you the best in your job search.",
+            sender="no-reply@ashbyhq.com",
+        )
+        assert outcome == "acknowledged"
+
+    def test_definite_rejection_overrides_receipt(self):
+        # A real rejection phrased as "thanks for applying ... but we've decided to
+        # pursue other candidates" must still be a rejection.
+        outcome, _, _ = classify_email_outcome(
+            subject="Your application Business Operations Coordinator",
+            body="Thank you for applying. After reviewing your application we have "
+                 "decided to pursue other candidates whose experience more closely aligns.",
+            sender="no-reply@myworkday.com",
+        )
+        assert outcome == "rejected"
+
+
+class TestAtsMailDomains:
+    """ATS platforms send from *-mail.* subdomains (greenhouse-mail.io, teamtailor-mail
+    .com), not the bare board domain -- detection/matching used to miss every one."""
+
+    def test_greenhouse_mail_subdomain_is_ats(self):
+        from applypilot.gmail_outcomes import _is_ats_domain
+        assert _is_ats_domain("us.greenhouse-mail.io") is True
+        assert _is_ats_domain("revalue.teamtailor-mail.com") is True
+        assert _is_ats_domain("ats.rippling.com") is True
+        assert _is_ats_domain("app.bamboohr.com") is True
+        assert _is_ats_domain("gmail.com") is False
+
+    def test_ats_sender_is_always_job_related(self):
+        from applypilot.gmail_outcomes import is_non_job_email
+        # Even a terse ATS email with no anchors is a job email (not dropped).
+        non_job, _ = is_non_job_email("Update", "Please see the portal.",
+                                      "noreply@us.greenhouse-mail.io")
+        assert non_job is False
+
+
+class TestAdversarialBoundaries:
+    """Regression guards for the 18 cases an adversarial review surfaced (offers/
+    interviews/rejections that the live all-acknowledgment inbox could not exercise).
+    The unifying rule: only a CONCRETE signal overrides an acknowledgment receipt;
+    receipt boilerplate ("if your background matches, we'll reach out to schedule a
+    call") must NOT register as a real interview/rejection."""
+
+    @pytest.mark.parametrize("subject,body,sender,expected", [
+        # --- precision: promos that reuse job words must drop ---
+        ("Your offer is ready",
+         "Your application for a loan is approved. We would like to offer you 0 percent APR.",
+         "noreply@bankpromo-mail.com", "not_job"),
+        ("Schedule your free career coaching call",
+         "Schedule a call with a coach. Pick a time on calendly.",
+         "hello@careercoachpro-news.com", "not_job"),
+        ("We received your application for a new credit card",
+         "Thank you for applying. We have received your application.",
+         "noreply@cardservices-mail.com", "not_job"),
+        # --- recall: real outcomes from NON-ATS company senders must survive the gate ---
+        ("Congratulations from Initech", "Welcome you aboard. Compensation: 170000. Start date: August 1.",
+         "careers@initech.com", "offer"),
+        ("Unfortunately, an update from Acme",
+         "We regret to inform you that you have not been selected.", "talent@acme.com", "rejected"),
+        # --- neutral status subjects must NOT inject a rejection ---
+        ("An update on your application",
+         "Congratulations! We would like to offer you the role. We are thrilled to have you join the team.",
+         "careers@acme.com", "offer"),
+        ("Update on your application",
+         "Great news - we'd like to move you forward to the next stage. Someone will be in touch shortly.",
+         "talent@acme.com", "acknowledged"),
+        # --- buried interview/assessment under a receipt subject -> interview ---
+        ("We've received your application",
+         "Thanks for applying. Please complete the online assessment via HackerRank.",
+         "noreply@hackerrank-mail.com", "interview"),
+        ("Application received", "We received your application. Are you available for a phone interview?",
+         "hr@company.com", "interview"),
+        # --- soft rejection under a receipt subject -> rejected ---
+        ("Thank you for applying",
+         "Thank you for applying. After review, you are not the right fit for this role.",
+         "careers@company.com", "rejected"),
+        ("Thanks for applying", "Thank you for applying. We have chosen another candidate for this role.",
+         "hr@company.com", "rejected"),
+        # --- receipt boilerplate (conditional/future) must STAY acknowledged ---
+        ("Thank you for applying to Acme",
+         "Thanks for applying. If your background aligns, we will reach out to schedule an interview.",
+         "no-reply@us.greenhouse-mail.io", "acknowledged"),
+        ("Thank you for applying",
+         "Thank you for applying. Due to the volume of applications, we unfortunately cannot respond to everyone.",
+         "hr@company.com", "acknowledged"),
+        # --- thread-title interview subject on a post-interview rejection -> rejected ---
+        ("Your interview with Acme Corp",
+         "Thank you for interviewing. Unfortunately, we have decided to go with another candidate.",
+         "recruiting@acmecorp.com", "rejected"),
+    ])
+    def test_boundary_case(self, subject, body, sender, expected):
+        outcome, _, _ = classify_email_outcome(subject, body, sender)
+        assert outcome == expected, f"{subject!r} -> {outcome}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +487,21 @@ class TestApplyOutcomes:
         result = apply_outcomes(outcomes, dry_run=True)
         assert result["written"] == 0
         assert result["skipped_ambiguous"] == 1
+
+    def test_acknowledged_is_shown_but_not_written(self):
+        # Acknowledgments are receipts -- counted/displayed but never written to the
+        # tracker (the tool already recorded the apply; an old receipt must not downgrade
+        # a job that has since advanced).
+        outcomes = [
+            EmailOutcome(
+                message_id="ack", date="", sender="no-reply@us.greenhouse-mail.io",
+                subject="Thank you for applying", outcome="acknowledged", confidence="high",
+                matched_job_url="https://acme.com/jobs/1",
+            ),
+        ]
+        result = apply_outcomes(outcomes, dry_run=True)
+        assert result["written"] == 0
+        assert result["skipped_acknowledged"] == 1
 
     def test_mixed_batch(self):
         outcomes = [
