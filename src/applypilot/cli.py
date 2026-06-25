@@ -384,10 +384,67 @@ def linkedin_split_command() -> None:
     )
     if offsite == 0:
         console.print(
-            "[dim]No offsite URLs resolved yet — have the extractor emit companyApplyUrl, "
-            "then re-run sync_linkedin_picks.py to backfill application_url.[/dim]"
+            "[dim]No offsite URLs resolved yet. Run "
+            "`applypilot linkedin-resolve-apply-urls --dry-run --limit 20` first, "
+            "then a small live resolver pass if the candidate list looks right.[/dim]"
         )
     conn.close()
+
+
+@app.command("linkedin-resolve-apply-urls")
+def linkedin_resolve_apply_urls_command(
+    limit: int = typer.Option(200, "--limit", help="Maximum unresolved LinkedIn jobs to inspect."),
+    delay_min: float = typer.Option(8.0, "--delay-min", help="Minimum delay between LinkedIn job pages."),
+    delay_max: float = typer.Option(20.0, "--delay-max", help="Maximum delay between LinkedIn job pages."),
+    tiers: str = typer.Option("priority,recommended", "--tiers", help="Comma-separated audit labels to include."),
+    include_low: bool = typer.Option(False, "--include-low", help="Also include review and low audit labels."),
+    refresh: bool = typer.Option(False, "--refresh", help="Revisit rows with previous resolver statuses."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List candidates without opening LinkedIn."),
+    browser: str = typer.Option("chrome", "--browser", help="Browser profile source: chrome, edge, cft, chromium, or default."),
+    worker_id: int = typer.Option(80, "--worker-id", help="Resolver browser worker id; keep separate from apply workers."),
+) -> None:
+    """Resolve external ATS apply URLs from LinkedIn job pages without applying."""
+    _bootstrap()
+    from applypilot import linkedin_resolver
+
+    parsed_tiers = tuple(t.strip() for t in tiers.split(",") if t.strip())
+    if not parsed_tiers:
+        console.print("[red]--tiers must include at least one audit label.[/red]")
+        raise typer.Exit(code=1)
+    if delay_max < delay_min:
+        console.print("[red]--delay-max must be greater than or equal to --delay-min.[/red]")
+        raise typer.Exit(code=1)
+    browser_name = browser.strip().lower()
+    if browser_name not in {"chrome", "edge", "cft", "chromium", "default"}:
+        console.print("[red]--browser must be one of chrome, edge, cft, chromium, or default.[/red]")
+        raise typer.Exit(code=1)
+
+    summary = linkedin_resolver.run_resolver(
+        linkedin_resolver.ResolverOptions(
+            limit=limit,
+            tiers=parsed_tiers,
+            include_low=include_low,
+            refresh=refresh,
+            dry_run=dry_run,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            browser=browser_name,
+            worker_id=worker_id,
+        )
+    )
+
+    console.print("\n[bold]LinkedIn external apply URL resolver[/bold]")
+    console.print(f"  considered: {summary.considered}")
+    if summary.dry_run:
+        console.print("  mode:       dry run")
+        for url in summary.sample_urls or []:
+            console.print(f"  - {url}")
+        return
+    for status, count in sorted((summary.counts or {}).items()):
+        console.print(f"  {status}: {count}")
+    if summary.stopped_reason:
+        console.print(f"  [yellow]stopped:[/yellow] {summary.stopped_reason}")
+    console.print("[dim]Next: run `applypilot linkedin-split` to inspect the offsite/Easy Apply split.[/dim]")
 
 
 @app.command("apply-failures")
