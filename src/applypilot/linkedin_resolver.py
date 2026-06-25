@@ -209,7 +209,7 @@ def record_resolution(
     ).fetchone()
     if existing is None:
         raise ValueError(f"Job not found: {url}")
-    current_app_url = existing["application_url"] if existing else None
+    current_app_url = existing[0] if existing else None
 
     should_set_application = (
         status == "resolved_offsite"

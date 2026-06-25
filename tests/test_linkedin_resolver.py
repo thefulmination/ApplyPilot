@@ -303,6 +303,49 @@ def test_fetch_candidates_obeys_max_scan_row_cap(tmp_path, monkeypatch):
     assert rows == []
 
 
+def test_record_resolution_works_with_plain_sqlite_connection(tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    database.init_db(db_path)
+    database.close_connection(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        _insert_job(
+            conn,
+            url="https://www.linkedin.com/jobs/view/plain-conn",
+            application_url="https://linkedin.com/jobs/view/plain",
+        )
+        linkedin_resolver.record_resolution(
+            "https://www.linkedin.com/jobs/view/plain-conn",
+            status="resolved_offsite",
+            final_url="https://jobs.ashbyhq.com/acme/plain",
+            conn=conn,
+        )
+        row = conn.execute(
+            """
+            SELECT application_url, linkedin_resolve_status, linkedin_resolve_attempts,
+                   linkedin_resolve_final_url
+              FROM jobs
+             WHERE url = ?
+            """,
+            ("https://www.linkedin.com/jobs/view/plain-conn",),
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "https://jobs.ashbyhq.com/acme/plain"
+    assert row[1] == "resolved_offsite"
+    assert row[2] == 1
+    assert row[3] == "https://jobs.ashbyhq.com/acme/plain"
+
+
+def test_fetch_candidates_max_scan_rows_zero_returns_empty(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/priority", audit_label="priority")
+
+    assert linkedin_resolver.fetch_candidates(limit=5, tiers=("priority",), max_scan_rows=0) == []
+
+
 def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
