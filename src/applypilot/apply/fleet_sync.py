@@ -171,3 +171,45 @@ def _home_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(config.DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# --- home-side fleet ops CLI ------------------------------------------------
+# Run on the home box with DATABASE_URL = the Railway Postgres PUBLIC url, e.g.:
+#   DATABASE_URL=postgres://... python -m applypilot.apply.fleet_sync push --limit 800
+def _cli() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="fleet_sync", description="Cloud apply-fleet home ops.")
+    ap.add_argument("cmd", choices=["migrate", "set-cap", "push", "pull", "stats", "pause", "resume"])
+    ap.add_argument("--cap", type=float, default=None, help="spend cap USD (set-cap)")
+    ap.add_argument("--score-floor", type=int, default=7, help="min score to push")
+    ap.add_argument("--limit", type=int, default=None, help="max jobs to push")
+    a = ap.parse_args()
+
+    pg = pgqueue.connect()
+    try:
+        if a.cmd == "migrate":
+            pgqueue.ensure_schema(pg); print("schema ensured (apply_queue + fleet_config)")
+        elif a.cmd == "set-cap":
+            if a.cap is None:
+                ap.error("--cap is required for set-cap")
+            pgqueue.set_spend_cap(pg, a.cap); print(f"spend_cap_usd = ${a.cap:.2f}")
+        elif a.cmd == "push":
+            n = push_offsite_jobs(pg_conn=pg, score_floor=a.score_floor, limit=a.limit)
+            print(f"pushed {n} offsite-eligible jobs to the queue")
+        elif a.cmd == "pull":
+            print("pulled results:", pull_results(pg_conn=pg))
+        elif a.cmd == "stats":
+            for row in pgqueue.queue_stats(pg):
+                print(row)
+        elif a.cmd == "pause":
+            pgqueue.set_paused(pg, True); print("fleet PAUSED (workers will drain + stop)")
+        elif a.cmd == "resume":
+            pgqueue.set_paused(pg, False); print("fleet resumed")
+    finally:
+        pg.close()
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli())

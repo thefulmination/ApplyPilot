@@ -501,6 +501,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
     ]
     if headless:
         cmd.append("--headless=new")
+    if platform.system() == "Linux":
+        # Cloud containers run as root with a tiny /dev/shm -- Chromium refuses to start
+        # without these. No-op/unwanted on the home Windows box (guarded by platform).
+        cmd += ["--no-sandbox", "--disable-dev-shm-usage"]
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

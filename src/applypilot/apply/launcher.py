@@ -86,6 +86,10 @@ _stop_event = threading.Event()
 
 # Track active apply-agent processes for skip (Ctrl+C) handling
 _agent_procs: dict[int, subprocess.Popen] = {}
+# Last apply-agent run stats per worker (cost_usd / tokens). run_job records cost to the
+# home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
+# real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
+_last_run_stats: dict[int, dict] = {}
 _agent_lock = threading.Lock()
 
 # Register cleanup on exit
@@ -1244,6 +1248,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         result_source = final_text if "RESULT:" in final_text else output
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
+        _last_run_stats[worker_id] = dict(stats) if stats else {}
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"

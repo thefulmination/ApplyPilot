@@ -1,0 +1,13 @@
+# In-container LiteLLM proxy: serves DeepSeek (via its OpenAI-compatible API) as an
+# Anthropic-compatible /v1/messages endpoint so Claude Code can drive it without the
+# count_tokens/streaming hang of talking to api.deepseek.com/anthropic directly.
+# The key is read from the DEEPSEEK_API_KEY env (sealed in Railway).
+model_list:
+  - model_name: deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: deepseek-reasoner
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
