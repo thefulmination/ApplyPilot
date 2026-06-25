@@ -30,8 +30,10 @@ def _build_profile_summary(profile: dict) -> str:
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
 
+    _fn = personal["full_name"]
+    _first, _last = _fn.split()[0], (_fn.split()[-1] if " " in _fn else "")
     lines = [
-        f"Name: {personal['full_name']}",
+        f"Name: {_fn}" + (f"  (first name: {_first}, last name: {_last}; write first name FIRST)" if _last else ""),
         f"Email: {personal['email']}",
         f"Phone: {personal['phone']}",
     ]
@@ -219,9 +221,21 @@ def _build_hard_rules(profile: dict) -> str:
     if permit_type:
         work_auth_rule = f"Work auth: {permit_type}. Sponsorship needed: {sponsorship}."
 
-    name_rule = f'Name: Legal name = {full_name}.'
-    if preferred_name and preferred_name != full_name.split()[0]:
-        name_rule += f' Preferred name = {preferred_name}. Use "{display_name}" unless a field specifically says "legal name".'
+    first_name = full_name.split()[0]
+    last_name = full_name.split()[-1] if " " in full_name else ""
+    if last_name:
+        name_rule = (
+            f'Name: Full legal name = "{full_name}" (FIRST name = {first_name}, LAST name = '
+            f'{last_name}). In a single "Name"/"Full name" field type it EXACTLY as "{full_name}" '
+            f'-- first name first. NEVER reorder to "{last_name} {first_name}". For separate fields: '
+            f'First name = {first_name}, Last name = {last_name}. Write "{last_name}, {first_name}" '
+            f'ONLY if the field label explicitly says "Last, First" (or "Last name, First name"). '
+            f'If a field is pre-filled with the name reversed, fix it to "{full_name}".'
+        )
+    else:
+        name_rule = f'Name: Full legal name = "{full_name}".'
+    if preferred_name and preferred_name != first_name:
+        name_rule += f' Preferred name = {preferred_name}; use "{display_name}" unless a field specifically says "legal name".'
 
     return f"""== HARD RULES (never break these) ==
 1. Never lie about: citizenship, work authorization, criminal history, education credentials, security clearance, licenses.
@@ -644,6 +658,7 @@ This is the owner's REAL LinkedIn account -- protect it above all else:
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
+   - NAME ORDER: a "Name"/"Full name" field must read first name first (see HARD RULES). If it's empty, type the full name in that order; if it's pre-filled reversed (last name first), fix it. Do not leave or enter the name last-first unless the label literally says "Last, First".
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
