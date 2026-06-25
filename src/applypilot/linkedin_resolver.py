@@ -91,6 +91,7 @@ def fetch_candidates(
     tiers: Iterable[str] | None = ("priority", "recommended"),
     include_low: bool = False,
     refresh: bool = False,
+    max_scan_rows: int | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> list[Candidate]:
     if conn is None:
@@ -125,7 +126,8 @@ def fetch_candidates(
            END,
            COALESCE(audit_score, -1) DESC,
            COALESCE(fit_score, -1) DESC,
-           COALESCE(discovered_at, '') DESC
+           COALESCE(discovered_at, '') DESC,
+           url ASC
          LIMIT ? OFFSET ?
     """
 
@@ -136,23 +138,34 @@ def fetch_candidates(
     if limit <= 0:
         return []
 
+    max_scan_rows = max(500, limit * 50) if max_scan_rows is None else max_scan_rows
+    if max_scan_rows <= 0:
+        return []
+
     max_page = 100
     chunk_size = max(limit * 5, 10)
     if max_page > 0:
         chunk_size = min(chunk_size, max_page)
 
     offset = 0
+    scanned_rows = 0
     candidates: list[Candidate] = []
     while len(candidates) < limit:
+        page_cap = max_scan_rows - scanned_rows
+        if page_cap <= 0:
+            break
+        current_page = min(chunk_size, page_cap)
+
         rows = _fetch_candidate_page(
             conn,
             query=query,
             params=params,
-            page_size=chunk_size,
+            page_size=current_page,
             offset=offset,
         )
         if not rows:
             break
+        scanned_rows += len(rows)
 
         for row in rows:
             if not row["application_url"] or not is_external_apply_url(row["application_url"]):
@@ -170,9 +183,9 @@ def fetch_candidates(
                 if len(candidates) >= limit:
                     break
 
-        if len(rows) < chunk_size:
+        if len(rows) < current_page or scanned_rows >= max_scan_rows:
             break
-        offset += chunk_size
+        offset += current_page
 
     return candidates[:limit]
 

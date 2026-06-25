@@ -171,8 +171,63 @@ def test_fetch_candidates_filters_external_application_urls_host_aware(tmp_path,
     rows = linkedin_resolver.fetch_candidates(limit=10, tiers=("priority",))
 
     assert [row.url for row in rows] == [
-        "https://www.linkedin.com/jobs/view/linkedin-host",
         "https://www.linkedin.com/jobs/view/blank-host",
+        "https://www.linkedin.com/jobs/view/linkedin-host",
+    ]
+
+
+def test_fetch_candidates_limit_zero_returns_empty(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/priority", audit_label="priority")
+
+    assert linkedin_resolver.fetch_candidates(limit=0, tiers=("priority",)) == []
+
+
+def test_fetch_candidates_returns_empty_when_no_qualifying_candidates(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/external-offsite",
+        audit_label="priority",
+        application_url="https://jobs.acme.com/abc",
+    )
+
+    rows = linkedin_resolver.fetch_candidates(limit=5, tiers=("priority",))
+    assert rows == []
+
+
+def test_fetch_candidates_uses_url_tie_break_for_deterministic_ordering(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/b-xyz",
+        audit_label="priority",
+        audit_score=8.8,
+        fit_score=10,
+        discovered_at="2026-06-20T00:00:00+00:00",
+        application_url=None,
+    )
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/a-xyz",
+        audit_label="priority",
+        audit_score=8.8,
+        fit_score=10,
+        discovered_at="2026-06-20T00:00:00+00:00",
+        application_url=None,
+    )
+
+    rows = linkedin_resolver.fetch_candidates(limit=2, tiers=("priority",))
+
+    assert [row.url for row in rows] == [
+        "https://www.linkedin.com/jobs/view/a-xyz",
+        "https://www.linkedin.com/jobs/view/b-xyz",
     ]
 
 
@@ -212,6 +267,40 @@ def test_fetch_candidates_scans_past_host_filtered_top_rows_to_fill_limit(tmp_pa
         "https://www.linkedin.com/jobs/view/first-real",
         "https://www.linkedin.com/jobs/view/second-real",
     ]
+
+
+def test_fetch_candidates_obeys_max_scan_row_cap(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    for index in range(1, 21):
+        _insert_job(
+            conn,
+            url=f"https://www.linkedin.com/jobs/view/offsite-{index}",
+            audit_label="priority",
+            application_url=f"https://jobs.lever.co/acme/{index}?utm_source=linkedin.com",
+            audit_score=9.9,
+            fit_score=9,
+            discovered_at=f"2026-06-20T00:{index:02d}:00+00:00",
+        )
+
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/valid-after-scan-window",
+        audit_label="priority",
+        application_url=None,
+        audit_score=5.0,
+        fit_score=7,
+        discovered_at="2026-06-21T00:00:00+00:00",
+    )
+
+    rows = linkedin_resolver.fetch_candidates(
+        limit=1,
+        tiers=("priority",),
+        max_scan_rows=10,
+    )
+
+    assert rows == []
 
 
 def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp_path, monkeypatch):
