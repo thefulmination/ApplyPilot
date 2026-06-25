@@ -43,7 +43,7 @@ Log "LAUNCH supervisor (target_applied=$TargetApplied)"
 # awkward to read/grep; Out-File -Encoding utf8 keeps them plain UTF-8. $LASTEXITCODE
 # still reflects python's exit code after the pipe (Out-File doesn't change it).
 & $py -m applypilot.cli supervise-apply --target-applied $TargetApplied --max-cost-usd 90 `
-    --linkedin-daily-cap 20 --max-job-age-days 45 --stall-minutes 20 `
+    --workers 2 --linkedin-daily-cap 20 --max-job-age-days 45 --stall-minutes 20 `
     --max-attempts 100 --max-hours 48 2>&1 |
     Out-File -FilePath $superOut -Append -Encoding utf8
 Log "supervisor exited code=$LASTEXITCODE"

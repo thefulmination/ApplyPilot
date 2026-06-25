@@ -1198,6 +1198,11 @@ def supervise_apply_command(
     max_cost_usd: float = typer.Option(..., "--max-cost-usd",
         help="TOTAL cost budget (USD) across all auto-restarts."),
     model: str = typer.Option("sonnet", "--model", "-m"),
+    workers: int = typer.Option(1, "--workers", "-w",
+        help="Parallel apply browser workers. Account-safe: the LinkedIn daily cap and "
+             "per-host throttle are process-global (shared across workers), and the lease "
+             "is re-stamped at launch so the reclaimer can't double-submit. 1 is "
+             "conservative; 2 ~doubles throughput on a machine with RAM headroom."),
     linkedin_daily_cap: int = typer.Option(20, "--linkedin-daily-cap"),
     base_resume: bool = typer.Option(True, "--base-resume/--no-base-resume"),
     max_job_age_days: int = typer.Option(0, "--max-job-age-days",
@@ -1230,7 +1235,8 @@ def supervise_apply_command(
     _bootstrap()
     from applypilot.apply.supervisor import supervise
     supervise(
-        total_cost_usd=max_cost_usd, model=model, linkedin_daily_cap=linkedin_daily_cap,
+        total_cost_usd=max_cost_usd, model=model, workers=workers,
+        linkedin_daily_cap=linkedin_daily_cap,
         base_resume=base_resume, max_job_age_days=max_job_age_days, lane_filter=lane_filter,
         preflight_liveness=preflight_liveness,
         stall_minutes=stall_minutes, max_attempts=max_attempts, max_hours=max_hours,
