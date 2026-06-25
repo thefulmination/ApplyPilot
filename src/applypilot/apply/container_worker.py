@@ -118,8 +118,10 @@ def _hydrate_assets(pg) -> None:
 # Compute the REAL DeepSeek cost from token counts. The Claude CLI prices the run via the
 # proxy and may not reflect DeepSeek's rates or caching, so the cap would be inaccurate if we
 # trusted its total_cost_usd. Standard-tier rates ($/M input, $/M output).
-_DEEPSEEK_RATES = {
-    "deepseek-chat": (0.27, 1.10),
+_DEEPSEEK_RATES = {  # ($/M cache-miss input, $/M output); cached input is ~$0.003/M, far cheaper
+    "deepseek-chat": (0.14, 0.28),        # the 'deepseek-chat' alias routes to v4-flash
+    "deepseek-v4-flash": (0.14, 0.28),
+    "deepseek-v4-pro": (0.435, 0.87),
     "deepseek-reasoner": (0.55, 2.19),
 }
 
