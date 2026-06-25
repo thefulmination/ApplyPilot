@@ -74,6 +74,17 @@ def _build_completed_status_filter() -> str:
     )
 
 
+def _fetch_candidate_page(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    params: list[str | int],
+    page_size: int,
+    offset: int,
+) -> list[sqlite3.Row]:
+    return conn.execute(query, (*params, page_size, offset)).fetchall()
+
+
 def fetch_candidates(
     *,
     limit: int,
@@ -115,28 +126,53 @@ def fetch_candidates(
            COALESCE(audit_score, -1) DESC,
            COALESCE(fit_score, -1) DESC,
            COALESCE(discovered_at, '') DESC
+         LIMIT ? OFFSET ?
     """
 
     params: list[str | int] = [*wanted_tiers]
     if not refresh:
         params.extend(completed_params)
 
-    rows = conn.execute(query, params).fetchall()
+    if limit <= 0:
+        return []
 
-    candidates = [
-        Candidate(
-            url=row["url"],
-            title=row["title"],
-            company=row["company"],
-            application_url=row["application_url"],
-            audit_label=row["audit_label"],
-            audit_score=row["audit_score"],
-            fit_score=row["fit_score"],
+    max_page = 100
+    chunk_size = max(limit * 5, 10)
+    if max_page > 0:
+        chunk_size = min(chunk_size, max_page)
+
+    offset = 0
+    candidates: list[Candidate] = []
+    while len(candidates) < limit:
+        rows = _fetch_candidate_page(
+            conn,
+            query=query,
+            params=params,
+            page_size=chunk_size,
+            offset=offset,
         )
-        for row in rows
-        if not row["application_url"]
-        or not is_external_apply_url(row["application_url"])
-    ]
+        if not rows:
+            break
+
+        for row in rows:
+            if not row["application_url"] or not is_external_apply_url(row["application_url"]):
+                candidates.append(
+                    Candidate(
+                        url=row["url"],
+                        title=row["title"],
+                        company=row["company"],
+                        application_url=row["application_url"],
+                        audit_label=row["audit_label"],
+                        audit_score=row["audit_score"],
+                        fit_score=row["fit_score"],
+                    )
+                )
+                if len(candidates) >= limit:
+                    break
+
+        if len(rows) < chunk_size:
+            break
+        offset += chunk_size
 
     return candidates[:limit]
 

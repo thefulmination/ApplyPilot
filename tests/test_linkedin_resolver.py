@@ -176,6 +176,44 @@ def test_fetch_candidates_filters_external_application_urls_host_aware(tmp_path,
     ]
 
 
+def test_fetch_candidates_scans_past_host_filtered_top_rows_to_fill_limit(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    for index in range(1, 26):
+        _insert_job(
+            conn,
+            url=f"https://www.linkedin.com/jobs/view/offsite-{index}",
+            audit_label="priority",
+            audit_score=9.9,
+            application_url=f"https://jobs.lever.co/acme/{index}?utm_source=linkedin.com",
+            discovered_at=f"2026-06-20T00:{index:02d}:00+00:00",
+        )
+
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/first-real",
+        audit_label="priority",
+        audit_score=9.0,
+        discovered_at="2026-06-21T12:00:00+00:00",
+    )
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/second-real",
+        audit_label="priority",
+        audit_score=8.5,
+        application_url="https://www.linkedin.com/jobs/view/999",
+        discovered_at="2026-06-21T11:00:00+00:00",
+    )
+
+    rows = linkedin_resolver.fetch_candidates(limit=2, tiers=("priority",))
+
+    assert [row.url for row in rows] == [
+        "https://www.linkedin.com/jobs/view/first-real",
+        "https://www.linkedin.com/jobs/view/second-real",
+    ]
+
+
 def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
