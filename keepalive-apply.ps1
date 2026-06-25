@@ -17,7 +17,7 @@ $logDir = Join-Path $ProjectRoot ".applypilot\logs"
 $keepLog = Join-Path $logDir "keepalive.log"
 $superOut = Join-Path $logDir "supervisor_stdout.out"
 $doneMarker = "C:\Users\JStal\AppData\Local\ApplyPilot\keepalive.done"
-$TargetApplied = 132
+$TargetApplied = 0   # 0 = BUDGET mode: --max-cost-usd is the real stop (target mode ignores it)
 
 function Log($m) { Add-Content -Path $keepLog -Value ("{0}  {1}" -f ((Get-Date).ToUniversalTime().ToString("o")), $m) }
 
