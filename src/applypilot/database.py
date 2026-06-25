@@ -209,6 +209,12 @@ _ALL_COLUMNS: dict[str, str] = {
     "application_url": "TEXT",
     "detail_scraped_at": "TEXT",
     "detail_error": "TEXT",
+    # LinkedIn external apply URL resolver
+    "linkedin_resolved_at": "TEXT",
+    "linkedin_resolve_status": "TEXT",
+    "linkedin_resolve_error": "TEXT",
+    "linkedin_resolve_attempts": "INTEGER DEFAULT 0",
+    "linkedin_resolve_final_url": "TEXT",
     "detail_attempts": "INTEGER DEFAULT 0",
     # Scoring
     "fit_score": "INTEGER",
