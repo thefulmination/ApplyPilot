@@ -118,11 +118,11 @@ def _hydrate_assets(pg) -> None:
 # Compute the REAL DeepSeek cost from token counts. The Claude CLI prices the run via the
 # proxy and may not reflect DeepSeek's rates or caching, so the cap would be inaccurate if we
 # trusted its total_cost_usd. Standard-tier rates ($/M input, $/M output).
-_DEEPSEEK_RATES = {  # ($/M cache-miss input, $/M output); cached input is ~$0.003/M, far cheaper
-    "deepseek-chat": (0.14, 0.28),        # the 'deepseek-chat' alias routes to v4-flash
-    "deepseek-v4-flash": (0.14, 0.28),
-    "deepseek-v4-pro": (0.435, 0.87),
-    "deepseek-reasoner": (0.55, 2.19),
+_DEEPSEEK_RATES = {  # ($/M cache-miss input, $/M output, $/M cache-hit input)
+    "deepseek-chat": (0.14, 0.28, 0.0028),     # 'deepseek-chat' routes to v4-flash
+    "deepseek-v4-flash": (0.14, 0.28, 0.0028),
+    "deepseek-v4-pro": (0.435, 0.87, 0.0036),
+    "deepseek-reasoner": (0.55, 2.19, 0.07),
 }
 
 
@@ -130,9 +130,10 @@ def _real_cost(stats: dict, model: str) -> float:
     rates = _DEEPSEEK_RATES.get(model)
     if not rates:
         return float(stats.get("cost_usd", 0) or 0)   # non-DeepSeek: trust the CLI
-    rin, rout = rates
-    return ((stats.get("input_tokens", 0) or 0) / 1e6 * rin
-            + (stats.get("output_tokens", 0) or 0) / 1e6 * rout)
+    rin, rout, rcache = rates
+    return ((stats.get("input_tokens", 0) or 0) / 1e6 * rin        # cache-miss input
+            + (stats.get("cache_read", 0) or 0) / 1e6 * rcache     # cache-hit input (cheap)
+            + (stats.get("output_tokens", 0) or 0) / 1e6 * rout)   # output
 
 
 def main() -> int:
