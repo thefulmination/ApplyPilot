@@ -1374,6 +1374,57 @@ def scan_gmail_command(
     console.print()
 
 
+@app.command("linkedin-login")
+def linkedin_login_command(
+    timeout: int = typer.Option(420, "--timeout", help="Max seconds to wait for you to log in."),
+    reset_workers: bool = typer.Option(
+        False, "--reset-workers",
+        help="After login, delete existing apply-worker profiles so they re-clone the "
+             "LinkedIn session on the next run. STOP the apply run first."),
+    browser: str = typer.Option("chrome", "--browser"),
+) -> None:
+    """One-time LinkedIn login so apply workers can apply via LinkedIn (~74% of the pool).
+
+    Opens a visible Chrome on a dedicated seed profile; YOU log in (including any 2FA or
+    security challenge) in that window. The tool NEVER types your password -- it only
+    detects when the LinkedIn session cookie (li_at) appears, then captures it for the
+    apply workers (which clone the seed profile).
+    """
+    _bootstrap()
+    import shutil
+    from applypilot.apply.chrome import linkedin_login
+
+    console.print("\n[bold]LinkedIn login[/bold] -- opening a Chrome window.")
+    console.print("  Log in to LinkedIn there (complete any 2FA / security checkpoint).")
+    console.print("  [dim]The tool never types your password; it just waits for the session.[/dim]\n")
+
+    ok, seed = linkedin_login(browser=browser, timeout_seconds=timeout)
+    if not ok:
+        console.print("[red]No LinkedIn session detected[/red] (li_at not found). "
+                      "Re-run and finish the login, or raise --timeout.")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓ LinkedIn session captured[/green] in the seed profile ({seed.name}).")
+    console.print("  Apply workers will clone this seed and inherit the session.")
+
+    if reset_workers:
+        from applypilot import config as _cfg
+        removed = 0
+        for d in _cfg.CHROME_WORKER_DIR.glob("worker-*"):
+            try:
+                shutil.rmtree(d)
+                removed += 1
+            except OSError as exc:
+                console.print(f"  [yellow]Could not remove {d.name}[/yellow] "
+                              f"(apply run using it? stop it first): {exc}")
+        console.print(f"  Reset {removed} worker profile(s) -- they re-clone the LinkedIn "
+                      "session on the next apply run.")
+    else:
+        console.print("  [dim]Existing worker profiles still hold the logged-out session. "
+                      "Re-run with --reset-workers (apply run stopped) to refresh them now.[/dim]")
+    console.print()
+
+
 @app.command()
 def dashboard() -> None:
     """Generate and open the HTML dashboard in your browser."""

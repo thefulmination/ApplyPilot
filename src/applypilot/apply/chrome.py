@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 # CDP port base — each worker uses BASE_CDP_PORT + worker_id
 BASE_CDP_PORT = 9222
 
+# Dedicated Chrome profile holding the one-time LinkedIn login (the li_at session). Apply
+# workers clone from it so they inherit the authenticated LinkedIn session. Populated by
+# `applypilot linkedin-login`. A separate CDP port keeps the login window off the apply
+# workers' ports so it never collides with a live run.
+SEED_PROFILE_NAME = "linkedin-seed"
+LINKEDIN_LOGIN_CDP_PORT = 9333
+
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
@@ -124,14 +131,19 @@ def setup_worker_profile(worker_id: int, browser: str | None = "chrome") -> Path
     if (profile_dir / "Default").exists():
         return profile_dir  # Already initialized
 
-    # Source: prefer an existing SAME-BROWSER worker (has session cookies that decrypt
-    # in this browser), else the user's real profile for this browser.
+    # Source priority: (1) the LinkedIn seed profile (carries the li_at session captured
+    # by `applypilot linkedin-login`) for Chrome workers, (2) an existing SAME-BROWSER
+    # worker (already has session cookies), (3) the user's real profile for this browser.
     source: Path | None = None
-    for wid in range(10):
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}{suffix}"
-        if candidate != profile_dir and (candidate / "Default").exists():
-            source = candidate
-            break
+    seed = config.CHROME_WORKER_DIR / SEED_PROFILE_NAME
+    if browser in (None, "", "chrome") and (seed / "Default").exists():
+        source = seed
+    if source is None:
+        for wid in range(10):
+            candidate = config.CHROME_WORKER_DIR / f"worker-{wid}{suffix}"
+            if candidate != profile_dir and (candidate / "Default").exists():
+                source = candidate
+                break
     if source is None:
         source = config.get_browser_user_data(browser)
 
@@ -166,6 +178,97 @@ def setup_worker_profile(worker_id: int, browser: str | None = "chrome") -> Path
             pass  # skip locked files
 
     return profile_dir
+
+
+def has_linkedin_session(profile_dir: Path) -> bool:
+    """True if `profile_dir` holds a LinkedIn auth cookie (li_at) = a logged-in session.
+
+    Reads a TEMP COPY of the Cookies DB to dodge Chrome's file lock, and checks only that
+    the li_at row EXISTS -- never reads or decrypts the cookie value."""
+    import os
+    import sqlite3
+    import tempfile
+    for ck in (profile_dir / "Default" / "Network" / "Cookies",
+               profile_dir / "Default" / "Cookies"):
+        if not ck.exists():
+            continue
+        tmpdir = None
+        try:
+            # Copy the DB AND its WAL/SHM sidecars into a temp dir under the same base
+            # name. Chrome's cookie DB runs in WAL mode, so a freshly-set li_at often
+            # still lives in the -wal (not yet checkpointed into the main file) -- copying
+            # only the main DB would miss it and falsely report "logged out". With the
+            # sidecars present, SQLite replays the WAL and sees the new cookie.
+            tmpdir = tempfile.mkdtemp(prefix="li_ck_")
+            dest = os.path.join(tmpdir, "Cookies")
+            shutil.copy2(str(ck), dest)
+            for ext in ("-wal", "-shm"):
+                side = Path(str(ck) + ext)
+                if side.exists():
+                    try:
+                        shutil.copy2(str(side), dest + ext)
+                    except OSError:
+                        pass  # sidecar locked -> SQLite recovers from what's present
+            con = sqlite3.connect(dest)
+            try:
+                n = con.execute(
+                    "SELECT COUNT(*) FROM cookies "
+                    "WHERE name='li_at' AND host_key LIKE '%linkedin%'"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            if n > 0:
+                return True
+        except Exception:
+            logger.debug("li_at check failed for %s", ck, exc_info=True)
+        finally:
+            if tmpdir and os.path.isdir(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+    return False
+
+
+def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
+                   poll_seconds: float = 4.0):
+    """Open a VISIBLE Chrome on the dedicated LinkedIn seed profile so the user logs in
+    ONCE. Polls for the li_at auth cookie and returns (ok, seed_dir) when it appears (or
+    on timeout). NEVER enters credentials -- the user logs in (and clears any 2FA/
+    challenge) in the window. Apply workers then clone the seed and inherit the session.
+
+    Returns (bool ok, Path seed_dir)."""
+    seed = config.CHROME_WORKER_DIR / SEED_PROFILE_NAME
+    seed.mkdir(parents=True, exist_ok=True)
+    _kill_on_port(LINKEDIN_LOGIN_CDP_PORT)
+    chrome_exe = config.resolve_browser_path(browser)
+    cmd = [
+        chrome_exe,
+        f"--remote-debugging-port={LINKEDIN_LOGIN_CDP_PORT}",
+        f"--user-data-dir={seed}",
+        "--profile-directory=Default",
+        "--no-first-run", "--no-default-browser-check",
+        "--window-size=1180,920",
+        "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", "--noerrdialogs",
+        "https://www.linkedin.com/login",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + timeout_seconds
+    ok = False
+    try:
+        while time.time() < deadline:
+            if proc.poll() is not None:  # user closed the window -> final check (close flushes)
+                ok = has_linkedin_session(seed)
+                break
+            if has_linkedin_session(seed):
+                ok = True
+                break
+            time.sleep(poll_seconds)
+        else:
+            ok = has_linkedin_session(seed)
+    finally:
+        # Close the seed Chrome so the profile is unlocked for workers to clone.
+        if proc.poll() is None:
+            time.sleep(1.0)  # let a just-detected cookie flush to disk
+            _kill_process_tree(proc.pid)
+    return ok, seed
 
 
 def _suppress_restore_nag(profile_dir: Path) -> None:
