@@ -68,9 +68,14 @@ SCORE_AUDIT_DIR = APP_DIR / "score_audits"
 APPLICATION_EXPORT_DIR = APP_DIR / "application_exports"
 LOG_DIR = APP_DIR / "logs"
 
-# Chrome worker isolation
-CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
-APPLY_WORKER_DIR = APP_DIR / "apply-workers"
+# Chrome worker isolation. These hold LIVE browser profiles (and per-job staged uploads)
+# that a running Chrome locks/writes constantly, so they must NOT live on OneDrive -- same
+# reason as the DB: OneDrive grabs OS file locks mid-write -> stalls/conflicts/corruption.
+# Default them next to the live DB (local disk whenever APPLYPILOT_DB_PATH points there, as
+# run-applypilot.ps1 / the keep-alive set it); an explicit env override still wins.
+_RUNTIME_DIR = DB_PATH.parent
+CHROME_WORKER_DIR = _path_from_env("APPLYPILOT_CHROME_WORKER_DIR", _RUNTIME_DIR / "chrome-workers")
+APPLY_WORKER_DIR = _path_from_env("APPLYPILOT_APPLY_WORKER_DIR", _RUNTIME_DIR / "apply-workers")
 
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
