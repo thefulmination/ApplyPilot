@@ -31,6 +31,14 @@ LINKEDIN_LOGIN_CDP_PORT = 9333
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
 
+# Windows Job Object handles per worker. Each launched Chrome is assigned to a job with
+# KILL_ON_JOB_CLOSE, so the whole browser tree dies when THIS python process dies for ANY
+# reason (graceful exit, crash, OOM, or an external taskkill of the parent) -- not only on
+# the graceful cleanup_worker path. This is what stops orphaned Chrome trees from lingering
+# and locking worker profiles. Keeping the handle referenced here holds the job open; the
+# OS closes it on process exit, which fires the kill.
+_job_handles: dict[int, int] = {}
+
 
 # ---------------------------------------------------------------------------
 # Cross-platform process helpers
@@ -98,6 +106,112 @@ def _kill_on_port(port: int) -> None:
         logger.debug("Port-kill tool not found (netstat/lsof) for port %d", port)
     except Exception:
         logger.debug("Failed to kill process on port %d", port, exc_info=True)
+
+
+def _assign_kill_on_close_job(worker_id: int, pid: int) -> None:
+    """Windows: put the launched browser in a Job Object that auto-kills the whole tree
+    when this process dies for ANY reason -- crash, OOM, or an external taskkill of the
+    parent -- not just the graceful cleanup_worker path. Without this, a parent killed from
+    outside leaves an orphaned Chrome tree that lingers and locks the worker profile (the
+    exact failure that stranded worker-80). No-op on non-Windows (launch_chrome already
+    starts those in their own process group for group-kill).
+
+    Best-effort: any failure is swallowed so a browser launch never breaks over it.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        JobObjectExtendedLimitInformation = 9
+        PROCESS_TERMINATE = 0x0001
+        PROCESS_SET_QUOTA = 0x0100
+
+        # restype/argtypes MUST be set: HANDLE is 64-bit on x64 and ctypes defaults to a
+        # 32-bit int return, which truncates the handle and silently breaks everything.
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                wintypes.LPVOID, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_void_p),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_uint64),
+                        ("WriteOperationCount", ctypes.c_uint64),
+                        ("OtherOperationCount", ctypes.c_uint64),
+                        ("ReadTransferCount", ctypes.c_uint64),
+                        ("WriteTransferCount", ctypes.c_uint64),
+                        ("OtherTransferCount", ctypes.c_uint64)]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BASIC),
+                        ("IoInfo", _IO),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = _EXTENDED()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                           ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job)
+            return
+        h_proc = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not h_proc:
+            k32.CloseHandle(job)
+            return
+        assigned = k32.AssignProcessToJobObject(job, h_proc)
+        k32.CloseHandle(h_proc)
+        if not assigned:
+            k32.CloseHandle(job)
+            return
+        # Hold the job handle open for this process's lifetime. Renderers Chrome spawns
+        # AFTER assignment inherit the job; the main process (port + profile-lock holder)
+        # is covered, which is what prevents the lingering-lock orphan.
+        _job_handles[worker_id] = job
+    except Exception:
+        logger.debug("[worker-%d] job-object assignment failed", worker_id, exc_info=True)
+
+
+def _close_job(worker_id: int) -> None:
+    """Close a worker's job handle (fires KILL_ON_JOB_CLOSE if the tree is still alive)."""
+    job = _job_handles.pop(worker_id, None)
+    if job and platform.system() == "Windows":
+        try:
+            import ctypes
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
+        except Exception:
+            logger.debug("[worker-%d] closing job handle failed", worker_id, exc_info=True)
+
+
+def _close_all_jobs() -> None:
+    """Close every tracked job handle (shutdown sweep)."""
+    for wid in list(_job_handles.keys()):
+        _close_job(wid)
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +341,37 @@ def has_linkedin_session(profile_dir: Path) -> bool:
     return False
 
 
+def _has_linkedin_session_cdp(port: int) -> bool:
+    """True if the LIVE browser on `port` holds a li_at LinkedIn cookie.
+
+    Reads cookies straight from the running Chrome over CDP (Playwright), so login is
+    detected WHILE the window is open -- no Cookies-file lock, no need to close the window
+    first (the lock was why the old file-only check forced a manual window close). Strictly
+    read-only: it never opens a page and never closes the user's browser (the browser was
+    launched externally, so we just disconnect on exit). Returns False on any error -- Chrome
+    not yet listening, CDP unreachable -- so the caller falls back to the file-copy check."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=5000)
+            # Do NOT call browser.close(): this Chrome was launched by us via Popen, not by
+            # Playwright; closing it would terminate the user's login window mid-login.
+            for ctx in browser.contexts:
+                try:
+                    for c in ctx.cookies():
+                        if (c.get("name") == "li_at"
+                                and "linkedin" in str(c.get("domain") or "").lower()):
+                            return True
+                except Exception:
+                    continue
+    except Exception:
+        logger.debug("CDP li_at check failed on port %d", port, exc_info=True)
+    return False
+
+
 def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                    poll_seconds: float = 4.0):
     """Open a VISIBLE Chrome on the dedicated LinkedIn seed profile so the user logs in
@@ -252,17 +397,24 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + timeout_seconds
     ok = False
+
+    def _logged_in() -> bool:
+        # Prefer the live-browser CDP read (detects login while the window is still open);
+        # fall back to the file-copy check. This is what lets the command auto-complete
+        # instead of waiting for the user to close the window to unlock the Cookies file.
+        return _has_linkedin_session_cdp(LINKEDIN_LOGIN_CDP_PORT) or has_linkedin_session(seed)
+
     try:
         while time.time() < deadline:
-            if proc.poll() is not None:  # user closed the window -> final check (close flushes)
+            if proc.poll() is not None:  # user closed the window -> file check (close flushes)
                 ok = has_linkedin_session(seed)
                 break
-            if has_linkedin_session(seed):
+            if _logged_in():
                 ok = True
                 break
             time.sleep(poll_seconds)
         else:
-            ok = has_linkedin_session(seed)
+            ok = _logged_in()
     finally:
         # Close the seed Chrome so the profile is unlocked for workers to clone.
         if proc.poll() is None:
@@ -359,6 +511,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
     proc = subprocess.Popen(cmd, **kwargs)
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
+    # Assign IMMEDIATELY (before Chrome forks much) so the tree dies with us even on a
+    # hard external kill -- no lingering orphan to lock the profile.
+    _assign_kill_on_close_job(worker_id, proc.pid)
 
     # Poll the CDP endpoint instead of a blind sleep(3): return as soon as Chrome's
     # debug port actually accepts connections (usually <1s when warm), and cap the
@@ -396,6 +551,7 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     """
     if process and process.poll() is None:
         _kill_process_tree(process.pid)
+    _close_job(worker_id)
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
@@ -417,6 +573,7 @@ def kill_all_chrome() -> None:
 
     # Sweep base port in case of zombies
     _kill_on_port(BASE_CDP_PORT)
+    _close_all_jobs()
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -454,3 +611,4 @@ def cleanup_on_exit() -> None:
 
     # Sweep base port for any orphan
     _kill_on_port(BASE_CDP_PORT)
+    _close_all_jobs()
