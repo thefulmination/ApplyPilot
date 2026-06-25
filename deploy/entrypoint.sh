@@ -5,7 +5,10 @@ set -uo pipefail
 export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
 echo "[entrypoint] starting LiteLLM proxy (DeepSeek -> Anthropic /v1/messages) on :4000..."
-litellm --config /app/litellm_config.yaml --port 4000 --num_workers 1 > /tmp/litellm.log 2>&1 &
+# Start the proxy with DATABASE_URL UNSET: otherwise litellm treats the worker's Postgres
+# URL as its own Prisma state DB and crashes ("No module named 'prisma'"). The worker (exec'd
+# below) keeps DATABASE_URL in its own env. The proxy needs no database.
+env -u DATABASE_URL litellm --config /app/litellm_config.yaml --port 4000 --num_workers 1 > /tmp/litellm.log 2>&1 &
 PROXY_PID=$!
 
 ok=0
