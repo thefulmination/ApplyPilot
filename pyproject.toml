@@ -34,6 +34,9 @@ dependencies = [
     "pandas>=2.1,<3.0",
     "pydantic>=2.13,<2.14",
     "regex>=2024.4.28,<2025.0.0",
+    # Postgres driver for the cloud apply-fleet: the home box uses it for the
+    # SQLite<->PG PUSH/PULL sync; the worker container uses it to lease/report.
+    "psycopg[binary]>=3.2",
     ]
 
 [project.optional-dependencies]
