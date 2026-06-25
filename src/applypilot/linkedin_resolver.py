@@ -29,13 +29,21 @@ STOP_STATUSES = {"login_required", "challenge_required"}
 CHALLENGE_TEXTS = (
     "security check",
     "verify it's you",
+    "verify it is you",
+    "quick security check",
+    "restricted your account",
     "verify your identity",
     "unusual activity",
+    "captcha",
     "checkpoint",
 )
 
 LOGIN_TEXTS = (
     "sign in to",
+    "sign in to view",
+    "sign in to continue",
+    "join linkedin",
+    "email or phone",
     "sign in",
     "log in",
     "linkedin login",
@@ -45,6 +53,9 @@ UNAVAILABLE_TEXTS = (
     "no longer accepting applications",
     "no longer accepting applications on linkedin",
     "this job is no longer accepting applications",
+    "this job is no longer available",
+    "this job has expired",
+    "we couldn't find a match",
 )
 
 

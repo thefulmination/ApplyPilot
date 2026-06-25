@@ -90,6 +90,32 @@ def test_classify_snapshot_stops_on_login_wall():
     assert decision.stop_run is True
 
 
+def test_classify_snapshot_stops_on_restricted_account_text():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/search",
+        text="We've restricted your account due to unusual activity.",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "challenge_required"
+    assert decision.stop_run is True
+
+
+def test_classify_snapshot_stops_for_email_or_phone_login_prompt():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/login",
+        text="Please enter email or phone to continue",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "login_required"
+    assert decision.stop_run is True
+
+
 def test_classify_snapshot_detects_unavailable_job():
     snapshot = linkedin_resolver.PageSnapshot(
         url="https://www.linkedin.com/jobs/view/404",
@@ -101,6 +127,18 @@ def test_classify_snapshot_detects_unavailable_job():
 
     assert decision.status == "unavailable"
     assert decision.stop_run is False
+
+
+def test_classify_snapshot_detects_expired_job():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/404",
+        text="This job has expired and is no longer open.",
+        controls=(),
+    )
+
+    decision = linkedin_resolver.classify_snapshot(snapshot)
+
+    assert decision.status == "unavailable"
 
 
 def test_classify_snapshot_detects_easy_apply():
