@@ -114,6 +114,24 @@ def _hydrate_assets(pg) -> None:
             _log(f"WARNING: {fname} not in Postgres and not on disk -- applies will fail")
 
 
+# Compute the REAL DeepSeek cost from token counts. The Claude CLI prices the run via the
+# proxy and may not reflect DeepSeek's rates or caching, so the cap would be inaccurate if we
+# trusted its total_cost_usd. Standard-tier rates ($/M input, $/M output).
+_DEEPSEEK_RATES = {
+    "deepseek-chat": (0.27, 1.10),
+    "deepseek-reasoner": (0.55, 2.19),
+}
+
+
+def _real_cost(stats: dict, model: str) -> float:
+    rates = _DEEPSEEK_RATES.get(model)
+    if not rates:
+        return float(stats.get("cost_usd", 0) or 0)   # non-DeepSeek: trust the CLI
+    rin, rout = rates
+    return ((stats.get("input_tokens", 0) or 0) / 1e6 * rin
+            + (stats.get("output_tokens", 0) or 0) / 1e6 * rout)
+
+
 def main() -> int:
     _setup_env()
     signal.signal(signal.SIGTERM, _on_term)
@@ -156,7 +174,7 @@ def main() -> int:
         try:
             status, dur_ms = launcher.run_job(job, port, worker_id=worker_id,
                                               model=model, agent=agent, dry_run=False)
-            cost = float(launcher._last_run_stats.get(worker_id, {}).get("cost_usd", 0) or 0)
+            cost = _real_cost(launcher._last_run_stats.get(worker_id, {}), model)
         except Exception as e:  # never let one job kill the worker
             status = f"failed:worker_error:{type(e).__name__}:{str(e)[:80]}"
         finally:
