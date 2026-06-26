@@ -4,16 +4,19 @@
 **Date:** 2026-06-25
 **Scope:** Make the Python brain (`applypilot.db`) the one canonical record per job. The TypeScript research/scoring tree (`New project 9`) reads jobs *from* it and writes scores + labels *back* to it, so research improvements reach the live applier and the hand-exported catalog (provenance gap) is retired.
 
+
 ## Owner decisions baked in
 - **Integration seam: Option A — TS reads/writes the brain DIRECTLY via Node's built-in `node:sqlite`.** Enabled by: Node v24 (built-in `node:sqlite`, **no native dep**, no new `package.json` entry → no conflict with the active Codex session), the authoritative DB being local (not OneDrive), and serial access (owner kills the other process) hardened by WAL + `busy_timeout`. (Option B export/import kept as a documented fallback; Option C local service deferred.)
 - **Sync cadence:** one-command wrapper (the scorer reads the brain and writes `research_scores` back directly — no separate import step).
 - **Pairwise labels:** include now (`research_pairwise_labels` table built this pass).
 - **KG scoring:** unify per §5 (build from brain, version + store the KG, scores tagged with `kg_version`).
+- **Supabase (audit §9.2):** stays the cross-device label COLLECTION point; the brain imports from it ONE-WAY. Brain authoritative for everything except label intake.
+- **Resume (audit §9.3):** KG master resume and apply resume are intentionally DIFFERENT; spec documents the divergence, no forced sync.
 
 ## 0. Guiding principles (non-negotiable)
 1. **`fit_score` / `audit_score` stay authoritative for applying.** Research scores are *advisory*; they only reach the apply gate when the owner explicitly promotes a job/batch. The fleet's default behavior never changes silently.
 2. **Additive, never destructive.** New tables/columns only — matches the brain's `ALTER TABLE ADD`-only discipline (`ensure_columns()` in `database.py`).
-3. **Serial access, hardened.** No *simultaneous* writers: the owner kills the other process before a cross-language run, AND TS opens the DB in WAL mode with a `busy_timeout` (~5s) so accidental overlap waits instead of erroring. TS targets the **authoritative LOCAL DB** (resolve `APPLYPILOT_DB_PATH`/`APP_DIR`), never the OneDrive backup copy.
+3. **Serial access, hardened.** No *simultaneous* writers: the owner kills the other process before a cross-language run, AND TS opens the DB in WAL mode with a `busy_timeout` (~5s) so accidental overlap waits instead of erroring. TS targets the **authoritative LOCAL DB** via the launcher env, never the OneDrive backup copy — **and never the `~/.applypilot` stub (see §9.1 hard guard: require `APPLYPILOT_DB_PATH` + rowcount floor).**
 4. **Python owns the schema.** Python `init_db()` creates/migrates ALL tables (incl. the new `research_*`). TS only **reads `jobs`** and **writes `research_*`** rows — it never issues DDL or touches live scoring columns.
 5. **Don't disrupt the active Codex session.** TS additions are a new DB-access module + one branch in `loadMergedApplyPilotCatalog` (`catalogInputs.ts:81`). `node:sqlite` is built-in, so **no dependency/`package.json` change**. No restructuring.
 6. **Every stage independently shippable and reversible**, gated by a flag/env var; the old JSON catalog flow keeps working until explicitly retired.
@@ -104,3 +107,28 @@ A single command (`npm run applypilot:sync-brain` or a flag on `model:score`) th
 - TS read seam: `New project 9/src/applypilot/catalogInputs.ts:81` (`loadMergedApplyPilotCatalog`); fallback `src/review/catalog.ts:52`
 - TS score writer: `src/cli/applypilotModelScore.ts:159`; TS label writer: `src/review/labelStore.ts:66`
 - NEW: `New project 9/src/applypilot/brainDb.ts` (`node:sqlite` access layer)
+
+## 9. Audit reconciliations (2026-06-25 cross-project sweep)
+A filesystem-wide audit of every ApplyPilot store (all `New project*` dirs + off-OneDrive) surfaced 5 gaps. Resolutions (owner-decided where noted):
+
+### 9.1 Three DBs — hard guard against the stub (was framed as "two DBs")
+There are THREE `applypilot.db`: the **945 MB canonical** at `%LOCALAPPDATA%\ApplyPilot\applypilot.db`; a **143 KB / 13-job STUB** at `~/.applypilot/applypilot.db` (config DEFAULT when `APPLYPILOT_DB_PATH` is unset — `config.py:10,19`); and the **OneDrive backup** at `New project/ApplyPilot/.applypilot/applypilot.db`. Canonicality is established ONLY by `run-applypilot.ps1:19` setting `APPLYPILOT_DB_PATH` to the 945 MB path.
+**Resolution:** `brainDb.ts` MUST NOT use `config.py`'s bare default. It (a) requires `APPLYPILOT_DB_PATH` to be set (sourced from the launcher env), and (b) fails fast with a sanity check — refuse to open a `jobs` table below a floor (e.g. < 1,000 rows) so it can never silently bind to the 13-row stub or the backup. Never fall back to `~/.applypilot`. (Upgrades old open-question #2 from "confirm the path" to a hard guard.)
+
+### 9.2 Supabase — collector, one-way import into the brain [OWNER DECISION]
+New project 9 syncs labels bidirectionally with a Supabase cloud Postgres (`public.label_events`, `public.source_items`) via `src/sync/supabaseClient.ts` (`review:sync` / `applypilot:sync`). **Decision: Supabase stays the cross-device label COLLECTION point; the brain imports ONE-WAY.** `research_labels` (§1c) is a sink fed by BOTH the JSONL logs AND Supabase `label_events`, deduped by event `id`. The brain is authoritative for everything EXCEPT label intake and NEVER pushes labels back to Supabase. `labelMerge` keeps running Supabase-side for cross-device collection; the brain import is strictly downstream. Conflict precedence: latest `created_at` wins; `raw_event_json` preserved losslessly. This removes the "three label homes" ambiguity: Supabase = intake, brain = truth, JSONL = human-facing log.
+
+### 9.3 Resume divergence — intentional [OWNER DECISION]
+The KG is built from `MasterResume\StalloneJonathan7.docx` (fuller ~20k-char master; `applypilotKnowledgeGraph.ts:28`). The live applier + fleet use a different, newer `~/.applypilot/resume.pdf`. **Decision: keep them separate intentionally** — the master feeds the KG/scoring; the tailored pdf is what's actually sent. `research_kg_runs.resume_path/resume_sha` records the KG master. The spec explicitly documents that **research advisory scores are computed against the master resume, NOT the apply resume** — treat this as a known, accepted gap when promoting scores to the apply gate (§4). No forced sync.
+
+### 9.4 inbox_events — named, not re-homed
+Gmail application-outcome events live in `applypilot.db :: inbox_events` (keyed by `job_url` + `received_at`), written by the read-only Gmail OAuth scanner. They ALREADY ride in the brain (consistent with single-source). Named here so they are NOT re-homed. FUTURE (out of scope for v1): surface `inbox_events` + the fleet's `apply_status` into an outcome-calibration loop alongside research scores — the strongest ground-truth signal.
+
+### 9.5 fleet_assets — third resume copy
+Railway Postgres `fleet_assets` holds a BYTEA copy of `profile.json` + `resume.pdf` for the offsite fleet — a third resume copy. It must stay consistent with the canonical APPLY resume (`~/.applypilot/resume.pdf` per §9.3), NOT the KG master. apply_queue mechanics stay downstream of the gate and out of scope; `apply_status`/`applied_at` noted as a future calibration input (§9.4).
+
+### 9.6 Path resolution — the launcher is authoritative
+ALL `APPLYPILOT_*_PATH` overrides (`APPLYPILOT_DB_PATH`, `APPLYPILOT_DIR`, `APPLYPILOT_SEARCH_CONFIG_PATH=searches_tuned.yaml`) come from `run-applypilot.ps1`, not `config.py` defaults. Note: `searches_tuned.yaml` IS used under the launcher (supersedes the old "silently ignored" assumption). Any cross-language tooling (`brainDb.ts`, the sync wrapper) MUST source the launcher's environment, never reimplement `config.py` defaults.
+
+### 9.7 Explicitly out of scope (no job/label/score data)
+New project 2 (onetab/bookmarks), New project 6 (music-lab SQLite), Claude_KG (empty), optquant (options pricing), and New project 3/4/5/7/8/10 (unrelated projects). Confirmed to contain no ApplyPilot job/label/score records — not part of the unification.
