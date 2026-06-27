@@ -42,5 +42,11 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
     summary["reclaimed_search"] = queue.reclaim_search(conn, grace_seconds=cfg.reclaim_grace_seconds)
     summary["reclaimed_apply"] = len(pgqueue.reclaim_stale_leases(conn, grace_seconds=cfg.reclaim_grace_seconds))
 
+    summary["breakers_recovered"] = governor.clear_expired_breakers(conn)
+    summary["breakers_tripped"] = governor.evaluate_breakers(
+        conn, captcha_threshold=cfg.captcha_threshold, min_samples=cfg.breaker_min_samples,
+        cool_seconds=cfg.breaker_cool_seconds,
+    )
+
     heartbeat.beat(conn, WATCHDOG_ID, role=WATCHDOG_ROLE, state="idle", spend_today_usd=0, commit=True)
     return summary

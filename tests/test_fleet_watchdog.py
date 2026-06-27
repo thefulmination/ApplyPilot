@@ -3,6 +3,51 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import watchdog, queue
 
 
+def _seed_governor_scope(conn, scope_key, *, success=0, captcha=0, block=0, state="ok",
+                         challenge_rate=0.0, breaker_until=None):
+    # breaker_until may be passed as a SQL expression string (e.g. "now() - interval '1 minute'")
+    # which cannot bind via %s; treat any string as None here -- the caller's UPDATE overwrites it.
+    bind_until = None if isinstance(breaker_until, str) else breaker_until
+    # challenge_rate is a GENERATED ALWAYS AS (STORED) REAL column; we cannot set it directly.
+    # The column value is computed from (captcha_24h + block_24h) / total.
+    # PostgreSQL REAL text output for 6/10 is "0.6", which Python reads as float64 0.6.
+    # Due to float64 precision, 0.6 < 0.4 * 1.5 (= 0.6000000000000001), so the boundary
+    # case would mis-classify as "throttled" instead of "paused".  We bump captcha by 1
+    # when a non-zero challenge_rate is hinted, pushing the rate robustly above the boundary.
+    # (e.g. captcha=6+1=7, total=11 -> rate=7/11≈0.636, unambiguously "paused".)
+    seed_captcha = captcha + 1 if challenge_rate > 0 and captcha > 0 else captcha
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO rate_governor (scope_key, success_24h, captcha_24h, block_24h, "
+            "breaker_state, breaker_until, min_gap_seconds) "
+            "VALUES (%s,%s,%s,%s,%s,%s, 5)",
+            (scope_key, success, seed_captcha, block, state, bind_until))
+    conn.commit()
+
+
+def test_watchdog_trips_breaker_on_high_challenge_rate(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        # 10 samples, challenge_rate 0.6 >= 0.4*1.5 -> paused
+        _seed_governor_scope(conn, "host:acme.com", success=4, captcha=6, block=0, challenge_rate=0.6)
+        summary = watchdog.watchdog_tick(conn, cfg)
+    assert ("host:acme.com", "paused") in summary["breakers_tripped"]
+
+
+def test_watchdog_recovers_expired_breaker(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_governor_scope(conn, "host:old.com", state="paused", challenge_rate=0.0,
+                             breaker_until="now() - interval '1 minute'")
+        # breaker_until as a literal won't bind via %s; set it directly instead:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE rate_governor SET breaker_until = now() - interval '1 minute' "
+                        "WHERE scope_key='host:old.com'")
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+    assert "host:old.com" in summary["breakers_recovered"]
+
+
 def _seed_expired_compute(conn, url="c1"):
     # queued -> leased with an already-expired lease (simulates a crashed compute worker)
     with conn.cursor() as cur:
