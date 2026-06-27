@@ -167,3 +167,23 @@ def test_no_denied_op_is_registered():
     for denied in ("apply", "approve", "resolve_challenge", "set_cost_cap", "unpause",
                    "resume_scope", "set_paused", "query", "execute", "sql"):
         assert denied not in names
+
+
+def test_bridge_end_to_end(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO compute_queue (url, task, status, updated_at) VALUES ('c1','score','done', now())")
+        cur.execute("INSERT INTO worker_heartbeat (worker_id, role, state, last_beat) VALUES ('w1','compute','idle', now())")
+        conn.commit()
+    # read: status + recent_results render
+    assert "machines" in codex_bridge.fleet_status()
+    assert codex_bridge.recent_results()["results"][0]["url"] == "c1"
+    # act: pause a scope, see it reflected
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO rate_governor (scope_key, min_gap_seconds) VALUES ('host:e2e',5)")
+        conn.commit()
+    assert codex_bridge.pause_scope("host:e2e")["action"] == "pause"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT breaker_state FROM rate_governor WHERE scope_key='host:e2e'")
+        assert cur.fetchone()["breaker_state"] == "paused"
