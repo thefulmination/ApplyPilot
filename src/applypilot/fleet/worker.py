@@ -125,6 +125,7 @@ class WorkerLoop:
         on_owner_machine: bool = False,
         public_ip: Optional[str] = None,
         owner_ip: Optional[str] = None,
+        compute_fns: Optional[dict] = None,
     ) -> None:
         if role not in (ROLE_APPLY, ROLE_COMPUTE, ROLE_DISCOVERY):
             raise ValueError(f"unknown role: {role!r}")
@@ -141,6 +142,18 @@ class WorkerLoop:
         self.on_owner_machine = on_owner_machine
         self.public_ip = public_ip or home_ip
         self.owner_ip = owner_ip
+        if compute_fns is not None:
+            self.compute_fns = compute_fns
+            self._legacy_score_fn = None
+        elif score_fn is not None:
+            # Back-compat: old score_fn received the full job dict; _tick_compute
+            # now calls fn(payload), so we wrap it to restore the original behaviour.
+            _sf = score_fn
+            self.compute_fns = {"score": _sf}
+            self._legacy_score_fn = _sf
+        else:
+            self.compute_fns = {}
+            self._legacy_score_fn = None
 
     # -- connection -----------------------------------------------------------
     def _connect(self):
@@ -175,17 +188,23 @@ class WorkerLoop:
         if job is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}
+        task = job.get("task") or "score"
+        fn = self.compute_fns.get(task)
+        if fn is None:
+            raise RuntimeError(f"compute role has no handler for task {task!r}")
         self._beat(conn, state="computing", current_job=job["url"])
-        if self.score_fn is None:
-            raise RuntimeError("compute role requires an injected score_fn")
-        result, cost = self.score_fn(job)
+        # Legacy score_fn receives the full job dict; new compute_fns receive payload.
+        if fn is self._legacy_score_fn:
+            result, cost = fn(job)
+        else:
+            result, cost = fn(job.get("payload") or {"url": job["url"]})
         queue.write_compute_result(
-            conn, self.worker_id, job["url"], result=result, status="done",
-            cost_usd=cost or 0, model=(result or {}).get("model") if isinstance(result, dict) else None,
-            task=job.get("task"), machine_owner=self.machine_owner,
+            conn, self.worker_id, job["url"], result=result, status=result.get("status", "done"),
+            cost_usd=cost or 0, model=result.get("model"), provider=result.get("provider"),
+            task=task, machine_owner=self.machine_owner,
         )
         self._beat(conn, state="idle")
-        return {"action": "compute_done", "url": job["url"], "cost_usd": cost or 0}
+        return {"action": "compute_done", "url": job["url"], "task": task, "cost_usd": cost or 0}
 
     # -- DISCOVERY: governed scrape (RF2/§8.5) --------------------------------
     def _tick_discovery(self, conn) -> dict:

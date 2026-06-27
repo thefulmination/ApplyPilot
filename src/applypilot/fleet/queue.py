@@ -233,7 +233,8 @@ def lease_compute(conn, worker_id, *, ttl_seconds=1200):
 
 
 def write_compute_result(conn, worker_id, url, *, result, status="done", cost_usd=0,
-                         model=None, task=None, machine_owner=None, tokens_in=None, tokens_out=None):
+                         model=None, provider=None, task=None, machine_owner=None,
+                         tokens_in=None, tokens_out=None):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE compute_queue SET status=%s, result=%s, est_cost_usd=COALESCE(%s,0), updated_at=now() "
@@ -244,9 +245,9 @@ def write_compute_result(conn, worker_id, url, *, result, status="done", cost_us
             conn.rollback()
             return False
         cur.execute(
-            "INSERT INTO llm_usage (worker_id, machine_owner, task, model, tokens_in, tokens_out, cost_usd) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (worker_id, machine_owner, task, model, tokens_in, tokens_out, cost_usd),
+            "INSERT INTO llm_usage (worker_id, machine_owner, task, model, provider, tokens_in, tokens_out, cost_usd) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (worker_id, machine_owner, task, model, provider, tokens_in, tokens_out, cost_usd),
         )
     conn.commit()
     return True

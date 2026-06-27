@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     ts            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage (ts);
+ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS provider TEXT;
 
 -- ---------------------------------------------------------------------------
 -- applied_set: cross-board posting-level dedup / double-apply guard (R9).
