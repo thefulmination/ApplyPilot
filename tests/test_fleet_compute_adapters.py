@@ -53,6 +53,21 @@ def test_score_fn_fails_over_to_next_provider(monkeypatch):
     assert result["provider"] == "gemini"
 
 
+def test_ensemble_scores_all_providers_and_aggregates(monkeypatch):
+    def fake_score_job(resume, job, pref=None, kg=None, provider=None):
+        return {"score": {"deepseek": 8, "gemini": 6}[provider], "keywords": "k",
+                "reasoning": "r", "model": provider, "provider": provider}
+    monkeypatch.setattr(ca, "score_job", fake_score_job)
+    monkeypatch.setattr(ca, "get_client", lambda **k: type("C", (), {"model": "m", "last_usage": None})())
+    monkeypatch.setattr(ca, "estimate_cost", lambda m, u: 0.001)
+    score_fn = ca.make_score_fn(_ctx(providers=["deepseek", "gemini"], ensemble=True))
+    result, cost = score_fn({"url": "u", "company": "C", "title": "T", "full_description": "d"})
+    assert result["research_fit_score"] == 7  # round(mean(8,6))
+    assert {e["provider"] for e in result["ensemble"]} == {"deepseek", "gemini"}
+    assert 0.0 <= result["agreement"] <= 1.0
+    assert round(cost, 4) == 0.002
+
+
 def test_audit_fn_maps_scoreaudit_to_decision():
     payload = {"url": "u", "company": "Acme", "title": "Chief of Staff",
                "full_description": "operations leadership", "fit_score": 8}

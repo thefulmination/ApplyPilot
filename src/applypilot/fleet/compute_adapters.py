@@ -57,6 +57,25 @@ def make_score_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
 
     def score_fn(payload: dict) -> tuple[dict, float]:
         job = _job_from_payload(payload)
+        if ctx.ensemble and len(ctx.providers) >= 2:
+            members, total_cost, scores = [], 0.0, []
+            for provider in ctx.providers:
+                raw, cost = _score_once(ctx, job, provider)
+                total_cost += cost
+                s = int(raw.get("score") or 0)
+                if not raw.get("error") and s > 0:
+                    members.append({"provider": raw.get("provider") or provider, "score": s})
+                    scores.append(s)
+            if not scores:
+                return _build({"reasoning": "ensemble: all providers failed"}, ctx.providers[0], total_cost, "failed")
+            mean = sum(scores) / len(scores)
+            spread = (max(scores) - min(scores)) / 9.0  # 1-10 scale span
+            res = {"task": "score", "research_fit_score": round(mean), "research_decision": None,
+                   "keywords": "", "reasoning": "ensemble", "model": None,
+                   "provider": "+".join(m["provider"] for m in members),
+                   "ensemble": members, "agreement": round(1.0 - spread, 3), "status": "done"}
+            return res, total_cost
+        # failover loop from Task 4
         total_cost = 0.0
         last = None
         for provider in chain:
