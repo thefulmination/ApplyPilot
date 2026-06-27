@@ -216,14 +216,15 @@ def test_watchdog_recovers_expired_breaker(fleet_db):
 
 - [ ] **Step 2: Run it, expect FAIL** (`KeyError: 'breakers_tripped'`).
 
-- [ ] **Step 3: Implement** — in `watchdog_tick`, after the three reclaim lines and before `heartbeat.beat`, add:
+- [ ] **Step 3: Implement** — in `watchdog_tick`, after the three reclaim lines and before `heartbeat.beat`, add (ORDER IS LOAD-BEARING — clear timer-expired breakers FIRST, then re-evaluate current conditions; reversing it makes `evaluate_breakers` recover quiet expired scopes itself, so they'd land in `breakers_tripped` and the recovery test would fail):
 
 ```python
+    # clear first: timer-expired scopes must be restored before evaluate re-assesses conditions
+    summary["breakers_recovered"] = governor.clear_expired_breakers(conn)
     summary["breakers_tripped"] = governor.evaluate_breakers(
         conn, captcha_threshold=cfg.captcha_threshold, min_samples=cfg.breaker_min_samples,
         cool_seconds=cfg.breaker_cool_seconds,
     )
-    summary["breakers_recovered"] = governor.clear_expired_breakers(conn)
 ```
 
 - [ ] **Step 4: Run it, expect PASS.**

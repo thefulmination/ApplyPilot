@@ -42,6 +42,10 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
     summary["reclaimed_search"] = queue.reclaim_search(conn, grace_seconds=cfg.reclaim_grace_seconds)
     summary["reclaimed_apply"] = len(pgqueue.reclaim_stale_leases(conn, grace_seconds=cfg.reclaim_grace_seconds))
 
+    # Order is load-bearing: clear timer-expired breakers FIRST (restore scopes whose
+    # cooldown passed), THEN re-evaluate current conditions (which re-trips anything
+    # still bad in the same tick). Reversing this makes evaluate_breakers recover quiet
+    # expired scopes itself -> they'd surface in breakers_tripped, not breakers_recovered.
     summary["breakers_recovered"] = governor.clear_expired_breakers(conn)
     summary["breakers_tripped"] = governor.evaluate_breakers(
         conn, captcha_threshold=cfg.captcha_threshold, min_samples=cfg.breaker_min_samples,
