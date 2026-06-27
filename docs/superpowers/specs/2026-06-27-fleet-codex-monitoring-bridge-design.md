@@ -41,10 +41,12 @@ FastMCP infers each tool's JSON-Schema from the function's **type annotations**,
 | Tool | Signature | Returns | Source |
 |---|---|---|---|
 | `fleet_status()` | `() -> dict[str, Any]` | machines, governor, queue_depth, captcha_backlog, quarantine, spend_today | `heartbeat.dashboard_snapshot(conn)` (rolls back internally) |
-| `health_report()` | `() -> str` | the text report incl. "NEEDS YOUR DECISION" | `monitor.build_health_report(snapshot, captcha_threshold=0.4, cost_cap_total=<cost_cap_daily_usd>)` — see note below |
-| `recent_results(limit: int = 20)` | `(int) -> list[dict[str, Any]]` | recent terminal rows, normalized + merged | `compute_queue` + `apply_queue`, see §3.1.1 |
-| `challenges()` | `() -> list[dict[str, Any]]` | open challenges | `auth_challenge` WHERE `resolved_at IS NULL`, columns id,url,worker_id,machine_owner,kind,route,raised_at |
+| `health_report()` | `() -> dict[str, Any]` | `{"report": <text incl. "NEEDS YOUR DECISION">}` | `monitor.build_health_report(snapshot, captcha_threshold=0.4, cost_cap_total=<cost_cap_daily_usd>)` — see note below |
+| `recent_results(limit: int = 20)` | `(int) -> dict[str, Any]` | `{"results": [<normalized merged rows>]}` | `compute_queue` + `apply_queue`, see §3.1.1 |
+| `challenges()` | `() -> dict[str, Any]` | `{"challenges": [<open rows>]}` | `auth_challenge` WHERE `resolved_at IS NULL`, columns id,url,worker_id,machine_owner,kind,route,raised_at |
 | `caps()` | `() -> dict[str, Any]` | paused, cost_cap_daily_usd, cost_cap_total_usd, spend_today (24h), spend_total (all-time) | `fleet_config` + `SUM(llm_usage.cost_usd)` over 24h and all-time |
+
+**Uniform return type:** every tool returns `dict[str, Any]` (text/list tools wrap under `report`/`results`/`challenges`), so the `{"error": …}` sentinel never collides with a narrow `-> str`/`-> list` annotation and datetime/Decimal serialize cleanly.
 
 **`health_report` cap pairing (corrected):** `snapshot.spend_today` is a **24-hour** SUM, but `build_health_report`'s `cost_cap_total` kwarg flags spend ≥ 90% of the cap. Comparing 24h spend to a *lifetime* cap is apples-to-oranges, so the bridge passes `cost_cap_total=<fleet_config.cost_cap_daily_usd>` (the daily cap, matching the 24h window). The kwarg name is historical; the value passed is the daily cap.
 
