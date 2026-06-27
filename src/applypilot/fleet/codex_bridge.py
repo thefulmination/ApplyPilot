@@ -11,6 +11,7 @@ through _with_conn, which reads FLEET_PG_DSN itself and rolls back + closes per 
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
@@ -105,6 +106,7 @@ def _recent_results(conn, limit: int) -> dict[str, Any]:
         for r in cur.fetchall():
             rows.append({"lane": "apply", "url": r["url"], "status": r["status"],
                          "finished_at": _iso(r["updated_at"]),
+                         "_sort": r["updated_at"],
                          "detail": {"company": r["company"], "title": r["title"],
                                     "apply_error": r["apply_error"]}})
         cur.execute(
@@ -114,8 +116,12 @@ def _recent_results(conn, limit: int) -> dict[str, Any]:
         for r in cur.fetchall():
             rows.append({"lane": "compute", "url": r["url"], "status": r["status"],
                          "finished_at": _iso(r["updated_at"]),
+                         "_sort": r["updated_at"],
                          "detail": {"task": r["task"], "cost": float(r["est_cost_usd"] or 0)}})
-    rows.sort(key=lambda x: x["finished_at"] or "", reverse=True)
+    # Sort on native datetime (None = oldest); avoids fragile ISO-string lexicographic comparison.
+    rows.sort(key=lambda x: (x["_sort"] is not None, x["_sort"] or datetime.min), reverse=True)
+    for row in rows:
+        del row["_sort"]
     return {"results": rows[:n]}
 
 
