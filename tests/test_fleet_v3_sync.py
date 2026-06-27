@@ -27,7 +27,7 @@ from applypilot.fleet import sync
 _JOBS_DDL = """
 CREATE TABLE jobs (
     url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
-    audit_score REAL, fit_score INTEGER, liveness_status TEXT,
+    audit_score REAL, fit_score INTEGER, full_description TEXT, liveness_status TEXT,
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
     applied_at TEXT, agent_id TEXT, verification_confidence TEXT,
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0,

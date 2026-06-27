@@ -193,7 +193,7 @@ def pull_apply_results(
 # that lack the corresponding result. The eligibility is intentionally light (no liveness
 # / approval gate -- scoring a job is harmless): a real job url at/above an optional floor.
 _PUSH_COMPUTE_SELECT = """
-SELECT url, company, title, application_url,
+SELECT url, company, title, application_url, full_description,
        CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
 FROM jobs
 WHERE duplicate_of_url IS NULL
@@ -227,8 +227,8 @@ def push_compute_eligible(
             out.append({
                 "url": r["url"], "task": task, "est_cost_usd": 0,
                 "payload": {
-                    "url": r["url"], "company": r["company"],
-                    "title": r["title"], "application_url": r["application_url"],
+                    "url": r["url"], "company": r["company"], "title": r["title"],
+                    "application_url": r["application_url"], "full_description": r["full_description"],
                 },
             })
             if limit and len(out) >= limit:
