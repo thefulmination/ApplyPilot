@@ -106,6 +106,27 @@ def test_breaker_pauses_high_challenge_host(fleet_db):
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
 
 
+def test_breaker_pauses_at_exact_threshold_boundary(fleet_db):
+    # Regression: a rate landing EXACTLY on the pause cut (1.5x captcha_threshold)
+    # must pause, not throttle. 4 success + 6 captcha -> challenge_rate 6/10 = 0.6,
+    # which the default captcha_threshold (0.4) makes the boundary: 0.4*1.5 evaluates
+    # to 0.6000000000000001 in float64, so a naive `rate >= captcha_threshold*1.5`
+    # mis-classified the exact-0.6 scope as 'throttled' and kept applying on a host
+    # that should have been paused.
+    with pgqueue.connect(fleet_db) as conn:
+        sk = governor.host_scope("edge.io")
+        governor.ensure_scope(conn, sk, min_gap_seconds=1)
+        for _ in range(4):
+            governor.record_outcome(conn, [sk], "success")
+        for _ in range(6):
+            governor.record_outcome(conn, [sk], "captcha")  # rate == 6/10 == 0.6, the boundary
+        changed = dict(governor.evaluate_breakers(conn))
+        assert changed.get(sk) == "paused"
+        with conn.cursor() as cur:
+            cur.execute("SELECT breaker_state FROM rate_governor WHERE scope_key=%s", (sk,))
+            assert cur.fetchone()["breaker_state"] == "paused"
+
+
 def test_breaker_demotes_on_hard_blocks(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         sk = governor.home_ip_scope("9.9.9.9")

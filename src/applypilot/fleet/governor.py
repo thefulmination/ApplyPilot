@@ -17,6 +17,12 @@ LINKEDIN_ACCOUNT = "account:linkedin"
 
 _OUTCOME_COL = {"success": "success_24h", "captcha": "captcha_24h", "block": "block_24h"}
 
+# Tolerance for the breaker rate cuts. challenge_rate is a PG REAL fraction (e.g. 6/10),
+# so an exact boundary like 0.6 can land one ULP under a naive `captcha_threshold * 1.5`
+# (0.4 * 1.5 == 0.6000000000000001 in float64). Comparing with this epsilon makes the
+# cut land ON the boundary -> an exact 6/10 challenge_rate pauses instead of throttling.
+_RATE_EPS = 1e-9
+
 
 def host_scope(host: str) -> str:
     return f"host:{host}"
@@ -75,6 +81,9 @@ def evaluate_breakers(
     or throttled (auto-recovers at ``breaker_until``); a recovered scope -> ok.
     Returns ``[(scope_key, new_state), ...]``."""
     changed = []
+    # Compute the pause cut once, with an epsilon so an exact boundary rate (e.g. 6/10)
+    # is treated as >= the cut rather than slipping under it by one float ULP (see _RATE_EPS).
+    pause_at = captcha_threshold * 1.5 - _RATE_EPS
     with conn.cursor() as cur:
         cur.execute(
             "SELECT scope_key, success_24h, captcha_24h, block_24h, challenge_rate, breaker_state FROM rate_governor"
@@ -88,7 +97,7 @@ def evaluate_breakers(
         if r["block_24h"] >= 3:
             new = "demoted"  # sticky: hard-blocked IP/host -> compute-only + alert
         elif total >= min_samples and rate >= captcha_threshold:
-            new = "paused" if rate >= captcha_threshold * 1.5 else "throttled"
+            new = "paused" if rate >= pause_at else "throttled"
         elif state in ("throttled", "paused") and (total < min_samples or rate < captcha_threshold * 0.5):
             new = "ok"
         if new == state:
