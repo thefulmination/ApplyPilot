@@ -53,9 +53,9 @@ FastMCP infers each tool's JSON-Schema from the function's **type annotations**,
 |---|---|---|---|
 | `restart_worker(worker_id: str)` | `(str) -> dict[str, Any]` | enqueue a `restart` command | `MonitorActions(conn).restart_worker(worker_id)` → `{"action":"restart","worker_id":…,"command_id":…}` |
 | `pause_scope(scope_key: str)` | `(str) -> dict[str, Any]` | set scope `breaker_state='paused'` | `MonitorActions(conn).pause_scope(scope_key)` → `{"action":"pause","scope_key":…}` |
-| `quarantine_job(url: str, worker: str, reason: str)` | `(str,str,str) -> dict[str, Any]` | strike a poison job | `MonitorActions(conn).quarantine(url, worker=worker, reason=reason)` → `{"action":"quarantine","url":…,"newly_quarantined":<bool>}` |
+| `quarantine_job(url: str, worker: str, reason: str)` | `(str,str,str) -> dict[str, Any]` | quarantine a job (manual one-shot) | `MonitorActions(conn).quarantine(url, worker=worker, reason=reason)` → `{"action":"quarantine","url":…,"newly_quarantined":<bool>}` |
 
-**`quarantine` delegation detail (corrected):** `MonitorActions.quarantine(self, url, *, worker, reason)` makes `worker`/`reason` **keyword-only** — the bridge MUST call `quarantine(url, worker=worker, reason=reason)` (positional would `TypeError`). `heartbeat.quarantine_job` bumps `poison_jobs.crash_count +1` every call and returns `True` only on the strike that crosses `threshold` (default 3); a single bridge call almost always returns `False`. The tool result reports `newly_quarantined` (the bool) honestly — it does NOT imply the job was pulled on the first call.
+**`quarantine` delegation detail (manual one-shot — v1 fix):** `MonitorActions.quarantine(self, url, *, worker, reason)` makes `worker`/`reason` **keyword-only** — the bridge MUST call `quarantine(url, worker=worker, reason=reason)` (positional would `TypeError`). Per §7, this lane adds a **manual one-shot** path so a deliberate quarantine is not a crash strike: `heartbeat.quarantine_job` gains a `manual: bool = False` kwarg; `manual=True` sets `poison_jobs.quarantined_at = now()` **immediately**, records the reason with a `manual:` prefix, and does **NOT** increment `crash_count` (so bridge/monitor quarantines never pollute real crash signal). `MonitorActions.quarantine` passes `manual=True`. The watchdog's *automatic* over-max quarantine keeps calling `heartbeat.quarantine_job` directly with the default (`manual=False`) crash-strike behavior, so the semantic split is clean: crash-driven quarantine accumulates `crash_count`; deliberate quarantine is a one-shot. A single bridge call therefore actually pulls the job; `newly_quarantined` is `True` on the pull and `False` only if it was already quarantined. (This touches the already-shipped `heartbeat.py` + `monitor.py` — a small, well-scoped change folded into this lane.)
 
 `MonitorActions.report` is NOT exposed (it is a no-op echo for the in-process monitor; Codex narrates its own findings).
 
@@ -74,7 +74,7 @@ There is **no** generic `query`/`execute`/`sql` tool, and **no** tool that maps 
 
 - The official SDK already isolates a tool's uncaught exception into an `isError` result; it does **not** crash the stdio server. So `_with_conn`'s `try/except` exists to (a) return a clean, model-readable `{"error": …}` payload and (b) guarantee `rollback()`+`close()` in `finally` — not as crash prevention.
 - `_with_conn` catches `RuntimeError` too (not only `OperationalError`): `pgqueue.get_dsn()` raises `RuntimeError` when no DSN resolves, and the bridge's own DSN-missing branch returns the structured error before any connect.
-- Bad arguments are not SQL-layer errors: an unknown `worker_id` still enqueues a `remote_commands` row; `quarantine` below threshold returns `False`. The tool result reflects what actually happened (e.g. `newly_quarantined: false`), never a false success.
+- Bad arguments are not SQL-layer errors: an unknown `worker_id` still enqueues a `remote_commands` row; a manual `quarantine` of an already-quarantined url returns `False`. The tool result reflects what actually happened (e.g. `newly_quarantined: false`), never a false success.
 
 ## 5. Testing (subagent-driven TDD, against the `fleet_db` disposable Postgres)
 
@@ -106,11 +106,11 @@ FLEET_PG_DSN = "postgresql://…"
 ## 7. Residual risk (the three actions are abusable for self-DoS)
 
 The actions are conservative in *direction* but are still an availability attack surface on the owner's own pipeline, which the design accepts and surfaces rather than hides:
-- `quarantine_job(good_url, …)` called 3× forces a perfectly good, high-value job out of the pool (threshold-by-repetition), and bridge-driven quarantines increment `poison_jobs.crash_count`, **mixing with real crash signal**.
+- `quarantine_job(good_url, …)` pulls a job out of the pool. **The sharpest edge — that repeated calls accumulated `crash_count` and polluted real crash signal — is closed in v1** by the manual one-shot quarantine (§3.1): a bridge quarantine sets `quarantined_at` directly with a `manual:` reason and never touches `crash_count`. The residual is that one call still pulls one job; an injected agent could quarantine a good job — recoverable (the owner sees it in the audit log and can clear it), and no longer corrupts crash data.
 - `pause_scope` can pause the most productive board, and there is **no unpause tool** — recovery requires owner CLI intervention.
 - `restart_worker` can be spammed to thrash the fleet.
 
-Mitigations: **(v1, in scope)** every action tool logs (stdlib `logging`) the action, args, and result, giving the owner an audit trail of bridge-initiated changes. **(follow-ups, out of v1 scope, noted)** a per-tool rate cap; a distinct "manual" quarantine reason or a single-call quarantine that does not pollute `crash_count`; persisting the audit trail to a small table. Leaving the action tools on Codex's per-call approval (§6) is the practical front-line guard.
+Mitigations: **(v1, in scope)** (a) the manual one-shot quarantine above, so deliberate quarantines never pollute `crash_count`; (b) every action tool logs (stdlib `logging`) the action, args, and result, giving the owner an audit trail of bridge-initiated changes. The practical front-line guard is leaving the action tools on Codex's per-call approval (§6) — a human approves each action. **(follow-ups, out of v1 scope, noted)** a per-tool rate cap (its value materializes mainly if the owner runs the action tools auto-approved, since approval-on already bounds burst blast radius); persisting the audit trail to a small table.
 
 ## 8. Decided questions
 
@@ -120,4 +120,5 @@ Mitigations: **(v1, in scope)** every action tool logs (stdlib `logging`) the ac
 - Read tools enforce read-only via `_with_conn` rollback-on-finally; `dict_row` via `pgqueue.connect`. **Decided.**
 - `FLEET_PG_DSN` read directly (no `get_dsn` fallback). **Decided.**
 - Registry test uses the sync `_tool_manager` path (no async test infra). **Decided.**
-- No web UI, no remote/authenticated transport, no per-tool rate limiting in v1. **Decided.**
+- Quarantine via the bridge is a **manual one-shot** that does not pollute `crash_count` (heartbeat `manual=` path); audit log + Codex per-call approval are the v1 guards. **Decided.**
+- No web UI, no remote/authenticated transport, no per-tool rate limiting in v1 (deferred — relevant mainly under auto-approve). **Decided.**
