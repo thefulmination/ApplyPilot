@@ -30,3 +30,16 @@ def test_compute_worker_routes_audit_task_and_records_provider(fleet_db):
         r = cur.fetchone(); assert r["status"] == "done" and r["result"]["research_decision"] == "qualified"
         cur.execute("SELECT provider, model FROM llm_usage WHERE task='score'")
         u = cur.fetchone(); assert u["provider"] == "deepseek" and u["model"] == "deepseek-v4-flash"
+
+
+def test_build_compute_loop_wires_both_handlers(fleet_db):
+    from applypilot.fleet import compute_context as cc
+    from applypilot.fleet import compute_worker_main as cwm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn:
+        cc.publish_context(conn, resume_text="R", preference_profile={}, kg_prompt="KG",
+                           search_cfg={}, version="v1")
+    with pgqueue.connect(fleet_db) as conn:
+        loop = cwm.build_compute_loop(conn, dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1",
+                                      providers=["deepseek"], fallback=[], ensemble=False)
+    assert set(loop.compute_fns) == {"score", "audit"} and loop.role == "compute"

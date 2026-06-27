@@ -44,6 +44,7 @@ dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
+applypilot-fleet-compute = "applypilot.fleet.compute_worker_main:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"
