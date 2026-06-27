@@ -8,6 +8,11 @@ from applypilot.fleet import sync
 
 
 def push_backlog(*, sqlite_conn=None, pg_conn=None, task="score", score_floor=7, limit=None) -> int:
+    # score_floor=7 here is intentional: the home driver applies a quality floor
+    # so only jobs worth a second LLM pass are queued for compute.  The underlying
+    # sync.push_compute_eligible defaults to score_floor=0 (score everything) — that
+    # default is intentional for the raw sync function, which callers may use with
+    # their own floor.  Do not change sync.py to match this default.
     return sync.push_compute_eligible(sqlite_conn=sqlite_conn, pg_conn=pg_conn,
                                       task=task, score_floor=score_floor, limit=limit)
 

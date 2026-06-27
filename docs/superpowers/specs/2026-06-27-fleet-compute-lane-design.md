@@ -116,7 +116,9 @@ estimation. The fleet builds three capabilities on top:
 - **Ensemble / A-B compare (opt-in, sampled)**: a per-batch flag scores a job on N providers and
   the result carries each provider's score plus an `agreement`/`spread` field; the aggregate is
   computed at pull time. OFF by default (doubles cost); intended for a sample or top-N, under the
-  same cost cap.
+  same cost cap. The ensemble per-provider scores and `agreement`/`spread` are preserved in the PG
+  `compute_queue.result` JSONB (inspectable there); promoting them to a brain-side column or report
+  is a follow-up (tracked in `.superpowers/sdd/compute-lane-followups.md`).
 
 ## 6. Cost governance
 

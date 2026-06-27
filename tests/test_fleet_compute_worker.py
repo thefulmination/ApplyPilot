@@ -40,6 +40,47 @@ def test_build_compute_loop_wires_both_handlers(fleet_db):
         cc.publish_context(conn, resume_text="R", preference_profile={}, kg_prompt="KG",
                            search_cfg={}, version="v1")
     with pgqueue.connect(fleet_db) as conn:
-        loop = cwm.build_compute_loop(conn, dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1",
-                                      providers=["deepseek"], fallback=[], ensemble=False)
+        loop, version = cwm.build_compute_loop(conn, dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1",
+                                               providers=["deepseek"], fallback=[], ensemble=False)
     assert set(loop.compute_fns) == {"score", "audit"} and loop.role == "compute"
+    assert version == "v1"
+
+
+def test_maybe_refresh_context_rebuilds_on_version_change(fleet_db):
+    from applypilot.fleet import compute_context as cc
+    from applypilot.fleet import compute_worker_main as cwm
+    from applypilot.apply import pgqueue
+
+    # Publish v1
+    with pgqueue.connect(fleet_db) as conn:
+        cc.publish_context(conn, resume_text="R1", preference_profile={}, kg_prompt="KG1",
+                           search_cfg={}, version="v1")
+
+    # Build loop — captures v1
+    with pgqueue.connect(fleet_db) as conn:
+        loop, v1 = cwm.build_compute_loop(conn, dsn=fleet_db, worker_id="w-refresh",
+                                          home_ip="1.1.1.1", providers=["deepseek"],
+                                          fallback=[], ensemble=False)
+    assert v1 == "v1"
+    original_fns = loop.compute_fns
+
+    # Publish v2 (updated resume)
+    with pgqueue.connect(fleet_db) as conn:
+        cc.publish_context(conn, resume_text="R2", preference_profile={}, kg_prompt="KG2",
+                           search_cfg={}, version="v2")
+
+    # maybe_refresh_context should detect the version bump and rebuild compute_fns
+    with pgqueue.connect(fleet_db) as conn:
+        v_after = cwm.maybe_refresh_context(conn, loop, current_version="v1",
+                                            providers=["deepseek"], fallback=[], ensemble=False)
+    assert v_after == "v2", f"expected 'v2', got {v_after!r}"
+    assert loop.compute_fns is not original_fns, "compute_fns should have been replaced (rebuilt)"
+    assert set(loop.compute_fns) == {"score", "audit"}
+
+    # Calling again with current_version already at v2 must be a no-op (same dict identity)
+    fns_after_rebuild = loop.compute_fns
+    with pgqueue.connect(fleet_db) as conn:
+        v_noop = cwm.maybe_refresh_context(conn, loop, current_version="v2",
+                                           providers=["deepseek"], fallback=[], ensemble=False)
+    assert v_noop == "v2"
+    assert loop.compute_fns is fns_after_rebuild, "no-op refresh must not replace compute_fns"

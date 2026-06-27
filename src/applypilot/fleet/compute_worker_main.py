@@ -11,13 +11,38 @@ from applypilot.fleet import compute_context as cc
 from applypilot.fleet.compute_adapters import make_audit_fn, make_score_fn
 from applypilot.fleet.worker import WorkerLoop
 
+# How many run_once iterations between context-version checks. Keep low enough
+# to pick up a re-published resume/KG without being DB-heavy (one extra SELECT
+# per N jobs is negligible vs the LLM cost).
+_VERSION_CHECK_INTERVAL = 10
+
 
 def build_compute_loop(conn, *, dsn, worker_id, home_ip, providers, fallback, ensemble,
-                       machine_owner=None) -> WorkerLoop:
-    ctx, _version = cc.load_context(conn, providers=providers, fallback=fallback, ensemble=ensemble)
+                       machine_owner=None) -> tuple[WorkerLoop, str]:
+    """Build the WorkerLoop and return (loop, initial_version) so callers can
+    implement periodic re-fetch without calling load_context a second time."""
+    ctx, version = cc.load_context(conn, providers=providers, fallback=fallback, ensemble=ensemble)
     fns = {"score": make_score_fn(ctx), "audit": make_audit_fn(ctx)}
-    return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="compute",
+    loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="compute",
                       compute_fns=fns, machine_owner=machine_owner)
+    return loop, version
+
+
+def maybe_refresh_context(conn, loop: WorkerLoop, *, current_version: str,
+                           providers, fallback, ensemble) -> str:
+    """Check whether the published context version has changed.
+
+    If the stored ctx:version differs from *current_version* AND is non-empty,
+    rebuild loop.compute_fns in place from the freshly loaded context and return
+    the new version string.  Otherwise return *current_version* unchanged (the
+    dict object is NOT replaced, preserving identity for the no-op case).
+    """
+    ctx, new_version = cc.load_context(conn, providers=providers, fallback=fallback,
+                                       ensemble=ensemble)
+    if new_version and new_version != current_version:
+        loop.compute_fns = {"score": make_score_fn(ctx), "audit": make_audit_fn(ctx)}
+        return new_version
+    return current_version
 
 
 def main(argv=None) -> int:
@@ -34,9 +59,33 @@ def main(argv=None) -> int:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
     providers = [s for s in args.providers.split(",") if s]
     fallback = [s for s in args.fallback.split(",") if s]
+
     with pgqueue.connect(args.dsn) as conn:
-        loop = build_compute_loop(conn, dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
-                                  providers=providers, fallback=fallback, ensemble=args.ensemble,
-                                  machine_owner=args.machine_owner)
-    loop.run_forever()
-    return 0
+        loop, ctx_version = build_compute_loop(
+            conn, dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
+            providers=providers, fallback=fallback, ensemble=args.ensemble,
+            machine_owner=args.machine_owner,
+        )
+
+    # Drive run_once ourselves so we can periodically re-check the context version.
+    # run_forever is still available for callers that don't need the re-fetch
+    # (e.g. very short-lived workers), but the recommended path for long-running
+    # workers is this loop.
+    import time
+    iteration = 0
+    while True:  # pragma: no cover
+        try:
+            res = loop.run_once()
+        except Exception:
+            res = {"action": "error"}
+        if res.get("action") == "idle":
+            time.sleep(5.0)
+        iteration += 1
+        if iteration % _VERSION_CHECK_INTERVAL == 0:
+            with pgqueue.connect(args.dsn) as conn:
+                ctx_version = maybe_refresh_context(
+                    conn, loop, current_version=ctx_version,
+                    providers=providers, fallback=fallback, ensemble=args.ensemble,
+                )
+
+    return 0  # unreachable; satisfies type-checkers

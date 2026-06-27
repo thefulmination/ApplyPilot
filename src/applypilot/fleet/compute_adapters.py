@@ -37,6 +37,14 @@ def _job_from_payload(payload: dict) -> dict:
 
 def _score_once(ctx: ComputeContext, job: dict, provider: str | None) -> tuple[dict, float]:
     raw = score_job(ctx.resume_text, job, ctx.preference_profile, ctx.kg_prompt, provider=provider)
+    # Cost is read from the process-wide get_client(...) singleton's last_usage
+    # immediately after the scoring call.  This means a compute PROCESS must run
+    # ONE scoring slot at a time (the standard deployment is one WorkerLoop per
+    # process; scale = more processes, not threads).  A cleaner fix would be to
+    # have score_job return its token usage directly so the adapter needn't
+    # re-read a shared singleton — that refactor is tracked in
+    # .superpowers/sdd/compute-lane-followups.md (do NOT change score_job's
+    # return contract here).
     client = get_client(stage="score", provider_override=provider)
     cost = estimate_cost(getattr(client, "model", None), getattr(client, "last_usage", None)) or 0.0
     return raw, float(cost)
