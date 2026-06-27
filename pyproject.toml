@@ -49,6 +49,7 @@ applypilot-fleet-compute-home = "applypilot.fleet.compute_home_main:main"
 applypilot-fleet-discovery = "applypilot.fleet.discovery_main:main_worker"
 applypilot-fleet-discovery-home = "applypilot.fleet.discovery_main:main_home"
 applypilot-fleet-frontier = "applypilot.fleet.frontier_main:main"
+applypilot-fleet-watchdog = "applypilot.fleet.watchdog:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"

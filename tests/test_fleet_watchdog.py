@@ -183,3 +183,30 @@ def test_watchdog_does_not_roll_off_hour(fleet_db):
             cur.execute("UPDATE fleet_config SET last_window_roll_at = NULL WHERE id=1")
         conn.commit()
         assert watchdog._maybe_roll_window(conn, cfg, now_hour=13) is False
+
+
+def test_run_watchdog_runs_until_stop(fleet_db):
+    cfg = watchdog.WatchdogConfig(cadence_seconds=0)  # no real sleep in the test
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return calls["n"] > 3  # let 3 ticks run, then stop
+
+    ticks = watchdog.run_watchdog(lambda: pgqueue.connect(fleet_db), cfg, stop=stop)
+    assert ticks == 3
+
+
+def test_run_watchdog_survives_a_bad_tick(fleet_db, monkeypatch):
+    cfg = watchdog.WatchdogConfig(cadence_seconds=0)
+    seq = {"n": 0}
+
+    def flaky_tick(conn, c):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            raise RuntimeError("boom")
+        return {}
+
+    monkeypatch.setattr(watchdog, "watchdog_tick", flaky_tick)
+    ticks = watchdog.run_watchdog(lambda: pgqueue.connect(fleet_db), cfg, max_ticks=2)
+    assert ticks == 2  # the RuntimeError on tick 1 did not kill the loop

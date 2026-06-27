@@ -66,6 +66,39 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
     return summary
 
 
+def run_watchdog(conn_factory, cfg: WatchdogConfig, *, stop=None, max_ticks=None) -> int:
+    """Drive watchdog_tick on a cadence. A fresh connection per tick keeps a transient
+    DB blip from wedging the loop; a per-tick exception is swallowed so one bad pass
+    never takes the watchdog down. Returns the number of ticks executed."""
+    ticks = 0
+    while True:
+        if stop is not None and stop():
+            break
+        if max_ticks is not None and ticks >= max_ticks:
+            break
+        try:
+            with conn_factory() as conn:
+                watchdog_tick(conn, cfg)
+        except Exception:  # pragma: no cover - logged, never fatal
+            pass
+        ticks += 1
+        if cfg.cadence_seconds:
+            time.sleep(cfg.cadence_seconds)
+    return ticks
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="applypilot-fleet-watchdog")
+    p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
+    p.add_argument("--cadence", type=int, default=25)
+    args = p.parse_args(argv)
+    if not args.dsn:
+        raise SystemExit("set --dsn or FLEET_PG_DSN")
+    cfg = WatchdogConfig(cadence_seconds=args.cadence)
+    run_watchdog(lambda: pgqueue.connect(args.dsn), cfg)  # pragma: no cover - infinite
+    return 0
+
+
 def _maybe_roll_window(conn, cfg: WatchdogConfig, *, now_hour: int) -> bool:
     """Roll the rolling-24h governor counters at most once per night. Guarded by
     fleet_config.last_window_roll_at so a restart can't double-roll the same night."""
