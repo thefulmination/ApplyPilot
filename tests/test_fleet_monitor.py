@@ -1,5 +1,6 @@
 # tests/test_fleet_monitor.py
 from applypilot.apply import pgqueue
+from applypilot.fleet import heartbeat
 from applypilot.fleet import monitor
 
 
@@ -68,3 +69,43 @@ def test_health_report_clean_when_no_anomalies():
     report = monitor.build_health_report(snapshot, captcha_threshold=0.4, cost_cap_total=100.0)
     assert "NEEDS YOUR DECISION" in report
     assert "none" in report.lower()  # the decision section says nothing needs attention
+
+
+def test_quarantine_manual_one_shot_no_crash_count(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        newly = heartbeat.quarantine_job(conn, "j1", worker="w", reason="bad", manual=True)
+        assert newly is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT crash_count, quarantined_at, reason FROM poison_jobs WHERE url='j1'")
+            row = cur.fetchone()
+        assert row["crash_count"] == 0          # one-shot did NOT bump the strike counter
+        assert row["quarantined_at"] is not None  # pulled immediately
+        assert row["reason"].startswith("manual:")
+        # second manual call: already quarantined -> False, still no crash_count bump
+        again = heartbeat.quarantine_job(conn, "j1", worker="w", reason="bad", manual=True)
+        assert again is False
+        with conn.cursor() as cur:
+            cur.execute("SELECT crash_count FROM poison_jobs WHERE url='j1'")
+            assert cur.fetchone()["crash_count"] == 0
+
+
+def test_quarantine_default_still_strikes(fleet_db):
+    # Regression: the default (manual=False) crash-strike path is unchanged.
+    with pgqueue.connect(fleet_db) as conn:
+        assert heartbeat.quarantine_job(conn, "j2", worker="w", reason="crash", threshold=3) is False  # strike 1
+        assert heartbeat.quarantine_job(conn, "j2", worker="w", reason="crash", threshold=3) is False  # strike 2
+        assert heartbeat.quarantine_job(conn, "j2", worker="w", reason="crash", threshold=3) is True   # strike 3 -> pulled
+        with conn.cursor() as cur:
+            cur.execute("SELECT crash_count FROM poison_jobs WHERE url='j2'")
+            assert cur.fetchone()["crash_count"] == 3
+
+
+def test_monitor_actions_quarantine_uses_manual(fleet_db):
+    from applypilot.fleet import monitor
+    with pgqueue.connect(fleet_db) as conn:
+        newly = monitor.MonitorActions(conn).quarantine("j3", worker="w", reason="owner")
+        assert newly is True  # single call pulls the job (manual one-shot)
+        with conn.cursor() as cur:
+            cur.execute("SELECT crash_count, quarantined_at FROM poison_jobs WHERE url='j3'")
+            row = cur.fetchone()
+        assert row["crash_count"] == 0 and row["quarantined_at"] is not None

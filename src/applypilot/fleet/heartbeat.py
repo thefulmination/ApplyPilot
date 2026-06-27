@@ -135,11 +135,32 @@ def detect_stuck(conn, *, heartbeat_timeout=90, job_max_seconds=600) -> list[dic
 # ---------------------------------------------------------------------------
 # Poison-job quarantine (R7).
 # ---------------------------------------------------------------------------
-def quarantine_job(conn, url, *, worker, reason, threshold=3, commit=True) -> bool:
+def quarantine_job(conn, url, *, worker, reason, threshold=3, commit=True, manual=False) -> bool:
     """Bump ``poison_jobs.crash_count`` for ``url`` (creating the row on first
     strike). Once the count reaches ``threshold`` and the job is not already
     quarantined, stamp ``quarantined_at`` + ``reason``. Returns True ONLY on the
-    transition that newly quarantines the job (idempotent thereafter)."""
+    transition that newly quarantines the job (idempotent thereafter).
+
+    ``manual=True`` is a DELIBERATE one-shot (owner / monitor / Codex bridge): pull the
+    job immediately WITHOUT accumulating ``crash_count`` (so manual quarantines never
+    pollute real crash signal), tagging the reason with a ``manual:`` prefix. Returns
+    True only on the newly-quarantined transition, False if already quarantined."""
+    if manual:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO poison_jobs (url, crash_count, last_worker, reason, quarantined_at)
+                   VALUES (%s, 0, %s, %s, now())
+                   ON CONFLICT (url) DO UPDATE SET
+                       last_worker    = EXCLUDED.last_worker,
+                       reason         = EXCLUDED.reason,
+                       quarantined_at = now()
+                   WHERE poison_jobs.quarantined_at IS NULL""",
+                (url, worker, f"manual:{reason}"),
+            )
+            newly = cur.rowcount > 0
+        if commit:
+            conn.commit()
+        return newly
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO poison_jobs (url, crash_count, last_worker, reason)

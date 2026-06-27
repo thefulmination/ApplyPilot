@@ -21,8 +21,9 @@ class MonitorActions:
         return heartbeat.issue_command(self._conn, worker_id, "restart")
 
     def quarantine(self, url: str, *, worker: str, reason: str) -> bool:
-        """Quarantine a poison job so it stops being re-leased."""
-        return heartbeat.quarantine_job(self._conn, url, worker=worker, reason=reason)
+        """Quarantine a poison job (deliberate one-shot: pulls immediately, does not
+        pollute crash_count). Stops the job being re-leased."""
+        return heartbeat.quarantine_job(self._conn, url, worker=worker, reason=reason, manual=True)
 
     def pause_scope(self, scope_key: str) -> None:
         """Pause a host/board scope (bounded write). Does NOT resume -- resume of any
