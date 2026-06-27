@@ -2,7 +2,7 @@
 import os
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import queue
+from applypilot.fleet import queue, governor
 
 
 def test_build_discovery_loop_wires_search_fn(fleet_db):
@@ -51,6 +51,41 @@ def test_push_discovered_stages_rows(fleet_db):
         assert rows[0]["synced_to_home_at"] is None
 
 
+def test_worker_discovery_scrape_error_reschedules(fleet_db):
+    """Gap 1: when search_fn raises, _tick_discovery must not crash, must return error='blocked',
+    stage 0 postings, reschedule the task, and mark a governor block on the board scope."""
+    from applypilot.fleet.worker import WorkerLoop
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO search_tasks (task_id, query, board, location, cadence_seconds) "
+                    "VALUES ('terror','chief of staff','indeed','Remote',3600)")
+        conn.commit()
+
+    def _raise(task):
+        raise RuntimeError("boom")
+
+    loop = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w-err", home_ip="1.1.1.1", role="discovery",
+                      search_fn=_raise)
+    res = loop.run_once()  # must not raise
+
+    assert res["action"] == "search_done"
+    assert res["error"] == "blocked"
+    assert res.get("staged", 0) == 0
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        # No postings staged
+        cur.execute("SELECT count(*) AS n FROM discovered_postings WHERE task_id='terror'")
+        assert cur.fetchone()["n"] == 0
+        # Task rescheduled
+        cur.execute("SELECT status, next_due_at > now() AS future FROM search_tasks WHERE task_id='terror'")
+        r = cur.fetchone()
+        assert r["status"] == "queued" and r["future"] is True
+        # Governor block recorded for the board scope (complete_search records this when board is set)
+        sk = governor.board_scope("indeed")
+        cur.execute("SELECT block_24h FROM rate_governor WHERE scope_key=%s", (sk,))
+        row = cur.fetchone()
+        assert row is not None and row["block_24h"] >= 1
+
+
 def test_pull_discovered_ingests_and_marks_synced(fleet_db, monkeypatch):
     import applypilot.fleet.sync as sync_mod
     captured = {}
@@ -70,3 +105,29 @@ def test_pull_discovered_ingests_and_marks_synced(fleet_db, monkeypatch):
     # re-pull is a no-op
     with pgqueue.connect(fleet_db) as pg:
         assert sync_mod.pull_discovered(sqlite_conn=object(), pg_conn=pg) == 0
+
+
+def test_pull_discovered_multi_label_no_cross_contamination(fleet_db, monkeypatch):
+    """Gap 2: pull_discovered must call store_jobspy_results once per source_label with
+    only that label's rows — no cross-contamination between labels."""
+    import applypilot.fleet.sync as sync_mod
+    calls: list = []
+    def fake_store(conn, df, source_label):
+        calls.append((source_label, sorted(list(df["job_url"]))))
+        return (len(df), 0)
+    monkeypatch.setattr(sync_mod, "store_jobspy_results", fake_store)
+
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_discovered(conn, task_id="t-cos", source_label="cos", worker_id="w1",
+                              postings=[{"job_url": "u1", "title": "COS A"},
+                                        {"job_url": "u2", "title": "COS B"}])
+        queue.push_discovered(conn, task_id="t-pm", source_label="pm", worker_id="w1",
+                              postings=[{"job_url": "u3", "title": "PM A"}])
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync_mod.pull_discovered(sqlite_conn=object(), pg_conn=pg)
+
+    assert n == 3
+    # Build a dict from recorded calls for order-tolerant comparison
+    by_label = {label: urls for label, urls in calls}
+    assert by_label == {"cos": ["u1", "u2"], "pm": ["u3"]}
