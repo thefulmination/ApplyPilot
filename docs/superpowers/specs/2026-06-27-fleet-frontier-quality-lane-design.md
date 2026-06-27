@@ -1,173 +1,176 @@
 # Fleet Frontier Quality Lane — Design Spec
 
-**Date:** 2026-06-27
+**Date:** 2026-06-27 (rev 2 — subscription-priority)
 **Status:** design, pending review
 **Repo:** `New project/ApplyPilot` (Python tool)
-**Depends on:** the shipped **compute lane** (`src/applypilot/fleet/compute_adapters.py`,
-`scoring/scorer.py`, 123 PG tests) — reuses its scorer + the multi-provider/failover idea.
-Grounding for Flavor B: memory `applypilot-subscription-scoring` (the ToS verdicts).
+**Depends on:** the shipped **compute lane** (`scoring/scorer.py`, `fleet/compute_adapters.py`,
+123 PG tests). Grounding: memory `applypilot-subscription-scoring` (ToS verdicts: Codex YELLOW,
+Claude Max stricter, Gemini excluded).
 See [`2026-06-27-fleet-compute-lane-design.md`](2026-06-27-fleet-compute-lane-design.md).
 
 ## 1. Goal & success criteria
 
-Put **frontier-model judgment (GPT‑5.5 / Opus class) only where it changes the decision** — the
-small *contested* subset of jobs — without a metered frontier bill on the whole corpus and without
-making the user's personal subscriptions load‑bearing.
+Put **frontier-model judgment as the PRIORITY for the non-bulk scoring work** — everything beyond
+the cheap first pass DeepSeek does — using the user's own **top-tier subscriptions** (Codex **Pro**
+/ gpt‑5.5 as the primary; Claude **Max** / Opus as an optional attended cross-check), paced under
+their caps and failing over to a metered frontier API so the lane never stalls. The user's goal: the
+best reasoning models on the jobs that matter, paid from sunk flat-rate quota, with the cheap API as
+the floor, not the ceiling.
 
-A **hybrid**: the cheap metered API (DeepSeek, the shipped compute lane) scores the full corpus; a
-**frontier second pass** re‑scores only the contested subset and **flags where the frontier judge
-disagrees with the cheap one** for the owner's eye. The frontier backend is a config choice on one
-interface:
-- **Flavor A (default, ToS‑clean):** a metered frontier API model (e.g. `gpt-5.5` / `claude-opus`
-  via API key). Runs anywhere; zero subscription exposure.
-- **Flavor B (default‑OFF toggle):** the frontier pass uses the user's **own Codex/ChatGPT
-  subscription** via `codex exec`, on the user's logged‑in home box, paid from sunk quota — with
-  automatic failover to Flavor A.
+**Backend priority (per job, in order):**
+1. **Codex subscription (gpt‑5.5)** — PRIMARY frontier backend, via `codex exec` on the user's
+   logged-in home box. Rate-governed, serial + jitter.
+2. **Metered frontier API** (e.g. `gpt-5.5`/`o`-class or `claude-opus` via API key) — **failover**
+   when the subscription is capped/unavailable, and the **default** backend when the subscription
+   toggle is off. ToS-clean.
+3. **Claude Max (Opus)** — OPTIONAL, default-OFF, **attended cross-check** on the highest-value
+   subset only (not an unattended engine — Anthropic's Consumer Terms are stricter on this pattern).
+Cheap **DeepSeek** stays the separate, unchanged **bulk** lane (the shipped compute lane).
 
-**Architecture decision (why home‑side, not the fleet queue):** the contested subset is *small* and
-Flavor B is *serial + home‑box only* (one login). The distributed compute_queue is keyed by `url`
-(a job already bulk‑scored can't be cleanly re‑queued), and parallel fan‑out is pointless for a
-small set and outright harmful for a subscription login. So the frontier lane is a **standalone
-home‑side pass** — select → score → record — that reuses the scorer but needs **no new queue, no
-worker/lease changes**.
+**Done when:** `applypilot-fleet-frontier` works down the priority-ordered backlog of not-yet-
+frontier-scored jobs, scoring each with the Codex subscription backend (rate-governed), recording the
+frontier score + agreement-vs-cheap in a self-contained `frontier_scores` brain side-table (advisory
+— the `jobs` table is NOT migrated), failing over to the metered API when the sub caps, and printing
+a disagreement report. Verified by tests with stubbed backends (no spend / no real CLI); opt-in live
+smokes for the subscription (`codex exec`), the metered API, and the optional Claude cross-check.
 
-**Done when:** `applypilot-fleet-frontier` selects the contested subset from the brain, scores each
-with the chosen frontier backend (A or B, B failing over to A), records the frontier score +
-agreement‑vs‑cheap in a self‑contained `frontier_scores` brain side‑table (advisory — the 60‑col
-`jobs` table is NOT migrated), and prints a **disagreement report** (jobs where the frontier and
-cheap judges diverge). Verified by tests with stubbed backends (no spend); one opt‑in live smoke
-each for A (metered key) and B (`codex exec`).
-
-**Non‑goals:** replacing the cheap API for bulk (it isn't — DeepSeek does the whole 77k for ~$10–30);
-Claude‑subscription (a later optional toggle, OFF) and Gemini (login path removed 2026‑06‑18,
-excluded); pooling anyone else's subscription (a hard ToS line); any change to the shipped compute
-lane or its queue/worker.
+**Non-goals:** changing the bulk compute lane; cover-letter / diagnosis re-routing (a later adopter
+of the same backend — those touch in-flight files); resume tailoring (the user's rule); Gemini (login
+path removed 2026‑06‑18); **pooling anyone else's subscription** (a hard ToS line).
 
 ## 2. Flow
 
 ```
-Brain (SQLite jobs)  ── cheap research_fit_score already written by the compute lane (BULK) ──┐
-        │                                                                                      │
-        ▼  select_contested(band)                                                              │
-  contested subset ── frontier_pass ──► frontier backend per job (serial, gap-jitter):         │
-        │                                 Flavor A: scorer.score_job(provider=gpt-5.5|opus)     │
-        │                                 Flavor B: cli_providers.score_via_codex(codex exec)   │
-        │                                 (B -> A failover on SubscriptionUnavailable)          │
-        ▼                                                                                       │
-  frontier_scores side-table (url, cheap_score, frontier_score, provider, agreement, scored_at) ◄┘
+Brain (SQLite jobs)  ── cheap research_fit_score written by the BULK compute lane (DeepSeek) ──┐
+        │                                                                                       │
+        ▼  select_priority(backlog)  (highest-value not-yet-frontier-scored, ordered)           │
+  per job, SERIAL, gap-jitter:                                                                   │
+     governor.allow(account) ? ──yes──► Codex subscription (codex exec, gpt-5.5)                 │
+                              └─no/limit─► metered frontier API (failover)                       │
+     [optional, attended] also score on Claude Max (Opus) for the top tier → cross-check         │
+        │                                                                                        │
+        ▼  agreement = f(cheap_score, frontier_score[, opus_score])                              │
+  frontier_scores side-table (url, cheap, frontier, opus?, provider, agreement, scored_at) ◄─────┘
         │
-        ▼  disagreement_report(max_agreement)   ──►  owner-review queue (low-agreement jobs)
+        ▼  disagreement_report  ──►  owner-review queue (low-agreement jobs)
 ```
 
-Advisory throughout. The frontier score lands in `frontier_scores`, never in `jobs.fit_score` /
-`jobs.audit_score` — a flaky frontier call can't corrupt the brain.
+Advisory throughout; `jobs.fit_score`/`audit_score` never touched.
 
 ## 3. Components
 
-### 3.1 `fleet/frontier_select.py` — contested-subset selector
-`select_contested(sqlite_conn, *, band=200, mode="band", lo=7.0, hi=8.5, hours=24, urls=None)
--> list[dict]` (each `{url, company, title, full_description, cheap_score}`). Modes:
-- **`band` (default):** jobs whose **cheap score** (`COALESCE(research_fit_score, fit_score)`) is in
-  `[lo, hi]` (default **[7.0, 8.5]** — the "maybe" zone a better judge resolves), `duplicate_of_url
-  IS NULL`, **not already frontier‑scored** (no row in `frontier_scores`), ordered by cheap_score
-  desc, `LIMIT band`.
-- **`new`:** jobs discovered within the last `hours` (the daily trickle), same exclusions.
-- **`urls`:** an explicit url list (e.g. a pairwise‑adjudication candidate set).
-`lo`/`hi`/`band` are arguments, not hard‑coded.
+### 3.1 `fleet/frontier_select.py` — priority backlog selector
+`select_priority(sqlite_conn, *, limit, floor=7.0, mode="backlog", hours=24, urls=None) -> list[dict]`
+(`{url, company, title, full_description, cheap_score}`). Modes:
+- **`backlog` (default):** not-yet-frontier-scored jobs (no `frontier_scores` row), `duplicate_of_url
+  IS NULL`, `COALESCE(research_fit_score, fit_score) >= floor`, **ordered by cheap_score desc** (best
+  first), `LIMIT limit`. The lane works down this priority queue across runs as quota allows.
+- **`new`:** discovered within the last `hours` (the daily trickle). **`urls`:** an explicit set.
+`floor`/`limit` are arguments. (Default `floor=7.0` so the frontier judge is spent on plausible jobs,
+not obvious rejects; set lower to cover more.)
 
-### 3.2 `fleet/cli_providers.py` — the subscription‑CLI backend (Flavor B)
-`score_via_codex(prompt, *, schema_path, timeout_s=120, retries=2) -> dict`: runs
-`codex exec --output-schema <schema_path> -o <tmp.json> "<prompt>"`, reads + JSON‑parses `<tmp.json>`,
-returns `{"score": int, "reasoning": str, ...}`. On a malformed object → bounded retry with a
-"return ONLY the JSON object" reinforcement; on non‑zero exit / auth / quota / parse‑exhaustion →
-raise `SubscriptionUnavailable`. Uses `--output-schema`/`-o` (the single‑object form) — **never**
-`--json` (a JSONL event stream). A `claude -p --output-format json --json-schema … → .structured_output`
-variant is **stubbed** for a later optional toggle (Claude stays OFF per the ToS findings).
-This module shells out only; it holds no token (the CLI uses the local login).
+### 3.2 `fleet/cli_providers.py` — subscription-CLI backends
+- `score_via_codex(prompt, *, schema_path, timeout_s=120, retries=2) -> dict`: runs
+  `codex exec --output-schema <schema_path> -o <tmp.json> "<prompt>"`, parses `<tmp.json>` →
+  `{"score", "reasoning", ...}`; bounded retry on malformed; raises **`SubscriptionUnavailable`** on
+  non-zero exit / auth / **quota/limit** / parse-exhaustion. Uses `--output-schema`/`-o` (single
+  object), never `--json` (event stream). The exact flag is verified against `codex exec --help` at
+  build time.
+- `score_via_claude(prompt, *, schema, timeout_s=120) -> dict` (OPTIONAL, used only by the attended
+  cross-check): `claude -p --output-format json --json-schema '<schema>'`, parse `.structured_output`;
+  requires `CLAUDE_CODE_OAUTH_TOKEN` set and `ANTHROPIC_API_KEY` unset and **not** `--bare` (else it
+  bills the metered API); raises `SubscriptionUnavailable` on limit/auth/parse failure.
+These modules shell out only; they hold no token (the CLIs use the local login).
 
-### 3.3 `fleet/frontier_pass.py` — the orchestrator (home‑side, reuses the scorer)
-`run_frontier_pass(*, sqlite_conn, provider, mode, band, lo, hi, hours, urls, resume_text,
-preference_profile, kg_prompt, subscription_enabled=False) -> dict`:
-1. `select_contested(...)`.
-2. For each job, build the score prompt (the same job dict `score_job` consumes) and score it with
-   the backend: a **metered‑API provider** → `scorer.score_job(resume, job, preference, kg,
-   provider=<frontier>)`; **`codex-subscription`** → `cli_providers.score_via_codex(...)` — but only
-   if `subscription_enabled` (else raise; default off). On `SubscriptionUnavailable`, **fail over**
-   to the configured Flavor‑A metered model so the opinion still arrives (and record which backend
-   actually produced it).
-3. Compute `agreement = round(1 - abs(frontier_score - cheap_score)/9.0, 3)` (1.0 identical, lower =
-   more divergence).
-4. Upsert a `frontier_scores` row. Serial with gap‑jitter between calls (reuse the apply‑lane jitter)
-   — no parallelism on a subscription login.
-Returns `{scored, failed_over, disagreements}`.
+### 3.3 `fleet/frontier_governor.py` — subscription rate-governor (home-side)
+The plan caps are opaque ("a message is not a fixed unit") and **shared with the user's dev use**, so
+the governor is conservative + reactive. `FrontierGovernor(account, *, window_seconds, window_budget,
+min_gap_seconds)` with `allow() -> bool` (under the per-rolling-window budget AND past the min-gap)
+and `record(outcome)` (counts a call; `outcome='limit'` from a `SubscriptionUnavailable` **trips the
+account out for the rest of the window**). State persists in a small local sqlite/JSON so it survives
+process restarts within a window. One governor instance per account (Codex; Claude). This is what
+keeps the lane from (a) exhausting the window, (b) starving the user's dev quota, (c) hammering after
+a limit (the abuse pattern). `window_budget`/`min_gap` are configurable and default conservative.
 
-### 3.4 `frontier_scores` brain side‑table (no `jobs` migration)
+### 3.4 `fleet/frontier_pass.py` — orchestrator
+`run_frontier_pass(*, sqlite_conn, limit, floor, mode, hours, urls, resume_text, preference_profile,
+kg_prompt, use_subscription=True, metered_provider, cross_check_opus=False) -> dict`:
+1. `select_priority(...)`.
+2. For each job (serial, gap-jitter): build the score prompt; pick the backend —
+   `use_subscription AND codex_governor.allow()` → `score_via_codex`; on `SubscriptionUnavailable`
+   (or governor deny) → **failover** to `scorer.score_job(provider=metered_provider)` (the metered
+   frontier API). Record which backend actually produced the score.
+3. If `cross_check_opus` AND the job is in the top tier AND `claude_governor.allow()`: also
+   `score_via_claude` and store `opus_score`. (Attended; default off.)
+4. `agreement = round(1 - abs(frontier_score - cheap_score)/9.0, 3)` (and an opus/frontier agreement
+   when present). Upsert a `frontier_scores` row.
+Returns `{scored, by_subscription, failed_over, cross_checked, disagreements}`.
+
+### 3.5 `frontier_scores` brain side-table (no `jobs` migration)
 ```sql
 CREATE TABLE IF NOT EXISTS frontier_scores (
   url            TEXT PRIMARY KEY,
   cheap_score    REAL,
   frontier_score REAL,
+  opus_score     REAL,          -- only when the attended cross-check ran
   frontier_decision TEXT,
-  provider       TEXT,       -- the backend that actually produced it (post-failover)
-  agreement      REAL,       -- 1.0 = identical; low = divergent
+  provider       TEXT,          -- the backend that produced frontier_score (post-failover)
+  agreement      REAL,          -- vs cheap; low = divergent
   reasoning      TEXT,
   scored_at      TEXT
 );
 ```
-Self‑contained + advisory; the pairwise review tool / a future jobs‑column promotion can read it
-later. Created by `frontier_pass` on first run (idempotent).
+Self-contained + advisory; idempotently created on first run.
 
-### 3.5 Disagreement report
-`disagreement_report(sqlite_conn, *, max_agreement=0.8) -> list[dict]` — `frontier_scores` rows with
-`agreement < max_agreement`, ordered by agreement asc: `{url, company, title, cheap_score,
-frontier_score, agreement, provider}`. This is the **owner‑review queue**: "the model you trust most
-disagreed with the cheap one here." It never auto‑acts.
+### 3.6 Disagreement report + CLI
+`disagreement_report(sqlite_conn, *, max_agreement=0.8) -> list` — rows with `agreement <
+max_agreement`, ordered asc — the owner-review queue. CLI `applypilot-fleet-frontier`:
+`--mode backlog|new|urls`, `--limit N`, `--floor`, `--metered-provider <model>`,
+`--no-subscription` (force metered/Flavor-A), `--cross-check-opus` (attended Claude),
+`--window-budget`/`--min-gap` (governor), `--report`.
 
-### 3.6 CLI: `applypilot-fleet-frontier`
-`--mode band|new|urls`, `--band N`, `--lo`/`--hi`, `--provider <model|codex-subscription>`,
-`--enable-subscription` (required to use `codex-subscription`; default off), `--report`
-(print the disagreement queue). Loads the resume/preference/KG context locally (the same inputs the
-compute lane serves as assets; here read from the brain/owner config since the pass is home‑side).
+## 4. Safety / honesty constraints
 
-## 4. Safety / honesty constraints (from the subscription research)
-
-- **Advisory only.** Frontier scores live in `frontier_scores`; `jobs.fit_score`/`audit_score` are
-  never touched.
-- **Own accounts only.** Flavor B uses the user's own ChatGPT login on the user's own box; no token
-  is ever read or distributed. Pooling a friend's subscription is account‑sharing (ToS violation +
-  ban vector) and is structurally impossible here.
-- **Home box only.** Flavor B runs only where `codex` is logged in (the home box) — it's a local
-  subprocess, never a cloud worker.
-- **Default OFF + explicit opt‑in.** `codex-subscription` requires `--enable-subscription`; the
-  default backend is a metered API model (Flavor A), which is ToS‑clean.
-- **ToS reality, stated.** Flavor A is clean. Flavor B (programmatic `codex exec` on a personal
-  plan) is a documented **gray zone** (OpenAI's automation clause) — bounded to a small subset,
-  default‑off, owner‑run; the spec does not claim it is blessed.
-- **Cost truth.** Bulk stays on the cheap API; this is a *quality* lane on a small subset, not a
-  cost optimization.
+- **Advisory only.** Frontier/opus scores live in `frontier_scores`; the `jobs` canonical columns are
+  never touched. A flaky CLI call cannot corrupt the brain.
+- **Own accounts only.** The CLIs use the user's own local login; no token is read or distributed.
+  Pooling a friend's subscription is account-sharing (ToS violation + ban vector) and is structurally
+  impossible here.
+- **Home box only; serial; governed.** The subscription backends run only where the CLI is logged in,
+  one call at a time, paced by the governor — never parallel, never on a cloud worker.
+- **Dedicated fleet account — strongly recommended.** Running the fleet on the user's *dev* ChatGPT
+  (Pro) or Claude (Max) account shares both the quota and the **ban blast radius** with the IDE the
+  user codes in (Codex; Claude Code). A **dedicated ChatGPT account for the fleet's Codex backend**
+  isolates both. This is a deployment choice (the backend uses whatever login is active), surfaced as
+  guidance, not enforced in code.
+- **ToS reality, stated.** The metered API (failover/default) is clean. Codex-subscription automation
+  is a documented **gray zone** (OpenAI's automation clause) — bounded by the governor, home-box,
+  owner-run. Claude-subscription bulk automation is **stricter/riskier** (Consumer Terms +
+  OpenClaw) — hence Opus is an **optional, attended, top-tier-only cross-check**, off by default. The
+  spec does not claim either subscription path is blessed.
+- **Don't starve the dev tools.** The governor's conservative default budget leaves headroom so the
+  fleet doesn't consume the quota the user needs for interactive Codex/Claude — the single most
+  likely day-to-day harm.
 
 ## 5. Testing
-- **Selector:** temp SQLite brain → `band` returns only in‑band, non‑dup, not‑yet‑frontier jobs,
-  ordered; `new`/`urls` modes select correctly; already‑scored urls excluded.
-- **CLI backend (stubbed subprocess):** `score_via_codex` parses a valid schema object; retries then
-  raises `SubscriptionUnavailable` on malformed; raises on non‑zero exit. The `--output-schema`/`-o`
-  argv is asserted (not `--json`).
-- **Orchestrator:** with a stubbed `score_job`, a `band` pass writes `frontier_scores` rows with a
-  correct `agreement`; with a stubbed `score_via_codex` that raises `SubscriptionUnavailable`, the
-  pass **fails over** to the stubbed metered model and records `provider` = the metered one.
-- **Guardrail:** `provider='codex-subscription'` without `--enable-subscription` raises before any
-  subprocess; advisory‑only — the `jobs` table is never written.
-- **Report:** seeded mixed agreement → only `agreement < max` returned, ordered.
-- **Opt‑in live smokes:** A (one real metered frontier call, key‑gated); B (one real `codex exec`,
-  gated on `codex login status` reporting ChatGPT).
+- **Selector:** priority order, floor, exclusions (dup, already-frontier-scored); `new`/`urls`.
+- **CLI backends (stubbed subprocess):** parse a valid schema object; retry→`SubscriptionUnavailable`
+  on malformed; raise on non-zero exit and on a quota/limit signal; assert the `--output-schema`/`-o`
+  argv (not `--json`); the Claude variant requires the OAuth-token / no-API-key / no-`--bare` precond.
+- **Governor:** `allow()` false past the window budget and within the min-gap; a `record('limit')`
+  trips the account out for the rest of the window; state survives a restart.
+- **Orchestrator (stubs):** subscription path records `by_subscription`; a `SubscriptionUnavailable`
+  (or governor deny) **fails over** to the stubbed metered model and records `provider` accordingly;
+  `cross_check_opus` stores `opus_score` only for the top tier; `agreement` correct; advisory-only.
+- **Report:** only `agreement < max`, ordered.
+- **Opt-in live smokes:** one real `codex exec` (gated on `codex login status` == ChatGPT); one real
+  metered-API call (key-gated); one real `claude -p` cross-check (gated on a Max OAuth token).
 
 ## 6. Decided vs open
-- Home‑side pass (not the fleet queue); cheap API for bulk + a frontier pass on the contested subset;
-  Flavor A default, Flavor B default‑off explicit opt‑in; frontier data in a self‑contained
-  `frontier_scores` side‑table. **Decided.**
-- Backends: metered API (A) + Codex subscription (B). Claude subscription = later optional, OFF;
-  Gemini = excluded. **Decided.**
-- **Open for review:** (1) the default contested band `[7.0, 8.5]` on `COALESCE(research_fit_score,
-  fit_score)` — confirm the field + window; (2) whether `disagreement_report` should also write a
-  flag the pairwise review tool reads, or stay a standalone report (default: standalone). Defaults
-  chosen; confirm at review.
+- Subscription is the PRIORITY for the non-bulk frontier lane: Codex/gpt‑5.5 primary, metered API
+  failover/default, Claude/Opus optional attended cross-check; DeepSeek = bulk floor; home-side pass;
+  rate-governed; advisory `frontier_scores`. **Decided (this rev).**
+- **Open for review:** (1) default `floor=7.0` and the governor's default `window_budget`/`min_gap`
+  (need the user's Pro tier sizing — Pro 5x vs 20x — to set a conservative budget); (2) dedicated
+  fleet account vs running on the dev accounts (operational); (3) whether to enable the Opus
+  cross-check by default for the very top tier or keep it fully opt-in (default: opt-in).
