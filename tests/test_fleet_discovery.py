@@ -1,6 +1,23 @@
 # tests/test_fleet_discovery.py
+import os
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import queue
+
+
+def test_build_discovery_loop_wires_search_fn(fleet_db):
+    from applypilot.fleet import discovery_main as dm
+    loop = dm.build_discovery_loop(dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1",
+                                   results_per_site=25, hours_old=48, proxy=None)
+    assert loop.role == "discovery" and loop.search_fn is not None
+
+
+def test_main_worker_no_dsn_raises_system_exit(monkeypatch):
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    from applypilot.fleet import discovery_main as dm
+    import pytest
+    with pytest.raises(SystemExit):
+        dm.main_worker(["--worker-id", "w1"])
 
 
 def test_worker_discovery_stages_postings(fleet_db):
