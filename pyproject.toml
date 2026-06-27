@@ -37,6 +37,7 @@ dependencies = [
     # Postgres driver for the cloud apply-fleet: the home box uses it for the
     # SQLite<->PG PUSH/PULL sync; the worker container uses it to lease/report.
     "psycopg[binary]>=3.2",
+    "mcp>=1.28,<2",
     ]
 
 [project.optional-dependencies]
@@ -50,6 +51,7 @@ applypilot-fleet-discovery = "applypilot.fleet.discovery_main:main_worker"
 applypilot-fleet-discovery-home = "applypilot.fleet.discovery_main:main_home"
 applypilot-fleet-frontier = "applypilot.fleet.frontier_main:main"
 applypilot-fleet-watchdog = "applypilot.fleet.watchdog:main"
+applypilot-fleet-codex-bridge = "applypilot.fleet.codex_bridge:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"
