@@ -196,8 +196,9 @@ CREATE INDEX IF NOT EXISTS idx_challenge_open ON auth_challenge (url) WHERE reso
 
 -- ---------------------------------------------------------------------------
 -- otp_request: Gmail relay bookkeeping (R4). The CODE is NEVER persisted (E1) --
--- it is returned only over the broker RPC response. This row tracks request +
--- consumed bookkeeping so the same email isn't handed to two workers.
+-- it is returned only over the broker RPC response. This row is the request +
+-- consumed AUDIT TRAIL; single-delivery (not handing one code to two workers) is
+-- enforced by the owner-side relay that matches+consumes the email, not by this row.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS otp_request (
     id               BIGSERIAL PRIMARY KEY,

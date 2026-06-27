@@ -347,9 +347,11 @@ class Broker:
         Gmail token. The real ``gmail.readonly`` inbox lives on ONE trusted spot
         (the owner box or a separately-credentialed relay process) which reads the
         last-~60s code for the matching sender and returns it over the RPC -- the
-        code is NEVER persisted. This method only writes the request row (so the
-        same email isn't handed to two workers) and returns a documented stub so
-        the surface is wired without any secret living in this module.
+        code is NEVER persisted. This method only writes a request audit-trail row
+        and returns a documented stub so the surface is wired without any secret
+        living in this module. (Single-delivery -- not handing the same code to two
+        workers -- is the OWNER-SIDE relay's job when it matches+consumes the email;
+        this row is bookkeeping, not an enforced mutex.)
         """
         self._require(conn, worker_id, token)
         with conn.cursor() as cur:
