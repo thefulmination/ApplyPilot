@@ -221,13 +221,20 @@ class WorkerLoop:
             postings = self.search_fn(task) or []
         except Exception:  # a scrape-block / transport error parks the task (RF3)
             error = "blocked"
+        staged = 0
+        if not error and postings:
+            staged = queue.push_discovered(
+                conn, task_id=task["task_id"],
+                source_label=task.get("query") or task.get("board"),
+                worker_id=self.worker_id, postings=postings, commit=False,
+            )
         queue.complete_search(
             conn, self.worker_id, task["task_id"],
             result_count=len(postings), board=task.get("board"), error=error,
         )
         self._beat(conn, state="idle")
         return {"action": "search_done", "task_id": task["task_id"],
-                "result_count": len(postings), "error": error}
+                "result_count": len(postings), "staged": staged, "error": error}
 
     # -- APPLY: governed, dedup-gated, approval-gated, captcha-aware (§5/§7) ---
     def _tick_apply(self, conn) -> dict:
