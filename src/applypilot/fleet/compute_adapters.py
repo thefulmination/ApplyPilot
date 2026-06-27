@@ -44,18 +44,30 @@ def _score_once(ctx: ComputeContext, job: dict, provider: str | None) -> tuple[d
 
 def make_score_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
     primary = ctx.providers[0] if ctx.providers else None
+    chain = [primary] + list(ctx.fallback)
+
+    def _build(raw, provider, cost, status):
+        ok = status == "done"
+        return ({"task": "score",
+                 "research_fit_score": int(raw["score"]) if ok else None,
+                 "research_decision": None,
+                 "keywords": raw.get("keywords", "") if ok else "",
+                 "reasoning": raw.get("reasoning") or raw.get("error") or "",
+                 "model": raw.get("model"), "provider": provider, "status": status}, cost)
 
     def score_fn(payload: dict) -> tuple[dict, float]:
         job = _job_from_payload(payload)
-        raw, cost = _score_once(ctx, job, primary)
-        provider = raw.get("provider") or primary
-        if raw.get("error") or int(raw.get("score") or 0) <= 0:
-            return ({"task": "score", "research_fit_score": None, "research_decision": None,
-                     "keywords": "", "reasoning": raw.get("reasoning") or raw.get("error") or "",
-                     "model": raw.get("model"), "provider": provider, "status": "failed"}, cost)
-        return ({"task": "score", "research_fit_score": int(raw["score"]), "research_decision": None,
-                 "keywords": raw.get("keywords", ""), "reasoning": raw.get("reasoning", ""),
-                 "model": raw.get("model"), "provider": provider, "status": "done"}, cost)
+        total_cost = 0.0
+        last = None
+        for provider in chain:
+            raw, cost = _score_once(ctx, job, provider)
+            total_cost += cost
+            prov = raw.get("provider") or provider
+            if not raw.get("error") and int(raw.get("score") or 0) > 0:
+                return _build(raw, prov, total_cost, "done")
+            last = (raw, prov)
+        raw, prov = last
+        return _build(raw, prov, total_cost, "failed")
 
     return score_fn
 

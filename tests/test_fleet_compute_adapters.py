@@ -39,6 +39,20 @@ def test_score_fn_maps_llm_error_to_failed(monkeypatch):
     assert cost == 0.0
 
 
+def test_score_fn_fails_over_to_next_provider(monkeypatch):
+    def fake_score_job(resume, job, pref=None, kg=None, provider=None):
+        if provider == "deepseek":
+            return {"score": 0, "error": "429", "reasoning": "rate limited"}
+        return {"score": 7, "keywords": "k", "reasoning": "ok", "model": "gemini-2.0-flash", "provider": "gemini"}
+    monkeypatch.setattr(ca, "score_job", fake_score_job)
+    monkeypatch.setattr(ca, "get_client", lambda **k: type("C", (), {"model": "m", "last_usage": None})())
+    monkeypatch.setattr(ca, "estimate_cost", lambda m, u: 0.0)
+    score_fn = ca.make_score_fn(_ctx(providers=["deepseek"], fallback=["gemini"]))
+    result, _ = score_fn({"url": "u", "company": "C", "title": "T", "full_description": "d"})
+    assert result["status"] == "done" and result["research_fit_score"] == 7
+    assert result["provider"] == "gemini"
+
+
 def test_audit_fn_maps_scoreaudit_to_decision():
     payload = {"url": "u", "company": "Acme", "title": "Chief of Staff",
                "full_description": "operations leadership", "fit_score": 8}
