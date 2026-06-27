@@ -171,3 +171,35 @@ def test_seed_known_bulk_loads(fleet_db):
         for q, a in pairs.items():
             assert answer_bank.get_answer(conn, q) == a
         assert answer_bank.list_unknown(conn) == []
+
+
+# ---------------------------------------------------------------------------
+# concurrency: two workers hitting the same unknown race the defer-insert
+# ---------------------------------------------------------------------------
+
+def test_unknown_get_answer_is_concurrency_safe(fleet_db):
+    import threading
+
+    q = "A never-before-seen screening question, concurrency edition?"
+    results: list = []
+    lock = threading.Lock()
+
+    def worker():
+        with pgqueue.connect(fleet_db) as conn:
+            r = answer_bank.get_answer(conn, q)
+            with lock:
+                results.append(r)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # every worker DEFERS (None) -- never a guessed answer -- and the ON CONFLICT
+    # DO NOTHING leaves exactly ONE defer row (no duplicate, no unique-violation crash).
+    assert results == [None, None, None, None]
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM answer_bank WHERE q_norm=%s",
+                    (answer_bank.normalize_question(q),))
+        assert cur.fetchone()["n"] == 1

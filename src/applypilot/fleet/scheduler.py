@@ -82,6 +82,7 @@ def expand_search_config(conn, config: dict[str, Any], *, default_cadence: int =
     """
     searches = config.get("searches") or []
     n = 0
+    seen: set[str] = set()  # dedupe task_ids within one expand so n == distinct rows
     with conn.cursor() as cur:
         for s in searches:
             query = s.get("query")
@@ -109,8 +110,12 @@ def expand_search_config(conn, config: dict[str, Any], *, default_cadence: int =
             enabled = bool(s["enabled"]) if "enabled" in s else None
             for board in boards:
                 for location in locations:
+                    tid = task_id_for(query, board, location)
+                    if tid in seen:   # a duplicate (query x board x location) -> one row, count once
+                        continue
+                    seen.add(tid)
                     cur.execute(_UPSERT_TASK, {
-                        "task_id": task_id_for(query, board, location),
+                        "task_id": tid,
                         "query": query, "board": board, "location": location,
                         "params": params_json, "cadence": cadence, "enabled": enabled,
                     })

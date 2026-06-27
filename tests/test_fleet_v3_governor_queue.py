@@ -8,6 +8,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import config as fcfg
 from applypilot.fleet import governor
@@ -66,6 +68,24 @@ def test_per_host_gap_blocks_then_allows(fleet_db):
                         "WHERE scope_key='host:greenhouse.io'")
         conn.commit()
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is not None
+
+
+# ---- governor: cap is coupled to a confirmed apply -----------------------------
+
+def test_record_outcome_bump_cap_requires_success(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        sk = governor.host_scope("g.io")
+        governor.ensure_scope(conn, sk)
+        # bumping the cap/min-gap on a captcha or block is a bug -> rejected
+        with pytest.raises(ValueError):
+            governor.record_outcome(conn, [sk], "captcha", bump_cap=True)
+        with pytest.raises(ValueError):
+            governor.record_outcome(conn, [sk], "block", bump_cap=True)
+        # success + bump_cap is the only valid combination
+        governor.record_outcome(conn, [sk], "success", bump_cap=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count_24h FROM rate_governor WHERE scope_key=%s", (sk,))
+            assert cur.fetchone()["count_24h"] == 1
 
 
 # ---- adaptive circuit-breaker (R6) ---------------------------------------------

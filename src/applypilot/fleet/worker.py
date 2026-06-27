@@ -261,25 +261,32 @@ class WorkerLoop:
         # owner_tray / owner_inbox: a human must solve it. Raise a challenge and
         # PARK -- the lease is HELD (not released, not closed): the job is neither
         # double-claimable nor marked applied (spec §7.3 frozen challenge-hold).
-        self._raise_and_park(conn, url, kind, route=route, outcome="captcha",
+        # A pure LOGIN wall is not a bot-detection signal (the site just requires an
+        # account), so it records NO governor outcome -- otherwise a login-only host
+        # would inflate challenge_rate and false-trip its breaker. Real captcha walls
+        # (visible_captcha / sms_otp) DO feed the breaker.
+        wall_outcome = None if kind == "login_gate" else "captcha"
+        self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome,
                              target_host=target_host)
         return {"action": "parked_challenge", "url": url, "kind": kind, "route": route}
 
     def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host) -> int:
-        """Raise an auth_challenge row, record the wall outcome on the governor, and
-        FREEZE the held lease out of the reclaim pool (``queue.park_challenge``) so the
-        SAME wall is never reclaimed and re-driven blind on another machine -- the
-        IP-burn fail-safe (§7.3). No apply result is written; the owner resolves the
-        challenge from the trusted box. A blocked/captcha wall is also a leading
-        indicator the governor must see (§6)."""
+        """Raise an auth_challenge row, optionally record the wall outcome on the
+        governor, and FREEZE the held lease out of the reclaim pool
+        (``queue.park_challenge``) so the SAME wall is never reclaimed and re-driven
+        blind on another machine -- the IP-burn fail-safe (§7.3). No apply result is
+        written; the owner resolves the challenge from the trusted box. ``outcome`` may
+        be None (e.g. a login wall) -> no governor outcome is recorded, so a non-bot
+        wall doesn't pollute the breaker's challenge_rate (§6)."""
         cid = _insert_challenge(
             conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
             home_ip=self.home_ip, kind=kind, route=route, commit=False,
         )
-        scopes = [governor.GLOBAL, governor.home_ip_scope(self.home_ip)]
-        if target_host:
-            scopes.append(governor.host_scope(target_host))
-        governor.record_outcome(conn, scopes, outcome, commit=False)
+        if outcome is not None:
+            scopes = [governor.GLOBAL, governor.home_ip_scope(self.home_ip)]
+            if target_host:
+                scopes.append(governor.host_scope(target_host))
+            governor.record_outcome(conn, scopes, outcome, commit=False)
         queue.park_challenge(conn, self.worker_id, url, commit=False)
         conn.commit()
         self._beat(conn, state="challenge_pending", current_job=url)

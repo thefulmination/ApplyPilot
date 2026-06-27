@@ -47,6 +47,11 @@ def record_outcome(conn, scope_keys, outcome, *, bump_cap=False, commit=True) ->
     (the min-gap / mutex). All in one transaction (caller may extend it)."""
     if outcome not in _OUTCOME_COL:
         raise ValueError(f"unknown outcome: {outcome}")
+    if bump_cap and outcome != "success":
+        # The cap counter + min-gap stamp represent a CONFIRMED apply; a captcha/block
+        # must never advance them (would under-count the remaining daily budget AND
+        # push the next allowed apply out by a full gap on a non-apply).
+        raise ValueError("bump_cap is only valid with outcome='success'")
     col = _OUTCOME_COL[outcome]
     extra = ", count_24h = count_24h + 1, last_applied_at = now()" if bump_cap else ""
     with conn.cursor() as cur:

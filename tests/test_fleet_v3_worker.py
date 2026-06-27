@@ -78,6 +78,27 @@ _CF_HTML = """
 <p>Ray ID: 7abc</p></body></html>
 """
 
+# Other interactive anti-bot providers (status 200, NO reCAPTCHA marker) -- these
+# used to fall through to 'clear' (a phantom apply). Each must be a visible_captcha.
+_ARKOSE_HTML = """
+<html><body><div id="arkose-challenge"></div>
+<script src="https://client-api.arkoselabs.com/v2/abc/api.js"></script>
+<input name="fc-token" value="x"/></body></html>
+"""
+_GEETEST_HTML = """
+<html><body><div class="geetest_holder"></div>
+<script src="https://static.geetest.com/static/js/gt.0.4.9.js"></script></body></html>
+"""
+_PERIMETERX_HTML = """
+<html><body><div id="px-captcha"></div>
+<p>Press &amp; Hold to confirm you are a human (and not a bot).</p>
+<script src="https://captcha.px-cdn.net/PXxxx/main.min.js"></script></body></html>
+"""
+_DATADOME_HTML = """
+<html><body><script>var dd={'host':'geo.captcha-delivery.com','t':'fe'}</script>
+<iframe src="https://geo.captcha-delivery.com/captcha/?initialCid=x"></iframe></body></html>
+"""
+
 
 def test_classify_one_per_kind():
     cases = {
@@ -134,6 +155,16 @@ def test_classify_never_returns_clear_on_any_wall():
     # and the two pass-kinds ARE 'clear'/'invisible_pass' (not walls)
     assert captcha.is_wall("clear") is False
     assert captcha.is_wall("invisible_pass") is False
+
+
+def test_other_antibot_providers_are_visible_captcha_not_clear():
+    # Arkose/FunCaptcha, GeeTest, PerimeterX, DataDome: a page that is ONLY one of
+    # these walls (200, no reCAPTCHA marker) must NOT classify as 'clear' (which the
+    # worker would record as a phantom apply). Fail-safe -> visible_captcha.
+    for html in (_ARKOSE_HTML, _GEETEST_HTML, _PERIMETERX_HTML, _DATADOME_HTML):
+        got = captcha.classify(html)
+        assert got == "visible_captcha", f"expected visible_captcha, got {got!r}"
+        assert got != "clear"
 
 
 # ===========================================================================
@@ -318,6 +349,32 @@ def test_worker_apply_cf_block_skips_no_park(fleet_db):
         assert cur.fetchone()["n"] == 0  # nothing a human can solve -> no challenge
         cur.execute("SELECT block_24h FROM rate_governor WHERE scope_key='global'")
         assert cur.fetchone()["block_24h"] == 1
+
+
+def test_worker_login_gate_parks_without_feeding_breaker(fleet_db):
+    # A login wall parks (needs a human) but is NOT a bot-detection signal, so it
+    # must NOT record a captcha governor outcome (else a sign-in-only host would
+    # inflate challenge_rate and false-trip its breaker).
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "a-login", host="login.io")
+
+    loop = WorkerLoop(
+        _factory(fleet_db), "w-login", home_ip="8.8.8.8", role="apply",
+        apply_fn=lambda job: _LOGIN_GATE_HTML, on_owner_machine=False,
+    )
+    res = loop.run_once()
+    assert res["action"] == "parked_challenge" and res["kind"] == "login_gate"
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        # the wall was raised + the job parked (held, challenge_pending, not applied)
+        cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='a-login' AND resolved_at IS NULL")
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT status, apply_status FROM apply_queue WHERE url='a-login'")
+        q = cur.fetchone()
+        assert q["status"] == "leased" and q["apply_status"] == "challenge_pending"
+        # but NO governor captcha outcome was recorded anywhere
+        cur.execute("SELECT count(*) AS n FROM rate_governor WHERE captcha_24h > 0")
+        assert cur.fetchone()["n"] == 0, "a login wall must not feed the captcha breaker"
 
 
 def test_worker_role_validation():

@@ -116,6 +116,21 @@ def test_push_apply_eligible_excludes_crash_unconfirmed(fleet_db, tmp_path):
         "a crash_unconfirmed / no_confirmation posting must not be re-pushed"
 
 
+def test_push_apply_eligible_respects_limit(fleet_db, tmp_path):
+    # limit is pushed into SQL (top-N by score), not just a post-fetch slice.
+    sq = _home_sqlite(tmp_path)
+    for i in range(3):
+        _add_job(sq, f"https://boards.greenhouse.io/x/jobs/{i}",
+                 company=f"C{i}", title="COS", audit_score=float(9 - i))
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7,
+                                     approved_batch="b1", limit=2)
+        assert n == 2
+        with pg.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM apply_queue")
+            assert cur.fetchone()["n"] == 2
+
+
 def test_push_apply_eligible_is_idempotent(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://jobs.lever.co/acme/1", company="Acme", title="COS")

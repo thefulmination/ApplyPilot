@@ -27,6 +27,18 @@ def _row(conn, task_id):
         return cur.fetchone()
 
 
+def test_expand_dedupes_duplicate_triples_in_count(fleet_db):
+    # Duplicate boards/locations within one config produce one physical row; the
+    # returned count must equal the distinct task count (n == COUNT(*)).
+    cfg = {"searches": [{"query": "cos",
+                         "boards": ["greenhouse", "greenhouse"],
+                         "locations": ["remote", "remote"]}]}
+    with pgqueue.connect(fleet_db) as conn:
+        n = scheduler.expand_search_config(conn, cfg)
+        rows = _count_tasks(conn)
+    assert n == rows == 1, f"duplicate triple must collapse to one task; n={n} rows={rows}"
+
+
 # ---------------------------------------------------------------------------
 # Expansion = cartesian product of (query x board x location).
 # ---------------------------------------------------------------------------

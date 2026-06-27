@@ -80,6 +80,53 @@ def test_detect_stuck_flags_dead_and_overrunning(fleet_db):
     assert ("slow", "no_heartbeat") not in found
 
 
+def test_beat_keepalive_preserves_in_flight_job_started_at(fleet_db):
+    # A keepalive on the SAME job that doesn't re-pass job_started_at must NOT clear
+    # it -- else job_over_max stuck-detection is silently disabled for that job.
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "w1", state="applying", current_job="u/a")
+        with conn.cursor() as cur:
+            cur.execute("UPDATE worker_heartbeat SET job_started_at = now() - make_interval(secs => 1200) "
+                        "WHERE worker_id='w1'")
+        conn.commit()
+        # keepalive: same job, state re-passed, job_started_at omitted
+        heartbeat.beat(conn, "w1", state="applying", current_job="u/a")
+        with conn.cursor() as cur:
+            cur.execute("SELECT job_started_at FROM worker_heartbeat WHERE worker_id='w1'")
+            assert cur.fetchone()["job_started_at"] is not None  # preserved
+        # so the overrunning job is still detected
+        assert "job_over_max" in {r["reason"] for r in heartbeat.detect_stuck(conn)
+                                  if r["worker_id"] == "w1"}
+        # but switching to a DIFFERENT job takes the new (here NULL) value
+        heartbeat.beat(conn, "w1", state="applying", current_job="u/b")
+        with conn.cursor() as cur:
+            cur.execute("SELECT job_started_at FROM worker_heartbeat WHERE worker_id='w1'")
+            assert cur.fetchone()["job_started_at"] is None
+
+
+def test_detect_stuck_boundary(fleet_db):
+    # Just-inside the window is NOT flagged; just-outside IS (pins the comparison).
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "inside", state="applying", current_job="u/i")
+        heartbeat.beat(conn, "outside", state="applying", current_job="u/o")
+        with conn.cursor() as cur:
+            # heartbeat_timeout=90: 80s old -> inside (ok); 100s old -> outside (stale)
+            cur.execute("UPDATE worker_heartbeat SET last_beat = now() - make_interval(secs => 80) "
+                        "WHERE worker_id='inside'")
+            cur.execute("UPDATE worker_heartbeat SET last_beat = now() - make_interval(secs => 100) "
+                        "WHERE worker_id='outside'")
+            # job_max=600: started 590s ago -> inside; 610s ago -> outside
+            cur.execute("UPDATE worker_heartbeat SET job_started_at = now() - make_interval(secs => 590) "
+                        "WHERE worker_id='inside'")
+            cur.execute("UPDATE worker_heartbeat SET job_started_at = now() - make_interval(secs => 610) "
+                        "WHERE worker_id='outside'")
+        conn.commit()
+        found = {(r["worker_id"], r["reason"]) for r in
+                 heartbeat.detect_stuck(conn, heartbeat_timeout=90, job_max_seconds=600)}
+    assert ("inside", "no_heartbeat") not in found and ("inside", "job_over_max") not in found
+    assert ("outside", "no_heartbeat") in found and ("outside", "job_over_max") in found
+
+
 def test_detect_stuck_can_flag_both_reasons(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         heartbeat.beat(conn, "both", state="applying", current_job="u/x")

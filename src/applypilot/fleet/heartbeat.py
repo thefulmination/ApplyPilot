@@ -32,7 +32,13 @@ ON CONFLICT (worker_id) DO UPDATE SET
     role            = EXCLUDED.role,
     state           = EXCLUDED.state,
     current_job     = EXCLUDED.current_job,
-    job_started_at  = EXCLUDED.job_started_at,
+    -- Preserve job_started_at across a keepalive on the SAME job: a beat that
+    -- doesn't re-pass job_started_at must not NULL it (that would silently disable
+    -- job_over_max stuck-detection). A change of current_job takes the new value.
+    job_started_at  = CASE
+        WHEN EXCLUDED.current_job IS NOT DISTINCT FROM worker_heartbeat.current_job
+        THEN COALESCE(EXCLUDED.job_started_at, worker_heartbeat.job_started_at)
+        ELSE EXCLUDED.job_started_at END,
     success_today   = EXCLUDED.success_today,
     captcha_today   = EXCLUDED.captcha_today,
     block_today     = EXCLUDED.block_today,
@@ -65,7 +71,11 @@ def beat(
     sw_version=None,
     commit=True,
 ) -> None:
-    """UPSERT this worker's heartbeat row, stamping ``last_beat = now()``."""
+    """UPSERT this worker's heartbeat row, stamping ``last_beat = now()``.
+
+    Pass the live ``state`` on every beat. ``job_started_at`` is preserved across a
+    keepalive on the SAME ``current_job`` (so a beat that omits it doesn't disable
+    job_over_max detection); a change of ``current_job`` takes the new value."""
     with conn.cursor() as cur:
         cur.execute(_BEAT, {
             "worker_id": worker_id,

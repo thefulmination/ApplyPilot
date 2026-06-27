@@ -80,7 +80,13 @@ def push_apply_eligible(
     pg = pg_conn or pgqueue.connect()
     try:
         out: list[dict[str, Any]] = []
-        for r in sq.execute(_PUSH_APPLY_SELECT, (score_floor,)).fetchall():
+        # Push the limit into SQL so we fetch only the top-N (not the whole eligible
+        # set on a 70k+ job brain); keep the Python break as belt-and-suspenders.
+        sql, params = _PUSH_APPLY_SELECT, [score_floor]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        for r in sq.execute(sql, params).fetchall():
             host = _target_host(r["application_url"])
             out.append({
                 "url": r["url"], "company": r["company"], "title": r["title"],
@@ -213,7 +219,11 @@ def push_compute_eligible(
     pg = pg_conn or pgqueue.connect()
     try:
         out: list[dict[str, Any]] = []
-        for r in sq.execute(_PUSH_COMPUTE_SELECT, (score_floor,)).fetchall():
+        sql, params = _PUSH_COMPUTE_SELECT, [score_floor]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        for r in sq.execute(sql, params).fetchall():
             out.append({
                 "url": r["url"], "task": task, "est_cost_usd": 0,
                 "payload": {

@@ -19,7 +19,8 @@ nagged, spec §7.2).
 The eight kinds (spec §7.1):
     clear           -- form proceeded normally, no wall
     invisible_pass  -- reCAPTCHA v3 passed silently (present, no challenge, not blocked)
-    visible_captcha -- image/checkbox challenge (reCAPTCHA v2, hCaptcha, Turnstile interactive)
+    visible_captcha -- interactive challenge (reCAPTCHA v2, hCaptcha, Turnstile,
+                       Arkose/FunCaptcha, GeeTest, PerimeterX, DataDome)
     email_otp       -- email verification-code wall (auto-solved via the Gmail relay)
     sms_otp         -- phone/SMS verification-code wall (needs the human)
     login_gate      -- "sign in / create an account to apply" wall
@@ -60,6 +61,19 @@ _HCAPTCHA_SIGNS = ("hcaptcha.com", "h-captcha", "hcaptcha")
 
 # reCAPTCHA v2 visible checkbox / image challenge.
 _RECAPTCHA_V2_SIGNS = ("g-recaptcha", "recaptcha/api2", "recaptcha/api/fallback")
+
+# Other interactive anti-bot providers common on ATS / job boards. Each presents a
+# human-solvable challenge (Arkose/FunCaptcha puzzle, GeeTest slider, PerimeterX
+# press-and-hold, DataDome captcha). WITHOUT these, a page that is ONLY one of them
+# (status 200, no reCAPTCHA marker) falls through every branch to 'clear' -- and the
+# worker records a PHANTOM apply for a job it never submitted. Classified as
+# 'visible_captcha' (the fail-safe direction: route to a human, never blind-submit).
+_INTERACTIVE_ANTIBOT_SIGNS = (
+    "arkoselabs", "funcaptcha", "arkose-labs", "fc-token",   # Arkose / FunCaptcha
+    "geetest", "gt_captcha", "geetest_",                       # GeeTest
+    "perimeterx", "px-captcha", "_pxhd", "press & hold",       # PerimeterX
+    "datadome", "captcha-delivery.com",                        # DataDome
+)
 
 # reCAPTCHA v3 invisible bootstrap (present without a visible widget).
 _RECAPTCHA_V3_SIGNS = ("recaptcha/api.js?render=", "grecaptcha.execute", "?render=")
@@ -139,8 +153,9 @@ def classify(html, frames_text: str = "", final_url: str = "", status=None) -> s
         return "cf"
 
     # ---- 2. Interactive captcha widgets -> a human-solvable visible challenge.
-    #         Turnstile / hCaptcha / reCAPTCHA-v2 checkbox are all 'visible_captcha'.
-    if _has(hay, _TURNSTILE_SIGNS) or _has(hay, _HCAPTCHA_SIGNS) or _has(hay, _RECAPTCHA_V2_SIGNS):
+    #         Turnstile / hCaptcha / reCAPTCHA-v2 + Arkose/GeeTest/PerimeterX/DataDome.
+    if (_has(hay, _TURNSTILE_SIGNS) or _has(hay, _HCAPTCHA_SIGNS)
+            or _has(hay, _RECAPTCHA_V2_SIGNS) or _has(hay, _INTERACTIVE_ANTIBOT_SIGNS)):
         return "visible_captcha"
 
     # ---- 3. OTP / verification-code wall (email auto-solves, sms needs the human).
