@@ -215,3 +215,144 @@ def test_apply_lease_atomic_under_concurrency(fleet_db):
 
     assert len(grabbed) == n_jobs
     assert len(set(grabbed)) == n_jobs, "a job was double-grabbed"
+
+
+# ---- LinkedIn mutex SERIALIZES at claim time (R1 catastrophe) ------------------
+
+def test_linkedin_lease_serializes_under_concurrency(fleet_db):
+    # The real invariant the old test missed: two owner-IP machines, with NO
+    # record_outcome between them, must NOT both get a live LinkedIn session.
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=300)
+        with conn.cursor() as cur:
+            for i in range(4):
+                cur.execute(
+                    "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
+                    "VALUES (%s,'Co','Role','https://linkedin.com/jobs/%s',%s,'linkedin','b1')",
+                    (f"li{i}", i, 9 - i),
+                )
+        conn.commit()
+
+    leased: list[str] = []
+    lock = threading.Lock()
+
+    def grab(wid):
+        with pgqueue.connect(fleet_db) as c:
+            row = queue.lease_linkedin(c, wid, public_ip="1.1.1.1", owner_ip="1.1.1.1")
+            if row:
+                with lock:
+                    leased.append(row["url"])
+
+    threads = [threading.Thread(target=grab, args=(f"w{i}",)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(leased) == 1, f"account:linkedin must serialize to ONE concurrent session, got {leased}"
+
+
+def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-x','Co','Role','https://linkedin.com/jobs/x',9,'linkedin','b1')",
+            )
+        conn.commit()
+        a = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1")
+        assert a and a["url"] == "li-x"
+        # cap reserved at lease time -> count_24h already 1
+        with conn.cursor() as cur:
+            cur.execute("SELECT count_24h FROM rate_governor WHERE scope_key='account:linkedin'")
+            assert cur.fetchone()["count_24h"] == 1
+        assert queue.write_linkedin_result(conn, "w1", "li-x", status="applied") is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM linkedin_queue WHERE url='li-x'")
+            assert cur.fetchone()["status"] == "applied"  # closed in linkedin_queue, not apply_queue
+            cur.execute("SELECT count_24h, success_24h FROM rate_governor WHERE scope_key='account:linkedin'")
+            g = cur.fetchone()
+            assert g["count_24h"] == 1 and g["success_24h"] == 1  # NOT double-bumped
+        # a stale/other worker cannot close it
+        assert queue.write_linkedin_result(conn, "intruder", "li-x", status="applied") is False
+
+
+# ---- numeric cap actually BLOCKS a lease (not just bookkeeping) -----------------
+
+def test_apply_host_cap_blocks_then_allows(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.host_scope("cap.io"), daily_cap=1, min_gap_seconds=1)
+        _seed_apply(conn, "k1", host="cap.io", score=9, title="A")
+        _seed_apply(conn, "k2", host="cap.io", score=8, title="B")
+        a = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+        assert a is not None
+        queue.write_apply_result(conn, "w1", a["url"], status="applied", target_host="cap.io", home_ip="1.1.1.1")
+        # cap=1 reached. Wind last_applied back so the GAP isn't the blocker -> isolate the CAP.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE rate_governor SET last_applied_at = now() - interval '300 seconds' WHERE scope_key='host:cap.io'")
+        conn.commit()
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None  # cap blocks
+        with conn.cursor() as cur:
+            cur.execute("UPDATE rate_governor SET daily_cap=5 WHERE scope_key='host:cap.io'")
+        conn.commit()
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is not None  # raised cap -> leases
+
+
+# ---- 'throttled' is a REAL state: leases (paced), unlike paused -----------------
+
+def test_throttled_host_still_leases_and_gap_does_not_compound(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        sk = governor.host_scope("thr.io")
+        governor.ensure_scope(conn, sk, min_gap_seconds=10)
+        for _ in range(5):
+            governor.record_outcome(conn, [sk], "success")
+        for _ in range(5):
+            governor.record_outcome(conn, [sk], "captcha")  # rate 0.5 in [0.4,0.6) -> throttled
+        assert dict(governor.evaluate_breakers(conn)).get(sk) == "throttled"
+        with conn.cursor() as cur:
+            cur.execute("SELECT min_gap_seconds, base_min_gap_seconds FROM rate_governor WHERE scope_key=%s", (sk,))
+            r = cur.fetchone()
+            assert r["base_min_gap_seconds"] == 10 and r["min_gap_seconds"] == 30  # base captured, 3x gap
+        # throttled host is STILL leasable (no last_applied stamp yet -> gap open), unlike paused
+        _seed_apply(conn, "t1", host="thr.io", score=9)
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is not None
+        # recover -> gap restored to the pristine base (no 3x->9x compounding)
+        governor.roll_window(conn)
+        governor.evaluate_breakers(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT min_gap_seconds, breaker_state FROM rate_governor WHERE scope_key=%s", (sk,))
+            r = cur.fetchone()
+            assert r["breaker_state"] == "ok" and r["min_gap_seconds"] == 10
+
+
+# ---- a parked auth wall is FROZEN out of the reclaim pool (R3 fail-safe) --------
+
+def test_parked_challenge_frozen_against_reclaim(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        # control: a normal leased row whose ttl elapsed IS reclaimed back to 'queued'
+        _seed_apply(conn, "ctrl", host="c.io", score=5)
+        queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+        with conn.cursor() as cur:
+            cur.execute("UPDATE apply_queue SET lease_expires_at = now() - interval '1 hour' WHERE url='ctrl'")
+        conn.commit()
+        pgqueue.reclaim_stale_leases(conn, grace_seconds=0)
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue WHERE url='ctrl'")
+            assert cur.fetchone()["status"] == "queued"
+
+        # parked wall: park freezes it so the SAME elapsed ttl does NOT reclaim it
+        _seed_apply(conn, "wall1", host="walled.io", score=9)
+        a = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+        assert a["url"] == "wall1"
+        assert queue.park_challenge(conn, "w1", "wall1") is True
+        pgqueue.reclaim_stale_leases(conn, grace_seconds=0)
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, apply_status FROM apply_queue WHERE url='wall1'")
+            r = cur.fetchone()
+        assert r["status"] == "leased" and r["apply_status"] == "challenge_pending", \
+            "a parked wall must NOT be reclaimed and re-driven blind"
+        # owner resolves -> back to the pool for a retry from the trusted box
+        assert queue.resolve_challenge(conn, "wall1", requeue=True) is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue WHERE url='wall1'")
+            assert cur.fetchone()["status"] == "queued"

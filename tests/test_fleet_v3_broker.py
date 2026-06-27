@@ -175,6 +175,46 @@ def test_linkedin_refused_for_non_owner_ip(fleet_db):
         assert r["status"] == "leased" and r["lease_owner"] == owid
 
 
+def test_linkedin_owner_ip_spoof_is_ignored(fleet_db):
+    # The real attack the old test missed: a friend supplies its OWN ip as owner_ip
+    # to satisfy the mutex. The broker must IGNORE any caller-supplied owner_ip and
+    # gate on the registered public_ip vs the broker-configured owner_ip only.
+    b = Broker(owner_ip=OWNER_IP)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_linkedin(conn)
+        fwid, ftok = b.enroll_worker(
+            conn, "friend", capabilities={"can_linkedin": True}, public_ip=FRIEND_IP
+        )
+        # spoof attempts -- own IP, the real owner IP -- all refused:
+        assert b.lease(conn, fwid, ftok, lane="linkedin", owner_ip=FRIEND_IP) is None
+        assert b.lease(conn, fwid, ftok, lane="linkedin", owner_ip=OWNER_IP) is None
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM linkedin_queue LIMIT 1")
+            assert cur.fetchone()["status"] == "queued"  # never leased by the friend
+
+
+def test_write_result_routes_linkedin_to_linkedin_queue(fleet_db):
+    # A LinkedIn result must close the linkedin_queue row + advance account:linkedin,
+    # NOT silently no-op against apply_queue (which would leave the lease open ->
+    # double-apply, and leave the account cap inert).
+    b = Broker(owner_ip=OWNER_IP)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_linkedin(conn)
+        owid, otok = b.enroll_worker(
+            conn, "owner", capabilities={"can_linkedin": True}, public_ip=OWNER_IP
+        )
+        job = b.lease(conn, owid, otok, lane="linkedin")
+        assert job is not None
+        assert b.write_result(conn, owid, otok, lane="linkedin", url=job["url"], status="applied") is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM linkedin_queue WHERE url=%s", (job["url"],))
+            assert cur.fetchone()["status"] == "applied"  # closed in linkedin_queue
+            cur.execute("SELECT success_24h FROM rate_governor WHERE scope_key='account:linkedin'")
+            assert cur.fetchone()["success_24h"] == 1  # account governor advanced
+        # lease-owner guarded: a worker that doesn't hold the lease cannot close it
+        assert queue.write_linkedin_result(conn, "intruder-worker", job["url"], status="applied") is False
+
+
 # ---------------------------------------------------------------------------
 # Answer bank: single answer, defer-on-unknown, never bulk
 # ---------------------------------------------------------------------------

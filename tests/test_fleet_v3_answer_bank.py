@@ -40,6 +40,26 @@ def test_normalize_handles_none_and_blank():
     assert answer_bank.normalize_question("   ") == ""
 
 
+def test_normalize_keeps_technical_tokens_distinct():
+    # The old `[^\w\s]+ -> space` strip collapsed these to one key ("how many
+    # years of c"), so a vetted C++ answer was served for C# and C. They must
+    # be PAIRWISE different.
+    cpp = answer_bank.normalize_question("How many years of C++?")
+    csharp = answer_bank.normalize_question("How many years of C#?")
+    c = answer_bank.normalize_question("How many years of C?")
+    assert cpp != csharp
+    assert cpp != c
+    assert csharp != c
+
+
+def test_normalize_keeps_trailing_plus_qualifier_distinct():
+    # "18+" means "18 or more" -- not the same question as "18".
+    assert (
+        answer_bank.normalize_question("Are you 18+?")
+        != answer_bank.normalize_question("Are you 18?")
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_answer: fail-safe on unknown
 # ---------------------------------------------------------------------------
@@ -95,6 +115,16 @@ def test_set_then_get_returns_known(fleet_db):
             row = cur.fetchone()
         assert row["status"] == "known"
         assert row["kind"] == "work_auth"
+
+
+def test_technical_token_answers_do_not_cross_contaminate(fleet_db):
+    # The real fail-safe: a vetted C++ answer must NOT be served for a different
+    # question (C#). Before the fix both normalized to "how many years of c",
+    # so get_answer(C#) would have returned the C++ answer "9".
+    with pgqueue.connect(fleet_db) as conn:
+        answer_bank.set_answer(conn, "How many years of C++?", "9")
+        assert answer_bank.get_answer(conn, "How many years of C#?") is None
+        assert answer_bank.get_answer(conn, "How many years of C++?") == "9"
 
 
 def test_set_answer_promotes_a_deferred_unknown(fleet_db):

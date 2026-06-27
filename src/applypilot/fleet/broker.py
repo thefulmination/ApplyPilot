@@ -174,10 +174,14 @@ class Broker:
         """Authenticate, gate on capability, then route to the right queue lease.
 
         ``lane`` in {``ats``/``apply``, ``compute``, ``search``/``discover``,
-        ``linkedin``}. The LinkedIn lane is special-cased (R1): it is leased with
-        the worker's REGISTERED ``public_ip`` and the fleet ``owner_ip`` so
-        ``queue.lease_linkedin`` refuses any non-owner IP -- a friend on a
-        different egress IP physically cannot lease it.
+        ``linkedin``}.
+
+        SECURITY: ``home_ip`` and ``owner_ip`` are IGNORED for the gate. The
+        breaker home-IP and the LinkedIn owner-IP are taken from SERVER-SIDE state
+        -- the worker's registered ``public_ip`` and the broker's configured
+        ``owner_ip`` -- never from the (untrusted) caller. The params are accepted
+        only for call-site compatibility; a worker can NOT supply its own IP to
+        satisfy the LinkedIn mutex or to retarget its rate-breaker.
         """
         worker = self._require(conn, worker_id, token)
         cap_flag = _LANE_CAPABILITY.get(lane)
@@ -186,23 +190,18 @@ class Broker:
         if not self._capabilities(worker).get(cap_flag):
             raise CapabilityError(f"worker {worker_id} lacks capability {cap_flag} for lane {lane}")
 
+        reg_ip = worker.get("public_ip")  # registered egress -- the ONLY IP we trust
+        kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
         if lane in ("ats", "apply"):
-            kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
-            return queue.lease_apply(conn, worker_id, home_ip=home_ip, **kw)
+            return queue.lease_apply(conn, worker_id, home_ip=reg_ip, **kw)
         if lane == "compute":
-            kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
             return queue.lease_compute(conn, worker_id, **kw)
         if lane in ("search", "discover"):
-            kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
             return queue.lease_search(conn, worker_id, **kw)
         if lane == "linkedin":
-            # Owner-IP mutex: the worker's REGISTERED public_ip vs. the fleet owner IP.
-            public_ip = worker.get("public_ip")
-            eff_owner_ip = owner_ip if owner_ip is not None else self.owner_ip
-            kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
-            return queue.lease_linkedin(
-                conn, worker_id, public_ip=public_ip, owner_ip=eff_owner_ip, **kw
-            )
+            # R1 mutex: the worker's REGISTERED public_ip vs the broker-configured
+            # owner_ip -- both server-side. queue.lease_linkedin refuses a mismatch.
+            return queue.lease_linkedin(conn, worker_id, public_ip=reg_ip, owner_ip=self.owner_ip, **kw)
         raise ValueError(f"unknown lane: {lane!r}")  # pragma: no cover
 
     # -- result writes (route by lane) ---------------------------------------
@@ -230,13 +229,34 @@ class Broker:
         tokens_out: int | None = None,
     ) -> bool:
         """Authenticate then forward to the lease-owner-guarded result writer for
-        the lane (apply/compute). The underlying writers reject a non-holder."""
+        the lane (apply / linkedin / compute). The underlying writers reject a
+        non-holder. The LinkedIn lane closes the SEPARATE linkedin_queue (and the
+        account:linkedin governor), never apply_queue."""
         worker = self._require(conn, worker_id, token)
-        if lane in ("ats", "apply", "linkedin"):
+        if lane in ("ats", "apply"):
+            # Bind the breaker keys (host, home_ip) to what was recorded on the leased
+            # row at lease time, NOT to client-supplied values -- otherwise a worker
+            # could report outcomes under a different host/IP to dodge its breaker.
+            eff_host, eff_home = target_host, home_ip
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(target_host, apply_domain) AS th, worker_home_ip "
+                    "FROM apply_queue WHERE url=%s AND lease_owner=%s",
+                    (url, worker_id),
+                )
+                r = cur.fetchone()
+            if r:
+                eff_host = r["th"] or target_host
+                eff_home = r["worker_home_ip"] if r["worker_home_ip"] is not None else worker.get("public_ip")
             return queue.write_apply_result(
-                conn, worker_id, url, status=status, target_host=target_host,
-                home_ip=home_ip, apply_status=apply_status, apply_error=apply_error,
+                conn, worker_id, url, status=status, target_host=eff_host,
+                home_ip=eff_home, apply_status=apply_status, apply_error=apply_error,
                 est_cost_usd=est_cost_usd, outcome=outcome,
+            )
+        if lane == "linkedin":
+            return queue.write_linkedin_result(
+                conn, worker_id, url, status=status, apply_status=apply_status,
+                apply_error=apply_error, est_cost_usd=est_cost_usd, outcome=outcome,
             )
         if lane == "compute":
             return queue.write_compute_result(
@@ -429,9 +449,12 @@ def build_app(*, owner_ip: str | None = None, dsn: str | None = None):
     def _lease(body: dict = Body(...), authorization: str | None = Header(None)):
         token = _token(authorization)
         with _conn() as conn:
+            # NB: home_ip / owner_ip are deliberately NOT forwarded from the client.
+            # The broker derives the breaker IP + LinkedIn owner IP from server-side
+            # state, so a caller cannot supply its own IP to satisfy the gate.
             return {"job": _guard(
                 broker.lease, conn, body["worker_id"], token,
-                lane=body["lane"], home_ip=body.get("home_ip"), owner_ip=body.get("owner_ip"),
+                lane=body["lane"], ttl_seconds=body.get("ttl_seconds"),
             )}
 
     @app.post("/write_result")

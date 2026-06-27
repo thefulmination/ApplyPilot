@@ -33,9 +33,9 @@ def home_ip_scope(ip: str) -> str:
 def ensure_scope(conn, scope_key, *, daily_cap=1_000_000, min_gap_seconds=90, commit=True) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds) "
-            "VALUES (%s,%s,%s) ON CONFLICT (scope_key) DO NOTHING",
-            (scope_key, daily_cap, min_gap_seconds),
+            "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
+            "VALUES (%s,%s,%s,%s) ON CONFLICT (scope_key) DO NOTHING",
+            (scope_key, daily_cap, min_gap_seconds, min_gap_seconds),
         )
     if commit:
         conn.commit()
@@ -90,8 +90,13 @@ def evaluate_breakers(
             continue
         with conn.cursor() as cur:
             if new == "throttled":
+                # Widen the gap from the PRISTINE base (not the current value) so
+                # repeated throttle->recover->throttle cycles can't compound it
+                # (3x, 9x, 27x...). base is captured once, on the first throttle.
                 cur.execute(
-                    "UPDATE rate_governor SET breaker_state='throttled', min_gap_seconds = min_gap_seconds * %s, "
+                    "UPDATE rate_governor SET breaker_state='throttled', "
+                    "base_min_gap_seconds = COALESCE(base_min_gap_seconds, min_gap_seconds), "
+                    "min_gap_seconds = COALESCE(base_min_gap_seconds, min_gap_seconds) * %s, "
                     "breaker_until = now() + make_interval(secs => %s), updated_at = now() WHERE scope_key = %s",
                     (throttle_gap_multiplier, cool_seconds, r["scope_key"]),
                 )
@@ -106,9 +111,10 @@ def evaluate_breakers(
                     "UPDATE rate_governor SET breaker_state='demoted', updated_at = now() WHERE scope_key = %s",
                     (r["scope_key"],),
                 )
-            else:  # ok
+            else:  # ok -- restore the pristine min-gap
                 cur.execute(
-                    "UPDATE rate_governor SET breaker_state='ok', breaker_until = NULL, updated_at = now() WHERE scope_key = %s",
+                    "UPDATE rate_governor SET breaker_state='ok', breaker_until = NULL, "
+                    "min_gap_seconds = COALESCE(base_min_gap_seconds, min_gap_seconds), updated_at = now() WHERE scope_key = %s",
                     (r["scope_key"],),
                 )
         changed.append((r["scope_key"], new))
@@ -122,7 +128,8 @@ def clear_expired_breakers(conn, *, commit=True):
     (Demoted scopes are sticky -- they require an explicit reset / re-promotion.)"""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE rate_governor SET breaker_state='ok', breaker_until = NULL, updated_at = now() "
+            "UPDATE rate_governor SET breaker_state='ok', breaker_until = NULL, "
+            "min_gap_seconds = COALESCE(base_min_gap_seconds, min_gap_seconds), updated_at = now() "
             "WHERE breaker_state IN ('throttled','paused') AND breaker_until IS NOT NULL AND breaker_until < now() "
             "RETURNING scope_key"
         )

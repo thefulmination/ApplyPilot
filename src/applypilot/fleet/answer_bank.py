@@ -25,13 +25,40 @@ from typing import Any, Mapping
 _PUNCT = re.compile(r"[^\w\s]+", re.UNICODE)  # drop punctuation, keep word chars + space
 _WS = re.compile(r"\s+")
 
+# Meaningful technical tokens whose distinguishing punctuation would otherwise be
+# erased by the ``[^\w\s]+`` strip (collapsing genuinely different questions to one
+# key). Canonicalize them to word-safe sentinels FIRST so they survive normalization.
+# Order matters: longer / more-specific keys precede shorter ones (".net" before the
+# bare letters, "c++" before "c#", "node.js" before a hypothetical "node").
+_TECH_SENTINELS: tuple[tuple[str, str], ...] = (
+    ("c++", " cplusplus "),
+    ("c#", " csharp "),
+    ("f#", " fsharp "),
+    ("node.js", " nodejs "),
+    ("node js", " nodejs "),
+    (".net", " dotnet "),
+)
+
+# A trailing '+' qualifier on a number ("18+", "5+ years") is meaningful: it means
+# "or more", which is NOT the same question as the bare number. Preserve it as
+# ``<n>plus`` so it survives the punctuation strip and stays distinct from ``<n>``.
+_NUM_PLUS = re.compile(r"(?<!\w)(\d+)\+")
+
 
 def normalize_question(q: str | None) -> str:
     """Canonical key for a screening question: lowercase, strip punctuation,
-    collapse whitespace. ``None``/blank -> ``""``."""
+    collapse whitespace. ``None``/blank -> ``""``.
+
+    Before stripping punctuation, meaningful technical tokens (``c++``, ``c#``,
+    ``f#``, ``.net``, ``node.js``) and a trailing-``+`` numeric qualifier
+    (``18+`` -> ``18plus``) are canonicalized to word-safe sentinels so they are
+    NOT collapsed onto a different question by the punctuation strip."""
     if not q:
         return ""
     s = q.strip().lower()
+    for token, sentinel in _TECH_SENTINELS:
+        s = s.replace(token, sentinel)
+    s = _NUM_PLUS.sub(r"\1plus", s)
     s = _PUNCT.sub(" ", s)        # underscores survive (\w), other punctuation -> space
     return _WS.sub(" ", s).strip()
 

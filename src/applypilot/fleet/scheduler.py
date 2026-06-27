@@ -35,21 +35,27 @@ def task_id_for(query: str, board: str, location: str | None) -> str:
 # ---------------------------------------------------------------------------
 # Config expansion -- the cartesian product UPSERT (RF3).
 # ---------------------------------------------------------------------------
-# On a 'queued' row we refresh the declarative fields (cadence/params/enabled/
-# query/board/location). We deliberately leave next_due_at alone so a re-expand
-# never pulls the recurrence clock forward. The WHERE status='queued' guard means
-# a 'leased' row is invisible to the UPDATE branch -- its lease + next_due_at are
-# untouched. A brand-new row is claimable immediately (next_due_at default now()).
+# On a 'queued' row we refresh the declarative fields (cadence/params/query/board/
+# location). We deliberately leave next_due_at alone so a re-expand never pulls the
+# recurrence clock forward. ``enabled`` is OPERATOR-OWNED: a re-expand must NOT
+# clobber a manual set_task_enabled(). The config only sets ``enabled`` when the
+# entry EXPLICITLY provides the key (EXCLUDED.enabled is non-NULL); otherwise
+# COALESCE preserves the existing row value -- so a manually-disabled task stays
+# disabled across "edit searches.yaml and re-expand". On INSERT, EXCLUDED.enabled
+# is itself COALESCEd to TRUE (the default) when the config omits the key.
+# The WHERE status='queued' guard means a 'leased' row is invisible to the UPDATE
+# branch -- its lease + next_due_at are untouched. A brand-new row is claimable
+# immediately (next_due_at default now()).
 _UPSERT_TASK = """
 INSERT INTO search_tasks (task_id, query, board, location, params, cadence_seconds, enabled)
-VALUES (%(task_id)s, %(query)s, %(board)s, %(location)s, %(params)s, %(cadence)s, %(enabled)s)
+VALUES (%(task_id)s, %(query)s, %(board)s, %(location)s, %(params)s, %(cadence)s, COALESCE(%(enabled)s, TRUE))
 ON CONFLICT (task_id) DO UPDATE SET
     query           = EXCLUDED.query,
     board           = EXCLUDED.board,
     location        = EXCLUDED.location,
     params          = EXCLUDED.params,
     cadence_seconds = EXCLUDED.cadence_seconds,
-    enabled         = EXCLUDED.enabled,
+    enabled         = COALESCE(%(enabled)s, search_tasks.enabled),
     updated_at      = now()
 WHERE search_tasks.status = 'queued';
 """
@@ -96,7 +102,11 @@ def expand_search_config(conn, config: dict[str, Any], *, default_cadence: int =
                 cadence = int(default_cadence)
             params = s.get("params")
             params_json = json.dumps(params) if params is not None else None
-            enabled = bool(s.get("enabled", True))
+            # ``enabled`` is operator-owned: pass an explicit bool ONLY when the
+            # config entry sets the key, else None so the UPSERT preserves the
+            # existing row's value (and defaults to TRUE on a fresh INSERT). This
+            # stops a re-expand from resurrecting a manually-disabled task.
+            enabled = bool(s["enabled"]) if "enabled" in s else None
             for board in boards:
                 for location in locations:
                     cur.execute(_UPSERT_TASK, {

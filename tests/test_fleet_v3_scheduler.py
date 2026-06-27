@@ -148,6 +148,31 @@ def test_disable_removes_from_lease_eligibility(fleet_db):
 
 
 # ---------------------------------------------------------------------------
+# Re-expand must NOT resurrect a manually-disabled task (enabled is operator-owned).
+# ---------------------------------------------------------------------------
+def test_reexpand_preserves_manual_disable(fleet_db):
+    config = {"searches": [{"query": "chief of staff", "boards": ["linkedin"],
+                            "locations": ["Remote"], "cadence_hours": 6}]}
+    with pgqueue.connect(fleet_db) as conn:
+        scheduler.expand_search_config(conn, config)
+        tid = scheduler.task_id_for("chief of staff", "linkedin", "Remote")
+
+        # Operator manually disables the task (YAML omits an `enabled` key).
+        assert scheduler.set_task_enabled(conn, tid, False) is True
+        assert _row(conn, tid)["enabled"] is False
+        assert queue.lease_search(conn, "worker-A") is None  # excluded from lease
+
+        # The documented "edit searches.yaml and re-expand" workflow re-runs with
+        # the SAME config (which never carries an `enabled` key).
+        scheduler.expand_search_config(conn, config)
+
+        # The manual disable must survive the re-expand...
+        assert _row(conn, tid)["enabled"] is False
+        # ...and the task must STILL be out of lease eligibility.
+        assert queue.lease_search(conn, "worker-A") is None
+
+
+# ---------------------------------------------------------------------------
 # coverage_view returns one row per task with the dashboard fields.
 # ---------------------------------------------------------------------------
 def test_coverage_view_returns_rows(fleet_db):

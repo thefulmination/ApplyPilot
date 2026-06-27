@@ -27,9 +27,9 @@ WITH home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHER
        LEFT JOIN glob ON TRUE
        WHERE q.status = 'queued' AND q.lane = 'ats' AND q.approved_batch IS NOT NULL
          AND (glob.count_24h IS NULL OR glob.count_24h < glob.daily_cap)
-         AND COALESCE(home.breaker_state, 'ok') = 'ok'
+         AND COALESCE(home.breaker_state, 'ok') NOT IN ('paused','demoted')
          AND (home.count_24h IS NULL OR home.count_24h < home.daily_cap)
-         AND COALESCE(g.breaker_state, 'ok') = 'ok'
+         AND COALESCE(g.breaker_state, 'ok') NOT IN ('paused','demoted')
          AND COALESCE(g.count_24h, 0) < COALESCE(g.daily_cap, 2000000000)
          AND (g.last_applied_at IS NULL
               OR g.last_applied_at < now() - make_interval(secs => COALESCE(g.min_gap_seconds, 90) * (0.7 + random()*0.7)))
@@ -65,11 +65,13 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
     so the posting can never be applied to again. One transaction.
 
     ``outcome`` in {'success','captcha','block'}; derived from ``status`` if None.
+    A generic page/form failure derives to None and records NO challenge outcome,
+    so it cannot pollute the captcha_24h leading indicator that drives the breaker.
     Returns False if the lease was lost (already reclaimed/closed)."""
     if outcome is None:
-        outcome = {"applied": "success", "blocked": "block"}.get(status, "captcha")
+        # Only true terminal classes map to a governor outcome; unknown -> None.
+        outcome = {"applied": "success", "blocked": "block", "captcha": "captcha"}.get(status)
     scopes = [governor.GLOBAL, governor.host_scope(target_host), governor.home_ip_scope(home_ip)]
-    col = governor._OUTCOME_COL[outcome]
     extra = ", count_24h = count_24h + 1, last_applied_at = now()" if status == "applied" else ""
     with conn.cursor() as cur:
         cur.execute(
@@ -81,10 +83,15 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         if cur.rowcount == 0:
             conn.rollback()
             return False
-        for sk in scopes:
-            cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
-            cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at = now() WHERE scope_key = %s", (sk,))
-        if status == "applied":
+        if outcome is not None:
+            col = governor._OUTCOME_COL[outcome]
+            for sk in scopes:
+                cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
+                cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at = now() WHERE scope_key = %s", (sk,))
+        # A confirmed apply OR a possibly-submitted crash both enter applied_set, so the
+        # cross-board dedup guard at lease time covers a posting that may already carry
+        # the user's name -- never re-apply (and never re-push, see fleet.sync).
+        if status in ("applied", "crash_unconfirmed"):
             cur.execute(
                 "INSERT INTO applied_set (dedup_key, company, applied_url) "
                 "SELECT dedup_key, company, application_url FROM apply_queue WHERE url=%s AND dedup_key IS NOT NULL "
@@ -129,6 +136,56 @@ def approve_jobs(conn, urls, batch, *, commit=True) -> int:
     if commit:
         conn.commit()
     return n
+
+
+def park_challenge(conn, worker_id, url, *, commit=True) -> bool:
+    """Freeze a leased apply row OUT of the reclaim pool while a human resolves an
+    auth wall (R3 fail-safe). Keep status='leased' (so ``lease_apply`` -- which only
+    picks status='queued' -- never re-picks it), but push ``lease_expires_at`` far
+    out so ``apply.pgqueue.reclaim_stale_leases`` (status='leased' AND
+    lease_expires_at < now()) never resets it and re-drives the SAME wall, blind,
+    on another machine -- which is exactly how a residential IP gets burned. Mark
+    the row challenge_pending for the owner queue. Lease-owner guarded; returns
+    False if the lease is no longer held."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE apply_queue SET lease_expires_at = now() + interval '3650 days', "
+            "apply_status='challenge_pending', apply_error=COALESCE(apply_error,'challenge_pending'), updated_at=now() "
+            "WHERE url=%s AND lease_owner=%s AND status='leased'",
+            (url, worker_id),
+        )
+        ok = cur.rowcount > 0
+    if commit:
+        conn.commit()
+    return ok
+
+
+def resolve_challenge(conn, url, *, requeue=True, commit=True) -> bool:
+    """Owner-side release of a parked challenge (after the owner solves the wall on
+    the trusted box, or gives up). ``requeue`` -> back to the pool for a retry from
+    the owner machine; otherwise close it 'blocked'. Also resolves the open
+    auth_challenge row(s). Returns True if a parked row was found."""
+    with conn.cursor() as cur:
+        if requeue:
+            cur.execute(
+                "UPDATE apply_queue SET status='queued', lease_owner=NULL, lease_expires_at=NULL, "
+                "apply_status=NULL, apply_error=NULL, updated_at=now() "
+                "WHERE url=%s AND apply_status='challenge_pending'",
+                (url,),
+            )
+        else:
+            cur.execute(
+                "UPDATE apply_queue SET status='blocked', lease_owner=NULL, lease_expires_at=NULL, "
+                "apply_status='challenge_skipped', updated_at=now() "
+                "WHERE url=%s AND apply_status='challenge_pending'",
+                (url,),
+            )
+        n = cur.rowcount
+        cur.execute("UPDATE auth_challenge SET resolved_at=now(), outcome=%s WHERE url=%s AND resolved_at IS NULL",
+                    ("solved" if requeue else "skipped", url))
+    if commit:
+        conn.commit()
+    return n > 0
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +278,7 @@ WITH next AS (
   SELECT s.task_id FROM search_tasks s
   LEFT JOIN rate_governor g ON g.scope_key = 'board:' || s.board
   WHERE s.status='queued' AND s.enabled AND s.next_due_at <= now()
-    AND COALESCE(g.breaker_state, 'ok') = 'ok'
+    AND COALESCE(g.breaker_state, 'ok') NOT IN ('paused','demoted')
     AND COALESCE(g.count_24h, 0) < COALESCE(g.daily_cap, 2000000000)
     AND (g.last_applied_at IS NULL
          OR g.last_applied_at < now() - make_interval(secs => COALESCE(g.min_gap_seconds, 90) * (0.7 + random()*0.7)))
@@ -268,18 +325,34 @@ def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, err
 
 # ---------------------------------------------------------------------------
 # LINKEDIN lease -- single-account mutex, owner-IP only (R1).
+#
+# A LinkedIn ban is the one catastrophe, so this lane is the strictest. The mutex
+# is enforced at CLAIM time, not apply time: the lease locks the account:linkedin
+# governor row (FOR UPDATE) so concurrent owner-IP machines serialize, and RESERVES
+# the cap + min-gap right there (count_24h++ , last_applied_at=now()). Two coordinated
+# machines therefore can NEVER hold two live sessions: the second blocks on the row
+# lock, re-reads the just-stamped last_applied_at, fails the min-gap, and gets nothing.
+# (Reserving at claim is deliberately conservative -- a crashed lease over-counts
+# rather than risking a second concurrent session.)
 # ---------------------------------------------------------------------------
 _LEASE_LINKEDIN = """
-WITH acct AS (SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state
-              FROM rate_governor WHERE scope_key = 'account:linkedin'),
-     next AS (
-       SELECT q.url FROM linkedin_queue q LEFT JOIN acct a ON TRUE
-       WHERE q.status='queued' AND q.approved_batch IS NOT NULL
-         AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
-         AND COALESCE(a.breaker_state, 'ok') = 'ok'
-         AND (a.last_applied_at IS NULL OR a.last_applied_at < now() - make_interval(secs => COALESCE(a.min_gap_seconds, 300)))
-       ORDER BY q.score DESC, q.url LIMIT 1 FOR UPDATE OF q SKIP LOCKED
-     )
+WITH acct AS (
+  SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state
+  FROM rate_governor WHERE scope_key = 'account:linkedin' FOR UPDATE
+),
+next AS (
+  SELECT q.url FROM linkedin_queue q LEFT JOIN acct a ON TRUE
+  WHERE q.status='queued' AND q.approved_batch IS NOT NULL
+    AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
+    AND COALESCE(a.breaker_state, 'ok') NOT IN ('paused','demoted')
+    AND (a.last_applied_at IS NULL OR a.last_applied_at < now() - make_interval(secs => COALESCE(a.min_gap_seconds, 300)))
+  ORDER BY q.score DESC, q.url LIMIT 1 FOR UPDATE OF q SKIP LOCKED
+),
+reserve AS (
+  UPDATE rate_governor SET count_24h = count_24h + 1, last_applied_at = now(), updated_at = now()
+  WHERE scope_key = 'account:linkedin' AND EXISTS (SELECT 1 FROM next)
+  RETURNING 1
+)
 UPDATE linkedin_queue q SET status='leased', lease_owner=%(worker)s,
   lease_expires_at = now() + make_interval(secs => %(ttl)s), last_attempted_at=now(), attempts=q.attempts+1, updated_at=now()
 FROM next WHERE q.url = next.url
@@ -287,15 +360,63 @@ RETURNING q.url, q.company, q.title, q.application_url, q.score;
 """
 
 
-def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200):
-    """LinkedIn lease: ONLY from the one owner IP, serialized by the account mutex."""
-    if public_ip != owner_ip:
-        return None  # broker-level guard: LinkedIn never from a different IP
+def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
+                   daily_cap=20, min_gap_seconds=300):
+    """LinkedIn lease: ONLY from the one owner IP, serialized by the account mutex.
+
+    ``public_ip`` is the worker's REGISTERED egress IP and ``owner_ip`` is the
+    broker-trusted owner IP -- both supplied server-side by the broker, never by the
+    worker. They must match or the lease is refused outright."""
+    if public_ip is None or owner_ip is None or public_ip != owner_ip:
+        return None  # LinkedIn never from a different IP than the owner's
     with conn.cursor() as cur:
+        # Ensure the account governor row EXISTS so the FOR UPDATE mutex has a row to
+        # lock (otherwise concurrent leases wouldn't serialize). Preserves an existing cap.
+        cur.execute(
+            "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
+            "VALUES ('account:linkedin', %s, %s, %s) ON CONFLICT (scope_key) DO NOTHING",
+            (daily_cap, min_gap_seconds, min_gap_seconds),
+        )
         cur.execute(_LEASE_LINKEDIN, {"worker": worker_id, "ttl": ttl_seconds})
         row = cur.fetchone()
     conn.commit()
     return dict(row) if row else None
+
+
+def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, apply_error=None,
+                          est_cost_usd=0, outcome=None):
+    """Close a LinkedIn lease (lease-owner guarded) in linkedin_queue -- NOT apply_queue --
+    record the outcome on the account:linkedin governor, and UPSERT applied_set on a
+    confirmed/possibly-submitted terminal. The cap (count_24h) + min-gap were already
+    RESERVED at lease time, so this does NOT bump count_24h again. Returns False if the
+    lease was lost."""
+    if outcome is None:
+        outcome = {"applied": "success", "blocked": "block", "captcha": "captcha"}.get(status)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE linkedin_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
+            "WHERE url=%s AND lease_owner=%s",
+            (status, apply_status, apply_error, est_cost_usd, status, worker_id, url, worker_id),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False
+        if outcome is not None:
+            sk = governor.LINKEDIN_ACCOUNT
+            col = governor._OUTCOME_COL[outcome]
+            extra = ", last_applied_at = now()" if status == "applied" else ""  # refresh gap on a confirmed apply
+            cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
+            cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at=now() WHERE scope_key=%s", (sk,))
+        if status in ("applied", "crash_unconfirmed"):
+            cur.execute(
+                "INSERT INTO applied_set (dedup_key, company, applied_url) "
+                "SELECT dedup_key, company, application_url FROM linkedin_queue WHERE url=%s AND dedup_key IS NOT NULL "
+                "ON CONFLICT (dedup_key) DO NOTHING",
+                (url,),
+            )
+    conn.commit()
+    return True
 
 
 # ---------------------------------------------------------------------------

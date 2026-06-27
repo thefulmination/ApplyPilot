@@ -129,6 +129,10 @@ CREATE TABLE IF NOT EXISTS rate_governor (
     breaker_until   TIMESTAMPTZ,                          -- auto-recover time
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Pristine min-gap, so a 'throttled' breaker can widen the gap (base * multiplier)
+-- WITHOUT compounding across throttle->recover->throttle cycles, and restore it
+-- exactly on recovery. NULL is treated as "base == current min_gap_seconds".
+ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS base_min_gap_seconds INTEGER;
 
 -- ---------------------------------------------------------------------------
 -- llm_usage cost ledger (R14). The CAP lives in fleet_config; this is the spend log.
