@@ -90,6 +90,56 @@ def health_report() -> dict[str, Any]:
     return _with_conn(_build)
 
 
+def _iso(v: Any) -> Any:
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+def _recent_results(conn, limit: int) -> dict[str, Any]:
+    n = max(1, min(int(limit), 100))
+    rows: list[dict[str, Any]] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, status, updated_at, company, title, apply_error FROM apply_queue "
+            "WHERE status IN ('applied','failed','blocked','crash_unconfirmed') "
+            "ORDER BY updated_at DESC LIMIT %s", (n,))
+        for r in cur.fetchall():
+            rows.append({"lane": "apply", "url": r["url"], "status": r["status"],
+                         "finished_at": _iso(r["updated_at"]),
+                         "detail": {"company": r["company"], "title": r["title"],
+                                    "apply_error": r["apply_error"]}})
+        cur.execute(
+            "SELECT url, status, updated_at, task, est_cost_usd FROM compute_queue "
+            "WHERE status IN ('done','failed','quarantined') "
+            "ORDER BY updated_at DESC LIMIT %s", (n,))
+        for r in cur.fetchall():
+            rows.append({"lane": "compute", "url": r["url"], "status": r["status"],
+                         "finished_at": _iso(r["updated_at"]),
+                         "detail": {"task": r["task"], "cost": float(r["est_cost_usd"] or 0)}})
+    rows.sort(key=lambda x: x["finished_at"] or "", reverse=True)
+    return {"results": rows[:n]}
+
+
+@mcp.tool()
+def recent_results(limit: int = 20) -> dict[str, Any]:
+    """The most recent terminal fleet events (apply + compute) merged newest-first,
+    each row carrying a lane-specific structured detail dict. limit capped at 100."""
+    return _with_conn(lambda conn: _recent_results(conn, limit))
+
+
+def _challenges(conn) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, url, worker_id, machine_owner, kind, route, raised_at "
+                    "FROM auth_challenge WHERE resolved_at IS NULL ORDER BY raised_at DESC")
+        out = [{**r, "raised_at": _iso(r["raised_at"])} for r in cur.fetchall()]
+    return {"challenges": out}
+
+
+@mcp.tool()
+def challenges() -> dict[str, Any]:
+    """Open (unresolved) auth challenges — the captcha backlog detail."""
+    return _with_conn(_challenges)
+
+
 def main() -> int:  # pragma: no cover - stdio server loop, not unit-testable
     """Entry point: run the FastMCP server over stdio. No DB access here."""
     mcp.run()

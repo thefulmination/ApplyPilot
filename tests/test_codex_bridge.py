@@ -71,3 +71,48 @@ def test_health_report_returns_text(fleet_db, monkeypatch):
         _seed_caps(conn)
     out = codex_bridge.health_report()
     assert "report" in out and "NEEDS YOUR DECISION" in out["report"]
+
+
+def test_recent_results_merges_lanes_newest_first(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        # an apply terminal row (older) and a compute terminal row (newer)
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, company, title, apply_error, updated_at) "
+                    "VALUES ('a1','http://x','5','failed','Acme','COS','form_error', now() - interval '2 min')")
+        cur.execute("INSERT INTO compute_queue (url, task, status, est_cost_usd, updated_at) "
+                    "VALUES ('c1','score','done', 0.01, now())")
+        conn.commit()
+    out = codex_bridge.recent_results(limit=10)
+    rows = out["results"]
+    assert [r["lane"] for r in rows] == ["compute", "apply"]   # newest-first
+    apply_row = next(r for r in rows if r["lane"] == "apply")
+    assert apply_row["url"] == "a1" and apply_row["status"] == "failed"
+    assert apply_row["detail"]["apply_error"] == "form_error"
+    compute_row = next(r for r in rows if r["lane"] == "compute")
+    assert compute_row["detail"]["task"] == "score"
+
+
+def test_recent_results_caps_limit(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        for i in range(5):
+            cur.execute("INSERT INTO compute_queue (url, task, status, updated_at) "
+                        "VALUES (%s,'score','done', now())", (f"c{i}",))
+        conn.commit()
+    out = codex_bridge.recent_results(limit=3)
+    assert len(out["results"]) == 3
+
+
+def test_challenges_only_unresolved(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO auth_challenge (url, worker_id, kind, route) VALUES ('u1','w','captcha','offsite')")
+        cur.execute("INSERT INTO auth_challenge (url, worker_id, kind, route, resolved_at) "
+                    "VALUES ('u2','w','captcha','offsite', now())")
+        conn.commit()
+    out = codex_bridge.challenges()
+    urls = [c["url"] for c in out["challenges"]]
+    assert "u1" in urls and "u2" not in urls
