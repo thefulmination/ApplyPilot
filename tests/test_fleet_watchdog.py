@@ -124,3 +124,31 @@ def test_watchdog_never_restarts_itself(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM remote_commands WHERE worker_id='watchdog'")
         assert cur.fetchone()["n"] == 0
+
+
+def test_watchdog_pauses_on_total_cap_breach(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET cost_cap_total_usd=1.0, paused=FALSE WHERE id=1")
+            cur.execute("INSERT INTO llm_usage (cost_usd, ts) VALUES (2.50, now())")
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+    assert summary["paused_on_cap"] is True
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT paused FROM fleet_config WHERE id=1")
+        assert cur.fetchone()["paused"] is True
+
+
+def test_watchdog_does_not_pause_under_cap(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET cost_cap_total_usd=100.0, paused=FALSE WHERE id=1")
+            cur.execute("INSERT INTO llm_usage (cost_usd, ts) VALUES (2.50, now())")
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+    assert summary["paused_on_cap"] is False
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT paused FROM fleet_config WHERE id=1")
+        assert cur.fetchone()["paused"] is False

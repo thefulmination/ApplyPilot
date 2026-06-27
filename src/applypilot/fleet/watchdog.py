@@ -54,8 +54,48 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
 
     summary["stuck_handled"] = _handle_stuck(conn, cfg)
 
+    summary["paused_on_cap"] = _enforce_cap(conn)
+
     heartbeat.beat(conn, WATCHDOG_ID, role=WATCHDOG_ROLE, state="idle", spend_today_usd=0, commit=True)
     return summary
+
+
+def _total_cap_breached(conn) -> bool:
+    """True if a configured daily OR total cost cap is met/exceeded (mirrors
+    queue._cost_cap_exceeded). A 0/NULL cap means 'no cap'."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT cost_cap_daily_usd, cost_cap_total_usd FROM fleet_config WHERE id=1")
+        cfg_row = cur.fetchone()
+        if not cfg_row:
+            return False
+        daily = float(cfg_row["cost_cap_daily_usd"] or 0)
+        total = float(cfg_row["cost_cap_total_usd"] or 0)
+        if daily > 0:
+            cur.execute("SELECT COALESCE(SUM(cost_usd),0) AS s FROM llm_usage WHERE ts >= now() - interval '24 hours'")
+            if float(cur.fetchone()["s"]) >= daily:
+                return True
+        if total > 0:
+            cur.execute("SELECT COALESCE(SUM(cost_usd),0) AS s FROM llm_usage")
+            if float(cur.fetchone()["s"]) >= total:
+                return True
+    return False
+
+
+def _enforce_cap(conn) -> bool:
+    """If a cap is breached, set fleet_config.paused=true to make the halt explicit
+    (surfaced to dashboard/monitor; leasing already self-halts on the cap).
+
+    Return semantics: reflects WHETHER the cap IS breached, not whether this call
+    flipped the row. An already-paused fleet that is still over-cap returns True;
+    a fleet under-cap returns False. The UPDATE uses IS DISTINCT FROM TRUE so it's
+    a no-op if paused is already true, but the return value is still True because
+    the cap is still exceeded."""
+    breached = _total_cap_breached(conn)
+    if breached:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1 AND paused IS DISTINCT FROM TRUE")
+        conn.commit()
+    return breached
 
 
 def _handle_stuck(conn, cfg: WatchdogConfig) -> list[dict]:
