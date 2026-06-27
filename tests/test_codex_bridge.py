@@ -33,3 +33,41 @@ def test_with_conn_runs_fn_and_closes(fleet_db, monkeypatch):
     from applypilot.fleet import codex_bridge
     out = codex_bridge._with_conn(lambda conn: {"ok": True})
     assert out == {"ok": True}
+
+
+def _seed_caps(conn):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=FALSE, cost_cap_daily_usd=10, cost_cap_total_usd=100 WHERE id=1")
+        cur.execute("INSERT INTO llm_usage (cost_usd, ts) VALUES (3.0, now())")
+    conn.commit()
+
+
+def test_fleet_status_returns_snapshot(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    out = codex_bridge.fleet_status()
+    # dashboard_snapshot keys
+    for k in ("machines", "governor", "queue_depth", "captcha_backlog", "quarantine", "spend_today"):
+        assert k in out
+
+
+def test_caps_returns_caps_and_spend(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_caps(conn)
+    out = codex_bridge.caps()
+    assert out["paused"] is False
+    assert float(out["cost_cap_daily_usd"]) == 10.0
+    assert float(out["cost_cap_total_usd"]) == 100.0
+    assert float(out["spend_today"]) == 3.0
+    assert float(out["spend_total"]) == 3.0
+
+
+def test_health_report_returns_text(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_caps(conn)
+    out = codex_bridge.health_report()
+    assert "report" in out and "NEEDS YOUR DECISION" in out["report"]

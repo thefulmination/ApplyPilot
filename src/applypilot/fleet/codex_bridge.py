@@ -45,6 +45,51 @@ def _with_conn(fn: Callable[[Any], dict]) -> dict:
         conn.close()
 
 
+@mcp.tool()
+def fleet_status() -> dict[str, Any]:
+    """Fleet health rollup: machines, breaker states, queue depths, captcha backlog,
+    quarantine count, 24h spend."""
+    return _with_conn(lambda conn: heartbeat.dashboard_snapshot(conn))
+
+
+def _read_caps(conn) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT paused, cost_cap_daily_usd, cost_cap_total_usd FROM fleet_config WHERE id=1")
+        cfg = cur.fetchone() or {}
+        cur.execute("SELECT COALESCE(SUM(cost_usd),0) AS s FROM llm_usage WHERE ts >= now() - interval '24 hours'")
+        spend_today = float(cur.fetchone()["s"])
+        cur.execute("SELECT COALESCE(SUM(cost_usd),0) AS s FROM llm_usage")
+        spend_total = float(cur.fetchone()["s"])
+    return {
+        "paused": cfg.get("paused"),
+        "cost_cap_daily_usd": float(cfg.get("cost_cap_daily_usd") or 0),
+        "cost_cap_total_usd": float(cfg.get("cost_cap_total_usd") or 0),
+        "spend_today": spend_today,
+        "spend_total": spend_total,
+    }
+
+
+@mcp.tool()
+def caps() -> dict[str, Any]:
+    """Cost caps + spend: paused flag, daily/total caps, 24h spend, all-time spend."""
+    return _with_conn(_read_caps)
+
+
+@mcp.tool()
+def health_report() -> dict[str, Any]:
+    """The text health report (incl. a NEEDS YOUR DECISION anomaly section). The 24h
+    spend is compared against the DAILY cap (apples-to-apples)."""
+    def _build(conn):
+        snap = heartbeat.dashboard_snapshot(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT cost_cap_daily_usd FROM fleet_config WHERE id=1")
+            row = cur.fetchone()
+        daily = float((row or {}).get("cost_cap_daily_usd") or 0)
+        text = monitor.build_health_report(snap, captcha_threshold=0.4, cost_cap_total=daily)
+        return {"report": text}
+    return _with_conn(_build)
+
+
 def main() -> int:  # pragma: no cover - stdio server loop, not unit-testable
     """Entry point: run the FastMCP server over stdio. No DB access here."""
     mcp.run()
