@@ -151,7 +151,8 @@ def score_job(
     resume_text: str,
     job: dict,
     preference_profile: dict | None = None,
-    knowledge_graph_prompt: str | None = None
+    knowledge_graph_prompt: str | None = None,
+    provider: str | None = None
 ) -> dict:
     """Score a single job against the resume.
 
@@ -160,6 +161,7 @@ def score_job(
         job: Job dict with keys: title, site, location, full_description.
         preference_profile: Human preference calibration data.
         knowledge_graph_prompt: Factual knowledge graph prompt pack.
+        provider: Optional LLM provider override.
 
     Returns:
         {"score": int, "keywords": str, "reasoning": str}
@@ -194,7 +196,7 @@ def score_job(
     ]
 
     try:
-        client = get_client(stage="score")
+        client = get_client(stage="score", provider_override=provider)
         prompt_variant = os.getenv("SCORE_PROMPT_VARIANT")
         response = client.chat(messages, max_tokens=512, temperature=0.2, stage="score", prompt_variant=prompt_variant)
         parsed = _parse_score_response(response)
