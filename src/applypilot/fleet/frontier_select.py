@@ -17,6 +17,8 @@ WHERE f.url IS NULL
 
 def select_priority(conn, *, limit=200, floor=7.0, mode="backlog", hours=24, urls=None) -> list[dict]:
     frontier_db.ensure_frontier_schema(conn)
+    if mode == "urls" and not urls:
+        return []
     if mode == "urls":
         marks = ",".join("?" * len(urls or []))
         sql = _BASE + f" AND j.url IN ({marks}) ORDER BY cheap_score DESC LIMIT ?"

@@ -41,3 +41,11 @@ def test_score_via_codex_retries_then_raises_on_malformed(tmp_path):
 def test_score_via_codex_raises_on_nonzero_exit(tmp_path):
     with pytest.raises(clp.SubscriptionUnavailable):
         clp.score_via_codex("P", schema_path=str(tmp_path / "s.json"), _runner=_runner_writing({}, returncode=1))
+
+
+def test_score_via_codex_file_not_found_raises_clear_message(tmp_path):
+    """Finding #2: missing codex binary should give a named, actionable error message."""
+    def _missing(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory", "codex")
+    with pytest.raises(clp.SubscriptionUnavailable, match="codex CLI not found on PATH"):
+        clp.score_via_codex("P", schema_path=str(tmp_path / "s.json"), _runner=_missing)

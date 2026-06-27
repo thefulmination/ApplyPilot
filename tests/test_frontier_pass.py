@@ -44,3 +44,22 @@ def test_failover_to_metered_on_subscription_unavailable(monkeypatch, tmp_path):
     assert res["failed_over"] == 1 and res["by_subscription"] == 0
     row = c.execute("SELECT frontier_score, provider FROM frontier_scores WHERE url='u1'").fetchone()
     assert row["frontier_score"] == 6 and row["provider"] == "gpt-5.5"  # the metered model
+
+
+def test_metered_llm_error_writes_null_scores_and_not_in_disagreement_report(monkeypatch, tmp_path):
+    """Finding #1: an LLM error result must NOT manufacture a false disagreement."""
+    def boom(*a, **k): raise clp.SubscriptionUnavailable("limit")
+    monkeypatch.setattr(fp, "score_via_codex", boom)
+    # score_job returns an error payload (score=0, error set) — as a real LLM failure would
+    monkeypatch.setattr(fp, "score_job", lambda *a, **k: {"score": 0, "error": "LLM error: boom"})
+    c = _brain()
+    fp.run_frontier_pass(c, resume_text="R", schema_path=str(tmp_path / "s.json"),
+                         metered_provider="gpt-5.5", min_gap_seconds=0)
+    row = c.execute("SELECT frontier_score, agreement FROM frontier_scores WHERE url='u1'").fetchone()
+    assert row is not None, "attempt row should exist"
+    assert row["frontier_score"] is None, "errored score must be stored as NULL"
+    assert row["agreement"] is None, "errored agreement must be stored as NULL"
+    # NULL agreement self-excludes from disagreement_report (NULL < threshold is false in SQLite)
+    report = fdb.disagreement_report(c)
+    urls_in_report = [r["url"] for r in report]
+    assert "u1" not in urls_in_report, "errored job must not appear in disagreement report"

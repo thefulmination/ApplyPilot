@@ -40,12 +40,15 @@ def run_frontier_pass(conn, *, resume_text, preference_profile=None, kg_prompt=N
                 provider, by_subscription = "codex-subscription", by_subscription + 1
                 gov.record("ok")
             except SubscriptionUnavailable:
-                gov.record("limit")
+                gov.record("limit")  # deliberate: any subscription failure cools the window conservatively
                 result = None
         if result is None:  # failover / subscription off / governor deny
             result = score_job(resume_text, job, preference_profile, kg_prompt, provider=metered_provider)
             provider, failed_over = metered_provider, failed_over + 1
-        fscore = result.get("score")
+        # Treat any LLM error result as absent: NULL score+agreement so the job
+        # self-excludes from disagreement_report (NULL < 0.8 is false in SQLite)
+        # but still records the attempt so the selector skips it on the next run.
+        fscore = None if (result.get("error") or result.get("score") is None) else result.get("score")
         frontier_db.upsert_frontier_score(
             conn, url=j["url"], cheap_score=cheap, frontier_score=fscore, provider=provider,
             agreement=_agreement(fscore, cheap), reasoning=result.get("reasoning"),

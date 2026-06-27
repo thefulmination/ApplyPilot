@@ -25,6 +25,10 @@ def score_via_codex(prompt, *, schema_path, model=None, timeout_s=120, retries=2
             argv += ["--output-schema", schema_path, "-o", out, prompt]
             try:
                 proc = _runner(argv, capture_output=True, text=True, timeout=timeout_s)
+            except FileNotFoundError as e:  # codex not on PATH
+                raise SubscriptionUnavailable(
+                    "codex CLI not found on PATH -- is Codex installed/logged in? Falling back to metered."
+                ) from e
             except Exception as e:  # transport / timeout
                 raise SubscriptionUnavailable(f"codex exec failed: {e}") from e
             if getattr(proc, "returncode", 1) != 0:

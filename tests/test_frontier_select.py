@@ -10,6 +10,12 @@ def _brain():
     c.executescript(_DDL); fdb.ensure_frontier_schema(c); return c
 
 
+def test_urls_mode_empty_list_returns_empty():
+    """Finding #7: mode='urls' with empty urls must not build an IN () syntax error."""
+    c = _brain()
+    assert fs.select_priority(c, mode="urls", urls=[]) == []
+
+
 def test_backlog_orders_by_cheap_score_respects_floor_and_exclusions():
     c = _brain()
     c.executemany("INSERT INTO jobs (url, company, title, full_description, research_fit_score) VALUES (?,?,?,?,?)",
