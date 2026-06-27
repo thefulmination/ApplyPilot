@@ -91,7 +91,7 @@ These map directly to the hard constraints:
 - **The FastAPI broker surface is untested in this env** (fastapi isn't installed). The `Broker` class — where all the security logic lives — is fully tested; the thin HTTP wrapper is guarded and would need a TestClient run once fastapi is present.
 - **The owner-side Gmail OTP relay does not exist.** `request_otp` only records an audit row. The actual `gmail.readonly` read/match/return must be built on the trusted box.
 - **No Helper app, no dashboard UI, no canary harness.** `dashboard_snapshot` returns the data; nothing renders it yet.
-- **One MEDIUM test-gap left:** the answer-bank unknown-insert idempotency is correct (ON CONFLICT DO NOTHING) but only tested sequentially, not under a true two-connection race.
+- **Captcha coverage is good, not exhaustive.** The classifier now covers Cloudflare/Turnstile/hCaptcha/reCAPTCHA v2+v3 plus Arkose/FunCaptcha/GeeTest/PerimeterX/DataDome, and fails safe (a wall never reads as `clear`). A future hardening is a positive success-marker check (require a confirmation token before declaring `clear`), which needs per-ATS tuning and isn't wired yet.
 
 ---
 
@@ -103,8 +103,11 @@ These map directly to the hard constraints:
 e2ef53f  feat(fleet-v3): scheduler, health, answer-bank, sync, broker, worker+captcha (S1 breadth)
 5c8f6b0  fix(fleet-v3): adversarial-review wave 1 — R1/safety-critical defects
 c543092  fix(fleet-v3): adversarial-review wave 2 — correctness + safety hardening
-(this report + otp-docstring honesty fix)
+abac0f5  docs(fleet-v3): BUILD REPORT + otp-docstring honesty fix
+5ad982e  fix(fleet-v3): adversarial-review wave 3 — remaining correctness items
 ```
+
+**Test count: 110 passing** (89 at first green → +11 wave-1/2 regressions → +8 wave-3).
 
 ---
 
