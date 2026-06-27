@@ -93,6 +93,43 @@ def _preference_profile_prompt(preference_profile: dict | None) -> str:
     return text
 
 
+def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge_graph_prompt=None) -> str:
+    """The combined prompt text for a single-string backend (e.g. `codex exec`).
+    Same instructions + context as score_job, flattened to one prompt."""
+    job_text = (
+        f"TITLE: {job['title']}\n"
+        f"COMPANY: {job.get('site', '')}\n"
+        f"LOCATION: {job.get('location', 'N/A')}\n\n"
+        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+    )
+    parts = [SCORE_PROMPT, f"RESUME:\n{resume_text}"]
+    pref = _preference_profile_prompt(preference_profile)
+    if pref:
+        parts.append(pref)
+    if knowledge_graph_prompt:
+        parts.append(knowledge_graph_prompt)
+    parts.append(f"JOB POSTING:\n{job_text}")
+    return "\n\n---\n\n".join(parts)
+
+
+def load_score_context() -> dict:
+    """Resume / preference profile / KG prompt from the same sources run_scoring reads.
+    For the frontier pass + any standalone scorer caller."""
+    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    preference_profile = load_preference_profile()
+    kg_prompt = None
+    try:
+        if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
+            kg_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
+            if kg_prompt and len(kg_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
+                kg_prompt = kg_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
+            if not (kg_prompt or "").strip():
+                kg_prompt = None
+    except OSError:
+        kg_prompt = None
+    return {"resume_text": resume_text, "preference_profile": preference_profile, "kg_prompt": kg_prompt}
+
+
 def _parse_score_response(response: str) -> dict:
     """Parse the LLM's score response into structured data.
 
