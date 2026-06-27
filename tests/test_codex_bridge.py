@@ -150,3 +150,20 @@ def test_quarantine_job_one_shot(fleet_db, monkeypatch):
         cur.execute("SELECT quarantined_at, crash_count FROM poison_jobs WHERE url='jX'")
         row = cur.fetchone()
         assert row["quarantined_at"] is not None and row["crash_count"] == 0
+
+
+def test_registry_is_exactly_the_eight_tools():
+    from applypilot.fleet import codex_bridge
+    names = {t.name for t in codex_bridge.mcp._tool_manager.list_tools()}  # sync, no await
+    assert names == {
+        "fleet_status", "health_report", "recent_results", "challenges", "caps",
+        "restart_worker", "pause_scope", "quarantine_job",
+    }
+
+
+def test_no_denied_op_is_registered():
+    from applypilot.fleet import codex_bridge
+    names = {t.name for t in codex_bridge.mcp._tool_manager.list_tools()}
+    for denied in ("apply", "approve", "resolve_challenge", "set_cost_cap", "unpause",
+                   "resume_scope", "set_paused", "query", "execute", "sql"):
+        assert denied not in names
