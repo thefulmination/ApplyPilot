@@ -52,5 +52,34 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
         cool_seconds=cfg.breaker_cool_seconds,
     )
 
+    summary["stuck_handled"] = _handle_stuck(conn, cfg)
+
     heartbeat.beat(conn, WATCHDOG_ID, role=WATCHDOG_ROLE, state="idle", spend_today_usd=0, commit=True)
     return summary
+
+
+def _handle_stuck(conn, cfg: WatchdogConfig) -> list[dict]:
+    """Restart every stuck worker (and quarantine its job if it blew the job-max).
+    NEVER acts on the watchdog's own reserved id."""
+    out: list[dict] = []
+    stuck = heartbeat.detect_stuck(conn, heartbeat_timeout=cfg.heartbeat_timeout,
+                                   job_max_seconds=cfg.job_max_seconds)
+    for s in stuck:
+        wid = s["worker_id"]
+        if wid == WATCHDOG_ID:
+            continue
+        actions = ["restart"]
+        heartbeat.issue_command(conn, wid, "restart")
+        if s["reason"] == "job_over_max":
+            # the worker's current job has been running too long -> quarantine it so a
+            # restart doesn't immediately re-lease the same poison job.
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_job FROM worker_heartbeat WHERE worker_id=%s", (wid,))
+                row = cur.fetchone()
+            job = row["current_job"] if row else None
+            if job:
+                if heartbeat.quarantine_job(conn, job, worker=wid, reason="job_over_max",
+                                            threshold=cfg.quarantine_threshold):
+                    actions.append("quarantine")
+        out.append({"worker_id": wid, "reason": s["reason"], "action": actions})
+    return out

@@ -86,3 +86,41 @@ def test_watchdog_tick_beats_own_liveness(fleet_db):
         cur.execute("SELECT role, state FROM worker_heartbeat WHERE worker_id='watchdog'")
         row = cur.fetchone()
     assert row is not None and row["role"] == "watchdog"
+
+
+def _seed_stuck_worker(conn, worker_id="wStuck", *, current_job=None, applying=False):
+    state = "applying" if applying else "idle"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO worker_heartbeat (worker_id, role, state, current_job, job_started_at, last_beat) "
+            "VALUES (%s,'apply',%s,%s, now() - interval '20 minutes', now() - interval '10 minutes')",
+            (worker_id, state, current_job))
+    conn.commit()
+
+
+def test_watchdog_restarts_stuck_worker(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_stuck_worker(conn, "wStuck")  # last_beat 10m ago > 90s timeout
+        summary = watchdog.watchdog_tick(conn, cfg)
+        entries = [e for e in summary["stuck_handled"] if e["worker_id"] == "wStuck"]
+        assert entries and "restart" in entries[0]["action"]
+        # a 'restart' command was actually enqueued
+        with conn.cursor() as cur:
+            cur.execute("SELECT command FROM remote_commands WHERE worker_id='wStuck'")
+            assert cur.fetchone()["command"] == "restart"
+
+
+def test_watchdog_never_restarts_itself(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        # give the watchdog a STALE heartbeat, then run a tick
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO worker_heartbeat (worker_id, role, state, last_beat) "
+                        "VALUES ('watchdog','watchdog','idle', now() - interval '10 minutes')")
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+    assert all(e["worker_id"] != "watchdog" for e in summary["stuck_handled"])
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM remote_commands WHERE worker_id='watchdog'")
+        assert cur.fetchone()["n"] == 0
