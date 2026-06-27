@@ -10,6 +10,7 @@ through _with_conn, which reads FLEET_PG_DSN itself and rolls back + closes per 
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime
 from typing import Any, Callable
@@ -20,6 +21,7 @@ from applypilot.apply.pgqueue import connect
 from applypilot.fleet import heartbeat, monitor
 
 mcp = FastMCP("applypilot-fleet")
+logger = logging.getLogger("applypilot.fleet.codex_bridge")
 
 
 def _with_conn(fn: Callable[[Any], dict]) -> dict:
@@ -144,6 +146,36 @@ def _challenges(conn) -> dict[str, Any]:
 def challenges() -> dict[str, Any]:
     """Open (unresolved) auth challenges — the captcha backlog detail."""
     return _with_conn(_challenges)
+
+
+@mcp.tool()
+def restart_worker(worker_id: str) -> dict[str, Any]:
+    """Enqueue a 'restart' command for a worker (conservative — only slows the fleet)."""
+    def _do(conn):
+        command_id = monitor.MonitorActions(conn).restart_worker(worker_id)
+        logger.info("bridge action: restart_worker worker_id=%s command_id=%s", worker_id, command_id)
+        return {"action": "restart", "worker_id": worker_id, "command_id": command_id}
+    return _with_conn(_do)
+
+
+@mcp.tool()
+def pause_scope(scope_key: str) -> dict[str, Any]:
+    """Pause a host/board scope. Does NOT unpause (resume is owner-only, absent here)."""
+    def _do(conn):
+        monitor.MonitorActions(conn).pause_scope(scope_key)
+        logger.info("bridge action: pause_scope scope_key=%s", scope_key)
+        return {"action": "pause", "scope_key": scope_key}
+    return _with_conn(_do)
+
+
+@mcp.tool()
+def quarantine_job(url: str, worker: str, reason: str) -> dict[str, Any]:
+    """Manually quarantine a job (one-shot: pulls it now, does not pollute crash_count)."""
+    def _do(conn):
+        newly = monitor.MonitorActions(conn).quarantine(url, worker=worker, reason=reason)
+        logger.info("bridge action: quarantine_job url=%s worker=%s newly=%s", url, worker, newly)
+        return {"action": "quarantine", "url": url, "newly_quarantined": newly}
+    return _with_conn(_do)
 
 
 def main() -> int:  # pragma: no cover - stdio server loop, not unit-testable

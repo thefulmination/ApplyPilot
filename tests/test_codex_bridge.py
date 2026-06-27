@@ -116,3 +116,37 @@ def test_challenges_only_unresolved(fleet_db, monkeypatch):
     out = codex_bridge.challenges()
     urls = [c["url"] for c in out["challenges"]]
     assert "u1" in urls and "u2" not in urls
+
+
+def test_restart_worker_enqueues_command(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    out = codex_bridge.restart_worker("wA")
+    assert out["action"] == "restart" and out["worker_id"] == "wA"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT command FROM remote_commands WHERE worker_id='wA'")
+        assert cur.fetchone()["command"] == "restart"
+
+
+def test_pause_scope_pauses(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO rate_governor (scope_key, min_gap_seconds) VALUES ('host:z.com',5)")
+        conn.commit()
+    out = codex_bridge.pause_scope("host:z.com")
+    assert out["action"] == "pause" and out["scope_key"] == "host:z.com"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT breaker_state FROM rate_governor WHERE scope_key='host:z.com'")
+        assert cur.fetchone()["breaker_state"] == "paused"
+
+
+def test_quarantine_job_one_shot(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    from applypilot.fleet import codex_bridge
+    out = codex_bridge.quarantine_job("jX", "wA", "owner-pulled")
+    assert out["action"] == "quarantine" and out["url"] == "jX" and out["newly_quarantined"] is True
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT quarantined_at, crash_count FROM poison_jobs WHERE url='jX'")
+        row = cur.fetchone()
+        assert row["quarantined_at"] is not None and row["crash_count"] == 0
