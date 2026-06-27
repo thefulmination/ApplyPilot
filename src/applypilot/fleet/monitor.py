@@ -35,3 +35,49 @@ class MonitorActions:
     def report(self, text: str) -> str:
         """Emit/return a report string (alert hook)."""
         return text
+
+
+def build_health_report(snapshot: dict, *, captcha_threshold: float = 0.4,
+                        cost_cap_total: float | None = None) -> str:
+    """Render a text health report from a dashboard_snapshot, with a 'NEEDS YOUR
+    DECISION' section listing anomalies the monitor will NOT auto-fix."""
+    lines: list[str] = []
+    anomalies: list[str] = []
+
+    lines.append("=== MACHINES ===")
+    for m in snapshot.get("machines", []):
+        beat = m.get("last_beat")
+        flag = "  <OFFLINE: no heartbeat>" if not beat else ""
+        lines.append(f"  {m.get('worker_id')} [{m.get('role')}] state={m.get('state')}{flag}")
+        if not beat:
+            anomalies.append(f"worker {m.get('worker_id')} offline (no heartbeat)")
+
+    lines.append("=== QUEUES ===")
+    for lane, depths in (snapshot.get("queue_depth") or {}).items():
+        lines.append(f"  {lane}: {dict(depths)}")
+
+    lines.append("=== GOVERNOR ===")
+    for g in snapshot.get("governor", []):
+        rate = float(g.get("challenge_rate") or 0)
+        flag = "  <HIGH CHALLENGE RATE>" if rate >= captcha_threshold else ""
+        lines.append(f"  {g.get('scope_key')} state={g.get('breaker_state')} "
+                     f"rate={rate:.2f} n={g.get('count_24h')}{flag}")
+        if rate >= captcha_threshold:
+            anomalies.append(f"scope {g.get('scope_key')} challenge_rate {rate:.2f} >= {captcha_threshold}")
+
+    lines.append(f"=== CAPTCHA BACKLOG ===\n  open challenges: {snapshot.get('captcha_backlog', 0)}; "
+                 f"quarantined jobs: {snapshot.get('quarantine', 0)}")
+
+    spend = float(snapshot.get("spend_today") or 0)
+    cap_str = f" / cap {cost_cap_total}" if cost_cap_total else ""
+    lines.append(f"=== SPEND ===\n  last 24h: ${spend:.2f}{cap_str}")
+    if cost_cap_total and cost_cap_total > 0 and spend >= 0.9 * cost_cap_total:
+        anomalies.append(f"spend ${spend:.2f} is within 90% of cap ${cost_cap_total:.2f}")
+
+    lines.append("=== NEEDS YOUR DECISION ===")
+    if anomalies:
+        lines.extend(f"  - {a}" for a in anomalies)
+    else:
+        lines.append("  none")
+
+    return "\n".join(lines)
