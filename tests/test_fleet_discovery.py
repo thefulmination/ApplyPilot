@@ -32,3 +32,24 @@ def test_push_discovered_stages_rows(fleet_db):
         assert [r["posting"]["job_url"] for r in rows] == ["u1", "u2"]
         assert rows[0]["task_id"] == "t1" and rows[0]["source_label"] == "chief of staff"
         assert rows[0]["synced_to_home_at"] is None
+
+
+def test_pull_discovered_ingests_and_marks_synced(fleet_db, monkeypatch):
+    import applypilot.fleet.sync as sync_mod
+    captured = {}
+    def fake_store(conn, df, source_label):
+        captured["urls"] = list(df["job_url"]); captured["label"] = source_label
+        return (len(df), 0)
+    monkeypatch.setattr(sync_mod, "store_jobspy_results", fake_store)
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_discovered(conn, task_id="t1", source_label="cos", worker_id="w1",
+                              postings=[{"job_url": "u1", "title": "COS"}, {"job_url": "u2", "title": "PM"}])
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync_mod.pull_discovered(sqlite_conn=object(), pg_conn=pg)  # brain conn unused by the stub
+    assert n == 2 and captured["urls"] == ["u1", "u2"] and captured["label"] == "cos"
+    with pgqueue.connect(fleet_db) as pg, pg.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM discovered_postings WHERE synced_to_home_at IS NULL")
+        assert cur.fetchone()["n"] == 0
+    # re-pull is a no-op
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync_mod.pull_discovered(sqlite_conn=object(), pg_conn=pg) == 0

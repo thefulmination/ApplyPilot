@@ -23,10 +23,13 @@ import sqlite3
 from typing import Any
 from urllib.parse import urlsplit
 
+import pandas as pd
+
 from applypilot import config
 from applypilot.apply import pgqueue
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import queue as _queue
+from applypilot.discovery.jobspy import store_jobspy_results
 
 
 # ===========================================================================
@@ -326,6 +329,48 @@ def _mark_compute_synced(pg_conn: Any, url: str) -> None:
     with pg_conn.cursor() as cur:
         cur.execute("UPDATE compute_queue SET synced_to_home_at = now() WHERE url = %s", (url,))
     pg_conn.commit()
+
+
+# ===========================================================================
+# DISCOVERY -- PULL
+# ===========================================================================
+
+
+def pull_discovered(*, sqlite_conn=None, pg_conn=None, batch=500) -> int:
+    """Ingest staged discovery postings into the shared brain via store_jobspy_results.
+    Group unsynced rows by source_label, rebuild a DataFrame per group, dedup-insert,
+    then mark synced. Idempotent: synced rows are skipped; store_jobspy_results dedups by url."""
+    own_sq, own_pg = sqlite_conn is None, pg_conn is None
+    sq = sqlite_conn or _home_conn()
+    pg = pg_conn or pgqueue.connect()
+    n = 0
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT id, source_label, posting FROM discovered_postings "
+                "WHERE synced_to_home_at IS NULL ORDER BY discovered_at LIMIT %s",
+                (batch,),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return 0
+        by_label: dict[str, list] = {}
+        ids: list[int] = []
+        for r in rows:
+            by_label.setdefault(r["source_label"] or "", []).append(r["posting"])
+            ids.append(r["id"])
+        for label, postings in by_label.items():
+            store_jobspy_results(sq, pd.DataFrame(postings), label)
+            n += len(postings)
+        with pg.cursor() as cur:
+            cur.execute("UPDATE discovered_postings SET synced_to_home_at = now() WHERE id = ANY(%s)", (ids,))
+        pg.commit()
+        return n
+    finally:
+        if own_sq:
+            sq.close()
+        if own_pg:
+            pg.close()
 
 
 # ===========================================================================
