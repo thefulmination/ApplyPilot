@@ -62,9 +62,15 @@ FastMCP infers each tool's JSON-Schema from the function's **type annotations**,
 #### 3.1.1 `recent_results` — normalized merge of two non-union-compatible tables
 
 `compute_queue` and `apply_queue` have different columns and different terminal-status enums, with no shared completion-timestamp column. So:
-- **apply_queue:** terminal statuses `('applied','failed','blocked','crash_unconfirmed')`; `ORDER BY updated_at DESC` (NOT `applied_at` — it is NULL for failed/blocked rows). Project `company`/`title`/`url`/`status`/`updated_at`.
-- **compute_queue:** terminal statuses `('done','failed','quarantined')`; `ORDER BY updated_at DESC`. Project `url`/`task`/`status`/`updated_at` (no company/title).
-- Each table is queried separately with `LIMIT min(limit,100)`, projected into a **normalized row** `{"lane": "apply"|"compute", "url": …, "status": …, "finished_at": <updated_at iso>, "detail": <company+title for apply / task for compute>}`, then merged and sorted by `finished_at` DESC in Python and sliced to `min(limit, 100)`.
+- **apply_queue:** terminal statuses `('applied','failed','blocked','crash_unconfirmed')`; `ORDER BY updated_at DESC` (NOT `applied_at` — it is NULL for failed/blocked rows). Select `url`/`status`/`updated_at` + the lane-detail columns `company`/`title`/`apply_error`.
+- **compute_queue:** terminal statuses `('done','failed','quarantined')`; `ORDER BY updated_at DESC`. Select `url`/`status`/`updated_at` + the lane-detail columns `task`/`est_cost_usd`.
+- Each table is queried separately with `LIMIT min(limit,100)`, projected into a **normalized row** with a **structured `detail` dict** (not a flattened string) so per-lane fidelity is preserved while the feed stays chronological:
+  ```
+  {"lane": "apply"|"compute", "url": …, "status": …, "finished_at": <updated_at iso>,
+   "detail": {"company": …, "title": …, "apply_error": …}   # apply lane
+           | {"task": …, "cost": <est_cost_usd>}}            # compute lane
+  ```
+  then merged and sorted by `finished_at` DESC in Python and sliced to `min(limit, 100)`. (The implementer confirms the exact `apply_queue`/`compute_queue` column names against the schema before SELECTing; a column absent on a table is simply omitted from that lane's `detail`.)
 
 ### 3.2 What is structurally absent (precise statement)
 
@@ -80,7 +86,7 @@ There is **no** generic `query`/`execute`/`sql` tool, and **no** tool that maps 
 
 The `fleet_db` fixture already truncates/reseeds every table the bridge reads (`compute_queue`, `apply_queue`, `auth_challenge`, `llm_usage`, `fleet_config`, `worker_heartbeat`, `rate_governor`, `poison_jobs`, `remote_commands`) — no new fixture work.
 
-- **Read tools:** seed PG, call each read tool's **module-level function** directly (the `@mcp.tool()` decorator returns it unchanged), assert structure/keys; `health_report()` surfaces a seeded anomaly; `recent_results` respects `min(limit,100)`, returns the normalized shape, and merges both lanes ordered by `finished_at`; `challenges()` returns only `resolved_at IS NULL` rows; `caps()` returns both daily/total caps + 24h and all-time spend.
+- **Read tools:** seed PG, call each read tool's **module-level function** directly (the `@mcp.tool()` decorator returns it unchanged), assert structure/keys; `health_report()` surfaces a seeded anomaly; `recent_results` respects `min(limit,100)`, returns the normalized row with a structured per-lane `detail` dict, and merges both lanes ordered by `finished_at`; `challenges()` returns only `resolved_at IS NULL` rows; `caps()` returns both daily/total caps + 24h and all-time spend.
 - **Action tools:** call each, assert the real DB effect (a `remote_commands` row; `breaker_state='paused'`; a `poison_jobs` strike), proving the `MonitorActions` delegation — including the kwarg-only `quarantine(url, worker=…, reason=…)` and that the result dict reports `newly_quarantined` honestly.
 - **Registry / safety (hard gate, sync — no pytest-asyncio):** `names = {t.name for t in mcp._tool_manager.list_tools()}`; assert `names == {fleet_status, health_report, recent_results, challenges, caps, restart_worker, pause_scope, quarantine_job}`. A second assertion confirms no denied-op name is registered.
 - **DSN discipline:** (a) importing the module with `FLEET_PG_DSN` unset does NOT raise (no DB at import/main); (b) a tool called with `FLEET_PG_DSN` unset returns `{"error": …}` and does NOT silently fall through to `DATABASE_URL`; (c) a tool called with an unreachable/closed DSN returns `{"error": …}`, not a raised exception.
@@ -118,6 +124,7 @@ Mitigations: **(v1, in scope)** (a) the manual one-shot quarantine above, so del
 - Framework/transport = official `mcp` SDK FastMCP over stdio; sync tools; connection-per-call. **Decided.**
 - Safety guarantee = the 8-name registry test is the hard gate; namespace-minimization is defense-in-depth. **Decided (corrected).**
 - Read tools enforce read-only via `_with_conn` rollback-on-finally; `dict_row` via `pgqueue.connect`. **Decided.**
+- `recent_results` = a single merged chronological feed (newest-first across both lanes), with a **structured per-lane `detail` dict** (not a flattened string) to keep fidelity. **Decided.**
 - `FLEET_PG_DSN` read directly (no `get_dsn` fallback). **Decided.**
 - Registry test uses the sync `_tool_manager` path (no async test infra). **Decided.**
 - Quarantine via the bridge is a **manual one-shot** that does not pollute `crash_count` (heartbeat `manual=` path); audit log + Codex per-call approval are the v1 guards. **Decided.**
