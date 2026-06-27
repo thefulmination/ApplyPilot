@@ -421,6 +421,26 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
 
 
 # ---------------------------------------------------------------------------
+# DISCOVERY staging -- lean workers push raw JobSpy postings here; home box ingests.
+# ---------------------------------------------------------------------------
+def push_discovered(conn, *, task_id, source_label, worker_id, postings, commit=True) -> int:
+    """Stage raw JobSpy postings (dicts) from a discovery worker into discovered_postings.
+    The home box later ingests them into the brain (sync.pull_discovered)."""
+    n = 0
+    with conn.cursor() as cur:
+        for p in postings:
+            cur.execute(
+                "INSERT INTO discovered_postings (task_id, source_label, posting, worker_id) "
+                "VALUES (%s,%s,%s,%s)",
+                (task_id, source_label, json.dumps(p, default=str), worker_id),
+            )
+            n += 1
+    if commit:
+        conn.commit()
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Reclaim (crash-safety) for the compute + search queues. (apply_queue reclaim
 # is provided by apply.pgqueue.reclaim_stale_leases.)
 # ---------------------------------------------------------------------------

@@ -70,6 +70,20 @@ CREATE INDEX IF NOT EXISTS idx_compute_reclaim ON compute_queue (lease_expires_a
 CREATE INDEX IF NOT EXISTS idx_compute_unsynced ON compute_queue (updated_at)
     WHERE status IN ('done','failed') AND synced_to_home_at IS NULL;
 
+-- discovered_postings: raw JobSpy postings staged by lean discovery workers (no local brain).
+-- The home box ingests these into the shared SQLite brain via store_jobspy_results (one write path).
+CREATE TABLE IF NOT EXISTS discovered_postings (
+    id                BIGSERIAL PRIMARY KEY,
+    task_id           TEXT,
+    source_label      TEXT,
+    posting           JSONB NOT NULL,
+    worker_id         TEXT,
+    discovered_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    synced_to_home_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_unsynced ON discovered_postings (discovered_at)
+    WHERE synced_to_home_at IS NULL;
+
 -- ---------------------------------------------------------------------------
 -- search_tasks: distributed, RECURRING discovery (R3-disc / RF3).
 -- One task = (query x board x location). Re-runs when next_due_at passes.
