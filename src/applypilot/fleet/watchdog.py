@@ -9,9 +9,12 @@ foundation's recovery primitives on a cadence so the fleet self-heals unattended
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import governor, heartbeat, queue
@@ -80,7 +83,7 @@ def run_watchdog(conn_factory, cfg: WatchdogConfig, *, stop=None, max_ticks=None
             with conn_factory() as conn:
                 watchdog_tick(conn, cfg)
         except Exception:  # pragma: no cover - logged, never fatal
-            pass
+            logger.exception("watchdog tick failed; continuing")
         ticks += 1
         if cfg.cadence_seconds:
             time.sleep(cfg.cadence_seconds)

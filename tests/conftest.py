@@ -103,6 +103,7 @@ def fleet_db(fleet_pg):
             for t in _V3_TABLES:
                 cur.execute(f"TRUNCATE {t};")
             cur.execute("UPDATE fleet_config SET spend_cap_usd=0, paused=FALSE, "
-                        "cost_cap_daily_usd=0, cost_cap_total_usd=0 WHERE id=1;")
+                        "cost_cap_daily_usd=0, cost_cap_total_usd=0, "
+                        "last_window_roll_at=NULL WHERE id=1;")
         conn.commit()
     return fleet_pg

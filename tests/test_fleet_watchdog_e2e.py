@@ -72,9 +72,14 @@ def test_watchdog_full_recovery_pass_and_report(fleet_db):
     assert summary["paused_on_cap"] is True
 
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        # parked challenge untouched (still unresolved)
-        cur.execute("SELECT resolved_at FROM auth_challenge WHERE url='https://x.com/job'")
-        assert cur.fetchone()["resolved_at"] is None
+        # parked challenge untouched: row still exists, unresolved, worker_id unchanged
+        cur.execute(
+            "SELECT resolved_at, worker_id FROM auth_challenge WHERE url='https://x.com/job'"
+        )
+        row = cur.fetchone()
+        assert row is not None, "challenge row was deleted by watchdog"
+        assert row["resolved_at"] is None, "watchdog resolved the challenge"
+        assert row["worker_id"] == "wP", "watchdog mutated challenge worker_id"
         # fleet paused
         cur.execute("SELECT paused FROM fleet_config WHERE id=1")
         assert cur.fetchone()["paused"] is True
