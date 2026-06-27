@@ -7,7 +7,7 @@ sync.pull_compute_results reads (research_fit_score / research_decision). No DB 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 from applypilot.llm import get_client, _estimate_cost as estimate_cost
 from applypilot.scoring.scorer import score_job
@@ -58,3 +58,13 @@ def make_score_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
                  "model": raw.get("model"), "provider": provider, "status": "done"}, cost)
 
     return score_fn
+
+
+def make_audit_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
+    def audit_fn(payload: dict) -> tuple[dict, float]:
+        job = _job_from_payload(payload)
+        a = audit_job(job, ctx.search_cfg)
+        return ({"task": "audit", "research_fit_score": None, "research_decision": a.audit_label,
+                 "audit_score": a.audit_score, "role_fit_score": a.role_fit_score,
+                 "flags": list(a.flags), "reason": a.reason, "status": "done"}, 0.0)
+    return audit_fn

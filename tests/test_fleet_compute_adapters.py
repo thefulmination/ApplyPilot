@@ -37,3 +37,14 @@ def test_score_fn_maps_llm_error_to_failed(monkeypatch):
     result, cost = score_fn({"url": "u", "company": "C", "title": "T", "full_description": "d"})
     assert result["status"] == "failed" and result["research_fit_score"] is None
     assert cost == 0.0
+
+
+def test_audit_fn_maps_scoreaudit_to_decision():
+    payload = {"url": "u", "company": "Acme", "title": "Chief of Staff",
+               "full_description": "operations leadership", "fit_score": 8}
+    audit_fn = ca.make_audit_fn(_ctx())
+    result, cost = audit_fn(payload)
+    assert result["task"] == "audit" and result["status"] == "done"
+    assert isinstance(result["research_decision"], str) and result["research_fit_score"] is None
+    assert "audit_score" in result and isinstance(result["flags"], list)
+    assert cost == 0.0
