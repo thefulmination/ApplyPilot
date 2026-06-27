@@ -13,7 +13,12 @@ def test_monitor_actions_allow_ops_work(fleet_db):
             cur.execute("INSERT INTO rate_governor (scope_key, min_gap_seconds) VALUES ('host:z.com',5)")
         conn.commit()
         ma = monitor.MonitorActions(conn)
-        assert ma.restart_worker("wA") == 1            # one command row enqueued
+        cmd_id = ma.restart_worker("wA")
+        assert cmd_id > 0                               # valid BIGSERIAL id returned
+        with conn.cursor() as cur:
+            cur.execute("SELECT command FROM remote_commands WHERE worker_id='wA'")
+            rows = cur.fetchall()
+        assert len(rows) == 1 and rows[0]["command"] == "restart"  # command landed
         ma.pause_scope("host:z.com")
         with conn.cursor() as cur:
             cur.execute("SELECT breaker_state FROM rate_governor WHERE scope_key='host:z.com'")
