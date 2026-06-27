@@ -35,6 +35,7 @@ ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS cost_cap_total_usd     NUMERIC
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS pinned_worker_version  TEXT;            -- R12 fleet version
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_version         TEXT;            -- R12 staged update
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_worker_id       TEXT;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS last_window_roll_at    TIMESTAMPTZ;     -- nightly window roll guard
 
 -- ---------------------------------------------------------------------------
 -- Status enum shared by the compute + search-task queues.

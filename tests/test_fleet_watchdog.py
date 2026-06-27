@@ -3,6 +3,12 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import watchdog, queue
 
 
+def _seed_governor_scope_count(conn, scope_key, *, count_24h):
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO rate_governor (scope_key, count_24h, min_gap_seconds) VALUES (%s,%s,5)",
+                    (scope_key, count_24h))
+
+
 def _seed_governor_scope(conn, scope_key, *, success=0, captcha=0, block=0, state="ok",
                          challenge_rate=0.0, breaker_until=None):
     # breaker_until may be passed as a SQL expression string (e.g. "now() - interval '1 minute'")
@@ -152,3 +158,28 @@ def test_watchdog_does_not_pause_under_cap(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT paused FROM fleet_config WHERE id=1")
         assert cur.fetchone()["paused"] is False
+
+
+def test_watchdog_rolls_window_once_per_night(fleet_db):
+    cfg = watchdog.WatchdogConfig(nightly_roll_hour=4)
+    with pgqueue.connect(fleet_db) as conn:
+        # force "it is 4am and we've never rolled"
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET last_window_roll_at = NULL WHERE id=1")
+            _seed_governor_scope_count(conn, "host:x.com", count_24h=99)
+        conn.commit()
+        rolled1 = watchdog._maybe_roll_window(conn, cfg, now_hour=4)
+        rolled2 = watchdog._maybe_roll_window(conn, cfg, now_hour=4)  # same night -> no-op
+    assert rolled1 is True and rolled2 is False
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT count_24h FROM rate_governor WHERE scope_key='host:x.com'")
+        assert cur.fetchone()["count_24h"] == 0  # roll zeroed the counters
+
+
+def test_watchdog_does_not_roll_off_hour(fleet_db):
+    cfg = watchdog.WatchdogConfig(nightly_roll_hour=4)
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET last_window_roll_at = NULL WHERE id=1")
+        conn.commit()
+        assert watchdog._maybe_roll_window(conn, cfg, now_hour=13) is False

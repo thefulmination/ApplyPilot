@@ -56,8 +56,34 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
 
     summary["paused_on_cap"] = _enforce_cap(conn)
 
+    with conn.cursor() as cur:
+        cur.execute("SELECT extract(hour from now())::int AS h")
+        _hour = cur.fetchone()["h"]
+    conn.rollback()  # read-only hour probe
+    summary["rolled_window"] = _maybe_roll_window(conn, cfg, now_hour=_hour)
+
     heartbeat.beat(conn, WATCHDOG_ID, role=WATCHDOG_ROLE, state="idle", spend_today_usd=0, commit=True)
     return summary
+
+
+def _maybe_roll_window(conn, cfg: WatchdogConfig, *, now_hour: int) -> bool:
+    """Roll the rolling-24h governor counters at most once per night. Guarded by
+    fleet_config.last_window_roll_at so a restart can't double-roll the same night."""
+    if now_hour != cfg.nightly_roll_hour:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("SELECT last_window_roll_at FROM fleet_config WHERE id=1")
+        row = cur.fetchone()
+        last = row["last_window_roll_at"] if row else None
+        if last is not None:
+            cur.execute("SELECT (now() - %s) < interval '23 hours' AS recent", (last,))
+            if cur.fetchone()["recent"]:
+                return False
+    governor.roll_window(conn)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET last_window_roll_at = now() WHERE id=1")
+    conn.commit()
+    return True
 
 
 def _total_cap_breached(conn) -> bool:
