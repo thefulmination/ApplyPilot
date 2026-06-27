@@ -314,28 +314,19 @@ class Broker:
     # -- remote commands -----------------------------------------------------
     def poll_commands(self, conn, worker_id: str, token: str) -> list[dict[str, Any]]:
         """Un-acked owner -> machine commands for this worker (or fleet-wide '*').
-        The friend does nothing; the watchdog polls + executes locally (§11)."""
+        The friend does nothing; the watchdog polls + executes locally (§11).
+        Delegates to ``heartbeat`` so the per-worker broadcast accounting is shared
+        (a '*' command reaches every worker, not just the first acker)."""
         self._require(conn, worker_id, token)
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, worker_id, command, target_version, issued_at FROM remote_commands "
-                "WHERE acked_at IS NULL AND (worker_id=%s OR worker_id='*') ORDER BY issued_at",
-                (worker_id,),
-            )
-            return [dict(r) for r in cur.fetchall()]
+        from applypilot.fleet import heartbeat  # lazy: sibling module
+        return heartbeat.poll_commands(conn, worker_id)
 
     def ack_command(self, conn, worker_id: str, token: str, command_id: int) -> bool:
-        """Mark a polled command acknowledged (idempotent)."""
+        """Ack a polled command FOR THIS WORKER (idempotent). A broadcast is acked
+        per-worker; a direct command is hard-closed."""
         self._require(conn, worker_id, token)
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE remote_commands SET acked_at=now() WHERE id=%s "
-                "AND (worker_id=%s OR worker_id='*') AND acked_at IS NULL",
-                (command_id, worker_id),
-            )
-            ok = cur.rowcount > 0
-        conn.commit()
-        return ok
+        from applypilot.fleet import heartbeat  # lazy: sibling module
+        return heartbeat.ack_command(conn, command_id, worker_id)
 
     # -- answer bank (single answer, defer-on-unknown, NEVER bulk) -----------
     def get_answer(self, conn, worker_id: str, token: str, question: str) -> str | None:

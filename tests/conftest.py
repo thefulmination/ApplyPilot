@@ -25,7 +25,7 @@ from applypilot.fleet import schema as fleet_schema
 _V3_TABLES = [
     "compute_queue", "search_tasks", "linkedin_queue", "rate_governor", "llm_usage",
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
-    "workers", "worker_heartbeat", "poison_jobs", "remote_commands",
+    "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "command_acks",
 ]
 
 

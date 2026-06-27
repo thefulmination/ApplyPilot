@@ -96,6 +96,26 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
 
 
+def test_push_apply_eligible_excludes_crash_unconfirmed(fleet_db, tmp_path):
+    # A posting that may already have been submitted under the user's name (a
+    # crash_unconfirmed / no_confirmation terminal) must NEVER be re-pushed.
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/ok/jobs/1", company="OK", title="COS")  # eligible
+    _add_job(sq, "https://boards.greenhouse.io/cu/jobs/2", company="CU", title="COS",
+             audit_score=9.0, apply_status="crash_unconfirmed")                        # possibly-submitted
+    _add_job(sq, "https://boards.greenhouse.io/ce/jobs/3", company="CE", title="COS",
+             audit_score=9.0, apply_error="no_confirmation")                           # possibly-submitted
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="b1")
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+    assert any(u.endswith("/ok/jobs/1") for u in urls)
+    assert not any(("/cu/jobs/2" in u or "/ce/jobs/3" in u) for u in urls), \
+        "a crash_unconfirmed / no_confirmation posting must not be re-pushed"
+
+
 def test_push_apply_eligible_is_idempotent(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://jobs.lever.co/acme/1", company="Acme", title="COS")

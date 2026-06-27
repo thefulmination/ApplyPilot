@@ -286,6 +286,17 @@ CREATE TABLE IF NOT EXISTS remote_commands (
     command        TEXT NOT NULL,                     -- 'restart'|'pause'|'resume'|'self_update'|'drain'
     target_version TEXT,                              -- for 'self_update' (R12 canary)
     issued_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    acked_at       TIMESTAMPTZ
+    acked_at       TIMESTAMPTZ                        -- hard global close (direct commands)
 );
 CREATE INDEX IF NOT EXISTS idx_commands_open ON remote_commands (worker_id) WHERE acked_at IS NULL;
+
+-- command_acks: per-worker ack of a command, so a fleet-wide ('*') broadcast is
+-- delivered to EVERY worker -- not consumed by whoever acks first (R7). poll_commands
+-- excludes a command this worker has already acked here; a DIRECT command also closes
+-- via remote_commands.acked_at. No FK (keeps the test TRUNCATE order-independent).
+CREATE TABLE IF NOT EXISTS command_acks (
+    command_id BIGINT      NOT NULL,
+    worker_id  TEXT        NOT NULL,
+    acked_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (command_id, worker_id)
+);

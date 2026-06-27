@@ -36,6 +36,8 @@ from applypilot.fleet import queue as _queue
 # Eligibility mirrors fleet_sync._PUSH_SELECT (the offsite-apply predicate, S2/S9.3):
 #   not a dedup duplicate; score floor on COALESCE(audit_score, fit_score); not dead;
 #   not already applied/in-flight; a real http(s) offsite (non-LinkedIn) target.
+# crash_unconfirmed / no_confirmation are EXCLUDED (v1 parity): a posting that may
+# already have been submitted under the user's name must never be re-pushed/re-applied.
 _PUSH_APPLY_SELECT = """
 SELECT url, company, title, application_url,
        CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
@@ -43,7 +45,8 @@ FROM jobs
 WHERE duplicate_of_url IS NULL
   AND COALESCE(audit_score, fit_score) >= ?
   AND COALESCE(liveness_status, '') != 'dead'
-  AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress'))
+  AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
+  AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
   AND application_url LIKE 'http%'
   AND application_url NOT LIKE '%linkedin.com%'
 ORDER BY score DESC

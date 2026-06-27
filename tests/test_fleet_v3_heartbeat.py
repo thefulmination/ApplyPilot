@@ -138,16 +138,33 @@ def test_command_lifecycle_incl_broadcast(fleet_db):
         su = next(c for c in cmds if c["command"] == "self_update")
         assert su["target_version"] == "v2"
 
-        # ack w1's own command -> it drops out; the broadcast remains until acked
-        assert heartbeat.ack_command(conn, cid_w1) is True
+        # ack w1's own command -> it drops out; the broadcast remains until w1 acks it
+        assert heartbeat.ack_command(conn, cid_w1, "w1") is True
         remaining = {c["id"] for c in heartbeat.poll_commands(conn, "w1")}
         assert cid_w1 not in remaining
         assert cid_all in remaining
 
-        # acking the broadcast removes it for everyone; double-ack is a no-op
-        assert heartbeat.ack_command(conn, cid_all) is True
-        assert heartbeat.ack_command(conn, cid_all) is False
+        # w1 acking the broadcast removes it FOR w1; double-ack by w1 is a no-op
+        assert heartbeat.ack_command(conn, cid_all, "w1") is True
+        assert heartbeat.ack_command(conn, cid_all, "w1") is False
         assert heartbeat.poll_commands(conn, "w1") == []
+
+
+def test_broadcast_reaches_every_worker_not_just_first_acker(fleet_db):
+    # The real R7 invariant: a fleet-wide '*' command must be delivered to EVERY
+    # worker. The old single-acked_at design let the first acker close it for all.
+    with pgqueue.connect(fleet_db) as conn:
+        cid = heartbeat.issue_command(conn, "*", "self_update", target_version="v2")
+        assert any(c["id"] == cid for c in heartbeat.poll_commands(conn, "wA"))
+        assert any(c["id"] == cid for c in heartbeat.poll_commands(conn, "wB"))
+        # wA acks -> wA no longer sees it, but wB STILL does
+        assert heartbeat.ack_command(conn, cid, "wA") is True
+        assert not any(c["id"] == cid for c in heartbeat.poll_commands(conn, "wA"))
+        assert any(c["id"] == cid for c in heartbeat.poll_commands(conn, "wB")), \
+            "a broadcast must reach every worker, not be consumed by the first acker"
+        # wB acks its own copy independently
+        assert heartbeat.ack_command(conn, cid, "wB") is True
+        assert not any(c["id"] == cid for c in heartbeat.poll_commands(conn, "wB"))
 
 
 # ---------------------------------------------------------------------------

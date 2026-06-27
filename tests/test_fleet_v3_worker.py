@@ -247,18 +247,32 @@ def test_worker_apply_visible_captcha_parks_and_raises_challenge(fleet_db):
         assert ch is not None
         assert ch["kind"] == "visible_captcha" and ch["route"] == "owner_inbox"
         assert ch["resolved_at"] is None
-        # the job is PARKED: lease still HELD by the worker, NOT applied
-        cur.execute("SELECT status, lease_owner, apply_status FROM apply_queue WHERE url='a1'")
+        # the job is PARKED + FROZEN: lease still HELD by the worker, marked
+        # challenge_pending (NOT applied), and pushed out of the reclaim window so the
+        # SAME wall is never reclaimed + re-driven blind (IP-burn fail-safe, §7.3).
+        cur.execute("SELECT status, lease_owner, apply_status, "
+                    "lease_expires_at > now() + interval '300 days' AS frozen "
+                    "FROM apply_queue WHERE url='a1'")
         q = cur.fetchone()
         assert q["status"] == "leased", "wall must keep the lease held (parked), not close it"
         assert q["lease_owner"] == "w-apply-friend"
-        assert q["apply_status"] is None, "job must NOT be marked applied on a wall"
+        assert q["apply_status"] == "challenge_pending" and q["apply_status"] != "applied"
+        assert q["frozen"] is True, "parked wall must be frozen out of the reclaim window"
         # the captcha outcome was recorded on the governor (leading indicator, §6)
         cur.execute("SELECT captcha_24h FROM rate_governor WHERE scope_key='global'")
         assert cur.fetchone()["captcha_24h"] == 1
         # heartbeat reflects the parked challenge
         cur.execute("SELECT state FROM worker_heartbeat WHERE worker_id='w-apply-friend'")
         assert cur.fetchone()["state"] == "challenge_pending"
+
+    # the reclaim sweep must NOT resurrect a parked wall (would re-drive the captcha)
+    with pgqueue.connect(fleet_db) as conn:
+        pgqueue.reclaim_stale_leases(conn, grace_seconds=0)
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, apply_status FROM apply_queue WHERE url='a1'")
+            q = cur.fetchone()
+        assert q["status"] == "leased" and q["apply_status"] == "challenge_pending", \
+            "reclaim must leave a parked wall frozen, not re-queue it"
 
 
 def test_worker_apply_clear_marks_applied(fleet_db):

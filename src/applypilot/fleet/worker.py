@@ -266,9 +266,12 @@ class WorkerLoop:
         return {"action": "parked_challenge", "url": url, "kind": kind, "route": route}
 
     def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host) -> int:
-        """Raise an auth_challenge row + record the wall outcome on the governor,
-        WITHOUT writing an apply result (the lease stays held -> the job parks).
-        A blocked/captcha wall is a leading indicator the governor must see (§6)."""
+        """Raise an auth_challenge row, record the wall outcome on the governor, and
+        FREEZE the held lease out of the reclaim pool (``queue.park_challenge``) so the
+        SAME wall is never reclaimed and re-driven blind on another machine -- the
+        IP-burn fail-safe (§7.3). No apply result is written; the owner resolves the
+        challenge from the trusted box. A blocked/captcha wall is also a leading
+        indicator the governor must see (§6)."""
         cid = _insert_challenge(
             conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
             home_ip=self.home_ip, kind=kind, route=route, commit=False,
@@ -277,6 +280,7 @@ class WorkerLoop:
         if target_host:
             scopes.append(governor.host_scope(target_host))
         governor.record_outcome(conn, scopes, outcome, commit=False)
+        queue.park_challenge(conn, self.worker_id, url, commit=False)
         conn.commit()
         self._beat(conn, state="challenge_pending", current_job=url)
         return cid

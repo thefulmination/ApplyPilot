@@ -117,7 +117,9 @@ def detect_stuck(conn, *, heartbeat_timeout=90, job_max_seconds=600) -> list[dic
             "hb_timeout": heartbeat_timeout,
             "job_max": job_max_seconds,
         })
-        return [dict(r) for r in cur.fetchall()]
+        out = [dict(r) for r in cur.fetchall()]
+    conn.rollback()  # read-only: don't leave an idle-in-transaction (cf. pgqueue reads)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +162,9 @@ def is_quarantined(conn, url) -> bool:
             "SELECT 1 FROM poison_jobs WHERE url = %s AND quarantined_at IS NOT NULL",
             (url,),
         )
-        return cur.fetchone() is not None
+        found = cur.fetchone() is not None
+    conn.rollback()  # read-only
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -182,30 +186,48 @@ def issue_command(conn, worker_id, command, *, target_version=None, commit=True)
 
 
 def poll_commands(conn, worker_id) -> list[dict]:
-    """Open (un-acked) commands addressed to this worker OR broadcast to ``'*'``,
-    oldest first."""
+    """Open commands addressed to this worker OR broadcast to ``'*'``, oldest first.
+
+    A broadcast is excluded only once THIS worker has acked it (via ``command_acks``),
+    so a fleet-wide command reaches EVERY worker rather than being consumed by whoever
+    acks first."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, worker_id, command, target_version, issued_at "
-            "FROM remote_commands WHERE acked_at IS NULL AND worker_id IN (%s, '*') "
-            "ORDER BY issued_at, id",
-            (worker_id,),
+            "SELECT c.id, c.worker_id, c.command, c.target_version, c.issued_at "
+            "FROM remote_commands c "
+            "WHERE c.acked_at IS NULL AND c.worker_id IN (%(w)s, '*') "
+            "  AND NOT EXISTS (SELECT 1 FROM command_acks a "
+            "                  WHERE a.command_id = c.id AND a.worker_id = %(w)s) "
+            "ORDER BY c.issued_at, c.id",
+            {"w": worker_id},
         )
-        return [dict(r) for r in cur.fetchall()]
+        out = [dict(r) for r in cur.fetchall()]
+    conn.rollback()  # read-only
+    return out
 
 
-def ack_command(conn, command_id, *, commit=True) -> bool:
-    """Mark a command acknowledged. Returns True if it was open (idempotent)."""
+def ack_command(conn, command_id, worker_id, *, commit=True) -> bool:
+    """Ack a command FOR THIS WORKER. Records a per-worker ack (so a broadcast '*'
+    is acked independently by each worker, not closed for the whole fleet) and, for a
+    DIRECT command, also stamps ``remote_commands.acked_at`` (hard close). Returns True
+    if this worker newly acked an open command; idempotent (a second ack -> False)."""
     with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO command_acks (command_id, worker_id) VALUES (%s, %s) "
+            "ON CONFLICT (command_id, worker_id) DO NOTHING",
+            (command_id, worker_id),
+        )
+        newly = cur.rowcount > 0
+        # Hard-close a direct (non-broadcast) command so it leaves the open index.
         cur.execute(
             "UPDATE remote_commands SET acked_at = now() "
-            "WHERE id = %s AND acked_at IS NULL",
-            (command_id,),
+            "WHERE id = %s AND worker_id = %s AND worker_id <> '*' AND acked_at IS NULL",
+            (command_id, worker_id),
         )
-        ok = cur.rowcount > 0
+        closed = cur.rowcount > 0
     if commit:
         conn.commit()
-    return ok
+    return newly or closed
 
 
 # ---------------------------------------------------------------------------
@@ -261,4 +283,5 @@ def dashboard_snapshot(conn) -> dict:
         )
         snap["spend_today"] = float(cur.fetchone()["spend"])
 
+    conn.rollback()  # read-only rollup
     return snap
