@@ -481,6 +481,57 @@ def push_discovered(conn, *, task_id, source_label, worker_id, postings, commit=
     return n
 
 
+def park_linkedin_challenge(conn, worker_id, url, *, halt_seconds, commit=True) -> bool:
+    """Freeze the held linkedin_queue lease out of reclaim AND set the account halt, in ONE tx."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE linkedin_queue SET apply_status='challenge_pending', "
+            "lease_expires_at = now() + interval '3650 days', updated_at=now() "
+            "WHERE url=%s AND lease_owner=%s", (url, worker_id))
+        if cur.rowcount == 0:
+            conn.rollback(); return False
+        cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING",
+                    (governor.LINKEDIN_ACCOUNT,))
+        cur.execute("UPDATE rate_governor SET halted_until = now() + make_interval(secs => %s), updated_at=now() "
+                    "WHERE scope_key=%s", (halt_seconds, governor.LINKEDIN_ACCOUNT))
+    if commit:
+        conn.commit()
+    return True
+
+
+def reclaim_linkedin(conn, *, grace_seconds=30, commit=True) -> int:
+    """Stale linkedin_queue leases -> crash_unconfirmed, attempts=99, NEVER re-queued
+    (a stale LinkedIn lease may have already submitted)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE linkedin_queue SET status='crash_unconfirmed', apply_error='crash_unconfirmed', "
+            "attempts=99, lease_owner=NULL, lease_expires_at=NULL, updated_at=now() "
+            "WHERE status='leased' AND lease_expires_at < now() - make_interval(secs => %s) "
+            "RETURNING url", (grace_seconds,))
+        n = len(cur.fetchall())
+    if commit:
+        conn.commit()
+    return n
+
+
+def _set_linkedin_halt(conn, value_sql, commit):
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING",
+                    (governor.LINKEDIN_ACCOUNT,))
+        cur.execute(f"UPDATE rate_governor SET halted_until = {value_sql}, updated_at=now() WHERE scope_key=%s",
+                    (governor.LINKEDIN_ACCOUNT,))
+    if commit:
+        conn.commit()
+
+
+def clear_linkedin_halt(conn, *, commit=True):
+    _set_linkedin_halt(conn, "NULL", commit)
+
+
+def kill_linkedin(conn, *, commit=True):
+    _set_linkedin_halt(conn, "now() + interval '36500 days'", commit)
+
+
 # ---------------------------------------------------------------------------
 # Reclaim (crash-safety) for the compute + search queues. (apply_queue reclaim
 # is provided by apply.pgqueue.reclaim_stale_leases.)

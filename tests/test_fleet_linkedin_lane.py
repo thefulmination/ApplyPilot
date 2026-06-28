@@ -65,3 +65,41 @@ def test_linkedin_schema_columns(fleet_db):
         cur.execute("INSERT INTO rate_governor (scope_key) VALUES ('account:linkedin')")
         cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
         assert cur.fetchone()["halted_until"] is None
+
+
+from applypilot.fleet import governor
+
+
+def test_park_linkedin_sets_halt_one_tx_even_without_account_row(fleet_db):
+    from applypilot.fleet import queue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, lease_owner) "
+                    "VALUES ('lp','https://linkedin.com/jobs/x','9','leased','ats','w1')")
+        conn.commit()
+        assert queue.park_linkedin_challenge(conn, "w1", "lp", halt_seconds=21600) is True
+        cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
+        assert cur.fetchone()["halted_until"] is not None       # account row was INSERTed + halted
+        cur.execute("SELECT status, apply_status FROM linkedin_queue WHERE url='lp'")
+        r = cur.fetchone(); assert r["status"] == "leased" and r["apply_status"] == "challenge_pending"  # frozen, not closed
+
+
+def test_reclaim_linkedin_crash_unconfirmed_only(fleet_db):
+    from applypilot.fleet import queue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, lease_owner, lease_expires_at, attempts) "
+                    "VALUES ('lr','https://linkedin.com/jobs/y','9','leased','ats','wDead', now()-interval '5 min', 1)")
+        conn.commit()
+        assert queue.reclaim_linkedin(conn) == 1
+        cur.execute("SELECT status, attempts FROM linkedin_queue WHERE url='lr'")
+        r = cur.fetchone(); assert r["status"] == "crash_unconfirmed" and r["attempts"] == 99  # NEVER re-queued
+
+
+def test_clear_and_kill_halt(fleet_db):
+    from applypilot.fleet import queue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        queue.kill_linkedin(conn)
+        cur.execute("SELECT halted_until > now() + interval '300 days' AS far FROM rate_governor WHERE scope_key='account:linkedin'")
+        assert cur.fetchone()["far"] is True
+        queue.clear_linkedin_halt(conn)
+        cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
+        assert cur.fetchone()["halted_until"] is None
