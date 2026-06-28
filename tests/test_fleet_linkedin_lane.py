@@ -103,3 +103,23 @@ def test_clear_and_kill_halt(fleet_db):
         queue.clear_linkedin_halt(conn)
         cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
         assert cur.fetchone()["halted_until"] is None
+
+
+def test_linkedin_interlock_refuses_when_held(fleet_db):
+    from applypilot.fleet import linkedin_worker_main as lm
+    from applypilot.apply import pgqueue
+    holder = pgqueue.connect(fleet_db)  # a separate session holds the lock
+    try:
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(hashtext('applypilot:linkedin_driver'))")
+        holder.commit()
+        with pgqueue.connect(fleet_db) as conn:
+            assert lm.acquire_linkedin_interlock(conn) is False  # already held -> refuse
+    finally:
+        holder.close()
+
+
+def test_build_linkedin_loop_role(fleet_db):
+    from applypilot.fleet import linkedin_worker_main as lm
+    loop = lm.build_linkedin_loop(dsn=fleet_db, worker_id="w1", owner_ip="1.1.1.1", model="sonnet", agent="claude")
+    assert loop.role == "linkedin" and loop.apply_fn is not None and loop.owner_ip == "1.1.1.1"

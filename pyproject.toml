@@ -54,6 +54,7 @@ applypilot-fleet-watchdog = "applypilot.fleet.watchdog:main"
 applypilot-fleet-codex-bridge = "applypilot.fleet.codex_bridge:main"
 applypilot-fleet-apply = "applypilot.fleet.apply_worker_main:main"
 applypilot-fleet-apply-home = "applypilot.fleet.apply_home_main:main"
+applypilot-fleet-linkedin = "applypilot.fleet.linkedin_worker_main:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"
