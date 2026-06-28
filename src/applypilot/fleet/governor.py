@@ -154,7 +154,9 @@ def clear_expired_breakers(conn, *, commit=True):
 
 
 def roll_window(conn, *, commit=True) -> None:
-    """Nightly: reset the rolling-24h counters + re-anchor the window."""
+    """Nightly: reset the rolling-24h counters + re-anchor the window.
+    halted_until is deliberately NOT reset here -- a LinkedIn account halt must
+    survive a nightly window roll (see test_roll_window_preserves_halt)."""
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE rate_governor SET window_start = now(), count_24h = 0, "

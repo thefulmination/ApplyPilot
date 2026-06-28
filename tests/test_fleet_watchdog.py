@@ -210,3 +210,24 @@ def test_run_watchdog_survives_a_bad_tick(fleet_db, monkeypatch):
     monkeypatch.setattr(watchdog, "watchdog_tick", flaky_tick)
     ticks = watchdog.run_watchdog(lambda: pgqueue.connect(fleet_db), cfg, max_ticks=2)
     assert ticks == 2  # the RuntimeError on tick 1 did not kill the loop
+
+
+def test_watchdog_reclaims_linkedin(fleet_db):
+    from applypilot.fleet import watchdog
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, lease_owner, lease_expires_at, attempts) "
+                    "VALUES ('lw','https://linkedin.com/jobs/z','9','leased','ats','wDead', now()-interval '5 min', 1)")
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+    assert summary["reclaimed_linkedin"] == 1
+
+
+def test_roll_window_preserves_halt(fleet_db):
+    from applypilot.fleet import governor
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO rate_governor (scope_key, halted_until) VALUES ('account:linkedin', now()+interval '6 hours')")
+        conn.commit()
+        governor.roll_window(conn)
+        cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
+        assert cur.fetchone()["halted_until"] is not None  # nightly roll did NOT clear the halt

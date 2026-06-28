@@ -44,6 +44,7 @@ def watchdog_tick(conn, cfg: WatchdogConfig) -> dict:
     summary["reclaimed_compute"] = queue.reclaim_compute(conn, grace_seconds=cfg.reclaim_grace_seconds)
     summary["reclaimed_search"] = queue.reclaim_search(conn, grace_seconds=cfg.reclaim_grace_seconds)
     summary["reclaimed_apply"] = len(pgqueue.reclaim_stale_leases(conn, grace_seconds=cfg.reclaim_grace_seconds))
+    summary["reclaimed_linkedin"] = queue.reclaim_linkedin(conn, grace_seconds=cfg.reclaim_grace_seconds)
 
     # Order is load-bearing: clear timer-expired breakers FIRST (restore scopes whose
     # cooldown passed), THEN re-evaluate current conditions (which re-trips anything
