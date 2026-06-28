@@ -429,3 +429,64 @@ def test_tick_apply_status_passthrough(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='jp' AND resolved_at IS NULL")
         assert cur.fetchone()["n"] == 1
+
+
+# ===========================================================================
+# 6. WorkerLoop LINKEDIN path (_tick_linkedin).
+#    applied->applied+applied_set; failed:no_result_line->crash_unconfirmed;
+#    captcha->parked + halted_until set (one tx).
+# ===========================================================================
+
+def test_tick_linkedin_routes(fleet_db):
+    from applypilot.fleet.worker import WorkerLoop
+    from applypilot.apply import pgqueue
+
+    def _seed(conn, url):
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key) "
+                        "VALUES (%s,'https://linkedin.com/jobs/x','9','queued','ats','b1',%s)", (url, "dk-"+url))
+        conn.commit()
+
+    # Pre-seed the governor with min_gap_seconds=0 so back-to-back sub-cases can all lease.
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
+                "VALUES ('account:linkedin', 100, 0, 0) ON CONFLICT (scope_key) DO UPDATE "
+                "SET min_gap_seconds=0, base_min_gap_seconds=0, last_applied_at=NULL, daily_cap=100",
+            )
+        conn.commit()
+
+    # applied -> applied + applied_set
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "ka")
+    loop = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w1", home_ip="1.1.1.1", role="linkedin",
+                      public_ip="1.1.1.1", owner_ip="1.1.1.1",
+                      apply_fn=lambda job: {"run_status": "applied", "est_cost_usd": 0.0})
+    assert loop.run_once()["action"] == "applied"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM linkedin_queue WHERE url='ka'"); assert cur.fetchone()["status"] == "applied"
+        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ka'"); assert cur.fetchone()["n"] == 1
+
+    # failed:no_result_line -> crash_unconfirmed (never phantom-applied)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "kc")
+    loop2 = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w2", home_ip="1.1.1.1", role="linkedin",
+                       public_ip="1.1.1.1", owner_ip="1.1.1.1",
+                       apply_fn=lambda job: {"run_status": "failed:no_result_line", "est_cost_usd": 0.0})
+    assert loop2.run_once()["action"] == "crash_unconfirmed"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM linkedin_queue WHERE url='kc'"); assert cur.fetchone()["status"] == "crash_unconfirmed"
+
+    # captcha -> parked + halted_until set (one tx)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "kp")
+    loop3 = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w3", home_ip="1.1.1.1", role="linkedin",
+                       public_ip="1.1.1.1", owner_ip="1.1.1.1",
+                       apply_fn=lambda job: {"run_status": "captcha", "est_cost_usd": 0.0})
+    assert loop3.run_once()["action"] == "parked_challenge"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
+        assert cur.fetchone()["halted_until"] is not None
+        cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='kp' AND resolved_at IS NULL")
+        assert cur.fetchone()["n"] == 1

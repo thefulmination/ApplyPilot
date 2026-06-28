@@ -45,6 +45,7 @@ from applypilot.fleet import queue
 ROLE_APPLY = "apply"
 ROLE_COMPUTE = "compute"
 ROLE_DISCOVERY = "discovery"
+ROLE_LINKEDIN = "linkedin"
 
 
 def _insert_challenge(conn, *, url, worker_id, machine_owner, home_ip, kind, route,
@@ -131,7 +132,7 @@ class WorkerLoop:
         owner_ip: Optional[str] = None,
         compute_fns: Optional[dict] = None,
     ) -> None:
-        if role not in (ROLE_APPLY, ROLE_COMPUTE, ROLE_DISCOVERY):
+        if role not in (ROLE_APPLY, ROLE_COMPUTE, ROLE_DISCOVERY, ROLE_LINKEDIN):
             raise ValueError(f"unknown role: {role!r}")
         self.conn_factory = conn_factory
         self.worker_id = worker_id
@@ -184,6 +185,8 @@ class WorkerLoop:
                 return self._tick_compute(conn)
             if self.role == ROLE_DISCOVERY:
                 return self._tick_discovery(conn)
+            if self.role == ROLE_LINKEDIN:
+                return self._tick_linkedin(conn)
             return self._tick_apply(conn)
 
     # -- COMPUTE: score/audit/tailor -- IP-free, cost-governed (§8, R14) -------
@@ -305,6 +308,42 @@ class WorkerLoop:
 
     _WALL_STATUSES = ("captcha", "login_issue", "auth_required")
     _CRASH_STATUSES = ("failed:no_result_line", "failed:timeout")
+
+    def _linkedin_halt_seconds(self) -> int:
+        import os
+        return int(os.environ.get("APPLYPILOT_LINKEDIN_HALT_COOLDOWN") or 21600)
+
+    def _tick_linkedin(self, conn) -> dict:
+        # Pre-checks (belts; the lease SQL is the real enforcement). Session pre-flight +
+        # halt pre-check; the interlock is held by the entrypoint for the worker's life.
+        job = queue.lease_linkedin(conn, self.worker_id, public_ip=self.public_ip, owner_ip=self.owner_ip)
+        if job is None:
+            self._beat(conn, state="idle"); return {"action": "idle"}
+        url = job["url"]
+        self._beat(conn, state="applying", current_job=url)
+        if self.apply_fn is None:
+            raise RuntimeError("linkedin role requires an injected apply_fn")
+        out = self.apply_fn(job)
+        run_status = (out or {}).get("run_status") or ""
+        cost = (out or {}).get("est_cost_usd", 0)
+        if run_status == "applied":
+            queue.write_linkedin_result(conn, self.worker_id, url, status="applied", apply_status="applied",
+                                        est_cost_usd=cost, outcome="success")
+            self._beat(conn, state="idle"); return {"action": "applied", "url": url}
+        if run_status in self._WALL_STATUSES:
+            queue.park_linkedin_challenge(conn, self.worker_id, url, halt_seconds=self._linkedin_halt_seconds())
+            _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
+                              home_ip=self.home_ip, kind="visible_captcha" if run_status == "captcha" else "login_gate",
+                              route="owner_inbox")
+            self._beat(conn, state="challenge_pending", current_job=url)
+            return {"action": "parked_challenge", "url": url}
+        if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
+            queue.write_linkedin_result(conn, self.worker_id, url, status="crash_unconfirmed",
+                                        apply_status="crash_unconfirmed", apply_error=run_status[:200], est_cost_usd=cost)
+            self._beat(conn, state="idle"); return {"action": "crash_unconfirmed", "url": url}
+        queue.write_linkedin_result(conn, self.worker_id, url, status="failed", apply_status="failed",
+                                    apply_error=(run_status or "unknown")[:200], est_cost_usd=cost)
+        self._beat(conn, state="idle"); return {"action": "failed", "url": url}
 
     def _apply_status_passthrough(self, conn, url, target_host, res: dict) -> dict:
         """Route off run_job's terminal status (the agent already classified by SEEING
