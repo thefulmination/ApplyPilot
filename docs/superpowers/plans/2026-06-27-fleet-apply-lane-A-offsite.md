@@ -89,7 +89,7 @@ git commit -m "feat(fleet): canary fleet_config columns + fixture reset"
 
 **Interfaces:**
 - Consumes: `fleet_config.canary_enabled/canary_remaining/paused` (Task 1 + existing).
-- Produces: `lease_apply` now (a) returns None when `fleet_config.paused`; (b) when `canary_enabled`, leases at most `canary_remaining` jobs fleet-wide — atomically (serialized on the `fleet_config` row via `FOR UPDATE`), decrementing per lease and setting `paused=TRUE` at 0. Decrement is at-lease, never on a no-op lease.
+- Produces: `lease_apply` now (a) returns None when `fleet_config.paused`; (b) when `canary_enabled`, leases at most `canary_remaining` jobs fleet-wide — atomically (serialized on the `fleet_config` row via `FOR UPDATE`), decrementing per lease and setting `paused=TRUE` at 0; (c) returns None when a `spend_cap_usd` is set and cumulative apply spend (`SUM(apply_queue.est_cost_usd)`) has reached it — a HARD lease guard (G5), not just the worker's soft `should_halt` belt. Decrement is at-lease, never on a no-op lease.
 
 - [ ] **Step 1: Write the failing tests** (the catastrophe gate — concurrency is mandatory)
 
@@ -160,6 +160,20 @@ def test_canary_disabled_does_not_decrement(fleet_db):
         with conn.cursor() as cur:
             cur.execute("SELECT canary_remaining FROM fleet_config WHERE id=1")
             assert cur.fetchone()["canary_remaining"] is None  # untouched
+
+
+def test_lease_blocked_when_spend_cap_breached(fleet_db):
+    # G5 as a HARD lease guard: cumulative apply spend >= spend_cap_usd -> no lease.
+    from applypilot.fleet import queue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_approved_apply_rows(conn, 1)
+        cur.execute("UPDATE apply_queue SET est_cost_usd = 5.0 WHERE url='u0'")  # already-spent row
+        # add a second leasable row so the SUM (5.0) is what blocks, not an empty queue
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
+                    "VALUES ('u1','http://acme.com/1','8','queued','ats','b1','dk1','acme.com')")
+        cur.execute("UPDATE fleet_config SET spend_cap_usd = 1.0 WHERE id=1")
+        conn.commit()
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None  # 5.0 >= 1.0 cap
 ```
 
 - [ ] **Step 2: Run them, expect FAIL** (canary not enforced; paused not enforced).
@@ -168,7 +182,7 @@ def test_canary_disabled_does_not_decrement(fleet_db):
 
 ```python
 _LEASE_APPLY = """
-WITH cfg AS (SELECT canary_enabled, canary_remaining, paused FROM fleet_config WHERE id=1 FOR UPDATE),
+WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
      home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHERE scope_key = %(home_scope)s),
      glob AS (SELECT count_24h, daily_cap FROM rate_governor WHERE scope_key = 'global'),
      next_job AS (
@@ -181,6 +195,8 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused FROM fleet_config W
        WHERE q.status = 'queued' AND q.lane = 'ats' AND q.approved_batch IS NOT NULL
          AND NOT COALESCE(cfg.paused, FALSE)
          AND (NOT COALESCE(cfg.canary_enabled, FALSE) OR cfg.canary_remaining > 0)
+         AND (COALESCE(cfg.spend_cap_usd, 0) <= 0
+              OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
          AND (glob.count_24h IS NULL OR glob.count_24h < glob.daily_cap)
          AND COALESCE(home.breaker_state, 'ok') NOT IN ('paused','demoted')
          AND (home.count_24h IS NULL OR home.count_24h < home.daily_cap)
@@ -898,7 +914,7 @@ git commit -m "test(fleet): apply lane A canary-go-live e2e + runbook"
 
 ## Self-Review
 
-**Spec coverage:** §3.1 entrypoint+contract → Task 3 (worker) + Task 4 (entrypoint). §3.2 home driver → Task 7. §3.3 v1 isolation → Task 5. §4.2 approval gate → built + Task 7 driver. §4.3 canary → Task 1 (schema) + Task 2 (atomic lease) + Task 7 (arm/lift) + Task 8 (e2e). §4.4 paused → Task 2 (lease guard) + Task 4 (should_halt loop). §4.5 cost cap (should_halt over apply_queue.est_cost_usd) → Task 4 (worker) — note `should_halt` already sums `apply_queue.est_cost_usd`, so no new cost code is needed beyond the worker check + the owner's `set_spend_cap`. §4.5 G6 backfill + push cross-check → Task 6. §3.2 resolve-challenge → Task 7. §6 testing/regression baseline → every task names it; Task 8 runs the full suite. §7 runbook → Task 8.
+**Spec coverage:** §3.1 entrypoint+contract → Task 3 (worker) + Task 4 (entrypoint). §3.2 home driver → Task 7. §3.3 v1 isolation → Task 5. §4.2 approval gate → built + Task 7 driver. §4.3 canary → Task 1 (schema) + Task 2 (atomic lease) + Task 7 (arm/lift) + Task 8 (e2e). §4.4 paused → Task 2 (lease guard) + Task 4 (should_halt loop). §4.5 cost cap (G5) → **HARD lease guard in Task 2** (`spend_cap_usd` in the locked `cfg` CTE; `SUM(apply_queue.est_cost_usd) < spend_cap_usd`) **plus** the worker's `should_halt` belt in Task 4 — enforced at the lease like the canary/paused guards, not operator discipline. The owner sets the cap via `set_spend_cap`. §4.6 G6 backfill + push cross-check → Task 6. §3.2 resolve-challenge → Task 7. §6 testing/regression baseline → every task names it; Task 8 runs the full suite. §7 runbook → Task 8.
 
 **Placeholder scan:** none — every step has complete code. Three `NOTE:` callouts (Task 4 chrome fn names; Task 5 pre-existing pgqueue test-seed fix; Task 7 sync conn kwargs) are verification instructions, not placeholders.
 
