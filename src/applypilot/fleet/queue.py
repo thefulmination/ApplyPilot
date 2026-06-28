@@ -15,9 +15,21 @@ from applypilot.fleet import governor
 
 # ---------------------------------------------------------------------------
 # APPLY lease -- governed, approval-gated, dedup-guarded (R6, R9, R11).
+#
+# Atomicity notes (catastrophe gate):
+#   - cfg … FOR UPDATE row-locks the single fleet_config row, serializing ALL
+#     apply leases on it — exactly as _LEASE_LINKEDIN locks 'account:linkedin'.
+#     No two transactions can pass the canary guard simultaneously.
+#   - The reserve UPDATE is a data-modifying CTE. Postgres runs ALL WITH
+#     data-modifying CTEs to completion even when unreferenced in the outer
+#     statement. It only fires when EXISTS(next_job), so a no-op lease (empty
+#     queue / all guards fail) never decrements canary_remaining.
+#   - paused = (paused OR canary_remaining-1 <= 0) only ever SETS paused to
+#     TRUE; it never clears it, so a cost-pause or manual pause is preserved.
 # ---------------------------------------------------------------------------
 _LEASE_APPLY = """
-WITH home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHERE scope_key = %(home_scope)s),
+WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
+     home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHERE scope_key = %(home_scope)s),
      glob AS (SELECT count_24h, daily_cap FROM rate_governor WHERE scope_key = 'global'),
      next_job AS (
        SELECT q.url
@@ -25,7 +37,12 @@ WITH home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHER
        LEFT JOIN rate_governor g ON g.scope_key = 'host:' || COALESCE(q.target_host, q.apply_domain)
        LEFT JOIN home ON TRUE
        LEFT JOIN glob ON TRUE
+       LEFT JOIN cfg ON TRUE
        WHERE q.status = 'queued' AND q.lane = 'ats' AND q.approved_batch IS NOT NULL
+         AND NOT COALESCE(cfg.paused, FALSE)
+         AND (NOT COALESCE(cfg.canary_enabled, FALSE) OR cfg.canary_remaining > 0)
+         AND (COALESCE(cfg.spend_cap_usd, 0) <= 0
+              OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
          AND (glob.count_24h IS NULL OR glob.count_24h < glob.daily_cap)
          AND COALESCE(home.breaker_state, 'ok') NOT IN ('paused','demoted')
          AND (home.count_24h IS NULL OR home.count_24h < home.daily_cap)
@@ -37,6 +54,13 @@ WITH home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHER
        ORDER BY q.score DESC, q.url
        LIMIT 1
        FOR UPDATE OF q SKIP LOCKED
+     ),
+     reserve AS (
+       UPDATE fleet_config
+          SET canary_remaining = canary_remaining - 1,
+              paused = (paused OR canary_remaining - 1 <= 0)
+        WHERE id = 1 AND canary_enabled AND EXISTS (SELECT 1 FROM next_job)
+       RETURNING 1
      )
 UPDATE apply_queue q
 SET status='leased', lease_owner=%(worker)s, lease_expires_at = now() + make_interval(secs => %(ttl)s),
