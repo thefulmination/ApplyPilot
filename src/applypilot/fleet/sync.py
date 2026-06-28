@@ -247,6 +247,67 @@ def pull_apply_results(
 
 
 # ===========================================================================
+# LINKEDIN -- PUSH
+# ===========================================================================
+
+# Eligibility mirrors _PUSH_APPLY_SELECT but with the INVERSE effective-host predicate:
+# only postings whose effective apply URL (application_url if http, else url) contains
+# 'linkedin.com'. Stages UNAPPROVED (approval is a separate gated step via the LinkedIn
+# canary gate). crash_unconfirmed is excluded (same rule as the offsite lane).
+_PUSH_LINKEDIN_SELECT = """
+SELECT url, company, title, application_url,
+       CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
+FROM jobs
+WHERE duplicate_of_url IS NULL
+  AND COALESCE(audit_score, fit_score) >= ?
+  AND COALESCE(liveness_status, '') != 'dead'
+  AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
+  AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
+  AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+ORDER BY score DESC
+"""
+
+
+def push_linkedin_eligible(
+    *,
+    sqlite_conn=None,
+    pg_conn=None,
+    score_floor: int = 7,
+    approved_batch=None,
+    limit=None,
+) -> int:
+    """Push LinkedIn-eligible jobs from the brain into ``linkedin_queue`` (idempotent).
+
+    The effective-host predicate is the INVERSE of the offsite lane: only postings
+    whose effective apply URL (application_url when it starts with 'http', else url)
+    contains 'linkedin.com'. Stages rows UNAPPROVED (approval is a separate gated step
+    via the LinkedIn canary gate). Returns the number of rows the UPSERT touched."""
+    own_sq, own_pg = sqlite_conn is None, pg_conn is None
+    sq = sqlite_conn or _home_conn()
+    pg = pg_conn or pgqueue.connect()
+    try:
+        out = []
+        sql, params = _PUSH_LINKEDIN_SELECT, [score_floor]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        for r in sq.execute(sql, params).fetchall():
+            out.append({
+                "url": r["url"], "company": r["company"], "title": r["title"],
+                "application_url": r["application_url"], "score": r["score"],
+                "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
+            })
+            if limit and len(out) >= limit:
+                break
+        return _queue.push_linkedin_jobs(pg, out, approved_batch=approved_batch)
+    finally:
+        if own_sq:
+            sq.close()
+        if own_pg:
+            pg.close()
+
+
+# ===========================================================================
 # COMPUTE -- PUSH
 # ===========================================================================
 

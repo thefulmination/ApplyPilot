@@ -533,6 +533,74 @@ def kill_linkedin(conn, *, commit=True):
 
 
 # ---------------------------------------------------------------------------
+# LINKEDIN OWNER HELPERS -- push/approve/resolve for the linkedin_queue.
+# Mirrors push_apply_jobs / approve_jobs / resolve_challenge over linkedin_queue.
+# ---------------------------------------------------------------------------
+
+def push_linkedin_jobs(conn, rows, *, approved_batch=None, commit=True) -> int:
+    """UPSERT linkedin_queue rows with dedup_key, lane='ats', and approved_batch.
+    Only refreshes ``queued`` rows. ``rows`` need url, company, title,
+    application_url, score. Uses the SAME _dedup.dedup_key as the offsite lane
+    so cross-lane dedup (applied_set) works correctly."""
+    n = 0
+    with conn.cursor() as cur:
+        for r in rows:
+            dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, dedup_key, approved_batch) "
+                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,'ats',%(dk)s,%(batch)s) "
+                "ON CONFLICT (url) DO UPDATE SET company=EXCLUDED.company, title=EXCLUDED.title, "
+                "application_url=EXCLUDED.application_url, score=EXCLUDED.score, "
+                "dedup_key=EXCLUDED.dedup_key, "
+                "approved_batch=COALESCE(EXCLUDED.approved_batch, linkedin_queue.approved_batch), updated_at=now() "
+                "WHERE linkedin_queue.status='queued'",
+                {**r, "dk": dk, "batch": approved_batch},
+            )
+            n += cur.rowcount
+    if commit:
+        conn.commit()
+    return n
+
+
+def approve_linkedin_jobs(conn, urls, batch, *, commit=True) -> int:
+    """Stamp the owner approval token on queued linkedin_queue rows."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE linkedin_queue SET approved_batch=%s, updated_at=now() "
+                    "WHERE url = ANY(%s) AND status='queued'", (batch, list(urls)))
+        n = cur.rowcount
+    if commit:
+        conn.commit()
+    return n
+
+
+def resolve_linkedin_challenge(conn, url, *, requeue=True, commit=True) -> bool:
+    """Owner-side release of a parked LinkedIn challenge. ``requeue`` -> back to the pool
+    for a retry from the owner machine; otherwise close it 'blocked'. Also resolves the open
+    auth_challenge row(s). Returns True if a parked row was found."""
+    with conn.cursor() as cur:
+        if requeue:
+            cur.execute(
+                "UPDATE linkedin_queue SET status='queued', lease_owner=NULL, lease_expires_at=NULL, "
+                "apply_status=NULL, apply_error=NULL, updated_at=now() "
+                "WHERE url=%s AND apply_status='challenge_pending'",
+                (url,),
+            )
+        else:
+            cur.execute(
+                "UPDATE linkedin_queue SET status='blocked', lease_owner=NULL, lease_expires_at=NULL, "
+                "apply_status='challenge_skipped', updated_at=now() "
+                "WHERE url=%s AND apply_status='challenge_pending'",
+                (url,),
+            )
+        n = cur.rowcount
+        cur.execute("UPDATE auth_challenge SET resolved_at=now(), outcome=%s WHERE url=%s AND resolved_at IS NULL",
+                    ("solved" if requeue else "skipped", url))
+    if commit:
+        conn.commit()
+    return n > 0
+
+
+# ---------------------------------------------------------------------------
 # Reclaim (crash-safety) for the compute + search queues. (apply_queue reclaim
 # is provided by apply.pgqueue.reclaim_stale_leases.)
 # ---------------------------------------------------------------------------
