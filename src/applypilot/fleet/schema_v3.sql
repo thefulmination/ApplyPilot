@@ -38,6 +38,8 @@ ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_worker_id       TEXT;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS last_window_roll_at    TIMESTAMPTZ;     -- nightly window roll guard
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_remaining        INTEGER;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_canary_enabled  BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_canary_remaining INTEGER;
 
 -- ---------------------------------------------------------------------------
 -- Status enum shared by the compute + search-task queues.
@@ -150,6 +152,7 @@ CREATE TABLE IF NOT EXISTS rate_governor (
 -- WITHOUT compounding across throttle->recover->throttle cycles, and restore it
 -- exactly on recovery. NULL is treated as "base == current min_gap_seconds".
 ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS base_min_gap_seconds INTEGER;
+ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS halted_until TIMESTAMPTZ;
 
 -- ---------------------------------------------------------------------------
 -- llm_usage cost ledger (R14). The CAP lives in fleet_config; this is the spend log.
