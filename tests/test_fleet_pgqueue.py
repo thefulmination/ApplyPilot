@@ -108,6 +108,9 @@ def db(pg_dsn):
     with pgqueue.connect(pg_dsn) as conn:
         pgqueue.ensure_schema(conn)
         with conn.cursor() as cur:
+            # lease_one now requires approved_batch IS NOT NULL (Task 5 gate); add the column
+            # to the base schema so pgqueue tests work against the old fleet_schema.sql cluster.
+            cur.execute("ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS approved_batch TEXT;")
             cur.execute("TRUNCATE apply_queue;")
             cur.execute("UPDATE fleet_config SET spend_cap_usd=0, paused=FALSE WHERE id=1;")
         conn.commit()
@@ -127,6 +130,10 @@ def _seed_queued(conn, n, *, score_desc=True):
         "apply_domain": f"greenhouse-{i}.io",   # distinct domains -> politeness never blocks
     } for i in range(n)]
     pgqueue.push_jobs(conn, rows)
+    # Stamp approval so lease_one (now gated on approved_batch IS NOT NULL) can pick these up.
+    with conn.cursor() as cur:
+        cur.execute("UPDATE apply_queue SET approved_batch='b0'")
+    conn.commit()
     return rows
 
 
@@ -205,6 +212,12 @@ def test_reclaim_requeues_prelaunch_only(db):
         reclaimed = {r["url"]: r["status"] for r in pgqueue.reclaim_stale_leases(conn, grace_seconds=0)}
         assert reclaimed["u/fresh"] == "queued"
         assert reclaimed["u/maybe"] == "crash_unconfirmed"
+
+        # Stamp approval on the requeued row so lease_one (gated on approved_batch IS NOT NULL)
+        # can pick it up.  u/maybe stays NULL intentionally — it must NEVER be re-leased.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE apply_queue SET approved_batch='b0' WHERE url='u/fresh'")
+        conn.commit()
 
         # The requeued one can be re-leased; the crash_unconfirmed one can NEVER be.
         leased_urls = set()
@@ -388,6 +401,10 @@ def test_pull_maps_applied_and_idempotent(db, tmp_path, monkeypatch):
     _add_job(sq, url)
     with pgqueue.connect(db) as pg:
         fleet_sync.push_offsite_jobs(sqlite_conn=sq, pg_conn=pg)
+        # Stamp approval so lease_one (gated on approved_batch IS NOT NULL) can pick this up.
+        with pg.cursor() as cur:
+            cur.execute("UPDATE apply_queue SET approved_batch='b0'")
+        pg.commit()
         job = pgqueue.lease_one(pg, "w", politeness_seconds=0)
         pgqueue.write_result(pg, "w", job["url"], status="applied", apply_status="applied",
                              est_cost_usd=0.6, agent_model="deepseek-chat", apply_duration_ms=42000)
@@ -408,6 +425,10 @@ def test_pull_failed_pins_attempts(db, tmp_path, monkeypatch):
     _add_job(sq, url)
     with pgqueue.connect(db) as pg:
         fleet_sync.push_offsite_jobs(sqlite_conn=sq, pg_conn=pg)
+        # Stamp approval so lease_one (gated on approved_batch IS NOT NULL) can pick this up.
+        with pg.cursor() as cur:
+            cur.execute("UPDATE apply_queue SET approved_batch='b0'")
+        pg.commit()
         job = pgqueue.lease_one(pg, "w", politeness_seconds=0)
         pgqueue.write_result(pg, "w", job["url"], status="blocked", apply_error="cloudflare")
         fleet_sync.pull_results(sqlite_conn=sq, pg_conn=pg)

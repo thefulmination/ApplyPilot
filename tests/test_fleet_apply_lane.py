@@ -118,3 +118,18 @@ def test_run_apply_idles_when_halted(fleet_db):
                                              model="sonnet", agent="claude"),
                          max_iterations=2, idle_sleep=0)
     assert ticks["halted"] >= 1 and ticks["applied"] == 0
+
+
+def test_lease_one_requires_approval(fleet_db):
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('uone','http://x','9','queued','ats','x.com')")  # approved_batch NULL
+        conn.commit()
+    with pgqueue.connect(fleet_db) as conn:
+        assert pgqueue.lease_one(conn, "w1", politeness_seconds=0) is None  # not leasable: unapproved
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE apply_queue SET approved_batch='b1' WHERE url='uone'")
+        conn.commit()
+    with pgqueue.connect(fleet_db) as conn:
+        assert pgqueue.lease_one(conn, "w1", politeness_seconds=0) is not None  # now leasable

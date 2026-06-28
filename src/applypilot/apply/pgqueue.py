@@ -69,6 +69,7 @@ next_job AS (
     FROM apply_queue q
     LEFT JOIN host_recent hr ON hr.apply_domain = q.apply_domain
     WHERE q.status = 'queued'
+      AND q.approved_batch IS NOT NULL
       AND (hr.last_at IS NULL
            OR hr.last_at < now() - make_interval(
                   secs => (%(politeness)s * (0.7 + random() * 0.7))::int))
