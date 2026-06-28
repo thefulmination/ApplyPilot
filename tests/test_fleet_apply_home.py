@@ -44,3 +44,44 @@ def test_backfill_applied_set_from_home_history(fleet_db, tmp_path):
     # idempotent second run
     with pgqueue.connect(fleet_db) as pg:
         assert sync.backfill_applied_set(sq, pg) == 0
+
+
+def test_apply_home_canary_and_approve_gate(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('q1','http://x','9','queued','ats','x.com')")  # unapproved
+        conn.commit()
+    # approve refuses when canary not armed
+    with pgqueue.connect(fleet_db) as conn:
+        try:
+            hm.approve(conn, all_pushed=True)
+            assert False, "approve must refuse when canary not armed"
+        except SystemExit:
+            pass
+    # arm canary, then approve
+    with pgqueue.connect(fleet_db) as conn:
+        hm.set_canary(conn, 3)
+        token = hm.approve(conn, all_pushed=True)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT canary_enabled, canary_remaining FROM fleet_config WHERE id=1")
+        assert cur.fetchone()["canary_remaining"] == 3
+        cur.execute("SELECT approved_batch FROM apply_queue WHERE url='q1'")
+        assert cur.fetchone()["approved_batch"] == token
+
+
+def test_apply_home_resolve_challenge(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.fleet import queue
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain, lease_owner) "
+                    "VALUES ('p1','http://x','9','leased','ats','x.com','w1')")
+        cur.execute("INSERT INTO auth_challenge (url, worker_id, kind, route) VALUES ('p1','w1','captcha','owner_inbox')")
+        conn.commit()
+        queue.park_challenge(conn, "w1", "p1")  # freeze (sets apply_status, 3650d lease)
+        hm.resolve_challenge_cmd(conn, "p1", skip=False)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM apply_queue WHERE url='p1'"); assert cur.fetchone()["status"] == "queued"
+        cur.execute("SELECT resolved_at FROM auth_challenge WHERE url='p1'"); assert cur.fetchone()["resolved_at"] is not None
