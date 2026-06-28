@@ -36,6 +36,8 @@ ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS pinned_worker_version  TEXT;  
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_version         TEXT;            -- R12 staged update
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_worker_id       TEXT;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS last_window_roll_at    TIMESTAMPTZ;     -- nightly window roll guard
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_remaining        INTEGER;
 
 -- ---------------------------------------------------------------------------
 -- Status enum shared by the compute + search-task queues.
