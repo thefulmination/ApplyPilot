@@ -1,4 +1,4 @@
-"""Residential worker LOOP (scaffold) -- spec §5/§6/§7.
+"""Residential worker LOOP -- spec §5/§6/§7.
 
 A :class:`WorkerLoop` is the thin per-slot loop that runs on each residential
 machine (and, wrapped in the Helper app, on friend machines -- §16.5). It leases
@@ -10,13 +10,17 @@ broker RPC surface, but the lease/result functions share the same call shapes.
 WHY EVERYTHING BROWSER-FACING IS INJECTED
 -----------------------------------------
 The real apply path drives a live Chromium via Playwright
-(``applypilot.apply.container_worker.run_job``), the real discovery path drives
+(``applypilot.fleet.launcher.run_job``), the real discovery path drives
 ``jobspy``, and the real compute path calls an LLM. None of those are unit-
 testable in CI. So the loop takes them as INJECTED callables:
 
-    apply_fn(job)   -> html         # wraps container_worker.run_job; returns the
-                                    #   final page HTML (and optionally a tuple
-                                    #   (html, frames_text, final_url, status)).
+    apply_fn(job)   -> {"run_status": str, "est_cost_usd": float}
+                                    # wraps launcher.run_job; returns run_job's
+                                    #   terminal status (the agent already
+                                    #   classified by SEEING the page). Legacy
+                                    #   path: may also return a bare HTML string
+                                    #   or (html, frames_text, final_url, status)
+                                    #   tuple (old contract; existing tests use this).
     search_fn(task) -> postings     # wraps jobspy; returns a list of posting dicts.
     score_fn(job)   -> (result, cost_usd)   # wraps the LLM scorer/auditor.
     classify_fn     = captcha.classify       # the pure detector (§7.1).
@@ -250,6 +254,9 @@ class WorkerLoop:
 
         # Drive the real browser (STUBBED in tests) and classify the resulting page.
         out = self.apply_fn(job)
+        if isinstance(out, dict) and "run_status" in out:
+            return self._apply_status_passthrough(conn, url, target_host, out)
+        # --- legacy html-classify path (existing test fakes return html/4-tuple) ---
         html, frames_text, final_url, status = _normalize_apply_output(out)
         kind = self.classify_fn(html, frames_text=frames_text, final_url=final_url, status=status)
 
@@ -295,6 +302,38 @@ class WorkerLoop:
         self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome,
                              target_host=target_host)
         return {"action": "parked_challenge", "url": url, "kind": kind, "route": route}
+
+    _WALL_STATUSES = ("captcha", "login_issue", "auth_required")
+    _CRASH_STATUSES = ("failed:no_result_line", "failed:timeout")
+
+    def _apply_status_passthrough(self, conn, url, target_host, res: dict) -> dict:
+        """Route off run_job's terminal status (the agent already classified by SEEING
+        the page). applied -> applied; a wall -> park; a ran-but-no-clean-result crash
+        -> crash_unconfirmed (possibly submitted, never re-leased); else -> failed."""
+        run_status = res.get("run_status") or ""
+        cost = res.get("est_cost_usd", 0)
+        if run_status == "applied":
+            queue.write_apply_result(conn, self.worker_id, url, status="applied", apply_status="applied",
+                                     target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost, outcome="success")
+            self._beat(conn, state="idle")
+            return {"action": "applied", "url": url}
+        if run_status in self._WALL_STATUSES:
+            kind = "login_gate" if run_status in ("login_issue", "auth_required") else "visible_captcha"
+            route = _captcha.route_for(kind, on_owner_machine=self.on_owner_machine)
+            wall_outcome = None if kind == "login_gate" else "captcha"
+            self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome, target_host=target_host)
+            return {"action": "parked_challenge", "url": url}
+        if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
+            queue.write_apply_result(conn, self.worker_id, url, status="crash_unconfirmed",
+                                     apply_status="crash_unconfirmed", apply_error=run_status[:200],
+                                     target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost)
+            self._beat(conn, state="idle")
+            return {"action": "crash_unconfirmed", "url": url}
+        queue.write_apply_result(conn, self.worker_id, url, status="failed", apply_status="failed",
+                                 apply_error=(run_status or "unknown")[:200],
+                                 target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost)
+        self._beat(conn, state="idle")
+        return {"action": "failed", "url": url}
 
     def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host) -> int:
         """Raise an auth_challenge row, optionally record the wall outcome on the

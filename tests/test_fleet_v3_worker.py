@@ -380,3 +380,52 @@ def test_worker_login_gate_parks_without_feeding_breaker(fleet_db):
 def test_worker_role_validation():
     with pytest.raises(ValueError):
         WorkerLoop(_factory("x"), "w", home_ip="1.1.1.1", role="bogus")
+
+
+# ===========================================================================
+# 5. WorkerLoop APPLY status-passthrough path (apply_fn returns dict).
+#    Prove crash != phantom-applied; captcha -> parked.
+# ===========================================================================
+
+def test_tick_apply_status_passthrough(fleet_db):
+    # The new contract: apply_fn returns {"run_status": ...}. Prove crash != phantom-applied.
+    from applypilot.fleet.worker import WorkerLoop
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import queue
+
+    def _seed(conn, url, domain="acme.com"):
+        # use a distinct apply_domain per sub-case so the host-governor min-gap
+        # from sub-case 1 does not block sub-cases 2 and 3
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
+                        "VALUES (%s,'http://acme.com/x','9','queued','ats','b1',%s,%s)", (url, "dk-"+url, domain))
+        conn.commit()
+
+    # applied -> applied + applied_set
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "ja", "acme-a.com")
+    loop = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w1", home_ip="1.1.1.1", role="apply",
+                      apply_fn=lambda job: {"run_status": "applied", "est_cost_usd": 0.01})
+    assert loop.run_once()["action"] == "applied"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM apply_queue WHERE url='ja'"); assert cur.fetchone()["status"] == "applied"
+        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ja'"); assert cur.fetchone()["n"] == 1
+
+    # failed:no_result_line -> crash_unconfirmed, NOT applied
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "jc", "acme-c.com")
+    loop2 = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w2", home_ip="2.2.2.2", role="apply",
+                       apply_fn=lambda job: {"run_status": "failed:no_result_line", "est_cost_usd": 0.0})
+    assert loop2.run_once()["action"] == "crash_unconfirmed"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM apply_queue WHERE url='jc'"); assert cur.fetchone()["status"] == "crash_unconfirmed"
+
+    # captcha -> parked (auth_challenge raised, lease frozen)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "jp", "acme-p.com")
+    loop3 = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w3", home_ip="3.3.3.3", role="apply",
+                       apply_fn=lambda job: {"run_status": "captcha", "est_cost_usd": 0.0})
+    assert loop3.run_once()["action"] == "parked_challenge"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='jp' AND resolved_at IS NULL")
+        assert cur.fetchone()["n"] == 1
