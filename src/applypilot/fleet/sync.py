@@ -55,6 +55,54 @@ WHERE duplicate_of_url IS NULL
 ORDER BY score DESC
 """
 
+# Extra clause appended when the home brain has an ``applications`` ledger table --
+# excludes URLs already in the ledger so the fleet never re-pushes a job the home
+# runner already applied to via a different lane.
+_PUSH_APPLY_LEDGER_CROSS_CHECK = (
+    "  AND COALESCE(application_url, url) NOT IN (\n"
+    "      SELECT COALESCE(NULLIF(application_url,''), job_url) FROM applications WHERE status = 'applied')\n"
+)
+
+
+def _applications_table_exists(sqlite_conn: sqlite3.Connection) -> bool:
+    """Return True if the home brain has an ``applications`` ledger table."""
+    row = sqlite_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'"
+    ).fetchone()
+    return row is not None
+
+
+def backfill_applied_set(sqlite_conn: sqlite3.Connection, pg_conn: Any) -> int:
+    """Seed PG applied_set (the lease-time R9 dedup) from the home brain's apply history,
+    so the fleet never re-applies a job already applied OUTSIDE the fleet. Idempotent."""
+    # Part 1: jobs with apply_status='applied' or crash-variant apply_error.
+    rows: list[Any] = sqlite_conn.execute(
+        "SELECT DISTINCT company, title FROM jobs "
+        "WHERE apply_status = 'applied' OR apply_error IN ('no_confirmation','crash_unconfirmed')"
+    ).fetchall()
+    # Part 2: applications ledger (may not exist in minimal test fixtures).
+    if _applications_table_exists(sqlite_conn):
+        ledger_rows = sqlite_conn.execute(
+            "SELECT DISTINCT j.company, j.title FROM applications a "
+            "JOIN jobs j ON j.url = a.job_url "
+            "WHERE a.status = 'applied'"
+        ).fetchall()
+        rows = list(rows) + list(ledger_rows)
+    n = 0
+    with pg_conn.cursor() as cur:
+        for r in rows:
+            dk = _dedup.dedup_key(r["company"], r["title"])
+            if not dk:
+                continue
+            cur.execute(
+                "INSERT INTO applied_set (dedup_key, company) VALUES (%s,%s) "
+                "ON CONFLICT (dedup_key) DO NOTHING",
+                (dk, r["company"]),
+            )
+            n += cur.rowcount
+    pg_conn.commit()
+    return n
+
 
 def _target_host(application_url: str | None) -> str | None:
     """Effective apply host (the governor key) -- the application_url netloc, port + creds
@@ -82,10 +130,20 @@ def push_apply_eligible(
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
     try:
+        backfill_applied_set(sq, pg)
         out: list[dict[str, Any]] = []
+        # Build the eligibility SQL; append the ledger cross-check when the home brain
+        # has an applications table (the check is a no-op on minimal test fixtures).
+        base_sql = _PUSH_APPLY_SELECT
+        if _applications_table_exists(sq):
+            # Inject the cross-check before the ORDER BY clause.
+            base_sql = base_sql.replace(
+                "ORDER BY score DESC",
+                _PUSH_APPLY_LEDGER_CROSS_CHECK + "ORDER BY score DESC",
+            )
         # Push the limit into SQL so we fetch only the top-N (not the whole eligible
         # set on a 70k+ job brain); keep the Python break as belt-and-suspenders.
-        sql, params = _PUSH_APPLY_SELECT, [score_floor]
+        sql, params = base_sql, [score_floor]
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
