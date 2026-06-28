@@ -123,3 +123,16 @@ def test_build_linkedin_loop_role(fleet_db):
     from applypilot.fleet import linkedin_worker_main as lm
     loop = lm.build_linkedin_loop(dsn=fleet_db, worker_id="w1", owner_ip="1.1.1.1", model="sonnet", agent="claude")
     assert loop.role == "linkedin" and loop.apply_fn is not None and loop.owner_ip == "1.1.1.1"
+
+
+def test_supervised_detects_fleet_linkedin(fleet_db):
+    from applypilot.apply import launcher, pgqueue
+    holder = pgqueue.connect(fleet_db)
+    try:
+        with holder.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(hashtext('applypilot:linkedin_driver'))")
+        holder.commit()
+        assert launcher.fleet_linkedin_active(fleet_db) is True   # fleet holds it
+    finally:
+        holder.close()
+    assert launcher.fleet_linkedin_active(fleet_db) is False      # lock free now

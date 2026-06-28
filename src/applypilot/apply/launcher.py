@@ -41,6 +41,59 @@ from applypilot.apply.dashboard import (
 
 logger = logging.getLogger(__name__)
 
+_FLEET_LI_KEY = "applypilot:linkedin_driver"
+
+
+def fleet_linkedin_active(pg_dsn: str | None) -> bool:
+    """Probe whether the fleet LinkedIn driver holds the advisory interlock.
+
+    Opens a transient connection to the fleet PG and attempts
+    ``pg_try_advisory_lock(hashtext('applypilot:linkedin_driver'))``.
+
+    * If the try-lock returns FALSE (we could NOT acquire because the fleet
+      holds it) → returns **True** (fleet is active; supervised must defer).
+    * If the try-lock returns TRUE (we acquired it) → immediately unlocks
+      (non-destructive probe, never leaves the lock held) and returns **False**.
+    * Any error (missing/unreachable fleet PG, connect failure, etc.) →
+      returns **False** so a probe failure never crashes the supervised run.
+      The runbook is the backstop for that edge.
+    """
+    if not pg_dsn:
+        return False
+    conn = None
+    try:
+        import psycopg  # lazy import — fleet PG may not be present
+        conn = psycopg.connect(pg_dsn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(hashtext(%s)) AS acquired",
+                (_FLEET_LI_KEY,),
+            )
+            row = cur.fetchone()
+            acquired = row[0] if row else True
+        if acquired:
+            # We grabbed it — fleet does NOT hold it; release and report inactive.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s))",
+                    (_FLEET_LI_KEY,),
+                )
+            conn.commit()
+            return False
+        else:
+            # Could not acquire — fleet IS holding the lock.
+            return True
+    except Exception:
+        logger.debug("fleet_linkedin_active probe failed", exc_info=True)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 AUTH_REQUIRED_REASONS: set[str] = {
     "auth_required",
     "login_issue",
@@ -1855,7 +1908,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             # Browser without the LinkedIn session (e.g. edge) -> offsite lane only,
             # so it never grabs a LinkedIn job it can't finish. Else the shared
             # halt/cap gate below decides.
-            exclude_li = (not browser_li_ok) or _linkedin_halt.is_set()
+            _fleet_dsn = os.environ.get("FLEET_PG_DSN")
+            exclude_li = (
+                (not browser_li_ok) or _linkedin_halt.is_set()
+                or (bool(_fleet_dsn) and fleet_linkedin_active(_fleet_dsn))
+            )
             if not exclude_li:
                 try:
                     _conn = get_connection()
