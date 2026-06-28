@@ -28,12 +28,19 @@ def test_backfill_applied_set_from_home_history(fleet_db, tmp_path):
     sq.execute("INSERT INTO applications (job_url, status) VALUES ('h2','applied')")  # ledger-only
     sq.execute("INSERT INTO jobs (url, company, title) VALUES ('h2','Beta','PM')")
     sq.commit()
+    from applypilot.fleet import dedup as _dedup
+    dk_acme = _dedup.dedup_key("Acme", "COS")
+    dk_beta = _dedup.dedup_key("Beta", "PM")
     with pgqueue.connect(fleet_db) as pg:
         n = sync.backfill_applied_set(sq, pg)
         with pg.cursor() as cur:
-            cur.execute("SELECT count(*) AS n FROM applied_set")
-            assert cur.fetchone()["n"] >= 1  # Acme|COS dedup_key landed
-    assert n >= 1
+            # jobs.apply_status='applied' source (Acme/COS)
+            cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key = %s", (dk_acme,))
+            assert cur.fetchone()["n"] == 1, "Acme/COS (jobs-history source) missing from applied_set"
+            # applications-ledger-only source (Beta/PM — the load-bearing lost-apply_status case)
+            cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key = %s", (dk_beta,))
+            assert cur.fetchone()["n"] == 1, "Beta/PM (ledger-only source) missing from applied_set — backfill production bug"
+    assert n >= 2
     # idempotent second run
     with pgqueue.connect(fleet_db) as pg:
-        assert sync.backfill_applied_set(sq, pg) >= 0
+        assert sync.backfill_applied_set(sq, pg) == 0
