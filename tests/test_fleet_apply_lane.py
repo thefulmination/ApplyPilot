@@ -89,3 +89,32 @@ def test_lease_blocked_when_spend_cap_breached(fleet_db):
         cur.execute("UPDATE fleet_config SET spend_cap_usd = 1.0 WHERE id=1")
         conn.commit()
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None  # 5.0 >= 1.0 cap
+
+
+def test_build_apply_loop_wires_apply_fn(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_DB_PATH", "x")  # _setup_apply_env may setdefault
+    from applypilot.fleet import apply_worker_main as am
+    loop = am.build_apply_loop(dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1", model="sonnet", agent="claude")
+    assert loop.role == "apply" and loop.apply_fn is not None
+
+
+def test_apply_env_sets_base_resume():
+    from applypilot.fleet import apply_worker_main as am
+    am._setup_apply_env()
+    import os
+    assert os.environ.get("APPLYPILOT_BASE_RESUME") == "1"
+    assert os.environ.get("APPLYPILOT_LANE_FILTER") == "0"
+
+
+def test_run_apply_idles_when_halted(fleet_db):
+    # should_halt True (paused) -> the loop does not lease; it returns after one idle pass.
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import apply_worker_main as am
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1")
+        conn.commit()
+    ticks = am.run_apply(lambda: pgqueue.connect(fleet_db),
+                         am.build_apply_loop(dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1",
+                                             model="sonnet", agent="claude"),
+                         max_iterations=2, idle_sleep=0)
+    assert ticks["halted"] >= 1 and ticks["applied"] == 0
