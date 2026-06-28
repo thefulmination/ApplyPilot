@@ -40,7 +40,7 @@ def approve(conn, *, urls=None, all_pushed=False) -> str:
         with conn.cursor() as cur:
             cur.execute("SELECT url FROM apply_queue WHERE status='queued' AND approved_batch IS NULL")
             urls = [r["url"] for r in cur.fetchall()]
-    token = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    token = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     queue.approve_jobs(conn, urls or [], token)
     return token
 

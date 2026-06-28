@@ -4,8 +4,11 @@ Respects fleet_config.paused via should_halt; never leases through a pause/canar
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import time
+
+logger = logging.getLogger("applypilot.fleet.apply_worker_main")
 
 
 def _setup_apply_env() -> None:
@@ -83,6 +86,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dic
                 if idle_sleep:
                     time.sleep(idle_sleep)
         except Exception:  # pragma: no cover - logged, backed off, never fatal
+            logger.exception("apply tick failed; backing off")
             counts["error"] += 1
             if idle_sleep:
                 time.sleep(idle_sleep)
