@@ -359,25 +359,42 @@ def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, err
 # lock, re-reads the just-stamped last_applied_at, fails the min-gap, and gets nothing.
 # (Reserving at claim is deliberately conservative -- a crashed lease over-counts
 # rather than risking a second concurrent session.)
+#
+# Lock-order note: cfg is locked FIRST (FOR UPDATE), then acct -- matching the order in
+# _LEASE_APPLY (which locks fleet_config before home/glob governor rows). This prevents
+# cross-lane deadlock between concurrent apply and linkedin leases. The canary decrement
+# (canary CTE) is atomic because the 'account:linkedin' FOR UPDATE mutex already serializes
+# ALL LinkedIn leases -- no separate cfg lock is needed for canary atomicity; cfg's FOR
+# UPDATE is purely for lock-order consistency. At remaining=0 the linkedin_canary_remaining>0
+# guard blocks (no paused flag, unlike the apply lane). min_gap=ttl (1200s) closes the
+# halt-write race (§4.3): a row inserted by reserve at claim-time carries the same gap
+# as the ttl, so the next claim cannot race in before the current one expires.
 # ---------------------------------------------------------------------------
 _LEASE_LINKEDIN = """
-WITH acct AS (
-  SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state
-  FROM rate_governor WHERE scope_key = 'account:linkedin' FOR UPDATE
-),
-next AS (
-  SELECT q.url FROM linkedin_queue q LEFT JOIN acct a ON TRUE
-  WHERE q.status='queued' AND q.approved_batch IS NOT NULL
-    AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
-    AND COALESCE(a.breaker_state, 'ok') NOT IN ('paused','demoted')
-    AND (a.last_applied_at IS NULL OR a.last_applied_at < now() - make_interval(secs => COALESCE(a.min_gap_seconds, 300)))
-  ORDER BY q.score DESC, q.url LIMIT 1 FOR UPDATE OF q SKIP LOCKED
-),
-reserve AS (
-  UPDATE rate_governor SET count_24h = count_24h + 1, last_applied_at = now(), updated_at = now()
-  WHERE scope_key = 'account:linkedin' AND EXISTS (SELECT 1 FROM next)
-  RETURNING 1
-)
+WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM fleet_config WHERE id=1 FOR UPDATE),
+     acct AS (
+       SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state, halted_until
+       FROM rate_governor WHERE scope_key = 'account:linkedin' FOR UPDATE
+     ),
+     next AS (
+       SELECT q.url FROM linkedin_queue q LEFT JOIN acct a ON TRUE LEFT JOIN cfg ON TRUE
+       WHERE q.status='queued' AND q.approved_batch IS NOT NULL
+         AND (NOT COALESCE(cfg.linkedin_canary_enabled, FALSE) OR cfg.linkedin_canary_remaining > 0)
+         AND (a.halted_until IS NULL OR a.halted_until < now())
+         AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
+         AND COALESCE(a.breaker_state, 'ok') NOT IN ('paused','demoted')
+         AND (a.last_applied_at IS NULL OR a.last_applied_at < now() - make_interval(secs => COALESCE(a.min_gap_seconds, 1200)))
+         AND NOT EXISTS (SELECT 1 FROM applied_set s WHERE s.dedup_key = q.dedup_key)
+       ORDER BY q.score DESC, q.url LIMIT 1 FOR UPDATE OF q SKIP LOCKED
+     ),
+     reserve AS (
+       UPDATE rate_governor SET count_24h = count_24h + 1, last_applied_at = now(), updated_at = now()
+       WHERE scope_key = 'account:linkedin' AND EXISTS (SELECT 1 FROM next) RETURNING 1
+     ),
+     canary AS (
+       UPDATE fleet_config SET linkedin_canary_remaining = linkedin_canary_remaining - 1
+       WHERE id = 1 AND linkedin_canary_enabled AND EXISTS (SELECT 1 FROM next) RETURNING 1
+     )
 UPDATE linkedin_queue q SET status='leased', lease_owner=%(worker)s,
   lease_expires_at = now() + make_interval(secs => %(ttl)s), last_attempted_at=now(), attempts=q.attempts+1, updated_at=now()
 FROM next WHERE q.url = next.url
@@ -386,7 +403,7 @@ RETURNING q.url, q.company, q.title, q.application_url, q.score;
 
 
 def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
-                   daily_cap=20, min_gap_seconds=300):
+                   daily_cap=20, min_gap_seconds=1200):
     """LinkedIn lease: ONLY from the one owner IP, serialized by the account mutex.
 
     ``public_ip`` is the worker's REGISTERED egress IP and ``owner_ip`` is the
