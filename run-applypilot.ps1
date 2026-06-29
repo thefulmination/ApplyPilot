@@ -17,13 +17,25 @@ $env:APPLYPILOT_DIR = $ApplyPilotDir
 $LocalDbDir = Join-Path $env:LOCALAPPDATA "ApplyPilot"
 New-Item -ItemType Directory -Force -Path $LocalDbDir | Out-Null
 $env:APPLYPILOT_DB_PATH = Join-Path $LocalDbDir "applypilot.db"
-$OneDriveDbBackup = Join-Path $ApplyPilotDir "applypilot.db"
-if (Test-Path -LiteralPath $OneDriveDbBackup) {
-    $BackupDb = Get-Item -LiteralPath $OneDriveDbBackup
+# Backups go to a LOCAL versioned folder (NOT OneDrive: syncing the ~1GB db held OS file
+# locks -> "database is locked" crashes, and a single corrupt run could clobber the only
+# backup). The legacy OneDrive copy is kept read-only as a seed fallback during transition.
+$BackupDir = Join-Path $LocalDbDir "db-backups"
+$KeepBackups = 8
+$OneDriveDbBackup = Join-Path $ApplyPilotDir "applypilot.db"   # legacy; seed fallback only
+
+# Seed the live DB if missing/implausibly small: prefer newest local backup, else legacy OneDrive copy.
+$NewestLocalBackup = Get-ChildItem -Path $BackupDir -Filter "applypilot-*.db" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$SeedSource = if ($NewestLocalBackup) { $NewestLocalBackup.FullName }
+              elseif (Test-Path -LiteralPath $OneDriveDbBackup) { $OneDriveDbBackup }
+              else { $null }
+if ($SeedSource) {
+    $SeedItem = Get-Item -LiteralPath $SeedSource
     $LiveDb = Get-Item -LiteralPath $env:APPLYPILOT_DB_PATH -ErrorAction SilentlyContinue
-    if (-not $LiveDb -or ($BackupDb.Length -gt 1048576 -and $LiveDb.Length -lt ($BackupDb.Length / 2))) {
-        Copy-Item -LiteralPath $OneDriveDbBackup -Destination $env:APPLYPILOT_DB_PATH -Force
-        Write-Host "[run-applypilot] Seeded local DB from OneDrive backup."
+    if (-not $LiveDb -or ($SeedItem.Length -gt 1048576 -and $LiveDb.Length -lt ($SeedItem.Length / 2))) {
+        Copy-Item -LiteralPath $SeedSource -Destination $env:APPLYPILOT_DB_PATH -Force
+        Write-Host "[run-applypilot] Seeded local DB from $($SeedItem.Name)."
     }
 }
 # Activate the tuned search config. This MUST be set in the process environment here:
@@ -58,20 +70,39 @@ if (Test-Path -LiteralPath $GlobalClaude) { $env:CLAUDE_PATH = $GlobalClaude }
 & (Join-Path $PythonScripts "applypilot.exe") @args
 $rc = $LASTEXITCODE
 
-# Back up the live LOCAL db to OneDrive after commands that WRITE it (OneDrive copy =
-# backup, not the live db). Read-only commands are skipped so we don't copy ~750MB
-# after every `status`. Failure to back up is non-fatal.
+# Back up the live LOCAL db to a LOCAL versioned folder after WRITE commands. NOT OneDrive
+# (syncing a ~1GB db locked the file and a single corrupt run could clobber the only backup).
+# Integrity gate: refuse to back up a corrupt db. Versioned: keep newest $KeepBackups so a bad
+# run can't wipe prior good copies. Read-only commands are skipped. Non-fatal.
 $WriteCmds = @("run","apply","discover","enrich","score","audit","diagnose","tailor","cover","pdf",
                "verify-live","resolve-ats-boards","resolve-company-apply-urls","boost-output","dedupe-jobs","rescore-jobs","scan-gmail")
 if ($args.Count -gt 0 -and $WriteCmds -contains $args[0]) {
     try {
         $LiveDb = Get-Item -LiteralPath $env:APPLYPILOT_DB_PATH -ErrorAction Stop
-        $BackupDb = Get-Item -LiteralPath $OneDriveDbBackup -ErrorAction SilentlyContinue
-        if ($BackupDb -and $BackupDb.Length -gt 1048576 -and $LiveDb.Length -lt ($BackupDb.Length / 2)) {
-            throw "Refusing to overwrite larger OneDrive DB backup ($($BackupDb.Length) bytes) with much smaller live DB ($($LiveDb.Length) bytes)."
+        # Integrity gate: never save corruption over good backups (a corrupt clobber is what bit us).
+        $DbOk = $true
+        $Sqlite3 = Join-Path $ProjectRoot ".conda-env\Library\bin\sqlite3.exe"
+        if (Test-Path -LiteralPath $Sqlite3) {
+            try {
+                $chk = (& $Sqlite3 -readonly $env:APPLYPILOT_DB_PATH "PRAGMA quick_check(1);" 2>$null | Out-String).Trim()
+                if ($chk -and $chk -ne "ok") {
+                    $DbOk = $false
+                    Write-Warning "[run-applypilot] DB failed quick_check -- SKIPPING backup to avoid saving corruption ($chk)."
+                }
+            } catch { }  # if the check itself can't run, fall through and back up anyway
         }
-        Copy-Item -LiteralPath $env:APPLYPILOT_DB_PATH -Destination $OneDriveDbBackup -Force -ErrorAction Stop
-        Write-Host "[run-applypilot] DB backed up to OneDrive."
-    } catch { Write-Warning "[run-applypilot] DB backup to OneDrive failed: $_" }
+        if ($DbOk) {
+            New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
+            # Checkpoint WAL into the main db so a plain file copy is complete + consistent.
+            if (Test-Path -LiteralPath $Sqlite3) { & $Sqlite3 $env:APPLYPILOT_DB_PATH "PRAGMA wal_checkpoint(TRUNCATE);" 2>$null | Out-Null }
+            $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $dest = Join-Path $BackupDir "applypilot-$stamp.db"
+            Copy-Item -LiteralPath $env:APPLYPILOT_DB_PATH -Destination $dest -Force -ErrorAction Stop
+            Get-ChildItem -Path $BackupDir -Filter "applypilot-*.db" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -Skip $KeepBackups |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Host "[run-applypilot] DB backed up locally -> $dest"
+        }
+    } catch { Write-Warning "[run-applypilot] local DB backup failed: $_" }
 }
 exit $rc
