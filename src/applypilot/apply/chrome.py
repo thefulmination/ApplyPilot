@@ -446,8 +446,12 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
     try:
         prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
         prefs.setdefault("profile", {})["exit_type"] = "Normal"
-        prefs.setdefault("session", {})["restore_on_startup"] = 4  # 4 = open blank
-        prefs.setdefault("session", {}).pop("startup_urls", None)
+        prefs.setdefault("session", {})["restore_on_startup"] = 5  # 5 = open the New Tab Page (one blank tab)
+        prefs["session"]["startup_urls"] = []
+        # Pinned tabs reopen on EVERY launch regardless of the startup setting. A worker profile
+        # cloned from the user's real Chrome inherits their pinned (e.g. job-search) tabs, so each
+        # worker's browser opens with those extra tabs -- clear them for a clean single-tab start.
+        prefs["pinned_tabs"] = []
         prefs["credentials_enable_service"] = False
         prefs.setdefault("password_manager", {})["saving_enabled"] = False
         prefs.setdefault("autofill", {})["profile_enabled"] = False

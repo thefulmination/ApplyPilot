@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import time
 
 logger = logging.getLogger("applypilot.fleet.apply_worker_main")
@@ -24,7 +25,21 @@ def _setup_apply_env() -> None:
     os.environ.setdefault("APPLYPILOT_AGENT_TIMEOUT", "300")
 
 
-def make_apply_fn(model: str, agent: str):
+def _chrome_slot(worker_id, override=None) -> int:
+    """Integer Chrome slot (profile + CDP port + per-run log id) for this worker.
+
+    Multiple apply workers on ONE machine MUST use distinct slots or their Chrome
+    instances collide in a single shared browser. Auto-derived from the trailing digits
+    of --worker-id (home-0 -> 0, home-1 -> 1), capped to 0-9; --chrome-slot overrides.
+    A worker-id with no trailing number falls back to slot 0.
+    """
+    if override is not None:
+        return int(override) % 10
+    m = re.search(r"(\d+)\s*$", str(worker_id or ""))
+    return (int(m.group(1)) % 10) if m else 0
+
+
+def make_apply_fn(model: str, agent: str, slot: int = 0):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
 
@@ -38,9 +53,11 @@ def make_apply_fn(model: str, agent: str):
     from applypilot.apply.container_worker import _real_cost
 
     def apply_fn(job: dict) -> dict:
-        worker_id = 0
+        # `slot` keys this worker's Chrome profile + CDP port + per-run logs, so multiple
+        # workers on ONE machine (distinct slots) never collide in a shared browser.
+        worker_id = slot
         port = BASE_CDP_PORT + worker_id
-        proc = chrome.launch_chrome(worker_id)  # returns Popen; port is implicit BASE_CDP_PORT+0
+        proc = chrome.launch_chrome(worker_id)  # returns Popen; port is implicit BASE_CDP_PORT+slot
         try:
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
@@ -53,12 +70,12 @@ def make_apply_fn(model: str, agent: str):
     return apply_fn
 
 
-def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="claude", machine_owner=None):
+def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="claude", machine_owner=None, slot=0):
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
     return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
-                      apply_fn=make_apply_fn(model, agent), machine_owner=machine_owner)
+                      apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner)
 
 
 def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dict:
@@ -101,11 +118,17 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     p.add_argument("--model", default="sonnet")
     p.add_argument("--agent", default="claude")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
+    p.add_argument("--chrome-slot", type=int, default=None,
+                   help="Browser slot (Chrome profile + CDP port + logs). Auto-derived from "
+                        "--worker-id's trailing digits; set explicitly (0,1,2,...) to run "
+                        "multiple workers on ONE machine without browser collisions.")
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
+    slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
-                            model=args.model, agent=args.agent, machine_owner=args.machine_owner)
+                            model=args.model, agent=args.agent, machine_owner=args.machine_owner,
+                            slot=slot)
     run_apply(lambda: pgqueue.connect(args.dsn), loop)
     return 0

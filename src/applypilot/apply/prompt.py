@@ -108,6 +108,19 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     accept_patterns = location_cfg.get("accept_patterns", [])
     primary_city = personal.get("city", location_cfg.get("primary", "your city"))
 
+    # accept_any_us: the applicant will relocate anywhere in the US -> accept EVERY
+    # US-based role (any city, onsite or hybrid); reject ONLY roles based outside the
+    # US that offer no US-remote option (the applicant is US-work-authorized, English only).
+    if location_cfg.get("accept_any_us"):
+        return """== LOCATION CHECK (do this FIRST before any form) ==
+Read the job page. Determine the work arrangement. Then decide:
+- "Remote" / "work from anywhere" -> ELIGIBLE. Apply.
+- ANY location within the United States (any city or state) -> ELIGIBLE. Apply. The applicant will relocate anywhere in the US, so do NOT reject a US role for being onsite or hybrid.
+- Outside the US but offers a remote option open to US-based workers -> ELIGIBLE. Apply.
+- Onsite/hybrid OUTSIDE the United States with NO remote option -> NOT ELIGIBLE (US work authorization only, English only). Output RESULT:FAILED:not_eligible_location
+- Cannot determine the location -> Continue applying.
+Reject ONLY a role based outside the US with no US-remote option. NEVER reject a US-based role on location grounds."""
+
     # Build the list of acceptable cities for hybrid/onsite
     if accept_patterns:
         city_list = ", ".join(accept_patterns)
@@ -688,10 +701,12 @@ Output EXACTLY one RESULT: line as the LAST line of your response, using only th
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
 
 == FORM TRICKS ==
+- NEVER click a mailto: link or any control that launches an external DESKTOP app (e.g. an email client). On Windows that pops the user's Outlook, which you cannot drive and which hijacks their desktop -- it does NOT help you apply. If the ONLY way to apply is emailing a resume to an address, follow the email-only steps above if email tooling is available; otherwise output RESULT:AUTH_REQUIRED:email_only. Do not open a desktop mail client.
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 - File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
 - Dropdown won't fill? browser_click to open it, then browser_click the option.
+- STUBBORN OPTIONAL DROPDOWN (esp. Workday's "How did you hear about us?" / source / referral fields): these JS comboboxes often fight automation and keep losing their selection. They are almost always OPTIONAL. If an OPTIONAL dropdown won't accept a selection after ~2 attempts, LEAVE it (blank or whatever it currently shows) and move on. NEVER spend more than 2 tries on one optional field, and never let a single optional field block submission. Only fight a field this hard when it is REQUIRED (marked with *, or it blocks Next/Submit with a validation error). A submitted application with one optional field skipped beats a timeout with nothing submitted.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
 - Date fields: {datetime.now().strftime('%m/%d/%Y')}
