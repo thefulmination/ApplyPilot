@@ -2,6 +2,10 @@
 profile.json
 resume.txt
 resume.pdf
+# Machine-transfer bundles (wrap profile.json/resume/config — a .zip defeats the
+# loose-file ignores above, so the secrets would sail straight into git history)
+*.zip
+machine2-bundle.zip
 *.env
 .env.*
 !.env.example
