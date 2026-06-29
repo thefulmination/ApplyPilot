@@ -187,6 +187,23 @@ def _normalize_agent(agent: str | None) -> str:
     return normalized
 
 
+# Claude model TIER names. The fleet/CLI default --model is "sonnet" (a Claude tier),
+# and it flows into build_apply_agent_command for BOTH agents. Codex does not know
+# these names: `codex exec --model sonnet` fails the turn with "Model metadata for
+# `sonnet` not found" / "'sonnet' model is not supported", so Codex emits an error +
+# turn.failed and never prints a RESULT: line -> the parser returns no_result_line.
+# Strip them so Codex uses its own default model (the documented intent: "codex uses
+# its own default"). A genuine Codex model (e.g. "gpt-5-codex") is still passed through.
+_CLAUDE_MODEL_TIERS = {"sonnet", "opus", "haiku"}
+
+
+def _codex_model_args(model: str | None) -> list[str]:
+    """--model args for Codex, dropping Claude tier names so Codex uses its default."""
+    if model and model.strip().lower() not in _CLAUDE_MODEL_TIERS:
+        return ["--model", model]
+    return []
+
+
 def _codex_mcp_config_args(cdp_port: int) -> list[str]:
     """Return Codex -c overrides for the per-worker Playwright MCP server."""
     playwright_args = [
@@ -283,7 +300,7 @@ def build_apply_agent_command(
             "--verbose", "-",
         ]
 
-    model_args = ["--model", model] if model else []
+    model_args = _codex_model_args(model)
     return [
         config.get_codex_path(),
         "exec",
@@ -310,7 +327,7 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
             "--no-session-persistence",
             prompt,
         ]
-    model_args = ["--model", model] if model else []
+    model_args = _codex_model_args(model)
     return [
         config.get_codex_path(),
         "exec",
@@ -1245,7 +1262,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 "cost_usd": usage.get("total_cost_usd", 0),
                                 "turns": usage.get("turns", 0),
                             })
-                        elif msg_type == "error":
+                        elif msg_type in ("error", "turn.failed"):
+                            # Codex surfaces hard failures (e.g. an invalid --model, an
+                            # auth/quota error) as an `error` or `turn.failed` event and
+                            # then exits WITHOUT printing a RESULT: line. Capturing the
+                            # message into the transcript turns an opaque no_result_line
+                            # into a logged, diagnosable reason.
                             err = msg.get("message") or msg.get("error") or line
                             text_parts.append(str(err))
                             lf.write(str(err) + "\n")

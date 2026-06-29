@@ -94,6 +94,37 @@ def test_build_apply_agent_command_allows_codex_default_model(monkeypatch, tmp_p
     assert "--model" not in cmd
 
 
+def test_build_apply_agent_command_drops_claude_tier_model_for_codex(monkeypatch, tmp_path: Path) -> None:
+    """Regression: the fleet/CLI default --model is 'sonnet' (a Claude tier). Passing it
+    to `codex exec --model sonnet` fails the turn ("model not supported") so Codex never
+    prints a RESULT: line -> no_result_line. Codex must fall back to its own default."""
+    from applypilot.apply import launcher
+
+    monkeypatch.setattr(launcher.config, "get_codex_path", lambda: "codex.exe")
+    for tier in ("sonnet", "Opus", "haiku"):
+        cmd = launcher.build_apply_agent_command(
+            agent="codex",
+            model=tier,
+            mcp_config_path=tmp_path / ".mcp-apply-0.json",
+            cdp_port=9333,
+        )
+        assert "--model" not in cmd, f"codex must not receive Claude tier {tier!r}"
+        assert tier.lower() not in [c.lower() for c in cmd]
+
+    # A genuine Codex model is still forwarded.
+    cmd = launcher.build_apply_agent_command(
+        agent="codex",
+        model="gpt-5-codex",
+        mcp_config_path=tmp_path / ".mcp-apply-0.json",
+        cdp_port=9333,
+    )
+    assert cmd[:4] == ["codex.exe", "exec", "--model", "gpt-5-codex"]
+
+    # The canary path shares the same guard.
+    canary = launcher.build_agent_canary_command("codex", "sonnet")
+    assert "--model" not in canary
+
+
 def test_build_apply_agent_canary_command_uses_selected_agent(monkeypatch) -> None:
     from applypilot.apply import launcher
 
