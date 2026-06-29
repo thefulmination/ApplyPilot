@@ -1,9 +1,13 @@
-# run-fleet-worker.ps1 [-Slot N] [-Agent claude|codex] [-Model name]
+# run-fleet-worker.ps1 [-Slot N] [-Agent claude|codex] [-Model name] [-Label name]
 #   Launch ONE offsite apply worker. Use a DISTINCT -Slot per worker on the same machine
 #   (slot keys the browser profile + CDP port + logs so they don't collide).
-#   Run each in its own window:  .\run-fleet-worker.ps1 -Slot 0 -Agent codex
+#   Use a DISTINCT -Label per MACHINE (home box = "home", second box = e.g. "m2") so the
+#   worker-id (= "<Label>-<Slot>") is unique fleet-wide -- otherwise two machines both stamp
+#   "home-0" and lease attribution / monitoring can't tell them apart.
+#   Run each in its own window:  .\run-fleet-worker.ps1 -Slot 0 -Agent codex -Label m2
 #   Requires FLEET_PG_DSN already set (the setup script persists it). LinkedIn never runs here.
-param([int]$Slot = 0, [string]$Agent = "claude", [string]$Model = "")
+param([int]$Slot = 0, [string]$Agent = "claude", [string]$Model = "", [string]$Label = "home")
+$WorkerId = "$Label-$Slot"
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
@@ -41,5 +45,5 @@ $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 if (-not $env:FLEET_PG_DSN) { throw "FLEET_PG_DSN is not set (the setup script persists it; open a fresh window)." }
 
 $margs = @(); if ($Model) { $margs = @("--model", $Model) }
-Write-Host "[fleet-worker] worker home-$Slot  agent=$Agent  model=$(if($Model){$Model}else{'default'})  -> logs .applypilot\logs\worker-$Slot.log"
-& $exe --dsn $env:FLEET_PG_DSN --worker-id "home-$Slot" --chrome-slot $Slot --agent $Agent @margs
+Write-Host "[fleet-worker] worker $WorkerId  agent=$Agent  model=$(if($Model){$Model}else{'default'})  -> logs .applypilot\logs\worker-$Slot.log"
+& $exe --dsn $env:FLEET_PG_DSN --worker-id "$WorkerId" --chrome-slot $Slot --agent $Agent @margs
