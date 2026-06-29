@@ -1,3 +1,141 @@
+# Task 8 Report: applypilot-fleet-linkedin-home driver + push/approve/resolve LinkedIn helpers
+
+## Status: GREEN
+
+## RED phase
+Added two verbatim tests from the brief to `tests/test_fleet_linkedin_home.py`. Ran:
+```
+.conda-env/python.exe -m pytest tests/test_fleet_linkedin_home.py -q
+```
+Result:
+```
+FAILED tests/test_fleet_linkedin_home.py::test_linkedin_approve_gated_by_canary
+  ImportError: cannot import name 'linkedin_home_main' from 'applypilot.fleet'
+FAILED tests/test_fleet_linkedin_home.py::test_push_linkedin_jobs_dedup_key
+  AttributeError: module 'applypilot.fleet.queue' has no attribute 'push_linkedin_jobs'
+2 failed in 6.32s
+```
+
+## GREEN phase
+
+Implemented all required code. Ran:
+```
+.conda-env/python.exe -m pytest tests/test_fleet_linkedin_home.py -q
+```
+Result: `2 passed in 10.23s`
+
+Import check: `python -c "import applypilot.fleet.linkedin_home_main"` → `import OK`
+
+Regression check (`apply_home_main`, `linkedin_lane`, `sync`): `23 passed in 12.78s`
+
+## Files Changed
+
+| File | Action |
+|------|--------|
+| `tests/test_fleet_linkedin_home.py` | CREATED — verbatim tests from brief |
+| `src/applypilot/fleet/queue.py` | MODIFIED — added `push_linkedin_jobs`, `approve_linkedin_jobs`, `resolve_linkedin_challenge` |
+| `src/applypilot/fleet/sync.py` | MODIFIED — added `push_linkedin_eligible` |
+| `src/applypilot/fleet/linkedin_home_main.py` | CREATED — home driver |
+| `pyproject.toml` | MODIFIED — registered `applypilot-fleet-linkedin-home` entrypoint |
+
+## Approve Canary-Gate Trace
+
+`approve(conn, all_pushed=True)` calls `_linkedin_canary_armed(conn)`, which runs:
+```sql
+SELECT linkedin_canary_enabled FROM fleet_config WHERE id=1
+```
+- Returns `False` (default) → `raise SystemExit(...)` — test asserts `SystemExit` is raised.
+- After `set_linkedin_canary(conn, 1)` sets `linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1`:
+  - `_linkedin_canary_armed` returns `True`
+  - `approve` generates a UTC timestamp token, calls `approve_linkedin_jobs(conn, ['q1'], token)`
+  - `approve_linkedin_jobs` runs `UPDATE linkedin_queue SET approved_batch=%s ... WHERE url = ANY(%s) AND status='queued'`
+  - Test verifies `linkedin_queue.approved_batch == token` ✓
+
+The gate reads/writes ONLY `linkedin_canary_enabled` / `linkedin_canary_remaining` — never touches A's `canary_enabled` / `canary_remaining`.
+
+## dedup_key Confirmation
+
+`push_linkedin_jobs` computes:
+```python
+dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
+```
+This is the exact same `_dedup.dedup_key` call the offsite `push_apply_jobs` uses.
+
+Test asserts `r["dedup_key"] == _dedup.dedup_key("Acme", "COS")`. `"COS"` normalizes to `"chief of staff"` via `_ROLE_SYNONYMS`, so the key matches identically between lanes → cross-lane `applied_set` dedup works. ✓
+
+## Host-Filter Confirmation (push_linkedin_eligible)
+
+The `_PUSH_LINKEDIN_SELECT` query uses the INVERSE effective-host predicate:
+```sql
+AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+```
+vs. offsite (`_PUSH_APPLY_SELECT`):
+```sql
+AND application_url LIKE 'http%'
+AND application_url NOT LIKE '%linkedin.com%'
+```
+Rows stage UNAPPROVED (`approved_batch=None` by default); approval requires arming the LinkedIn canary first. ✓
+
+## Self-Review Checklist
+
+- [x] `approve` raises `SystemExit` unless `_linkedin_canary_armed` returns True
+- [x] `_linkedin_canary_armed` reads `linkedin_canary_enabled` NOT `canary_enabled`
+- [x] `set_linkedin_canary` / `lift_linkedin_canary` touch `linkedin_canary_*` columns only
+- [x] `push_linkedin_jobs` writes `dedup_key=_dedup.dedup_key(company, title)` (same function as offsite)
+- [x] `push_linkedin_eligible` uses inverse effective-host LinkedIn predicate, stages UNAPPROVED
+- [x] `resolve_linkedin_challenge` mirrors `resolve_challenge` over `linkedin_queue`
+- [x] Offsite functions `push_apply_jobs`, `approve_jobs`, `resolve_challenge`, `push_apply_eligible` are UNTOUCHED
+- [x] `_LEASE_APPLY`, `_LEASE_LINKEDIN` are UNTOUCHED
+- [x] `applypilot-fleet-linkedin-home` entrypoint registered in `pyproject.toml`
+- [x] dirty files not touched
+- [x] `git add` targets only the five exact paths from the brief
+
+## Concerns
+
+None.
+
+---
+
+# Task 8 Report: build_health_report (Fleet Watchdog Layer B reporting half)
+
+## Status: GREEN
+
+## RED phase
+After adding the two verbatim tests from the brief, ran:
+```
+.conda-env/python.exe -m pytest tests/test_fleet_monitor.py -q
+```
+Result: 2 failed (AttributeError: module 'applypilot.fleet.monitor' has no attribute 'build_health_report'), 2 passed.
+
+## GREEN phase
+Implemented `build_health_report` in `src/applypilot/fleet/monitor.py` as specified verbatim in the brief. Ran again:
+Result: 4 passed in 7.70s.
+
+## Files changed
+- `src/applypilot/fleet/monitor.py` — added module-level `build_health_report` function (45 lines); `MonitorActions` untouched
+- `tests/test_fleet_monitor.py` — added two new tests verbatim from brief
+
+## Commit
+SHA: c516688
+Subject: feat(fleet): monitor health-report generator with anomaly escalation
+
+## Self-review checklist
+- [x] All 6 section labels present: `MACHINES`, `QUEUES`, `GOVERNOR`, `CAPTCHA BACKLOG`, `SPEND`, `NEEDS YOUR DECISION`
+- [x] High-challenge scope (`host:bad.com`, rate=0.55 >= 0.4) appears in anomaly section
+- [x] Offline machine (`w2`, last_beat=None) appears in anomaly section
+- [x] Near-cap spend ($9.50 of $10.00 cap = 95% >= 90%) flagged; "cap" present in output
+- [x] Clean snapshot yields `"none"` in the NEEDS YOUR DECISION section
+- [x] All dict accesses use `.get(...)` defensively — no KeyError on partial snapshots
+- [x] Spend-near-cap flag only triggers when `cost_cap_total` is provided and > 0
+- [x] `MonitorActions` (Task 7) unchanged
+- [x] Only the two exact paths staged (`git add src/applypilot/fleet/monitor.py tests/test_fleet_monitor.py`)
+- [x] Not pushed
+
+## Concerns
+None.
+
+---
+
 # Task 8 Report: End-to-End Test + Full Suite (Frontier Quality Lane)
 
 ## TDD RED/GREEN
@@ -125,3 +263,73 @@ None. All 136 tests pass with no `src/` modifications. The deferred Opus cross-c
 - `tests/test_cli_providers.py`
 - `.superpowers/sdd/frontier-lane-followups.md` (new)
 - `.superpowers/sdd/task-8-report.md` (appended)
+
+---
+
+# Task 8 (Final) — Apply Lane A Canary Go-Live E2E + Runbook
+
+## e2e Status: GREEN (first run, no iteration)
+
+`tests/test_fleet_apply_e2e.py::test_canary_go_live_path` PASSED immediately.
+
+### Seed adjustment (host-gap avoidance)
+
+The brief's seed used `apply_domain='acme.com'` for all 5 rows.  Adjusted to
+distinct domains `acme0.com … acme4.com` per the task brief note.  Rationale: after
+the first confirmed apply, `write_apply_result` stamps `last_applied_at=now()` on
+`host:acme.com` and the next lease query blocks that host for ~90s.  Without distinct
+domains the second apply would be blocked by the host-gap governor rather than the
+canary, making `applied == 2` accidentally true for the wrong reason.  With distinct
+domains the CANARY (not the host gap) is what caps at K=2.  Minimal, correct
+adjustment per brief instructions.
+
+## Full Suite Gate
+
+Command:
+```
+.conda-env/python.exe -m pytest tests/test_fleet_*.py tests/test_codex_bridge.py \
+  tests/test_discovery_adapter.py tests/test_frontier_*.py tests/test_cli_providers.py \
+  tests/test_build_score_prompt_text.py -q
+```
+
+Result: **201 passed, 1 skipped, 0 failures** (50.53s)
+
+(The 1 skip is a pre-existing codex-bridge skip, unrelated to this task.)
+
+## Production Code Touched
+
+**None.** E2e passes against code built in Tasks 1–7 with zero production changes.
+
+## Self-Review
+
+**E2E proves the canary caps at exactly K then auto-pauses:**
+- Seeds 5 rows with distinct apply_domain (host-gap avoidance).
+- Arms canary K=2 via `hm.set_canary(conn, 2)`.
+- Approves all queued rows via `hm.approve(conn, all_pushed=True)` (the approve
+  call itself would refuse if the canary were not armed — double-tests that gate).
+- Runs 6 worker ticks (2 more than the budget) with a stub `apply_fn` returning
+  `{"run_status": "applied", "est_cost_usd": 0.01}`.
+- Asserts `applied == 2` (canary caps) AND `fleet_config.paused is True` (auto-pause).
+
+**Runbook covers:**
+- P1: v1-fleet-off precondition.
+- P2: watchdog-running requirement.
+- Ordered steps: pull → push → canary K → approve --all-pushed →
+  start applypilot-fleet-apply → applies ≤K then auto-pauses →
+  pull + review + challenges/resolve-challenge →
+  canary N or lift-canary + set spend_cap_usd.
+- Residuals: aggregator/push cross-check, approved_batch presence-stamp,
+  per-destination block risk, spend_cap_usd=0 means no cap.
+
+## Files Created
+
+- `tests/test_fleet_apply_e2e.py`
+- `docs/fleet-apply-lane-runbook.md`
+
+## Files Modified (production code)
+
+None.
+
+## Concerns
+
+None.
