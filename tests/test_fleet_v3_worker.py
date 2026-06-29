@@ -406,6 +406,12 @@ def test_scrub_redacts_dsn_and_tokens(monkeypatch):
         "postgresql://postgres:hunter2@localhost:5432/applypilot_fleet\n"
         "Authorization: Bearer sk-deadbeefdeadbeefdeadbeefdeadbeef00\n"
         "leaked token ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\n"
+        # JSON `"key":"value"` form: the closing quote of the KEY sits between the
+        # keyword and the colon. A naive `keyword[:=]` pattern never matches here,
+        # so these short, never-in-env values would leak unless the regex handles
+        # the quoted-key form explicitly. (Regression guard for the S1 bypass.)
+        'agent error body: {"error":"auth","api_key":"AKIAEXAMPLE12345","password":"S3cretDbPw"}\n'
+        '  spaced json: { "token": "abc123def456" }\n'
     )
     out = _scrub(tb)
     # No secret material survives.
@@ -413,7 +419,10 @@ def test_scrub_redacts_dsn_and_tokens(monkeypatch):
                  "sk-deadbeefdeadbeefdeadbeefdeadbeef00",
                  "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
                  "postgresql://postgres:hunter2@localhost",
-                 "dbname=applypilot_fleet"):
+                 "dbname=applypilot_fleet",
+                 # JSON-form values (short + not present in os.environ): these are the
+                 # exact strings the broken pattern let through.
+                 "AKIAEXAMPLE12345", "S3cretDbPw", "abc123def456"):
         assert leak not in out, f"secret leaked through _scrub: {leak!r}"
     assert "[REDACTED]" in out
     # The benign frame text survives so the traceback is still useful.

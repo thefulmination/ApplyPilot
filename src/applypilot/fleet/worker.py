@@ -66,7 +66,10 @@ _SECRET_PATTERNS = [
     # postgres:// (and other) URL DSNs, incl. embedded user:pass@host credentials.
     re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s'\"]+"),
     # JSON / header style "password": "...", token=..., api_key: ...
-    re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*['\"]?\S+"),
+    # NOTE: the optional ['\"]? BEFORE the separator lets the keyword's own closing
+    # quote sit between it and the colon (JSON `"api_key":"..."`); the value class
+    # [^\s,'\"}{]+ stops at JSON/quote delimiters so we redact exactly the value.
+    re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key)\b['\"]?\s*[:=]\s*['\"]?[^\s,'\"}{]+"),
     # Authorization: Bearer <token>
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"),
     # Known token prefixes: OpenAI-style sk-..., GitHub ghp_/gho_/ghs_..., etc.
