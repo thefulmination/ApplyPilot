@@ -3,6 +3,14 @@ from __future__ import annotations
 import time
 
 
+def _stub_discovery_finalizers(monkeypatch) -> None:
+    from applypilot import database
+
+    monkeypatch.setattr(database, "get_connection", lambda: object())
+    monkeypatch.setattr(database, "dedupe_existing_jobs", lambda _conn: {"duplicates": 0, "groups": 0})
+    monkeypatch.setattr(database, "get_scrape_quality_report", lambda _conn: {"boards": []})
+
+
 def test_fast_discovery_mode_keeps_role_hiringcafe_but_disables_company_watchlist() -> None:
     from applypilot import pipeline
 
@@ -34,7 +42,9 @@ def test_safe_discovery_mode_uses_parallel_safe_sources_and_serial_jobspy() -> N
 
     tasks = pipeline._discover_source_tasks(cfg, workers=6, discover_mode="safe")
 
-    assert next(task for task in tasks if task["name"] == "jobspy")["serial"] is True
+    jobspy = next(task for task in tasks if task["name"] == "jobspy")
+    assert jobspy["serial"] is True
+    assert jobspy["workers"] == 5
     assert next(task for task in tasks if task["name"] == "public_boards")["serial"] is False
     assert next(task for task in tasks if task["name"] == "corporate_ats")["workers"] == 8
     assert next(task for task in tasks if task["name"] == "workday")["workers"] == 4
@@ -43,6 +53,8 @@ def test_safe_discovery_mode_uses_parallel_safe_sources_and_serial_jobspy() -> N
 
 def test_parallel_discovery_scheduler_runs_safe_tasks_concurrently(monkeypatch) -> None:
     from applypilot import pipeline
+
+    _stub_discovery_finalizers(monkeypatch)
 
     events: list[tuple[str, float]] = []
 
@@ -74,6 +86,8 @@ def test_parallel_discovery_scheduler_runs_safe_tasks_concurrently(monkeypatch) 
 def test_discovery_scheduler_marks_source_errors_partial(monkeypatch) -> None:
     from applypilot import pipeline
 
+    _stub_discovery_finalizers(monkeypatch)
+
     def broken() -> dict:
         raise RuntimeError("rate limited")
 
@@ -91,6 +105,8 @@ def test_discovery_scheduler_marks_source_errors_partial(monkeypatch) -> None:
 
 def test_discovery_scheduler_marks_error_counts_partial(monkeypatch) -> None:
     from applypilot import pipeline
+
+    _stub_discovery_finalizers(monkeypatch)
 
     tasks = [
         {

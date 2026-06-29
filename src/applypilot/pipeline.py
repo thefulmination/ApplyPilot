@@ -161,16 +161,17 @@ def _discover_source_tasks(search_cfg: dict, workers: int, discover_mode: str = 
 
     tasks: list[dict] = []
 
+    jobspy_workers = min(_configured_workers(base_cfg, "jobspy", workers), 5)
     tasks.append(task(
         "jobspy",
         "JobSpy full crawl",
         _source_enabled(base_cfg, "jobspy", True),
         True,
-        lambda cfg=base_cfg: __import__(
+        lambda cfg=base_cfg, jobspy_workers=jobspy_workers: __import__(
             "applypilot.discovery.jobspy", fromlist=["run_discovery"]
-        ).run_discovery(cfg=cfg),
+        ).run_discovery(cfg=cfg, workers=jobspy_workers),
         base_cfg,
-        1,
+        jobspy_workers,
     ))
     tasks.append(task(
         "public_boards",
