@@ -35,6 +35,7 @@ import math
 import os
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from applypilot.apply import pgqueue
@@ -204,6 +205,67 @@ def _linkedin_summary(conn) -> dict:
     }
 
 
+def _discovery(conn) -> dict:
+    """Discovery-lane status (READ-ONLY, PG-only — never touches the SQLite brain):
+    the search_tasks work-list, the discovered_postings staging area, and discovery-worker
+    liveness (worker_heartbeat role='discovery', alive = beat within 150s)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS total, count(*) FILTER (WHERE enabled) AS enabled, "
+            "       count(*) FILTER (WHERE enabled AND next_due_at IS NOT NULL "
+            "                        AND next_due_at <= now()) AS due_now "
+            "FROM search_tasks"
+        )
+        t = dict(cur.fetchone())
+        cur.execute(
+            "SELECT count(*) AS total, "
+            "       count(*) FILTER (WHERE synced_to_home_at IS NULL) AS pending, "
+            "       count(*) FILTER (WHERE discovered_at > now() - interval '24 hours') AS last24h "
+            "FROM discovered_postings"
+        )
+        d = dict(cur.fetchone())
+        cur.execute(
+            "SELECT wh.worker_id, wh.state, wh.last_beat, "
+            "       (SELECT COUNT(*) FROM discovered_postings dp "
+            "          WHERE dp.worker_id = wh.worker_id "
+            "            AND dp.discovered_at > now() - interval '24 hours') AS found_24h "
+            "FROM worker_heartbeat wh WHERE wh.role = 'discovery' ORDER BY wh.worker_id"
+        )
+        wrows = cur.fetchall()
+        cur.execute(
+            "SELECT dp.discovered_at, dp.source_label, st.query, st.board "
+            "FROM discovered_postings dp LEFT JOIN search_tasks st ON st.task_id = dp.task_id "
+            "ORDER BY dp.discovered_at DESC LIMIT 10"
+        )
+        rrows = cur.fetchall()
+    conn.rollback()  # read-only
+    workers = []
+    for r in wrows:
+        secs = _seconds_since(r["last_beat"])
+        workers.append({
+            "worker_id": r["worker_id"],
+            "alive": bool(secs is not None and secs <= _HB_ALIVE_SECONDS),
+            "last_beat": _iso(r["last_beat"]),
+            "seconds_since": secs,
+            "state": r["state"],
+            "found_24h": int(r["found_24h"] or 0),
+        })
+    recent = [{
+        "time": _iso(r["discovered_at"]),
+        "source": r["source_label"],
+        "query": r["query"],
+        "board": r["board"],
+    } for r in rrows]
+    return {
+        "tasks": {"total": int(t["total"] or 0), "enabled": int(t["enabled"] or 0),
+                  "due_now": int(t["due_now"] or 0)},
+        "postings": {"total": int(d["total"] or 0), "pending_ingest": int(d["pending"] or 0),
+                     "last24h": int(d["last24h"] or 0)},
+        "workers": workers,
+        "recent": recent,
+    }
+
+
 def build_status() -> dict:
     """Assemble the full /api/status object. Opens its OWN short-lived connections
     (each helper rolls back and we always close) so no connection is ever leaked."""
@@ -219,6 +281,14 @@ def build_status() -> dict:
         ch = cb._challenges(conn)
         challenges = len(ch.get("challenges", []))
         linkedin = _linkedin_summary(conn)
+        try:
+            discovery = _discovery(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            discovery = None
     finally:
         try:
             conn.rollback()
@@ -233,6 +303,7 @@ def build_status() -> dict:
         "recent": recent,
         "challenges": challenges,
         "linkedin": linkedin,
+        "discovery": discovery,
     }
 
 
@@ -284,8 +355,82 @@ def _do_set_cap(conn, body: dict) -> str:
     return f"Spend cap set to {cap_txt}."
 
 
+def _searches_config_path() -> str:
+    """Locate the project's searches config. Prefer APPLYPILOT_DIR (the launcher sets it),
+    else <repo>/.applypilot/searches.yaml. Raises if absent."""
+    candidates = []
+    app_dir = os.environ.get("APPLYPILOT_DIR")
+    if app_dir:
+        candidates.append(os.path.join(app_dir, "searches.yaml"))
+    repo_root = Path(__file__).resolve().parents[3]  # fleet -> applypilot -> src -> repo
+    candidates.append(str(repo_root / ".applypilot" / "searches.yaml"))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError("searches.yaml not found (set APPLYPILOT_DIR or place it in .applypilot/)")
+
+
+def _apply_searches_to_fleet(cfg: dict) -> dict:
+    """Translate the apply tool's searches.yaml (queries/locations/sites) into the fleet
+    discovery scheduler's {'searches':[...]} shape. A config that already has 'searches' is
+    returned unchanged.
+
+    SAFETY: LinkedIn is EXCLUDED from discovery boards. The home box holds the LinkedIn apply
+    session (the catastrophe lane); anonymous LinkedIn scraping from that IP could correlate
+    and endanger it. Discovery scrapes the non-LinkedIn boards (e.g. indeed) only."""
+    if cfg.get("searches"):
+        return cfg  # already fleet-native
+    queries = []
+    for q in (cfg.get("queries") or []):
+        val = q.get("query") if isinstance(q, dict) else q
+        if val:
+            queries.append(val)
+    boards = [s for s in (cfg.get("sites") or ["indeed"]) if s != "linkedin"] or ["indeed"]
+    locations = []
+    for loc in (cfg.get("locations") or []):
+        if isinstance(loc, dict) and loc.get("location"):
+            locations.append(loc["location"])
+        elif isinstance(loc, str) and loc:
+            locations.append(loc)
+    if "Remote" not in locations:
+        locations.append("Remote")
+    if not locations:
+        locations = ["Remote"]
+    defaults = cfg.get("defaults") or {}
+    params = {
+        "results_wanted": int(defaults.get("results_per_site", 50)),
+        "hours_old": int(defaults.get("hours_old", 72)),
+    }
+    searches = [{"query": q, "boards": boards, "locations": locations, "params": params}
+                for q in queries]
+    return {"searches": searches}
+
+
+def _do_expand_searches(conn, body: dict) -> str:
+    """Seed/refresh search_tasks from searches.yaml (PG-only — does NOT write the brain and
+    does NOT submit any application). Calls the scheduler directly so the console never has to
+    import the JobSpy-heavy discovery worker module."""
+    from applypilot.fleet.scheduler import expand_search_config  # lazy: keeps the console light
+    path = _searches_config_path()
+    if path.endswith((".yaml", ".yml")):
+        import yaml
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
+    else:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    config = _apply_searches_to_fleet(raw)
+    n = expand_search_config(conn, config)
+    conn.commit()  # run_action rolls back in finally, so write actions must commit themselves
+    roles = len(config.get("searches") or [])
+    return (f"Seeded/refreshed {n} search task(s) across {roles} roles "
+            f"(LinkedIn excluded from discovery for safety). Discovery workers will pick them up.")
+
+
 # Explicit allow-list. The handler indexes THIS dict by the action string; it never
 # eval()s or getattr()s anything derived from the request. Any other action -> 400.
+# NOTE: discovery's expand_searches is PG-only (no brain write); there is deliberately NO
+# brain-ingest ("pull") action and NO LinkedIn action on this surface.
 _ACTIONS = {
     "arm_canary": _do_arm_canary,
     "lift_canary": _do_lift_canary,
@@ -293,6 +438,7 @@ _ACTIONS = {
     "resume": _do_resume,
     "reclaim": _do_reclaim,
     "set_cap": _do_set_cap,
+    "expand_searches": _do_expand_searches,
 }
 
 
@@ -570,6 +716,28 @@ _INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section>
+    <h2>Discovery lane</h2>
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="label">Search tasks</div>
+        <div class="val" id="dTasks">&mdash;</div><div class="hint" id="dTasksHint">enabled</div></div>
+      <div class="card"><div class="label">Due now</div>
+        <div class="val" id="dDue">&mdash;</div><div class="hint">ready to scrape</div></div>
+      <div class="card"><div class="label">Postings staged</div>
+        <div class="val" id="dStaged">&mdash;</div><div class="hint" id="dStagedHint">pending ingest</div></div>
+      <div class="card"><div class="label">Found (24h)</div>
+        <div class="val" id="dFound24">&mdash;</div><div class="hint">new postings</div></div>
+    </div>
+    <div class="controls" style="margin-bottom:12px">
+      <button class="go" id="btnExpand">Expand searches (seed tasks)</button>
+      <span class="mut" style="font-size:12px">Seeds <code>search_tasks</code> from searches.yaml &mdash; queues scrape work, submits nothing. Discovery workers run per-machine (<code>applypilot-fleet-discovery</code>).</span>
+    </div>
+    <table><thead><tr><th>Discovery worker</th><th>Live</th><th>Last beat</th><th>Found 24h</th></tr></thead>
+      <tbody id="discWorkers"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+    <table style="margin-top:10px"><thead><tr><th>Found</th><th>Source</th><th>Search</th></tr></thead>
+      <tbody id="discRecent"><tr><td colspan="3" class="mut">&hellip;</td></tr></tbody></table>
+  </section>
+
+  <section>
     <h2>LinkedIn (read-only &mdash; the catastrophe lane has no controls here)</h2>
     <div class="li-strip">
       <div class="chip">Queued: <b id="liQueued">&mdash;</b></div>
@@ -653,6 +821,31 @@ function render(s){
   document.getElementById("liApplied").textContent = li.applied;
   document.getElementById("liCanary").textContent = li.canary_enabled ? "armed" : "off";
   document.getElementById("liHalted").textContent = li.halted ? "YES" : "no";
+
+  const d = s.discovery;
+  if(d){
+    document.getElementById("dTasks").textContent = d.tasks.total;
+    document.getElementById("dTasksHint").textContent = d.tasks.enabled + " enabled";
+    document.getElementById("dDue").textContent = d.tasks.due_now;
+    document.getElementById("dStaged").textContent = d.postings.total;
+    document.getElementById("dStagedHint").textContent = d.postings.pending_ingest + " pending ingest";
+    document.getElementById("dFound24").textContent = d.postings.last24h;
+    const dw = document.getElementById("discWorkers");
+    if(!d.workers.length){ dw.innerHTML = '<tr><td colspan="4" class="mut">no discovery workers heartbeating &mdash; start one with applypilot-fleet-discovery</td></tr>'; }
+    else dw.innerHTML = d.workers.map(w=>{
+      const beat = w.last_beat ? (rel(w.last_beat)+(w.seconds_since!=null?" ("+w.seconds_since+"s)":"")) : "never";
+      return '<tr><td>'+esc(w.worker_id)+'</td>'+
+        '<td><span class="ldot '+(w.alive?"on":"off")+'"></span>'+(w.alive?"alive":"down")+'</td>'+
+        '<td class="mut">'+esc(beat)+'</td><td>'+(w.found_24h||0)+'</td></tr>';
+    }).join("");
+    const dr = document.getElementById("discRecent");
+    if(!d.recent.length){ dr.innerHTML = '<tr><td colspan="3" class="mut">no postings discovered yet</td></tr>'; }
+    else dr.innerHTML = d.recent.map(r=>{
+      const search = esc([r.query,r.board].filter(Boolean).join(" · "));
+      return '<tr><td class="mut">'+esc(rel(r.time))+'</td><td>'+esc(r.source||"—")+
+        '</td><td>'+(search||'<span class="mut">—</span>')+'</td></tr>';
+    }).join("");
+  }
 }
 
 async function poll(){
@@ -696,6 +889,9 @@ document.getElementById("btnCap").onclick = ()=>{
   act("set_cap", {usd},
     "Set spend cap to $"+usd.toFixed(2)+" → the fleet halts once total est cost reaches this. ($0 = NO cap.) Continue?");
 };
+
+document.getElementById("btnExpand").onclick = ()=>act("expand_searches", null,
+  "Expand searches → seed/refresh the discovery queue (search_tasks) from your searches.yaml. This queues scrape work; it does NOT submit any applications and does NOT write your brain. Continue?");
 
 poll();
 setInterval(poll, 4000);

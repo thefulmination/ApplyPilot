@@ -16,6 +16,8 @@ $Port      = 8787   # 8765 is used by an unrelated local app (radio_digest); 878
 # the reused fleet helpers (pgqueue.connect / codex_bridge). Never echoed to the console.
 $env:APPLYPILOT_FLEET_DSN = $FleetDsn
 $env:FLEET_PG_DSN         = $FleetDsn
+# So the "Expand searches" button can find searches.yaml (PG-only seed; no brain access).
+$env:APPLYPILOT_DIR       = Join-Path $RepoRoot ".applypilot"
 
 Set-Location $RepoRoot
 
