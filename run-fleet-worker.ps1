@@ -12,6 +12,16 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
+# Guard against the multi-tab collision: refuse a SECOND worker on the SAME worker-id/slot.
+# Multiple processes on one slot share ONE Chrome profile + CDP debug port and fight over it
+# (the "3-4 tabs, stuck/crash" symptom). For parallelism use DISTINCT -Slot values (each gets
+# its own isolated browser), or run-fleet-workers.ps1 -Count N.
+$dupe = Get-CimInstance Win32_Process -Filter "Name='applypilot-fleet-apply.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match ('--worker-id\s+"?' + [regex]::Escape($WorkerId) + '"?(\s|$)') }
+if ($dupe) {
+  throw "Worker '$WorkerId' (slot $Slot) is ALREADY running (PID $($dupe.ProcessId -join ', ')). Another worker on the SAME slot collides on one Chrome. Use a different -Slot for parallelism, or stop the existing one first."
+}
+
 # Python env: the home box uses .conda-env; a bootstrapped machine uses .venv. Find whichever exists.
 $exe = $null
 foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
