@@ -5,6 +5,26 @@ import time
 from pathlib import Path
 
 
+def test_safe_job_prefix_removes_control_whitespace_and_windows_invalid_chars():
+    from applypilot.scoring import cover_letter, tailor
+
+    job = {
+        "url": "https://example.com/unsafe-title",
+        "title": "Business Operations Associate\nSan Francisco",
+        "site": "Whipple Learning Co\r\t/ East:West",
+        "location": "Remote",
+    }
+
+    for module in (tailor, cover_letter):
+        prefix = module._safe_job_prefix(job)
+
+        assert "\n" not in prefix
+        assert "\r" not in prefix
+        assert "\t" not in prefix
+        assert not any(char in prefix for char in '<>:"/\\|?*')
+        assert "Business_Operations_Associate_San_Francisco" in prefix
+
+
 class _SelectResult:
     def __init__(self, rows: list[dict]):
         self._rows = rows

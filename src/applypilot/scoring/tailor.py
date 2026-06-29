@@ -9,11 +9,9 @@ is always code-injected, never LLM-generated. Each retry starts a fresh conversa
 to avoid apologetic spirals.
 """
 
-import hashlib
 import json
 import logging
 import os
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -21,6 +19,7 @@ from datetime import datetime, timezone
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile, load_resume_strategy
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.filenames import safe_job_prefix
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     sanitize_text,
@@ -140,13 +139,7 @@ def _usage_for_report(client) -> dict:
 
 def _safe_job_prefix(job: dict) -> str:
     """Readable, stable filename prefix that avoids collisions for duplicate titles."""
-    safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-    safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-    fingerprint_source = job.get("url") or "|".join(
-        str(job.get(key, "")) for key in ("site", "title", "location")
-    )
-    fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:8]
-    return f"{safe_site}_{safe_title}_{fingerprint}"
+    return safe_job_prefix(job)
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────

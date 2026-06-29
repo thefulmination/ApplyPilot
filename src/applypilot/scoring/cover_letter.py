@@ -5,7 +5,6 @@ postings. All personal data (name, skills, achievements) comes from the user's
 profile at runtime. No hardcoded personal information.
 """
 
-import hashlib
 import logging
 import os
 import re
@@ -16,6 +15,7 @@ from datetime import datetime, timezone
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile, load_resume_strategy
 from applypilot.database import get_connection
 from applypilot.llm import get_client
+from applypilot.scoring.filenames import safe_job_prefix
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     LLM_LEAK_PHRASES,
@@ -48,13 +48,7 @@ def _model_is_available(model: str) -> bool:
 
 def _safe_job_prefix(job: dict) -> str:
     """Readable, stable filename prefix that avoids collisions for duplicate titles."""
-    safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-    safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-    fingerprint_source = job.get("url") or "|".join(
-        str(job.get(key, "")) for key in ("site", "title", "location")
-    )
-    fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:8]
-    return f"{safe_site}_{safe_title}_{fingerprint}"
+    return safe_job_prefix(job)
 
 
 def _build_cover_model_plan() -> list[dict]:
