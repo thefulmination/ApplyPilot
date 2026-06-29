@@ -153,6 +153,12 @@ CREATE TABLE IF NOT EXISTS rate_governor (
 -- exactly on recovery. NULL is treated as "base == current min_gap_seconds".
 ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS base_min_gap_seconds INTEGER;
 ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS halted_until TIMESTAMPTZ;
+-- A3: a recency stamp for EVERY lease/outcome (success + captcha + block), distinct from
+-- last_applied_at (which is stamped ONLY on a confirmed apply). The ATS apply lease gates the
+-- min-gap / Doctor floor off COALESCE(last_applied_at, last_attempt_at) so a never-succeeded
+-- (hard-blocking) host -- whose last_applied_at is forever NULL -- is still spaced by the breaker
+-- gap AND the Doctor's doctor_min_gap_floor, instead of leasing back-to-back at zero spacing.
+ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
 
 -- ---------------------------------------------------------------------------
 -- llm_usage cost ledger (R14). The CAP lives in fleet_config; this is the spend log.
@@ -328,3 +334,134 @@ CREATE TABLE IF NOT EXISTS command_acks (
     acked_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (command_id, worker_id)
 );
+
+-- ===========================================================================
+-- FLEET DOCTOR v1 (this file's only auto-remediation layer).
+--
+-- The Doctor reads the centralized failure data (apply_queue.apply_error,
+-- worker_heartbeat.last_error/recent_log) and applies BOUNDED, REVERSIBLE,
+-- MONOTONICALLY-CONSERVATIVE auto-fixes. Every auto action it takes can ONLY make
+-- the fleet MORE conservative (skip a host, un-approve queued rows, quarantine a
+-- poison url, pace down / pause, or RAISE a timeout within a ceiling); it can never
+-- un-pause, re-approve, raise the spend cap, lower the gap, or touch LinkedIn. The
+-- two tables below are its KNOBS (active conservative state) + its AUDIT LOG.
+-- ===========================================================================
+
+-- fleet_config: a NEW, bounded apply-agent timeout override. NULL = use the
+-- env/default (APPLYPILOT_AGENT_TIMEOUT). The Doctor only ever RAISES it within a
+-- ceiling (timeout_bump); a longer timeout is conservative (it lets a slow page
+-- finish instead of being killed + retried, which would re-hit the host). The apply
+-- worker prefers this value over the env when it is set.
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS agent_timeout_override INTEGER;
+
+-- ===========================================================================
+-- FLEET DOCTOR HARDENING (red-team H1-H19): EFFECT-level monotonicity.
+-- ===========================================================================
+
+-- H1 (CATASTROPHE FIX): an ATS-ONLY pause flag. The Doctor's lane-pause writes THIS,
+-- never fleet_config.paused. The apply lease/worker honor ats_paused; the LinkedIn lane
+-- (_LEASE_LINKEDIN + linkedin_should_halt) NEVER reads it, so a Doctor pause can never
+-- halt the LinkedIn catastrophe lane. fleet_config.paused stays the shared operator/cost
+-- kill switch (still read by BOTH lanes' should_halt); the Doctor is forbidden to touch it.
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS ats_paused BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- H2 (AGGREGATE BUDGET): per-day blast-radius counters the Doctor decrements against. The
+-- date anchor rolls the counters once per UTC day. NULL anchor / mismatched day == fresh.
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_budget_day        DATE;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_host_skips_today  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_pace_actions_today INTEGER NOT NULL DEFAULT 0;
+
+-- H18 (above-the-fold signal): the Doctor's last-pass timestamp + active auto-fix snapshot,
+-- so /api/status (the 4s poll) can show a "Doctor" card + fire a toast on a new auto-fix
+-- WITHOUT folding the heavy diagnostics blob into the fast poll.
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_last_pass_at TIMESTAMPTZ;
+
+-- H5/H8 (pause debounce + provenance): persist when the Doctor armed a lane-pause (2-pass
+-- debounce) and remember that the ACTIVE ats_paused was set by the Doctor (so it auto-reverts
+-- only its OWN pause and the console can label provenance). pause_source: NULL|'doctor'.
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_pause_armed_at TIMESTAMPTZ;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS ats_pause_source      TEXT;
+
+-- A6: consecutive-systemic-pass counter. The N4 systemic classifier emits ONE de-duplicated
+-- distinct-severity alert only on the Nth consecutive systemic pass (so a single flagged home_IP
+-- mis-classified as systemic doesn't spam, and a permanently-systemic fleet emits one escalation
+-- rather than latching recommend-only silently). Reset to 0 on the first non-systemic pass.
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_systemic_streak INTEGER NOT NULL DEFAULT 0;
+
+-- N2 (DOCTOR-OWNED, NON-SHARED ACTUATORS): two columns the Doctor SOLELY owns on a host:<h>
+-- governor scope, so the watchdog breaker (which owns min_gap_seconds/base_min_gap_seconds/
+-- breaker_state) and the Doctor never clobber each other.
+--   doctor_min_gap_floor  -- H4: the lease uses GREATEST(min_gap_seconds, doctor_min_gap_floor)
+--                            so a Doctor pace is monotone-by-construction and the breaker's
+--                            min_gap restore can never wipe it.
+--   doctor_skip_until     -- H6: host_skip becomes a self-expiring leasable FILTER (the lease
+--                            adds AND COALESCE(doctor_skip_until,'-infinity') < now()) instead
+--                            of NULLing approved_batch -- vetted approval is preserved.
+ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS doctor_min_gap_floor INTEGER;
+ALTER TABLE rate_governor ADD COLUMN IF NOT EXISTS doctor_skip_until    TIMESTAMPTZ;
+-- NOTE: the fleet_diagnoses audit columns (H19/H13) are added AFTER that table is created,
+-- at the bottom of this file -- ADD COLUMN here would fail (the table doesn't exist yet).
+
+-- fleet_knobs: ACTIVE conservative state the Doctor sets (and a human can REVERSE).
+-- A host_skip knob makes a re-push/approve respect the skip; a timeout_bump knob is
+-- the audit twin of fleet_config.agent_timeout_override. TTL'd via expires_at so a
+-- transient host block self-heals; the sweep deactivates expired rows each run.
+CREATE TABLE IF NOT EXISTS fleet_knobs (
+    id          BIGSERIAL PRIMARY KEY,
+    knob_type   TEXT NOT NULL,                      -- 'host_skip'|'timeout_bump'|'quarantine'|'pace_or_pause'
+    scope_key   TEXT,                               -- host / lane / url the knob applies to
+    value_text  TEXT,                               -- e.g. the new timeout, the new min_gap, 'paused'
+    reason      TEXT,
+    created_by  TEXT NOT NULL DEFAULT 'doctor',
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_knobs_active
+    ON fleet_knobs (active, knob_type, scope_key);
+
+-- H9 (singleton / race-proof idempotency): at most ONE active knob per (knob_type, scope_key).
+-- With INSERT ... ON CONFLICT DO NOTHING this makes a duplicate-knob write from two racing
+-- Doctor passes a no-op at the DB level (the advisory lock in run_doctor is the first line of
+-- defense; this index is the backstop). A12: the de-dup of a NULL scope_key works ONLY because
+-- of COALESCE(scope_key,''): Postgres treats two NULLs as DISTINCT in a UNIQUE index (NULLs do
+-- NOT collide), so WITHOUT the COALESCE two active (knob_type, NULL) knobs would both be allowed
+-- and the H9 race would re-open for any NULL-scope knob. The COALESCE(...,'') is therefore
+-- LOAD-BEARING -- it maps NULL -> '' so they collide. Do NOT "simplify" it away.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_fleet_knobs_one_active
+    ON fleet_knobs (knob_type, COALESCE(scope_key, '')) WHERE active;
+
+-- fleet_diagnoses: the Doctor's AUDIT LOG + the human RECOMMENDATION queue. Every
+-- auto action writes one row (what + why + evidence + how_to_reverse + expires_at);
+-- everything the Doctor finds that is NOT one of the four conservative auto-fixes
+-- becomes a status='recommended' row for a human (never auto-applied).
+CREATE TABLE IF NOT EXISTS fleet_diagnoses (
+    id             BIGSERIAL PRIMARY KEY,
+    cluster_key    TEXT,                             -- reason|host|machine|lane signature (idempotency key)
+    reason         TEXT,
+    host           TEXT,
+    machine        TEXT,
+    lane           TEXT,
+    sample_count   INT,
+    severity       TEXT,                             -- 'info'|'warn'|'severe'
+    diagnosis      TEXT,                             -- rule-templated, NO LLM in v1 (hook reserved)
+    recommendation TEXT,
+    auto_action    TEXT,                             -- the knob_type applied, or NULL for a recommendation
+    how_to_reverse TEXT,
+    status         TEXT NOT NULL DEFAULT 'open',     -- open|auto_applied|recommended|applied|dismissed|reverted|expired
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_diagnoses_status
+    ON fleet_diagnoses (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_fleet_diagnoses_cluster
+    ON fleet_diagnoses (cluster_key) WHERE status IN ('auto_applied','recommended','open');
+
+-- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on
+-- the diagnosis row, so a Reverse / audit can report exactly which/how-many rows were affected,
+-- how many prior incidents, and how broad the block was -- without re-deriving from transient state.
+ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS rows_affected        INTEGER;
+ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS prior_incident_count INTEGER;
+ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS distinct_hosts       INTEGER;
+ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS distinct_workers     INTEGER;

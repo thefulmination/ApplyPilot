@@ -354,8 +354,14 @@ def test_throttled_host_still_leases_and_gap_does_not_compound(fleet_db):
             cur.execute("SELECT min_gap_seconds, base_min_gap_seconds FROM rate_governor WHERE scope_key=%s", (sk,))
             r = cur.fetchone()
             assert r["base_min_gap_seconds"] == 10 and r["min_gap_seconds"] == 30  # base captured, 3x gap
-        # throttled host is STILL leasable (no last_applied stamp yet -> gap open), unlike paused
+        # throttled host is STILL leasable (unlike paused). A3: record_outcome now stamps
+        # last_attempt_at, so wind it back past the 30s throttled gap to open the lease window
+        # (the throttle widens the GAP, it does not block leasing outright like a pause).
         _seed_apply(conn, "t1", host="thr.io", score=9)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE rate_governor SET last_attempt_at = now() - interval '1 hour' "
+                        "WHERE scope_key=%s", (sk,))
+        conn.commit()
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is not None
         # recover -> gap restored to the pristine base (no 3x->9x compounding)
         governor.roll_window(conn)

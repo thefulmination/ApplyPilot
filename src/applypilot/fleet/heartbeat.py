@@ -169,11 +169,19 @@ def quarantine_job(conn, url, *, worker, reason, threshold=3, commit=True, manua
                    crash_count = poison_jobs.crash_count + 1,
                    last_worker = EXCLUDED.last_worker,
                    reason      = EXCLUDED.reason
+               WHERE poison_jobs.quarantined_at IS NULL
                RETURNING crash_count, quarantined_at""",
             (url, worker, reason),
         )
         row = cur.fetchone()
         newly = False
+        if row is None:
+            # Conflict on an already-quarantined url: the guarded DO UPDATE
+            # matched nothing, so crash_count was NOT bumped. Nothing to do —
+            # never pollute a clean (incl. manual) quarantine's crash signal.
+            if commit:
+                conn.commit()
+            return False
         if row["crash_count"] >= threshold and row["quarantined_at"] is None:
             cur.execute(
                 "UPDATE poison_jobs SET quarantined_at = now(), reason = %s "

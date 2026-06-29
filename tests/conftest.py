@@ -26,7 +26,7 @@ _V3_TABLES = [
     "compute_queue", "search_tasks", "linkedin_queue", "rate_governor", "llm_usage",
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "command_acks",
-    "fleet_assets", "discovered_postings",
+    "fleet_assets", "discovered_postings", "fleet_knobs", "fleet_diagnoses",
 ]
 
 
@@ -104,8 +104,13 @@ def fleet_db(fleet_pg):
                 cur.execute(f"TRUNCATE {t};")
             cur.execute("UPDATE fleet_config SET spend_cap_usd=0, paused=FALSE, "
                         "cost_cap_daily_usd=0, cost_cap_total_usd=0, "
-                        "last_window_roll_at=NULL, "
+                        "last_window_roll_at=NULL, agent_timeout_override=NULL, "
                         "canary_enabled=FALSE, canary_remaining=NULL, "
-                        "linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL WHERE id=1;")
+                        "linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL, "
+                        # Fleet Doctor hardening columns (H1/H2/H5/H8/H18) -- reset per test.
+                        "ats_paused=FALSE, ats_pause_source=NULL, doctor_budget_day=NULL, "
+                        "doctor_host_skips_today=0, doctor_pace_actions_today=0, "
+                        "doctor_last_pass_at=NULL, doctor_pause_armed_at=NULL, "
+                        "doctor_systemic_streak=0 WHERE id=1;")
         conn.commit()
     return fleet_pg

@@ -160,9 +160,17 @@ def restart_worker(worker_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def pause_scope(scope_key: str) -> dict[str, Any]:
-    """Pause a host/board scope. Does NOT unpause (resume is owner-only, absent here)."""
+    """Pause a host/board scope. Does NOT unpause (resume is owner-only, absent here).
+
+    A4: ONLY 'host:'/'board:' scopes are pausable. account:linkedin / global / home_ip:
+    scopes are rejected with a structured error -- this surface can never halt the LinkedIn
+    catastrophe lane."""
     def _do(conn):
-        monitor.MonitorActions(conn).pause_scope(scope_key)
+        try:
+            monitor.MonitorActions(conn).pause_scope(scope_key)
+        except monitor.ScopeNotPausable as e:
+            logger.warning("bridge action REJECTED: pause_scope scope_key=%s (%s)", scope_key, e)
+            return {"error": str(e), "rejected": True, "action": "pause", "scope_key": scope_key}
         logger.info("bridge action: pause_scope scope_key=%s", scope_key)
         return {"action": "pause", "scope_key": scope_key}
     return _with_conn(_do)

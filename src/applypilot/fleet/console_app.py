@@ -269,6 +269,151 @@ def _discovery(conn) -> dict:
     }
 
 
+def _diagnostics(conn) -> dict:
+    """READ-ONLY Fleet Doctor surface (its own endpoint, NOT in the 4s /api/status poll):
+      ``clusters``        -- live failure clusters over the rolling window (analyze())
+      ``auto_fixes``      -- ACTIVE fleet_knobs joined to their recent auto_applied diagnoses
+                             (type, scope, reason, expires, knob_id, diagnosis_id, how_to_reverse)
+      ``recommendations`` -- status='recommended' fleet_diagnoses rows (human queue)
+
+    All free text is re-scrubbed on read (defense in depth -- S1) and sizes are capped. The
+    Doctor already scrubbed before storing; we scrub AGAIN here. LinkedIn never appears: the
+    Doctor only ever clusters / acts on the apply (ats) lane."""
+    from applypilot.fleet import doctor as _doctor
+    try:
+        clustered = _doctor.analyze(conn, window_minutes=60)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        clustered = {"cluster_rows": []}
+    clusters = []
+    for c in (clustered.get("cluster_rows") or [])[:50]:
+        clusters.append({
+            "reason": c.get("reason"),
+            "host": _scrub(c.get("host"))[:200],
+            "machine": _scrub(c.get("machine"))[:120],
+            "lane": c.get("lane"),
+            "sample_count": int(c.get("sample_count") or 0),
+        })
+    with conn.cursor() as cur:
+        # Active knobs + the most recent auto-applied diagnosis for the same scope (for the
+        # Reverse button + how_to_reverse text). LEFT JOIN LATERAL keeps it one row per knob.
+        # H18: the join is CONSTRAINED TO THE KNOB'S SCOPE (not just the auto_action type prefix),
+        # so with two active host_skips each knob shows ITS OWN diagnosis -- the old type-prefix-only
+        # match showed the most-recent diagnosis text for ALL knobs of a type (operator could Reverse
+        # on misleading evidence). Per type: host_skip -> d2.host=scope; pace -> d2.host=substr(scope,6);
+        # timeout_bump/pause -> d2.lane=scope; quarantine -> d2.host=knob host (url has no diag host,
+        # fall back to type-only via the OR).
+        cur.execute(
+            "SELECT k.id AS knob_id, k.knob_type, k.scope_key, k.value_text, k.reason, "
+            "       k.created_at, k.expires_at, d.id AS diagnosis_id, d.how_to_reverse, d.diagnosis "
+            "FROM fleet_knobs k "
+            "LEFT JOIN LATERAL ("
+            "   SELECT id, how_to_reverse, diagnosis FROM fleet_diagnoses d2 "
+            "   WHERE d2.auto_action LIKE k.knob_type || '%' AND d2.status='auto_applied' "
+            "     AND ( "
+            "       (k.knob_type='host_skip'    AND d2.host = "
+            "           CASE WHEN k.scope_key LIKE 'host:%' THEN substr(k.scope_key, 6) ELSE k.scope_key END) "
+            "       OR (k.knob_type='pace_or_pause' AND k.scope_key LIKE 'host:%' "
+            "           AND d2.host = substr(k.scope_key, 6)) "
+            "       OR (k.knob_type='pace_or_pause' AND k.scope_key='ats' AND d2.lane = k.scope_key) "
+            "       OR (k.knob_type='timeout_bump' AND d2.lane = k.scope_key) "
+            "       OR (k.knob_type='quarantine') "
+            "     ) "
+            "   ORDER BY d2.created_at DESC LIMIT 1"
+            ") d ON TRUE "
+            "WHERE k.active AND (k.expires_at IS NULL OR k.expires_at > now()) "
+            "ORDER BY k.created_at DESC LIMIT 100"
+        )
+        krows = cur.fetchall()
+        cur.execute(
+            "SELECT id, cluster_key, reason, host, machine, lane, sample_count, severity, "
+            "       diagnosis, recommendation, created_at "
+            "FROM fleet_diagnoses WHERE status='recommended' "
+            "ORDER BY created_at DESC LIMIT 100"
+        )
+        rrows = cur.fetchall()
+        # H11/H15: quarantined URLs surfaced INDEPENDENT of fleet_knobs, so a still-quarantined url
+        # whose audit knob already expired (the 7-day knob TTL only expires the audit row, not the
+        # permanent quarantine) is still visible + has a reversible path. manual: reasons only.
+        cur.execute(
+            "SELECT url, reason, quarantined_at FROM poison_jobs "
+            "WHERE quarantined_at IS NOT NULL AND reason LIKE 'manual:%' "
+            "ORDER BY quarantined_at DESC LIMIT 100"
+        )
+        qrows = cur.fetchall()
+    conn.rollback()  # read-only
+    auto_fixes = [{
+        "knob_id": r["knob_id"],
+        "diagnosis_id": r["diagnosis_id"],
+        "knob_type": r["knob_type"],
+        "scope_key": _scrub(r.get("scope_key"))[:300],
+        "value_text": _scrub(r.get("value_text"))[:200],
+        "reason": _scrub(r.get("reason"))[:200],
+        "created_at": _iso(r.get("created_at")),
+        "expires_at": _iso(r.get("expires_at")),
+        "how_to_reverse": _scrub(r.get("how_to_reverse"))[:400],
+    } for r in krows]
+    recommendations = [{
+        "diagnosis_id": r["id"],
+        "reason": r.get("reason"),
+        "host": _scrub(r.get("host"))[:200],
+        "machine": _scrub(r.get("machine"))[:120],
+        "lane": r.get("lane"),
+        "sample_count": int(r.get("sample_count") or 0),
+        "severity": r.get("severity"),
+        "diagnosis": _scrub(r.get("diagnosis"))[:600],
+        "recommendation": _scrub(r.get("recommendation"))[:600],
+        "created_at": _iso(r.get("created_at")),
+    } for r in rrows]
+    quarantined = [{
+        "url": _scrub(r.get("url"))[:300],
+        "reason": _scrub(r.get("reason"))[:200],
+        "quarantined_at": _iso(r.get("quarantined_at")),
+    } for r in qrows]
+    return {"clusters": clusters, "auto_fixes": auto_fixes,
+            "recommendations": recommendations, "quarantined": quarantined}
+
+
+def _doctor_signal(conn) -> dict:
+    """H18: a SMALL, above-the-fold Doctor signal folded into the fast /api/status poll (NOT the
+    heavy diagnostics blob): last_pass_at, the active auto-fix count, and the newest active
+    auto-fix timestamp/id so the frontend can show a Doctor card + fire a toast on a NEW auto-fix.
+    Also surfaces ats_paused provenance (H8) so the banner can label a Doctor pause vs operator."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT doctor_last_pass_at, ats_paused, ats_pause_source FROM fleet_config WHERE id=1")
+        cfg = cur.fetchone() or {}
+        cur.execute(
+            "SELECT count(*) AS n, max(created_at) AS newest, max(id) AS newest_id "
+            "FROM fleet_knobs WHERE active AND (expires_at IS NULL OR expires_at > now())")
+        k = cur.fetchone() or {}
+    conn.rollback()  # read-only
+    return {
+        "last_pass_at": _iso(cfg.get("doctor_last_pass_at")),
+        "active_auto_fix_count": int(k.get("n") or 0),
+        "newest_auto_action_at": _iso(k.get("newest")),
+        "newest_auto_fix_id": k.get("newest_id"),
+        "ats_paused": bool(cfg.get("ats_paused")),
+        "ats_pause_source": cfg.get("ats_pause_source"),
+    }
+
+
+def diagnostics() -> dict:
+    """Open a short-lived connection, build the Doctor surface, always close."""
+    conn = pgqueue.connect()
+    try:
+        return _diagnostics(conn)
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+
 def build_status() -> dict:
     """Assemble the full /api/status object. Opens its OWN short-lived connections
     (each helper rolls back and we always close) so no connection is ever leaked."""
@@ -284,6 +429,14 @@ def build_status() -> dict:
         ch = cb._challenges(conn)
         challenges = len(ch.get("challenges", []))
         linkedin = _linkedin_summary(conn)
+        try:
+            doctor_sig = _doctor_signal(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            doctor_sig = None
         try:
             discovery = _discovery(conn)
         except Exception:
@@ -306,6 +459,7 @@ def build_status() -> dict:
         "recent": recent,
         "challenges": challenges,
         "linkedin": linkedin,
+        "doctor": doctor_sig,
         "discovery": discovery,
     }
 
@@ -474,10 +628,154 @@ def _do_expand_searches(conn, body: dict) -> str:
             f"(LinkedIn excluded from discovery for safety). Discovery workers will pick them up.")
 
 
+# ---------------------------------------------------------------------------
+# FLEET DOCTOR controls (exactly two, both CONSERVATIVE / bookkeeping). These are the
+# ONLY new actions added to the allow-list. Reversing a Doctor knob is conservative-or-
+# neutral (clear host_skip = nothing else re-approved; clear timeout_override = back to
+# NULL/default; deactivate a pace/pause knob = audit-only, the human still resumes
+# explicitly). Dismissing a recommendation is pure bookkeeping. There is deliberately NO
+# action that APPLIES a recommendation or does anything activity-increasing -- those stay
+# manual via the existing controls. NO LinkedIn action exists here.
+# ---------------------------------------------------------------------------
+def _do_doctor_revert(conn, body: dict) -> str:
+    """Reverse a single Doctor auto-fix: deactivate its fleet_knobs row, undo the knob's
+    conservative-or-neutral side (clear the timeout override / restore the paced gap to its
+    base), and mark its diagnosis 'reverted'. Identified by knob_id (preferred) or
+    diagnosis_id. Parameterized SQL only. NEVER re-approves jobs, never resumes a pause, never
+    raises a cap -- a revert can only relax a conservative knob, which is itself safe."""
+    knob_id = body.get("knob_id")
+    diagnosis_id = body.get("diagnosis_id")
+    if not _is_pos_int(knob_id) and not _is_pos_int(diagnosis_id):
+        raise ValueError("doctor_revert requires a positive integer knob_id or diagnosis_id")
+    with conn.cursor() as cur:
+        if _is_pos_int(knob_id):
+            cur.execute("SELECT id, knob_type, scope_key, value_text FROM fleet_knobs WHERE id=%s AND active",
+                        (int(knob_id),))
+        else:
+            # Resolve the active knob for this diagnosis via the auto_action prefix + scope.
+            cur.execute(
+                "SELECT k.id, k.knob_type, k.scope_key, k.value_text FROM fleet_knobs k "
+                "JOIN fleet_diagnoses d ON d.auto_action LIKE k.knob_type || '%' "
+                "WHERE d.id=%s AND k.active "
+                "ORDER BY k.created_at DESC LIMIT 1",
+                (int(diagnosis_id),),
+            )
+        knob = cur.fetchone()
+        if knob is None:
+            raise ValueError("no active Doctor knob found to revert")
+        ktype, scope, vtext = knob["knob_type"], knob["scope_key"], knob.get("value_text")
+        # Deactivate the knob (audit twin stays for history; active=FALSE removes its effect).
+        cur.execute("UPDATE fleet_knobs SET active=FALSE WHERE id=%s", (knob["id"],))
+        # Undo the knob's mechanical side -- each branch is conservative or neutral. H11: the
+        # quarantine + host_skip branches now ACTUALLY clear the underlying state (the old
+        # comment-only fall-through made those Reverse buttons lies).
+        if ktype == "timeout_bump":
+            # H7: restore the PRE-bump override captured in value_text ('new|prev'), not an
+            # unconditional NULL -- preserving an operator-set override. Restore only if no OTHER
+            # active timeout_bump remains (single shared column).
+            prev = None
+            if vtext and "|" in str(vtext):
+                tail = str(vtext).split("|", 1)[1].strip()
+                prev = int(tail) if tail.isdigit() else None
+            cur.execute("SELECT count(*) AS n FROM fleet_knobs WHERE active AND knob_type='timeout_bump'")
+            if int(cur.fetchone()["n"]) == 0:
+                cur.execute("UPDATE fleet_config SET agent_timeout_override=%s, updated_at=now() WHERE id=1",
+                            (prev,))
+        elif ktype == "pace_or_pause":
+            if scope and scope.startswith("host:"):
+                # H4: a host pace lived in the Doctor-owned doctor_min_gap_floor; clearing it lets
+                # the host run at its breaker-owned gap again. (We never touch min_gap_seconds --
+                # that is the watchdog breaker's column.)
+                cur.execute(
+                    "UPDATE rate_governor SET doctor_min_gap_floor=NULL, updated_at=now() WHERE scope_key=%s",
+                    (scope,))
+            elif scope == "ats":
+                # H8: a Doctor-authored ATS pause (ats_pause_source='doctor') -- Reverse DOES clear
+                # it (the old Reverse was a no-op so it looked broken). NEVER clears an operator/cost
+                # ats pause. This only ever touches ats_paused, never the shared fleet_config.paused,
+                # so it cannot resume the LinkedIn lane.
+                cur.execute(
+                    "UPDATE fleet_config SET ats_paused=FALSE, ats_pause_source=NULL, "
+                    "doctor_pause_armed_at=NULL, updated_at=now() "
+                    "WHERE id=1 AND ats_pause_source='doctor'")
+        elif ktype == "host_skip":
+            # H6/H11: a host_skip lived in rate_governor.doctor_skip_until on the host scope.
+            # Clearing it lets the host lease again immediately (approval was preserved -- nothing
+            # to re-approve). This is the REAL undo the how_to_reverse text promises.
+            cur.execute(
+                "UPDATE rate_governor SET doctor_skip_until=NULL, updated_at=now() WHERE scope_key=%s",
+                ("host:" + scope if scope and not scope.startswith("host:") else scope,))
+        elif ktype == "quarantine":
+            # H11: actually clear poison_jobs.quarantined_at for this url (manual: reasons only --
+            # never un-quarantine a real crash-accumulated poison). The job is retained, never deleted.
+            cur.execute(
+                "UPDATE poison_jobs SET quarantined_at=NULL, reviewed=TRUE "
+                "WHERE url=%s AND reason LIKE 'manual:%%'", (scope,))
+        # Mark the audit diagnosis 'reverted'. If the caller named a diagnosis_id, mark exactly
+        # that row. Otherwise (the UI's knob_id path) match the audit rows by the knob's
+        # IDENTITY -- the same auto_action prefix the _diagnostics LATERAL join uses -- scoped to
+        # the host/lane the diagnosis actually carries for this knob_type. The OLD COALESCE(host,
+        # lane,'') = COALESCE(scope,...) match was a NO-OP for production-shaped diagnoses:
+        # timeout_bump carries host=<triggering host>+lane='ats' but knob scope='ats' ('host'!='ats'),
+        # and pace carries host=<host> but knob scope='host:'||<host> -- neither matched, leaving the
+        # row stuck in 'auto_applied' (a phantom active auto-fix; corrupts the D3 audit trail).
+        if _is_pos_int(diagnosis_id):
+            cur.execute(
+                "UPDATE fleet_diagnoses SET status='reverted', updated_at=now() "
+                "WHERE id=%s AND status IN ('auto_applied','open')", (int(diagnosis_id),))
+        else:
+            # Per-knob-type scoping of the audit rows this knob produced:
+            #   host_skip   -> diagnosis.host == knob.scope (the host)
+            #   timeout_bump-> diagnosis.lane == knob.scope ('ats'); host is the *triggering* host
+            #   pace_or_pause(pace)  -> knob.scope='host:'||<host>, diagnosis.host==<host>
+            #   pace_or_pause(pause) -> knob.scope='ats', diagnosis.lane=='ats'
+            if ktype == "host_skip":
+                # A5: the host_skip knob scope is now canonical 'host:<h>'; the diagnosis carries the
+                # BARE host, so strip the prefix to match.
+                bare = scope[len("host:"):] if scope and scope.startswith("host:") else scope
+                where, params = "host = %s", (bare,)
+            elif ktype == "timeout_bump":
+                where, params = "lane = %s", (scope,)
+            elif ktype == "pace_or_pause" and scope and scope.startswith("host:"):
+                where, params = "host = %s", (scope[len("host:"):],)
+            else:  # pace_or_pause pause (scope='ats') or any lane-scoped knob
+                where, params = "lane = %s", (scope,)
+            cur.execute(
+                "UPDATE fleet_diagnoses SET status='reverted', updated_at=now() "
+                "WHERE status IN ('auto_applied','open') AND auto_action LIKE %s || '%%' AND " + where,
+                (ktype, *params),
+            )
+    conn.commit()  # run_action rolls back in finally, so write actions must commit themselves
+    return f"Reverted Doctor {ktype} (scope {scope!r}). The knob is deactivated; nothing was re-approved or resumed."
+
+
+def _do_doctor_dismiss(conn, body: dict) -> str:
+    """Dismiss a Doctor RECOMMENDATION (status -> 'dismissed'). Pure bookkeeping: it does NOT
+    apply the recommendation or change any fleet state. Parameterized SQL only."""
+    diagnosis_id = body.get("diagnosis_id")
+    if not _is_pos_int(diagnosis_id):
+        raise ValueError("doctor_dismiss requires a positive integer diagnosis_id")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_diagnoses SET status='dismissed', updated_at=now() "
+            "WHERE id=%s AND status='recommended'", (int(diagnosis_id),))
+        n = cur.rowcount
+    conn.commit()
+    if n == 0:
+        raise ValueError("no open recommendation with that id")
+    return "Recommendation dismissed (bookkeeping only -- no fleet state changed)."
+
+
+def _is_pos_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
 # Explicit allow-list. The handler indexes THIS dict by the action string; it never
 # eval()s or getattr()s anything derived from the request. Any other action -> 400.
 # NOTE: discovery's expand_searches is PG-only (no brain write); there is deliberately NO
-# brain-ingest ("pull") action and NO LinkedIn action on this surface.
+# brain-ingest ("pull") action and NO LinkedIn action on this surface. The two doctor_*
+# actions are CONSERVATIVE/bookkeeping (revert a conservative knob / dismiss a rec) -- they
+# never apply a recommendation and never do anything activity-increasing.
 _ACTIONS = {
     "arm_canary": _do_arm_canary,
     "lift_canary": _do_lift_canary,
@@ -486,6 +784,8 @@ _ACTIONS = {
     "reclaim": _do_reclaim,
     "set_cap": _do_set_cap,
     "expand_searches": _do_expand_searches,
+    "doctor_revert": _do_doctor_revert,
+    "doctor_dismiss": _do_doctor_dismiss,
 }
 
 
@@ -594,6 +894,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             try:
                 self._send_json(200, build_status())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if path == "/api/diagnostics":
+            # Dedicated endpoint (NOT folded into the 4s /api/status poll): the Doctor blob
+            # (clusters + auto-fixes + recommendations) can be large, so it is fetched on its
+            # own cadence by the Diagnostics section.
+            try:
+                self._send_json(200, diagnostics())
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
@@ -734,6 +1043,17 @@ _INDEX_HTML = r"""<!doctype html>
     margin:0;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--fg)}
   pre.log.err{border-color:rgba(218,54,51,.45)}
+  .dgrp{margin-bottom:14px}
+  .dgrp .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+  .rec{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+  .rec .rh{display:flex;gap:10px;align-items:center;margin-bottom:4px}
+  .rec .sev{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:6px;
+    border:1px solid var(--border);color:var(--muted)}
+  .rec .sev.warn{color:var(--amber);border-color:rgba(210,153,34,.4)}
+  .rec .sev.severe{color:var(--red2);border-color:rgba(218,54,51,.4)}
+  .rec .body{font-size:13px}
+  .rec .recm{color:var(--muted);font-size:12px;margin-top:4px}
+  button.sm{padding:5px 10px;font-size:12px}
 </style>
 </head>
 <body>
@@ -761,6 +1081,8 @@ _INDEX_HTML = r"""<!doctype html>
       <div class="val" id="cLeasable">&mdash;</div><div class="hint">approved &amp; not deduped</div></div>
     <div class="card"><div class="label">Open challenges</div>
       <div class="val" id="cChallenges">&mdash;</div><div class="hint">need a human</div></div>
+    <div class="card"><div class="label">Doctor</div>
+      <div class="val" id="cDoctor">&mdash;</div><div class="hint" id="cDoctorHint">auto-fixes active</div></div>
   </div>
 
   <section>
@@ -825,6 +1147,27 @@ _INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section>
+    <h2>Diagnostics (Doctor)</h2>
+    <div class="sub" style="margin-bottom:12px">
+      Bounded, reversible, <b>conservative-only</b> auto-fixes (skip a blocking host, raise a
+      timeout within a ceiling, quarantine a poison url, pace down / pause). The Doctor can never
+      resume, re-approve, raise the spend cap, lower the gap, or touch LinkedIn. Everything else is
+      a recommendation for you.
+    </div>
+    <div class="dgrp"><div class="lbl">Live failure clusters (last 60m)</div>
+      <table><thead><tr><th>Reason</th><th>Host</th><th>Machine</th><th>Samples</th></tr></thead>
+        <tbody id="docClusters"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+    </div>
+    <div class="dgrp"><div class="lbl">Active auto-fixes</div>
+      <table><thead><tr><th>Type</th><th>Scope</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
+        <tbody id="docAuto"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table>
+    </div>
+    <div class="dgrp"><div class="lbl">Recommendations (need a human)</div>
+      <div id="docRecs" class="mut">&hellip;</div>
+    </div>
+  </section>
+
+  <section>
     <h2>LinkedIn (read-only &mdash; the catastrophe lane has no controls here)</h2>
     <div class="li-strip">
       <div class="chip">Queued: <b id="liQueued">&mdash;</b></div>
@@ -864,14 +1207,33 @@ function toast(msg, kind){
 function render(s){
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
-  const g = s.gate, q = s.queue.apply, li = s.linkedin;
+  const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
+  // H8: an ATS-only Doctor pause (ats_paused, source='doctor') is a distinct, milder state than a
+  // full operator/cost halt -- label it so the operator knows the LinkedIn lane is untouched and
+  // that it auto-reverts. The shared paused/spend-cap halt still shows as the hard PAUSE/HALTED.
+  const doctorAtsPause = doc.ats_paused && doc.ats_pause_source === "doctor";
   const paused = g.paused || g.should_halt;
   const banner = document.getElementById("banner");
-  banner.className = "banner " + (paused ? "pause" : "run");
+  banner.className = "banner " + ((paused || doctorAtsPause) ? "pause" : "run");
   document.getElementById("bannerText").textContent =
-    paused ? (g.should_halt && !g.paused ? "HALTED (spend cap)" : "PAUSED") : "RUNNING";
+    paused ? (g.should_halt && !g.paused ? "HALTED (spend cap)" : "PAUSED")
+           : (doctorAtsPause ? "ATS PAUSED by Fleet Doctor (auto)" : "RUNNING");
   document.getElementById("updated").textContent =
-    "updated " + rel(s.now) + (g.should_halt ? " • halt active" : "");
+    "updated " + rel(s.now) + (g.should_halt ? " • halt active"
+      : doctorAtsPause ? " • LinkedIn lane UNAFFECTED" : "");
+
+  // H18: above-the-fold Doctor card + a toast when a NEW auto-fix appears between polls.
+  const dc = document.getElementById("cDoctor");
+  if(dc){
+    dc.textContent = (doc.active_auto_fix_count!=null) ? doc.active_auto_fix_count : "—";
+    document.getElementById("cDoctorHint").textContent =
+      "active • last pass " + rel(doc.last_pass_at);
+    if(window._lastDoctorFixId!=null && doc.newest_auto_fix_id!=null
+       && doc.newest_auto_fix_id > window._lastDoctorFixId){
+      toast("Fleet Doctor applied a new auto-fix", "ok");
+    }
+    if(doc.newest_auto_fix_id!=null) window._lastDoctorFixId = doc.newest_auto_fix_id;
+  }
 
   document.getElementById("cCanary").textContent =
     g.canary_enabled ? (g.canary_remaining==null ? "on" : g.canary_remaining) : "off";
@@ -1020,8 +1382,57 @@ async function loadLogs(){
 document.getElementById("btnLogs").onclick = loadLogs;
 document.getElementById("logWorker").onchange = loadLogs;
 
+// --- Fleet Doctor: its own fetch (NOT in the 4s status poll; the blob can be large) ---
+function renderDiagnostics(d){
+  const ct = document.getElementById("docClusters");
+  if(!d.clusters || !d.clusters.length){ ct.innerHTML = '<tr><td colspan="4" class="mut">no failure clusters in the window</td></tr>'; }
+  else ct.innerHTML = d.clusters.map(c=>
+    '<tr><td>'+esc(c.reason)+'</td><td class="mut">'+esc(c.host)+'</td><td class="mut">'+
+    esc(c.machine)+'</td><td>'+(c.sample_count||0)+'</td></tr>').join("");
+
+  const at = document.getElementById("docAuto");
+  if(!d.auto_fixes || !d.auto_fixes.length){ at.innerHTML = '<tr><td colspan="5" class="mut">no active auto-fixes</td></tr>'; }
+  else at.innerHTML = d.auto_fixes.map(a=>{
+    const exp = a.expires_at ? rel(a.expires_at).replace(" ago"," from now").replace("never","never") : "—";
+    return '<tr><td>'+esc(a.knob_type)+'</td><td class="mut">'+esc(a.scope_key)+'</td><td class="mut">'+
+      esc(a.reason||"—")+'</td><td class="mut">'+esc(a.expires_at||"—")+'</td>'+
+      '<td><button class="sm" data-revert="'+esc(a.knob_id)+'">Reverse</button></td></tr>';
+  }).join("");
+  at.querySelectorAll("button[data-revert]").forEach(b=>{
+    b.onclick = ()=>act("doctor_revert", {knob_id: parseInt(b.getAttribute("data-revert"),10)},
+      "Reverse this Doctor auto-fix? It deactivates the conservative knob (e.g. clears a host_skip or restores a paced gap). Nothing is re-approved and the fleet is NOT resumed.")
+      .then(loadDiagnostics);
+  });
+
+  const rc = document.getElementById("docRecs");
+  if(!d.recommendations || !d.recommendations.length){ rc.className="mut"; rc.textContent = "no open recommendations"; }
+  else { rc.className=""; rc.innerHTML = d.recommendations.map(r=>{
+    const sev = (r.severity==="severe"?"severe":(r.severity==="warn"?"warn":""));
+    return '<div class="rec"><div class="rh"><span class="sev '+sev+'">'+esc(r.severity||"info")+
+      '</span><span class="mut" style="font-size:12px">'+esc(r.reason||"")+
+      (r.host?(" · "+esc(r.host)):"")+'</span>'+
+      '<button class="sm" style="margin-left:auto" data-dismiss="'+esc(r.diagnosis_id)+'">Dismiss</button></div>'+
+      '<div class="body">'+esc(r.diagnosis||"")+'</div>'+
+      '<div class="recm">'+esc(r.recommendation||"")+'</div></div>';
+  }).join(""); }
+  rc.querySelectorAll("button[data-dismiss]").forEach(b=>{
+    b.onclick = ()=>act("doctor_dismiss", {diagnosis_id: parseInt(b.getAttribute("data-dismiss"),10)})
+      .then(loadDiagnostics);
+  });
+}
+
+async function loadDiagnostics(){
+  try{
+    const r = await fetch("/api/diagnostics", {cache:"no-store"});
+    if(!r.ok) return;
+    renderDiagnostics(await r.json());
+  }catch(e){ /* leave the last render; the status poll drives the connection banner */ }
+}
+
 poll();
 setInterval(poll, 4000);
+loadDiagnostics();
+setInterval(loadDiagnostics, 15000);
 </script>
 </body>
 </html>

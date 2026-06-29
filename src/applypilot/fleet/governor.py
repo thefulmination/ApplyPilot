@@ -59,7 +59,13 @@ def record_outcome(conn, scope_keys, outcome, *, bump_cap=False, commit=True) ->
         # push the next allowed apply out by a full gap on a non-apply).
         raise ValueError("bump_cap is only valid with outcome='success'")
     col = _OUTCOME_COL[outcome]
-    extra = ", count_24h = count_24h + 1, last_applied_at = now()" if bump_cap else ""
+    # A3: stamp last_attempt_at on EVERY outcome (success + captcha + block), not just confirmed
+    # applies. The ATS apply lease gates the min-gap / Doctor floor off COALESCE(last_applied_at,
+    # last_attempt_at), so a never-succeeded (hard-blocking) host -- whose last_applied_at stays
+    # NULL -- is still spaced instead of leasing back-to-back at zero gap. count_24h + last_applied_at
+    # remain CONFIRMED-apply only (bump_cap).
+    extra = ", count_24h = count_24h + 1, last_applied_at = now(), last_attempt_at = now()" if bump_cap \
+        else ", last_attempt_at = now()"
     with conn.cursor() as cur:
         for sk in scope_keys:
             cur.execute(
@@ -85,8 +91,13 @@ def evaluate_breakers(
     # is treated as >= the cut rather than slipping under it by one float ULP (see _RATE_EPS).
     pause_at = captcha_threshold * 1.5 - _RATE_EPS
     with conn.cursor() as cur:
+        # A1: ORDER BY scope_key imposes ONE global lock order on rate_governor rows. The Doctor's
+        # sweep_expired pre-locks its target scopes in the SAME ORDER BY scope_key order, so the two
+        # writers can never take the per-row UPDATE locks in opposite orders -> no AB-BA deadlock
+        # (SQLSTATE 40P01) under a correlated outage that makes both touch the most rows.
         cur.execute(
-            "SELECT scope_key, success_24h, captcha_24h, block_24h, challenge_rate, breaker_state FROM rate_governor"
+            "SELECT scope_key, success_24h, captcha_24h, block_24h, challenge_rate, breaker_state "
+            "FROM rate_governor ORDER BY scope_key"
         )
         rows = cur.fetchall()
     for r in rows:
@@ -135,6 +146,26 @@ def evaluate_breakers(
     if commit:
         conn.commit()
     return changed
+
+
+def trip_breaker(conn, scope_key, *, state="paused", cool_seconds=1800, commit=True) -> None:
+    """A2: AUTO-EXPIRING breaker trip. Set breaker_state + breaker_until = now() + cool together
+    (mirroring evaluate_breakers' throttled/paused branches) so clear_expired_breakers can recover
+    it at TTL. This is the ONLY breaker-write primitive a transient/systemic event should use --
+    NEVER monitor.pause_scope (breaker_until=NULL, sticky human-only). ``state`` in
+    {'throttled','paused'} (a 'demoted' trip is sticky-by-design and not offered here)."""
+    if state not in ("throttled", "paused"):
+        raise ValueError(f"trip_breaker state must be throttled|paused, got {state!r}")
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING",
+                    (scope_key,))
+        cur.execute(
+            "UPDATE rate_governor SET breaker_state=%s, breaker_until = now() + make_interval(secs => %s), "
+            "updated_at = now() WHERE scope_key = %s",
+            (state, cool_seconds, scope_key),
+        )
+    if commit:
+        conn.commit()
 
 
 def clear_expired_breakers(conn, *, commit=True):

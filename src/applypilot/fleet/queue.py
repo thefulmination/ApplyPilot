@@ -28,7 +28,7 @@ from applypilot.fleet import governor
 #     TRUE; it never clears it, so a cost-pause or manual pause is preserved.
 # ---------------------------------------------------------------------------
 _LEASE_APPLY = """
-WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
+WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
      home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHERE scope_key = %(home_scope)s),
      glob AS (SELECT count_24h, daily_cap FROM rate_governor WHERE scope_key = 'global'),
      next_job AS (
@@ -40,6 +40,10 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, spend_cap_usd FROM
        LEFT JOIN cfg ON TRUE
        WHERE q.status = 'queued' AND q.lane = 'ats' AND q.approved_batch IS NOT NULL
          AND NOT COALESCE(cfg.paused, FALSE)
+         -- H1: the Fleet Doctor's lane-pause writes ats_paused (NEVER the shared paused flag),
+         -- honored here on the ATS lane only. _LEASE_LINKEDIN never reads ats_paused, so a
+         -- Doctor pause can never halt the LinkedIn catastrophe lane.
+         AND NOT COALESCE(cfg.ats_paused, FALSE)
          AND (NOT COALESCE(cfg.canary_enabled, FALSE) OR cfg.canary_remaining > 0)
          AND (COALESCE(cfg.spend_cap_usd, 0) <= 0
               OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
@@ -48,8 +52,22 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, spend_cap_usd FROM
          AND (home.count_24h IS NULL OR home.count_24h < home.daily_cap)
          AND COALESCE(g.breaker_state, 'ok') NOT IN ('paused','demoted')
          AND COALESCE(g.count_24h, 0) < COALESCE(g.daily_cap, 2000000000)
-         AND (g.last_applied_at IS NULL
-              OR g.last_applied_at < now() - make_interval(secs => COALESCE(g.min_gap_seconds, 90) * (0.7 + random()*0.7)))
+         -- H6: the Doctor's host_skip is a self-expiring lease FILTER (doctor_skip_until),
+         -- NOT an approved_batch=NULL un-approve -- so vetted owner approval is preserved and
+         -- the skip auto-reverts at its TTL exactly like the breaker's breaker_until.
+         AND COALESCE(g.doctor_skip_until, '-infinity'::timestamptz) < now()
+         -- H4: the effective min-gap is GREATEST(breaker-owned min_gap, Doctor-owned floor), so
+         -- a Doctor pace is monotone-by-construction and the watchdog breaker's min_gap restore
+         -- can never silently wipe a still-active Doctor pace (and vice-versa).
+         -- A3: gate off COALESCE(last_applied_at, last_attempt_at). last_applied_at is stamped ONLY
+         -- on a confirmed apply, so a never-succeeded (hard-blocking) host had last_applied_at=NULL
+         -- forever and short-circuited the WHOLE gap (both the breaker min_gap AND the Doctor floor),
+         -- leasing back-to-back at zero spacing. last_attempt_at is now stamped on every outcome
+         -- (success+captcha+block), so the GREATEST gap is actually enforced on those hosts.
+         AND (COALESCE(g.last_applied_at, g.last_attempt_at) IS NULL
+              OR COALESCE(g.last_applied_at, g.last_attempt_at) < now() - make_interval(secs =>
+                   GREATEST(COALESCE(g.min_gap_seconds, 90), COALESCE(g.doctor_min_gap_floor, 0))
+                   * (0.7 + random()*0.7)))
          AND NOT EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)
        ORDER BY q.score DESC, q.url
        LIMIT 1
@@ -96,7 +114,11 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         # Only true terminal classes map to a governor outcome; unknown -> None.
         outcome = {"applied": "success", "blocked": "block", "captcha": "captcha"}.get(status)
     scopes = [governor.GLOBAL, governor.host_scope(target_host), governor.home_ip_scope(home_ip)]
-    extra = ", count_24h = count_24h + 1, last_applied_at = now()" if status == "applied" else ""
+    # A3: last_attempt_at stamped on EVERY recorded outcome (so a never-succeeded host is still
+    # spaced by the lease's COALESCE(last_applied_at, last_attempt_at) gap); last_applied_at +
+    # count_24h remain confirmed-apply only.
+    extra = (", count_24h = count_24h + 1, last_applied_at = now(), last_attempt_at = now()"
+             if status == "applied" else ", last_attempt_at = now()")
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
@@ -305,8 +327,9 @@ WITH next AS (
   WHERE s.status='queued' AND s.enabled AND s.next_due_at <= now()
     AND COALESCE(g.breaker_state, 'ok') NOT IN ('paused','demoted')
     AND COALESCE(g.count_24h, 0) < COALESCE(g.daily_cap, 2000000000)
-    AND (g.last_applied_at IS NULL
-         OR g.last_applied_at < now() - make_interval(secs => COALESCE(g.min_gap_seconds, 90) * (0.7 + random()*0.7)))
+    AND (COALESCE(g.last_applied_at, g.last_attempt_at) IS NULL
+         OR COALESCE(g.last_applied_at, g.last_attempt_at) < now()
+              - make_interval(secs => COALESCE(g.min_gap_seconds, 90) * (0.7 + random()*0.7)))
   ORDER BY s.next_due_at LIMIT 1 FOR UPDATE OF s SKIP LOCKED
 )
 UPDATE search_tasks s SET status='leased', lease_owner=%(worker)s,
@@ -340,7 +363,9 @@ def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, err
         if board:
             outcome = "block" if error == "blocked" else ("captcha" if error == "captcha" else "success")
             col = governor._OUTCOME_COL[outcome]
-            extra = ", count_24h = count_24h + 1, last_applied_at = now()" if outcome == "success" else ""
+            # A3: stamp last_attempt_at on every board outcome so a never-succeeding board is spaced.
+            extra = (", count_24h = count_24h + 1, last_applied_at = now(), last_attempt_at = now()"
+                     if outcome == "success" else ", last_attempt_at = now()")
             sk = governor.board_scope(board)
             cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
             cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at=now() WHERE scope_key=%s", (sk,))

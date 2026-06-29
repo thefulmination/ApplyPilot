@@ -6,7 +6,23 @@ ABSENCE -- those operations are simply not methods on MonitorActions, so neither
 prompt-injected agent nor a bug can invoke them through this surface."""
 from __future__ import annotations
 
-from applypilot.fleet import heartbeat
+from applypilot.fleet import governor, heartbeat
+
+# A4: the ONLY scope-key prefixes the bounded monitor surface may pause. A free-form scope_key
+# with NO guard let pause_scope('account:linkedin') halt the LinkedIn catastrophe lane forever
+# (breaker_until=NULL) outside any gate -- the exact D2 violation, reached through an actuator the
+# Doctor's gate never sees. We allow-LIST host:/board: only; everything else (account:linkedin,
+# global, home_ip:, bare strings) is rejected BEFORE the UPDATE.
+_PAUSABLE_SCOPE_PREFIXES = ("host:", "board:")
+
+# A4: default cool-down for a legitimate monitor pause -- breaker_until is set (never NULL) so
+# clear_expired_breakers can time-recover it (mirrors evaluate_breakers' paused branch).
+_MONITOR_PAUSE_COOL_SECONDS = 1800
+
+
+class ScopeNotPausable(ValueError):
+    """A4: raised when pause_scope is asked to pause a forbidden scope (LinkedIn / global /
+    home_ip / any non host:/board: scope). Surfaced as a structured codex_bridge error."""
 
 
 class MonitorActions:
@@ -27,11 +43,24 @@ class MonitorActions:
 
     def pause_scope(self, scope_key: str) -> None:
         """Pause a host/board scope (bounded write). Does NOT resume -- resume of any
-        paused scope (esp. the LinkedIn lane) is owner-only and absent by design."""
-        with self._conn.cursor() as cur:
-            cur.execute("UPDATE rate_governor SET breaker_state='paused', breaker_until=NULL, "
-                        "updated_at=now() WHERE scope_key=%s", (scope_key,))
-        self._conn.commit()
+        paused scope is owner-only and absent by design.
+
+        A4 HARD GUARD: only ``host:``/``board:`` scopes may be paused. The LinkedIn account
+        (``account:linkedin``), ``global``, and any ``home_ip:`` scope are REJECTED before any
+        write -- a free-form scope_key on this surface could otherwise halt the LinkedIn
+        catastrophe lane forever, outside the Doctor gate entirely. A4: the pause is
+        AUTO-EXPIRING (breaker_until = now()+cool, never NULL) so clear_expired_breakers can
+        time-recover it instead of leaving it sticky."""
+        sk = str(scope_key or "")
+        if sk == governor.LINKEDIN_ACCOUNT or sk == governor.GLOBAL \
+                or sk.startswith("home_ip:") or not sk.startswith(_PAUSABLE_SCOPE_PREFIXES):
+            raise ScopeNotPausable(
+                f"scope_key {scope_key!r} is not pausable via the monitor surface; only "
+                "'host:'/'board:' scopes may be paused (the LinkedIn lane / global / per-IP "
+                "scopes are off-limits here). (A4)")
+        # A4: route through the auto-expiring breaker primitive (breaker_until set, never NULL).
+        governor.trip_breaker(self._conn, sk, state="paused",
+                              cool_seconds=_MONITOR_PAUSE_COOL_SECONDS, commit=True)
 
     def report(self, text: str) -> str:
         """Emit/return a report string (alert hook)."""

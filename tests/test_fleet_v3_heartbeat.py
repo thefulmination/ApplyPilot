@@ -157,13 +157,47 @@ def test_quarantine_after_n_crashes(fleet_db):
         assert heartbeat.quarantine_job(conn, url, worker="w3", reason="timeout") is True
         assert heartbeat.is_quarantined(conn, url) is True
 
-        # further strikes keep counting but do NOT re-report newly-quarantined
+        # further strikes do NOT re-report newly-quarantined AND, once quarantined,
+        # do NOT bump crash_count (the guarded ON CONFLICT skips an already-pulled url).
+        with conn.cursor() as cur:
+            cur.execute("SELECT quarantined_at FROM poison_jobs WHERE url=%s", (url,))
+            qat_before = cur.fetchone()["quarantined_at"]
         assert heartbeat.quarantine_job(conn, url, worker="w4", reason="crash") is False
         with conn.cursor() as cur:
             cur.execute("SELECT crash_count, quarantined_at FROM poison_jobs WHERE url=%s", (url,))
             r = cur.fetchone()
-        assert r["crash_count"] == 4
-        assert r["quarantined_at"] is not None
+        assert r["crash_count"] == 3, "crash_count must freeze once quarantined"
+        assert r["quarantined_at"] == qat_before, "quarantined_at must not be re-stamped"
+
+
+def test_manual_quarantine_signal_not_polluted_by_watchdog_strike(fleet_db):
+    """H16(b): a manually-quarantined url (crash_count=0) must NEVER have its
+    crash_count bumped by a later non-manual strike (e.g. watchdog 'job_over_max').
+    The guarded non-manual ON CONFLICT must no-op on an already-quarantined row so
+    the clean manual signal is preserved."""
+    url = "https://jobs.example.com/owner-pulled"
+    with pgqueue.connect(fleet_db) as conn:
+        # Doctor / monitor / Codex bridge path: manual one-shot, crash_count stays 0.
+        assert heartbeat.quarantine_job(conn, url, worker="doctor",
+                                        reason="owner_pull", manual=True) is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT crash_count, quarantined_at, reason "
+                        "FROM poison_jobs WHERE url=%s", (url,))
+            before = cur.fetchone()
+        assert before["crash_count"] == 0
+        assert before["quarantined_at"] is not None
+        assert before["reason"] == "manual:owner_pull"
+
+        # Watchdog later strikes the SAME url non-manually -> must be a no-op.
+        assert heartbeat.quarantine_job(conn, url, worker="watchdog",
+                                        reason="job_over_max") is False
+        with conn.cursor() as cur:
+            cur.execute("SELECT crash_count, quarantined_at, reason "
+                        "FROM poison_jobs WHERE url=%s", (url,))
+            after = cur.fetchone()
+        assert after["crash_count"] == 0, "manual quarantine crash signal polluted by watchdog"
+        assert after["quarantined_at"] == before["quarantined_at"]
+        assert after["reason"] == "manual:owner_pull", "manual reason clobbered by watchdog"
 
 
 # ---------------------------------------------------------------------------

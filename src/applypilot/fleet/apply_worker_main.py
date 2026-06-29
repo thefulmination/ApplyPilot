@@ -1,6 +1,8 @@
 """applypilot-fleet-apply: an OFFSITE apply worker for owner-controlled machines.
 Wraps the proven launcher.run_job into an apply_fn and drives WorkerLoop(role='apply').
-Respects fleet_config.paused via should_halt; never leases through a pause/canary-pause."""
+Respects the shared kill switch AND the Fleet Doctor's ATS-only pause via ats_should_halt
+(H1); never leases through a pause/canary-pause. The LinkedIn lane uses plain should_halt so
+a Doctor ATS pause can never halt it."""
 from __future__ import annotations
 
 import argparse
@@ -91,10 +93,74 @@ def make_log_tail_fn(slot: int, *, n_lines: int = 40):
     return _tail
 
 
+def resolve_agent_timeout(conn, *, env_default=None) -> int:
+    """Effective apply-agent wall-clock timeout for THIS worker. The FLEET DOCTOR may RAISE
+    a bounded override (fleet_config.agent_timeout_override) when a host clusters timeouts; a
+    worker PREFERS that override when set, else the env/default (APPLYPILOT_AGENT_TIMEOUT, 300).
+
+    Read-only + best-effort: any DB error falls back to the env/default so a transient blip
+    never changes the worker's bound. The override is the Doctor's ONLY conservative timeout
+    lever -- it can only ever lengthen the timeout within a ceiling (see doctor._assert_conservative)."""
+    default = env_default
+    if default is None:
+        try:
+            default = int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or 300)
+        except (TypeError, ValueError):
+            default = 300
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT agent_timeout_override FROM fleet_config WHERE id=1")
+            row = cur.fetchone()
+        try:
+            conn.rollback()  # read-only
+        except Exception:
+            pass
+        if row is not None:
+            ov = row.get("agent_timeout_override") if hasattr(row, "get") else row["agent_timeout_override"]
+            if ov is not None:
+                # Defensive clamp: never let a bad override SHORTEN the timeout below the
+                # default (the Doctor only ever raises it; this guards manual edits too).
+                return max(int(default), int(ov))
+    except Exception:
+        pass
+    return int(default)
+
+
+def _apply_timeout_override(dsn=None, *, conn=None) -> None:
+    """If the Doctor set fleet_config.agent_timeout_override, prefer it: assign the launcher's
+    module-level AGENT_TIMEOUT_SECONDS (which it reads from APPLYPILOT_AGENT_TIMEOUT at import)
+    to the resolved value. No override -> leave the env/default untouched.
+
+    Called BOTH once at startup (with a ``dsn`` -- opens its own short-lived connection) AND on
+    EVERY apply tick (with an already-open ``conn`` -- avoids a second connection per tick). The
+    per-tick call is what makes a live Doctor timeout_bump actually take effect on a long-lived
+    worker: launcher.run_job reads AGENT_TIMEOUT_SECONDS as a module global per-job, so the next
+    job after a bump sees the raised value. The 'only reassign if changed' guard keeps it cheap
+    and best-effort (a transient DB blip never changes the bound)."""
+    try:
+        from applypilot.apply import launcher
+
+        def _set_from(c):
+            eff = resolve_agent_timeout(c)
+            if int(getattr(launcher, "AGENT_TIMEOUT_SECONDS", 0)) != int(eff):
+                launcher.AGENT_TIMEOUT_SECONDS = int(eff)
+
+        if conn is not None:
+            _set_from(conn)
+        else:
+            from applypilot.apply import pgqueue
+            with pgqueue.connect(dsn) as own:
+                _set_from(own)
+    except Exception:  # pragma: no cover - best-effort; never block the worker
+        logger.debug("could not resolve agent_timeout_override; using env/default", exc_info=True)
+
+
 def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="claude", machine_owner=None, slot=0):
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
+    # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
+    _apply_timeout_override(dsn)
     return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
                       log_tail_fn=make_log_tail_fn(slot))
@@ -111,7 +177,16 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dic
         it += 1
         try:
             with conn_factory() as conn:
-                if pgqueue.should_halt(conn):
+                # Re-resolve the Doctor's agent_timeout_override on EVERY tick (not just at
+                # startup): the Doctor sets the override mid-flight while this worker is already
+                # running, so a startup-only read would never see a live timeout_bump. The
+                # 'only reassign if changed' guard inside makes this cheap, and launcher reads
+                # AGENT_TIMEOUT_SECONDS as a module global per-job, so the next job picks it up.
+                _apply_timeout_override(conn=conn)
+                # H1: the APPLY lane honors the Doctor's ATS-only pause (ats_paused) in addition
+                # to the shared kill switch; ats_should_halt OR-s it in. The LinkedIn worker keeps
+                # plain should_halt(), so a Doctor ATS pause never halts the LinkedIn lane.
+                if pgqueue.ats_should_halt(conn):
                     counts["halted"] += 1
                     if idle_sleep:
                         time.sleep(idle_sleep)

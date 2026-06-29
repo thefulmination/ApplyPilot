@@ -120,6 +120,27 @@ def test_run_apply_idles_when_halted(fleet_db):
     assert ticks["halted"] >= 1 and ticks["applied"] == 0
 
 
+def test_run_apply_reresolves_timeout_override_mid_flight(fleet_db, monkeypatch):
+    """The Doctor sets agent_timeout_override WHILE a worker is already running. A startup-only
+    read would never see it; the per-tick re-resolve must pick up a bump on the next tick and
+    raise launcher.AGENT_TIMEOUT_SECONDS (which run_job reads as a module global per job)."""
+    monkeypatch.setenv("APPLYPILOT_DB_PATH", "x")
+    monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT", "300")
+    from applypilot.apply import pgqueue, launcher
+    from applypilot.fleet import apply_worker_main as am
+    # Build the loop at the baseline (no override yet) and pin the launcher global to the default.
+    loop = am.build_apply_loop(dsn=fleet_db, worker_id="w1", home_ip="1.1.1.1",
+                               model="sonnet", agent="claude")
+    monkeypatch.setattr(launcher, "AGENT_TIMEOUT_SECONDS", 300, raising=False)
+    # Doctor bumps the override AFTER the loop is built; keep the lane paused so the tick just
+    # idles (the re-resolve runs BEFORE the should_halt check, so this is enough to observe it).
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET agent_timeout_override=720, paused=TRUE WHERE id=1")
+        conn.commit()
+    am.run_apply(lambda: pgqueue.connect(fleet_db), loop, max_iterations=1, idle_sleep=0)
+    assert int(launcher.AGENT_TIMEOUT_SECONDS) == 720  # next job sees the raised value
+
+
 def test_lease_one_requires_approval(fleet_db):
     from applypilot.apply import pgqueue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:

@@ -176,12 +176,53 @@ WHERE fc.id = 1;
 def should_halt(conn: psycopg.Connection) -> bool:
     """True if the fleet must stop leasing: globally paused OR SUM(est_cost_usd) >= cap.
     A soft pre-lease gate (spec S6) -- up to ~N in-flight jobs may overshoot, which is fine
-    against the POC budget."""
+    against the POC budget.
+
+    NOTE (H1): this reads ONLY the shared kill switch (fleet_config.paused) + spend cap. It
+    deliberately does NOT read ats_paused -- the LinkedIn worker calls should_halt(), so adding
+    ats_paused here would re-introduce the catastrophe coupling. The ATS lane uses
+    ats_should_halt() instead (which OR-s in ats_paused); the LinkedIn lane keeps should_halt()."""
     with conn.cursor() as cur:
         cur.execute(_HALT_SQL)
         row = cur.fetchone()
     conn.rollback()  # read-only
     return bool(row["should_halt"]) if row else False
+
+
+_ATS_HALT_SQL = """
+SELECT
+    fc.paused
+    OR COALESCE(fc.ats_paused, FALSE)
+    OR (fc.spend_cap_usd > 0
+        AND COALESCE((SELECT SUM(est_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
+        AS should_halt
+FROM fleet_config fc
+WHERE fc.id = 1;
+"""
+
+
+def ats_should_halt(conn: psycopg.Connection) -> bool:
+    """ATS-lane pre-lease halt gate: the shared kill switch (paused/spend cap) OR the
+    Fleet Doctor's ATS-only ats_paused (H1). The LinkedIn worker must NEVER call this -- it
+    uses should_halt() so a Doctor ATS pause can never stop the LinkedIn lane."""
+    with conn.cursor() as cur:
+        cur.execute(_ATS_HALT_SQL)
+        row = cur.fetchone()
+    conn.rollback()  # read-only
+    return bool(row["should_halt"]) if row else False
+
+
+def set_ats_paused(conn: psycopg.Connection, paused: bool, *, source: str | None = None) -> None:
+    """Set the ATS-only pause flag (H1). The Fleet Doctor routes its lane-pause HERE, never to
+    set_paused(). source ('doctor'|NULL) records provenance so the console can label it and the
+    Doctor only ever auto-reverts its OWN pause. Clearing the pause also clears the source."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET ats_paused = %s, "
+            "ats_pause_source = CASE WHEN %s THEN %s ELSE NULL END, updated_at = now() WHERE id = 1",
+            (paused, paused, source),
+        )
+    conn.commit()
 
 
 def set_spend_cap(conn: psycopg.Connection, cap_usd: float) -> None:
