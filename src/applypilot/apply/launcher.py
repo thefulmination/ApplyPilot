@@ -1090,6 +1090,74 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     """Spawn an apply-agent session for one job application.
 
     Returns:
+# ---------------------------------------------------------------------------
+# Usage-limit / quota wall detection (RETRYABLE -- the agent never touched the page)
+# ---------------------------------------------------------------------------
+# An agent (Codex or Claude) that hits its OWN account usage/quota wall fails on the FIRST
+# turn -- before calling a single browser/MCP tool -- and exits WITHOUT printing a RESULT:
+# line. The generic fallback classifies that as `no_result_line`, which the fleet worker
+# parks as `crash_unconfirmed` ("may have submitted, never re-lease"). But a wall hit with
+# ZERO tool calls in the transcript PROVABLY never touched the application form, so the job
+# was never submitted and is safe to RE-QUEUE. Detect the wall here and emit a distinct,
+# retryable status; everything else keeps the conservative no_result_line -> crash_unconfirmed
+# treatment (a genuine mid-apply crash always shows tool calls). Live incident 2026-06-29:
+# a Codex-Spark wall poisoned ~283 good, never-touched jobs into crash_unconfirmed in minutes.
+USAGE_LIMIT_STATUS = "failed:usage_limit"
+
+# Phrases that identify an AGENT-side usage/quota wall (NOT a site's application limit --
+# that surfaces as RESULT:FAILED:rate_limited and never reaches this fallback). Matched
+# case-insensitively as substrings. "hit your usage limit" deliberately avoids the
+# you've/you’ve apostrophe variants. Covers Codex-Spark ("You've hit your usage limit / Try
+# again at <time> / Switch to another model") and Claude (usage/weekly/5-hour limit).
+_USAGE_LIMIT_SIGNATURES = (
+    "hit your usage limit",
+    "usage limit reached",
+    "reached your usage limit",
+    "usage limit exceeded",
+    "exceeded your usage limit",
+    "hit your weekly limit",
+    "weekly limit reached",
+    "5-hour limit reached",
+    "switch to another model",
+    "switch to a different model",
+    "try again at",
+    "quota exceeded",
+    "exceeded your quota",
+    "insufficient quota",
+    "out of credits",
+    "upgrade to continue",
+)
+
+
+def _is_usage_limit_signature(text: str | None) -> bool:
+    """True if the transcript carries an agent usage/quota-wall signature."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(sig in low for sig in _USAGE_LIMIT_SIGNATURES)
+
+
+def _no_result_status(transcript: str | None, tool_calls: int) -> str:
+    """Classify a run that printed NO RESULT: line.
+
+    A usage/quota wall hit on the FIRST turn (tool_calls == 0 -> the agent never drove the
+    browser) provably never submitted -> RETRYABLE USAGE_LIMIT_STATUS (re-queued upstream).
+    ANY tool call means the agent may have reached/filled the form (a real mid-apply crash)
+    -> the conservative no_result_line, which is parked crash_unconfirmed and NEVER re-leased.
+    """
+    if tool_calls == 0 and _is_usage_limit_signature(transcript):
+        return USAGE_LIMIT_STATUS
+    return "failed:no_result_line"
+
+
+def is_usage_limit_result(status: str | None) -> bool:
+    """True if a run_job status is the retryable usage/quota-wall outcome. Consumed by the
+    fleet worker to RE-QUEUE (vs crash_unconfirmed) and to back off when walls repeat."""
+    if not status:
+        return False
+    return status.split(":", 1)[-1].strip().lower() == "usage_limit"
+
+
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
@@ -1184,6 +1252,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             """
             with open(worker_log, "a", encoding="utf-8") as lf:
                 lf.write(log_header)
+        # Count browser/MCP tool calls. ZERO tool calls + a usage-limit signature == the
+        # agent hit a wall on turn 1 and never touched the page -> safely re-queuable (see
+        # _no_result_status). A list so the daemon-thread closure can mutate it.
+        tool_calls = [0]
                 for line in proc.stdout:
                     line = line.strip()
                     if not line:
@@ -1208,6 +1280,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                         desc = f"{name} {inp['url'][:60]}"
                                     elif "ref" in inp:
                                         desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
+                                    tool_calls[0] += 1
                                     elif "fields" in inp:
                                         desc = f"{name} ({len(inp['fields'])} fields)"
                                     elif "paths" in inp:
@@ -1255,6 +1328,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         elif msg_type == "turn.completed":
                             usage = msg.get("usage", {})
                             stats_holder.update({
+                                tool_calls[0] += 1
                                 "input_tokens": usage.get("input_tokens", 0),
                                 "output_tokens": usage.get("output_tokens", 0),
                                 "cache_read": usage.get("cached_input_tokens", 0),
@@ -1400,9 +1474,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     return f"failed:{reason}", duration_ms
             return "failed:unknown", duration_ms
 
-        add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
+        # No RESULT: line. Distinguish an agent usage/quota wall hit on turn 1 (no tool
+        # calls -> the page was never touched -> RETRYABLE, re-queued upstream) from a
+        # genuine ran-but-no-clean-result crash (-> no_result_line -> crash_unconfirmed).
+        status = _no_result_status(output, tool_calls[0])
+        if status == USAGE_LIMIT_STATUS:
+            add_event(f"[W{worker_id}] USAGE-LIMIT wall, page never touched ({elapsed}s) -- retryable")
+            update_state(worker_id, status="failed", last_action=f"usage-limit ({elapsed}s)")
+        else:
+            add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
+            update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
+        return status, duration_ms
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
@@ -1787,8 +1869,8 @@ def _update_host_breaker(job: dict, ok: bool, reason: str | None, worker_id: int
 SYSTEMIC_FAIL_BREAKER = int(os.environ.get("APPLYPILOT_SYSTEMIC_FAIL_BREAKER")
                             or os.environ.get("APPLYPILOT_GLOBAL_FAIL_BREAKER") or 5)
 # Failure reasons that mean the agent never proved it could drive the browser this run
-# -> likely the environment (auth/API/CDP/Chrome), not the specific posting. A streak
-# of these trips the breaker; any proof-of-life outcome resets it. browser_crashed /
+# -> likely the environment (auth/API/CDP/Chrome/usage wall), not the specific posting. A
+# streak of these trips the breaker; any proof-of-life outcome resets it. browser_crashed /
 # browser_unavailable were observed in a live run -- a one-off is harmless (resets on
 # the next success), but a sustained streak means Chrome/CDP is broken, not the jobs.
 SYSTEMIC_FAIL_REASONS = {
@@ -1801,8 +1883,11 @@ _systemic_fail_lock = threading.Lock()
 
 def _is_systemic_failure(reason: str | None) -> bool:
     """True if a failure reason signals a likely environment outage (not job-specific)."""
+# usage_limit (agent quota/usage wall, never touched the page) belongs here too: a wall
+# storm should halt + keep the streak retryable rather than churn the whole queue.
     r = (reason or "").split(":", 1)[-1].strip().lower()
     return r in SYSTEMIC_FAIL_REASONS
+    "usage_limit",
 
 
 def _note_systemic_failure(url: str | None) -> bool:

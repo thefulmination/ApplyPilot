@@ -98,6 +98,41 @@ def _map_status(status: str) -> tuple[str, str | None]:
     return "failed", (s[:200] or "unknown")
 
 
+# Repeated agent usage/quota walls: each is re-queued (the job was never touched), but after
+# this many CONSECUTIVE walls the worker stops leasing and exits instead of spinning ~30
+# instant-fails/min through the whole queue. A wall typically lasts until a reset time, so a
+# fresh worker restarting later is the right recovery. 0 disables the backoff. Tunable.
+USAGE_LIMIT_MAX_STREAK = int(os.environ.get("APPLYPILOT_USAGE_LIMIT_MAX_STREAK") or 3)
+# Brief cooldown (seconds) between consecutive usage-limit re-queues, so a wall can't churn
+# the queue at full lease speed before the streak limit trips.
+USAGE_LIMIT_COOLDOWN = float(os.environ.get("APPLYPILOT_USAGE_LIMIT_COOLDOWN") or 30)
+
+
+def _handle_run_status(pg, worker_id, url, status, *, cost, dur_ms, model) -> str:
+    """Persist one run_job outcome and release the lease. Returns the action taken:
+
+      'requeued' -- an agent usage/quota wall (provably never touched the page: a turn-1
+                    failure with zero browser tool calls) -> back to 'queued' so it is
+                    re-leased later. NOT crash_unconfirmed: re-queuing cannot double-submit.
+      'applied'  -- a confirmed submit.
+      'other'    -- any other terminal outcome (failed / blocked / crash_unconfirmed),
+                    written via _map_status. crash_unconfirmed handling is UNCHANGED: a
+                    genuine ran-but-no-result crash (no_result_line/timeout/worker_error)
+                    still parks crash_unconfirmed and is never re-leased.
+    """
+    # Lazy import: main() points config at container paths BEFORE importing applypilot, so
+    # these must not be imported at module load. By the time this runs they are cached.
+    from applypilot.apply import launcher, pgqueue
+    if launcher.is_usage_limit_result(status):
+        pgqueue.requeue_job(pg, str(worker_id), url, apply_error=(status or "")[:200])
+        return "requeued"
+    pg_status, apply_error = _map_status(status)
+    pgqueue.write_result(pg, str(worker_id), url, status=pg_status,
+                         apply_status=status, apply_error=apply_error,
+                         est_cost_usd=cost, agent_model=model, apply_duration_ms=dur_ms)
+    return "applied" if pg_status == "applied" else "other"
+
+
 def _hydrate_assets(pg) -> None:
     """Write profile.json + resume.pdf from Postgres to APPLYPILOT_DIR before the first apply.
     PII ships through PG (not a Railway volume/secret); skips a file already on disk."""
@@ -264,7 +299,8 @@ def main() -> int:
         return 0
 
     idle_seconds = 0.0
-    applied = failed = 0
+    applied = failed = requeued = 0
+    consecutive_usage_limit = 0
     while not _STOP["flag"]:
         if pgqueue.should_halt(pg):
             _log("HALT: paused or spend cap reached -- exiting"); break
@@ -306,17 +342,34 @@ def main() -> int:
         finally:
             cleanup_worker(worker_id, proc)
 
-        pg_status, apply_error = _map_status(status)
-        pgqueue.write_result(pg, str(worker_id), row["url"], status=pg_status,
-                             apply_status=status, apply_error=apply_error,
-                             est_cost_usd=cost, agent_model=model, apply_duration_ms=dur_ms)
-        applied += (pg_status == "applied")
-        failed += (pg_status != "applied")
-        _log(f"result {row['url']} -> {pg_status} ({status}) ${cost:.4f} {dur_ms}ms "
-             f"| applied={applied} other={failed}")
+        action = _handle_run_status(pg, worker_id, row["url"], status,
+                                    cost=cost, dur_ms=dur_ms, model=model)
+
+        # Usage/quota wall (the agent never touched the page): re-queued, not parked. Back
+        # off after a streak so a wall doesn't churn the whole queue at lease speed -- the
+        # wall lasts until a reset time, so a fresh worker restarting later is the recovery.
+        if action == "requeued":
+            consecutive_usage_limit += 1
+            requeued += 1
+            _log(f"usage-limit wall (page never touched) -> re-queued {row['url']} "
+                 f"| streak={consecutive_usage_limit}/{USAGE_LIMIT_MAX_STREAK} "
+                 f"applied={applied} other={failed} requeued={requeued}")
+            if USAGE_LIMIT_MAX_STREAK > 0 and consecutive_usage_limit >= USAGE_LIMIT_MAX_STREAK:
+                _log(f"{consecutive_usage_limit} consecutive usage-limit walls -- backing off "
+                     f"(stop leasing); worker exiting so it isn't spinning the queue")
+                break
+            if USAGE_LIMIT_COOLDOWN > 0:
+                time.sleep(USAGE_LIMIT_COOLDOWN)
+            continue
+
+        consecutive_usage_limit = 0  # any non-wall outcome resets the streak
+        applied += (action == "applied")
+        failed += (action != "applied")
+        _log(f"result {row['url']} -> {action} ({status}) ${cost:.4f} {dur_ms}ms "
+             f"| applied={applied} other={failed} requeued={requeued}")
         launcher._throttle_after_apply(job["application_url"])  # natural inter-job pacing
 
-    _log(f"worker {worker_id} done | applied={applied} other={failed}")
+    _log(f"worker {worker_id} done | applied={applied} other={failed} requeued={requeued}")
     return 0
 
 

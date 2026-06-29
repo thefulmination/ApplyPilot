@@ -308,6 +308,50 @@ def write_result(
 # ---------------------------------------------------------------------------
 # PUSH / PULL sync surface (home box drives these; see fleet_sync.py)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Re-queue  (a RETRYABLE non-submit: back to 'queued', lease released; lease_owner-guarded)
+# ---------------------------------------------------------------------------
+
+_REQUEUE_SQL = """
+UPDATE apply_queue
+SET status           = 'queued'::apply_queue_status,
+    apply_error      = %(apply_error)s,
+    -- Undo the lease-time attempt bump: a usage/quota wall hit on turn 1 PROVABLY never
+    -- touched the page, so this lease did nothing -- don't penalize the job. NOT pinned to
+    -- 99 (that's crash_unconfirmed / reclaim). GREATEST guards against underflow.
+    attempts         = GREATEST(attempts - 1, 0),
+    lease_owner      = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE url = %(url)s
+  AND lease_owner = %(worker)s          -- only the lease holder may re-queue it
+RETURNING url;
+"""
+
+
+def requeue_job(
+    conn: psycopg.Connection,
+    worker_id: str,
+    url: str,
+    *,
+    apply_error: str | None = None,
+) -> bool:
+    """Return a leased job to 'queued' so it can be re-leased -- the RETRYABLE counterpart
+    to write_result. Use ONLY when the run provably never touched the application form
+    (e.g. an agent usage/quota wall hit before any browser tool call): this re-queue can
+    NEVER cause a double-submit. attempts is NOT pinned (the lease bump is undone). Mirrors
+    write_result's lease_owner guard, so a reclaimed/foreign row is never clobbered. Returns
+    True only if this worker held the lease."""
+    with conn.cursor() as cur:
+        cur.execute(
+            _REQUEUE_SQL,
+            {"apply_error": apply_error, "worker": worker_id, "url": url},
+        )
+        landed = cur.fetchone() is not None
+    conn.commit()
+    return landed
+
+
 
 _PUSH_SQL = """
 INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, status)
