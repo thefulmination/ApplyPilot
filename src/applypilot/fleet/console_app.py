@@ -41,10 +41,13 @@ from typing import Any
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
+from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor (S1: scrub on READ too)
 
 DEFAULT_PORT = 8787
 _HB_ALIVE_SECONDS = 150          # apply workers beat ~every tick; >150s stale = dead
 _INFERRED_WINDOW_SECONDS = 300   # fallback only (unused: apply workers DO beat)
+_LOG_LAST_ERROR_CAP = 4000       # mirror the worker write caps on read (S3)
+_LOG_RECENT_CAP = 8000
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +311,50 @@ def build_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# READ: per-worker crash + log tail (separate endpoint; NOT in the 4s /api/status
+# poll, so the big text blobs never bloat it). The worker already scrubbed this text
+# before storing it; we scrub AGAIN on read (defense in depth -- S1) and cap sizes (S3).
+# ---------------------------------------------------------------------------
+def _worker_logs(conn, worker_id: str) -> dict | None:
+    """Return {worker_id, last_beat, last_error, recent_log} for one worker, or None if
+    no such worker_heartbeat row exists (handler -> 404). The query is PARAMETERIZED
+    (never SQL built from request input -- S5). Text is re-scrubbed + size-capped."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT worker_id, last_beat, last_error, recent_log "
+            "FROM worker_heartbeat WHERE worker_id = %s",
+            (worker_id,),
+        )
+        row = cur.fetchone()
+    conn.rollback()  # read-only
+    if row is None:
+        return None
+    last_error = _scrub(row.get("last_error"))[:_LOG_LAST_ERROR_CAP]
+    recent_log = _scrub(row.get("recent_log"))
+    if len(recent_log) > _LOG_RECENT_CAP:
+        recent_log = recent_log[-_LOG_RECENT_CAP:]
+    return {
+        "worker_id": row["worker_id"],
+        "last_beat": _iso(row.get("last_beat")),
+        "last_error": last_error,
+        "recent_log": recent_log,
+    }
+
+
+def worker_logs(worker_id: str) -> dict | None:
+    """Open a short-lived connection, read one worker's logs, always close. None -> 404."""
+    conn = pgqueue.connect()
+    try:
+        return _worker_logs(conn, worker_id)
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # WRITE: the strict action allow-list. NO LinkedIn action exists here by design.
 # ---------------------------------------------------------------------------
 def _do_arm_canary(conn, body: dict) -> str:
@@ -550,6 +597,26 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
+        if path == "/api/logs":
+            # Separate endpoint (NOT folded into /api/status) so the big text blobs
+            # never bloat the 4s poll. The `worker` param is validated against an
+            # existing worker_heartbeat row; an unknown/missing worker -> 400/404.
+            import urllib.parse as _up
+            qs = _up.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            wid = (qs.get("worker") or [None])[0]
+            if not wid or not isinstance(wid, str):
+                self._send_json(400, {"error": "missing worker param"})
+                return
+            try:
+                logs = worker_logs(wid)
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+                return
+            if logs is None:
+                self._send_json(404, {"error": "unknown worker"})
+                return
+            self._send_json(200, logs)
+            return
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -659,6 +726,14 @@ _INDEX_HTML = r"""<!doctype html>
   .toast.err{border-left-color:var(--red2)}
   .toast.ok{border-left-color:var(--green2)}
   label.inl{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+  select{font:inherit;background:var(--bg);border:1px solid var(--border);color:var(--fg);
+    padding:8px;border-radius:8px}
+  .logblk{margin-top:10px}
+  .logblk .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+  pre.log{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;
+    margin:0;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--fg)}
+  pre.log.err{border-color:rgba(218,54,51,.45)}
 </style>
 </head>
 <body>
@@ -713,6 +788,18 @@ _INDEX_HTML = r"""<!doctype html>
     <h2>Recent activity</h2>
     <table><thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Company / Title</th></tr></thead>
       <tbody id="recent"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>Worker logs (crash + recent activity)</h2>
+    <div class="controls" style="margin-bottom:12px">
+      <label class="inl">worker
+        <select id="logWorker"><option value="">&mdash;</option></select>
+      </label>
+      <button id="btnLogs">Refresh</button>
+      <span class="mut" style="font-size:12px">Last crash traceback + recent log tail, shipped via the heartbeat (secrets scrubbed). Read-only.</span>
+    </div>
+    <div id="logArea" class="mut" style="font-size:12px">Select a worker to view its logs.</div>
   </section>
 
   <section>
@@ -822,6 +909,22 @@ function render(s){
   document.getElementById("liCanary").textContent = li.canary_enabled ? "armed" : "off";
   document.getElementById("liHalted").textContent = li.halted ? "YES" : "no";
 
+  // Populate the worker-logs <select> from apply + discovery workers, preserving the
+  // current selection. Only rebuild when the worker set changes (don't clobber an open
+  // dropdown every 4s).
+  const ids = [];
+  (s.workers||[]).forEach(w=>ids.push(w.worker_id));
+  if(s.discovery && s.discovery.workers){ s.discovery.workers.forEach(w=>ids.push(w.worker_id)); }
+  const sel = document.getElementById("logWorker");
+  const sig = ids.join("|");
+  if(sel._sig !== sig){
+    sel._sig = sig;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— select worker —</option>' +
+      ids.map(id=>'<option value="'+esc(id)+'">'+esc(id)+'</option>').join("");
+    if(ids.indexOf(cur) >= 0) sel.value = cur;
+  }
+
   const d = s.discovery;
   if(d){
     document.getElementById("dTasks").textContent = d.tasks.total;
@@ -892,6 +995,30 @@ document.getElementById("btnCap").onclick = ()=>{
 
 document.getElementById("btnExpand").onclick = ()=>act("expand_searches", null,
   "Expand searches → seed/refresh the discovery queue (search_tasks) from your searches.yaml. This queues scrape work; it does NOT submit any applications and does NOT write your brain. Continue?");
+
+async function loadLogs(){
+  const wid = document.getElementById("logWorker").value;
+  const area = document.getElementById("logArea");
+  if(!wid){ area.className = "mut"; area.style.fontSize = "12px";
+    area.textContent = "Select a worker to view its logs."; return; }
+  area.className = "mut"; area.textContent = "loading…";
+  try{
+    const r = await fetch("/api/logs?worker=" + encodeURIComponent(wid), {cache:"no-store"});
+    const j = await r.json();
+    if(!r.ok){ area.textContent = (j && j.error) ? j.error : ("error " + r.status); return; }
+    const err = j.last_error ? j.last_error : "(no crash recorded)";
+    const log = j.recent_log ? j.recent_log : "(no recent log)";
+    area.className = "";
+    area.innerHTML =
+      '<div class="logblk"><div class="lbl">Last crash (' + esc(wid) +
+        ', beat ' + esc(rel(j.last_beat)) + ')</div>' +
+        '<pre class="log err">' + esc(err) + '</pre></div>' +
+      '<div class="logblk"><div class="lbl">Recent log tail</div>' +
+        '<pre class="log">' + esc(log) + '</pre></div>';
+  }catch(e){ area.textContent = "request failed: " + e.message; }
+}
+document.getElementById("btnLogs").onclick = loadLogs;
+document.getElementById("logWorker").onchange = loadLogs;
 
 poll();
 setInterval(poll, 4000);

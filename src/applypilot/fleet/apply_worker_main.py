@@ -70,12 +70,34 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
     return apply_fn
 
 
+def make_log_tail_fn(slot: int, *, n_lines: int = 40):
+    """Return a zero-arg callable yielding the LAST ~n_lines of THIS apply worker's rich
+    log (the live agent transcript), or None. The launcher writes that file at
+    ``config.LOG_DIR / f"worker-{slot}.log"`` (launcher.py:1141, keyed by the Chrome slot
+    int). WorkerLoop scrubs + caps the returned text before it is shipped/stored, so this
+    only has to read defensively: a missing file (worker hasn't applied yet) -> None, and
+    ANY read error -> None (the heartbeat then ships the in-memory event ring instead)."""
+    def _tail():
+        try:
+            from applypilot import config  # the module launcher.run_job writes through
+            path = config.LOG_DIR / f"worker-{slot}.log"
+            if not path.exists():
+                return None
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            return "".join(lines[-n_lines:]) if lines else None
+        except Exception:
+            return None
+    return _tail
+
+
 def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="claude", machine_owner=None, slot=0):
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
     return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
-                      apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner)
+                      apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
+                      log_tail_fn=make_log_tail_fn(slot))
 
 
 def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dict:

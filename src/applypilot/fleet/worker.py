@@ -35,6 +35,9 @@ owns the connection lifecycle so it can reconnect after a transient DB blip.
 """
 from __future__ import annotations
 
+import collections
+import os
+import re
 from typing import Any, Callable, Optional
 
 from applypilot.fleet import captcha as _captcha
@@ -46,6 +49,74 @@ ROLE_APPLY = "apply"
 ROLE_COMPUTE = "compute"
 ROLE_DISCOVERY = "discovery"
 ROLE_LINKEDIN = "linkedin"
+
+_REDACTED = "[REDACTED]"
+
+# Pattern-based secret redaction. The fleet submits REAL applications, so a single
+# leaked DSN / password / token reaching worker_heartbeat or the LAN console is a
+# CRITICAL defect. These patterns catch the structural secrets (connection strings,
+# bearer tokens, known key prefixes); _scrub() additionally redacts the LITERAL
+# values of secret-bearing env vars present in os.environ (see below).
+_SECRET_PATTERNS = [
+    # libpq conninfo key=value secrets (password / pwd anywhere in a DSN/conninfo).
+    re.compile(r"(?i)\b(password|pwd)\s*=\s*\S+"),
+    # A full libpq keyword DSN (host=... ... dbname=...) -- redact the whole run so
+    # host/user/dbname triplets never leak even without a password token present.
+    re.compile(r"(?i)\bhost\s*=\s*\S+(?:\s+\w+\s*=\s*\S+)*"),
+    # postgres:// (and other) URL DSNs, incl. embedded user:pass@host credentials.
+    re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s'\"]+"),
+    # JSON / header style "password": "...", token=..., api_key: ...
+    re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*['\"]?\S+"),
+    # Authorization: Bearer <token>
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"),
+    # Known token prefixes: OpenAI-style sk-..., GitHub ghp_/gho_/ghs_..., etc.
+    re.compile(r"\b(?:sk|rk)-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\bgh[opsu]_[A-Za-z0-9]{20,}"),
+    # Long base64-ish opaque blobs (likely keys/tokens). 40+ chars to avoid eating words.
+    re.compile(r"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b"),
+]
+
+
+def _scrub(text: Optional[str]) -> str:
+    """Redact secrets from any text BEFORE it is shipped to Postgres or rendered in
+    the LAN console. Returns "" for None. This is the load-bearing safety control:
+
+      * the LITERAL values of secret-bearing env vars (FLEET_PG_DSN /
+        APPLYPILOT_FLEET_DSN / DATABASE_URL / DEEPSEEK_API_KEY / any *_API_KEY /
+        *_TOKEN) are removed first -- an exact-value match is the surest redaction;
+      * then structural patterns (conninfo, URL DSNs, bearer/api tokens, known key
+        prefixes, long base64 blobs) catch anything constructed at runtime.
+
+    Never raises (a logging/scrub error must never break the heartbeat)."""
+    if text is None:
+        return ""
+    try:
+        s = str(text)
+        # 1) Exact env-value redaction (longest first so a value that is a substring
+        #    of another doesn't leave a fragment behind).
+        try:
+            secret_values = []
+            for k, v in os.environ.items():
+                if not v or len(v) < 4:
+                    continue
+                ku = k.upper()
+                if (ku in ("FLEET_PG_DSN", "APPLYPILOT_FLEET_DSN", "DATABASE_URL",
+                           "DEEPSEEK_API_KEY")
+                        or ku.endswith("_API_KEY") or ku.endswith("_TOKEN")
+                        or ku.endswith("_DSN") or ku.endswith("_SECRET")
+                        or ku.endswith("_PASSWORD")):
+                    secret_values.append(v)
+            for v in sorted(set(secret_values), key=len, reverse=True):
+                s = s.replace(v, _REDACTED)
+        except Exception:
+            pass
+        # 2) Structural pattern redaction.
+        for pat in _SECRET_PATTERNS:
+            s = pat.sub(_REDACTED, s)
+        return s
+    except Exception:
+        # Never let scrubbing failure leak raw text OR break the caller.
+        return ""
 
 
 def _insert_challenge(conn, *, url, worker_id, machine_owner, home_ip, kind, route,
@@ -66,18 +137,24 @@ def _insert_challenge(conn, *, url, worker_id, machine_owner, home_ip, kind, rou
 
 
 def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_job=None,
-               sw_version=None, commit=True) -> None:
+               sw_version=None, last_error=None, recent_log=None, commit=True) -> None:
     """UPSERT this worker's ``worker_heartbeat`` row (~every iteration, spec §11/R5).
     A missing heartbeat for > lease TTL is what lets the reclaim sweep re-queue a
-    crashed worker's job (§5 stateless self-resume)."""
+    crashed worker's job (§5 stateless self-resume).
+
+    ``last_error`` / ``recent_log`` (crash-visibility, scrubbed by the caller) OVERWRITE
+    on every beat (set ...=EXCLUDED.x), unlike ``sw_version`` which COALESCEs to keep a
+    previously reported version when a beat omits it."""
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, last_beat) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s, now()) "
+            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, last_error, recent_log, last_beat) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
             "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
             "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
-            "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), last_beat=now()",
-            (worker_id, machine_owner, home_ip, role, state, current_job, sw_version),
+            "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
+            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, last_beat=now()",
+            (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
+             last_error, recent_log),
         )
     if commit:
         conn.commit()
@@ -131,6 +208,7 @@ class WorkerLoop:
         public_ip: Optional[str] = None,
         owner_ip: Optional[str] = None,
         compute_fns: Optional[dict] = None,
+        log_tail_fn: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         if role not in (ROLE_APPLY, ROLE_COMPUTE, ROLE_DISCOVERY, ROLE_LINKEDIN):
             raise ValueError(f"unknown role: {role!r}")
@@ -147,6 +225,13 @@ class WorkerLoop:
         self.on_owner_machine = on_owner_machine
         self.public_ip = public_ip or home_ip
         self.owner_ip = owner_ip
+        # Crash + log visibility (shipped on every beat). _last_error holds the most
+        # recent SCRUBBED traceback (None until a tick crashes). _events is an in-memory
+        # ring telling the recent tick story (leased X / wrote Y). log_tail_fn, when set
+        # (apply lane), returns the rich agent log tail; otherwise the ring is shipped.
+        self._last_error: Optional[str] = None
+        self._events: collections.deque = collections.deque(maxlen=40)
+        self._log_tail_fn = log_tail_fn
         if compute_fns is not None:
             self.compute_fns = compute_fns
             self._legacy_score_fn = None
@@ -163,6 +248,19 @@ class WorkerLoop:
     # -- connection -----------------------------------------------------------
     def _connect(self):
         return self.conn_factory()
+
+    # -- event ring (crash/log visibility) ------------------------------------
+    def _record_event(self, msg) -> None:
+        """Append a timestamped, SCRUBBED one-line event to the in-memory ring. Cheap
+        (bounded deque, one scrub) and MUST NOT raise -- a logging failure can never be
+        allowed to change tick control flow or break a heartbeat."""
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M:%S")
+            line = _scrub(str(msg)).replace("\n", " ")[:300]
+            self._events.append(f"{ts} {line}")
+        except Exception:
+            pass
 
     # -- the single tick ------------------------------------------------------
     def run_once(self) -> dict:
@@ -196,6 +294,7 @@ class WorkerLoop:
             self._beat(conn, state="idle")
             return {"action": "idle"}
         task = job.get("task") or "score"
+        self._record_event(f"leased compute {task} {job.get('url')}")
         fn = self.compute_fns.get(task)
         if fn is None:
             raise RuntimeError(f"compute role has no handler for task {task!r}")
@@ -210,6 +309,7 @@ class WorkerLoop:
             cost_usd=cost or 0, model=result.get("model"), provider=result.get("provider"),
             task=task, machine_owner=self.machine_owner,
         )
+        self._record_event(f"wrote compute {result.get('status', 'done')} {job.get('url')}")
         self._beat(conn, state="idle")
         return {"action": "compute_done", "url": job["url"], "task": task, "cost_usd": cost or 0}
 
@@ -219,6 +319,7 @@ class WorkerLoop:
         if task is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}
+        self._record_event(f"leased search {task.get('task_id')} {task.get('query') or task.get('board')}")
         self._beat(conn, state="searching", current_job=task["task_id"])
         if self.search_fn is None:
             raise RuntimeError("discovery role requires an injected search_fn")
@@ -239,6 +340,9 @@ class WorkerLoop:
             conn, self.worker_id, task["task_id"],
             result_count=len(postings), board=task.get("board"), error=error,
         )
+        self._record_event(
+            f"wrote search {('error:' + error) if error else 'ok'} "
+            f"{task.get('task_id')} found={len(postings)} staged={staged}")
         self._beat(conn, state="idle")
         return {"action": "search_done", "task_id": task["task_id"],
                 "result_count": len(postings), "staged": staged, "error": error}
@@ -251,6 +355,7 @@ class WorkerLoop:
             return {"action": "idle"}
         url = job["url"]
         target_host = job.get("target_host")
+        self._record_event(f"leased apply {url} host={target_host}")
         self._beat(conn, state="applying", current_job=url)
         if self.apply_fn is None:
             raise RuntimeError("apply role requires an injected apply_fn")
@@ -269,6 +374,7 @@ class WorkerLoop:
                 conn, self.worker_id, url, status="applied", apply_status="applied",
                 target_host=target_host, home_ip=self.home_ip, outcome="success",
             )
+            self._record_event(f"wrote apply applied {url} ({kind})")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url, "kind": kind}
 
@@ -291,6 +397,7 @@ class WorkerLoop:
                 apply_error=f"captcha:{kind}", target_host=target_host, home_ip=self.home_ip,
                 outcome="block",
             )
+            self._record_event(f"wrote apply blocked {url} (captcha:{kind})")
             self._beat(conn, state="idle")
             return {"action": "skipped", "url": url, "kind": kind, "route": route}
 
@@ -320,6 +427,7 @@ class WorkerLoop:
         if job is None:
             self._beat(conn, state="idle"); return {"action": "idle"}
         url = job["url"]
+        self._record_event(f"leased linkedin {url}")
         self._beat(conn, state="applying", current_job=url)
         if self.apply_fn is None:
             raise RuntimeError("linkedin role requires an injected apply_fn")
@@ -329,20 +437,24 @@ class WorkerLoop:
         if run_status == "applied":
             queue.write_linkedin_result(conn, self.worker_id, url, status="applied", apply_status="applied",
                                         est_cost_usd=cost, outcome="success")
+            self._record_event(f"wrote linkedin applied {url}")
             self._beat(conn, state="idle"); return {"action": "applied", "url": url}
         if run_status in self._WALL_STATUSES:
             queue.park_linkedin_challenge(conn, self.worker_id, url, halt_seconds=self._linkedin_halt_seconds())
             _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
                               home_ip=self.home_ip, kind="visible_captcha" if run_status == "captcha" else "login_gate",
                               route="owner_inbox")
+            self._record_event(f"parked linkedin challenge {url} ({run_status})")
             self._beat(conn, state="challenge_pending", current_job=url)
             return {"action": "parked_challenge", "url": url}
         if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
             queue.write_linkedin_result(conn, self.worker_id, url, status="crash_unconfirmed",
                                         apply_status="crash_unconfirmed", apply_error=run_status[:200], est_cost_usd=cost)
+            self._record_event(f"wrote linkedin crash_unconfirmed {url} ({run_status})")
             self._beat(conn, state="idle"); return {"action": "crash_unconfirmed", "url": url}
         queue.write_linkedin_result(conn, self.worker_id, url, status="failed", apply_status="failed",
                                     apply_error=(run_status or "unknown")[:200], est_cost_usd=cost)
+        self._record_event(f"wrote linkedin failed {url} ({run_status or 'unknown'})")
         self._beat(conn, state="idle"); return {"action": "failed", "url": url}
 
     def _apply_status_passthrough(self, conn, url, target_host, res: dict) -> dict:
@@ -354,6 +466,7 @@ class WorkerLoop:
         if run_status == "applied":
             queue.write_apply_result(conn, self.worker_id, url, status="applied", apply_status="applied",
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost, outcome="success")
+            self._record_event(f"wrote apply applied {url}")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
         if run_status in self._WALL_STATUSES:
@@ -366,11 +479,13 @@ class WorkerLoop:
             queue.write_apply_result(conn, self.worker_id, url, status="crash_unconfirmed",
                                      apply_status="crash_unconfirmed", apply_error=run_status[:200],
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost)
+            self._record_event(f"wrote apply crash_unconfirmed {url} ({run_status})")
             self._beat(conn, state="idle")
             return {"action": "crash_unconfirmed", "url": url}
         queue.write_apply_result(conn, self.worker_id, url, status="failed", apply_status="failed",
                                  apply_error=(run_status or "unknown")[:200],
                                  target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost)
+        self._record_event(f"wrote apply failed {url} ({run_status or 'unknown'})")
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}
 
@@ -393,15 +508,47 @@ class WorkerLoop:
             governor.record_outcome(conn, scopes, outcome, commit=False)
         queue.park_challenge(conn, self.worker_id, url, commit=False)
         conn.commit()
+        self._record_event(f"parked challenge {url} ({kind}->{route})")
         self._beat(conn, state="challenge_pending", current_job=url)
         return cid
 
     # -- heartbeat helper -----------------------------------------------------
+    def _build_recent_log(self) -> Optional[str]:
+        """Freshest SCRUBBED log tail to ship on this beat, capped to the LAST 8000
+        chars (bound PG growth -- S3). Prefers the rich agent log via log_tail_fn (apply
+        lane); a missing/failed tail falls back to the in-memory event ring. NEVER raises:
+        any logging error returns None so the heartbeat still fires (S2)."""
+        try:
+            text: Optional[str] = None
+            if self._log_tail_fn is not None:
+                try:
+                    text = self._log_tail_fn()
+                except Exception:
+                    text = None
+            if not text:
+                try:
+                    text = "\n".join(self._events)
+                except Exception:
+                    text = None
+            if not text:
+                return None
+            scrubbed = _scrub(text)
+            return scrubbed[-8000:] if len(scrubbed) > 8000 else scrubbed
+        except Exception:
+            return None
+
     def _beat(self, conn, *, state, current_job=None) -> None:
+        # recent_log / last_error are crash-visibility extras; building them must NEVER
+        # break the heartbeat (S2). last_error is already scrubbed + capped at capture.
+        try:
+            recent_log = self._build_recent_log()
+        except Exception:
+            recent_log = None
+        last_error = self._last_error
         _heartbeat(
             conn, worker_id=self.worker_id, machine_owner=self.machine_owner,
             home_ip=self.home_ip, role=self.role, state=state, current_job=current_job,
-            sw_version=self.sw_version,
+            sw_version=self.sw_version, last_error=last_error, recent_log=recent_log,
         )
 
     # -- long-running driver (not exercised by unit tests) --------------------
@@ -419,6 +566,17 @@ class WorkerLoop:
             except Exception:
                 # A transient failure must not kill the slot; the reclaim sweep
                 # re-queues anything we were holding (§5 stateless self-resume).
+                # ALSO capture the (scrubbed) traceback so the crash is VISIBLE in the
+                # console -- previously this except swallowed it (the invisibility bug).
+                # Recovery behavior is otherwise UNCHANGED.
+                try:
+                    import traceback
+                    tb = _scrub(traceback.format_exc())
+                    self._last_error = tb[:4000]
+                    last_line = next((ln for ln in reversed(tb.splitlines()) if ln.strip()), "")
+                    self._record_event("ERROR: " + last_line)
+                except Exception:
+                    pass
                 res = {"action": "error"}
             if res.get("action") == "idle":
                 time.sleep(idle_sleep_seconds)

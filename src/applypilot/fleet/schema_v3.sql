@@ -286,6 +286,12 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
     last_beat       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_heartbeat_stale ON worker_heartbeat (last_beat);
+-- Crash + log visibility (shipped on every beat, OVERWRITE per beat). Both are
+-- already SCRUBBED of secrets by the worker before the UPSERT; the console scrubs
+-- again on read (defense in depth). Capped at write time (last_error <= 4000,
+-- recent_log <= 8000) so this one-row-per-worker table cannot grow unbounded.
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS last_error  TEXT;
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS recent_log  TEXT;
 
 -- ---------------------------------------------------------------------------
 -- poison_jobs: quarantine for jobs that crash/hang whoever claims them (R7).

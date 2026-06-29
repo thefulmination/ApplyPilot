@@ -383,6 +383,97 @@ def test_worker_role_validation():
 
 
 # ===========================================================================
+# 4b. Crash + log visibility: _scrub redacts secrets; _heartbeat persists
+#     last_error / recent_log (scrubbed) to worker_heartbeat.
+# ===========================================================================
+
+def test_scrub_redacts_dsn_and_tokens(monkeypatch):
+    from applypilot.fleet.worker import _scrub
+
+    # None -> "" (never leaks, never raises)
+    assert _scrub(None) == ""
+
+    # Env secret values are redacted by exact value (the surest match).
+    monkeypatch.setenv("FLEET_PG_DSN", "host=localhost port=5432 dbname=applypilot_fleet user=postgres password=hunter2")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deadbeefdeadbeefdeadbeefdeadbeef00")
+    monkeypatch.setenv("SOME_TOKEN", "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
+
+    tb = (
+        "Traceback (most recent call last):\n"
+        '  File "worker.py", line 1, in run\n'
+        "    connect('host=localhost port=5432 dbname=applypilot_fleet user=postgres password=hunter2')\n"
+        "psycopg.OperationalError: could not connect using DATABASE_URL="
+        "postgresql://postgres:hunter2@localhost:5432/applypilot_fleet\n"
+        "Authorization: Bearer sk-deadbeefdeadbeefdeadbeefdeadbeef00\n"
+        "leaked token ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\n"
+    )
+    out = _scrub(tb)
+    # No secret material survives.
+    for leak in ("hunter2", "password=hunter2",
+                 "sk-deadbeefdeadbeefdeadbeefdeadbeef00",
+                 "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                 "postgresql://postgres:hunter2@localhost",
+                 "dbname=applypilot_fleet"):
+        assert leak not in out, f"secret leaked through _scrub: {leak!r}"
+    assert "[REDACTED]" in out
+    # The benign frame text survives so the traceback is still useful.
+    assert "Traceback" in out and "OperationalError" in out
+
+
+def test_heartbeat_persists_scrubbed_last_error_and_recent_log(fleet_db, monkeypatch):
+    from applypilot.fleet.worker import _heartbeat, _scrub
+
+    monkeypatch.setenv("FLEET_PG_DSN", "host=db port=5432 dbname=x user=u password=topsecretpw")
+    planted = (
+        "ERROR boom\n"
+        "connect: host=db port=5432 dbname=x user=u password=topsecretpw\n"
+        "token sk-aaaabbbbccccddddeeeeffffgggghhhh1234\n"
+    )
+    le = _scrub(planted)[:4000]
+    rl = _scrub("line1\nline2\nhost=db password=topsecretpw\n")[-8000:]
+
+    with pgqueue.connect(fleet_db) as conn:
+        _heartbeat(conn, worker_id="w-crash", machine_owner="jon", home_ip="1.2.3.4",
+                   role="apply", state="idle", last_error=le, recent_log=rl)
+        # UPSERT path: a second beat OVERWRITES both fields.
+        _heartbeat(conn, worker_id="w-crash", machine_owner="jon", home_ip="1.2.3.4",
+                   role="apply", state="applying", last_error="second", recent_log="freshtail")
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT state, last_error, recent_log FROM worker_heartbeat WHERE worker_id='w-crash'")
+        row = cur.fetchone()
+    assert row["state"] == "applying"
+    assert row["last_error"] == "second" and row["recent_log"] == "freshtail"  # overwrote, not coalesced
+
+    # And what we stored from the planted secrets carries NO secret material.
+    for leak in ("topsecretpw", "sk-aaaabbbbccccddddeeeeffffgggghhhh1234", "password=topsecretpw"):
+        assert leak not in le and leak not in rl
+
+
+def test_run_forever_records_scrubbed_crash(fleet_db, monkeypatch):
+    """run_forever's tick-exception handler must CAPTURE the traceback (the prior bug
+    swallowed it) -- scrubbed, capped, and visible via the next heartbeat."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-zzzzyyyyxxxxwwwwvvvvuuuuttttssss9999")
+
+    def boom_factory():
+        raise RuntimeError("kaboom secret sk-zzzzyyyyxxxxwwwwvvvvuuuuttttssss9999")
+
+    loop = WorkerLoop(boom_factory, "w-boom", home_ip="9.9.9.9", role="compute",
+                      score_fn=lambda j: ({}, 0))
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return calls["n"] > 1  # let exactly one tick run, then stop
+
+    loop.run_forever(idle_sleep_seconds=0, stop=stop)
+    assert loop._last_error is not None
+    assert "RuntimeError" in loop._last_error
+    assert "sk-zzzzyyyyxxxxwwwwvvvvuuuuttttssss9999" not in loop._last_error
+    assert len(loop._last_error) <= 4000
+
+
+# ===========================================================================
 # 5. WorkerLoop APPLY status-passthrough path (apply_fn returns dict).
 #    Prove crash != phantom-applied; captcha -> parked.
 # ===========================================================================
