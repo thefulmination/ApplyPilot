@@ -137,3 +137,29 @@ def test_requeue_job_lost_race_writes_nothing():
     ins = [e for e in conn._cur.executed if "INSERT INTO remediation_actions" in e[0]]
     assert len(ins) == 0
     assert conn.committed is False
+
+
+def _cand(url, dk="dk"):
+    return remediator.Candidate(url=url, worker_id="m2-3", dedup_key=dk,
+                                status="crash_unconfirmed", attempts=99,
+                                apply_error="crash_unconfirmed", reason="usage_limit")
+
+
+def test_remediate_applies_guards_and_caps(monkeypatch):
+    cands = [_cand("u-clean"), _cand("u-applied"), _cand("u-emailed"), _cand("u-overflow")]
+    monkeypatch.setattr(remediator, "ensure_remediation_table", lambda conn: None)
+    monkeypatch.setattr(remediator, "select_candidates", lambda conn, **k: cands)
+    # guard 2 vetoes the candidate whose dedup_key == "applied"; guard 3 vetoes url "u-emailed"
+    monkeypatch.setattr(remediator, "in_applied_set",
+                        lambda conn, dk: dk == "applied")
+    monkeypatch.setattr(remediator, "has_confirming_email",
+                        lambda bp, url: url == "u-emailed")
+    requeued = []
+    monkeypatch.setattr(remediator, "requeue_job",
+                        lambda conn, c: (requeued.append(c.url) or True))
+    cands[1] = _cand("u-applied", dk="applied")  # guard-2 veto target
+    out = remediator.remediate(object(), brain_path="x", max_requeue=1, max_per_job=2)
+    # only u-clean re-queued (u-applied vetoed, u-emailed vetoed, then max_requeue=1 caps the rest)
+    assert requeued == ["u-clean"]
+    assert out["requeued"] == 1 and out["vetoed_applied_set"] == 1 and out["vetoed_email"] == 1
+    assert out["capped"] >= 1

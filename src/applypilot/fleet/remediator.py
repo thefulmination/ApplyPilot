@@ -126,3 +126,30 @@ def requeue_job(conn, c: Candidate) -> bool:
             (c.url, c.worker_id, c.reason, c.status, c.attempts, c.apply_error, how_to_reverse))
     conn.commit()
     return True
+
+
+def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
+              max_per_job: int = 2, window_minutes: int = 30) -> dict:
+    """One pass: select usage-limit casualties, then re-queue each ONLY if all 3 guards pass,
+    bounded by max_requeue. Guard failures and cap overflow are left parked (a recommendation,
+    not an action). Returns a summary. brain_path defaults to the live brain (config.DB_PATH)."""
+    if brain_path is None:
+        from applypilot.config import DB_PATH
+        brain_path = str(DB_PATH)
+    ensure_remediation_table(conn)
+    cands = select_candidates(conn, window_minutes=window_minutes, max_per_job=max_per_job)
+    out = {"candidates": len(cands), "requeued": 0, "vetoed_applied_set": 0,
+           "vetoed_email": 0, "capped": 0}
+    for c in cands:
+        if in_applied_set(conn, c.dedup_key):           # guard 2
+            out["vetoed_applied_set"] += 1
+            continue
+        if has_confirming_email(brain_path, c.url):     # guard 3
+            out["vetoed_email"] += 1
+            continue
+        if out["requeued"] >= max_requeue:              # per-pass blast-radius cap
+            out["capped"] += 1
+            continue
+        if requeue_job(conn, c):                        # guard 1 already satisfied by selection
+            out["requeued"] += 1
+    return out
