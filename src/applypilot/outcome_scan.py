@@ -102,6 +102,35 @@ def upsert_email_event(conn, row: dict, *, reextract: bool = False) -> str:
     return "inserted"
 
 
+# Gmail messages().list caps a single page at 500 ids; we page until exhausted
+# or until this overall safety cap, so a busy 30-day inbox isn't truncated.
+_GMAIL_PAGE_SIZE = 500
+_GMAIL_MAX_MESSAGES = 3000
+
+
+def _accumulate_message_refs(
+    service,
+    query: str,
+    *,
+    page_size: int = _GMAIL_PAGE_SIZE,
+    max_messages: int = _GMAIL_MAX_MESSAGES,
+) -> list[dict]:
+    """Page through messages().list, accumulating message refs across pages
+    until there's no nextPageToken or `max_messages` is reached. Extracted from
+    the network fetch so the page-accumulation loop is unit-testable."""
+    refs: list[dict] = []
+    page_token = None
+    while True:
+        resp = service.users().messages().list(
+            userId="me", q=query, maxResults=page_size, pageToken=page_token
+        ).execute()
+        refs.extend(resp.get("messages", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token or len(refs) >= max_messages:
+            break
+    return refs[:max_messages]
+
+
 def _gmail_fetch(days: int, credentials_path: Path | None) -> Callable[[], list[dict]]:
     """Default fetch: pull candidate messages from Gmail (read-only). Returns a
     thunk so the network call is deferred until scan time."""
@@ -109,9 +138,9 @@ def _gmail_fetch(days: int, credentials_path: Path | None) -> Callable[[], list[
         from applypilot.gmail_outcomes import build_gmail_service, _get_text_body, _search_query
         service = build_gmail_service(credentials_path=credentials_path)
         query = _search_query(days)
-        resp = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
+        refs = _accumulate_message_refs(service, query)
         out: list[dict] = []
-        for ref in resp.get("messages", []):
+        for ref in refs:
             tid = ref.get("threadId", ref["id"])
             full = service.users().messages().get(userId="me", id=ref["id"], format="full").execute()
             headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}

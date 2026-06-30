@@ -75,3 +75,49 @@ def test_scan_outcomes_uses_injected_fetch(tmp_path, monkeypatch):
     counts2 = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: messages, conn=conn)
     assert counts2["skipped"] == 1
     assert counts2["inserted"] == 0
+
+
+class _FakePage:
+    """One canned messages().list() response that answers .execute()."""
+    def __init__(self, resp): self._resp = resp
+    def execute(self): return self._resp
+
+
+class _FakeGmailService:
+    """Minimal stand-in for the Gmail client. Records the pageToken passed to
+    each messages().list() call and returns the canned page keyed by it."""
+    def __init__(self, pages):
+        self._pages = pages
+        self.page_tokens = []
+
+    def users(self): return self
+    def messages(self): return self
+
+    def list(self, *, userId, q, maxResults, pageToken=None):
+        self.page_tokens.append(pageToken)
+        return _FakePage(self._pages[pageToken])
+
+
+def test_accumulate_message_refs_follows_pagination():
+    pages = {
+        None: {"messages": [{"id": "a"}, {"id": "b"}], "nextPageToken": "p2"},
+        "p2": {"messages": [{"id": "c"}], "nextPageToken": "p3"},
+        "p3": {"messages": [{"id": "d"}]},  # no nextPageToken -> stop
+    }
+    service = _FakeGmailService(pages)
+    refs = S._accumulate_message_refs(service, "q", page_size=500, max_messages=1000)
+    assert [r["id"] for r in refs] == ["a", "b", "c", "d"]
+    assert service.page_tokens == [None, "p2", "p3"]
+
+
+def test_accumulate_message_refs_respects_cap():
+    pages = {
+        None: {"messages": [{"id": "a"}, {"id": "b"}], "nextPageToken": "p2"},
+        "p2": {"messages": [{"id": "c"}, {"id": "d"}], "nextPageToken": "p3"},
+        "p3": {"messages": [{"id": "e"}], "nextPageToken": "p4"},
+    }
+    service = _FakeGmailService(pages)
+    refs = S._accumulate_message_refs(service, "q", page_size=2, max_messages=3)
+    assert [r["id"] for r in refs] == ["a", "b", "c"]
+    # Stopped once the cap was reached on page 2; page 3 was never fetched.
+    assert service.page_tokens == [None, "p2"]

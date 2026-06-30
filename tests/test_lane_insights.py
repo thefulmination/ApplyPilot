@@ -1,6 +1,16 @@
 from applypilot.lane_insights import compute_lane_insights, derive_segments, wilson_interval
 
 
+def test_empty_apps_returns_zero_baseline():
+    # Day-1 dashboard path: a brand-new user with zero applications.
+    assert compute_lane_insights([]) == {
+        "n": 0,
+        "baseline_response_rate": 0.0,
+        "baseline_positive_rate": 0.0,
+        "segments": [],
+    }
+
+
 def test_derive_segments_buckets_score_and_title():
     seg = derive_segments({
         "source_board": "greenhouse", "title": "Senior Quant Analyst",
