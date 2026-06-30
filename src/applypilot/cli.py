@@ -1863,6 +1863,85 @@ def import_decisions_command(
     )
 
 
+@app.command("resbuild-promote")
+def resbuild_promote_command(
+    path: Path = typer.Argument(..., help="res_build apply-list JSONL (from applypilotExportApplyList.ts)."),
+    source: str = typer.Option("res_build", "--source", help="decision_source tag written to promoted rows."),
+    scale: str = typer.Option("ten", "--scale", help="Score scale of decision_score: ten (1-10), auto, unit, percent."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Promote only the top-N by the user's own score. 0 = all."),
+    exclude_host: list[str] = typer.Option(["linkedin.com"], "--exclude-host",
+                                            help="Host(s) to skip (repeatable). LinkedIn excluded by default -- its lane is separate."),
+    include_applied: bool = typer.Option(False, "--include-applied",
+                                         help="Also consider already-applied / duplicate rows (default: skip them)."),
+    snapshot: Path = typer.Option(None, "--snapshot", help="Snapshot path for revert (default: <path>.snapshot.json)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only -- no writes, no snapshot."),
+) -> None:
+    """Promote res_build's curated apply-list into ApplyPilot's apply gate (REVERSIBLE).
+
+    Makes the jobs YOU reviewed and kept authoritative (audit_score + decision_source)
+    so the apply gate selects them -- including the ones ApplyPilot's own ranker scores
+    below the apply threshold. Promotion only STAGES jobs (nothing applies until you run
+    the fleet). LinkedIn is excluded by default. Reverse with 'resbuild-revert <snapshot>'.
+    """
+    _bootstrap()
+    from applypilot import resbuild_bridge as rb
+
+    if scale not in {"auto", "ten", "unit", "percent"}:
+        console.print(f"[red]Invalid --scale '{scale}'.[/red] Use one of: auto, ten, unit, percent.")
+        raise typer.Exit(1)
+    if not Path(path).exists():
+        console.print(f"[red]Apply-list not found: {path}[/red]")
+        raise typer.Exit(1)
+
+    snap = snapshot if snapshot is not None else (None if dry_run else Path(str(path) + ".snapshot.json"))
+    r = rb.promote(
+        path, source=source, scale=scale,
+        exclude_hosts=tuple(exclude_host), only_applyable=not include_applied,
+        limit=(limit or None), snapshot_path=snap, dry_run=dry_run,
+    )
+
+    console.print(f"\n[bold green]{'DRY RUN (no writes)' if dry_run else 'Promoted'}[/bold green]")
+    console.print(f"  Input records:         {r['input_records']}")
+    console.print(f"  After filter:          {r['after_filter']}  (excluded hosts: {', '.join(r['excluded_hosts'])})")
+    console.print(f"  Below-threshold UNLOCKED by bridge: {r['would_raise']}  (apply threshold {r['apply_threshold']})")
+    if dry_run:
+        console.print(f"  Would promote:         {r['would_promote']}")
+        for u in r.get("sample", []):
+            console.print(f"    [dim]{u}[/dim]")
+        console.print("\n[dim]Re-run without --dry-run to apply. Reverse later with resbuild-revert.[/dim]")
+    else:
+        console.print(f"  Promoted (gate-authoritative): {r['promoted']}")
+        c = r["import_counts"]
+        if c.get("not_found_insufficient_metadata"):
+            console.print(f"  [yellow]Apply-list URLs not in brain (skipped, never inserted): "
+                          f"{c['not_found_insufficient_metadata']}[/yellow]")
+        if c.get("skipped_already_applied"):
+            console.print(f"  [dim]Skipped (already applied): {c['skipped_already_applied']}[/dim]")
+        console.print(f"  [bold]Snapshot (for revert):[/bold] {r['snapshot_path']}")
+        console.print("\n[dim]Now apply-eligible. Stage to the fleet with 'applypilot-fleet-apply-home push' "
+                      "(or 'applypilot run tailor cover pdf' + 'applypilot apply').[/dim]")
+
+
+@app.command("resbuild-revert")
+def resbuild_revert_command(
+    snapshot: Path = typer.Argument(..., help="Snapshot JSON written by resbuild-promote."),
+    source: str = typer.Option("res_build", "--source", help="decision_source tag to match when reverting."),
+) -> None:
+    """Reverse a resbuild-promote: restore each promoted job's prior audit state.
+
+    Only rows that still carry the promotion's decision_source tag are restored, so a
+    job re-decided since the promotion is left untouched.
+    """
+    _bootstrap()
+    from applypilot import resbuild_bridge as rb
+
+    if not Path(snapshot).exists():
+        console.print(f"[red]Snapshot not found: {snapshot}[/red]")
+        raise typer.Exit(1)
+    n = rb.revert(snapshot, source=source)
+    console.print(f"[bold green]Reverted {n} job(s)[/bold green] to their pre-promotion (pre-res_build) state.")
+
+
 @app.command("reenrich")
 def reenrich_command(
     min_chars: int = typer.Option(200, "--min-chars", help="Re-scrape jobs whose stored description is shorter than this."),

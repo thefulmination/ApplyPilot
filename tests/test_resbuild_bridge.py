@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+def _setup(monkeypatch, tmp_path: Path):
+    """Wire both import_decisions and resbuild_bridge to one disposable SQLite brain."""
+    from applypilot import database, import_decisions, resbuild_bridge
+
+    conn = database.init_db(tmp_path / "applypilot.db")
+    for mod in (import_decisions, resbuild_bridge):
+        monkeypatch.setattr(mod, "init_db", lambda *a, **k: conn)
+        monkeypatch.setattr(mod, "get_connection", lambda: conn)
+    return conn, resbuild_bridge
+
+
+def _insert_job(conn, url, *, title="Engineer", site="Co", fit_score=5,
+                audit_score=None, audit_label=None, full_description="desc",
+                applied_at=None, duplicate_of_url=None):
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, full_description, fit_score, audit_score, "
+        "audit_label, applied_at, duplicate_of_url) VALUES (?,?,?,?,?,?,?,?,?)",
+        (url, title, site, full_description, fit_score, audit_score, audit_label,
+         applied_at, duplicate_of_url),
+    )
+    conn.commit()
+
+
+def _write(tmp_path, records, name="applylist.jsonl"):
+    path = tmp_path / name
+    path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+    return path
+
+
+def _src(conn, url):
+    return conn.execute("SELECT decision_source FROM jobs WHERE url=?", (url,)).fetchone()["decision_source"]
+
+
+def test_excludes_linkedin_by_default(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://www.linkedin.com/jobs/view/1")
+    _insert_job(conn, "https://job-boards.greenhouse.io/x/jobs/2")
+    path = _write(tmp_path, [
+        {"url": "https://www.linkedin.com/jobs/view/1", "verdict": "approve", "decision_score": 9},
+        {"url": "https://job-boards.greenhouse.io/x/jobs/2", "verdict": "approve", "decision_score": 9},
+    ])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 1
+    assert _src(conn, "https://www.linkedin.com/jobs/view/1") is None       # catastrophe lane untouched
+    gh = conn.execute("SELECT decision_source, audit_score FROM jobs WHERE url=?",
+                      ("https://job-boards.greenhouse.io/x/jobs/2",)).fetchone()
+    assert gh["decision_source"] == "res_build" and gh["audit_score"] == 9.0
+
+
+def test_excludes_linkedin_trailing_dot_fqdn(monkeypatch, tmp_path):
+    # The fully-qualified 'linkedin.com.' form must NOT slip past the exclusion.
+    conn, mod = _setup(monkeypatch, tmp_path)
+    url = "https://www.linkedin.com./jobs/view/9"
+    _insert_job(conn, url)
+    path = _write(tmp_path, [{"url": url, "verdict": "approve", "decision_score": 9}])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 0
+    assert _src(conn, url) is None
+
+
+def test_only_applyable_skips_applied_and_duplicate(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/clean")
+    _insert_job(conn, "https://x.io/applied", applied_at="2026-06-01T00:00:00+00:00")
+    _insert_job(conn, "https://x.io/dup", duplicate_of_url="https://x.io/clean")
+    path = _write(tmp_path, [
+        {"url": "https://x.io/clean", "verdict": "approve", "decision_score": 9},
+        {"url": "https://x.io/applied", "verdict": "approve", "decision_score": 9},
+        {"url": "https://x.io/dup", "verdict": "approve", "decision_score": 9},
+    ])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 1
+    assert _src(conn, "https://x.io/clean") == "res_build"
+    assert _src(conn, "https://x.io/applied") is None
+    assert _src(conn, "https://x.io/dup") is None
+
+
+def test_limit_takes_top_by_score(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    for u in ("https://x.io/a", "https://x.io/b", "https://x.io/c"):
+        _insert_job(conn, u, fit_score=3)
+    path = _write(tmp_path, [
+        {"url": "https://x.io/a", "verdict": "approve", "decision_score": 9},
+        {"url": "https://x.io/b", "verdict": "approve", "decision_score": 7},
+        {"url": "https://x.io/c", "verdict": "approve", "decision_score": 5},
+    ])
+    r = mod.promote(path, source="res_build", limit=2, snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 2
+    promoted = {row["url"] for row in conn.execute(
+        "SELECT url FROM jobs WHERE decision_source='res_build'")}
+    assert promoted == {"https://x.io/a", "https://x.io/b"}
+
+
+def test_dry_run_writes_nothing(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/j", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
+    snap = tmp_path / "snap.json"
+    r = mod.promote(path, source="res_build", dry_run=True, snapshot_path=snap)
+    assert r["dry_run"] is True and r["would_promote"] == 1
+    row = conn.execute("SELECT audit_score, decision_source FROM jobs WHERE url=?",
+                      ("https://x.io/j",)).fetchone()
+    assert row["audit_score"] is None and row["decision_source"] is None
+    assert not snap.exists()   # dry run never snapshots
+
+
+def test_dry_run_counts_only_jobs_it_unlocks(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/low", fit_score=5)    # eff 5 < 7 -> unlocked by bridge
+    _insert_job(conn, "https://x.io/high", fit_score=8)   # eff 8 >= 7 -> already qualifies
+    path = _write(tmp_path, [
+        {"url": "https://x.io/low", "verdict": "approve", "decision_score": 9},
+        {"url": "https://x.io/high", "verdict": "approve", "decision_score": 9},
+    ])
+    r = mod.promote(path, source="res_build", dry_run=True)
+    assert r["would_promote"] == 2 and r["would_raise"] == 1
+
+
+def test_promote_then_revert_restores_prior(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/j", fit_score=5, audit_score=4.0, audit_label="audit")
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
+    snap = tmp_path / "snap.json"
+    mod.promote(path, source="res_build", snapshot_path=snap)
+    row = conn.execute("SELECT audit_score, decision_source FROM jobs WHERE url=?",
+                      ("https://x.io/j",)).fetchone()
+    assert row["audit_score"] == 9.0 and row["decision_source"] == "res_build"
+    assert mod.revert(snap) == 1
+    row2 = conn.execute("SELECT audit_score, audit_label, decision_source FROM jobs WHERE url=?",
+                       ("https://x.io/j",)).fetchone()
+    assert row2["audit_score"] == 4.0 and row2["audit_label"] == "audit" and row2["decision_source"] is None
+
+
+def test_revert_restores_null_prior(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/j", fit_score=5)   # no prior audit at all
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
+    snap = tmp_path / "snap.json"
+    mod.promote(path, source="res_build", snapshot_path=snap)
+    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 9.0
+    mod.revert(snap)
+    row = conn.execute("SELECT audit_score, audit_label, decision_source FROM jobs WHERE url=?",
+                      ("https://x.io/j",)).fetchone()
+    assert row["audit_score"] is None and row["audit_label"] is None and row["decision_source"] is None
+
+
+def test_scale_ten_preserves_decimal(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/j", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9.9}])
+    mod.promote(path, source="res_build", scale="ten", snapshot_path=tmp_path / "snap.json")
+    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 9.9
+
+
+def test_revert_skips_rows_no_longer_ours(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _insert_job(conn, "https://x.io/j", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
+    snap = tmp_path / "snap.json"
+    mod.promote(path, source="res_build", snapshot_path=snap)
+    conn.execute("UPDATE jobs SET decision_source='other', audit_score=6 WHERE url=?", ("https://x.io/j",))
+    conn.commit()
+    assert mod.revert(snap) == 0   # not ours anymore -> leave it alone
+    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 6

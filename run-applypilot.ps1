@@ -75,7 +75,8 @@ $rc = $LASTEXITCODE
 # Integrity gate: refuse to back up a corrupt db. Versioned: keep newest $KeepBackups so a bad
 # run can't wipe prior good copies. Read-only commands are skipped. Non-fatal.
 $WriteCmds = @("run","apply","discover","enrich","score","audit","diagnose","tailor","cover","pdf",
-               "verify-live","resolve-ats-boards","resolve-company-apply-urls","boost-output","dedupe-jobs","rescore-jobs","scan-gmail")
+               "verify-live","resolve-ats-boards","resolve-company-apply-urls","boost-output","dedupe-jobs","rescore-jobs","scan-gmail",
+               "import-decisions","resbuild-promote","resbuild-revert")
 if ($args.Count -gt 0 -and $WriteCmds -contains $args[0]) {
     try {
         $LiveDb = Get-Item -LiteralPath $env:APPLYPILOT_DB_PATH -ErrorAction Stop
