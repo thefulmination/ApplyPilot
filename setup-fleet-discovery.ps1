@@ -43,24 +43,49 @@ if ($gw -notlike '192.168.*' -and $gw -notlike '10.*' -and $gw -notlike '172.*')
 }
 
 # --- 1. Reach the home box's Postgres BEFORE the heavy install ---
-Say "`n[1/6] checking $HomeIp:5432 is reachable ..." Cyan
+Say "`n[1/6] checking ${HomeIp}:5432 is reachable ..." Cyan
 if (-not (Test-NetConnection $HomeIp -Port 5432 -WarningAction SilentlyContinue).TcpTestSucceeded) {
-  Say "  cannot reach $HomeIp:5432 -- confirm same router + the home box is up." Yellow
+  Say "  cannot reach ${HomeIp}:5432 -- confirm same router + the home box is up." Yellow
   if ((Read-Host "  continue anyway? (y/n)") -ne 'y') { exit 1 }
 } else { Say "  reachable." Green }
 
-# --- 2. Base tools via winget (Git + Python only; no Node/Codex/Playwright) ---
-Say "`n[2/6] installing Git / Python (winget; skips present) ..." Cyan
-function Ensure($name,$id,$cmd){ if (Get-Command $cmd -ErrorAction SilentlyContinue){ Say "  [ok] $name" Green } else { Say "  installing $name ..."; winget install -e --id $id --accept-source-agreements --accept-package-agreements } }
-Ensure "Git"         "Git.Git"            "git"
-Ensure "Python 3.12" "Python.Python.3.12" "py"
-Refresh-Path
-foreach ($c in @("git","py")) {
-  if (-not (Get-Command $c -ErrorAction SilentlyContinue)) {
-    Say "  '$c' still not on PATH. CLOSE this window, open a NEW PowerShell, and re-run (winget PATH changes need a fresh session)." Yellow
-    exit 1
+# --- 2. Tooling: prefer what's already installed; winget only as a fallback ---
+#   winget is absent on plenty of Windows builds (Server, LTSC, fresh images). Don't hard-depend
+#   on it: use an existing git / python / project venv if present, fall back to winget if we have
+#   it, and otherwise print manual download links instead of crashing.
+Say "`n[2/6] locating Git + Python (reusing what's installed) ..." Cyan
+$haveWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+
+function Ensure-Tool($name, $wingetId, [string[]]$cmds) {
+  foreach ($c in $cmds) { if (Get-Command $c -ErrorAction SilentlyContinue) { Say "  [ok] $name" Green; return $true } }
+  if ($haveWinget) {
+    Say "  installing $name via winget ..."; winget install -e --id $wingetId --accept-source-agreements --accept-package-agreements; Refresh-Path
+    foreach ($c in $cmds) { if (Get-Command $c -ErrorAction SilentlyContinue) { return $true } }
   }
+  return $false
 }
+function Find-Python {
+  foreach ($v in @((Join-Path $InstallDir ".venv\Scripts\python.exe"), (Join-Path $InstallDir ".conda-env\Scripts\python.exe"))) {
+    if (Test-Path $v) { return (Resolve-Path $v).Path }
+  }
+  foreach ($c in @("py","python","python3")) { $g = Get-Command $c -ErrorAction SilentlyContinue; if ($g) { return $g.Source } }
+  return $null
+}
+
+$gitOk = Ensure-Tool "Git" "Git.Git" @("git")
+$pyExe = Find-Python
+if (-not $pyExe -and $haveWinget) {
+  Say "  installing Python 3.12 via winget ..."; winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements; Refresh-Path
+  $pyExe = Find-Python
+}
+if (-not $gitOk -or -not $pyExe) {
+  Say "`n  Missing prerequisite(s) and winget is unavailable on this machine:" Yellow
+  if (-not $gitOk) { Say "    - Git:    https://git-scm.com/download/win" Yellow }
+  if (-not $pyExe) { Say "    - Python: https://www.python.org/downloads/  (tick 'Add python.exe to PATH')" Yellow }
+  Say "  Install the above, open a NEW PowerShell, and re-run this script." Yellow
+  exit 1
+}
+Say "  python: $pyExe" Green
 
 # --- 3. Clone the fleet repo (GitHub sign-in if prompted) ---
 Say "`n[3/6] cloning the fleet repo -> $InstallDir ..." Cyan
@@ -70,8 +95,11 @@ Set-Location $InstallDir
 
 # --- 4. Python venv + package + JobSpy (the separate --no-deps step) ---
 Say "`n[4/6] Python env + package + JobSpy (a few minutes) ..." Cyan
-if (-not (Test-Path ".\.venv")) { py -3 -m venv .venv }
-$py = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+# Reuse an existing project venv/conda if present (machine 2 may already be an apply worker);
+# otherwise create one with whatever Python step 2 found.
+if (-not (Test-Path ".\.venv") -and -not (Test-Path ".\.conda-env")) { & $pyExe -m venv .venv }
+$py = @(".\.venv\Scripts\python.exe", ".\.conda-env\Scripts\python.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+$py = (Resolve-Path $py).Path
 & $py -m pip install --upgrade pip --quiet
 & $py -m pip install -e . --quiet
 & $py -m pip install "psycopg[binary]" pyyaml --quiet
