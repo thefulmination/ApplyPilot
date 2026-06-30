@@ -451,7 +451,7 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
 
 
 def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, apply_error=None,
-                          est_cost_usd=0, outcome=None):
+                          est_cost_usd=0, outcome=None, apply_channel=None, apply_external_host=None):
     """Close a LinkedIn lease (lease-owner guarded) in linkedin_queue -- NOT apply_queue --
     record the outcome on the account:linkedin governor, and UPSERT applied_set on a
     confirmed/possibly-submitted terminal. The cap (count_24h) + min-gap were already
@@ -462,9 +462,11 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE linkedin_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "apply_channel=COALESCE(%s, apply_channel), apply_external_host=COALESCE(%s, apply_external_host), "
             "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
             "WHERE url=%s AND lease_owner=%s",
-            (status, apply_status, apply_error, est_cost_usd, status, worker_id, url, worker_id),
+            (status, apply_status, apply_error, est_cost_usd, apply_channel, apply_external_host,
+             status, worker_id, url, worker_id),
         )
         if cur.rowcount == 0:
             conn.rollback()

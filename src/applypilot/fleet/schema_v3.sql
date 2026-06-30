@@ -121,6 +121,11 @@ CREATE INDEX IF NOT EXISTS idx_search_reclaim ON search_tasks (lease_expires_at)
 -- Same shape as apply_queue (separate lane).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS linkedin_queue (LIKE apply_queue INCLUDING DEFAULTS INCLUDING INDEXES);
+-- apply-time channel recorder (zero LinkedIn scraping): how the apply actually happened.
+--   apply_channel: 'easy_apply' (stayed on linkedin.com) | 'external' (redirected to an ATS)
+--   apply_external_host: the ATS base host when external (e.g. 'ashbyhq.com', 'greenhouse.io')
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS apply_channel TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS apply_external_host TEXT;
 
 -- ---------------------------------------------------------------------------
 -- rate_governor: outcome-aware + adaptive circuit-breaker (R6, R1, RF2).

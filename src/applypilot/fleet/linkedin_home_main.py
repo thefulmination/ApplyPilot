@@ -103,6 +103,10 @@ def _print_status(conn) -> None:
             "JOIN linkedin_queue lq ON lq.url = ac.url WHERE ac.resolved_at IS NULL"
         )
         open_ch = cur.fetchone()["n"]
+        # apply-time channel recorder: how applied jobs actually submitted (easy_apply vs external ATS)
+        cur.execute("SELECT COALESCE(apply_channel, '(unrecorded)') AS ch, count(*) AS n "
+                    "FROM linkedin_queue WHERE status='applied' GROUP BY ch")
+        channels = {r["ch"]: r["n"] for r in cur.fetchall()}
     print({
         "queue": depth,
         "linkedin_canary_enabled": cfg["linkedin_canary_enabled"],
@@ -111,6 +115,7 @@ def _print_status(conn) -> None:
         "linkedin_spend": spend,
         "halted_until": halted_until,
         "open_challenges": open_ch,
+        "apply_channels": channels,
     })
 
 

@@ -439,7 +439,9 @@ class WorkerLoop:
         cost = (out or {}).get("est_cost_usd", 0)
         if run_status == "applied":
             queue.write_linkedin_result(conn, self.worker_id, url, status="applied", apply_status="applied",
-                                        est_cost_usd=cost, outcome="success")
+                                        est_cost_usd=cost, outcome="success",
+                                        apply_channel=(out or {}).get("apply_channel"),
+                                        apply_external_host=(out or {}).get("apply_external_host"))
             self._record_event(f"wrote linkedin applied {url}")
             self._beat(conn, state="idle"); return {"action": "applied", "url": url}
         if run_status in self._WALL_STATUSES:

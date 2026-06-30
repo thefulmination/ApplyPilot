@@ -41,6 +41,42 @@ def _chrome_slot(worker_id, override=None) -> int:
     return (int(m.group(1)) % 10) if m else 0
 
 
+def classify_apply_channel(tab_urls) -> dict:
+    """Record HOW a LinkedIn apply happened, from the browser tabs the agent ended on
+    (ZERO LinkedIn scraping -- these tabs were already opened by the apply itself):
+      easy_apply -> stayed on linkedin.com (the catastrophe-class on-LinkedIn submit)
+      external   -> redirected to an off-LinkedIn ATS (first-party submit, ~no ban risk)
+    Returns {'apply_channel': 'easy_apply'|'external'|None, 'apply_external_host': base-host|None}.
+    None = no informative tab (can't tell -- record nothing rather than guess)."""
+    from urllib.parse import urlparse
+    hosts = []
+    for u in tab_urls or []:
+        p = urlparse(u or "")
+        if p.scheme in ("http", "https") and p.hostname:
+            h = p.hostname.lower()
+            hosts.append(h[4:] if h.startswith("www.") else h)
+    if not hosts:
+        return {"apply_channel": None, "apply_external_host": None}
+    external = [h for h in hosts if not h.endswith("linkedin.com")]
+    if external:
+        parts = external[0].split(".")
+        base = ".".join(parts[-2:]) if len(parts) >= 2 else external[0]
+        return {"apply_channel": "external", "apply_external_host": base}
+    return {"apply_channel": "easy_apply", "apply_external_host": None}
+
+
+def _cdp_page_urls(port: int) -> list[str]:
+    """Best-effort read-only list of open page-tab URLs from Chrome's CDP /json endpoint."""
+    import json
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+        return [t.get("url", "") for t in data if isinstance(t, dict) and t.get("type") == "page"]
+    except Exception:
+        return []
+
+
 def make_apply_fn(model: str, agent: str, slot: int = 0):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
@@ -63,7 +99,12 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
         try:
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
-            return {"run_status": status, "est_cost_usd": _real_cost(stats, model)}
+            out = {"run_status": status, "est_cost_usd": _real_cost(stats, model)}
+            if status == "applied":
+                # Record the apply channel from the STILL-OPEN tabs (the finally below kills
+                # Chrome). Best-effort: never let recording break a confirmed apply.
+                out.update(classify_apply_channel(_cdp_page_urls(port)))
+            return out
         finally:
             try:
                 chrome.cleanup_worker(worker_id, proc)
