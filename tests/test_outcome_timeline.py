@@ -48,3 +48,22 @@ def test_events_are_sorted_by_time():
     assert [e["stage"] for e in t["ordered"]] == ["acknowledged", "rejected"]
     assert t["outcome"] == "rejected"
     assert t["decision_stage"] == "rejected"
+
+
+def test_mixed_tz_naive_applied_at_does_not_raise():
+    t = build_timeline(
+        "2026-06-01T00:00:00",
+        [{"occurred_at": "2026-06-05T00:00:00+00:00", "stage": "screen", "outcome": None}],
+        now_iso="2026-06-20T00:00:00+00:00",
+    )
+    assert t["first_response_days"] == 4
+
+
+def test_latest_terminal_decision_wins():
+    events = [
+        _ev("2026-06-10T00:00:00+00:00", "rejected", outcome="rejected"),
+        _ev("2026-06-15T00:00:00+00:00", "offer", outcome="offer"),
+    ]
+    t = build_timeline("2026-06-01T00:00:00+00:00", events, now_iso="2026-06-20T00:00:00+00:00")
+    assert t["outcome"] == "offer"
+    assert t["decision_stage"] == "offer"

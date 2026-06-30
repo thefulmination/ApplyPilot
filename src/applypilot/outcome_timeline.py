@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 RESPONSE_STAGES = ("screen", "assessment", "interview", "offer", "rejected")
 POSITIVE_STAGES = ("screen", "assessment", "interview", "offer")
@@ -12,7 +12,10 @@ def _dt(iso: str | None):
     if not iso:
         return None
     try:
-        return datetime.fromisoformat(iso)
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         return None
 
@@ -38,7 +41,7 @@ def build_timeline(applied_at: str | None, events: list[dict], now_iso: str) -> 
         any(e.get("outcome") == "offer" for e in ordered)
 
     first_response_days = _days(applied_at, responses[0]["occurred_at"]) if responses else None
-    decision = decisions[0] if decisions else None
+    decision = decisions[-1] if decisions else None
     decision_days = _days(applied_at, decision["occurred_at"]) if decision else None
 
     current_stage = ordered[-1]["stage"] if ordered else "applied"
