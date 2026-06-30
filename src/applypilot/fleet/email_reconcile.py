@@ -49,3 +49,21 @@ def classify_match(method: str | None, score: float | None, *, min_strong: float
     if method in STRONG_METHODS or (score is not None and score >= min_strong):
         return "confirmed"
     return "probable"
+
+
+def load_outcome_emails(conn) -> list:
+    """Read submission-proving outcome emails from the home brain's email_events table.
+    Caller opens the sqlite connection read-only."""
+    placeholders = ",".join("?" for _ in CONFIRMING_STAGES)
+    cur = conn.execute(
+        f"SELECT message_id, sender, subject, body_text, company, title, job_url, stage, occurred_at "
+        f"FROM email_events WHERE stage IN ({placeholders})",
+        tuple(sorted(CONFIRMING_STAGES)),
+    )
+    out = []
+    for r in cur.fetchall():
+        out.append(OutcomeEmail(
+            message_id=r[0], sender=r[1] or "", subject=r[2] or "", body=r[3] or "",
+            company=r[4] or "", title=r[5] or "", job_url=r[6], stage=r[7], occurred_at=r[8],
+        ))
+    return out
