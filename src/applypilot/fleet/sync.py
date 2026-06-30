@@ -577,7 +577,7 @@ def push_inbox_outcomes(*, sqlite_conn=None, pg_conn=None, limit: int | None = N
     try:
         sql = _PUSH_INBOX_SELECT
         params: list = []
-        if limit:
+        if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
         with pg.cursor() as cur:

@@ -27,7 +27,7 @@ def test_outcomes_promote_is_preview_only(monkeypatch, tmp_path):
     conn = database.init_db(tmp_path / "applypilot.db")
     _seed_rejected(conn)
     monkeypatch.setattr(cli, "_bootstrap", lambda: None)
-    monkeypatch.setattr("applypilot.outcome_dashboard._read_only_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("applypilot.outcome_dashboard._read_only_conn", lambda db_path: conn)
     result = runner.invoke(cli.app, ["outcomes-promote"])
     assert result.exit_code == 0
     assert "rejected" in result.stdout.lower()
@@ -42,6 +42,6 @@ def test_outcomes_lanes_runs(monkeypatch, tmp_path):
     conn = database.init_db(tmp_path / "applypilot.db")
     _seed_rejected(conn)
     monkeypatch.setattr(cli, "_bootstrap", lambda: None)
-    monkeypatch.setattr("applypilot.outcome_dashboard._read_only_conn", lambda *a, **k: conn)
+    monkeypatch.setattr("applypilot.outcome_dashboard._read_only_conn", lambda db_path: conn)
     result = runner.invoke(cli.app, ["outcomes-lanes"])
     assert result.exit_code == 0

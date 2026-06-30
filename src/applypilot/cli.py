@@ -1410,13 +1410,16 @@ def outcomes_promote_command() -> None:
     """PREVIEW ONLY: show what email outcomes WOULD promote into the application tracker.
     Reads the tracker read-only and writes NOTHING (no apply flag; promotion is parked)."""
     _bootstrap()
+    from applypilot.config import DB_PATH
     from applypilot.outcome_dashboard import _read_only_conn, build_application_rows
     from applypilot.outcome_implied import implied_status
 
-    conn = _read_only_conn()
+    conn = _read_only_conn(DB_PATH)
     rows = build_application_rows(conn)
     table = Table(title="Implied promotions (PREVIEW — writes nothing)", show_header=True, header_style="bold")
-    table.add_column("Company"); table.add_column("Current tracker"); table.add_column("Implied")
+    table.add_column("Company")
+    table.add_column("Current tracker")
+    table.add_column("Implied")
     table.add_column("Would")
     shown = 0
     for row in rows:
@@ -1452,16 +1455,19 @@ def outcomes_lanes_command(
     """Advisory: which coarse lanes (board/role/seniority/score-band/...) respond above/below
     your baseline. Read-only; NEVER folded into scoring or the apply gate."""
     _bootstrap()
+    from applypilot.config import DB_PATH
     from applypilot.outcome_dashboard import _read_only_conn, build_application_rows
     from applypilot.outcome_lane_signal import compute_lane_report
 
-    conn = _read_only_conn()
+    conn = _read_only_conn(DB_PATH)
     rows = build_application_rows(conn)
     rep = compute_lane_report(rows, floor=floor)
     console.print(f"\n[bold]Lane signal[/bold]  (n={rep['n']}, baseline reply rate "
                   f"{rep['baseline_response_rate'] * 100:.0f}%)  [dim]advisory only[/dim]")
     table = Table(show_header=True, header_style="bold")
-    table.add_column("Flag", style="bold"); table.add_column("Lane"); table.add_column("Reply rate")
+    table.add_column("Flag", style="bold")
+    table.add_column("Lane")
+    table.add_column("Reply rate")
     table.add_column("n")
     for s in rep["warm"] + rep["cold"]:
         color = "green" if s["flag"] == "warm" else "red"
