@@ -19,7 +19,8 @@ def _failing_workers(conn) -> list[str]:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="applypilot-fleet-diagnose",
                                 description="Advisory log-reading diagnosis of apply failures.")
-    p.add_argument("--dsn", default=None, help="Postgres DSN (default: FLEET_PG_DSN env).")
+    p.add_argument("--dsn", default=None,
+                   help="Postgres DSN (default: DATABASE_URL / APPLYPILOT_FLEET_DSN env).")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--worker", help="diagnose a single worker_id")
     g.add_argument("--all-failing", action="store_true",
