@@ -82,17 +82,21 @@ def _parse_json(raw: str) -> dict:
     start, end = raw.find("{"), raw.rfind("}")
     if start < 0 or end <= start:
         return {}
-    return json.loads(raw[start:end + 1])
+    try:
+        return json.loads(raw[start:end + 1])
+    except json.JSONDecodeError:
+        return {}
 
 
 def tier1_diagnose(ctx: WorkerCtx, client) -> Diagnosis:
     try:
         raw = client.chat(build_messages(ctx), temperature=0.0, max_tokens=300, stage="diagnose")
         data = _parse_json(raw)
+        _conf = data.get("confidence")
         return Diagnosis(
             worker_id=ctx.worker_id,
             root_cause=str(data.get("root_cause") or "unknown"),
-            confidence=float(data.get("confidence") or 0.5),
+            confidence=float(_conf) if _conf is not None else 0.5,
             recommendation=str(data.get("recommendation") or "Review the worker log manually."),
             source="deepseek", evidence=ctx.recent_log[-160:].strip(),
         )

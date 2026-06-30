@@ -46,3 +46,17 @@ def test_tier1_graceful_on_llm_error():
     d = diagnoser.tier1_diagnose(WorkerCtx("m2-3", recent_log="x"), client)
     assert d.source == "none"
     assert d.confidence == 0.0
+
+def test_parse_json_returns_empty_on_malformed():
+    assert diagnoser._parse_json('{"a": }') == {}
+    assert diagnoser._parse_json("no json here") == {}
+
+def test_tier1_preserves_zero_confidence():
+    client = _FakeLLM('{"root_cause":"x","recommendation":"y","confidence":0}')
+    d = diagnoser.tier1_diagnose(WorkerCtx("m2-3", recent_log="x"), client)
+    assert d.confidence == 0.0
+
+def test_tier1_error_path_keeps_worker_id():
+    client = _FakeLLM(RuntimeError("down"))
+    d = diagnoser.tier1_diagnose(WorkerCtx("m2-3", recent_log="x"), client)
+    assert d.worker_id == "m2-3"
