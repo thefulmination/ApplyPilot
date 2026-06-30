@@ -67,3 +67,20 @@ def load_outcome_emails(conn) -> list:
             company=r[4] or "", title=r[5] or "", job_url=r[6], stage=r[7], occurred_at=r[8],
         ))
     return out
+
+
+def load_crash_jobs(conn) -> list[dict]:
+    """Read the crash_unconfirmed / no_result_line jobs and shape them as match_email_to_job
+    candidates (site = apply_domain). Read-only."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, application_url, company, title, apply_domain "
+            "FROM apply_queue WHERE status='crash_unconfirmed' AND apply_error='failed:no_result_line'"
+        )
+        out = []
+        for r in cur.fetchall():
+            out.append({
+                "url": r["url"], "application_url": r["application_url"],
+                "company": r["company"], "title": r["title"], "site": r["apply_domain"],
+            })
+    return out

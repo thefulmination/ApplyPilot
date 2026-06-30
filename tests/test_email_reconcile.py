@@ -26,6 +26,38 @@ def test_load_outcome_emails_keeps_only_confirming_stages():
     assert m1.company == "Stripe" and m1.stage == "acknowledged"
 
 
+# ---------------------------------------------------------------------------
+# Task 3: load_crash_jobs
+# ---------------------------------------------------------------------------
+class _FakeCursor:
+    def __init__(self, rows): self._rows = rows; self.executed = []
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, sql, params=None): self.executed.append((sql, params))
+    def fetchall(self): return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows): self._cur = _FakeCursor(rows)
+    def cursor(self): return self._cur
+
+
+def test_load_crash_jobs_shapes_candidates_for_matcher():
+    rows = [{"url": "https://stripe.com/jobs/1", "application_url": "https://boards.greenhouse.io/stripe/jobs/1",
+             "company": "Stripe", "title": "Analyst", "apply_domain": "boards.greenhouse.io"}]
+    jobs = er.load_crash_jobs(_FakeConn(rows))
+    assert jobs[0]["site"] == "boards.greenhouse.io"       # apply_domain -> site
+    assert jobs[0]["company"] == "Stripe" and jobs[0]["url"] == "https://stripe.com/jobs/1"
+
+
+def test_load_crash_jobs_filters_no_result_line_bucket():
+    fc = _FakeConn([])
+    er.load_crash_jobs(fc)
+    sql = fc._cur.executed[0][0].replace(" ", "")
+    assert "status='crash_unconfirmed'" in sql
+    assert "failed:no_result_line" in sql
+
+
 def test_classify_strong_method_is_confirmed_regardless_of_score():
     assert er.classify_match("company_domain", 1.0) == "confirmed"
     assert er.classify_match("board_slug", 1.0) == "confirmed"
