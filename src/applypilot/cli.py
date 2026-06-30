@@ -1390,6 +1390,21 @@ def export_outcomes_command(
     )
 
 
+@app.command("outcomes-export")
+def outcomes_export_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder. Defaults to a timestamped application_exports folder."),
+) -> None:
+    """Export email events + per-application outcome timelines (JSONL) for the learning loop / external tools."""
+    _bootstrap()
+    from applypilot.outcome_export import export_outcome_events
+    result = export_outcome_events(output_dir=output)
+    console.print("\n[bold green]Outcome export complete[/bold green]")
+    console.print(f"  Email events:      {result['email_events_exported']}")
+    console.print(f"  Outcome timelines: {result['outcome_timelines_exported']}")
+    console.print(f"  Folder:            {result['output_dir']}")
+    console.print()
+
+
 @app.command("supervise-apply")
 def supervise_apply_command(
     max_cost_usd: float = typer.Option(..., "--max-cost-usd",
