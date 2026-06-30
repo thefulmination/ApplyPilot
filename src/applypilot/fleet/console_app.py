@@ -414,6 +414,42 @@ def diagnostics() -> dict:
         conn.close()
 
 
+def _outcomes(conn, limit: int = 25) -> list[dict]:
+    """READ-ONLY recent inbox_outcomes (newest first). Parameterized LIMIT only (S5);
+    free text re-scrubbed + capped (S1/S3); timestamps ISO-serialized; conn.rollback()
+    marks it read-only."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT message_id, company, title, stage, outcome, sender_domain, occurred_at "
+            "FROM inbox_outcomes ORDER BY occurred_at DESC NULLS LAST LIMIT %s",
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+    return [{
+        "message_id": r.get("message_id"),
+        "time": _iso(r.get("occurred_at")),
+        "company": _scrub(r.get("company") or "")[:200],
+        "title": _scrub(r.get("title") or "")[:200],
+        "stage": r.get("stage"),
+        "outcome": r.get("outcome"),
+        "sender_domain": r.get("sender_domain"),
+    } for r in rows]
+
+
+def outcomes() -> dict:
+    """Open a short-lived connection, read recent outcomes, always close."""
+    conn = pgqueue.connect()
+    try:
+        return {"outcomes": _outcomes(conn)}
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+
 def build_status() -> dict:
     """Assemble the full /api/status object. Opens its OWN short-lived connections
     (each helper rolls back and we always close) so no connection is ever leaked."""
@@ -906,6 +942,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
+        if path == "/api/outcomes":
+            try:
+                self._send_json(200, outcomes())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs
             # never bloat the 4s poll. The `worker` param is validated against an
@@ -1145,6 +1187,12 @@ _INDEX_HTML = r"""<!doctype html>
     <table style="margin-top:10px"><thead><tr><th>Found</th><th>Source</th><th>Search</th></tr></thead>
       <tbody id="discRecent"><tr><td colspan="3" class="mut">&hellip;</td></tr></tbody></table>
   </section>
+
+  <section>
+  <h2>Recent outcomes (read-only)</h2>
+  <table><thead><tr><th>Time</th><th>Company / Title</th><th>Stage</th><th>Outcome</th></tr></thead>
+    <tbody id="outcomes"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+</section>
 
   <section>
     <h2>Diagnostics (Doctor)</h2>
@@ -1428,6 +1476,26 @@ async function loadDiagnostics(){
     renderDiagnostics(await r.json());
   }catch(e){ /* leave the last render; the status poll drives the connection banner */ }
 }
+
+function renderOutcomes(d){
+  const t = document.getElementById("outcomes");
+  const rows = (d && d.outcomes) || [];
+  if(!rows.length){ t.innerHTML = '<tr><td colspan="4" class="mut">no outcomes yet</td></tr>'; return; }
+  t.innerHTML = rows.map(r=>{
+    const ct = esc([r.company,r.title].filter(Boolean).join(" — "));
+    return '<tr><td class="mut">'+esc(rel(r.time))+'</td><td>'+(ct||'<span class="mut">—</span>')+
+      '</td><td>'+esc(r.stage||"—")+'</td><td>'+esc(r.outcome||"—")+'</td></tr>';
+  }).join("");
+}
+async function loadOutcomes(){
+  try{
+    const r = await fetch("/api/outcomes", {cache:"no-store"});
+    if(!r.ok) return;
+    renderOutcomes(await r.json());
+  }catch(e){ /* leave last render */ }
+}
+loadOutcomes();
+setInterval(loadOutcomes, 15000);
 
 poll();
 setInterval(poll, 4000);
