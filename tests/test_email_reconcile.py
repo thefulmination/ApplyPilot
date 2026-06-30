@@ -30,16 +30,29 @@ def test_load_outcome_emails_keeps_only_confirming_stages():
 # Task 3: load_crash_jobs
 # ---------------------------------------------------------------------------
 class _FakeCursor:
-    def __init__(self, rows): self._rows = rows; self.executed = []
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
-    def execute(self, sql, params=None): self.executed.append((sql, params))
-    def fetchall(self): return self._rows
+    def __init__(self, rows):
+        self._rows = rows
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return self._rows
 
 
 class _FakeConn:
-    def __init__(self, rows): self._cur = _FakeCursor(rows)
-    def cursor(self): return self._cur
+    def __init__(self, rows):
+        self._cur = _FakeCursor(rows)
+
+    def cursor(self):
+        return self._cur
 
 
 def test_load_crash_jobs_shapes_candidates_for_matcher():
@@ -64,7 +77,8 @@ def test_load_crash_jobs_filters_no_result_line_bucket():
 def _email(**kw):
     base = dict(message_id="m", sender="", subject="", body="", company="", title="",
                 job_url=None, stage="acknowledged", occurred_at="2026-06-29T10:00:00+00:00")
-    base.update(kw); return er.OutcomeEmail(**base)
+    base.update(kw)
+    return er.OutcomeEmail(**base)
 
 
 def test_reconcile_company_domain_is_confirmed():
@@ -103,9 +117,17 @@ def test_reconcile_resolves_each_job_once():
 # Task 5: apply_resolutions
 # ---------------------------------------------------------------------------
 class _ScriptCursor:
-    def __init__(self, rowcounts): self._rc = list(rowcounts); self.executed = []; self.rowcount = 0
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
+    def __init__(self, rowcounts):
+        self._rc = list(rowcounts)
+        self.executed = []
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
         if sql.strip().upper().startswith("UPDATE"):
@@ -113,9 +135,15 @@ class _ScriptCursor:
 
 
 class _ScriptConn:
-    def __init__(self, rowcounts): self._cur = _ScriptCursor(rowcounts); self.commits = 0
-    def cursor(self): return self._cur
-    def commit(self): self.commits += 1
+    def __init__(self, rowcounts):
+        self._cur = _ScriptCursor(rowcounts)
+        self.commits = 0
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.commits += 1
 
 
 def _res(confirmed=(), probable=()):
@@ -157,6 +185,18 @@ def test_apply_resolutions_includes_probable_when_opted_in():
     conn = _ScriptConn(rowcounts=[1])
     counts = er.apply_resolutions(conn, _res(probable=[_r("u2", cls="probable")]), include_probable=True)
     assert counts == {"flipped": 1, "skipped": 0}
+
+
+# ---------------------------------------------------------------------------
+# Task 6: format_report
+# ---------------------------------------------------------------------------
+def test_format_report_summarizes_counts():
+    res = er.ReconcileResult(confirmed=[_r("u1")], probable=[_r("u2", cls="probable")],
+                             unmatched_emails=5, jobs_total=480)
+    text = er.format_report(res)
+    assert "confirmed: 1" in text.lower()
+    assert "probable: 1" in text.lower()
+    assert "480" in text            # jobs_total surfaced
 
 
 def test_classify_strong_method_is_confirmed_regardless_of_score():

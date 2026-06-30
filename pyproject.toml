@@ -59,6 +59,7 @@ applypilot-fleet-diagnose = "applypilot.fleet.diagnoser_main:main"
 applypilot-fleet-remediate = "applypilot.fleet.remediator_main:main"
 applypilot-fleet-linkedin = "applypilot.fleet.linkedin_worker_main:main"
 applypilot-fleet-linkedin-home = "applypilot.fleet.linkedin_home_main:main"
+applypilot-fleet-reconcile-email = "applypilot.fleet.email_reconcile_main:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"

@@ -138,3 +138,17 @@ def apply_resolutions(conn, result: ReconcileResult, *, include_probable: bool =
             flipped += 1
         conn.commit()
     return {"flipped": flipped, "skipped": skipped}
+
+
+def format_report(result: ReconcileResult) -> str:
+    lines = [
+        f"crash jobs considered: {result.jobs_total}",
+        f"confirmed: {len(result.confirmed)}",
+        f"probable: {len(result.probable)}",
+        f"unmatched emails: {result.unmatched_emails}",
+    ]
+    for r in sorted(result.confirmed, key=lambda x: x.method):
+        lines.append(f"  [confirmed] {r.method} {r.score:.2f} {r.stage} -> {r.job_url}")
+    for r in sorted(result.probable, key=lambda x: -x.score):
+        lines.append(f"  [probable]  {r.method} {r.score:.2f} {r.stage} -> {r.job_url}")
+    return "\n".join(lines)
