@@ -75,3 +75,24 @@ def test_scan_outcomes_uses_injected_fetch(tmp_path, monkeypatch):
     counts2 = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: messages, conn=conn)
     assert counts2["skipped"] == 1
     assert counts2["inserted"] == 0
+
+
+def test_scan_outcomes_concurrent_inserts_all_and_is_idempotent(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed_applied_job(conn)
+    messages = [{
+        "message_id": f"m{i}", "thread_id": "t1",
+        "subject": "Update on your application to Acme",
+        "sender": "careers@acme.com",
+        "date": "Wed, 03 Jun 2026 10:00:00 +0000",
+        "body": "We went with another candidate.",
+    } for i in range(6)]
+    reply = '{"stage":"rejected","outcome":"rejected","reason":"chose another","title":"Quant Analyst","company":"Acme","confidence":"high"}'
+    counts = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: messages, conn=conn, concurrency=4)
+    assert counts["inserted"] == 6
+    assert counts["errors"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM email_events").fetchone()[0] == 6
+    # Re-run under concurrency: idempotent, nothing duplicated.
+    counts2 = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: messages, conn=conn, concurrency=4)
+    assert counts2["skipped"] == 6
+    assert counts2["inserted"] == 0

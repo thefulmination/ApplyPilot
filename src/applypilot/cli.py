@@ -1580,6 +1580,8 @@ def scan_gmail_command(
 @app.command("outcomes-scan")
 def outcomes_scan_command(
     days: int = typer.Option(30, "--days", "-d", help="How many days back to search."),
+    max_messages: int = typer.Option(200, "--max-messages", "-n", help="Max emails to scan (paginated; Gmail pages are 500)."),
+    concurrency: int = typer.Option(8, "--concurrency", "-j", help="Parallel LLM extractions (network-bound, so higher = faster)."),
     reextract: bool = typer.Option(False, "--reextract", help="Re-run LLM extraction on already-seen emails."),
     credentials: Optional[Path] = typer.Option(None, "--credentials", help="Path to gmail_credentials.json."),
 ) -> None:
@@ -1587,7 +1589,10 @@ def outcomes_scan_command(
     _bootstrap()
     from applypilot.outcome_scan import scan_outcomes
     try:
-        counts = scan_outcomes(days=days, credentials_path=credentials, reextract=reextract)
+        counts = scan_outcomes(
+            days=days, credentials_path=credentials, reextract=reextract,
+            max_messages=max_messages, concurrency=concurrency,
+        )
     except FileNotFoundError as exc:
         console.print(f"[red]Setup required:[/red]\n{exc}")
         raise typer.Exit(1)

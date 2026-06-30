@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger(__name__)
 
@@ -102,27 +103,43 @@ def upsert_email_event(conn, row: dict, *, reextract: bool = False) -> str:
     return "inserted"
 
 
-def _gmail_fetch(days: int, credentials_path: Path | None) -> Callable[[], list[dict]]:
-    """Default fetch: pull candidate messages from Gmail (read-only). Returns a
-    thunk so the network call is deferred until scan time."""
+def _gmail_fetch(
+    days: int, credentials_path: Path | None, max_messages: int = 200
+) -> Callable[[], list[dict]]:
+    """Default fetch: pull up to `max_messages` candidate messages from Gmail
+    (read-only), paginating with nextPageToken (a Gmail page maxes at 500).
+    Returns a thunk so the network call is deferred until scan time."""
     def _fetch() -> list[dict]:
         from applypilot.gmail_outcomes import build_gmail_service, _get_text_body, _search_query
         service = build_gmail_service(credentials_path=credentials_path)
         query = _search_query(days)
-        resp = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
         out: list[dict] = []
-        for ref in resp.get("messages", []):
-            tid = ref.get("threadId", ref["id"])
-            full = service.users().messages().get(userId="me", id=ref["id"], format="full").execute()
-            headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
-            out.append({
-                "message_id": ref["id"],
-                "thread_id": tid,
-                "subject": headers.get("subject", ""),
-                "sender": headers.get("from", ""),
-                "date": headers.get("date", ""),
-                "body": _get_text_body(full.get("payload", {})),
-            })
+        page_token: str | None = None
+        while len(out) < max_messages:
+            resp = service.users().messages().list(
+                userId="me", q=query,
+                maxResults=min(500, max_messages - len(out)),
+                pageToken=page_token,
+            ).execute()
+            for ref in resp.get("messages", []):
+                tid = ref.get("threadId", ref["id"])
+                full = service.users().messages().get(
+                    userId="me", id=ref["id"], format="full"
+                ).execute()
+                headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
+                out.append({
+                    "message_id": ref["id"],
+                    "thread_id": tid,
+                    "subject": headers.get("subject", ""),
+                    "sender": headers.get("from", ""),
+                    "date": headers.get("date", ""),
+                    "body": _get_text_body(full.get("payload", {})),
+                })
+                if len(out) >= max_messages:
+                    break
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
         return out
     return _fetch
 
@@ -135,19 +152,51 @@ def scan_outcomes(
     reextract: bool = False,
     conn=None,
     fetch_messages: Callable[[], list[dict]] | None = None,
+    max_messages: int = 200,
+    concurrency: int = 8,
 ) -> dict[str, int]:
-    """Scan candidate emails and upsert them into email_events. Returns counts."""
+    """Scan candidate emails and upsert them into email_events. Returns counts.
+
+    LLM extraction (the network-bound bottleneck) is parallelized across
+    `concurrency` worker threads; the email_events upserts stay serial on this
+    thread (SQLite single-writer). `max_messages` bounds the paginated fetch.
+    """
     if conn is None:
         conn = get_connection()
-    fetch = fetch_messages or _gmail_fetch(days, credentials_path)
+    fetch = fetch_messages or _gmail_fetch(days, credentials_path, max_messages)
 
     applied_jobs = get_applied_jobs(conn)
     counts = {"inserted": 0, "skipped": 0, "updated": 0, "errors": 0}
-    for msg in fetch():
-        try:
-            row = build_email_event(msg, applied_jobs, client=client)
-            counts[upsert_email_event(conn, row, reextract=reextract)] += 1
-        except Exception:
-            log.exception("outcome scan: failed to process message %s", msg.get("message_id"))
-            counts["errors"] += 1
+    messages = list(fetch())
+
+    def _upsert(row: dict) -> None:
+        counts[upsert_email_event(conn, row, reextract=reextract)] += 1
+
+    if concurrency and concurrency > 1 and len(messages) > 1:
+        # Build rows (extract + match) in parallel; upsert serially on this thread.
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(build_email_event, msg, applied_jobs, client=client): msg
+                for msg in messages
+            }
+            for fut in as_completed(futures):
+                msg = futures[fut]
+                try:
+                    row = fut.result()
+                except Exception:
+                    log.exception("outcome scan: failed to process message %s", msg.get("message_id"))
+                    counts["errors"] += 1
+                    continue
+                try:
+                    _upsert(row)
+                except Exception:
+                    log.exception("outcome scan: failed to upsert %s", row.get("message_id"))
+                    counts["errors"] += 1
+    else:
+        for msg in messages:
+            try:
+                _upsert(build_email_event(msg, applied_jobs, client=client))
+            except Exception:
+                log.exception("outcome scan: failed to process message %s", msg.get("message_id"))
+                counts["errors"] += 1
     return counts
