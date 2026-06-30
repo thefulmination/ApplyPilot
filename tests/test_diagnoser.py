@@ -80,3 +80,48 @@ def test_diagnose_no_client_no_provider_returns_none_source(monkeypatch):
     monkeypatch.setattr("applypilot.llm.get_client", boom)
     d = diagnoser.diagnose(WorkerCtx("m2-3", recent_log="weird failure"))
     assert d.source == "none"
+
+
+class _FakeCursor:
+    def __init__(self, script): self.script = script; self.executed = []; self._last = None
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        for needle, rows in self.script.items():
+            if needle in sql: self._last = list(rows); return
+        self._last = []
+    def fetchone(self): return self._last[0] if self._last else None
+    def fetchall(self): return self._last
+
+class _FakeConn:
+    def __init__(self, script): self._cur = _FakeCursor(script); self.committed = False
+    def cursor(self): return self._cur
+    def commit(self): self.committed = True
+
+def test_load_worker_ctx_reads_heartbeat_and_failures():
+    conn = _FakeConn({
+        "FROM worker_heartbeat": [{"recent_log": "usage limit text", "last_error": "boom"}],
+        "FROM apply_queue": [{"apply_error": "suspicious_page", "host": "jobs.ashbyhq.com", "n": 4}],
+    })
+    ctx = diagnoser.load_worker_ctx(conn, "m4-1")
+    assert ctx.worker_id == "m4-1"
+    assert ctx.recent_log == "usage limit text"
+    assert ctx.recent_failures == [{"apply_error": "suspicious_page", "host": "jobs.ashbyhq.com", "n": 4}]
+
+def test_write_diagnosis_inserts_recommended_row():
+    conn = _FakeConn({"SELECT 1 FROM fleet_diagnoses": []})  # no existing open diagnosis
+    d = diagnoser.Diagnosis("m2-3", "usage_limit", 1.0, "re-queue", "tier0", evidence="hit your usage limit")
+    wrote = diagnoser.write_diagnosis(conn, d)
+    assert wrote is True and conn.committed is True
+    insert = [e for e in conn._cur.executed if "INSERT INTO fleet_diagnoses" in e[0]]
+    assert len(insert) == 1
+    params = insert[0][1]
+    assert "logdiag:m2-3:usage_limit" in params and "recommended" in params
+    assert None in params  # auto_action is NULL (advisory)
+
+def test_write_diagnosis_is_idempotent_on_open_row():
+    conn = _FakeConn({"SELECT 1 FROM fleet_diagnoses": [{"?column?": 1}]})  # already open
+    d = diagnoser.Diagnosis("m2-3", "usage_limit", 1.0, "re-queue", "tier0")
+    assert diagnoser.write_diagnosis(conn, d) is False
+    assert not any("INSERT INTO fleet_diagnoses" in e[0] for e in conn._cur.executed)

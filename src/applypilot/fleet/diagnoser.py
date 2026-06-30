@@ -124,3 +124,42 @@ def diagnose(ctx: WorkerCtx, client=None) -> Diagnosis:
                              "LLM diagnosis unavailable (no provider configured) — read the worker log.",
                              "none", details={"error": str(exc)[:200]})
     return tier1_diagnose(ctx, client)
+
+
+def load_worker_ctx(conn, worker_id: str) -> WorkerCtx:
+    """Assemble a WorkerCtx from Postgres. dict_row cursors -> read by column name."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT recent_log, last_error FROM worker_heartbeat WHERE worker_id=%s",
+                    (worker_id,))
+        hb = cur.fetchone() or {}
+        cur.execute(
+            "SELECT apply_error, COALESCE(target_host, apply_domain) AS host, COUNT(*) AS n "
+            "FROM apply_queue WHERE worker_id=%s AND status IN ('failed','crash_unconfirmed') "
+            "AND updated_at > now() - interval '30 minutes' GROUP BY 1,2 ORDER BY n DESC LIMIT 10",
+            (worker_id,))
+        fails = [{"apply_error": r["apply_error"], "host": r["host"], "n": r["n"]}
+                 for r in cur.fetchall()]
+    return WorkerCtx(worker_id=worker_id, recent_log=(hb.get("recent_log") or ""),
+                     last_error=(hb.get("last_error") or ""), recent_failures=fails)
+
+
+def write_diagnosis(conn, d: Diagnosis, ttl_seconds: int = 86400) -> bool:
+    """Write ONE advisory row to fleet_diagnoses (status='recommended', auto_action=NULL).
+    Idempotent on cluster_key 'logdiag:<worker>:<cause>'. Returns True if a row was inserted."""
+    cluster_key = f"logdiag:{d.worker_id}:{d.root_cause}"
+    severity = "severe" if d.confidence >= 0.8 else "warn" if d.confidence >= 0.4 else "info"
+    diagnosis_text = (f"[{d.source}] {d.root_cause} (confidence {d.confidence:.2f}). "
+                      f"Evidence: {d.evidence[:200]}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM fleet_diagnoses WHERE cluster_key=%s "
+                    "AND status IN ('open','recommended','auto_applied') LIMIT 1", (cluster_key,))
+        if cur.fetchone():
+            return False
+        cur.execute(
+            "INSERT INTO fleet_diagnoses (cluster_key, reason, machine, lane, sample_count, "
+            "severity, diagnosis, recommendation, auto_action, how_to_reverse, status, expires_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()+make_interval(secs=>%s))",
+            (cluster_key, d.root_cause, d.worker_id, "ats", 1, severity, diagnosis_text,
+             d.recommendation, None, "Advisory only — dismiss via the console.", "recommended", ttl_seconds))
+    conn.commit()
+    return True
