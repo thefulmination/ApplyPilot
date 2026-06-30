@@ -6,6 +6,7 @@ Safety: a job is re-queued only if ALL pass -- (1) its worker has a Tier-0 usage
 (2) its dedup_key is NOT in applied_set, (3) NO confirming email_events row for its url. ATS only."""
 from __future__ import annotations
 from dataclasses import dataclass
+import sqlite3
 
 REQUEUE_TAG = "requeued_by_remediator:usage_limit"
 
@@ -39,3 +40,30 @@ def ensure_remediation_table(conn) -> None:
             ")")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_remediation_url ON remediation_actions (url)")
     conn.commit()
+
+
+def in_applied_set(conn, dedup_key: str | None) -> bool:
+    """Guard 2 (internal ground truth): True if this job's dedup_key is already applied."""
+    if not dedup_key:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM applied_set WHERE dedup_key=%s LIMIT 1", (dedup_key,))
+        return cur.fetchone() is not None
+
+
+def has_confirming_email(brain_path: str, url: str) -> bool:
+    """Guard 3 (external ground truth): True if a recruiter email is tied to this job's url.
+    Graceful: a missing brain file or absent email_events table returns False (NO veto), so the
+    guarantee never drops below guards 1-2. Read-only."""
+    try:
+        conn = sqlite3.connect(f"file:{brain_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM email_events WHERE job_url=? LIMIT 1", (url,)).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False  # email_events not created yet (outcomes-tracker not run)
+    finally:
+        conn.close()
