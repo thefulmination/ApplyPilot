@@ -339,8 +339,9 @@ CREATE TABLE IF NOT EXISTS command_acks (
 -- FLEET DOCTOR v1 (this file's only auto-remediation layer).
 --
 -- The Doctor reads the centralized failure data (apply_queue.apply_error,
--- worker_heartbeat.last_error/recent_log) and applies BOUNDED, REVERSIBLE,
--- MONOTONICALLY-CONSERVATIVE auto-fixes. Every auto action it takes can ONLY make
+-- apply_status, target_host, worker_id) and applies BOUNDED, REVERSIBLE,
+-- MONOTONICALLY-CONSERVATIVE auto-fixes. Per-worker recent_log/last_error are consumed
+-- by the console and the Fleet Diagnoser (fleet/diagnoser.py), not the Doctor. Every auto action it takes can ONLY make
 -- the fleet MORE conservative (skip a host, un-approve queued rows, quarantine a
 -- poison url, pace down / pause, or RAISE a timeout within a ceiling); it can never
 -- un-pause, re-approve, raise the spend cap, lower the gap, or touch LinkedIn. The

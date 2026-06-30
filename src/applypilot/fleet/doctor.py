@@ -1,8 +1,9 @@
 """FLEET DOCTOR v1 -- bounded, reversible, monotonically-conservative auto-remediation.
 
 The Doctor reads the fleet's centralized failure data (apply_queue.apply_error /
-apply_status / target_host / worker_id, and worker_heartbeat.last_error / recent_log),
-clusters failures over a rolling window, and applies a CLOSED set of four auto-fixes,
+apply_status / target_host / worker_id; the per-worker recent_log / last_error are
+NOT read here — log-content root-cause analysis lives in the Fleet Diagnoser,
+fleet/diagnoser.py), clusters failures over a rolling window, and applies a CLOSED set of four auto-fixes,
 each of which can ONLY make the fleet MORE conservative. Everything else it finds
 becomes a human RECOMMENDATION row -- never auto-applied.
 
