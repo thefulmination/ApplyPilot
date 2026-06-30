@@ -254,6 +254,13 @@ def pull_apply_results(
 # only postings whose effective apply URL (application_url if http, else url) contains
 # 'linkedin.com'. Stages UNAPPROVED (approval is a separate gated step via the LinkedIn
 # canary gate). crash_unconfirmed is excluded (same rule as the offsite lane).
+# {recency} is filled by push_linkedin_eligible with an optional "discovered within N
+# days" clause. LinkedIn is a network-probe BLOCKED host (probing it from the apply IP is
+# the ban risk -- see apply.liveness.BLOCKED_HOSTS), so posting RECENCY is the only safe
+# pre-flight liveness proxy; apply-time detection (the logged-in worker sees a closed page
+# and never phantom-applies) remains the real gate. company AND title are REQUIRED: a
+# posting with neither is unapplyable AND collapses onto the (company,title) dedup_key, so
+# hundreds of them would silently share a single leasable slot.
 _PUSH_LINKEDIN_SELECT = """
 SELECT url, company, title, application_url,
        CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
@@ -263,7 +270,10 @@ WHERE duplicate_of_url IS NULL
   AND COALESCE(liveness_status, '') != 'dead'
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
+  AND TRIM(COALESCE(company, '')) != ''
+  AND TRIM(COALESCE(title, '')) != ''
   AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+  {recency}
 ORDER BY score DESC
 """
 
@@ -273,6 +283,7 @@ def push_linkedin_eligible(
     sqlite_conn=None,
     pg_conn=None,
     score_floor: int = 7,
+    max_age_days: int | None = None,
     approved_batch=None,
     limit=None,
 ) -> int:
@@ -280,14 +291,24 @@ def push_linkedin_eligible(
 
     The effective-host predicate is the INVERSE of the offsite lane: only postings
     whose effective apply URL (application_url when it starts with 'http', else url)
-    contains 'linkedin.com'. Stages rows UNAPPROVED (approval is a separate gated step
-    via the LinkedIn canary gate). Returns the number of rows the UPSERT touched."""
+    contains 'linkedin.com'. Excludes postings with no company or title (unapplyable +
+    dedup_key collapse). Stages rows UNAPPROVED (approval is a separate gated step via
+    the LinkedIn canary gate). Returns the number of rows the UPSERT touched.
+
+    ``max_age_days``: when > 0, only push postings discovered within that many days.
+    LinkedIn can't be network-probed for liveness (blocked host), so recency is the
+    safest pre-flight filter against stale/expired postings; None/0 disables it."""
     own_sq, own_pg = sqlite_conn is None, pg_conn is None
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
     try:
         out = []
-        sql, params = _PUSH_LINKEDIN_SELECT, [score_floor]
+        params = [score_floor]
+        recency = ""
+        if max_age_days and int(max_age_days) > 0:
+            recency = "AND discovered_at IS NOT NULL AND julianday(discovered_at) >= julianday('now', ?)"
+            params.append(f"-{int(max_age_days)} days")
+        sql = _PUSH_LINKEDIN_SELECT.format(recency=recency)
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -305,6 +326,36 @@ def push_linkedin_eligible(
             sq.close()
         if own_pg:
             pg.close()
+
+
+# Apply-shaped LinkedIn postings held out of the push SOLELY for want of a score.
+# Mirrors _PUSH_LINKEDIN_SELECT's apply-shape predicates but inverts the score check
+# (both audit_score AND fit_score NULL). Not network-dependent.
+_COUNT_LINKEDIN_UNSCORED = """
+SELECT COUNT(*) FROM jobs
+WHERE duplicate_of_url IS NULL
+  AND audit_score IS NULL AND fit_score IS NULL
+  AND COALESCE(liveness_status, '') != 'dead'
+  AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
+  AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
+  AND TRIM(COALESCE(company, '')) != ''
+  AND TRIM(COALESCE(title, '')) != ''
+  AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+"""
+
+
+def count_linkedin_unscored(sqlite_conn=None) -> int:
+    """Count apply-shaped LinkedIn postings excluded from the push SOLELY because they
+    are unscored (audit_score AND fit_score both NULL). These are correctly NOT applied
+    to -- you don't apply to a job you haven't scored for fit -- but the count makes the
+    backlog VISIBLE instead of silently lost: run the scorer to fold them into the pool."""
+    own = sqlite_conn is None
+    sq = sqlite_conn or _home_conn()
+    try:
+        return int(sq.execute(_COUNT_LINKEDIN_UNSCORED).fetchone()[0])
+    finally:
+        if own:
+            sq.close()
 
 
 # ===========================================================================

@@ -121,6 +121,10 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
 
     sp = sub.add_parser("push")
     sp.add_argument("--score-floor", type=int, default=7)
+    sp.add_argument("--max-age-days", type=int, default=21,
+                    help="only push LinkedIn jobs discovered within N days (liveness proxy -- "
+                         "LinkedIn can't be network-probed; stale postings are likely dead). "
+                         "Pass 0 to disable.")
     sp.add_argument("--limit", type=int, default=None)
 
     sub.add_parser("pull")
@@ -149,7 +153,13 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
 
     with pgqueue.connect(args.dsn) as conn:
         if args.cmd == "push":
-            print("pushed", sync.push_linkedin_eligible(pg_conn=conn, score_floor=args.score_floor, limit=args.limit))
+            n = sync.push_linkedin_eligible(pg_conn=conn, score_floor=args.score_floor,
+                                            max_age_days=args.max_age_days, limit=args.limit)
+            print("pushed", n)
+            unscored = sync.count_linkedin_unscored()
+            if unscored:
+                print(f"note: {unscored} apply-shaped LinkedIn jobs are UNSCORED and held out "
+                      f"of the push -- run the scorer to fold them into the candidate pool")
         elif args.cmd == "pull":
             # LinkedIn apply results are recorded in linkedin_queue by the worker;
             # the pull here reports the current terminal breakdown.

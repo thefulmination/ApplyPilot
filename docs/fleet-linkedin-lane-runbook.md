@@ -120,6 +120,20 @@ Push high-score LinkedIn rows from the brain into `linkedin_queue`:
 applypilot-fleet-linkedin-home --dsn $FLEET_PG_DSN push --score-floor 7
 ```
 
+The push now applies two extra eligibility guards beyond score:
+
+- **Recency (`--max-age-days`, default 21).** LinkedIn is a network-probe BLOCKED host
+  (probing it from the apply IP is the ban risk), so there is **no pre-apply liveness
+  check for LinkedIn** — `verify-live` skips it by policy. Posting recency is the only
+  safe pre-filter against expired postings; apply-time detection (the logged-in worker
+  sees a closed page and never phantom-applies) is the real liveness gate. Pass
+  `--max-age-days 0` to disable and push all ages.
+- **Company + title required.** Postings with neither are unapplyable and collapse onto a
+  single `(company,title)` dedup_key, so they are excluded.
+
+The push also prints a `note:` line counting apply-shaped LinkedIn jobs held out **only**
+because they are unscored — run the scorer to fold that backlog into the candidate pool.
+
 Verify the queue depth:
 ```bash
 applypilot-fleet-linkedin-home --dsn $FLEET_PG_DSN status
