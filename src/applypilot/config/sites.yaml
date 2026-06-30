@@ -20,9 +20,61 @@ blocked:
   url_patterns:
     - "%glassdoor%"
     - "%google.com/about/careers%"
+    - "%careers.google.com%"
     - "%google.jobs%"
+    - "%amazon.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
+
+# ── Unresolved aggregators — opaque apply targets, undedupable until resolved ──
+# Job-board aggregators that list a role but whose application_url is the
+# aggregator's OWN page (the real ATS + company are only revealed at runtime when
+# the agent follows the Apply link). Because the real target+company are unknown at
+# acquire time, the posting-level dedup CANNOT tell whether the row duplicates a job
+# already applied elsewhere -> double-submit risk (a real one: an aggregator
+# "Chief of Staff @ Picogrid" listing for a Picogrid CoS role already applied via
+# Ashby). Rows whose EFFECTIVE apply host is one of these are deferred at acquire
+# (apply_status='deferred', apply_error='aggregator_unresolved_target') until an
+# enrichment pass resolves application_url to the real ATS -- then the effective host
+# changes and the row becomes applyable + safely dedupable again.
+unresolved_aggregators:
+  - "chiefofstaffjob.com"
+
+# ── Lane filter (off-lane drift guard) ───────────────────────────────────
+# The apply ORDER BY ranks on-lane roles first but never EXCLUDES off-lane
+# ones, so a drained on-lane queue drifts into pure IC-sales/AE postings that
+# still score >=7 (e.g. "Sales Engineer-Flooring", "Enterprise AE"). When
+# APPLYPILOT_LANE_FILTER is on (the supervised/production run sets it; plain
+# `apply` is off unless you set the env var), acquire_job drops a candidate
+# whose TITLE matches an off_lane_title_pattern UNLESS it carries an
+# on_lane_audit_tag (a positive override), plus anything the diagnoser labelled
+# wrong_role_lane / ignore. Needles match a SPACE-PADDED lowercased title, so
+# short abbreviations keep their surrounding spaces (" ae ") to stay word-bounded.
+# These lists override the built-in defaults in config.load_lane_filter.
+lane_filter:
+  off_lane_title_patterns:
+    - "account executive"
+    - " ae "
+    - " aes "
+    - " sdr "
+    - " sdrs "
+    - " bdr "
+    - " bdrs "
+    - "sales development representative"
+    - "business development representative"
+    - "sales representative"
+    - " sales rep "
+    - "sales engineer"
+    - "inside sales"
+    - "outside sales"
+    - "field sales"
+    - "regional sales"
+    - "territory"
+  on_lane_audit_tags:
+    - "chief_of_staff"
+    - "strategy_ops"
+    - "gtm_ops"
+    - "operations_leadership"
 
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:
@@ -32,10 +84,48 @@ blocked_sso:
   - "auth0.com"
   - "sso.cisco.com"
 
+# ── Auth-gated application portals ───────────────────────────────────────
+# These are valid targets, but often require account creation, saved
+# credentials, email verification, or 2FA. ApplyPilot routes them into the
+# assisted workflow instead of burning retries in full auto-apply.
+auth_gated:
+  domains:
+    - "myworkdayjobs.com"
+    - "myworkdaysite.com"
+    - "workdayjobs.com"
+    - "taleo.net"
+    - "successfactors.com"
+    - "icims.com"
+    - "brassring.com"
+    - "adp.com"
+    - "oraclecloud.com"
+    - "oracle.com/cloud/cx/taleo"
+    - "eightfold.ai"
+    - "phenompeople.com"
+    # Added 2026-06-24 from a live run's auth-wall hits -- all require a candidate
+    # account to apply (auto-apply can't create one), so pre-filter instead of
+    # burning a Chrome launch. amazon.jobs alone is ~331 pending pool rows.
+    - "amazon.jobs"
+    - "ultipro.com"        # UKG/UltiPro candidate portal (recruiting*.ultipro.com)
+    - "paycomonline.net"   # Paycom candidate portal
+  url_patterns:
+    - "/login"
+    - "/signin"
+    - "/sign-in"
+    - "/account"
+    - "/candidate"
+    - "/candidatehome"
+    - "/createaccount"
+    - "/register"
+    - "/sso"
+    - "2fa"
+    - "mfa"
+
 # ── Base URLs for URL resolution ─────────────────────────────────────────
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.
 base_urls:
+  "Eluta": "https://www.eluta.ca"
   "Job Bank Canada": "https://www.jobbank.gc.ca"
   "CareerJet Canada": "https://www.careerjet.ca"
   "BuiltIn Remote": "https://builtin.com"
@@ -47,6 +137,8 @@ base_urls:
   "Startup.jobs": "https://startup.jobs"
   "Nodesk": "https://nodesk.co"
   "Talent.com": "https://www.talent.com"
+  "SimplyHired": "https://www.simplyhired.com"
+  "TrueUp Jobs": "https://www.trueup.io"
   "JustRemote": "https://justremote.co"
   "Arc.dev": "https://arc.dev"
   "Himalayas": "https://himalayas.app"
@@ -150,6 +242,10 @@ sites:
 
   - name: "BuiltIn Remote"
     url: "https://builtin.com/jobs/remote/dev-engineering"
+    type: static
+
+  - name: "TrueUp Jobs"
+    url: "https://www.trueup.io/jobs"
     type: static
 
   - name: "Wellfound"

@@ -1,18 +1,30 @@
-"""Text-to-PDF conversion for tailored resumes and cover letters.
+﻿"""Text-to-PDF conversion for tailored resumes and cover letters.
 
 Parses the structured text resume format, renders via an HTML/CSS template,
 and exports to PDF using headless Chromium via Playwright.
 """
 
+import html
 import logging
 from pathlib import Path
 
+from applypilot import config
 from applypilot.config import TAILORED_DIR
 
 log = logging.getLogger(__name__)
 
 
-# ── Resume Parser ────────────────────────────────────────────────────────
+def _esc(value: object) -> str:
+    """HTML-escape an interpolated value before it enters the resume template.
+
+    Resume/cover-letter content is LLM-generated; unescaped angle brackets or
+    ampersands silently corrupt the rendered document, and injected
+    <img>/<iframe> markup would trigger subresource fetches at render time.
+    """
+    return html.escape("" if value is None else str(value))
+
+
+# â”€â”€ Resume Parser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def parse_resume(text: str) -> dict:
     """Parse a structured text resume into sections.
@@ -146,7 +158,7 @@ def parse_entries(text: str) -> list[dict]:
     return entries
 
 
-# ── HTML Template ────────────────────────────────────────────────────────
+# â”€â”€ HTML Template â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def build_html(resume: dict) -> str:
     """Build professional resume HTML from parsed data.
@@ -165,7 +177,7 @@ def build_html(resume: dict) -> str:
         skills = parse_skills(sections["TECHNICAL SKILLS"])
         rows = ""
         for cat, val in skills:
-            rows += f'<div class="skill-row"><span class="skill-cat">{cat}:</span> {val}</div>\n'
+            rows += f'<div class="skill-row"><span class="skill-cat">{_esc(cat)}:</span> {_esc(val)}</div>\n'
         skills_html = f'<div class="section"><div class="section-title">Technical Skills</div>{rows}</div>'
 
     # Experience
@@ -174,9 +186,9 @@ def build_html(resume: dict) -> str:
         entries = parse_entries(sections["EXPERIENCE"])
         items = ""
         for e in entries:
-            bullets = "".join(f"<li>{b}</li>" for b in e["bullets"])
-            subtitle = f'<div class="entry-subtitle">{e["subtitle"]}</div>' if e["subtitle"] else ""
-            items += f'<div class="entry"><div class="entry-title">{e["title"]}</div>{subtitle}<ul>{bullets}</ul></div>'
+            bullets = "".join(f"<li>{_esc(b)}</li>" for b in e["bullets"])
+            subtitle = f'<div class="entry-subtitle">{_esc(e["subtitle"])}</div>' if e["subtitle"] else ""
+            items += f'<div class="entry"><div class="entry-title">{_esc(e["title"])}</div>{subtitle}<ul>{bullets}</ul></div>'
         exp_html = f'<div class="section"><div class="section-title">Experience</div>{items}</div>'
 
     # Projects
@@ -185,29 +197,29 @@ def build_html(resume: dict) -> str:
         entries = parse_entries(sections["PROJECTS"])
         items = ""
         for e in entries:
-            bullets = "".join(f"<li>{b}</li>" for b in e["bullets"])
-            subtitle = f'<div class="entry-subtitle">{e["subtitle"]}</div>' if e["subtitle"] else ""
-            items += f'<div class="entry"><div class="entry-title">{e["title"]}</div>{subtitle}<ul>{bullets}</ul></div>'
+            bullets = "".join(f"<li>{_esc(b)}</li>" for b in e["bullets"])
+            subtitle = f'<div class="entry-subtitle">{_esc(e["subtitle"])}</div>' if e["subtitle"] else ""
+            items += f'<div class="entry"><div class="entry-title">{_esc(e["title"])}</div>{subtitle}<ul>{bullets}</ul></div>'
         proj_html = f'<div class="section"><div class="section-title">Projects</div>{items}</div>'
 
     # Education
     edu_html = ""
     if "EDUCATION" in sections:
-        edu_text = sections["EDUCATION"].strip()
+        edu_text = _esc(sections["EDUCATION"].strip())
         edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
 
     # Summary
     summary_html = ""
     if "SUMMARY" in sections:
-        summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{sections["SUMMARY"].strip()}</div></div>'
+        summary_html = f'<div class="section"><div class="section-title">Summary</div><div class="summary">{_esc(sections["SUMMARY"].strip())}</div></div>'
 
     # Contact line parsing
     contact = resume["contact"]
-    contact_parts = [p.strip() for p in contact.split("|")] if contact else []
+    contact_parts = [_esc(p.strip()) for p in contact.split("|")] if contact else []
     contact_html = " &nbsp;|&nbsp; ".join(contact_parts)
 
     # Location line (may be empty)
-    location_html = f'<div class="location">{resume["location"]}</div>' if resume["location"] else ""
+    location_html = f'<div class="location">{_esc(resume["location"])}</div>' if resume["location"] else ""
 
     return f"""<!DOCTYPE html>
 <html>
@@ -317,8 +329,8 @@ li {{
 </head>
 <body>
 <div class="header">
-    <div class="name">{resume['name']}</div>
-    <div class="title">{resume['title']}</div>
+    <div class="name">{_esc(resume['name'])}</div>
+    <div class="title">{_esc(resume['title'])}</div>
     {location_html}
     <div class="contact">{contact_html}</div>
 </div>
@@ -331,7 +343,7 @@ li {{
 </html>"""
 
 
-# ── PDF Renderer ─────────────────────────────────────────────────────────
+# â”€â”€ PDF Renderer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_pdf(html: str, output_path: str) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
@@ -343,8 +355,18 @@ def render_pdf(html: str, output_path: str) -> None:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        launch_opts: dict = {}
+        try:
+            launch_opts["executable_path"] = config.get_chrome_path()
+        except FileNotFoundError:
+            pass
+        browser = p.chromium.launch(**launch_opts)
         page = browser.new_page()
+        # Block every subresource fetch. The HTML is set directly (not navigated
+        # to), so the document itself is unaffected, but any <img>/<iframe>/<link>
+        # the content tries to load would otherwise reach out from the local host
+        # during render -- an SSRF/exfiltration vector for injected markup.
+        page.route("**/*", lambda route: route.abort())
         page.set_content(html, wait_until="networkidle")
         page.pdf(
             path=output_path,
@@ -355,7 +377,7 @@ def render_pdf(html: str, output_path: str) -> None:
         browser.close()
 
 
-# ── Public API ───────────────────────────────────────────────────────────
+# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def convert_to_pdf(
     text_path: Path, output_path: Path | None = None, html_only: bool = False
@@ -390,14 +412,14 @@ def convert_to_pdf(
     return out
 
 
-def batch_convert(limit: int = 50) -> int:
+def batch_convert(limit: int = 900) -> int:
     """Convert .txt files in TAILORED_DIR that don't have corresponding PDFs.
 
     Scans for .txt files (excluding _JOB.txt and _REPORT.json), checks if a
     .pdf with the same stem already exists, and converts any that are missing.
 
     Args:
-        limit: Maximum number of files to convert.
+        limit: Maximum number of files to convert. 0 means no limit.
 
     Returns:
         Number of PDFs generated.
@@ -420,7 +442,7 @@ def batch_convert(limit: int = 50) -> int:
         pdf_path = f.with_suffix(".pdf")
         if not pdf_path.exists():
             to_convert.append(f)
-        if len(to_convert) >= limit:
+        if limit > 0 and len(to_convert) >= limit:
             break
 
     if not to_convert:
@@ -438,3 +460,4 @@ def batch_convert(limit: int = 50) -> int:
 
     log.info("Done: %d/%d PDFs generated in %s", converted, len(to_convert), TAILORED_DIR)
     return converted
+

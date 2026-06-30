@@ -10,14 +10,13 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
-import os
 import webbrowser
 from html import escape
 from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
+from applypilot.config import APP_DIR
 from applypilot.database import get_connection
 
 console = Console()
@@ -37,16 +36,16 @@ def generate_dashboard(output_path: str | None = None) -> str:
     conn = get_connection()
 
     # Stats
-    total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM jobs WHERE duplicate_of_url IS NULL").fetchone()[0]
     ready = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL"
+        "WHERE full_description IS NOT NULL AND application_url IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
     scored = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND duplicate_of_url IS NULL"
     ).fetchone()[0]
     high_fit = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
+        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7 AND duplicate_of_url IS NULL"
     ).fetchone()[0]
 
     # Score distribution
@@ -54,7 +53,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     if scored:
         rows = conn.execute(
             "SELECT fit_score, COUNT(*) FROM jobs "
-            "WHERE fit_score IS NOT NULL "
+            "WHERE fit_score IS NOT NULL AND duplicate_of_url IS NULL "
             "GROUP BY fit_score ORDER BY fit_score DESC"
         ).fetchall()
         for r in rows:
@@ -69,16 +68,18 @@ def generate_dashboard(output_path: str | None = None) -> str:
                SUM(CASE WHEN fit_score < 5 AND fit_score IS NOT NULL THEN 1 ELSE 0 END) as low_fit,
                SUM(CASE WHEN fit_score IS NULL THEN 1 ELSE 0 END) as unscored,
                ROUND(AVG(fit_score), 1) as avg_score
-        FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
+        FROM jobs
+        WHERE duplicate_of_url IS NULL
+        GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
     # All scored jobs (5+), ordered by score desc
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning, fit_verdict
         FROM jobs
-        WHERE fit_score >= 5
+        WHERE fit_score >= 5 AND duplicate_of_url IS NULL
         ORDER BY fit_score DESC, site, title
     """).fetchall()
 
@@ -159,6 +160,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         reasoning_lines = reasoning_raw.split("\n")
         keywords = reasoning_lines[0][:120] if reasoning_lines else ""
         reasoning = reasoning_lines[1][:200] if len(reasoning_lines) > 1 else ""
+        verdict = escape((j["fit_verdict"] or "")[:300])
 
         desc_preview = escape(j["full_description"] or "")[:300]
         full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
@@ -185,6 +187,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             <a href="{url}" class="job-title" target="_blank">{title}</a>
           </div>
           <div class="meta-row">{meta_html}</div>
+          {f'<div class="verdict-row">{verdict}</div>' if verdict else ''}
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
           <p class="desc-preview">{desc_preview}...</p>
@@ -273,6 +276,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .meta-tag.location {{ background: #1e3a5f; color: #93c5fd; }}
 
   .keywords-row {{ font-size: 0.75rem; color: #10b981; margin-bottom: 0.3rem; line-height: 1.4; }}
+  .verdict-row {{ font-size: 0.82rem; color: #e2e8f0; font-weight: 600; margin-bottom: 0.4rem; line-height: 1.4; }}
   .reasoning-row {{ font-size: 0.75rem; color: #94a3b8; margin-bottom: 0.5rem; font-style: italic; line-height: 1.4; }}
 
   .desc-preview {{ font-size: 0.8rem; color: #64748b; line-height: 1.5; margin-bottom: 0.75rem; max-height: 3.6em; overflow: hidden; }}

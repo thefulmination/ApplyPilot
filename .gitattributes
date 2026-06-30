@@ -1,0 +1,7 @@
+# Container files MUST keep LF endings regardless of the checkout platform -- a CRLF in a
+# shell shebang or the Dockerfile breaks the Linux build/run ("bad interpreter: ...^M").
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+deploy/**   text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf

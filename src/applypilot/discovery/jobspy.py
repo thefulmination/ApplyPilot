@@ -8,16 +8,37 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import get_connection, init_db, insert_discovered_job
 
 log = logging.getLogger(__name__)
+
+
+def _cfg_int_value(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _jobspy_worker_count(search_cfg: dict, requested_workers: int | None = None) -> int:
+    discovery_cfg = search_cfg.get("discovery", {}) or {}
+    jobspy_cfg = search_cfg.get("jobspy", {}) or {}
+    configured = None
+    if isinstance(jobspy_cfg, dict):
+        configured = jobspy_cfg.get("workers")
+    if configured is None and isinstance(discovery_cfg, dict):
+        configured = discovery_cfg.get("jobspy_workers")
+    workers = requested_workers if requested_workers is not None else configured
+    return max(1, min(8, _cfg_int_value(workers, 1)))
 
 
 # -- Proxy parsing -----------------------------------------------------------
@@ -81,8 +102,9 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
 
     Falls back to sensible defaults if not defined in the YAML.
     """
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
+    location_cfg = search_cfg.get("location", {}) or {}
+    accept = search_cfg.get("location_accept") or location_cfg.get("accept_patterns", [])
+    reject = search_cfg.get("location_reject_non_remote") or location_cfg.get("reject_patterns", [])
     return accept, reject
 
 
@@ -97,18 +119,29 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
     loc = location.lower()
 
+    def pattern_matches(pattern: str) -> bool:
+        needle = pattern.strip().lower()
+        if not needle:
+            return False
+        # Short region codes like CA/US must match as standalone tokens.
+        # Otherwise "CA" accidentally accepts "Canada" and "US" accepts words
+        # that merely contain those letters.
+        if len(needle) <= 3 and needle.replace(".", "").isalpha():
+            return re.search(rf"(?<![a-z]){re.escape(needle)}(?![a-z])", loc) is not None
+        return needle in loc
+
     # Remote jobs always OK
     if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
         return True
 
     # Reject non-remote matches
     for r in reject:
-        if r.lower() in loc:
+        if pattern_matches(r):
             return False
 
     # Accept matches
     for a in accept:
-        if a.lower() in loc:
+        if pattern_matches(a):
             return True
 
     # No match -- reject unknown
@@ -150,7 +183,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         site_name = str(row.get("site", source_label))
         is_remote = row.get("is_remote", False)
 
-        site_label = f"{site_name}"
+        # jobs.site is the employer display field in ApplyPilot. Keep the
+        # source board only as a fallback when JobSpy does not return company.
+        site_label = company or f"{site_name}"
         if is_remote:
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
 
@@ -166,16 +201,27 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
 
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
-            )
+        status = insert_discovered_job(
+            conn,
+            {
+                "url": url,
+                "title": title,
+                "salary": salary,
+                "description": description,
+                "location": location_str,
+                "company": company,
+                "full_description": full_description,
+                "application_url": apply_url,
+                "detail_scraped_at": detail_scraped_at,
+            },
+            site=site_label,
+            strategy=strategy,
+            source_board=site_name,
+            discovered_at=now,
+        )
+        if status == "new":
             new += 1
-        except sqlite3.IntegrityError:
+        elif status in {"existing", "duplicate"}:
             existing += 1
 
     conn.commit()
@@ -349,7 +395,9 @@ def search_jobs(
     log.info("Stored: %d new, %d already in DB", new, existing)
 
     db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL").fetchone()[0]
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL"
+    ).fetchone()[0]
     log.info("DB total: %d jobs, %d pending detail scrape", db_total, pending)
 
     return {"total": total, "new": new, "existing": existing}
@@ -366,6 +414,7 @@ def _full_crawl(
     hours_old: int = 72,
     proxy: str | None = None,
     max_retries: int = 2,
+    workers: int = 1,
 ) -> dict:
     """Run all search queries from search config across all locations."""
     if sites is None:
@@ -406,21 +455,36 @@ def _full_crawl(
     total_existing = 0
     total_errors = 0
     completed = 0
+    worker_count = max(1, int(workers or 1))
 
-    for s in searches:
-        result = _run_one_search(
+    def run_search(s: dict) -> dict:
+        return _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map,
         )
-        completed += 1
-        total_new += result["new"]
-        total_existing += result["existing"]
-        total_errors += result["errors"]
 
-        if completed % 5 == 0 or completed == len(searches):
-            log.info("Progress: %d/%d queries done (%d new, %d dupes, %d errors)",
-                     completed, len(searches), total_new, total_existing, total_errors)
+    if worker_count == 1 or len(searches) <= 1:
+        results_iter = (run_search(s) for s in searches)
+    else:
+        log.info("JobSpy query workers: %d", worker_count)
+        pool = ThreadPoolExecutor(max_workers=min(worker_count, len(searches)))
+        futures = [pool.submit(run_search, s) for s in searches]
+        results_iter = (future.result() for future in as_completed(futures))
+
+    try:
+        for result in results_iter:
+            completed += 1
+            total_new += result["new"]
+            total_existing += result["existing"]
+            total_errors += result["errors"]
+
+            if completed % 5 == 0 or completed == len(searches):
+                log.info("Progress: %d/%d queries done (%d new, %d dupes, %d errors)",
+                         completed, len(searches), total_new, total_existing, total_errors)
+    finally:
+        if worker_count > 1 and len(searches) > 1:
+            pool.shutdown(wait=True)
 
     # Final stats
     conn = get_connection()
@@ -440,7 +504,7 @@ def _full_crawl(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_discovery(cfg: dict | None = None) -> dict:
+def run_discovery(cfg: dict | None = None, workers: int | None = None) -> dict:
     """Main entry point for JobSpy-based job discovery.
 
     Loads search queries and locations from the user's search config YAML,
@@ -461,11 +525,12 @@ def run_discovery(cfg: dict | None = None) -> dict:
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
+    sites = cfg.get("sites") or cfg.get("boards")
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")
     locations = cfg.get("location_labels")
+    worker_count = _jobspy_worker_count(cfg, workers)
 
     return _full_crawl(
         search_cfg=cfg,
@@ -475,4 +540,5 @@ def run_discovery(cfg: dict | None = None) -> dict:
         results_per_site=results_per_site,
         hours_old=hours_old,
         proxy=proxy,
+        workers=worker_count,
     )

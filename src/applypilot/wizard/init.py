@@ -13,7 +13,7 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -26,9 +26,27 @@ from applypilot.config import (
     RESUME_PDF_PATH,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
+    get_claude_path,
+    get_codex_path,
 )
 
 console = Console()
+
+
+def _parse_salary_token(token: str, fallback: str) -> str:
+    """Parse a salary like '$80,000', '80k', or '120000' to a plain integer
+    string. Returns ``fallback`` when the token can't be parsed."""
+    if not token:
+        return fallback
+    t = token.strip().lower().replace("$", "").replace(",", "").replace(" ", "")
+    multiplier = 1
+    if t.endswith("k"):
+        multiplier = 1000
+        t = t[:-1]
+    try:
+        return str(int(float(t) * multiplier))
+    except (TypeError, ValueError):
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +119,6 @@ def _setup_profile() -> dict:
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
-        "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
 
     # -- Work Authorization --
@@ -117,12 +134,23 @@ def _setup_profile() -> dict:
     salary = Prompt.ask("Expected annual salary (number)", default="")
     salary_currency = Prompt.ask("Currency", default="USD")
     salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
+    salary_clean = _parse_salary_token(salary, salary)
     range_parts = salary_range.split("-") if "-" in salary_range else [salary, salary]
+    range_min = _parse_salary_token(range_parts[0], salary_clean)
+    range_max = _parse_salary_token(
+        range_parts[1] if len(range_parts) > 1 else range_parts[0], salary_clean
+    )
+    # Swap if the user entered the range inverted (e.g. 120000-80000).
+    try:
+        if int(range_min) > int(range_max):
+            range_min, range_max = range_max, range_min
+    except (TypeError, ValueError):
+        pass
     profile["compensation"] = {
-        "salary_expectation": salary,
+        "salary_expectation": salary_clean,
         "salary_currency": salary_currency,
-        "salary_range_min": range_parts[0].strip(),
-        "salary_range_max": range_parts[1].strip() if len(range_parts) > 1 else range_parts[0].strip(),
+        "salary_range_min": range_min,
+        "salary_range_max": range_max,
     }
 
     # -- Experience --
@@ -204,28 +232,31 @@ def _setup_searches() -> None:
         console.print("[yellow]No roles provided. Using a default set.[/yellow]")
         roles = ["Software Engineer"]
 
-    # Build YAML content
-    lines = [
-        "# ApplyPilot search configuration",
-        "# Edit this file to refine your job search queries.",
-        "",
-        "defaults:",
-        f'  location: "{location}"',
-        f"  distance: {distance}",
-        "  hours_old: 72",
-        "  results_per_site: 50",
-        "",
-        "locations:",
-        f'  - location: "{location}"',
-        f"    remote: {str(distance == 0).lower()}",
-        "",
-        "queries:",
-    ]
-    for i, role in enumerate(roles):
-        lines.append(f'  - query: "{role}"')
-        lines.append(f"    tier: {min(i + 1, 3)}")
-
-    SEARCH_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Build the config as a dict and let yaml.safe_dump handle quoting/escaping,
+    # so a location or role containing quotes/colons can't corrupt the file.
+    search_config = {
+        "defaults": {
+            "location": location,
+            "distance": distance,
+            "hours_old": 72,
+            "results_per_site": 50,
+        },
+        "locations": [
+            {"location": location, "remote": distance == 0},
+        ],
+        "queries": [
+            {"query": role, "tier": min(i + 1, 3)}
+            for i, role in enumerate(roles)
+        ],
+    }
+    header = (
+        "# ApplyPilot search configuration\n"
+        "# Edit this file to refine your job search queries.\n\n"
+    )
+    SEARCH_CONFIG_PATH.write_text(
+        header + yaml.safe_dump(search_config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
     console.print(f"[green]Search config saved to {SEARCH_CONFIG_PATH}[/green]")
 
 
@@ -280,26 +311,39 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (requires Claude or Codex CLI)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using Claude Code or Codex as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
-    if shutil.which("claude"):
+    # Check for at least one apply-agent CLI
+    found_agent = False
+    try:
+        get_claude_path()
         console.print("[green]Claude Code CLI detected.[/green]")
-    else:
+        found_agent = True
+    except FileNotFoundError:
         console.print(
             "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "Install it from: [bold]https://claude.ai/code[/bold], or use Codex."
         )
+    try:
+        get_codex_path()
+        console.print("[green]Codex CLI detected.[/green]")
+        found_agent = True
+    except FileNotFoundError:
+        console.print(
+            "[yellow]Codex CLI not found on PATH.[/yellow]\n"
+            "Install Codex CLI or set CODEX_PATH if you want to use --agent codex."
+        )
+    if not found_agent:
+        console.print("[yellow]Auto-apply needs Claude Code CLI or Codex CLI before it can run.[/yellow]")
 
     # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
@@ -356,7 +400,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply (agent CLI detection)
     _setup_auto_apply()
     console.print()
 
@@ -380,7 +424,7 @@ def run_wizard() -> None:
     if tier == 1:
         unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI or Codex CLI + Chrome.[/dim]"
 
     console.print(
         Panel.fit(

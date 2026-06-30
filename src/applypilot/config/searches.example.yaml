@@ -79,8 +79,33 @@ location:
     - "Seattle only"
     - "onsite only"
     - "London, UK"
+    - "Canada"
+    - "Toronto"
+    - "Ontario"
+    - "Vancouver"
+    - "Montreal"
+    - "Germany"
+    - "Europe"
     - "India"
     - "Philippines"
+
+# Deterministic score-audit rules.
+# The LLM score measures resume/job overlap; this layer checks whether the
+# role itself is in the target lane before ranking/tailoring/applying.
+score_audit:
+  target_title_patterns:
+    - "\\bchief of staff\\b"
+    - "\\bstrategy\\b.*\\boperations\\b"
+    - "\\bbusiness operations\\b"
+    - "\\bgtm\\b|\\bgo[- ]to[- ]market\\b"
+    - "\\bbusiness development\\b"
+    - "\\bstrategic finance\\b"
+  reject_title_patterns:
+    - "\\bstore manager\\b"
+    - "\\bretail\\b"
+    - "\\bgrocery\\b"
+    - "\\bcashier\\b"
+    - "\\brestaurant\\b"
 
 # Country for Indeed/LinkedIn/Google Jobs searches
 country: "USA"
@@ -92,6 +117,137 @@ boards:
   - glassdoor
   - zip_recruiter
   - google
+
+# Public job-board API settings.
+# These are broad discovery sources; use scoring/export to rank the best matches.
+discovery:
+  # Source-level parallelism runs independent source families together while
+  # each source keeps its own per-site rate limits and worker settings.
+  source_parallelism: 3
+  include_sources: []  # Optional: jobspy, public_boards, hiringcafe, corporate_ats, workday, smartextract
+  exclude_sources: []
+
+public_boards:
+  enabled: true
+  sources:
+    - the_muse
+    - remotejobs_org
+    - remotive
+    - arbeitnow
+    - hacker_news
+    - yc_jobs
+    - builtin
+    - chief_of_staff_jobs
+  max_pages: 3
+  results_per_source: 300
+  the_muse_categories:
+    - "Business Operations"
+    - "Data and Analytics"
+    - "Product Management"
+    - "Project Management"
+    - "Sales"
+  remotejobs_categories:
+    - business
+    - data-science
+    - finance
+    - product-management
+    - project-management
+    - sales
+  remotive_categories:
+    - Business
+    - Data
+    - Finance
+    - Product
+    - "Project Management"
+    - Sales
+  builtin_paths:
+    - /jobs/remote/operations
+    - /jobs/remote/sales
+    - /jobs/remote/product
+    - /jobs/remote/data-analytics
+    - /jobs/remote/finance
+
+# HiringCafe source settings.
+# Set company_watchlist_path to a text file with one company name per line.
+hiring_cafe:
+  enabled: true
+  max_pages: 2
+  results_per_site: 50
+  company_watchlist_enabled: false
+  company_watchlist_path: ""
+  company_watchlist_limit: 0  # 0 means search the full list
+  company_max_pages: 1
+  company_results_per_site: 20
+  request_delay_seconds: 0.35
+  company_request_delay_seconds: 0.75
+  rate_limit_backoff_seconds: 90
+  max_consecutive_rate_limits: 3
+
+# Corporate ATS source settings.
+# Uses public Greenhouse, Lever, and Ashby job-board APIs.
+corporate_ats:
+  enabled: false
+  sources:
+    - greenhouse
+    - lever
+    - ashby
+  company_watchlist_path: ""
+  company_watchlist_limit: 0  # 0 means search the full list
+  exact_boards_path: ""
+  match_queries: true
+  results_per_company: 80
+  workers: 8
+  request_timeout: 12
+  connect_timeout: 5
+  read_timeout: 12
+  request_retries: 2
+  retry_backoff_seconds: 1
+  rate_limit_backoff_seconds: 20
+  token_candidates_per_company: 4
+  cache_enabled: true
+  cache_ttl_days: 14
+  write_run_report: true
+  run_report_path: ""
+
+# Workday corporate scraper settings.
+# Plain company names can only filter configured Workday employers.
+# Add exact Workday tenant/site/base_url entries to ~/.applypilot/workday_employers.yaml.
+workday_company_watchlist_enabled: false
+workday_company_watchlist_path: ""
+workday_queries: []      # Optional explicit query list for Workday; overrides workday_max_tier.
+workday_max_tier: 2
+workday_location_filter: true
+workday_workers: 4
+workday_request_timeout: 20
+workday_request_retries: 2
+workday_retry_backoff_seconds: 2
+workday_max_pages: 10
+workday_max_results_per_employer_query: 150
+
+# Optional browser/LLM-based direct-site scraper.
+# Keep disabled when structured sources already cover your search, or narrow it
+# with include_sites/max_targets to avoid slow third-party pages dominating runs.
+smartextract:
+  enabled: false
+  workers: 1
+  goto_timeout_ms: 30000
+  action_timeout_ms: 8000
+  wait_for_network_idle: false
+  network_idle_timeout_ms: 5000
+  headful_retry: false
+  block_resources: true
+  max_response_bytes: 2000000
+  http_probe_enabled: true
+  health_enabled: true
+  skip_after_failures: 3
+  skip_cooldown_hours: 24
+  min_valid_jobs_for_success: 1
+  max_search_queries: 1
+  max_targets: 10
+  include_search_sites: true
+  include_static_sites: false
+  include_sites: []
+  exclude_sites: []
 
 # Search defaults
 defaults:

@@ -25,7 +25,19 @@ dependencies = [
     "playwright>=1.40",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
-    "pandas>=2.0",
+    # python-jobspy is intentionally NOT listed here: its metadata pins an exact
+    # numpy that breaks pip's resolver. It is installed separately with
+    # `pip install --no-deps python-jobspy` (see README / `applypilot doctor`).
+    # We declare jobspy's import-time runtime deps so the second install step is
+    # minimal. numpy is left to pandas to resolve (no exact pin -> 3.13 installs).
+    "markdownify>=0.13.1,<0.14.0",
+    "pandas>=2.1,<3.0",
+    "pydantic>=2.13,<2.14",
+    "regex>=2024.4.28,<2025.0.0",
+    # Postgres driver for the cloud apply-fleet: the home box uses it for the
+    # SQLite<->PG PUSH/PULL sync; the worker container uses it to lease/report.
+    "psycopg[binary]>=3.2",
+    "mcp>=1.28,<2",
     ]
 
 [project.optional-dependencies]
@@ -33,6 +45,20 @@ dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
+applypilot-fleet-compute = "applypilot.fleet.compute_worker_main:main"
+applypilot-fleet-compute-home = "applypilot.fleet.compute_home_main:main"
+applypilot-fleet-discovery = "applypilot.fleet.discovery_main:main_worker"
+applypilot-fleet-discovery-home = "applypilot.fleet.discovery_main:main_home"
+applypilot-fleet-frontier = "applypilot.fleet.frontier_main:main"
+applypilot-fleet-watchdog = "applypilot.fleet.watchdog:main"
+applypilot-fleet-doctor = "applypilot.fleet.doctor:main"
+applypilot-fleet-codex-bridge = "applypilot.fleet.codex_bridge:main"
+applypilot-fleet-apply = "applypilot.fleet.apply_worker_main:main"
+applypilot-fleet-apply-home = "applypilot.fleet.apply_home_main:main"
+applypilot-fleet-diagnose = "applypilot.fleet.diagnoser_main:main"
+applypilot-fleet-remediate = "applypilot.fleet.remediator_main:main"
+applypilot-fleet-linkedin = "applypilot.fleet.linkedin_worker_main:main"
+applypilot-fleet-linkedin-home = "applypilot.fleet.linkedin_home_main:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"

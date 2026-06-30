@@ -2,18 +2,40 @@
 profile.json
 resume.txt
 resume.pdf
+# Machine-transfer bundles (wrap profile.json/resume/config — a .zip defeats the
+# loose-file ignores above, so the secrets would sail straight into git history)
+*.zip
+machine2-bundle.zip
 *.env
 .env.*
 !.env.example
+# Gmail OAuth secrets (read-only scanner). The real ones live in .applypilot/ (already
+# ignored); these patterns also catch a stray copy left anywhere in the repo.
+gmail_credentials*.json
+gmail_token*.json
+*client_secret*.json
 
 # Runtime artifacts
 *.db
+*.log
+*.err
+discover_run*
+tuned_discover*
 tailored_resumes/
 cover_letters/
 chrome-workers/
 apply-workers/
 apply_logs/
 logs/
+.applypilot/
+.conda-env/
+.conda-pkgs/
+.conda-temp/
+.codex-temp/
+.npm-cache/
+.playwright-browsers/
+.tools/
+.venv/
 
 # MCP configs (per-machine)
 .mcp*.json
