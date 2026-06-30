@@ -24,6 +24,30 @@ if (-not $env:FLEET_PG_DSN) { $env:FLEET_PG_DSN = "host=localhost port=5432 dbna
 $worker = Join-Path $repo "run-fleet-worker.ps1"
 if (-not (Test-Path $worker)) { throw "run-fleet-worker.ps1 not found next to fleet-agent.ps1 ($worker)" }
 
+# ---- startup PRE-FLIGHT: is THIS box ready to run workers + reach the home box? ----
+Write-Host "[fleet-agent:$Label] pre-flight (DSN=$env:FLEET_PG_DSN)..." -ForegroundColor Cyan
+$pf = @()
+& $py -c "import applypilot" 2>$null; if (-not $?) { $pf += "applypilot not importable -> $py -m pip install -e ." }
+if (-not (@(".\.conda-env\Scripts\applypilot-fleet-apply.exe", ".\.venv\Scripts\applypilot-fleet-apply.exe") | Where-Object { Test-Path $_ })) { $pf += "applypilot-fleet-apply.exe MISSING -> pip install -e ." }
+if (-not (Get-ChildItem ".\.playwright-browsers\chromium-*" -Directory -ErrorAction SilentlyContinue)) { $pf += "Chromium MISSING in .playwright-browsers (set PLAYWRIGHT_BROWSERS_PATH + reinstall)" }
+$probe = (& $py "fleet-agent-query.py" $Label 2>$null | Select-Object -Last 1)
+if ("$probe" -notmatch '^\d+\|') {
+  $pf += "CANNOT reach home Postgres over FLEET_PG_DSN (got '$probe') -- check the DSN host/LAN/firewall/pg_hba"
+} else {
+  $wantAgent = ($probe -split '\|')[1]
+  $cli = if ($wantAgent -eq 'codex') { Join-Path $env:APPDATA "npm\codex.cmd" } else { Join-Path $env:APPDATA "npm\claude.cmd" }
+  if (-not (Test-Path $cli)) { $pf += "$wantAgent CLI missing ($cli) -- workers will flash-and-die until it's installed + logged in" }
+  Write-Host "[fleet-agent:$Label] home box wants this machine = '$probe' (workers|agent|model|gen)" -ForegroundColor Gray
+}
+if ($pf.Count) {
+  Write-Host "[fleet-agent:$Label] PRE-FLIGHT PROBLEMS on this box:" -ForegroundColor Red
+  $pf | ForEach-Object { Write-Host "   - $_" -ForegroundColor Red }
+  Write-Host "[fleet-agent:$Label] fix those and re-run. (Reconciling anyway in 8s; Ctrl-C to abort.)" -ForegroundColor Yellow
+  Start-Sleep -Seconds 8
+} else {
+  Write-Host "[fleet-agent:$Label] pre-flight PASS -- ready to obey the home box." -ForegroundColor Green
+}
+
 function Get-LocalWorkers {
   $rx = '--worker-id\s+"?' + [regex]::Escape($Label) + '-(\d+)'
   @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='applypilot-fleet-apply.exe'" -ErrorAction SilentlyContinue |
