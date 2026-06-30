@@ -100,6 +100,18 @@ class _RowcountConn(_FakeConn):
         super().__init__(script); self._cur = _RowcountCursor(script or {})
 
 
+class _LostRaceCursor(_RowcountCursor):
+    """Like _RowcountCursor but reports rowcount=0 for the UPDATE to simulate a lost race."""
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self.rowcount = 0 if sql.strip().upper().startswith("UPDATE") else 0
+
+
+class _LostRaceConn(_FakeConn):
+    def __init__(self, script=None):
+        super().__init__(script); self._cur = _LostRaceCursor(script or {})
+
+
 def test_requeue_job_updates_to_queued_and_audits():
     conn = _RowcountConn()
     c = remediator.Candidate(url="https://job/1", worker_id="m2-3", dedup_key="dk1",
@@ -112,3 +124,16 @@ def test_requeue_job_updates_to_queued_and_audits():
     assert "status='queued'" in upd[0][0].replace(" ", "") or "status = 'queued'" in upd[0][0]
     # audit row carries the PRIOR state for reversal
     assert "crash_unconfirmed" in ins[0][1] and 99 in ins[0][1]
+
+
+def test_requeue_job_lost_race_writes_nothing():
+    """When the UPDATE rowcount is 0 (race: status changed underneath), requeue_job must return
+    False and write NOTHING (no audit row, no commit). This proves the lost-race safety path."""
+    conn = _LostRaceConn()
+    c = remediator.Candidate(url="https://job/1", worker_id="m2-3", dedup_key="dk1",
+                             status="crash_unconfirmed", attempts=99,
+                             apply_error="crash_unconfirmed", reason="usage_limit")
+    assert remediator.requeue_job(conn, c) is False
+    ins = [e for e in conn._cur.executed if "INSERT INTO remediation_actions" in e[0]]
+    assert len(ins) == 0
+    assert conn.committed is False
