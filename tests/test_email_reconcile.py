@@ -190,6 +190,54 @@ def test_apply_resolutions_includes_probable_when_opted_in():
 
 
 # ---------------------------------------------------------------------------
+# Fix B: load_outcome_emails graceful missing table
+# ---------------------------------------------------------------------------
+def test_load_outcome_emails_missing_table_returns_empty():
+    conn = sqlite3.connect(":memory:")  # no email_events table
+    assert er.load_outcome_emails(conn) == []
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix D: apply_resolutions rolls back on write failure
+# ---------------------------------------------------------------------------
+class _FailingCursor(_ScriptCursor):
+    """Cursor that raises on INSERT (simulates a failed audit write)."""
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if sql.strip().upper().startswith("UPDATE"):
+            self.rowcount = self._rc.pop(0) if self._rc else 0
+        elif "INSERT" in sql.upper():
+            raise RuntimeError("simulated insert failure")
+
+
+class _RollbackConn(_ScriptConn):
+    def __init__(self, rowcounts):
+        self._cur = _FailingCursor(rowcounts)
+        self.commits = 0
+        self.rolled_back = 0
+
+    def cursor(self):
+        return self._cur
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rolled_back += 1
+
+
+def test_apply_resolutions_rolls_back_on_write_failure():
+    import pytest
+    conn = _RollbackConn(rowcounts=[1])  # UPDATE hits 1 row, INSERT will raise
+    with pytest.raises(RuntimeError, match="simulated insert failure"):
+        er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert conn.rolled_back == 1
+    assert conn.commits == 0  # no commit should have happened
+
+
+# ---------------------------------------------------------------------------
 # Task 6: format_report
 # ---------------------------------------------------------------------------
 def test_format_report_summarizes_counts():

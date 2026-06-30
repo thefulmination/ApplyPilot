@@ -2,6 +2,7 @@
 application-outcome emails (email_events) and flip confirmed ones to 'applied'. Advisory/
 dry-run by default; writes only to the fleet Postgres. Reuses gmail_outcomes.match_email_to_job."""
 from __future__ import annotations
+import sqlite3
 from dataclasses import dataclass
 
 from applypilot.gmail_outcomes import match_email_to_job
@@ -58,13 +59,19 @@ def classify_match(method: str | None, score: float | None, *, min_strong: float
 
 def load_outcome_emails(conn) -> list:
     """Read submission-proving outcome emails from the home brain's email_events table.
-    Caller opens the sqlite connection read-only."""
+    Caller opens the sqlite connection read-only.
+    Returns [] if the table does not exist (brain predates the outcomes tracker)."""
     placeholders = ",".join("?" for _ in CONFIRMING_STAGES)
-    cur = conn.execute(
-        f"SELECT message_id, sender, subject, body_text, company, title, job_url, stage, occurred_at "
-        f"FROM email_events WHERE stage IN ({placeholders})",
-        tuple(sorted(CONFIRMING_STAGES)),
-    )
+    try:
+        cur = conn.execute(
+            f"SELECT message_id, sender, subject, body_text, company, title, job_url, stage, occurred_at "
+            f"FROM email_events WHERE stage IN ({placeholders})",
+            tuple(sorted(CONFIRMING_STAGES)),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
     out = []
     for r in cur.fetchall():
         out.append(OutcomeEmail(
@@ -122,24 +129,28 @@ def apply_resolutions(conn, result: ReconcileResult, *, include_probable: bool =
     targets = list(result.confirmed) + (list(result.probable) if include_probable else [])
     flipped = skipped = 0
     for r in targets:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE apply_queue SET status='applied', apply_status='applied', apply_error=NULL, "
-                "applied_at=COALESCE(applied_at, %s), updated_at=now() "
-                "WHERE url=%s AND status='crash_unconfirmed'",
-                (r.occurred_at, r.job_url),
-            )
-            if cur.rowcount == 0:
-                skipped += 1
-                continue
-            cur.execute(
-                "INSERT INTO email_reconcile_actions (url, message_id, match_method, match_score, "
-                "stage, prior_status, how_to_reverse) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                (r.job_url, r.message_id, r.method, r.score, r.stage, "crash_unconfirmed",
-                 "Set apply_queue.status back to 'crash_unconfirmed', apply_status='crash_unconfirmed', "
-                 "apply_error='failed:no_result_line' WHERE url matches."),
-            )
-            flipped += 1
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE apply_queue SET status='applied', apply_status='applied', apply_error=NULL, "
+                    "applied_at=COALESCE(applied_at, %s), updated_at=now() "
+                    "WHERE url=%s AND status='crash_unconfirmed'",
+                    (r.occurred_at, r.job_url),
+                )
+                if cur.rowcount == 0:
+                    skipped += 1
+                    continue
+                cur.execute(
+                    "INSERT INTO email_reconcile_actions (url, message_id, match_method, match_score, "
+                    "stage, prior_status, how_to_reverse) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (r.job_url, r.message_id, r.method, r.score, r.stage, "crash_unconfirmed",
+                     "Set apply_queue.status back to 'crash_unconfirmed', apply_status='crash_unconfirmed', "
+                     "apply_error='failed:no_result_line' WHERE url matches."),
+                )
+                flipped += 1
+        except Exception:
+            conn.rollback()
+            raise
         conn.commit()
     return {"flipped": flipped, "skipped": skipped}
 

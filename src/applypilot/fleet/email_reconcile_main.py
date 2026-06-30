@@ -34,19 +34,25 @@ def main(argv=None) -> int:
         except Exception as exc:  # best-effort enrichment; reconcile still runs on existing data
             print(f"phase0 scan skipped ({type(exc).__name__}: {exc}); using existing email_events")
 
-    home = sqlite3.connect(f"file:{args.home_db}?mode=ro", uri=True)
     try:
-        emails = er.load_outcome_emails(home)
-    finally:
-        home.close()
+        home = sqlite3.connect(f"file:{args.home_db}?mode=ro", uri=True)
+        try:
+            emails = er.load_outcome_emails(home)
+        finally:
+            home.close()
+    except sqlite3.OperationalError as exc:
+        print(f"no outcome data: cannot open home brain at {args.home_db} ({exc})")
+        return 0
 
     with pgqueue.connect(args.dsn) as conn:
         jobs = er.load_crash_jobs(conn)
         result = er.reconcile(emails, jobs, min_strong=args.min_score)
         print(er.format_report(result))
-        if args.apply or args.apply_probable:
+        if args.apply:
             counts = er.apply_resolutions(conn, result, include_probable=args.apply_probable)
             print(f"applied: {counts}")
+        elif args.apply_probable:
+            print("(dry-run; --apply-probable requires --apply to write)")
         else:
             print("(dry-run; pass --apply to flip confirmed matches)")
     return 0
