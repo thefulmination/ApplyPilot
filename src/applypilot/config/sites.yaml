@@ -20,7 +20,9 @@ blocked:
   url_patterns:
     - "%glassdoor%"
     - "%google.com/about/careers%"
+    - "%careers.google.com%"
     - "%google.jobs%"
+    - "%amazon.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
 

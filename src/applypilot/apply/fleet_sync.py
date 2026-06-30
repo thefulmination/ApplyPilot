@@ -20,6 +20,8 @@ from applypilot import config
 from applypilot.apply import pgqueue
 from applypilot.apply.launcher import _apply_target, _throttle_host
 
+# Blocked sites/patterns loaded once at import (mirrors acquire_job in launcher.py).
+_BLOCKED_SITES, _BLOCKED_PATTERNS = config.load_blocked_sites()
 
 # --- PUSH -------------------------------------------------------------------
 
@@ -51,11 +53,19 @@ def _target(row: sqlite3.Row) -> str:
 def _eligible(row: sqlite3.Row) -> bool:
     """Host-logic filters that SQL can't express (mirror acquire_job)."""
     t = _target(row)
-    return not (
-        config.is_auth_gated_application(t)
-        or config.is_unresolved_aggregator(t)
-        or config.is_manual_ats(t)
-    )
+    if config.is_auth_gated_application(t) or config.is_unresolved_aggregator(t) or config.is_manual_ats(t):
+        return False
+    # Mirror the blocked-site/pattern check from acquire_job so the fleet push lane
+    # never queues jobs the home lane would skip (e.g. careers.google.com, amazon.jobs).
+    t_lower = t.lower()
+    if _BLOCKED_SITES and any(s.lower() in t_lower for s in _BLOCKED_SITES):
+        return False
+    if _BLOCKED_PATTERNS:
+        for pat in _BLOCKED_PATTERNS:
+            needle = pat.strip("%").lower()
+            if needle and needle in t_lower:
+                return False
+    return True
 
 
 def push_offsite_jobs(
