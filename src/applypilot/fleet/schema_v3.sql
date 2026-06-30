@@ -261,6 +261,29 @@ CREATE INDEX IF NOT EXISTS idx_inbox_unsurfaced ON inbox_events (received_at)
     WHERE event_type = 'interview' AND NOT surfaced;
 
 -- ---------------------------------------------------------------------------
+-- inbox_outcomes: thin per-EMAIL application-outcome summary pushed from the home
+-- brain's email_events (SQLite outcomes tracker). One row per Gmail message_id
+-- (idempotency anchor). Carries the R9 dedup_key so an outcome ties back to the
+-- application cross-board. Read-only mirror; no body_text / PII crosses.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS inbox_outcomes (
+    message_id    TEXT PRIMARY KEY,
+    dedup_key     TEXT,
+    job_url       TEXT,
+    company       TEXT,
+    title         TEXT,
+    stage         TEXT,
+    outcome       TEXT,
+    sender_domain TEXT,
+    confidence    TEXT,
+    occurred_at   TIMESTAMPTZ,
+    pushed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_outcomes_dedup ON inbox_outcomes (dedup_key);
+CREATE INDEX IF NOT EXISTS idx_inbox_outcomes_stage ON inbox_outcomes (stage, occurred_at);
+
+-- ---------------------------------------------------------------------------
 -- workers: enrollment / registration + capability flags + canary validation
 -- (R4 token auth, R7 health, R15 canary, lane split §4).
 -- ---------------------------------------------------------------------------

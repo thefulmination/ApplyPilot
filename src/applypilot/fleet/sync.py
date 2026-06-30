@@ -545,6 +545,62 @@ def pull_discovered(*, sqlite_conn=None, pg_conn=None, batch=500) -> int:
 
 
 # ===========================================================================
+# INBOX OUTCOMES -- PUSH (read-only summary of the brain's email_events)
+# ===========================================================================
+
+_PUSH_INBOX_SELECT = (
+    "SELECT message_id, job_url, company, title, stage, outcome, "
+    "sender_domain, confidence, occurred_at FROM email_events ORDER BY occurred_at"
+)
+
+_UPSERT_INBOX_OUTCOME = (
+    "INSERT INTO inbox_outcomes "
+    "(message_id, dedup_key, job_url, company, title, stage, outcome, sender_domain, confidence, occurred_at) "
+    "VALUES (%(message_id)s,%(dedup_key)s,%(job_url)s,%(company)s,%(title)s,%(stage)s,"
+    "%(outcome)s,%(sender_domain)s,%(confidence)s,%(occurred_at)s) "
+    "ON CONFLICT (message_id) DO UPDATE SET "
+    "dedup_key=EXCLUDED.dedup_key, job_url=EXCLUDED.job_url, company=EXCLUDED.company, "
+    "title=EXCLUDED.title, stage=EXCLUDED.stage, outcome=EXCLUDED.outcome, "
+    "sender_domain=EXCLUDED.sender_domain, confidence=EXCLUDED.confidence, "
+    "occurred_at=EXCLUDED.occurred_at, updated_at=now()"
+)
+
+
+def push_inbox_outcomes(*, sqlite_conn=None, pg_conn=None, limit: int | None = None) -> int:
+    """Push the brain's email_events outcome summaries into PG inbox_outcomes
+    (idempotent by message_id). Read-only on the brain; only the thin summary +
+    the R9 dedup_key cross (no body_text/PII). Returns rows the UPSERT touched."""
+    own_sq, own_pg = sqlite_conn is None, pg_conn is None
+    sq = sqlite_conn or _home_conn()
+    pg = pg_conn or pgqueue.connect()
+    n = 0
+    try:
+        sql = _PUSH_INBOX_SELECT
+        params: list = []
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with pg.cursor() as cur:
+            for r in sq.execute(sql, params).fetchall():
+                cur.execute(_UPSERT_INBOX_OUTCOME, {
+                    "message_id": r["message_id"],
+                    "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
+                    "job_url": r["job_url"], "company": r["company"], "title": r["title"],
+                    "stage": r["stage"], "outcome": r["outcome"],
+                    "sender_domain": r["sender_domain"], "confidence": r["confidence"],
+                    "occurred_at": r["occurred_at"],
+                })
+                n += cur.rowcount
+        pg.commit()
+        return n
+    finally:
+        if own_sq:
+            sq.close()
+        if own_pg:
+            pg.close()
+
+
+# ===========================================================================
 # Connection
 # ===========================================================================
 
