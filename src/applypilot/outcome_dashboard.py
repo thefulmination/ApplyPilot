@@ -1,5 +1,5 @@
-"""Read-only data assembly + CSV for the outcomes dashboard. The HTTP server
-(serve / _Handler) is added in the next task; these functions are pure-ish reads."""
+"""Read-only data assembly + CSV for the outcomes dashboard. This module contains
+both the read-only data assembly functions and the stdlib HTTP server (serve / _Handler)."""
 
 from __future__ import annotations
 
@@ -182,8 +182,8 @@ def _make_handler(db_path: str):
 def serve(host: str = "127.0.0.1", port: int = 8765, db_path=None) -> None:
     """Serve the read-only outcomes dashboard. Binds loopback/private IPs only."""
     ip = ipaddress.ip_address(host)
-    if not (ip.is_loopback or ip.is_private):
-        raise ValueError(f"refusing to bind non-private host {host}")
+    if ip.is_unspecified or not (ip.is_loopback or ip.is_private):
+        raise ValueError(f"refusing to bind non-private/unspecified host {host}")
     db_path = str(db_path or DB_PATH)
     server = ThreadingHTTPServer((host, port), _make_handler(db_path))
     print(f"Outcomes dashboard: http://{host}:{port}  (Ctrl-C to stop)")

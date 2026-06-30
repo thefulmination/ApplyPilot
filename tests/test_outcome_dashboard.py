@@ -66,6 +66,13 @@ def test_build_csv_has_header_and_row(tmp_path):
     assert "first_response_days" in parsed[0]
 
 
+def test_serve_refuses_unspecified_host():
+    import pytest
+    import applypilot.outcome_dashboard as D
+    with pytest.raises(ValueError):
+        D.serve(host="0.0.0.0", port=0)
+
+
 def test_server_serves_json_and_csv(tmp_path):
     db = tmp_path / "applypilot.db"
     conn = database.init_db(db)
@@ -87,3 +94,4 @@ def test_server_serves_json_and_csv(tmp_path):
         assert "company" in body.splitlines()[0]
     finally:
         server.shutdown()
+        server.server_close()
