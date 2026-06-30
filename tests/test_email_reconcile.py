@@ -99,6 +99,66 @@ def test_reconcile_resolves_each_job_once():
     assert len(res.confirmed) == 1
 
 
+# ---------------------------------------------------------------------------
+# Task 5: apply_resolutions
+# ---------------------------------------------------------------------------
+class _ScriptCursor:
+    def __init__(self, rowcounts): self._rc = list(rowcounts); self.executed = []; self.rowcount = 0
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if sql.strip().upper().startswith("UPDATE"):
+            self.rowcount = self._rc.pop(0) if self._rc else 0
+
+
+class _ScriptConn:
+    def __init__(self, rowcounts): self._cur = _ScriptCursor(rowcounts); self.commits = 0
+    def cursor(self): return self._cur
+    def commit(self): self.commits += 1
+
+
+def _res(confirmed=(), probable=()):
+    return er.ReconcileResult(confirmed=list(confirmed), probable=list(probable),
+                              unmatched_emails=0, jobs_total=0)
+
+
+def _r(url, cls="confirmed"):
+    return er.Resolution(job_url=url, message_id="m", method="company_domain", score=1.0,
+                         stage="acknowledged", occurred_at="2026-06-29T10:00:00+00:00", classification=cls)
+
+
+def test_apply_resolutions_flips_confirmed_and_audits():
+    conn = _ScriptConn(rowcounts=[1])               # UPDATE affects 1 row
+    counts = er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert counts == {"flipped": 1, "skipped": 0}
+    updates = [e for e in conn._cur.executed if e[0].strip().upper().startswith("UPDATE apply_queue".upper())]
+    inserts = [e for e in conn._cur.executed if "INSERT INTO email_reconcile_actions" in e[0]]
+    assert len(updates) == 1 and len(inserts) == 1
+    assert "status='applied'" in updates[0][0].replace(" ", "") or "status = 'applied'" in updates[0][0]
+    assert "status='crash_unconfirmed'" in updates[0][0].replace(" ", "")   # guarded
+
+
+def test_apply_resolutions_skips_when_row_already_moved():
+    conn = _ScriptConn(rowcounts=[0])               # UPDATE affects 0 rows (already not crash)
+    counts = er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert counts == {"flipped": 0, "skipped": 1}
+    assert not any("INSERT INTO email_reconcile_actions" in e[0] for e in conn._cur.executed)
+
+
+def test_apply_resolutions_excludes_probable_by_default():
+    conn = _ScriptConn(rowcounts=[1])
+    counts = er.apply_resolutions(conn, _res(probable=[_r("u2", cls="probable")]))
+    assert counts == {"flipped": 0, "skipped": 0}    # probable not applied unless included
+    assert not any(e[0].strip().upper().startswith("UPDATE") for e in conn._cur.executed)
+
+
+def test_apply_resolutions_includes_probable_when_opted_in():
+    conn = _ScriptConn(rowcounts=[1])
+    counts = er.apply_resolutions(conn, _res(probable=[_r("u2", cls="probable")]), include_probable=True)
+    assert counts == {"flipped": 1, "skipped": 0}
+
+
 def test_classify_strong_method_is_confirmed_regardless_of_score():
     assert er.classify_match("company_domain", 1.0) == "confirmed"
     assert er.classify_match("board_slug", 1.0) == "confirmed"

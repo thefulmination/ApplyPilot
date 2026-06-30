@@ -494,3 +494,16 @@ ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS rows_affected        INTEGE
 ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS prior_incident_count INTEGER;
 ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS distinct_hosts       INTEGER;
 ALTER TABLE fleet_diagnoses ADD COLUMN IF NOT EXISTS distinct_workers     INTEGER;
+
+-- email_reconcile_actions: audit + reversibility for the email-verification reconcile.
+CREATE TABLE IF NOT EXISTS email_reconcile_actions (
+    id              BIGSERIAL PRIMARY KEY,
+    url             TEXT,
+    message_id      TEXT,
+    match_method    TEXT,
+    match_score     REAL,
+    stage           TEXT,
+    prior_status    TEXT,
+    how_to_reverse  TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

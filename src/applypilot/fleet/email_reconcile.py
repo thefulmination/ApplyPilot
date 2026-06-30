@@ -109,3 +109,32 @@ def reconcile(emails: list, jobs: list[dict], *, min_strong: float = MIN_STRONG)
     probable = [r for r in best.values() if r.classification == "probable"]
     return ReconcileResult(confirmed=confirmed, probable=probable,
                            unmatched_emails=unmatched, jobs_total=len(jobs))
+
+
+def apply_resolutions(conn, result: ReconcileResult, *, include_probable: bool = False) -> dict:
+    """Flip confirmed (and, if opted-in, probable) jobs crash_unconfirmed -> applied, guarded on
+    the current status so it is idempotent and never clobbers a row another process moved. Writes
+    one audit row per flip. One transaction per job."""
+    targets = list(result.confirmed) + (list(result.probable) if include_probable else [])
+    flipped = skipped = 0
+    for r in targets:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET status='applied', apply_status='applied', apply_error=NULL, "
+                "applied_at=COALESCE(applied_at, %s), updated_at=now() "
+                "WHERE url=%s AND status='crash_unconfirmed'",
+                (r.occurred_at, r.job_url),
+            )
+            if cur.rowcount == 0:
+                skipped += 1
+                continue
+            cur.execute(
+                "INSERT INTO email_reconcile_actions (url, message_id, match_method, match_score, "
+                "stage, prior_status, how_to_reverse) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (r.job_url, r.message_id, r.method, r.score, r.stage, "crash_unconfirmed",
+                 "Set apply_queue.status back to 'crash_unconfirmed', apply_status='crash_unconfirmed', "
+                 "apply_error='failed:no_result_line' WHERE url matches."),
+            )
+            flipped += 1
+        conn.commit()
+    return {"flipped": flipped, "skipped": skipped}
