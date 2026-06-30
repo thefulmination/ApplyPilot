@@ -49,7 +49,7 @@ def tier0_diagnose(ctx: WorkerCtx) -> Diagnosis | None:
     model = _MODEL_RE.search(text)
     reset_s = reset.group(1) if reset else "unknown"
     model_s = model.group(1) if model else "the agent model"
-    rec = (f"Agent quota exhausted ({model_s}). RE-QUEUE these jobs (do NOT quarantine — they "
+    rec = (f"Agent quota exhausted ({model_s}). RE-QUEUE these jobs (do NOT quarantine - they"
            f"were never submitted); switch the worker's model or wait until {reset_s}.")
     return Diagnosis(
         worker_id=ctx.worker_id, root_cause="usage_limit", confidence=1.0,
@@ -103,7 +103,7 @@ def tier1_diagnose(ctx: WorkerCtx, client) -> Diagnosis:
     except Exception as exc:  # LLM down / bad JSON / no content
         return Diagnosis(
             worker_id=ctx.worker_id, root_cause="unknown", confidence=0.0,
-            recommendation="LLM diagnosis unavailable — read the worker log in the console.",
+            recommendation="LLM diagnosis unavailable - read the worker log in the console.",
             source="none", details={"error": str(exc)[:200]},
         )
 
@@ -121,7 +121,7 @@ def diagnose(ctx: WorkerCtx, client=None) -> Diagnosis:
             client = llm.get_client(provider_override="deepseek", stage="diagnose")
         except Exception as exc:
             return Diagnosis(ctx.worker_id, "unknown", 0.0,
-                             "LLM diagnosis unavailable (no provider configured) — read the worker log.",
+                             "LLM diagnosis unavailable (no provider configured) - read the worker log.",
                              "none", details={"error": str(exc)[:200]})
     return tier1_diagnose(ctx, client)
 
@@ -160,6 +160,6 @@ def write_diagnosis(conn, d: Diagnosis, ttl_seconds: int = 86400) -> bool:
             "severity, diagnosis, recommendation, auto_action, how_to_reverse, status, expires_at) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()+make_interval(secs=>%s))",
             (cluster_key, d.root_cause, d.worker_id, "ats", 1, severity, diagnosis_text,
-             d.recommendation, None, "Advisory only — dismiss via the console.", "recommended", ttl_seconds))
+             d.recommendation, None, "Advisory only - dismiss via the console.", "recommended", ttl_seconds))
     conn.commit()
     return True
