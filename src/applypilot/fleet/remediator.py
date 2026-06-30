@@ -67,3 +67,38 @@ def has_confirming_email(brain_path: str, url: str) -> bool:
         return False  # email_events not created yet (outcomes-tracker not run)
     finally:
         conn.close()
+
+
+_CANDIDATE_SQL = """
+SELECT q.url, q.worker_id, q.dedup_key, q.status::text AS status, q.attempts,
+       q.apply_error, 'usage_limit' AS reason
+FROM apply_queue q
+JOIN (
+    SELECT DISTINCT machine FROM fleet_diagnoses
+    WHERE reason = 'usage_limit' AND cluster_key LIKE 'logdiag:%%'
+      AND status IN ('recommended', 'open', 'auto_applied')
+      AND created_at > now() - make_interval(mins => %(window)s)
+) d ON d.machine = q.worker_id
+WHERE q.lane = 'ats'
+  AND q.status IN ('failed', 'crash_unconfirmed')
+  AND (q.status = 'crash_unconfirmed' OR q.apply_error ILIKE '%%no_result_line%%')
+  AND q.updated_at > now() - make_interval(mins => %(window)s)
+  AND (SELECT count(*) FROM remediation_actions ra
+       WHERE ra.url = q.url AND ra.action = 'requeue') < %(maxperjob)s
+ORDER BY q.updated_at DESC
+LIMIT %(hardlimit)s
+"""
+
+
+def select_candidates(conn, *, window_minutes: int = 30, max_per_job: int = 2,
+                      hard_limit: int = 500) -> list[Candidate]:
+    """Usage-limit casualties: ATS jobs parked/failed (no_result_line / crash_unconfirmed) by a
+    worker that has a recent Tier-0 usage_limit diagnosis, within the diagnosis window, not yet
+    re-queued max_per_job times. The double-apply guards run later, per-candidate."""
+    with conn.cursor() as cur:
+        cur.execute(_CANDIDATE_SQL, {"window": window_minutes, "maxperjob": max_per_job,
+                                     "hardlimit": hard_limit})
+        return [Candidate(url=r["url"], worker_id=r["worker_id"], dedup_key=r["dedup_key"],
+                          status=r["status"], attempts=r["attempts"],
+                          apply_error=r["apply_error"], reason=r["reason"])
+                for r in cur.fetchall()]
