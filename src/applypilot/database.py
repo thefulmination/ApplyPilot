@@ -182,6 +182,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     ensure_inbox_auth_tables(conn)
     ensure_pipeline_tables(conn)
     ensure_research_tables(conn)
+    ensure_outcome_tables(conn)
 
     return conn
 
@@ -598,6 +599,44 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_status ON auth_challenges(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_job_url ON auth_challenges(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)")
+    conn.commit()
+
+
+def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create the email-driven outcome-tracking table (outcomes tracker spec
+    2026-06-29). Distinct from inbox_events (which tracks apply-time auth/OTP
+    challenges): email_events is the evidence layer for application OUTCOMES --
+    one row per recruiter email, idempotent by Gmail message_id. ADDITIVE."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_events (
+            message_id     TEXT PRIMARY KEY,
+            thread_id      TEXT,
+            job_url        TEXT,
+            occurred_at    TEXT NOT NULL,
+            sender         TEXT,
+            sender_domain  TEXT,
+            subject        TEXT,
+            stage          TEXT NOT NULL,
+            outcome        TEXT,
+            reason         TEXT,
+            title          TEXT,
+            company        TEXT,
+            match_method   TEXT,
+            match_score    REAL,
+            confidence     TEXT,
+            body_text      TEXT,
+            snippet        TEXT,
+            extracted_by   TEXT,
+            scanned_at     TEXT NOT NULL,
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_email_events_job ON email_events(job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_email_events_occurred ON email_events(occurred_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_email_events_stage ON email_events(stage)")
     conn.commit()
 
 
