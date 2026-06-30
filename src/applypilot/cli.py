@@ -1577,6 +1577,47 @@ def scan_gmail_command(
     console.print()
 
 
+@app.command("outcomes-scan")
+def outcomes_scan_command(
+    days: int = typer.Option(30, "--days", "-d", help="How many days back to search."),
+    reextract: bool = typer.Option(False, "--reextract", help="Re-run LLM extraction on already-seen emails."),
+    credentials: Optional[Path] = typer.Option(None, "--credentials", help="Path to gmail_credentials.json."),
+) -> None:
+    """Scan Gmail and populate the email_events outcome timeline (LLM extraction)."""
+    _bootstrap()
+    from applypilot.outcome_scan import scan_outcomes
+    try:
+        counts = scan_outcomes(days=days, credentials_path=credentials, reextract=reextract)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Setup required:[/red]\n{exc}")
+        raise typer.Exit(1)
+    except ImportError as exc:
+        console.print(f"[red]Missing dependencies:[/red] {exc}")
+        raise typer.Exit(1)
+
+    table = Table(title="Outcome scan", show_header=True, header_style="bold")
+    table.add_column("Result", style="bold")
+    table.add_column("Count", justify="right")
+    for k in ("inserted", "updated", "skipped", "errors"):
+        table.add_row(k, str(counts.get(k, 0)))
+    console.print(table)
+
+
+@app.command("outcomes-dashboard")
+def outcomes_dashboard_command(
+    port: int = typer.Option(8765, "--port", "-p", help="Port to serve on (localhost)."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind (loopback/private only)."),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the browser."),
+) -> None:
+    """Serve the local read-only outcomes dashboard (timeline, analytics, lanes)."""
+    _bootstrap()
+    from applypilot.outcome_dashboard import serve
+    if open_browser:
+        import webbrowser
+        webbrowser.open(f"http://{host}:{port}")
+    serve(host=host, port=port)
+
+
 @app.command("linkedin-login")
 def linkedin_login_command(
     timeout: int = typer.Option(420, "--timeout", help="Max seconds to wait for you to log in."),
