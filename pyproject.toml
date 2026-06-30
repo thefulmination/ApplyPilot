@@ -56,6 +56,7 @@ applypilot-fleet-codex-bridge = "applypilot.fleet.codex_bridge:main"
 applypilot-fleet-apply = "applypilot.fleet.apply_worker_main:main"
 applypilot-fleet-apply-home = "applypilot.fleet.apply_home_main:main"
 applypilot-fleet-diagnose = "applypilot.fleet.diagnoser_main:main"
+applypilot-fleet-remediate = "applypilot.fleet.remediator_main:main"
 applypilot-fleet-linkedin = "applypilot.fleet.linkedin_worker_main:main"
 applypilot-fleet-linkedin-home = "applypilot.fleet.linkedin_home_main:main"
 

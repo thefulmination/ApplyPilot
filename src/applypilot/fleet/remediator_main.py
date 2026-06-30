@@ -1,0 +1,46 @@
+"""applypilot-fleet-remediate: autonomously re-queue usage-limit-casualty jobs behind the 3-layer
+double-apply guard. --once for a single pass; --interval to loop. ATS only, bounded, reversible."""
+from __future__ import annotations
+import argparse
+import sys
+import time
+
+from applypilot.apply import pgqueue
+from applypilot.fleet import remediator
+
+
+def _one_pass(args) -> None:
+    with pgqueue.connect(args.dsn) as conn:
+        out = remediator.remediate(conn, max_requeue=args.max_requeue,
+                                   max_per_job=args.max_per_job, window_minutes=args.window_minutes)
+    print(f"[remediate] candidates={out['candidates']} requeued={out['requeued']} "
+          f"vetoed_applied_set={out['vetoed_applied_set']} vetoed_email={out['vetoed_email']} "
+          f"capped={out['capped']}")
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        prog="applypilot-fleet-remediate",
+        description="Re-queue usage-limit-casualty jobs (3-guard double-apply gate). ATS only.")
+    p.add_argument("--dsn", default=None,
+                   help="Postgres DSN (default: DATABASE_URL / APPLYPILOT_FLEET_DSN env).")
+    p.add_argument("--max-requeue", type=int, default=50, dest="max_requeue",
+                   help="per-pass blast-radius cap (default 50)")
+    p.add_argument("--max-per-job", type=int, default=2, dest="max_per_job",
+                   help="max re-queues per job ever (default 2)")
+    p.add_argument("--window-minutes", type=int, default=30, dest="window_minutes")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--once", action="store_true", help="single pass")
+    g.add_argument("--interval", type=int, help="loop every N seconds")
+    args = p.parse_args(argv)
+
+    if args.once:
+        _one_pass(args)
+        return 0
+    while True:                       # --interval loop
+        _one_pass(args)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
