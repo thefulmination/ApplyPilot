@@ -200,34 +200,65 @@ def test_lease_orders_by_score_desc(db):
     assert first["url"].endswith("/4")
 
 
-def test_reclaim_requeues_prelaunch_only(db):
+def test_reclaim_parks_all_stale_leases_never_requeues(db):
+    """An expired lease == a hard crash (a clean finish always writes terminal status). Because
+    `attempts` is bumped only at lease time it cannot tell a never-launched lease (attempts=1)
+    from one that crashed mid-submit (also attempts=1), so EVERY stale lease is parked
+    crash_unconfirmed (attempts=99) and NONE is requeued -- the conservative anti-double-submit
+    default. (Was test_reclaim_requeues_prelaunch_only, which encoded the now-fixed vector.)"""
     with pgqueue.connect(db) as conn:
-        # pre-launch crash: leased, expired, attempts=1, no error -> safe to requeue
         _insert_leased(conn, "u/fresh", owner="dead", attempts=1, apply_error=None,
                        expires_delta_sec=-3600)
-        # possibly-submitted crash: attempts=2 -> must park crash_unconfirmed, never re-leased
         _insert_leased(conn, "u/maybe", owner="dead", attempts=2, apply_error=None,
                        expires_delta_sec=-3600)
 
         reclaimed = {r["url"]: r["status"] for r in pgqueue.reclaim_stale_leases(conn, grace_seconds=0)}
-        assert reclaimed["u/fresh"] == "queued"
+        assert reclaimed["u/fresh"] == "crash_unconfirmed"
         assert reclaimed["u/maybe"] == "crash_unconfirmed"
 
-        # Stamp approval on the requeued row so lease_one (gated on approved_batch IS NOT NULL)
-        # can pick it up.  u/maybe stays NULL intentionally — it must NEVER be re-leased.
+        # Neither can ever be re-leased, even with approval stamped.
         with conn.cursor() as cur:
-            cur.execute("UPDATE apply_queue SET approved_batch='b0' WHERE url='u/fresh'")
+            cur.execute("UPDATE apply_queue SET approved_batch='b0'")
         conn.commit()
-
-        # The requeued one can be re-leased; the crash_unconfirmed one can NEVER be.
         leased_urls = set()
         while (job := pgqueue.lease_one(conn, "w", politeness_seconds=0)):
             leased_urls.add(job["url"])
-        assert "u/fresh" in leased_urls
+        assert "u/fresh" not in leased_urls
         assert "u/maybe" not in leased_urls
 
         with conn.cursor() as cur:
-            cur.execute("SELECT attempts FROM apply_queue WHERE url='u/maybe'")
+            cur.execute("SELECT url, attempts FROM apply_queue WHERE url IN ('u/fresh','u/maybe')")
+            assert all(r["attempts"] == 99 for r in cur.fetchall())
+
+
+def test_reclaim_never_requeues_crash_at_submit(db):
+    """Live incident 2026-06-29: worker home-0 hard-crashed AFTER launching the browser
+    and reaching 'Now submitting the application' on
+    https://hiring.cafe/viewjob/k8odglehcnugjwyu, but BEFORE writing any terminal status
+    -- leaving the row at exactly attempts=1, apply_error=NULL, which is INDISTINGUISHABLE
+    from a never-launched lease (attempts is bumped only once, at lease time). Reclaim must
+    NOT treat that as 'safe to requeue': re-leasing it would apply a SECOND time under
+    Jonathan's name. Per the owner's hard rule (NEVER double-apply), an expired lease defaults
+    to crash_unconfirmed and is NEVER re-leasable."""
+    url = "https://hiring.cafe/viewjob/k8odglehcnugjwyu"
+    with pgqueue.connect(db) as conn:
+        _insert_leased(conn, url, owner="home-0", attempts=1, apply_error=None,
+                       expires_delta_sec=-3600)
+
+        reclaimed = {r["url"]: r["status"] for r in pgqueue.reclaim_stale_leases(conn, grace_seconds=0)}
+        assert reclaimed[url] == "crash_unconfirmed"
+
+        # Even with approval stamped, the possibly-submitted row must NEVER be re-leased.
+        with conn.cursor() as cur:
+            cur.execute("UPDATE apply_queue SET approved_batch='b0'")
+        conn.commit()
+        leased = set()
+        while (job := pgqueue.lease_one(conn, "w", politeness_seconds=0)):
+            leased.add(job["url"])
+        assert url not in leased
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT attempts FROM apply_queue WHERE url=%s", (url,))
             assert cur.fetchone()["attempts"] == 99
 
 

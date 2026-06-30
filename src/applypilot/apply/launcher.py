@@ -1091,16 +1091,6 @@ def reset_failed() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Per-job execution
-# ---------------------------------------------------------------------------
-
-def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str | None = "sonnet", dry_run: bool = False,
-            agent: str = "claude", inbox_auth_hint: str | None = None) -> tuple[str, int]:
-    """Spawn an apply-agent session for one job application.
-
-    Returns:
-# ---------------------------------------------------------------------------
 # Usage-limit / quota wall detection (RETRYABLE -- the agent never touched the page)
 # ---------------------------------------------------------------------------
 # An agent (Codex or Claude) that hits its OWN account usage/quota wall fails on the FIRST
@@ -1168,6 +1158,16 @@ def is_usage_limit_result(status: str | None) -> bool:
     return status.split(":", 1)[-1].strip().lower() == "usage_limit"
 
 
+# ---------------------------------------------------------------------------
+# Per-job execution
+# ---------------------------------------------------------------------------
+
+def run_job(job: dict, port: int, worker_id: int = 0,
+            model: str | None = "sonnet", dry_run: bool = False,
+            agent: str = "claude", inbox_auth_hint: str | None = None) -> tuple[str, int]:
+    """Spawn an apply-agent session for one job application.
+
+    Returns:
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
@@ -1252,6 +1252,10 @@ def is_usage_limit_result(status: str | None) -> bool:
         text_parts: list[str] = []
         final_result_text: list[str] = []  # text from the final 'result' message
         stats_holder: dict = {}
+        # Count browser/MCP tool calls. ZERO tool calls + a usage-limit signature == the
+        # agent hit a wall on turn 1 and never touched the page -> safely re-queuable (see
+        # _no_result_status). A list so the daemon-thread closure can mutate it.
+        tool_calls = [0]
 
         def _consume_stream() -> None:
             """Read the agent's stream-json stdout to EOF.
@@ -1262,10 +1266,6 @@ def is_usage_limit_result(status: str | None) -> bool:
             """
             with open(worker_log, "a", encoding="utf-8") as lf:
                 lf.write(log_header)
-        # Count browser/MCP tool calls. ZERO tool calls + a usage-limit signature == the
-        # agent hit a wall on turn 1 and never touched the page -> safely re-queuable (see
-        # _no_result_status). A list so the daemon-thread closure can mutate it.
-        tool_calls = [0]
                 for line in proc.stdout:
                     line = line.strip()
                     if not line:
@@ -1280,6 +1280,7 @@ def is_usage_limit_result(status: str | None) -> bool:
                                     text_parts.append(block["text"])
                                     lf.write(block["text"] + "\n")
                                 elif bt == "tool_use":
+                                    tool_calls[0] += 1
                                     name = (
                                         block.get("name", "")
                                         .replace("mcp__playwright__", "")
@@ -1290,7 +1291,6 @@ def is_usage_limit_result(status: str | None) -> bool:
                                         desc = f"{name} {inp['url'][:60]}"
                                     elif "ref" in inp:
                                         desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                    tool_calls[0] += 1
                                     elif "fields" in inp:
                                         desc = f"{name} ({len(inp['fields'])} fields)"
                                     elif "paths" in inp:
@@ -1328,6 +1328,7 @@ def is_usage_limit_result(status: str | None) -> bool:
                                     final_result_text.append(text)
                                     lf.write(text + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
+                                tool_calls[0] += 1
                                 name = item.get("name") or item.get("tool_name") or item_type
                                 lf.write(f"  >> {name}\n")
                                 ws = get_state(worker_id)
@@ -1338,7 +1339,6 @@ def is_usage_limit_result(status: str | None) -> bool:
                         elif msg_type == "turn.completed":
                             usage = msg.get("usage", {})
                             stats_holder.update({
-                                tool_calls[0] += 1
                                 "input_tokens": usage.get("input_tokens", 0),
                                 "output_tokens": usage.get("output_tokens", 0),
                                 "cache_read": usage.get("cached_input_tokens", 0),
@@ -1883,8 +1883,11 @@ SYSTEMIC_FAIL_BREAKER = int(os.environ.get("APPLYPILOT_SYSTEMIC_FAIL_BREAKER")
 # streak of these trips the breaker; any proof-of-life outcome resets it. browser_crashed /
 # browser_unavailable were observed in a live run -- a one-off is harmless (resets on
 # the next success), but a sustained streak means Chrome/CDP is broken, not the jobs.
+# usage_limit (agent quota/usage wall, never touched the page) belongs here too: a wall
+# storm should halt + keep the streak retryable rather than churn the whole queue.
 SYSTEMIC_FAIL_REASONS = {
     "no_result_line", "timeout", "browser_crashed", "browser_unavailable",
+    "usage_limit",
 }
 _systemic_fail_count = 0
 _systemic_recent: list[str] = []
@@ -1893,11 +1896,8 @@ _systemic_fail_lock = threading.Lock()
 
 def _is_systemic_failure(reason: str | None) -> bool:
     """True if a failure reason signals a likely environment outage (not job-specific)."""
-# usage_limit (agent quota/usage wall, never touched the page) belongs here too: a wall
-# storm should halt + keep the streak retryable rather than churn the whole queue.
     r = (reason or "").split(":", 1)[-1].strip().lower()
     return r in SYSTEMIC_FAIL_REASONS
-    "usage_limit",
 
 
 def _note_systemic_failure(url: str | None) -> bool:

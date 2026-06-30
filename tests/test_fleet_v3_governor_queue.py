@@ -376,7 +376,10 @@ def test_throttled_host_still_leases_and_gap_does_not_compound(fleet_db):
 
 def test_parked_challenge_frozen_against_reclaim(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
-        # control: a normal leased row whose ttl elapsed IS reclaimed back to 'queued'
+        # control: a normal leased row whose ttl elapsed IS swept by reclaim. Per the anti-
+        # double-submit fix an expired lease is parked crash_unconfirmed (never re-queued, since
+        # it may have crashed mid-submit); the contrast that matters here is swept-vs-frozen, and
+        # the parked wall below stays untouched.
         _seed_apply(conn, "ctrl", host="c.io", score=5)
         queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
         with conn.cursor() as cur:
@@ -385,7 +388,7 @@ def test_parked_challenge_frozen_against_reclaim(fleet_db):
         pgqueue.reclaim_stale_leases(conn, grace_seconds=0)
         with conn.cursor() as cur:
             cur.execute("SELECT status FROM apply_queue WHERE url='ctrl'")
-            assert cur.fetchone()["status"] == "queued"
+            assert cur.fetchone()["status"] == "crash_unconfirmed"
 
         # parked wall: park freezes it so the SAME elapsed ttl does NOT reclaim it
         _seed_apply(conn, "wall1", host="walled.io", score=9)

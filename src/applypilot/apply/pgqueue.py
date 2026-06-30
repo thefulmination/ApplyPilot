@@ -98,8 +98,11 @@ def lease_one(
     politeness_seconds: int = 90,
 ) -> dict[str, Any] | None:
     """Atomically lease the top-score queued job whose apply_domain is outside the jittered
-    politeness window. Bumps `attempts` AT lease time so reclaim can tell a launched row from
-    a never-touched one. Returns the leased row dict, or None if nothing is leasable.
+    politeness window. Bumps `attempts` AT lease time (so a row that has been handed to a worker
+    is visibly attempt>=1). NOTE: attempts does NOT distinguish a never-launched lease from one
+    that crashed mid-submit -- both stay at 1 -- so reclaim must park ALL expired leases
+    conservatively rather than requeue on attempts (see reclaim_stale_leases). Returns the leased
+    row dict, or None if nothing is leasable.
 
     politeness_seconds=0 disables host throttling (used by tests for determinism)."""
     with conn.cursor() as cur:
@@ -118,25 +121,16 @@ def lease_one(
 
 _RECLAIM_SQL = """
 WITH stale AS (
-    SELECT url, attempts, apply_error
+    SELECT url
     FROM apply_queue
     WHERE status = 'leased'
       AND lease_expires_at < now() - make_interval(secs => %(grace)s)
     FOR UPDATE SKIP LOCKED
 )
 UPDATE apply_queue q
-SET status = CASE
-        WHEN s.attempts <= 1 AND s.apply_error IS NULL THEN 'queued'::apply_queue_status
-        ELSE 'crash_unconfirmed'::apply_queue_status
-    END,
-    apply_error = CASE
-        WHEN s.attempts <= 1 AND s.apply_error IS NULL THEN NULL
-        ELSE 'crash_unconfirmed'
-    END,
-    attempts = CASE
-        WHEN s.attempts <= 1 AND s.apply_error IS NULL THEN s.attempts
-        ELSE 99
-    END,
+SET status           = 'crash_unconfirmed'::apply_queue_status,
+    apply_error      = 'crash_unconfirmed',
+    attempts         = 99,
     lease_owner      = NULL,
     lease_expires_at = NULL,
     updated_at       = now()
@@ -148,9 +142,18 @@ RETURNING q.url, q.status;
 
 def reclaim_stale_leases(conn: psycopg.Connection, *, grace_seconds: int = 30) -> list[dict[str, Any]]:
     """Sweep leased rows whose lease expired (a clean finish always writes terminal status, so
-    an expired lease == a hard crash). Only the pre-launch window (attempts<=1, no error) is
-    safe to requeue; anything that may have clicked submit -> crash_unconfirmed, attempts=99,
-    NEVER re-leased. Mirrors launcher.reclaim_stale_leases. Returns the reclaimed (url, status)."""
+    an expired lease == a hard crash) and PARK every one as crash_unconfirmed (attempts=99),
+    NEVER re-leased. Mirrors launcher.reclaim_stale_leases.
+
+    Why park unconditionally (not requeue the 'pre-launch' ones): `attempts` is bumped ONCE,
+    at lease time, so attempts=1 covers BOTH "leased but never launched" AND "leased, launched,
+    crashed at the submit step before any terminal write" -- they are INDISTINGUISHABLE here.
+    A live incident (2026-06-29) hit exactly the second case: a worker died at "Now submitting
+    the application" with the row still at attempts=1, apply_error=NULL. Requeuing on attempts<=1
+    would have applied a SECOND time under Jonathan's name. The owner's hard rule (NEVER
+    double-apply) outranks the cost of re-reviewing the rare job killed genuinely pre-launch:
+    crash_unconfirmed rows surface in apply-failures for a manual decision. Returns the reclaimed
+    (url, status)."""
     with conn.cursor() as cur:
         cur.execute(_RECLAIM_SQL, {"grace": grace_seconds})
         rows = cur.fetchall()
@@ -306,9 +309,6 @@ def write_result(
 
 
 # ---------------------------------------------------------------------------
-# PUSH / PULL sync surface (home box drives these; see fleet_sync.py)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Re-queue  (a RETRYABLE non-submit: back to 'queued', lease released; lease_owner-guarded)
 # ---------------------------------------------------------------------------
 
@@ -352,6 +352,9 @@ def requeue_job(
     return landed
 
 
+# ---------------------------------------------------------------------------
+# PUSH / PULL sync surface (home box drives these; see fleet_sync.py)
+# ---------------------------------------------------------------------------
 
 _PUSH_SQL = """
 INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, status)
