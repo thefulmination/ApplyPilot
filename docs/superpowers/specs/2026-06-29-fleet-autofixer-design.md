@@ -54,7 +54,7 @@ sources; either one vetoing is sufficient to block.
 
 | # | Guard | Passes when | Source | Availability |
 |---|-------|-------------|--------|--------------|
-| 1 | **Provably never submitted** | the job is a usage-limit casualty (see Candidate selection) — driven by the deterministic Tier-0 `usage_limit` diagnosis | `fleet_diagnoses` (reason=`usage_limit`) + `apply_queue.apply_error` | live |
+| 1 | **Provably never submitted** | the job's OWN `apply_error` carries the worker's zero-tool-call usage-limit marker (`status='failed'` AND `apply_error ILIKE '%usage_limit%'` = `launcher.USAGE_LIMIT_STATUS`, which the worker certifies "PROVABLY never touched the form") | `apply_queue.status` + `apply_queue.apply_error` (job-level, deterministic — **no diagnosis/LLM consulted**) | live |
 | 2 | **Internal record: not applied** | the job's `dedup_key` is **NOT** in `applied_set` | fleet PG `applied_set` (keyed by `dedup_key`; 871 rows live) | live |
 | 3 | **External record: not acknowledged** | there is **NO** confirming `email_events` row for the job's url (recruiter never acknowledged an application) | brain SQLite `email_events` (keyed by `job_url`) | activates when the outcomes-tracker scanner runs; **absent today** |
 
@@ -67,26 +67,32 @@ scanner runs — **no remediator change required**.
 
 If any guard fails (or guard data is contradictory) → **do not re-queue**; emit a `recommended` row instead.
 
-## Candidate selection (what counts as a usage-limit casualty)
+## Candidate selection — provably-never-submitted only (narrowed after final review)
 
-For each worker that currently has a Tier-0 `usage_limit` diagnosis (`fleet_diagnoses.reason='usage_limit'`,
-`source='tier0'`, open/recent), select its jobs in `apply_queue` where **all** hold:
+> **Scope decision (post-final-review).** The original design joined `fleet_diagnoses` on a worker-level
+> `usage_limit` diagnosis and admitted the `no_result_line` / `crash_unconfirmed` failure family. The adversarial
+> review found two problems: (a) `fleet_diagnoses` has no `source` column, so the join could not distinguish a
+> deterministic Tier-0 verdict from a Tier-1 (DeepSeek) one read from an **untrusted** web log — re-opening the
+> injection surface; and (b) `no_result_line` / `crash_unconfirmed` are the worker's *"agent ran and **may have
+> clicked submit**"* bucket, not provably-never-submitted. The remediator was therefore **narrowed to the worker's
+> own provably-safe marker**, and the diagnosis join was **dropped entirely** (no LLM signal in the action path).
 
-- `lane = 'ats'` (LinkedIn lane is **never** a candidate — additive to the existing no-LinkedIn-auto-action posture);
-- `status IN ('failed','crash_unconfirmed')`;
-- `apply_error` is in the **non-submission family**: `no_result_line`, `crash_unconfirmed`, or a usage-limit-family
-  error (the agent never reached the form);
-- `updated_at` falls within the worker's **usage-limit window** — defined as the diagnoser's recent-failure
-  lookback that produced the diagnosis (the 30-minute window `load_worker_ctx` reads), bounded forward by the
-  diagnosis `created_at`. (These are failures from the quota onset onward — the casualties — not older failures
-  that may have been genuine attempts.)
+A candidate is a job in `apply_queue` where **all** hold:
+
+- `lane = 'ats'` (LinkedIn lane is **never** a candidate);
+- `status = 'failed'` (a terminal non-submit — **excludes** `crash_unconfirmed`, the reclaim "died-at-submit" park);
+- `apply_error ILIKE '%usage_limit%'` — the worker's `USAGE_LIMIT_STATUS = 'failed:usage_limit'`
+  (`launcher.py`), emitted ONLY for a **zero-tool-call** wall the worker certifies *"PROVABLY never touched the
+  application form."* This is **job-level** evidence, deterministic, with **no diagnosis/LLM consulted**;
+- `dedup_key IS NOT NULL` (a row with no dedup_key cannot be proven un-applied by guard 2 → never a candidate);
+- `updated_at` within the window (default 30 min) — coverage scoping only;
 - the remediator has not already re-queued this job `K` times (see caps).
 
-The Tier-0 `usage_limit` diagnosis is the load-bearing "never submitted" evidence: a usage-limit error means the
-agent's first model call hit the quota *before* any page interaction. Jobs whose evidence does **not** match this
-(e.g., a real mid-form crash) are **not** candidates and stay parked. **Window precision affects coverage, not
-safety:** even if the window over-selects, guards 2 (`applied_set`) and 3 (`email_events`) hard-veto any job that
-was actually applied, so a loose window can only *miss* a casualty — never cause a double-apply.
+**This is a true backstop.** The worker (`container_worker.py`) already **auto-re-queues** `failed:usage_limit`
+inline, so in normal operation there are **zero** parked candidates (verified live: 0). The remediator catches only
+the rare crash-window where the worker wrote the `failed:usage_limit` status but died before its own re-queue.
+Excludes by construction any `no_result_line` / `crash_unconfirmed` row (the may-have-submitted set). Guards 2
+(`applied_set`) and 3 (`email_events`) remain as additional independent backstops.
 
 ## Re-queue mechanism + reversal
 
@@ -169,7 +175,9 @@ Default posture is **opt-in** (the operator starts it), consistent with every ot
 
 - **Graduated-trust autonomy:** v1's single action (re-queue) is safe + reversible + high-volume → autonomous; the
   riskier fixes are deferred (approval-gated when built).
-- **Deterministic, no LLM:** "never submitted" rides the Tier-0 `usage_limit` signal → no injection action surface.
+- **Deterministic, no LLM:** "never submitted" rides the worker's own job-level `failed:usage_limit` marker
+  (`apply_queue.apply_error`) — NOT a diagnosis. The `fleet_diagnoses` join was dropped in final review because it
+  could not distinguish a Tier-0 from a Tier-1 (LLM, untrusted-log) verdict → zero injection action surface.
 - **Email as the external ground truth (guard 3):** consumed read-only from the outcomes-tracker's `email_events`;
   optional + graceful until that scanner runs; strengthens the guard automatically when it does.
 - **Standalone remediator, not a Doctor knob:** keeps the Doctor's monotonically-conservative invariant intact.
