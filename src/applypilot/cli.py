@@ -821,7 +821,7 @@ def apply(
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
-    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset failed jobs for retry (skips possibly-submitted crash_unconfirmed/no_confirmation jobs to avoid double-applying)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()

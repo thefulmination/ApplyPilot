@@ -202,3 +202,61 @@ def test_crash_unconfirmed_blocks_sibling(conn):
     conn.commit()
     _seed(conn, "https://www.linkedin.com/jobs/view/9", company="Acme", title="Chief of Staff")
     assert L.acquire_job(min_score=7) is None
+
+
+# --- reset_failed must NOT un-park possibly-submitted jobs (anti double-submit) ---
+#
+# reclaim_stale_leases parks a hard-killed (maybe-already-submitted) lease as
+# failed/crash_unconfirmed; the agent records a submitted-but-unconfirmed apply as
+# failed/no_confirmation (no_confirmation = it DID click submit). Both carry
+# apply_status='failed', so the --reset-failed utility (reset_failed) used to match
+# them and clear apply_status/apply_error/attempts -> the row became re-acquirable ->
+# a SECOND application under the user's name. reset_failed must leave them parked,
+# mirroring acquire_job's own dedup exclusion of these error codes.
+
+def test_reset_failed_does_not_unpark_crash_unconfirmed(conn):
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
+        "fit_score, audit_score, apply_status, apply_error, apply_attempts) VALUES "
+        "('https://hiring.cafe/cu', 'Chief of Staff', 'X', 'Acme', "
+        "'https://job-boards.greenhouse.io/acme/jobs/1', 'x', 8, 9.0, 'failed', "
+        "'crash_unconfirmed', 99)")
+    conn.commit()
+    L.reset_failed()
+    r = conn.execute("SELECT apply_status, apply_error, apply_attempts FROM jobs "
+                     "WHERE url LIKE '%/cu'").fetchone()
+    assert r[0] == "failed" and r[1] == "crash_unconfirmed" and r[2] == 99
+    assert L.acquire_job(min_score=7) is None  # still not re-acquirable
+
+
+def test_reset_failed_does_not_unpark_no_confirmation(conn):
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
+        "fit_score, audit_score, apply_status, apply_error, apply_attempts) VALUES "
+        "('https://hiring.cafe/nc', 'Chief of Staff', 'X', 'Acme', "
+        "'https://job-boards.greenhouse.io/acme/jobs/2', 'x', 8, 9.0, 'failed', "
+        "'no_confirmation', 1)")
+    conn.commit()
+    L.reset_failed()
+    r = conn.execute("SELECT apply_status, apply_error FROM jobs "
+                     "WHERE url LIKE '%/nc'").fetchone()
+    assert r[0] == "failed" and r[1] == "no_confirmation"
+    assert L.acquire_job(min_score=7) is None  # still not re-acquirable
+
+
+def test_reset_failed_resets_ordinary_failure(conn):
+    # A genuine, safe-to-retry failure (page_error -- the agent never reached submit)
+    # SHOULD still be reset by --reset-failed and become acquirable again.
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
+        "fit_score, audit_score, apply_status, apply_error, apply_attempts) VALUES "
+        "('https://hiring.cafe/pe', 'Chief of Staff', 'X', 'Acme', "
+        "'https://job-boards.greenhouse.io/acme/jobs/3', 'x', 8, 9.0, 'failed', "
+        "'page_error', 1)")
+    conn.commit()
+    L.reset_failed()
+    r = conn.execute("SELECT apply_status, apply_error, apply_attempts FROM jobs "
+                     "WHERE url LIKE '%/pe'").fetchone()
+    assert r[0] is None and r[1] is None and r[2] == 0
+    job = L.acquire_job(min_score=7)
+    assert job is not None and job["url"].endswith("/pe")

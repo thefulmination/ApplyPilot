@@ -1069,12 +1069,22 @@ def reset_failed() -> int:
         Number of jobs reset.
     """
     conn = get_connection()
+    # Anti double-submit: NEVER un-park a possibly-submitted job. reclaim_stale_leases
+    # parks hard-killed leases as failed/crash_unconfirmed, and the agent records a
+    # submitted-but-unconfirmed apply as failed/no_confirmation (= it DID click submit).
+    # Both carry apply_status='failed', so a naive reset would clear them back to
+    # retryable -> acquire_job re-offers them -> a SECOND application under the user's
+    # name. Exclude these error codes here, mirroring the dedup exclusion in acquire_job
+    # (apply_error IN ('no_confirmation', 'crash_unconfirmed') = do not re-apply). The
+    # outer OR is parenthesized so the exclusion applies to BOTH match branches.
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
                        apply_attempts = 0, agent_id = NULL
-        WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
+        WHERE (apply_status = 'failed'
+               OR (apply_status IS NOT NULL AND apply_status != 'applied'
+                   AND apply_status != 'in_progress'))
+          AND (apply_error IS NULL
+               OR apply_error NOT IN ('no_confirmation', 'crash_unconfirmed'))
     """)
     conn.commit()
     return cursor.rowcount
