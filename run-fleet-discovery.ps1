@@ -1,19 +1,33 @@
-# run-fleet-discovery.ps1 [-Label m2] [-ResultsPerSite 50] [-HoursOld 72]
-#   Run ONE discovery worker: leases search_tasks from Postgres, scrapes JobSpy, and stages
-#   postings to discovered_postings. PURE SCRAPE -- no login, no apply agent (no Codex/Claude),
-#   no brain write. Best run on a residential machine (machine 2), NOT the home box, so scraping
-#   stays off the IP that holds the LinkedIn apply session.
+# run-fleet-discovery.ps1 [-Label m2] [-Workers N] [-ResultsPerSite 50] [-HoursOld 72]
+#   Run discovery worker(s): lease search_tasks from Postgres, scrape JobSpy, and stage postings
+#   to discovered_postings. PURE SCRAPE -- no login, no apply agent (no Codex/Claude), no brain
+#   write. Best run on a residential machine (machine 2), NOT the home box, so scraping stays off
+#   the IP that holds the LinkedIn apply session.
+#
+#   -Workers N runs N scrapers in TRUE parallel, each in its OWN window with a DISTINCT worker-id
+#   ($Label-disc-0 .. $Label-disc-(N-1)), so they lease different tasks instead of fighting over one
+#   lease. -Workers 1 (default) runs a single worker in THIS window (Ctrl-C to stop), id $Label-disc.
+#   Re-running with -Workers >1 first STOPS any discovery workers already up (clean slate -> no two
+#   processes on the same id). Scraping is light (no browser), so N can go higher than the apply
+#   launcher; the practical cap is your egress bandwidth + how fast the home box can `pull`.
 #
 #   FULL LOOP:
-#     1. SEED tasks (home box): the console "Expand searches" button, or
-#        .\.conda-env\Scripts\applypilot-fleet-discovery-home.exe expand --config .applypilot\searches.yaml
-#     2. SCRAPE (this script, on machine 2):  .\run-fleet-discovery.ps1
-#     3. INGEST to the brain (home box):
-#        .\.conda-env\Scripts\applypilot-fleet-discovery-home.exe pull
+#     1. SEED + INGEST (home box):       .\run-discovery-home-loop.ps1 -Seed
+#     2. SCRAPE (this script, machine 2): .\run-fleet-discovery.ps1 -Workers 4
+#   Without step 1 there are no tasks to lease and the workers just idle.
 #
-#   Without step 1 there are no tasks to lease and this just idles.
-param([string]$Label = "m2", [int]$ResultsPerSite = 50, [int]$HoursOld = 72)
+#   Examples:
+#     .\run-fleet-discovery.ps1                # 1 worker, foreground (unchanged behavior)
+#     .\run-fleet-discovery.ps1 -Workers 4     # 4 parallel scrapers, one window each
+param(
+  [string]$Label = "m2",
+  [int]$Workers = 1,
+  [int]$ResultsPerSite = 50,
+  [int]$HoursOld = 72,
+  [int]$Index = -1   # internal: set when the launcher self-spawns a child worker
+)
 $ErrorActionPreference = "Stop"
+if ($Workers -lt 1 -or $Workers -gt 16) { throw "-Workers must be 1..16 (each is a scraper leasing its own tasks)." }
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
@@ -26,11 +40,41 @@ foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
 if (-not $exe) { throw "applypilot-fleet-discovery not found in .conda-env or .venv -- run the setup script first." }
 
 # DSN: inherit a persisted FLEET_PG_DSN (machine 2 sets it at User scope -> the home box), else
-# default to the home box's local Postgres.
+# default to the home box's local Postgres. Set in THIS process so child windows inherit it.
 if (-not $env:FLEET_PG_DSN) { $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
 $env:APPLYPILOT_FLEET_DSN = $env:FLEET_PG_DSN
 $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 
-$wid = "$Label-disc"
-Write-Host "[fleet-discovery] worker $wid  results/site=$ResultsPerSite  hours-old=$HoursOld  (pure scrape, no agent)"
-& $exe --dsn $env:FLEET_PG_DSN --worker-id "$wid" --results-per-site $ResultsPerSite --hours-old $HoursOld
+# Run exactly one worker (helper used by both the single-worker path and each spawned child).
+function Start-OneWorker([string]$wid) {
+  Write-Host "[fleet-discovery] worker $wid  results/site=$ResultsPerSite  hours-old=$HoursOld  (pure scrape, no agent)"
+  & $exe --dsn $env:FLEET_PG_DSN --worker-id "$wid" --results-per-site $ResultsPerSite --hours-old $HoursOld
+}
+
+# --- child invocation: run ONE worker with a distinct id in the foreground ---
+if ($Index -ge 0) { Start-OneWorker "$Label-disc-$Index"; return }
+
+# --- single worker (default): foreground, unsuffixed id -- unchanged behavior ---
+if ($Workers -le 1) { Start-OneWorker "$Label-disc"; return }
+
+# --- multi-worker: clean slate, then one window per worker on a DISTINCT id ---
+$existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -eq 'applypilot-fleet-discovery.exe' -or
+  ($_.Name -eq 'python.exe' -and $_.CommandLine -match 'fleet-discovery' -and $_.CommandLine -notmatch 'discovery-home')
+}
+if ($existing) {
+  Write-Host ("Stopping {0} existing discovery worker process(es) for a clean slate..." -f @($existing).Count) -ForegroundColor Yellow
+  $existing | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep -Seconds 2
+}
+
+$self = $MyInvocation.MyCommand.Path
+for ($i = 0; $i -lt $Workers; $i++) {
+  $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", $self,
+               "-Index", $i, "-Label", $Label,
+               "-ResultsPerSite", $ResultsPerSite, "-HoursOld", $HoursOld)
+  Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $ProjectRoot
+  Write-Host ("  launched {0}-disc-{1}" -f $Label, $i) -ForegroundColor Green
+  Start-Sleep -Milliseconds 800
+}
+Write-Host ("`n{0} discovery scrapers up (ids {1}-disc-0..{2}), each its own window. They idle until the home box seeds tasks." -f $Workers, $Label, ($Workers - 1)) -ForegroundColor Cyan
