@@ -272,8 +272,9 @@ def build_apply_agent_command(
             "--model", model,
             "-p",
             # Hard per-apply $ ceiling: kills runaway sessions (a captcha flail measured 84
-            # turns / 8.5 min / $3.70 self-reported). Normal fills cost well under this. Tunable.
-            "--max-budget-usd", os.environ.get("APPLYPILOT_MAX_BUDGET_USD", "2.0"),
+            # turns / 8.5 min / $3.70 self-reported). EEO-heavy forms were failing mid-submit
+            # at the old $2.00 cap; $3.50 covers them while staying under the flail threshold.
+            "--max-budget-usd", os.environ.get("APPLYPILOT_MAX_BUDGET_USD", "3.5"),
             "--mcp-config", str(mcp_config_path),
             "--permission-mode", "bypassPermissions",
             "--no-session-persistence",
