@@ -8,10 +8,15 @@ from dataclasses import dataclass
 from applypilot.gmail_outcomes import match_email_to_job
 
 CONFIRMING_STAGES = frozenset({"acknowledged", "screen", "assessment", "interview", "offer", "rejected"})
-# Exact/near-exact methods that confirm a match regardless of score.  Note: `ats_domain` is
-# deliberately excluded — an ATS sender (Greenhouse, Lever, etc.) identifies the board, not the
-# specific employer, so it is treated as fuzzy and must clear MIN_STRONG.
+# Exact/near-exact methods that confirm a match regardless of score.
 STRONG_METHODS = frozenset({"board_slug", "linkedin_job_id", "company_domain"})
+# Fuzzy methods strong ENOUGH to auto-confirm when they clear MIN_STRONG. Only `ats_domain`
+# qualifies: an ATS sender (Greenhouse/Lever/...) plus a matching extracted employer name is
+# materially stronger than a bare token overlap. `company_name` and `title` are NOT here — a
+# company/title token overlap can conflate same-company-different-role across a large candidate
+# pool, and a wrong auto-flip permanently drops a wanted job from the apply surface. They are
+# always classified "probable" (review-only via --apply-probable). See spec §6.
+CONFIRMABLE_FUZZY_METHODS = frozenset({"ats_domain"})
 MIN_STRONG = 0.6
 
 
@@ -48,11 +53,14 @@ class ReconcileResult:
 
 
 def classify_match(method: str | None, score: float | None, *, min_strong: float = MIN_STRONG) -> str | None:
-    """confirmed if a strong (exact-ish) method or a fuzzy score >= min_strong; probable for a
-    weaker fuzzy hit; None when there was no match at all."""
+    """confirmed if an exact-ish method, or a confirmable fuzzy method (ats_domain) clearing
+    min_strong; probable for any other (weaker) fuzzy hit; None when there was no match at all.
+    company_name/title are always probable — too collision-prone for an irreversible auto-flip."""
     if method is None:
         return None
-    if method in STRONG_METHODS or (score is not None and score >= min_strong):
+    if method in STRONG_METHODS:
+        return "confirmed"
+    if method in CONFIRMABLE_FUZZY_METHODS and score is not None and score >= min_strong:
         return "confirmed"
     return "probable"
 

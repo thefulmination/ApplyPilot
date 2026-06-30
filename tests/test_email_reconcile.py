@@ -255,13 +255,20 @@ def test_classify_strong_method_is_confirmed_regardless_of_score():
     assert er.classify_match("linkedin_job_id", 1.0) == "confirmed"
 
 
-def test_classify_fuzzy_at_or_above_threshold_is_confirmed():
-    assert er.classify_match("company_name", 0.6) == "confirmed"
-    assert er.classify_match("title", 0.75) == "confirmed"
+def test_classify_ats_domain_at_or_above_threshold_is_confirmed():
+    assert er.classify_match("ats_domain", 0.6) == "confirmed"
+    assert er.classify_match("ats_domain", 0.75) == "confirmed"
+
+
+def test_classify_company_name_and_title_are_always_probable():
+    # too collision-prone to auto-flip, regardless of score (review-only via --apply-probable)
+    assert er.classify_match("company_name", 1.0) == "probable"
+    assert er.classify_match("title", 1.0) == "probable"
+    assert er.classify_match("company_name", 0.6) == "probable"
 
 
 def test_classify_fuzzy_below_threshold_is_probable():
-    assert er.classify_match("company_name", 0.59) == "probable"
+    assert er.classify_match("ats_domain", 0.59) == "probable"
     assert er.classify_match("ats_domain", 0.25) == "probable"
 
 
