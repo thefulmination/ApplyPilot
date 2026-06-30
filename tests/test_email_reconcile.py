@@ -58,6 +58,47 @@ def test_load_crash_jobs_filters_no_result_line_bucket():
     assert "failed:no_result_line" in sql
 
 
+# ---------------------------------------------------------------------------
+# Task 4: reconcile()
+# ---------------------------------------------------------------------------
+def _email(**kw):
+    base = dict(message_id="m", sender="", subject="", body="", company="", title="",
+                job_url=None, stage="acknowledged", occurred_at="2026-06-29T10:00:00+00:00")
+    base.update(kw); return er.OutcomeEmail(**base)
+
+
+def test_reconcile_company_domain_is_confirmed():
+    jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
+             "title": "Analyst", "site": "stripe.com"}]
+    emails = [_email(message_id="m1", sender="jobs@stripe.com", subject="Application received")]
+    res = er.reconcile(emails, jobs)
+    assert len(res.confirmed) == 1
+    r = res.confirmed[0]
+    assert r.job_url == "https://stripe.com/jobs/1" and r.method == "company_domain" and r.classification == "confirmed"
+
+
+def test_reconcile_no_overlap_is_unmatched():
+    jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
+             "title": "Analyst", "site": "stripe.com"}]
+    emails = [_email(message_id="m9", sender="news@randombrand.com", subject="Weekly digest", body="sale")]
+    res = er.reconcile(emails, jobs)
+    assert res.confirmed == [] and res.probable == [] and res.unmatched_emails == 1
+
+
+def test_reconcile_resolves_each_job_once():
+    # Two emails both match the same job; it must resolve to exactly one Resolution (dedupe).
+    jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
+             "title": "Analyst", "site": "stripe.com"}]
+    emails = [
+        _email(message_id="a", sender="jobs@stripe.com", subject="Application received"),
+        _email(message_id="b", sender="careers@stripe.com", subject="We got your application"),
+    ]
+    res = er.reconcile(emails, jobs)
+    all_urls = [r.job_url for r in res.confirmed + res.probable]
+    assert all_urls.count("https://stripe.com/jobs/1") == 1   # deduped to one resolution
+    assert len(res.confirmed) == 1
+
+
 def test_classify_strong_method_is_confirmed_regardless_of_score():
     assert er.classify_match("company_domain", 1.0) == "confirmed"
     assert er.classify_match("board_slug", 1.0) == "confirmed"

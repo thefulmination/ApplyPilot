@@ -4,6 +4,8 @@ dry-run by default; writes only to the fleet Postgres. Reuses gmail_outcomes.mat
 from __future__ import annotations
 from dataclasses import dataclass
 
+from applypilot.gmail_outcomes import match_email_to_job
+
 CONFIRMING_STAGES = frozenset({"acknowledged", "screen", "assessment", "interview", "offer", "rejected"})
 STRONG_METHODS = frozenset({"board_slug", "linkedin_job_id", "company_domain"})
 MIN_STRONG = 0.6
@@ -84,3 +86,26 @@ def load_crash_jobs(conn) -> list[dict]:
                 "company": r["company"], "title": r["title"], "site": r["apply_domain"],
             })
     return out
+
+
+def reconcile(emails: list, jobs: list[dict], *, min_strong: float = MIN_STRONG) -> ReconcileResult:
+    """Match each outcome email to a crash job via the existing fuzzy matcher and classify the hit.
+    A job is resolved at most once: the highest-scoring hit wins (a strong method scores 1.0)."""
+    best: dict[str, Resolution] = {}   # job_url -> best Resolution
+    unmatched = 0
+    for e in emails:
+        job, method, score = match_email_to_job(e.sender, e.subject, e.body, jobs)
+        cls = classify_match(method, score, min_strong=min_strong)
+        if job is None or cls is None:
+            unmatched += 1
+            continue
+        url = job["url"]
+        cand = Resolution(job_url=url, message_id=e.message_id, method=method, score=float(score),
+                          stage=e.stage, occurred_at=e.occurred_at, classification=cls)
+        prev = best.get(url)
+        if prev is None or cand.score > prev.score:
+            best[url] = cand
+    confirmed = [r for r in best.values() if r.classification == "confirmed"]
+    probable = [r for r in best.values() if r.classification == "probable"]
+    return ReconcileResult(confirmed=confirmed, probable=probable,
+                           unmatched_emails=unmatched, jobs_total=len(jobs))
