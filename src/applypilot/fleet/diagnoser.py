@@ -106,3 +106,21 @@ def tier1_diagnose(ctx: WorkerCtx, client) -> Diagnosis:
             recommendation="LLM diagnosis unavailable — read the worker log in the console.",
             source="none", details={"error": str(exc)[:200]},
         )
+
+
+def diagnose(ctx: WorkerCtx, client=None) -> Diagnosis:
+    """Tier 0 (deterministic) first; on no match, Tier 1 (DeepSeek). client may be injected
+    for tests; otherwise a DeepSeek client is created lazily (its own key, separate from the
+    Codex/Claude apply pools). A missing provider degrades to source='none' (advisory miss)."""
+    t0 = tier0_diagnose(ctx)
+    if t0 is not None:
+        return t0
+    if client is None:
+        try:
+            from applypilot import llm
+            client = llm.get_client(provider_override="deepseek", stage="diagnose")
+        except Exception as exc:
+            return Diagnosis(ctx.worker_id, "unknown", 0.0,
+                             "LLM diagnosis unavailable (no provider configured) — read the worker log.",
+                             "none", details={"error": str(exc)[:200]})
+    return tier1_diagnose(ctx, client)

@@ -60,3 +60,23 @@ def test_tier1_error_path_keeps_worker_id():
     client = _FakeLLM(RuntimeError("down"))
     d = diagnoser.tier1_diagnose(WorkerCtx("m2-3", recent_log="x"), client)
     assert d.worker_id == "m2-3"
+
+
+def test_diagnose_short_circuits_tier0_without_calling_llm():
+    log = (FIX / "usage_limit.log").read_text(encoding="utf-8")
+    client = _FakeLLM('{"root_cause":"SHOULD_NOT_BE_USED","recommendation":"x","confidence":0.1}')
+    d = diagnoser.diagnose(WorkerCtx("m2-3", recent_log=log), client=client)
+    assert d.source == "tier0"
+    assert client.last_messages is None  # LLM never called
+
+def test_diagnose_falls_through_to_tier1():
+    client = _FakeLLM('{"root_cause":"form_field_stuck","recommendation":"fix prompt","confidence":0.6}')
+    d = diagnoser.diagnose(WorkerCtx("m2-3", recent_log="Country React-select still errors"), client=client)
+    assert d.source == "deepseek"
+    assert d.root_cause == "form_field_stuck"
+
+def test_diagnose_no_client_no_provider_returns_none_source(monkeypatch):
+    def boom(*a, **k): raise RuntimeError("no provider")
+    monkeypatch.setattr("applypilot.llm.get_client", boom)
+    d = diagnoser.diagnose(WorkerCtx("m2-3", recent_log="weird failure"))
+    assert d.source == "none"
