@@ -51,3 +51,8 @@ def test_export_writes_both_jsonl_with_enrichment(tmp_path):
     # body_text stripped from timeline events (lean); snippet kept
     assert "body_text" not in tl["events"][0]
     assert tl["events"][0]["snippet"] == "hello"
+    # raw archive carries body_text (lossless)
+    assert next(e for e in events if e["message_id"] == "m1")["body_text"] == "hello"
+    # summary sidecar is written to disk
+    summary_on_disk = json.loads((out / "outcomes_summary.json").read_text(encoding="utf-8"))
+    assert summary_on_disk["email_events_exported"] == 2

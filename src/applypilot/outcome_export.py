@@ -17,7 +17,7 @@ from applypilot.outcome_lane_signal import annotate_job_signal, compute_lane_rep
 _RAW_EVENTS_SQL = (
     "SELECT message_id, thread_id, job_url, occurred_at, sender, sender_domain, subject, "
     "stage, outcome, reason, title, company, match_method, match_score, confidence, "
-    "snippet, extracted_by, scanned_at FROM email_events ORDER BY occurred_at"
+    "body_text, snippet, extracted_by, scanned_at FROM email_events ORDER BY occurred_at"
 )
 
 
