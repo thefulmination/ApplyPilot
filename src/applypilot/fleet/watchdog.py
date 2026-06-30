@@ -95,10 +95,27 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="applypilot-fleet-watchdog")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
     p.add_argument("--cadence", type=int, default=25)
+    p.add_argument(
+        "--heartbeat-timeout", type=int,
+        default=int(os.environ.get("APPLYPILOT_WATCHDOG_HEARTBEAT_TIMEOUT", "90")),
+        help="seconds since a worker's last beat before it's deemed stuck (default 90). Workers "
+             "do NOT beat mid-apply, so raise this above your longest single-apply duration or "
+             "healthy long-running workers get false-flagged and spammed with restart commands.",
+    )
+    p.add_argument(
+        "--job-max-seconds", type=int,
+        default=int(os.environ.get("APPLYPILOT_WATCHDOG_JOB_MAX_SECONDS", "600")),
+        help="seconds a single job may run before its worker is restarted and the job quarantined "
+             "as poison (default 600). Raise above your longest legitimate apply (e.g. Workday).",
+    )
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
-    cfg = WatchdogConfig(cadence_seconds=args.cadence)
+    cfg = WatchdogConfig(
+        cadence_seconds=args.cadence,
+        heartbeat_timeout=args.heartbeat_timeout,
+        job_max_seconds=args.job_max_seconds,
+    )
     run_watchdog(lambda: pgqueue.connect(args.dsn), cfg)  # pragma: no cover - infinite
     return 0
 
