@@ -1405,6 +1405,75 @@ def outcomes_export_command(
     console.print()
 
 
+@app.command("outcomes-promote")
+def outcomes_promote_command() -> None:
+    """PREVIEW ONLY: show what email outcomes WOULD promote into the application tracker.
+    Reads the tracker read-only and writes NOTHING (no apply flag; promotion is parked)."""
+    _bootstrap()
+    from applypilot.outcome_dashboard import _read_only_conn, build_application_rows
+    from applypilot.outcome_implied import implied_status
+
+    conn = _read_only_conn()
+    rows = build_application_rows(conn)
+    table = Table(title="Implied promotions (PREVIEW — writes nothing)", show_header=True, header_style="bold")
+    table.add_column("Company"); table.add_column("Current tracker"); table.add_column("Implied")
+    table.add_column("Would")
+    shown = 0
+    for row in rows:
+        imp = implied_status(row)
+        if not imp:
+            continue
+        cur = conn.execute(
+            "SELECT status, last_status_at FROM applications WHERE job_url = ?",
+            (row["job_url"],),
+        ).fetchone()
+        current = cur["status"] if cur else "(none)"
+        last_at = cur["last_status_at"] if cur else None
+        # Recency guard (display only): an email older than the known status would be stale.
+        if last_at and imp["occurred_at"] and imp["occurred_at"] <= last_at:
+            verdict = "skip (stale)"
+        elif current == imp["implied_status"]:
+            verdict = "no change"
+        else:
+            verdict = "advance"
+        table.add_row(row.get("company") or "?", str(current), imp["implied_status"], verdict)
+        shown += 1
+    if shown:
+        console.print(table)
+    else:
+        console.print("[dim]No implied promotions (no offer/interview/rejected outcomes yet).[/dim]")
+    console.print("\n[dim]Preview only — nothing was written. Promotion is parked (spec 2026-06-30 #3).[/dim]\n")
+
+
+@app.command("outcomes-lanes")
+def outcomes_lanes_command(
+    floor: int = typer.Option(8, "--floor", help="Min applications in a lane before it can be flagged."),
+) -> None:
+    """Advisory: which coarse lanes (board/role/seniority/score-band/...) respond above/below
+    your baseline. Read-only; NEVER folded into scoring or the apply gate."""
+    _bootstrap()
+    from applypilot.outcome_dashboard import _read_only_conn, build_application_rows
+    from applypilot.outcome_lane_signal import compute_lane_report
+
+    conn = _read_only_conn()
+    rows = build_application_rows(conn)
+    rep = compute_lane_report(rows, floor=floor)
+    console.print(f"\n[bold]Lane signal[/bold]  (n={rep['n']}, baseline reply rate "
+                  f"{rep['baseline_response_rate'] * 100:.0f}%)  [dim]advisory only[/dim]")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Flag", style="bold"); table.add_column("Lane"); table.add_column("Reply rate")
+    table.add_column("n")
+    for s in rep["warm"] + rep["cold"]:
+        color = "green" if s["flag"] == "warm" else "red"
+        table.add_row(f"[{color}]{s['flag']}[/{color}]", f"{s['dimension']}={s['value']}",
+                      f"{s['response_rate'] * 100:.0f}%", f"{s['n_responded']}/{s['n_applied']}")
+    if rep["warm"] or rep["cold"]:
+        console.print(table)
+    else:
+        console.print("[dim]No lanes meet the sample-size floor yet (need more outcomes).[/dim]")
+    console.print()
+
+
 @app.command("supervise-apply")
 def supervise_apply_command(
     max_cost_usd: float = typer.Option(..., "--max-cost-usd",
