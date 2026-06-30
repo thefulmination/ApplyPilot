@@ -262,7 +262,8 @@ def pull_apply_results(
 # posting with neither is unapplyable AND collapses onto the (company,title) dedup_key, so
 # hundreds of them would silently share a single leasable slot.
 _PUSH_LINKEDIN_SELECT = """
-SELECT url, company, title, application_url,
+SELECT url, company, title,
+       CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END AS application_url,
        CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
 FROM jobs
 WHERE duplicate_of_url IS NULL

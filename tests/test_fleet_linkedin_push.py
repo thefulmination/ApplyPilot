@@ -125,6 +125,25 @@ def test_push_linkedin_max_age_days_none_keeps_stale(fleet_db, tmp_path):
         assert n == 2
 
 
+# --- Bug: LinkedIn link in `url` only (application_url NULL) must still push --
+
+def test_push_linkedin_uses_url_when_application_url_null(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    # Common from scraping: the linkedin link is the primary `url`, application_url is NULL.
+    # Eligibility matches (effective host = url), but linkedin_queue.application_url is NOT NULL,
+    # so the push must stage the EFFECTIVE url, not the raw NULL.
+    sq.execute("INSERT INTO jobs (url, application_url, company, title, audit_score, discovered_at) "
+               "VALUES (?,?,?,?,?,?)",
+               ("https://www.linkedin.com/jobs/view/999", None, "Acme", "COS", 9.0, _iso(1)))
+    sq.commit()
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT application_url FROM linkedin_queue WHERE url='https://www.linkedin.com/jobs/view/999'")
+            assert cur.fetchone()["application_url"] == "https://www.linkedin.com/jobs/view/999"
+
+
 # --- Issue 3: unscored backlog is countable, not silently lost --------------
 
 def test_count_linkedin_unscored(tmp_path):
