@@ -49,7 +49,7 @@ def tier0_diagnose(ctx: WorkerCtx) -> Diagnosis | None:
     model = _MODEL_RE.search(text)
     reset_s = reset.group(1) if reset else "unknown"
     model_s = model.group(1) if model else "the agent model"
-    rec = (f"Agent quota exhausted ({model_s}). RE-QUEUE these jobs (do NOT quarantine - they"
+    rec = (f"Agent quota exhausted ({model_s}). RE-QUEUE these jobs (do NOT quarantine - they "
            f"were never submitted); switch the worker's model or wait until {reset_s}.")
     return Diagnosis(
         worker_id=ctx.worker_id, root_cause="usage_limit", confidence=1.0,
@@ -145,7 +145,10 @@ def load_worker_ctx(conn, worker_id: str) -> WorkerCtx:
 
 def write_diagnosis(conn, d: Diagnosis, ttl_seconds: int = 86400) -> bool:
     """Write ONE advisory row to fleet_diagnoses (status='recommended', auto_action=NULL).
-    Idempotent on cluster_key 'logdiag:<worker>:<cause>'. Returns True if a row was inserted."""
+    De-duplicates on cluster_key 'logdiag:<worker>:<cause>' via a check-then-insert: safe for the
+    serial Phase-1 callers (CLI loop / one-shot monitor hook). NOT race-proof under concurrent
+    callers — a partial UNIQUE index on cluster_key WHERE status IN (open,recommended,auto_applied)
+    is the Phase-2 hardening if a parallel cadence is ever added. Returns True if a row was inserted."""
     cluster_key = f"logdiag:{d.worker_id}:{d.root_cause}"
     severity = "severe" if d.confidence >= 0.8 else "warn" if d.confidence >= 0.4 else "info"
     diagnosis_text = (f"[{d.source}] {d.root_cause} (confidence {d.confidence:.2f}). "
