@@ -57,10 +57,12 @@ class _FakeConn:
 
 def test_load_crash_jobs_shapes_candidates_for_matcher():
     rows = [{"url": "https://stripe.com/jobs/1", "application_url": "https://boards.greenhouse.io/stripe/jobs/1",
-             "company": "Stripe", "title": "Analyst", "apply_domain": "boards.greenhouse.io"}]
+             "company": "Stripe", "title": "Analyst", "apply_domain": "boards.greenhouse.io",
+             "dedup_key": "k-stripe-analyst"}]
     jobs = er.load_crash_jobs(_FakeConn(rows))
     assert jobs[0]["site"] == "boards.greenhouse.io"       # apply_domain -> site
     assert jobs[0]["company"] == "Stripe" and jobs[0]["url"] == "https://stripe.com/jobs/1"
+    assert jobs[0]["dedup_key"] == "k-stripe-analyst"
 
 
 def test_load_crash_jobs_filters_no_result_line_bucket():
@@ -217,3 +219,23 @@ def test_classify_fuzzy_below_threshold_is_probable():
 
 def test_classify_no_match_is_none():
     assert er.classify_match(None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: end-to-end reconcile — fuzzy below threshold yields probable
+# ---------------------------------------------------------------------------
+def test_reconcile_fuzzy_below_threshold_is_probable():
+    # Sender is on a generic domain so company_domain strong path does NOT fire.
+    # Subject contains only "Acme" (1 of 3 tokens in "Acme Robotics Incorporated"),
+    # giving company_name score 1/3 ≈ 0.33 — in [0.25, 0.6) → probable.
+    jobs = [{"url": "https://x.io/1", "application_url": "",
+             "company": "Acme Robotics Incorporated", "title": "SWE Senior Engineer", "site": "x.io"}]
+    emails = [_email(message_id="m-fuzzy", sender="hr@somemail.com",
+                     subject="Update on your application to Acme")]
+    res = er.reconcile(emails, jobs)
+    assert res.confirmed == [], "expected zero confirmed"
+    assert len(res.probable) == 1, "expected exactly one probable"
+    r = res.probable[0]
+    assert r.method == "company_name"
+    assert 0.25 <= r.score < 0.6
+    assert r.classification == "probable"

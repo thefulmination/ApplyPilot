@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from applypilot.gmail_outcomes import match_email_to_job
 
 CONFIRMING_STAGES = frozenset({"acknowledged", "screen", "assessment", "interview", "offer", "rejected"})
+# Exact/near-exact methods that confirm a match regardless of score.  Note: `ats_domain` is
+# deliberately excluded — an ATS sender (Greenhouse, Lever, etc.) identifies the board, not the
+# specific employer, so it is treated as fuzzy and must clear MIN_STRONG.
 STRONG_METHODS = frozenset({"board_slug", "linkedin_job_id", "company_domain"})
 MIN_STRONG = 0.6
 
@@ -76,7 +79,7 @@ def load_crash_jobs(conn) -> list[dict]:
     candidates (site = apply_domain). Read-only."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT url, application_url, company, title, apply_domain "
+            "SELECT url, application_url, company, title, apply_domain, dedup_key "
             "FROM apply_queue WHERE status='crash_unconfirmed' AND apply_error='failed:no_result_line'"
         )
         out = []
@@ -84,6 +87,7 @@ def load_crash_jobs(conn) -> list[dict]:
             out.append({
                 "url": r["url"], "application_url": r["application_url"],
                 "company": r["company"], "title": r["title"], "site": r["apply_domain"],
+                "dedup_key": r["dedup_key"],
             })
     return out
 
