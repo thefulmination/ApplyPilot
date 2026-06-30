@@ -27,7 +27,7 @@ class Diagnosis:
 
 _USAGE_LIMIT_RE = re.compile(r"hit your usage limit", re.IGNORECASE)
 _RESET_RE = re.compile(r"try again at\s+(\d{1,2}:\d{2}\s*[AP]M)", re.IGNORECASE)
-_MODEL_RE = re.compile(r"usage limit for\s+([\w.\-]+)", re.IGNORECASE)
+_MODEL_RE = re.compile(r"usage limit for\s+([\w\-]+(?:\.[\w\-]+)*)", re.IGNORECASE)
 
 
 def _excerpt(text: str, pattern: re.Pattern, width: int = 160) -> str:

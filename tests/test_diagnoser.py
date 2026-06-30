@@ -12,7 +12,7 @@ def test_tier0_detects_usage_limit_with_model_and_reset():
     assert d.source == "tier0"
     assert d.confidence == 1.0
     assert d.details["reset_at"] == "8:10 PM"
-    assert "GPT-5.3-Codex-Spark" in d.details["model"]
+    assert d.details["model"] == "GPT-5.3-Codex-Spark"
     assert "RE-QUEUE" in d.recommendation.upper()
 
 def test_tier0_returns_none_when_no_usage_limit():
