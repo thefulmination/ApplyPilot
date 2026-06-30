@@ -84,3 +84,31 @@ def test_select_candidates_maps_rows_to_dataclass():
     # the query must scope to ATS lane, usage_limit diagnoses, and the per-job cap
     sql = conn._cur.executed[0][0]
     assert "lane = 'ats'" in sql and "usage_limit" in sql and "remediation_actions" in sql
+
+
+class _RowcountCursor(_FakeCursor):
+    """Like _FakeCursor but reports rowcount=1 for the UPDATE so requeue_job sees success."""
+    def __init__(self, script):
+        super().__init__(script); self.rowcount = 0
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self.rowcount = 1 if sql.strip().upper().startswith("UPDATE") else 0
+
+
+class _RowcountConn(_FakeConn):
+    def __init__(self, script=None):
+        super().__init__(script); self._cur = _RowcountCursor(script or {})
+
+
+def test_requeue_job_updates_to_queued_and_audits():
+    conn = _RowcountConn()
+    c = remediator.Candidate(url="https://job/1", worker_id="m2-3", dedup_key="dk1",
+                             status="crash_unconfirmed", attempts=99,
+                             apply_error="crash_unconfirmed", reason="usage_limit")
+    assert remediator.requeue_job(conn, c) is True and conn.committed is True
+    upd = [e for e in conn._cur.executed if e[0].strip().upper().startswith("UPDATE APPLY_QUEUE")]
+    ins = [e for e in conn._cur.executed if "INSERT INTO remediation_actions" in e[0]]
+    assert len(upd) == 1 and len(ins) == 1
+    assert "status='queued'" in upd[0][0].replace(" ", "") or "status = 'queued'" in upd[0][0]
+    # audit row carries the PRIOR state for reversal
+    assert "crash_unconfirmed" in ins[0][1] and 99 in ins[0][1]
