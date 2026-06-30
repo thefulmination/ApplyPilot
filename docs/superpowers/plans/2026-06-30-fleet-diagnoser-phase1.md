@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Python ≥ 3.11; run tests with `.conda-env\Scripts\python.exe -m pytest` (home box) or `.venv` on worker boxes.
+- Python ≥ 3.11; run tests with `.conda-env\python.exe -m pytest` (home box — note python is at the env root, NOT `Scripts\`) or `.venv\Scripts\python.exe` on worker boxes.
 - **Advisory only:** no module in this plan may mutate `fleet_config`, the canary, leases, or call `MonitorActions`. The only DB write is INSERT into `fleet_diagnoses`.
 - **Untrusted input:** `recent_log` is attacker-influenceable web-page text (already secret-scrubbed at ship time). Tier 1's prompt MUST frame it as untrusted data and forbid following instructions in it.
 - **DB cursors are `dict_row`** (`pgqueue.connect` sets `row_factory=dict_row`): read columns by name (`row["recent_log"]`), never by index.
@@ -69,7 +69,7 @@ def test_tier0_returns_none_when_no_usage_limit():
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -v`
 Expected: FAIL — `ModuleNotFoundError`/`AttributeError` (diagnoser not created yet).
 
 - [ ] **Step 4: Implement the dataclasses + Tier 0**
@@ -137,7 +137,7 @@ def tier0_diagnose(ctx: WorkerCtx) -> Diagnosis | None:
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -v`
 Expected: PASS (2 tests).
 
 - [ ] **Step 6: Commit**
@@ -193,7 +193,7 @@ def test_tier1_graceful_on_llm_error():
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -k tier1 -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -k tier1 -v`
 Expected: FAIL — `AttributeError: module ... has no attribute 'tier1_diagnose'`.
 
 - [ ] **Step 3: Implement Tier 1**
@@ -250,7 +250,7 @@ def tier1_diagnose(ctx: WorkerCtx, client) -> Diagnosis:
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -v`
 Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
@@ -298,7 +298,7 @@ def test_diagnose_no_client_no_provider_returns_none_source(monkeypatch):
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -k diagnose -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -k diagnose -v`
 Expected: FAIL — `AttributeError: ... 'diagnose'`.
 
 - [ ] **Step 3: Implement the orchestrator**
@@ -325,7 +325,7 @@ def diagnose(ctx: WorkerCtx, client=None) -> Diagnosis:
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -v`
 Expected: PASS (8 tests).
 
 - [ ] **Step 5: Commit**
@@ -398,7 +398,7 @@ def test_write_diagnosis_is_idempotent_on_open_row():
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -k "load_worker_ctx or write_diagnosis" -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -k "load_worker_ctx or write_diagnosis" -v`
 Expected: FAIL — attributes not defined.
 
 - [ ] **Step 3: Implement the DB I/O**
@@ -446,7 +446,7 @@ def write_diagnosis(conn, d: Diagnosis, ttl_seconds: int = 86400) -> bool:
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser.py -v`
 Expected: PASS (12 tests).
 
 - [ ] **Step 5: Commit**
@@ -502,7 +502,7 @@ def test_cli_diagnoses_named_worker(monkeypatch, capsys):
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser_cli.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser_cli.py -v`
 Expected: FAIL — `ModuleNotFoundError: ...diagnoser_main`.
 
 - [ ] **Step 3: Implement the CLI**
@@ -560,11 +560,11 @@ In `pyproject.toml`, in the `[project.scripts]` block (next to `applypilot-fleet
 ```toml
 applypilot-fleet-diagnose = "applypilot.fleet.diagnoser_main:main"
 ```
-Then re-install the entrypoint: `.conda-env\Scripts\python.exe -m pip install -e . -q`
+Then re-install the entrypoint: `.conda-env\python.exe -m pip install -e . -q`
 
 - [ ] **Step 5: Run to verify it passes**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/test_diagnoser_cli.py -v`
+Run: `.conda-env\python.exe -m pytest tests/test_diagnoser_cli.py -v`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -647,7 +647,7 @@ In `src/applypilot/fleet/schema_v3.sql` near line 341, update the comment that s
 
 - [ ] **Step 3: Verify nothing imports/relies on the old wording**
 
-Run: `.conda-env\Scripts\python.exe -m pytest tests/ -k doctor -q`
+Run: `.conda-env\python.exe -m pytest tests/ -k doctor -q`
 Expected: PASS (doc-only change; no behavior touched).
 
 - [ ] **Step 4: Commit**
