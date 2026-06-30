@@ -7,10 +7,13 @@ without the network."""
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
+
+log = logging.getLogger(__name__)
 
 from applypilot.database import get_connection
 from applypilot.gmail_outcomes import (
@@ -108,12 +111,8 @@ def _gmail_fetch(days: int, credentials_path: Path | None) -> Callable[[], list[
         query = _search_query(days)
         resp = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
         out: list[dict] = []
-        seen: set[str] = set()
         for ref in resp.get("messages", []):
             tid = ref.get("threadId", ref["id"])
-            if tid in seen:
-                continue
-            seen.add(tid)
             full = service.users().messages().get(userId="me", id=ref["id"], format="full").execute()
             headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
             out.append({
@@ -149,5 +148,6 @@ def scan_outcomes(
             row = build_email_event(msg, applied_jobs, client=client)
             counts[upsert_email_event(conn, row, reextract=reextract)] += 1
         except Exception:
+            log.exception("outcome scan: failed to process message %s", msg.get("message_id"))
             counts["errors"] += 1
     return counts
