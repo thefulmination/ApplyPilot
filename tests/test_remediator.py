@@ -184,3 +184,64 @@ def test_remediate_applies_guards_and_caps(monkeypatch):
     assert requeued == ["u-clean"]
     assert out["requeued"] == 1 and out["vetoed_applied_set"] == 1 and out["vetoed_email"] == 1
     assert out["capped"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Adversarial INTEGRATION test (real Postgres, fleet_db fixture) -- locks the
+# double-apply invariant against the live candidate SQL, not a string assertion.
+#
+# Only a PROVABLY-never-submitted job (status='failed', apply_error contains 'usage_limit')
+# may be a candidate. Every "may-have-submitted" park MUST be excluded:
+#   * apply_error='crash_unconfirmed' -- reclaim_stale_leases parks a HARD crash (possibly
+#     mid-submit, "may carry the user's name") and never writes applied_set;
+#   * 'failed:no_result_line' / 'failed:timeout' -- the agent RAN and may have reached the form.
+# A usage_limit diagnosis is seeded for the worker so this test ALSO fails (correctly) if a
+# future change re-introduces a worker-diagnosis JOIN that re-admits the no_result_line bucket.
+# This is the regression guard for the gap where status='crash_unconfirmed' was accepted alone.
+# ---------------------------------------------------------------------------
+from applypilot.apply import pgqueue
+
+
+def _seed_usage_limit_diagnosis(conn, machine):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_diagnoses (cluster_key, reason, machine, status, created_at) "
+            "VALUES (%s, 'usage_limit', %s, 'open', now())",
+            (f"logdiag:usage_limit|{machine}", machine))
+    conn.commit()
+
+
+def _seed_ats_job(conn, *, url, worker_id, status, apply_error, dedup_key):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, score, lane, status, "
+            "apply_error, worker_id, dedup_key, attempts, updated_at) "
+            "VALUES (%s, %s, 1.0, 'ats', %s, %s, %s, %s, 99, now())",
+            (url, url, status, apply_error, worker_id, dedup_key))
+    conn.commit()
+
+
+def test_select_candidates_only_provably_never_submitted(fleet_db):
+    """Only the provably-never-submitted bucket (status='failed', apply_error~usage_limit) is a
+    candidate; every may-have-submitted park (reclaim crash_unconfirmed, no_result_line, timeout)
+    on the SAME usage-limited worker is excluded -- so no re-queue can double-apply."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_usage_limit_diagnosis(conn, "m2-3")
+        # DANGEROUS may-have-submitted parks (all carry a non-null dedup_key, so exclusion is
+        # driven by status/apply_error, not by the dedup_key IS NOT NULL guard):
+        _seed_ats_job(conn, url="u-reclaim", worker_id="m2-3", status="crash_unconfirmed",
+                      apply_error="crash_unconfirmed", dedup_key="dk-reclaim")
+        _seed_ats_job(conn, url="u-nores", worker_id="m2-3", status="crash_unconfirmed",
+                      apply_error="failed:no_result_line", dedup_key="dk-nores")
+        _seed_ats_job(conn, url="u-timeout", worker_id="m2-3", status="crash_unconfirmed",
+                      apply_error="failed:timeout", dedup_key="dk-timeout")
+        # PROVABLY never submitted (the only legitimate candidate):
+        _seed_ats_job(conn, url="u-usage", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-usage")
+        cands = remediator.select_candidates(conn, window_minutes=30, max_per_job=2)
+    urls = {c.url for c in cands}
+    assert urls == {"u-usage"}        # exactly the provable bucket
+    assert "u-reclaim" not in urls    # reclaim park excluded (the original gap)
+    assert "u-nores" not in urls      # no_result_line is may-have-submitted -> excluded
+    assert "u-timeout" not in urls    # timeout is may-have-submitted -> excluded
