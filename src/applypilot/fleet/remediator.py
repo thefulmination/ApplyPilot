@@ -2,8 +2,9 @@
 (provably never submitted) behind a 3-layer double-apply guard. Expansionary action lives ONLY
 here (the Doctor stays conservative-pure; the diagnoser stays advisory-pure). No LLM, $0/pass.
 
-Safety: a job is re-queued only if ALL pass -- (1) its worker has a Tier-0 usage_limit diagnosis,
-(2) its dedup_key is NOT in applied_set, (3) NO confirming email_events row for its url. ATS only."""
+Safety: a job is re-queued only if ALL pass -- (1) the job's OWN apply_error contains
+'usage_limit' (PROVABLY never touched the form), (2) its dedup_key is NOT in applied_set,
+(3) NO confirming email_events row for its url. ATS only."""
 from __future__ import annotations
 from dataclasses import dataclass
 import sqlite3
@@ -57,14 +58,14 @@ def has_confirming_email(brain_path: str, url: str) -> bool:
     guarantee never drops below guards 1-2. Read-only."""
     try:
         conn = sqlite3.connect(f"file:{brain_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError:
+    except sqlite3.Error:
         return False
     try:
         row = conn.execute(
             "SELECT 1 FROM email_events WHERE job_url=? LIMIT 1", (url,)).fetchone()
         return row is not None
-    except sqlite3.OperationalError:
-        return False  # email_events not created yet (outcomes-tracker not run)
+    except sqlite3.Error:
+        return False  # email_events not created yet (outcomes-tracker not run) or corrupt brain
     finally:
         conn.close()
 
@@ -73,15 +74,10 @@ _CANDIDATE_SQL = """
 SELECT q.url, q.worker_id, q.dedup_key, q.status::text AS status, q.attempts,
        q.apply_error, 'usage_limit' AS reason
 FROM apply_queue q
-JOIN (
-    SELECT DISTINCT machine FROM fleet_diagnoses
-    WHERE reason = 'usage_limit' AND cluster_key LIKE 'logdiag:%%'
-      AND status IN ('recommended', 'open', 'auto_applied')
-      AND created_at > now() - make_interval(mins => %(window)s)
-) d ON d.machine = q.worker_id
 WHERE q.lane = 'ats'
-  AND q.status IN ('failed', 'crash_unconfirmed')
-  AND (q.status = 'crash_unconfirmed' OR q.apply_error ILIKE '%%no_result_line%%')
+  AND q.status = 'failed'
+  AND q.apply_error ILIKE '%%usage_limit%%'
+  AND q.dedup_key IS NOT NULL
   AND q.updated_at > now() - make_interval(mins => %(window)s)
   AND (SELECT count(*) FROM remediation_actions ra
        WHERE ra.url = q.url AND ra.action = 'requeue') < %(maxperjob)s
@@ -92,9 +88,10 @@ LIMIT %(hardlimit)s
 
 def select_candidates(conn, *, window_minutes: int = 30, max_per_job: int = 2,
                       hard_limit: int = 500) -> list[Candidate]:
-    """Usage-limit casualties: ATS jobs parked/failed (no_result_line / crash_unconfirmed) by a
-    worker that has a recent Tier-0 usage_limit diagnosis, within the diagnosis window, not yet
-    re-queued max_per_job times. The double-apply guards run later, per-candidate."""
+    """Usage-limit casualties: ATS jobs whose own apply_error contains 'usage_limit'
+    (PROVABLY never touched the form — status='failed', not crash_unconfirmed/no_result_line),
+    within the update window, not yet re-queued max_per_job times. The double-apply guards
+    run later, per-candidate."""
     with conn.cursor() as cur:
         cur.execute(_CANDIDATE_SQL, {"window": window_minutes, "maxperjob": max_per_job,
                                      "hardlimit": hard_limit})

@@ -75,15 +75,36 @@ def test_has_confirming_email_graceful_when_file_missing(tmp_path):
 
 def test_select_candidates_maps_rows_to_dataclass():
     rows = [{"url": "https://job/1", "worker_id": "m2-3", "dedup_key": "dk1",
-             "status": "crash_unconfirmed", "attempts": 99,
-             "apply_error": "crash_unconfirmed", "reason": "usage_limit"}]
+             "status": "failed", "attempts": 99,
+             "apply_error": "failed:usage_limit", "reason": "usage_limit"}]
     conn = _FakeConn({"FROM apply_queue": rows})
     cands = remediator.select_candidates(conn, window_minutes=30, max_per_job=2)
     assert len(cands) == 1
     assert cands[0].url == "https://job/1" and cands[0].reason == "usage_limit"
-    # the query must scope to ATS lane, usage_limit diagnoses, and the per-job cap
+    # the query must scope to ATS lane, own apply_error safety gate, and the per-job cap
     sql = conn._cur.executed[0][0]
-    assert "lane = 'ats'" in sql and "usage_limit" in sql and "remediation_actions" in sql
+    assert "lane = 'ats'" in sql
+    assert "status = 'failed'" in sql
+    assert "usage_limit" in sql
+    assert "dedup_key IS NOT NULL" in sql
+    assert "remediation_actions" in sql
+
+
+def test_candidate_sql_excludes_may_have_submitted():
+    """The emitted SQL must NOT reference the may-have-submitted bucket or diagnosis join."""
+    conn = _FakeConn({})
+    remediator.select_candidates(conn, window_minutes=30, max_per_job=2)
+    sql = conn._cur.executed[0][0]
+    assert "crash_unconfirmed" not in sql
+    assert "no_result_line" not in sql
+    assert "fleet_diagnoses" not in sql
+
+
+def test_has_confirming_email_graceful_on_corrupt_brain(tmp_path):
+    """A corrupt (non-SQLite) brain file must degrade to False, not raise."""
+    p = tmp_path / "corrupt.db"
+    p.write_bytes(b"not a database at all")
+    assert remediator.has_confirming_email(str(p), "u") is False  # no veto, no crash
 
 
 class _RowcountCursor(_FakeCursor):
