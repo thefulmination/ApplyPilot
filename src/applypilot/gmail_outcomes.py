@@ -666,10 +666,12 @@ def match_email_to_job(
 # DB helpers (lazy import to avoid loading DB at module import)
 # ---------------------------------------------------------------------------
 
-def get_applied_jobs() -> list[dict[str, Any]]:
-    """Return jobs from the DB that have been applied to (or tracked)."""
-    from applypilot.database import get_connection
-    conn = get_connection()
+def get_applied_jobs(conn=None) -> list[dict[str, Any]]:
+    """Return jobs from the DB that have been applied to (or tracked).
+    Pass `conn` to read from a specific connection (keeps callers hermetic)."""
+    if conn is None:
+        from applypilot.database import get_connection
+        conn = get_connection()
     rows = conn.execute("""
         SELECT j.url, j.application_url, j.title, j.site, j.apply_status,
                a.status AS tracker_status,
