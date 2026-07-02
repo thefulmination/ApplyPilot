@@ -155,6 +155,14 @@ def apply_resolutions(conn, result: ReconcileResult, *, include_probable: bool =
                      "Set apply_queue.status back to 'crash_unconfirmed', apply_status='crash_unconfirmed', "
                      "apply_error='failed:no_result_line' WHERE url matches."),
                 )
+                # The email that proved the flip IS the response -- mark applied_set.got_response
+                # for feedback/response-rate reporting. applied_set has no url column; key via
+                # apply_queue.dedup_key (the same join queue.write_apply_result uses to seed it).
+                cur.execute(
+                    "UPDATE applied_set SET got_response=true "
+                    "WHERE dedup_key = (SELECT dedup_key FROM apply_queue WHERE url=%s)",
+                    (r.job_url,),
+                )
                 flipped += 1
         except Exception:
             conn.rollback()

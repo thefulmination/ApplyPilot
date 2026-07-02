@@ -184,9 +184,74 @@ def test_apply_resolutions_excludes_probable_by_default():
 
 
 def test_apply_resolutions_includes_probable_when_opted_in():
-    conn = _ScriptConn(rowcounts=[1])
+    conn = _ScriptConn(rowcounts=[1, 1])
     counts = er.apply_resolutions(conn, _res(probable=[_r("u2", cls="probable")]), include_probable=True)
     assert counts == {"flipped": 1, "skipped": 0}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.3: apply_resolutions sets applied_set.got_response on a flip
+# ---------------------------------------------------------------------------
+def test_apply_resolutions_sets_got_response_on_flip():
+    # rowcounts: [0]=apply_queue flip UPDATE hits 1 row, [1]=applied_set got_response UPDATE hits 1 row
+    conn = _ScriptConn(rowcounts=[1, 1])
+    counts = er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert counts == {"flipped": 1, "skipped": 0}
+    got_response_updates = [
+        e for e in conn._cur.executed
+        if e[0].strip().upper().startswith("UPDATE APPLIED_SET")
+    ]
+    assert len(got_response_updates) == 1, "apply_resolutions must UPDATE applied_set.got_response on a flip"
+    sql, params = got_response_updates[0]
+    assert "got_response" in sql.lower() and "true" in sql.lower()
+    # keyed via apply_queue.url -> dedup_key (applied_set has no url column)
+    assert "apply_queue" in sql.lower() and "dedup_key" in sql.lower()
+    assert params is not None and "u1" in params
+
+
+def test_apply_resolutions_skipped_row_does_not_touch_got_response():
+    # UPDATE apply_queue hits 0 rows (already moved) -> skipped; got_response must NOT be touched.
+    conn = _ScriptConn(rowcounts=[0])
+    counts = er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert counts == {"flipped": 0, "skipped": 1}
+    assert not any(
+        e[0].strip().upper().startswith("UPDATE APPLIED_SET") for e in conn._cur.executed
+    ), "skipped rows must not touch applied_set.got_response"
+
+
+def test_apply_resolutions_got_response_end_to_end_real_pg(fleet_db):
+    """Real-Postgres check that the got_response SQL actually runs and is keyed
+    correctly through apply_queue.dedup_key -> applied_set.dedup_key (catches SQL
+    typos/join errors the fake-conn unit tests above can't catch)."""
+    from applypilot.apply import pgqueue
+    dk = "stripe::analyst"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain, dedup_key) "
+            "VALUES ('u1','http://x','9','crash_unconfirmed','ats','x.com',%s)", (dk,),
+        )
+        cur.execute(
+            "INSERT INTO applied_set (dedup_key, company, applied_url) VALUES (%s,'Stripe','u1')", (dk,),
+        )
+        # A second, unrelated row must NOT be touched (skip check).
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain, dedup_key) "
+            "VALUES ('u2','http://y','9','applied','ats','y.com','other::role')",
+        )
+        cur.execute(
+            "INSERT INTO applied_set (dedup_key, company, applied_url) VALUES ('other::role','Other','u2')",
+        )
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        counts = er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert counts == {"flipped": 1, "skipped": 0}
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT got_response FROM applied_set WHERE dedup_key=%s", (dk,))
+        assert cur.fetchone()["got_response"] is True
+        cur.execute("SELECT got_response FROM applied_set WHERE dedup_key='other::role'")
+        assert cur.fetchone()["got_response"] is False
 
 
 # ---------------------------------------------------------------------------

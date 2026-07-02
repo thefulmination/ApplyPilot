@@ -193,6 +193,9 @@ CREATE TABLE IF NOT EXISTS applied_set (
     applied_url      TEXT,                            -- the one URL we applied through
     got_response     BOOLEAN NOT NULL DEFAULT FALSE   -- set by the outcome loop (R8); display/feedback
 );
+-- Phase 2.3: belt-and-suspenders for a live DB whose applied_set predates got_response
+-- (CREATE TABLE IF NOT EXISTS above is a no-op on an already-existing table).
+ALTER TABLE applied_set ADD COLUMN IF NOT EXISTS got_response BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- ---------------------------------------------------------------------------
 -- answer_bank: screening-question answers, broker-served, defer-on-unknown (R10).
