@@ -237,7 +237,10 @@ Set-Location '$repo'
 "@
 $agentWrapper = Write-Wrapper "fleet-agent-task" $agentWrapperContent
 $agentTrigger = New-ScheduledTaskTrigger -AtLogOn
-$agentSettings = New-FleetSettings -restartCount 3 -restartInterval (New-TimeSpan -Minutes 1)
+# restartCount 10 (not the house default 3): fleet-agent is THE actuator -- if it crash-loops past
+# the restart budget it stays dark until next logon and nothing else can revive it (watchdog's
+# restart leg is dead, S6a). 10 restarts rides out a multi-minute PG outage.
+$agentSettings = New-FleetSettings -restartCount 10 -restartInterval (New-TimeSpan -Minutes 1)
 Register-FleetTask -Name "${TaskPrefix}FleetAgent" -WrapperPath $agentWrapper -Trigger $agentTrigger -Settings $agentSettings `
   -Description "ApplyPilot fleet actuator: polls fleet_desired_state, starts/stops local apply workers to match (machine=$Machine)."
 
@@ -272,7 +275,9 @@ Set-Location '$repo'
 "@
     $watchdogWrapper = Write-Wrapper "watchdog-task" $watchdogWrapperContent
     $watchdogTrigger = New-ScheduledTaskTrigger -AtLogOn
-    $watchdogSettings = New-FleetSettings -restartCount 3 -restartInterval (New-TimeSpan -Minutes 1)
+    # Same elevated restart budget as fleet-agent: an always-on daemon that exhausts its restarts
+    # goes dark until next logon (see comment at $agentSettings).
+    $watchdogSettings = New-FleetSettings -restartCount 10 -restartInterval (New-TimeSpan -Minutes 1)
     Register-FleetTask -Name "${TaskPrefix}Watchdog" -WrapperPath $watchdogWrapper -Trigger $watchdogTrigger -Settings $watchdogSettings `
       -Description "ApplyPilot fleet watchdog: rate-governor/roll_window/24h-cap ONLY. Restart leg writes to a dead channel (S6a) -- fleet-agent handles respawn."
   }
@@ -296,7 +301,7 @@ Set-Location '$repo'
 if (`$code -eq 3) { exit 0 } else { exit `$code }
 "@
   $doctorWrapper = Write-Wrapper "doctor-task" $doctorWrapperContent
-  $doctorTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
+  $doctorTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
   $doctorSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 4)
   Register-FleetTask -Name "${TaskPrefix}Doctor" -WrapperPath $doctorWrapper -Trigger $doctorTrigger -Settings $doctorSettings `
@@ -334,22 +339,23 @@ if (`$code -eq 3) { exit 0 } else { exit `$code }
 `$env:PYTHONIOENCODING = 'utf-8'
 Set-Location '$repo'
 `$log = '$outcomeLog'
-`$ts = Get-Date -Format 'o'
-Add-Content -Path `$log -Value ('[' + `$ts + '] === OutcomeScan start ===')
+Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === OutcomeScan start ===')
 & '$applypilotExe' outcomes-scan --days 7 *>> `$log
 `$scanExit = `$LASTEXITCODE
-Add-Content -Path `$log -Value ('[' + `$ts + '] outcomes-scan exit=' + `$scanExit)
+Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] outcomes-scan exit=' + `$scanExit)
 if (`$scanExit -ne 0) {
-  Add-Content -Path `$log -Value ('[' + `$ts + '] scan failed -- skipping reconcile-email')
+  Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] scan failed -- skipping reconcile-email')
   exit `$scanExit
 }
-& '$reconcileExe' --dsn `$env:APPLYPILOT_FLEET_DSN --apply *>> `$log
+# --no-scan: the standalone outcomes-scan above already refreshed email_events; without it the
+# reconcile runs its own built-in Phase-0 Gmail scan and every cycle would scan Gmail twice.
+& '$reconcileExe' --dsn `$env:APPLYPILOT_FLEET_DSN --no-scan --apply *>> `$log
 `$reconcileExit = `$LASTEXITCODE
-Add-Content -Path `$log -Value ('[' + `$ts + '] reconcile-email exit=' + `$reconcileExit)
+Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] reconcile-email exit=' + `$reconcileExit)
 exit `$reconcileExit
 "@
     $outcomeWrapper = Write-Wrapper "outcome-scan-task" $outcomeWrapperContent
-    $outcomeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration ([TimeSpan]::MaxValue)
+    $outcomeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 3650)
     $outcomeSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
       -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
     Register-FleetTask -Name "${TaskPrefix}OutcomeScan" -WrapperPath $outcomeWrapper -Trigger $outcomeTrigger -Settings $outcomeSettings `
@@ -372,7 +378,7 @@ Set-Location '$repo'
 & '$discIngestPs1' -Once *>> '$discIngestLog'
 "@
   $discIngestWrapper = Write-Wrapper "discovery-ingest-task" $discIngestWrapperContent
-  $discIngestTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration ([TimeSpan]::MaxValue)
+  $discIngestTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 3650)
   $discIngestSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
   Register-FleetTask -Name "${TaskPrefix}DiscoveryIngest" -WrapperPath $discIngestWrapper -Trigger $discIngestTrigger -Settings $discIngestSettings `
@@ -396,7 +402,7 @@ Set-Location '$repo'
 & '$discScrapePs1' -Label $Machine *>> '$discScrapeLog'
 "@
   $discScrapeWrapper = Write-Wrapper "discovery-scrape-task" $discScrapeWrapperContent
-  $discScrapeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration ([TimeSpan]::MaxValue)
+  $discScrapeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 3650)
   $discScrapeSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
   Register-FleetTask -Name "${TaskPrefix}DiscoveryScrape" -WrapperPath $discScrapeWrapper -Trigger $discScrapeTrigger -Settings $discScrapeSettings `
