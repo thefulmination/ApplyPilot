@@ -291,15 +291,23 @@ def load_profile() -> dict:
 
 
 def load_search_config() -> dict:
-    """Load search configuration from ~/.applypilot/searches.yaml."""
+    """Load search configuration from ~/.applypilot/searches.yaml.
+
+    The path is resolved at CALL time (mirroring load_preference_profile), not
+    import time: the module-level SEARCH_CONFIG_PATH freezes before
+    .applypilot/.env is loaded, so an APPLYPILOT_SEARCH_CONFIG_PATH set there
+    (e.g. searches_tuned.yaml) was silently ignored unless the caller also set
+    it as a process env var before launching Python.
+    """
     import yaml
-    if not SEARCH_CONFIG_PATH.exists():
+    path = _path_from_env("APPLYPILOT_SEARCH_CONFIG_PATH", SEARCH_CONFIG_PATH)
+    if not path.exists():
         # Fall back to package-shipped example
         example = CONFIG_DIR / "searches.example.yaml"
         if example.exists():
             return yaml.safe_load(example.read_text(encoding="utf-8"))
         return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def load_resume_strategy() -> dict:

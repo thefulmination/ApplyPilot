@@ -92,7 +92,7 @@ def test_score_job_survives_malformed_preference_profile(monkeypatch) -> None:
         def chat(self, messages, max_tokens, temperature, stage=None, prompt_variant=None):
             return "SCORE: 6\nKEYWORDS: x\nREASONING: ok"
 
-    monkeypatch.setattr(scorer, "get_client", lambda stage: FakeClient())
+    monkeypatch.setattr(scorer, "get_client", lambda stage, provider_override=None: FakeClient())
 
     result = scorer.score_job(
         "Resume",
@@ -113,7 +113,7 @@ def test_score_job_includes_preference_profile_in_llm_prompt(monkeypatch) -> Non
             captured_messages.extend(messages)
             return "SCORE: 8\nKEYWORDS: chief of staff, partnerships\nREASONING: Strong preference fit."
 
-    monkeypatch.setattr(scorer, "get_client", lambda stage: FakeClient())
+    monkeypatch.setattr(scorer, "get_client", lambda stage, provider_override=None: FakeClient())
 
     result = scorer.score_job(
         "Resume text",
@@ -147,7 +147,7 @@ def test_score_job_includes_knowledge_graph_in_llm_prompt(monkeypatch) -> None:
             captured_messages.extend(messages)
             return "SCORE: 7\nKEYWORDS: quantitative finance\nREASONING: Factual match citing education:stevens-quantitative-finance-bs."
 
-    monkeypatch.setattr(scorer, "get_client", lambda stage: FakeClient())
+    monkeypatch.setattr(scorer, "get_client", lambda stage, provider_override=None: FakeClient())
 
     result = scorer.score_job(
         "Resume text",
