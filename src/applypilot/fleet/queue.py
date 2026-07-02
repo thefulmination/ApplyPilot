@@ -144,6 +144,16 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 "ON CONFLICT (dedup_key) DO NOTHING",
                 (url,),
             )
+        # Phase 2.1: the apply lane spends real agent money but never recorded it to
+        # llm_usage, so every cost cap (_cost_cap_exceeded, fleet_config spend caps)
+        # read $0 while real cost was incurred. Mirrors write_compute_result's insert;
+        # 'apply_agent' matches the existing SQLite-brain stage convention (see
+        # apply.supervisor._apply_cost_total). Only a real, positive cost is worth a row.
+        if est_cost_usd is not None and float(est_cost_usd) > 0:
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id, task, cost_usd) VALUES (%s,%s,%s)",
+                (worker_id, "apply_agent", est_cost_usd),
+            )
     conn.commit()
     return True
 

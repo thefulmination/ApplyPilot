@@ -171,6 +171,52 @@ def test_write_result_records_outcome_and_applied_set(fleet_db):
                                         target_host="greenhouse.io", home_ip="1.2.3.4") is False
 
 
+# ---- write_apply_result records apply-agent cost to llm_usage (Phase 2.1) ------
+# Regression: the apply lane never wrote to llm_usage, so every cost cap read $0
+# while real agent money was spent. write_apply_result must insert one llm_usage
+# row per close when a real est_cost_usd is supplied, mirroring write_compute_result.
+
+def test_write_apply_result_records_llm_usage_cost(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "cost1", host="greenhouse.io", company="Gamma", title="Analyst")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        ok = queue.write_apply_result(conn, "w1", a["url"], status="applied",
+                                      target_host="greenhouse.io", home_ip="1.2.3.4", est_cost_usd=0.42)
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute("SELECT worker_id, task, cost_usd FROM llm_usage")
+            rows = cur.fetchall()
+        assert len(rows) == 1, "expected exactly one llm_usage row for the apply-agent cost"
+        row = rows[0]
+        assert row["worker_id"] == "w1"
+        assert row["task"] == "apply_agent"
+        assert float(row["cost_usd"]) == 0.42
+
+
+def test_write_apply_result_no_llm_usage_row_when_cost_zero_or_none(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "cost2", host="greenhouse.io", company="Delta", title="Engineer")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        # default est_cost_usd=0 -> no llm_usage row
+        ok = queue.write_apply_result(conn, "w1", a["url"], status="applied",
+                                      target_host="greenhouse.io", home_ip="1.2.3.4")
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM llm_usage")
+            assert cur.fetchone()["n"] == 0
+
+        # distinct host: same-host min-gap would otherwise block the second lease
+        _seed_apply(conn, "cost3", host="lever.co", company="Epsilon", title="Manager")
+        b = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        # explicit None -> still no row (not a cost to record)
+        ok = queue.write_apply_result(conn, "w1", b["url"], status="applied",
+                                      target_host="greenhouse.io", home_ip="1.2.3.4", est_cost_usd=None)
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM llm_usage")
+            assert cur.fetchone()["n"] == 0
+
+
 # ---- compute cost cap (R14) ----------------------------------------------------
 
 def test_compute_lease_and_cost_cap(fleet_db):
