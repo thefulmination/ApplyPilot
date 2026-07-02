@@ -82,6 +82,76 @@ def test_diagnose_no_client_no_provider_returns_none_source(monkeypatch):
     assert d.source == "none"
 
 
+# --- Tier-0.5: deterministic terminal RESULT-line guard (trust the agent's own verdict) ---
+# The apply agent emits an authoritative RESULT: line (launcher.py vocabulary). The diagnoser
+# must trust it instead of asking an LLM to re-derive a cause from a mismatched log/failure pair.
+
+def test_result_line_detects_applied_as_likely_applied():
+    log = "filled the form\nYour application was successfully submitted.\nRESULT:APPLIED"
+    d = diagnoser.result_line_diagnose(WorkerCtx("m2-1", recent_log=log))
+    assert d is not None
+    assert d.root_cause == "likely_applied"
+    assert d.source == "result_line"
+    assert d.confidence == 1.0
+    rec = d.recommendation.lower()
+    assert "applied-set" in rec or "reconcile" in rec
+    assert "re-queue" not in rec  # NEVER recommend re-applying a job the agent already submitted
+
+def test_result_line_detects_expired():
+    d = diagnoser.result_line_diagnose(WorkerCtx("m2-0", recent_log="Job not found.\nRESULT:EXPIRED"))
+    assert d is not None and d.root_cause == "expired" and d.source == "result_line"
+
+def test_result_line_parses_failed_reason():
+    d = diagnoser.result_line_diagnose(
+        WorkerCtx("m4-0", recent_log="cannot proceed.\nRESULT:FAILED:photo_required_no_file"))
+    assert d is not None and d.root_cause == "photo_required_no_file"
+
+def test_result_line_strips_trailing_markdown_from_reason():
+    d = diagnoser.result_line_diagnose(WorkerCtx("m4-0", recent_log='RESULT:FAILED:not_eligible_location*"'))
+    assert d.root_cause == "not_eligible_location"
+
+def test_result_line_uses_last_verdict_when_multiple():
+    # rolling buffer spanning two jobs: the most recent verdict wins (anti-stale + anti-spoof)
+    log = "RESULT:APPLIED\n...next job...\nRESULT:FAILED:not_eligible_location"
+    d = diagnoser.result_line_diagnose(WorkerCtx("m2-1", recent_log=log))
+    assert d is not None and d.root_cause == "not_eligible_location"
+
+def test_result_line_returns_none_without_a_result_line():
+    d = diagnoser.result_line_diagnose(WorkerCtx("m2-1", recent_log="agent crashed mid-form, no verdict printed"))
+    assert d is None
+
+def test_result_line_evidence_is_the_matched_verdict():
+    d = diagnoser.result_line_diagnose(WorkerCtx("m2-1", recent_log="blah\nRESULT:APPLIED"))
+    assert "RESULT:APPLIED" in d.evidence  # evidence ties to the decision, not a blind tail slice
+
+
+def test_diagnose_trusts_result_line_without_calling_llm():
+    # The exact production bug: a successful apply must not be re-diagnosed as a failure by the LLM.
+    client = _FakeLLM('{"root_cause":"usage_limit_exceeded","recommendation":"x","confidence":0.95}')
+    d = diagnoser.diagnose(WorkerCtx("m2-1", recent_log="submitted.\nRESULT:APPLIED"), client=client)
+    assert d.root_cause == "likely_applied"
+    assert d.source == "result_line"
+    assert client.last_messages is None  # LLM never consulted
+
+def test_diagnose_usage_limit_still_wins_over_result_line():
+    # An active usage-limit wall is the current worker-level blocker; Tier0 keeps precedence.
+    log = "RESULT:APPLIED\nYou've hit your usage limit for GPT-5.3-Codex-Spark. Try again at 8:10 PM."
+    client = _FakeLLM('{"root_cause":"x","recommendation":"y","confidence":0.5}')
+    d = diagnoser.diagnose(WorkerCtx("m2-1", recent_log=log), client=client)
+    assert d.source == "tier0" and d.root_cause == "usage_limit"
+
+
+# --- Part B: Tier1 hardening for the genuine no-RESULT case (no clean verdict at all) ---
+
+def test_tier1_prompt_offers_success_escape_hatch():
+    client = _FakeLLM('{"root_cause":"x","recommendation":"y","confidence":0.5}')
+    diagnoser.tier1_diagnose(WorkerCtx("m2-1", recent_log="ambiguous crash"), client)
+    blob = " ".join(m["content"] for m in client.last_messages).lower()
+    # the model must be allowed to report a non-failure (success) and told not to fabricate a cause
+    assert "likely_applied" in blob
+    assert "not invent" in blob or "do not invent" in blob
+
+
 class _FakeCursor:
     def __init__(self, script): self.script = script; self.executed = []; self._last = None
     def __enter__(self): return self
