@@ -245,3 +245,175 @@ def test_select_candidates_only_provably_never_submitted(fleet_db):
     assert "u-reclaim" not in urls    # reclaim park excluded (the original gap)
     assert "u-nores" not in urls      # no_result_line is may-have-submitted -> excluded
     assert "u-timeout" not in urls    # timeout is may-have-submitted -> excluded
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.4 / C12 -- (1) applied_set cleanup on re-queue, real Postgres.
+#
+# queue.write_apply_result seeds applied_set (keyed by dedup_key) whenever a job's status
+# lands on 'applied' or 'crash_unconfirmed'. A job can cycle through crash_unconfirmed (seeding
+# applied_set) on one lease and land on status='failed'+usage_limit on a LATER lease of the
+# SAME dedup_key/url -- select_candidates only looks at the row's CURRENT status/apply_error, so
+# it can legitimately select such a row. requeue_job flips it back to 'queued', but the lease
+# path excludes any dedup_key present in applied_set (queue.py:71,422) -- so the row is
+# unleasable until the stale applied_set row is cleared. Fix: requeue_job must delete the
+# matching applied_set row in the SAME transaction as the status flip.
+# ---------------------------------------------------------------------------
+
+def _seed_applied_set(conn, *, dedup_key, company="Acme", applied_url="https://job/x"):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO applied_set (dedup_key, company, applied_url) VALUES (%s, %s, %s)",
+            (dedup_key, company, applied_url))
+    conn.commit()
+
+
+def _in_applied_set_real(conn, dedup_key) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM applied_set WHERE dedup_key=%s", (dedup_key,))
+        return cur.fetchone() is not None
+
+
+def test_requeue_job_deletes_matching_applied_set_row(fleet_db):
+    """requeue_job must delete the candidate's OWN applied_set row (by dedup_key) in the same
+    transaction as the status flip, so the row becomes leasable again (queue.py's lease query
+    excludes any dedup_key present in applied_set)."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_ats_job(conn, url="u-stale", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-stale")
+        _seed_applied_set(conn, dedup_key="dk-stale")
+        c = remediator.Candidate(url="u-stale", worker_id="m2-3", dedup_key="dk-stale",
+                                 status="failed", attempts=1,
+                                 apply_error="failed:usage_limit", reason="usage_limit")
+        ok = remediator.requeue_job(conn, c)
+        assert ok is True
+        assert _in_applied_set_real(conn, "dk-stale") is False  # stale entry cleared
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue WHERE url=%s", ("u-stale",))
+            assert cur.fetchone()["status"] == "queued"
+
+
+def test_requeue_job_does_not_touch_other_dedup_keys_in_applied_set(fleet_db):
+    """A NON-requeued row's applied_set entry (different dedup_key) must be untouched."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_ats_job(conn, url="u-stale", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-stale")
+        _seed_applied_set(conn, dedup_key="dk-stale")
+        _seed_applied_set(conn, dedup_key="dk-other", applied_url="https://job/other")
+        c = remediator.Candidate(url="u-stale", worker_id="m2-3", dedup_key="dk-stale",
+                                 status="failed", attempts=1,
+                                 apply_error="failed:usage_limit", reason="usage_limit")
+        remediator.requeue_job(conn, c)
+        assert _in_applied_set_real(conn, "dk-other") is True  # untouched
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.4 -- (2) --usage-limit-backfill status-keyed selection (no time window).
+#
+# C12: the live 59 usage-limit casualties are ~62h old; the windowed default (30 min, or even
+# 720 min) selects nothing. These rows are DETERMINISTICALLY never-submitted regardless of age
+# (the agent hit its quota wall before touching the page), so age is irrelevant to safety. Add a
+# status-keyed query with NO time window, reusing the exact same 3-guard pipeline.
+# ---------------------------------------------------------------------------
+
+def test_select_backfill_candidates_finds_old_usage_limit_row(fleet_db):
+    """A 3-day-old failed+usage_limit row (older than any sane window) must be selected by the
+    backfill query, since it is provably never-submitted regardless of age."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_ats_job(conn, url="u-old", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-old")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET updated_at = now() - interval '3 days' WHERE url=%s",
+                ("u-old",))
+        conn.commit()
+        # windowed mode (even a generous 720 min) must NOT find it -- this is the C12 gap.
+        windowed = remediator.select_candidates(conn, window_minutes=720, max_per_job=2)
+        backfill = remediator.select_backfill_candidates(conn, max_per_job=2)
+    assert "u-old" not in {c.url for c in windowed}
+    assert {c.url for c in backfill} == {"u-old"}
+
+
+def test_backfill_excludes_crash_unconfirmed_and_no_result_line_even_with_usage_limit_text(fleet_db):
+    """Guard the may-have-submitted invariant: backfill must NEVER select crash_unconfirmed or
+    no_result_line rows, even if their apply_error text happens to contain 'usage_limit'."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_ats_job(conn, url="u-crash", worker_id="m2-3", status="crash_unconfirmed",
+                      apply_error="crash_unconfirmed after usage_limit retry", dedup_key="dk-crash")
+        _seed_ats_job(conn, url="u-nores", worker_id="m2-3", status="crash_unconfirmed",
+                      apply_error="failed:no_result_line usage_limit", dedup_key="dk-nores")
+        _seed_ats_job(conn, url="u-real", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-real")
+        for url in ("u-crash", "u-nores", "u-real"):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE apply_queue SET updated_at = now() - interval '3 days' WHERE url=%s",
+                    (url,))
+            conn.commit()
+        backfill = remediator.select_backfill_candidates(conn, max_per_job=2)
+    urls = {c.url for c in backfill}
+    assert urls == {"u-real"}
+    assert "u-crash" not in urls
+    assert "u-nores" not in urls
+
+
+def test_remediate_backfill_mode_requeues_and_clears_applied_set(fleet_db):
+    """End-to-end, GENUINE candidate (no applied_set collision): remediate(..., backfill=True)
+    selects the old usage_limit row through the backfill query, runs it through the same
+    3-guard pipeline, and re-queues it. Confirms the backfill wiring end-to-end (selection ->
+    guards -> requeue_job) without touching the guard-2-veto scenario (covered separately)."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_ats_job(conn, url="u-old2", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-old2")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET updated_at = now() - interval '3 days' WHERE url=%s",
+                ("u-old2",))
+        conn.commit()
+        out = remediator.remediate(conn, brain_path="C:/nonexistent/brain.db",
+                                   max_requeue=50, backfill=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue WHERE url=%s", ("u-old2",))
+            status = cur.fetchone()["status"]
+        leasable = not _in_applied_set_real(conn, "dk-old2")
+    assert out["requeued"] == 1
+    assert status == "queued"
+    assert leasable is True
+
+
+def test_remediate_backfill_clears_stale_applied_set_from_sibling_dedup_collision(fleet_db):
+    """Realistic collision (C12 / Fix 1's actual trigger): dedup_key is computed from
+    (company, title) -- see fleet/dedup.py -- so TWO DIFFERENT urls at the same company+title
+    can share one dedup_key. If url A (a DIFFERENT posting, same company+title) already landed
+    crash_unconfirmed and seeded applied_set for that shared dedup_key, url B's own
+    status='failed'+usage_limit row is STILL a legitimate remediator candidate (B itself never
+    touched the form) -- but guard 2 (in_applied_set) correctly vetoes it, because the posting
+    (by dedup_key) genuinely may already carry the user's name via sibling A. This test locks
+    that guard-2 veto still fires even under backfill (Fix 1 must never bypass guard 2)."""
+    with pgqueue.connect(fleet_db) as conn:
+        remediator.ensure_remediation_table(conn)
+        _seed_ats_job(conn, url="u-siblingA", worker_id="m2-3", status="crash_unconfirmed",
+                      apply_error="crash_unconfirmed", dedup_key="dk-shared")
+        _seed_applied_set(conn, dedup_key="dk-shared")  # real prior write, from sibling A
+        _seed_ats_job(conn, url="u-siblingB", worker_id="m2-3", status="failed",
+                      apply_error="failed:usage_limit", dedup_key="dk-shared")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET updated_at = now() - interval '3 days' WHERE url=%s",
+                ("u-siblingB",))
+        conn.commit()
+        out = remediator.remediate(conn, brain_path="C:/nonexistent/brain.db",
+                                   max_requeue=50, backfill=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue WHERE url=%s", ("u-siblingB",))
+            status = cur.fetchone()["status"]
+        sibling_a_preserved = _in_applied_set_real(conn, "dk-shared")
+    assert out["requeued"] == 0
+    assert out["vetoed_applied_set"] == 1
+    assert status == "failed"                    # untouched -- correctly vetoed
+    assert sibling_a_preserved is True            # sibling A's real entry preserved

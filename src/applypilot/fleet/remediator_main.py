@@ -12,7 +12,8 @@ from applypilot.fleet import remediator
 def _one_pass(args) -> None:
     with pgqueue.connect(args.dsn) as conn:
         out = remediator.remediate(conn, max_requeue=args.max_requeue,
-                                   max_per_job=args.max_per_job, window_minutes=args.window_minutes)
+                                   max_per_job=args.max_per_job, window_minutes=args.window_minutes,
+                                   backfill=args.usage_limit_backfill)
     print(f"[remediate] candidates={out['candidates']} requeued={out['requeued']} "
           f"vetoed_applied_set={out['vetoed_applied_set']} vetoed_email={out['vetoed_email']} "
           f"capped={out['capped']}")
@@ -29,6 +30,11 @@ def main(argv=None) -> int:
     p.add_argument("--max-per-job", type=int, default=2, dest="max_per_job",
                    help="max re-queues per job ever (default 2)")
     p.add_argument("--window-minutes", type=int, default=30, dest="window_minutes")
+    p.add_argument("--usage-limit-backfill", action="store_true", dest="usage_limit_backfill",
+                   help="Phase 2.4/C12: select ALL failed+usage_limit ATS rows with NO time "
+                        "window (status-keyed, not update-time-keyed) -- for casualties older "
+                        "than any sane --window-minutes. Same 3-guard pipeline as the default "
+                        "windowed mode; only the candidate query differs.")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--once", action="store_true", help="single pass")
     g.add_argument("--interval", type=int, help="loop every N seconds")
