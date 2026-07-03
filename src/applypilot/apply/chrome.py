@@ -515,9 +515,17 @@ def launch_chrome(worker_id: int, port: int | None = None,
     ]
     if headless:
         cmd.append("--headless=new")
-    if platform.system() == "Linux":
+    import os as _os
+    _no_sandbox = _os.environ.get("APPLYPILOT_CHROME_NO_SANDBOX", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if platform.system() == "Linux" or _no_sandbox:
         # Cloud containers run as root with a tiny /dev/shm -- Chromium refuses to start
-        # without these. No-op/unwanted on the home Windows box (guarded by platform).
+        # without these. Also REQUIRED on a Windows worker whose browser lives in a
+        # restricted path the Chrome sandbox's locked-down token cannot read (its own
+        # exe -> "Sandbox cannot access executable ... Access is denied"); such a box sets
+        # APPLYPILOT_CHROME_NO_SANDBOX=1 (e.g. an install under C:\ApplyPilot). The home
+        # box leaves it unset and keeps the sandbox.
         cmd += ["--no-sandbox", "--disable-dev-shm-usage"]
 
     # On Unix, start in a new process group so we can kill the whole tree
