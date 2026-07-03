@@ -1,7 +1,7 @@
 # Mac Offsite-Apply Fleet Worker — Design
 
 **Date:** 2026-07-03
-**Status:** Approved by owner (brainstorming session)
+**Status:** Implemented (see docs/superpowers/plans/2026-07-03-mac-fleet-worker.md); owner go-live via docs/fleet-mac-worker-runbook.md
 **Scope:** One new machine — a macOS computer at a different physical location/LAN — joins the fleet as an **offsite-ATS apply worker only**.
 
 ## Goal
