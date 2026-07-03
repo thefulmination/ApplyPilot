@@ -725,3 +725,24 @@ class TestTemporalGuard:
             occurred_at="2026-06-20T12:00:00+00:00",
         )
         assert r.status == "needs_review" and r.reason == "predates_application"
+
+    def test_naive_applied_at_does_not_crash(self):
+        # 225/372 live applied_at values are tz-naive; must compare, not TypeError
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io",
+            "Your application to Checkr",
+            "Thank you for applying to Checkr.",
+            [self._job(applied_at="2026-06-28T12:00:00")],   # NAIVE
+            occurred_at="2026-06-28T12:30:00+00:00",
+        )
+        assert r.status == "attributed" and r.job is not None
+
+    def test_naive_applied_at_still_guards(self):
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io",
+            "Your application to Checkr",
+            "Thank you for applying to Checkr.",
+            [self._job(applied_at="2026-06-28T12:00:00")],   # NAIVE, 8 days after email
+            occurred_at="2026-06-20T12:00:00+00:00",
+        )
+        assert r.status == "needs_review" and r.reason == "predates_application"

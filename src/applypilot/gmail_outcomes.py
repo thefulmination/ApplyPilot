@@ -606,7 +606,11 @@ def _occurred_at_iso(date_header: str) -> str | None:
 
 def _parse_iso(v: Any) -> datetime | None:
     try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        # Normalize naive datetimes to UTC (225/372 live applied_at values are tz-naive)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except (TypeError, ValueError):
         return None
 
