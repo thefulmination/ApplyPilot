@@ -1,7 +1,7 @@
 # Fleet-wide OTP / Email-Verification Relay — Design
 
 **Date:** 2026-07-03
-**Status:** Approved by owner (brainstorming session)
+**Status:** Implemented (see docs/superpowers/plans/2026-07-03-fleet-otp-relay.md); owner runs applypilot-fleet-otp-home per docs/fleet-otp-relay-runbook.md
 **Scope:** Finish the deferred centralized email-verification-code relay so a remote apply worker (the Mac, and any future offsite machine) can clear an email-verification wall using a code read from a **single** Gmail-connected home box — Gmail credentials never leave that home box.
 
 ## Goal
