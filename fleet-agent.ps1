@@ -1,4 +1,4 @@
-# fleet-agent.ps1 -Label m2 [-PollSec 20]
+# fleet-agent.ps1 -Label m2 [-PollSec 20] [-AutoUpdate] [-UpdateEverySec 900]
 #
 #   Run this ONCE on a worker box (m2, m4, or even home). It is the actuator that makes the home
 #   box's `fleet.ps1` able to control THIS machine: every -PollSec it reads this box's row in the
@@ -7,12 +7,22 @@
 #
 #   Enroll once per box (ideally as a Task Scheduler "At log on" task so it auto-starts):
 #     m2:  $env:FLEET_PG_DSN="host=192.168.1.187 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
-#          cd C:\ApplyPilot ;  .\fleet-agent.ps1 -Label m2
+#          cd C:\ApplyPilot ;  .\fleet-agent.ps1 -Label m2 -AutoUpdate
 #     m4:  $env:FLEET_PG_DSN="host=100.90.104.99 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
-#          cd C:\ApplyPilot ;  .\fleet-agent.ps1 -Label m4
+#          cd C:\ApplyPilot ;  .\fleet-agent.ps1 -Label m4 -AutoUpdate
+#
+#   -AutoUpdate (worker boxes ONLY, never home -- home is the dev origin and pushes, never pulls):
+#   every -UpdateEverySec git-fetch the current branch's upstream; if behind and fast-forwardable
+#   with a clean tree, wait for a BETWEEN-JOBS window (fleet-agent-update-gate.py: no fresh
+#   non-idle heartbeat + no live lease for this Label; fail-closed), then stop local workers,
+#   ff-only pull, pip reinstall only if pyproject.toml changed, and let the next reconcile respawn
+#   workers on the new code. If the agent's own files changed it exits 1 so the FleetAgent
+#   scheduled task (RestartCount budget) relaunches it fresh -- manual foreground runs must
+#   relaunch by hand. Spec: docs/superpowers/specs/2026-07-03-fleet-pull-updater-design.md
 #
 #   Fail-safe: on any DB blip the agent leaves local workers untouched (never kills on a transient error).
-param([Parameter(Mandatory = $true)][string]$Label, [int]$PollSec = 20)
+param([Parameter(Mandatory = $true)][string]$Label, [int]$PollSec = 20,
+      [switch]$AutoUpdate, [int]$UpdateEverySec = 900)
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repo
@@ -55,9 +65,102 @@ function Get-LocalWorkers {
 }
 function Slot-Of($proc) { if ($proc.CommandLine -match ('--worker-id\s+"?' + [regex]::Escape($Label) + '-(\d+)')) { [int]$matches[1] } else { -1 } }
 
+# ---- auto-update (spec: 2026-07-03-fleet-pull-updater-design.md) ----
+$updateLog = Join-Path $repo ".fleet-logs\fleet-agent-update.log"
+function Log-Update([string]$msg, [string]$color = "Gray") {
+  $line = "[{0}] [fleet-agent:{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Label, $msg
+  Write-Host $line -ForegroundColor $color
+  try {
+    $dir = Split-Path -Parent $updateLog
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $f = Get-Item $updateLog -ErrorAction SilentlyContinue
+    if ($f -and $f.Length -gt 50MB) { Move-Item $updateLog "$updateLog.1" -Force }  # single-slot rotation
+    Add-Content -Path $updateLog -Value $line
+  } catch { Write-Host "[fleet-agent:$Label] WARNING: update-log write failed: $_" -ForegroundColor Yellow }
+}
+function Get-ShortSha([string]$sha) { if ($sha -and $sha.Length -ge 9) { $sha.Substring(0, 9) } else { "$sha" } }
+
+# Files whose change requires the agent itself to restart (exit 1 -> scheduled-task relaunch).
+$selfFiles = @("fleet-agent.ps1", "fleet-agent-query.py", "fleet-agent-update-gate.py",
+               "src/applypilot/fleet/update_gate.py")
+$script:lastUpdateCheck = [datetime]::MinValue
+$script:updatePending = $false
+$script:updBranch = $null
+$script:updRemote = $null
+
+function Invoke-AutoUpdate {
+  # Returns $true when it stopped workers (update applied) so the caller can respawn immediately.
+  $due = ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -ge $UpdateEverySec
+  if (-not ($due -or $script:updatePending)) { return $false }
+
+  if ($due) {
+    $script:lastUpdateCheck = Get-Date
+    $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
+    if (-not $branch -or $branch -eq "HEAD") { Log-Update "skip: not on a branch ('$branch')" "Yellow"; $script:updatePending = $false; return $false }
+    $remote = (& git config "branch.$branch.remote" 2>$null); if (-not $remote) { $remote = "origin" }
+    & git fetch $remote --quiet 2>$null
+    if ($LASTEXITCODE -ne 0) { Log-Update "skip: git fetch $remote failed (offline?)" "Yellow"; $script:updatePending = $false; return $false }
+    $script:updBranch = $branch; $script:updRemote = $remote
+  }
+  $branch = $script:updBranch; $remote = $script:updRemote
+  if (-not $branch -or -not $remote) { $script:updatePending = $false; return $false }
+  $local = (& git rev-parse HEAD 2>$null)
+  $target = (& git rev-parse "$remote/$branch" 2>$null)
+  if (-not $target -or $local -eq $target) { $script:updatePending = $false; return $false }
+
+  # guards: worker boxes must never own local commits or edits
+  if (@(& git status --porcelain 2>$null).Count -gt 0) {
+    Log-Update "UPDATE BLOCKED: working tree dirty -- this box must be a clean clone" "Red"
+    $script:updatePending = $false; return $false
+  }
+  & git merge-base --is-ancestor HEAD "$remote/$branch" 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    Log-Update "UPDATE BLOCKED: history diverged from $remote/$branch -- fix by hand" "Red"
+    $script:updatePending = $false; return $false
+  }
+
+  if (-not $script:updatePending) { Log-Update "update available: $(Get-ShortSha $local) -> $(Get-ShortSha $target) (waiting for between-jobs window)" "Cyan" }
+  $script:updatePending = $true
+
+  # between-jobs gate (fail-closed: anything but IDLE means wait)
+  $gate = (& $py "fleet-agent-update-gate.py" $Label 2>$null | Select-Object -Last 1)
+  if ("$gate" -ne "IDLE") { return $false }
+
+  Log-Update "between-jobs window open -- updating" "Cyan"
+  Get-LocalWorkers | ForEach-Object {
+    Log-Update "-stop $Label-$(Slot-Of $_) (pre-update)" "Yellow"
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 2
+
+  & git merge --ff-only --quiet "$remote/$branch" 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    Log-Update "UPDATE FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local); workers respawn on old code" "Red"
+    $script:updatePending = $false; return $true
+  }
+  $script:updatePending = $false
+  $changed = @(& git diff --name-only $local HEAD 2>$null)
+  Log-Update "updated $(Get-ShortSha $local) -> $(Get-ShortSha (& git rev-parse HEAD)) ($($changed.Count) files)" "Green"
+
+  if ($changed -contains "pyproject.toml") {
+    Log-Update "pyproject.toml changed -> pip install -e ." "Cyan"
+    & $py -m pip install -e . --quiet
+    if ($LASTEXITCODE -ne 0) { Log-Update "PIP INSTALL FAILED -- new code + old deps; fix by hand ASAP" "Red" }
+  }
+  $selfChanged = @($changed | Where-Object { $selfFiles -contains ($_ -replace '\\', '/') })
+  if ($selfChanged.Count -gt 0) {
+    Log-Update "agent's own files changed ($($selfChanged -join ', ')) -- exiting for supervisor relaunch (manual runs: restart fleet-agent.ps1 yourself)" "Yellow"
+    exit 1
+  }
+  return $true
+}
+
 $lastGen = $null
 Write-Host "[fleet-agent:$Label] online -- reconciling LOCAL workers to fleet_desired_state every ${PollSec}s (Ctrl-C to stop)" -ForegroundColor Cyan
 while ($true) {
+  # auto-update runs BEFORE reconcile so a post-update respawn happens in this same tick
+  if ($AutoUpdate) { Invoke-AutoUpdate | Out-Null }
+
   $line = (& $py "fleet-agent-query.py" $Label 2>$null | Select-Object -Last 1)
   $f = "$line" -split '\|'
   if ($f.Count -lt 4 -or $f[0] -eq 'KEEP') { Start-Sleep -Seconds $PollSec; continue }  # DB blip -> leave as-is
