@@ -58,11 +58,12 @@ class _FakeConn:
 def test_load_crash_jobs_shapes_candidates_for_matcher():
     rows = [{"url": "https://stripe.com/jobs/1", "application_url": "https://boards.greenhouse.io/stripe/jobs/1",
              "company": "Stripe", "title": "Analyst", "apply_domain": "boards.greenhouse.io",
-             "dedup_key": "k-stripe-analyst"}]
+             "dedup_key": "k-stripe-analyst", "updated_at": "2026-06-29T12:00:00+00:00"}]
     jobs = er.load_crash_jobs(_FakeConn(rows))
     assert jobs[0]["site"] == "boards.greenhouse.io"       # apply_domain -> site
     assert jobs[0]["company"] == "Stripe" and jobs[0]["url"] == "https://stripe.com/jobs/1"
     assert jobs[0]["dedup_key"] == "k-stripe-analyst"
+    assert jobs[0]["guard_after"] == "2026-06-29T12:00:00+00:00"   # updated_at -> guard_after
 
 
 def test_load_crash_jobs_filters_no_result_line_bucket():
@@ -344,6 +345,24 @@ def test_classify_no_match_is_none():
 # ---------------------------------------------------------------------------
 # Fix 3: end-to-end reconcile — fuzzy below threshold yields probable
 # ---------------------------------------------------------------------------
+def test_email_predating_crash_attempt_cannot_confirm():
+    from applypilot.fleet.email_reconcile import reconcile, OutcomeEmail
+    emails = [OutcomeEmail(
+        message_id="m1", sender="no-reply@us.greenhouse-mail.io",
+        subject="Your application to Acme",
+        body="Thank you for applying to Acme. See https://boards.greenhouse.io/acme/jobs/1",
+        company="Acme", title="Analyst", job_url=None, stage="applied_confirmation",
+        occurred_at="2026-06-01T00:00:00+00:00",           # BEFORE the crash attempt
+    )]
+    jobs = [{"url": "https://boards.greenhouse.io/acme/jobs/1",
+             "application_url": "https://boards.greenhouse.io/acme/jobs/1",
+             "company": "Acme", "title": "Analyst", "site": "boards.greenhouse.io",
+             "dedup_key": "k1", "guard_after": "2026-06-29T12:00:00+00:00"}]
+    result = reconcile(emails, jobs)
+    assert result.confirmed == [] and result.probable == []
+    assert result.unmatched_emails == 1
+
+
 def test_reconcile_fuzzy_below_threshold_is_probable():
     # Sender is on a generic domain so company_domain strong path does NOT fire.
     # Subject contains only "Acme" (1 of 3 tokens in "Acme Robotics Incorporated"),

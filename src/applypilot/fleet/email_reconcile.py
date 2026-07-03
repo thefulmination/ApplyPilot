@@ -67,13 +67,33 @@ def classify_match(method: str | None, score: float | None, *, min_strong: float
 
 def load_outcome_emails(conn) -> list:
     """Read submission-proving outcome emails from the home brain's email_events table.
-    Caller opens the sqlite connection read-only.
+    Caller opens the sqlite connection read-only. reconcile() re-matches these raw emails
+    itself (it does NOT trust the stored attribution), so this does not filter on job_url
+    or match_status='attributed' -- a quarantined-at-scan-time email may legitimately
+    confirm a crash job. The ONE exclusion: rows with match_status='needs_review' AND
+    match_reason='no_timestamp' -- with no reliable timestamp, the email can never be
+    temporally validated as evidence, so there is no point re-matching it here.
     Returns [] if the table does not exist (brain predates the outcomes tracker)."""
     placeholders = ",".join("?" for _ in CONFIRMING_STAGES)
     try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(email_events)").fetchall()}
+    except sqlite3.OperationalError:
+        cols = set()
+    if not cols:
+        return []
+    # match_status/match_reason may be absent on a legacy brain -- COALESCE-tolerant only
+    # when the columns actually exist; otherwise no row can match the exclusion, so skip it.
+    if {"match_status", "match_reason"} <= cols:
+        exclude_clause = (
+            " AND NOT (COALESCE(match_status, '') = 'needs_review' "
+            "AND COALESCE(match_reason, '') = 'no_timestamp')"
+        )
+    else:
+        exclude_clause = ""
+    try:
         cur = conn.execute(
             f"SELECT message_id, sender, subject, body_text, company, title, job_url, stage, occurred_at "
-            f"FROM email_events WHERE stage IN ({placeholders})",
+            f"FROM email_events WHERE stage IN ({placeholders}){exclude_clause}",
             tuple(sorted(CONFIRMING_STAGES)),
         )
     except sqlite3.OperationalError as exc:
@@ -94,7 +114,7 @@ def load_crash_jobs(conn) -> list[dict]:
     candidates (site = apply_domain). Read-only."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT url, application_url, company, title, apply_domain, dedup_key "
+            "SELECT url, application_url, company, title, apply_domain, dedup_key, updated_at "
             "FROM apply_queue WHERE status='crash_unconfirmed' AND apply_error='failed:no_result_line'"
         )
         out = []
@@ -103,6 +123,7 @@ def load_crash_jobs(conn) -> list[dict]:
                 "url": r["url"], "application_url": r["application_url"],
                 "company": r["company"], "title": r["title"], "site": r["apply_domain"],
                 "dedup_key": r["dedup_key"],
+                "guard_after": r["updated_at"].isoformat() if hasattr(r["updated_at"], "isoformat") else r["updated_at"],
             })
     return out
 
@@ -113,7 +134,11 @@ def reconcile(emails: list, jobs: list[dict], *, min_strong: float = MIN_STRONG)
     best: dict[str, Resolution] = {}   # job_url -> best Resolution
     unmatched = 0
     for e in emails:
-        job, method, score = match_email_to_job(e.sender, e.subject, e.body, jobs).astuple()
+        r = match_email_to_job(e.sender, e.subject, e.body, jobs, occurred_at=e.occurred_at)
+        if r.status != "attributed":
+            unmatched += 1
+            continue
+        job, method, score = r.job, r.method, r.score
         cls = classify_match(method, score, min_strong=min_strong)
         if job is None or cls is None:
             unmatched += 1

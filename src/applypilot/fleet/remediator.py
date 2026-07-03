@@ -55,7 +55,8 @@ def in_applied_set(conn, dedup_key: str | None) -> bool:
 def has_confirming_email(brain_path: str, url: str) -> bool:
     """Guard 3 (external ground truth): True if a recruiter email is tied to this job's url.
     Graceful: a missing brain file or absent email_events table returns False (NO veto), so the
-    guarantee never drops below guards 1-2. Read-only."""
+    guarantee never drops below guards 1-2. Read-only.
+    # Deliberately reads ALL email_events incl. quarantined: negative evidence stays conservative."""
     try:
         conn = sqlite3.connect(f"file:{brain_path}?mode=ro", uri=True)
     except sqlite3.Error:
