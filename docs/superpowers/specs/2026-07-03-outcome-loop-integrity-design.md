@@ -109,4 +109,11 @@ Schedule 07:00 daily — after the nightly PG backup (03:30), before the owner's
    points to, or fails to re-match to any job at all — i.e. the re-audit's own attribution
    changed out from under a previously-attributed row, distinct from a plain temporal/ambiguity
    guard failure on first attribution.
-- Daily scan lands interview/offer events without owner action.
+4. §6 (cadence) is SUPERSEDED: the autonomy-loop build (register-fleet-tasks.ps1, Phase 1.4)
+   already registers a 6-hourly home task `OutcomeScan` running `outcomes-scan --days 7` then
+   `reconcile-email --apply` — strictly better than the daily 07:00 task this spec proposed.
+   The duplicate daily task was implemented, then reverted; no new task ships with this plan.
+   The success criterion "scan lands interview/offer events without owner action" is satisfied
+   by the pre-existing 6-hourly task. `outcomes-scan`/`reconcile-email` were added to
+   run-applypilot.ps1's `$WriteCmds` so MANUAL owner runs also trigger the integrity-gated
+   brain backup (the scheduled wrapper invokes the exe directly and is unaffected).
