@@ -1349,9 +1349,25 @@ _INDEX_HTML = r"""<!doctype html>
   .rec .body{font-size:13px}
   .rec .recm{color:var(--muted);font-size:12px;margin-top:4px}
   button.sm{padding:5px 10px;font-size:12px}
+  #challenges .chgrp{margin-bottom:14px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  #challenges .chgrp-h{display:flex;flex-wrap:wrap;align-items:center;gap:10px;
+    background:var(--panel2);padding:8px 12px;font-size:12px;color:var(--muted)}
+  #challenges .chgrp-h b{color:var(--fg)}
+  #challenges .chrow{display:flex;flex-wrap:wrap;align-items:center;gap:10px;
+    padding:10px 12px;border-top:1px solid var(--border)}
+  #challenges .chrow .meta{flex:1 1 220px;min-width:0}
+  #challenges .chrow .meta .ct{font-weight:600;overflow-wrap:anywhere}
+  #challenges .chrow .meta .sub{color:var(--muted);font-size:11px;margin-top:2px}
+  #challenges .chrow .btns{display:flex;flex-wrap:wrap;gap:8px}
+  #challenges button{min-height:36px}
+  .tokbanner{position:fixed;top:0;left:0;right:0;z-index:1000;background:var(--red2);
+    color:#1a0000;font-weight:700;text-align:center;padding:10px 14px;font-size:13px;
+    display:none}
+  .tokbanner.show{display:block}
 </style>
 </head>
 <body>
+<div class="tokbanner" id="tokBanner">token expired — open the ?token= URL printed by the console window</div>
 <header>
   <div>
     <h1>ApplyPilot Fleet Console</h1>
@@ -1393,6 +1409,15 @@ _INDEX_HTML = r"""<!doctype html>
       <label class="inl">$ <input type="number" id="capUsd" min="0" step="0.01" placeholder="cap"></label>
       <button id="btnCap">Set $ cap</button>
     </div>
+  </section>
+
+  <section id="challenges">
+    <h2>Challenges (need a human)</h2>
+    <div class="sub" style="margin-bottom:12px">
+      Parked applications waiting on a captcha / OTP / login wall, grouped by kind then host.
+      Solve it in the browser, then Re-queue (or Skip if it's not worth it).
+    </div>
+    <div id="chList" class="mut">&hellip;</div>
   </section>
 
   <section>
@@ -1624,16 +1649,28 @@ async function poll(){
   }
 }
 
+function showTokenBanner(){
+  const b = document.getElementById("tokBanner");
+  if(b) b.className = "tokbanner show";
+}
+
 async function act(action, extra, confirmMsg){
   if(confirmMsg && !window.confirm(confirmMsg)) return;
   try{
     const r = await fetch("/api/action", {method:"POST",
+      credentials: "same-origin",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(Object.assign({action}, extra||{}))});
+    if(r.status === 401){
+      showTokenBanner();
+      toast("token expired — open the ?token= URL printed by the console window", "err");
+      return {ok:false, error:"token expired"};
+    }
     const j = await r.json();
     if(!r.ok || !j.ok){ toast(j.error || ("action failed ("+r.status+")"), "err"); }
     else{ toast(j.message || "done", "ok"); if(j.status) render(j.status); }
-  }catch(e){ toast("request failed: "+e.message, "err"); }
+    return j;
+  }catch(e){ toast("request failed: "+e.message, "err"); return {ok:false, error:e.message}; }
 }
 
 document.getElementById("btnArm").onclick = ()=>{
@@ -1749,6 +1786,74 @@ async function loadOutcomes(){
 }
 loadOutcomes();
 setInterval(loadOutcomes, 15000);
+
+// --- Challenges triage: its own fetch of /api/challenges, folded into the same 4s cycle. ---
+function renderChallenges(d){
+  const wrap = document.getElementById("chList");
+  const groups = (d && d.groups) || [];
+  if(!groups.length){ wrap.className = "mut"; wrap.textContent = "no open challenges — nothing parked"; return; }
+  wrap.className = "";
+  wrap.innerHTML = groups.map((g, gi)=>{
+    const rows = g.rows || [];
+    const lane = rows.length ? rows[0].lane : null;
+    const rowsHtml = rows.map((r, ri)=>{
+      const ct = esc([r.company, r.title].filter(Boolean).join(" — ")) || '<span class="mut">—</span>';
+      const scoreTxt = (r.score!=null) ? (" · score " + r.score) : "";
+      const ageTxt = (r.age_hours!=null) ? (r.age_hours + "h old") : "age unknown";
+      return '<div class="chrow">' +
+        '<div class="meta"><div class="ct">' + ct + '</div>' +
+        '<div class="sub">' + esc(ageTxt + scoreTxt + (r.lane ? (" · " + r.lane) : "")) + '</div></div>' +
+        '<div class="btns">' +
+        '<a href="' + esc(r.url) + '" target="_blank" rel="noopener"><button class="sm" type="button">Open job</button></a>' +
+        '<button class="sm go" data-req="' + gi + ':' + ri + '">I solved it → Re-queue</button>' +
+        '<button class="sm danger" data-skip="' + gi + ':' + ri + '">Skip</button>' +
+        '</div></div>';
+    }).join("");
+    return '<div class="chgrp">' +
+      '<div class="chgrp-h"><b>' + esc(g.kind||"") + '</b><span>·</span><b>' + esc(g.host||"") +
+      '</b><span>·</span><span>' + rows.length + '</span>' +
+      '<button class="sm danger" style="margin-left:auto" data-skiphost="' + gi + '">Skip all on host</button>' +
+      '</div>' + rowsHtml + '</div>';
+  }).join("");
+
+  wrap.querySelectorAll("button[data-req]").forEach(b=>{
+    b.onclick = async ()=>{
+      const [gi, ri] = b.getAttribute("data-req").split(":").map(Number);
+      const row = groups[gi].rows[ri];
+      const j = await act("challenge_requeue", {url: row.url, lane: row.lane});
+      if(j && j.ok !== false) loadChallenges();
+    };
+  });
+  wrap.querySelectorAll("button[data-skip]").forEach(b=>{
+    b.onclick = async ()=>{
+      const [gi, ri] = b.getAttribute("data-skip").split(":").map(Number);
+      const row = groups[gi].rows[ri];
+      const j = await act("challenge_skip", {url: row.url, lane: row.lane});
+      if(j && j.ok !== false) loadChallenges();
+    };
+  });
+  wrap.querySelectorAll("button[data-skiphost]").forEach(b=>{
+    b.onclick = async ()=>{
+      const gi = Number(b.getAttribute("data-skiphost"));
+      const g = groups[gi];
+      const lane = g.rows.length ? g.rows[0].lane : null;
+      if(!window.confirm("Skip all " + g.rows.length + " parked challenge(s) on " + g.host + "?")) return;
+      const j = await act("challenge_skip_host", {host: g.host, lane});
+      if(j && j.ok !== false) loadChallenges();
+    };
+  });
+}
+
+async function loadChallenges(){
+  try{
+    const r = await fetch("/api/challenges", {cache:"no-store"});
+    if(r.status === 401){ showTokenBanner(); return; }
+    if(!r.ok) return;
+    renderChallenges(await r.json());
+  }catch(e){ /* leave last render; the status poll drives the connection banner */ }
+}
+loadChallenges();
+setInterval(loadChallenges, 4000);
 
 poll();
 setInterval(poll, 4000);
