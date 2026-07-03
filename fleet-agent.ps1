@@ -79,7 +79,11 @@ while ($true) {
     $started = 0; $slot = 0
     while ($started -lt ($want - $have) -and $slot -le 20) {
       if ($running -notcontains $slot) {
-        $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", $worker, "-Slot", $slot, "-Agent", $agent, "-Label", $Label)
+        # -File must be pre-quoted: Start-Process joins array args with spaces WITHOUT quoting,
+        # so a repo path containing spaces (home's OneDrive checkout) otherwise truncates to
+        # "-File C:\...\New" and the child exits before the launcher ever runs (m2/m4's
+        # C:\ApplyPilot masked this for days).
+        $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$worker`"", "-Slot", $slot, "-Agent", $agent, "-Label", $Label)
         if ($model) { $argList += @("-Model", $model) }
         Start-Process powershell.exe -ArgumentList $argList -WorkingDirectory $repo
         Write-Host "[fleet-agent:$Label] +start $Label-$slot ($agent$(if($model){"/$model"}))" -ForegroundColor Green
