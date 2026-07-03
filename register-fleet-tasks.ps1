@@ -158,7 +158,9 @@ Write-Host "`n[register-fleet-tasks] pre-flight: reading fleet_desired_state row
 # Worker boxes (m2/m4) have no psql.exe -- read via the python helper (psycopg ships with every
 # bootstrap; fleet-agent.ps1 already relies on it). psql is only a fallback for odd setups.
 $rowRaw = $null; $readOk = $false
-$pyPre = @((Join-Path $repo ".venv\Scripts\python.exe"), (Join-Path $repo ".conda-env\python.exe")) |
+# .conda-env FIRST (home's real runtime; .venv is stale there) then .venv (worker boxes have
+# only .venv). Matches the resolution order every other fleet script uses.
+$pyPre = @((Join-Path $repo ".conda-env\python.exe"), (Join-Path $repo ".venv\Scripts\python.exe")) |
   Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($pyPre) {
   $prevDsn = $env:FLEET_PG_DSN; $env:FLEET_PG_DSN = $effectiveDsn
