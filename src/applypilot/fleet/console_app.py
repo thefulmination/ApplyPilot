@@ -510,18 +510,12 @@ def build_status() -> dict:
 # operator can see the whole captcha/OTP backlog (including rows a worker parked
 # but that never raised/kept an auth_challenge row) in one place.
 # ---------------------------------------------------------------------------
-def _host_of(url: str | None) -> str:
-    """netloc of url, www. stripped. Best-effort -- never raises on a malformed url."""
-    import urllib.parse as _up
-    if not url:
-        return ""
-    try:
-        host = _up.urlsplit(url).hostname or ""
-    except Exception:
-        return ""
-    if host.startswith("www."):
-        host = host[4:]
-    return host
+# _host_of is the console's name for the shared queue.host_of helper (kept as a
+# module-level alias so this module's other call sites need no change). The
+# single host/kind derivation lives in fleet/queue.py so this detail view and
+# the CLI `challenges --grouped` count view (queue.challenge_summary) on both
+# home mains can never diverge.
+_host_of = _queue.host_of
 
 
 def _age_hours(ts: Any, now: _dt.datetime) -> float | None:
@@ -534,29 +528,13 @@ def _age_hours(ts: Any, now: _dt.datetime) -> float | None:
 def _challenges_data(conn) -> dict:
     """READ-ONLY: open auth_challenge rows + parked rows from apply_queue/linkedin_queue,
     unioned by url, grouped kind -> host. Parked rows with no matching open challenge
-    group under kind '(no challenge row)'. conn.rollback() marks it read-only."""
+    group under kind '(no challenge row)'. Fetched via the SHARED queue._challenge_rows
+    (lane=None -- both queues) so this detail view and queue.challenge_summary's count
+    view can never diverge on what counts as an open/parked row."""
     now = _utcnow()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT url, kind, machine_owner, screenshot_url, raised_at "
-            "FROM auth_challenge WHERE resolved_at IS NULL")
-        open_challenges = cur.fetchall()
-        cur.execute(
-            "SELECT url, company, title, score, updated_at "
-            "FROM apply_queue WHERE apply_status='challenge_pending'")
-        parked_apply = cur.fetchall()
-        cur.execute(
-            "SELECT url, company, title, score, updated_at "
-            "FROM linkedin_queue WHERE apply_status='challenge_pending'")
-        parked_linkedin = cur.fetchall()
-    conn.rollback()  # read-only
+    open_challenges, parked_by_url = _queue._challenge_rows(conn, None)
 
     challenge_by_url: dict[str, dict] = {r["url"]: r for r in open_challenges}
-    parked_by_url: dict[str, tuple[str, dict]] = {}
-    for r in parked_apply:
-        parked_by_url[r["url"]] = ("apply", r)
-    for r in parked_linkedin:
-        parked_by_url[r["url"]] = ("linkedin", r)
 
     urls = set(challenge_by_url) | set(parked_by_url)
     groups: dict[tuple[str, str], list[dict]] = {}

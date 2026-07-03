@@ -9,6 +9,7 @@ single-account mutex (R1).
 from __future__ import annotations
 
 import json
+import urllib.parse as _urlparse
 
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
@@ -635,6 +636,91 @@ def resolve_linkedin_challenge(conn, url, *, requeue=True, commit=True) -> bool:
     if commit:
         conn.commit()
     return n > 0
+
+
+# ---------------------------------------------------------------------------
+# Challenge summary -- SHARED kind x host x count view over the open
+# auth_challenge backlog UNION the lane's parked (apply_status='challenge_pending')
+# rows. This is the single source both the console's build_challenges() (detail
+# view, one row per job) and the CLI `challenges --grouped` flag on both home
+# mains (a plain kind x host -> count table) key off of, so the host/kind
+# derivation can never diverge between the two surfaces.
+# ---------------------------------------------------------------------------
+def host_of(url: str | None) -> str:
+    """netloc of url, www. stripped. Best-effort -- never raises on a malformed url."""
+    if not url:
+        return ""
+    try:
+        host = _urlparse.urlsplit(url).hostname or ""
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _challenge_rows(conn, lane: str | None):
+    """READ-ONLY: fetch the open auth_challenge rows + the lane's parked rows
+    (apply_queue for lane='apply', linkedin_queue for lane='linkedin', BOTH for
+    lane=None). Returns (open_challenges, parked_by_url) where parked_by_url maps
+    url -> (lane_name, row). conn.rollback() marks it read-only."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, kind, machine_owner, screenshot_url, raised_at "
+            "FROM auth_challenge WHERE resolved_at IS NULL")
+        open_challenges = cur.fetchall()
+        parked_apply = []
+        parked_linkedin = []
+        if lane in (None, "apply"):
+            cur.execute(
+                "SELECT url, company, title, score, updated_at "
+                "FROM apply_queue WHERE apply_status='challenge_pending'")
+            parked_apply = cur.fetchall()
+        if lane in (None, "linkedin"):
+            cur.execute(
+                "SELECT url, company, title, score, updated_at "
+                "FROM linkedin_queue WHERE apply_status='challenge_pending'")
+            parked_linkedin = cur.fetchall()
+    conn.rollback()  # read-only
+
+    parked_by_url: dict[str, tuple[str, dict]] = {}
+    for r in parked_apply:
+        parked_by_url[r["url"]] = ("apply", r)
+    for r in parked_linkedin:
+        parked_by_url[r["url"]] = ("linkedin", r)
+
+    if lane is not None:
+        # A lane-scoped view only ever shows open auth_challenge rows whose url is
+        # ALSO parked in that same lane's queue -- a bare open challenge with no
+        # parked row in either queue isn't attributable to one lane, so it's
+        # excluded once we've narrowed to a single lane.
+        open_challenges = [c for c in open_challenges
+                            if parked_by_url.get(c["url"], (None, None))[0] == lane]
+
+    return open_challenges, parked_by_url
+
+
+def challenge_summary(conn, lane: str | None) -> list[dict]:
+    """kind x host -> count rows over open auth_challenge UNION the lane's parked
+    rows (lane=None -> both queues). Reuses the exact host/kind derivation
+    build_challenges() (console_app.py) uses for its detail view, so the two
+    surfaces can never diverge.
+
+    ``lane`` in {None, 'apply', 'linkedin'}. Each returned dict is
+    {'kind': str, 'host': str, 'count': int}."""
+    open_challenges, parked_by_url = _challenge_rows(conn, lane)
+
+    challenge_by_url: dict[str, dict] = {r["url"]: r for r in open_challenges}
+    urls = set(challenge_by_url) | set(parked_by_url)
+
+    counts: dict[tuple[str, str], int] = {}
+    for url in urls:
+        ch = challenge_by_url.get(url)
+        kind = ch["kind"] if ch else "(no challenge row)"
+        host = host_of(url)
+        counts[(kind, host)] = counts.get((kind, host), 0) + 1
+
+    return [{"kind": kind, "host": host, "count": n} for (kind, host), n in counts.items()]
 
 
 # ---------------------------------------------------------------------------

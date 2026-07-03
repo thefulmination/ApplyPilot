@@ -85,6 +85,18 @@ def list_challenges(conn) -> list:
         return [dict(r) for r in cur.fetchall()]
 
 
+def print_challenges_grouped(conn) -> None:
+    """Plain kind x host -> count table for the linkedin lane only, sourced from
+    the SHARED queue.challenge_summary (same helper the console's build_challenges
+    detail view and the apply-home CLI use, lane='linkedin' here)."""
+    rows = queue.challenge_summary(conn, "linkedin")
+    if not rows:
+        print("no open/parked challenges")
+        return
+    for r in sorted(rows, key=lambda r: (r["kind"], r["host"])):
+        print(f"{r['kind']}\t{r['host']}\t{r['count']}")
+
+
 def _print_status(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT status, count(*) AS n FROM linkedin_queue GROUP BY status")
@@ -142,7 +154,8 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     ap = sub.add_parser("approve")
     ap.add_argument("--all-pushed", action="store_true")
 
-    sub.add_parser("challenges")
+    chp = sub.add_parser("challenges")
+    chp.add_argument("--grouped", action="store_true")
 
     rc = sub.add_parser("resolve-challenge")
     rc.add_argument("url")
@@ -179,8 +192,11 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
         elif args.cmd == "approve":
             print("approved batch", approve(conn, all_pushed=args.all_pushed))
         elif args.cmd == "challenges":
-            for c in list_challenges(conn):
-                print(c)
+            if args.grouped:
+                print_challenges_grouped(conn)
+            else:
+                for c in list_challenges(conn):
+                    print(c)
         elif args.cmd == "resolve-challenge":
             print("resolved", resolve_challenge_cmd(conn, args.url, skip=args.skip))
         elif args.cmd == "clear-halt":
