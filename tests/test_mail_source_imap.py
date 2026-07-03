@@ -1,0 +1,254 @@
+"""Tests for the permanent IMAP mail source (no network -- fake imaplib object)."""
+
+import base64
+import imaplib
+import json
+
+import pytest
+
+from applypilot import config
+from applypilot.mail_source import ImapMailSource, MailSourceError, _normalize
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: raw RFC822 message builders
+# ---------------------------------------------------------------------------
+
+def _multipart_alternative_raw() -> bytes:
+    return (
+        b"From: Alice <alice@example.com>\r\n"
+        b"Subject: Hello there\r\n"
+        b"Date: Wed, 01 Jul 2026 10:00:00 -0000\r\n"
+        b"Message-ID: <abc123@example.com>\r\n"
+        b'Content-Type: multipart/alternative; boundary="BOUNDARY"\r\n'
+        b"\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Plain text body.\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        b"<html><body><p>HTML body.</p></body></html>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+
+def _encoded_word_subject_raw() -> bytes:
+    return (
+        b"From: Bob <bob@example.com>\r\n"
+        b"Subject: =?UTF-8?B?SGVsbG8gd2l0aCBhY2NlbnRzOiBjYWbDqQ==?=\r\n"
+        b"Date: Wed, 01 Jul 2026 11:00:00 -0000\r\n"
+        b"Message-ID: <def456@example.com>\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Body text.\r\n"
+    )
+
+
+def _base64_plain_raw() -> bytes:
+    encoded_body = base64.b64encode(b"This is a base64-encoded plain body.\r\n").decode()
+    return (
+        b"From: Carol <carol@example.com>\r\n"
+        b"Subject: Base64 body test\r\n"
+        b"Date: Wed, 01 Jul 2026 12:00:00 -0000\r\n"
+        b"Message-ID: <ghi789@example.com>\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"Content-Transfer-Encoding: base64\r\n"
+        b"\r\n" + encoded_body.encode() + b"\r\n"
+    )
+
+
+def _html_only_raw() -> bytes:
+    return (
+        b"From: Dave <dave@example.com>\r\n"
+        b"Subject: HTML only\r\n"
+        b"Date: Wed, 01 Jul 2026 13:00:00 -0000\r\n"
+        b"Message-ID: <jkl012@example.com>\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        b"<html><body><h1>Title</h1><p>Some <b>bold</b> text.</p></body></html>\r\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _normalize tests
+# ---------------------------------------------------------------------------
+
+def test_normalize_multipart_alternative_prefers_plain_body():
+    msg = _normalize("1", _multipart_alternative_raw())
+    assert msg.id == "1"
+    assert msg.thread_id == "<abc123@example.com>"
+    assert msg.subject == "Hello there"
+    assert "Alice" in msg.sender
+    assert msg.date == "Wed, 01 Jul 2026 10:00:00 -0000"
+    assert msg.body.strip() == "Plain text body."
+    assert "<html>" not in msg.body
+
+
+def test_normalize_decodes_encoded_word_subject():
+    msg = _normalize("2", _encoded_word_subject_raw())
+    assert msg.subject == "Hello with accents: café"
+    assert msg.thread_id == "<def456@example.com>"
+
+
+def test_normalize_decodes_base64_plain_body():
+    msg = _normalize("3", _base64_plain_raw())
+    assert msg.body.strip() == "This is a base64-encoded plain body."
+
+
+def test_normalize_html_only_strips_tags():
+    msg = _normalize("4", _html_only_raw())
+    assert "<" not in msg.body
+    assert "Title" in msg.body
+    assert "bold" in msg.body
+
+
+def test_normalize_falls_back_to_uid_when_no_message_id():
+    raw = (
+        b"From: NoId <noid@example.com>\r\n"
+        b"Subject: No message id\r\n"
+        b"Date: Wed, 01 Jul 2026 14:00:00 -0000\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Body.\r\n"
+    )
+    msg = _normalize("42", raw)
+    assert msg.thread_id == "42"
+
+
+# ---------------------------------------------------------------------------
+# Fake imaplib object
+# ---------------------------------------------------------------------------
+
+class FakeImap:
+    def __init__(self, search_ids: list[bytes], messages_by_id: dict[bytes, bytes], login_error=None):
+        self._search_ids = search_ids
+        self._messages_by_id = messages_by_id
+        self._login_error = login_error
+        self.logged_out = False
+        self.login_calls = []
+        self.selected = None
+
+    def login(self, email_addr, app_password):
+        self.login_calls.append((email_addr, app_password))
+        if self._login_error:
+            raise self._login_error
+
+    def select(self, mailbox, readonly=False):
+        self.selected = (mailbox, readonly)
+        return "OK", [b"1"]
+
+    def search(self, charset, criterion, date):
+        return "OK", [b" ".join(self._search_ids)]
+
+    def fetch(self, uid, parts):
+        key = uid.encode() if isinstance(uid, str) else uid
+        raw = self._messages_by_id.get(key)
+        if raw is None:
+            return "NO", [None]
+        return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+
+    def logout(self):
+        self.logged_out = True
+
+
+# ---------------------------------------------------------------------------
+# ImapMailSource.fetch tests
+# ---------------------------------------------------------------------------
+
+def test_fetch_returns_newest_n_messages_within_window():
+    ids = [b"1", b"2", b"3", b"4"]
+    messages_by_id = {
+        b"1": _encoded_word_subject_raw(),
+        b"2": _base64_plain_raw(),
+        b"3": _html_only_raw(),
+        b"4": _multipart_alternative_raw(),
+    }
+    fake = FakeImap(search_ids=ids, messages_by_id=messages_by_id)
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    result = source.fetch(since_days=7, max_messages=2)
+
+    assert len(result) == 2
+    # newest-N = last 2 ids in search order: "3", "4"
+    assert [m.id for m in result] == ["3", "4"]
+    assert fake.selected == ("INBOX", True)
+    assert fake.logged_out is True
+
+
+def test_fetch_respects_max_messages_cap_when_fewer_available():
+    ids = [b"1", b"2"]
+    messages_by_id = {
+        b"1": _encoded_word_subject_raw(),
+        b"2": _base64_plain_raw(),
+    }
+    fake = FakeImap(search_ids=ids, messages_by_id=messages_by_id)
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    result = source.fetch(since_days=7, max_messages=10)
+
+    assert len(result) == 2
+
+
+def test_fetch_strips_spaces_from_app_password_before_login():
+    fake = FakeImap(search_ids=[], messages_by_id={})
+    source = ImapMailSource("me@example.com", "abcd efgh ijkl mnop", imap=fake)
+
+    source.fetch(since_days=7, max_messages=5)
+
+    assert fake.login_calls == [("me@example.com", "abcdefghijklmnop")]
+
+
+def test_fetch_login_failure_raises_mail_source_error():
+    fake = FakeImap(
+        search_ids=[],
+        messages_by_id={},
+        login_error=imaplib.IMAP4.error("invalid credentials"),
+    )
+    source = ImapMailSource("me@example.com", "bad password", imap=fake)
+
+    with pytest.raises(MailSourceError):
+        source.fetch(since_days=7, max_messages=5)
+
+    # even on failure, logout must still be attempted (finally block)
+    assert fake.logged_out is True
+
+
+# ---------------------------------------------------------------------------
+# config.load_gmail_app_password tests
+# ---------------------------------------------------------------------------
+
+def test_load_gmail_app_password_from_env(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_GMAIL_ADDRESS", "env@example.com")
+    monkeypatch.setenv("APPLYPILOT_GMAIL_APP_PASSWORD", "envpassword")
+
+    result = config.load_gmail_app_password()
+
+    assert result == ("env@example.com", "envpassword")
+
+
+def test_load_gmail_app_password_from_json_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("APPLYPILOT_GMAIL_ADDRESS", raising=False)
+    monkeypatch.delenv("APPLYPILOT_GMAIL_APP_PASSWORD", raising=False)
+    monkeypatch.setattr(config, "APP_DIR", tmp_path)
+
+    creds_path = tmp_path / "gmail_app_password.json"
+    creds_path.write_text(
+        json.dumps({"email": "file@example.com", "app_password": "filepassword"}),
+        encoding="utf-8",
+    )
+
+    result = config.load_gmail_app_password()
+
+    assert result == ("file@example.com", "filepassword")
+
+
+def test_load_gmail_app_password_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.delenv("APPLYPILOT_GMAIL_ADDRESS", raising=False)
+    monkeypatch.delenv("APPLYPILOT_GMAIL_APP_PASSWORD", raising=False)
+    monkeypatch.setattr(config, "APP_DIR", tmp_path)
+
+    result = config.load_gmail_app_password()
+
+    assert result is None

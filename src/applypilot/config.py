@@ -509,6 +509,33 @@ def get_min_score() -> int:
     return value
 
 
+def load_gmail_app_password() -> tuple[str, str] | None:
+    """Load the Gmail address + IMAP app password for the permanent (non-OAuth)
+    mail source. Prefers env vars (APPLYPILOT_GMAIL_ADDRESS +
+    APPLYPILOT_GMAIL_APP_PASSWORD); falls back to APP_DIR/gmail_app_password.json
+    ({"email", "app_password"}); returns None if neither is present.
+    """
+    import json
+
+    env_addr = os.environ.get("APPLYPILOT_GMAIL_ADDRESS")
+    env_pw = os.environ.get("APPLYPILOT_GMAIL_APP_PASSWORD")
+    if env_addr and env_pw:
+        return env_addr, env_pw
+
+    path = APP_DIR / "gmail_app_password.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    email_addr = data.get("email")
+    app_password = data.get("app_password")
+    if not email_addr or not app_password:
+        return None
+    return email_addr, app_password
+
+
 def load_env():
     """Load environment variables from ~/.applypilot/.env if it exists."""
     from dotenv import load_dotenv

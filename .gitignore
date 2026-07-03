@@ -13,6 +13,7 @@ machine2-bundle.zip
 # ignored); these patterns also catch a stray copy left anywhere in the repo.
 gmail_credentials*.json
 gmail_token*.json
+gmail_app_password*
 *client_secret*.json
 
 # Runtime artifacts
