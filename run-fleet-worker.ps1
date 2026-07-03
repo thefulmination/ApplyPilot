@@ -46,8 +46,15 @@ if ($Agent -eq "claude") {
   # leave $Model empty -> codex uses its default model
 } else { throw "unknown -Agent '$Agent' (use claude or codex)" }
 
-# Per-slot throwaway cost-DB (never the real brain), Gmail verification, 10-min timeout
-$env:APPLYPILOT_DB_PATH = Join-Path $env:TEMP "fleet_apply_throwaway_$Slot.db"
+# Per-LAUNCH throwaway cost-DB (never the real brain), Gmail verification, 10-min timeout.
+# Unique per launch (slot+PID): a corrupt leftover husk from a crashed run (seen live 7/03:
+# a 4KB unopenable fleet_apply_throwaway_0.db from 6/28 flash-killed every home-0 spawn at
+# startup, before the worker log existed) must never block the next launch. Best-effort
+# cleanup of old husks below keeps TEMP bounded.
+Get-ChildItem (Join-Path $env:TEMP "fleet_apply_throwaway_*.db*") -ErrorAction SilentlyContinue |
+  Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+  ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {} }
+$env:APPLYPILOT_DB_PATH = Join-Path $env:TEMP "fleet_apply_throwaway_${Slot}_$PID.db"
 $env:APPLYPILOT_ENABLE_GMAIL_MCP = "1"
 $env:APPLYPILOT_AGENT_TIMEOUT = "600"
 # Cheap read-only liveness probe before each agent launch: ~15% of queued postings are dead
