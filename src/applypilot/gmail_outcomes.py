@@ -627,6 +627,56 @@ class MatchResult:
         return (self.job, self.method, self.score)
 
 
+def _same_company(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Case-folded company match (falls back to `site` when `company` is missing)."""
+    ca = (a.get("company") or a.get("site") or "").strip().lower()
+    cb = (b.get("company") or b.get("site") or "").strip().lower()
+    return bool(ca) and ca == cb
+
+
+# Methods that pick a single company but not necessarily a single job -- these are the
+# only tiers where a same-company multi-job disambiguation makes sense. board_slug and
+# linkedin_job_id are exact per-JOB matches (a real link/id), so they skip this check.
+_DISAMBIGUATE_METHODS = frozenset({"ats_domain", "company_domain", "company_name"})
+
+
+def _disambiguate_same_company(
+    job: dict[str, Any],
+    method: str,
+    score: float | None,
+    subject: str,
+    body: str,
+    eligible: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None, float | None, str | None]:
+    """When a fuzzy/employer-level tier lands on a company with 2+ eligible applied jobs,
+    resolve by title-token overlap or quarantine as ambiguous. Returns
+    (job, method, score, ambiguous_reason) -- ambiguous_reason is set only on quarantine."""
+    if method not in _DISAMBIGUATE_METHODS:
+        return job, method, score, None
+
+    peers = [j for j in eligible if _same_company(j, job)]
+    if len(peers) < 2:
+        return job, method, score, None
+
+    text = subject + " " + body[:600]
+    best_job: dict[str, Any] | None = None
+    best_score = 0.0
+    tie = False
+    for peer in peers:
+        s = _token_overlap(peer.get("title") or "", text)
+        if s > best_score:
+            best_score = s
+            best_job = peer
+            tie = False
+        elif s == best_score and best_score > 0:
+            tie = True
+
+    if best_job is not None and best_score > 0 and not tie:
+        return best_job, f"{method}+title", best_score, None
+
+    return None, None, None, "ambiguous_company"
+
+
 def _match_tiers(
     sender: str,
     subject: str,
@@ -733,6 +783,11 @@ def match_email_to_job(
 
     job, method, score = _match_tiers(sender, subject, body, eligible, min_overlap=min_overlap)
     if job is not None:
+        job, method, score, ambiguous_reason = _disambiguate_same_company(
+            job, method, score, subject, body, eligible
+        )
+        if ambiguous_reason is not None:
+            return MatchResult(None, None, None, "needs_review", ambiguous_reason)
         return MatchResult(job, method, score, "attributed")
 
     if len(eligible) < len(applied_jobs):
