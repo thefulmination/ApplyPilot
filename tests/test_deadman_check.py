@@ -15,6 +15,7 @@ psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import deadman
+from applypilot import mail_source as deadman_mail_source
 
 NOW = dt.datetime(2026, 7, 3, 12, 0, 0, tzinfo=dt.timezone.utc)
 
@@ -480,3 +481,71 @@ def test_otp_relay_unknown_token_no_responder_does_not_alarm(fleet_db):
         alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=None)
 
     assert "otp_relay_down" not in _kinds(alerts)
+
+
+# ---------------------------------------------------------------------------
+# mail_source_alive: the probe that feeds deadman_check(gmail_token_ok=...)
+# ---------------------------------------------------------------------------
+
+class _FakeImapMailSourceOK:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fetch(self, *, since_days, max_messages):
+        return []
+
+
+class _FakeImapMailSourceLoginFails:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fetch(self, *, since_days, max_messages):
+        raise deadman_mail_source.MailSourceError("IMAP login failed")
+
+
+class _FakeImapMailSourceUnknownError:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fetch(self, *, since_days, max_messages):
+        raise OSError("network unreachable")
+
+
+def test_mail_source_alive_true_when_app_password_login_succeeds(monkeypatch):
+    monkeypatch.setattr(
+        deadman.config, "load_gmail_app_password", lambda: ("a@b.com", "pw")
+    )
+    monkeypatch.setattr(deadman, "ImapMailSource", _FakeImapMailSourceOK)
+
+    assert deadman.mail_source_alive() is True
+
+
+def test_mail_source_alive_false_when_app_password_login_raises_mail_source_error(monkeypatch):
+    monkeypatch.setattr(
+        deadman.config, "load_gmail_app_password", lambda: ("a@b.com", "pw")
+    )
+    monkeypatch.setattr(deadman, "ImapMailSource", _FakeImapMailSourceLoginFails)
+
+    assert deadman.mail_source_alive() is False
+
+
+def test_mail_source_alive_none_on_unexpected_exception(monkeypatch):
+    monkeypatch.setattr(
+        deadman.config, "load_gmail_app_password", lambda: ("a@b.com", "pw")
+    )
+    monkeypatch.setattr(deadman, "ImapMailSource", _FakeImapMailSourceUnknownError)
+
+    assert deadman.mail_source_alive() is None
+
+
+def test_mail_source_alive_falls_back_to_gmail_token_alive_when_no_app_password(monkeypatch):
+    monkeypatch.setattr(deadman.config, "load_gmail_app_password", lambda: None)
+    monkeypatch.setattr(deadman, "gmail_token_alive", lambda: False)
+
+    assert deadman.mail_source_alive() is False
+
+    monkeypatch.setattr(deadman, "gmail_token_alive", lambda: True)
+    assert deadman.mail_source_alive() is True
+
+    monkeypatch.setattr(deadman, "gmail_token_alive", lambda: None)
+    assert deadman.mail_source_alive() is None

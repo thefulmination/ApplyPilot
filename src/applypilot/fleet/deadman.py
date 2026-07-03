@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import imaplib
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from applypilot import config
+from applypilot.mail_source import ImapMailSource, MailSourceError
 
 # ---------------------------------------------------------------------------
 # Thresholds (module constants -- tune here, not inline).
@@ -255,6 +259,34 @@ def gmail_token_alive() -> bool | None:
         return None        # network/parse error -> unknown, don't false-alarm
 
 
+def mail_source_alive() -> bool | None:
+    """Best-effort: can the fleet's mail relay still read Gmail? Prefers the IMAP
+    app-password path (permanent, replaces the 7-day OAuth token): if an app password
+    is configured, attempts a real login+select+search via ImapMailSource.fetch(). Returns
+    True on success, False on a MailSourceError/imaplib login failure (bad password or IMAP
+    disabled in Gmail settings -- the relay is actually dead), or None on any other exception
+    (network/unknown -- don't false-alarm). If NO app password is configured, falls back to
+    the legacy gmail_token_alive() OAuth-refresh probe so nothing regresses for OAuth-only
+    setups. Never raises. Feeds run_deadman -> deadman_check(gmail_token_ok=...)."""
+    try:
+        creds = config.load_gmail_app_password()
+    except Exception:
+        creds = None
+
+    if not creds:
+        return gmail_token_alive()
+
+    try:
+        ImapMailSource(creds[0], creds[1]).fetch(since_days=1, max_messages=1)
+        return True
+    except MailSourceError:
+        return False
+    except imaplib.IMAP4.error:
+        return False
+    except Exception:
+        return None
+
+
 def _send_toast(summary: str) -> None:
     """Best-effort Windows toast via BurntToast. Callers MUST wrap this in
     try/except -- a missing module / non-Windows host / no PowerShell is a
@@ -364,7 +396,7 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
             ensure_schema_v3(conn)
             alerts = run_deadman(
                 conn, now=dt.datetime.now(dt.timezone.utc), alert_dir=Path(args.alert_dir),
-                gmail_token_ok=gmail_token_alive(),  # network probe stays in the untested CLI glue
+                gmail_token_ok=mail_source_alive(),  # network probe stays in the untested CLI glue
             )
     except Exception as exc:  # pragma: no cover - defensive: a monitor must not
         # error-spam Task Scheduler. Only a connection/infra failure gets here
