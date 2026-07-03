@@ -1,5 +1,6 @@
-"""Console-side Fleet Doctor tests: the action allow-list is EXACTLY the 7 existing + the
-two doctor_* actions (no LinkedIn), and the two new actions are conservative/bookkeeping.
+"""Console-side Fleet Doctor tests: the action allow-list is EXACTLY the 7 existing +
+the two doctor_* actions + the three challenge_* triage ops (no LinkedIn APPLY/scrape
+action), and the two doctor_* actions are conservative/bookkeeping.
 """
 from __future__ import annotations
 
@@ -13,11 +14,15 @@ _EXISTING_SEVEN = {
     "arm_canary", "lift_canary", "pause", "resume", "reclaim", "set_cap", "expand_searches",
 }
 _NEW_TWO = {"doctor_revert", "doctor_dismiss"}
+# Task 3: challenge triage ops. They route ONLY through queue.resolve_challenge /
+# resolve_linkedin_challenge (lane-routed); they never apply, scrape, or resume
+# LinkedIn, so they don't violate the "no LinkedIn action" guard below.
+_CHALLENGE_THREE = {"challenge_requeue", "challenge_skip", "challenge_skip_host"}
 
 
 def test_actions_allowlist_is_exactly_seven_plus_two_and_no_linkedin():
     keys = set(console_app._ACTIONS)
-    assert keys == _EXISTING_SEVEN | _NEW_TWO, keys
+    assert keys == _EXISTING_SEVEN | _NEW_TWO | _CHALLENGE_THREE, keys
     # No action key mentions linkedin (D2/D6).
     assert not any("linkedin" in k.lower() for k in keys)
 

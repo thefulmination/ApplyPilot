@@ -44,6 +44,7 @@ from typing import Any
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
+from applypilot.fleet import queue as _queue
 from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor (S1: scrub on READ too)
 
 DEFAULT_PORT = 8787
@@ -910,12 +911,86 @@ def _is_pos_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
 
+# ---------------------------------------------------------------------------
+# Challenge triage ops -- the ONLY mutations here go through queue.resolve_challenge
+# (apply/ats lane) or queue.resolve_linkedin_challenge (linkedin lane). Both already
+# stamp auth_challenge.resolved_at/outcome internally (queue.py:219-240 / :613-635),
+# so we never re-stamp it here, and neither function touches rate_governor -- a
+# LinkedIn halt (account:linkedin) is untouched by resolving a challenge. Routing is
+# strictly by the request's ``lane`` field so an ats op can never reach a
+# linkedin_queue row (and vice versa) even if the SAME url happens to be parked in
+# both queues.
+# ---------------------------------------------------------------------------
+_LANE_RESOLVERS = {
+    "apply": _queue.resolve_challenge,
+    "linkedin": _queue.resolve_linkedin_challenge,
+}
+
+
+def _do_challenge_resolve(conn, body: dict, *, requeue: bool):
+    """Shared body for challenge_requeue (requeue=True) / challenge_skip (requeue=False).
+    Idempotent: a url with no parked row is a success no-op (queue_rows: 0), never an
+    error, per the triage contract."""
+    url = body.get("url")
+    lane = body.get("lane")
+    if not isinstance(url, str) or not url:
+        raise ValueError("url is required")
+    resolver = _LANE_RESOLVERS.get(lane)
+    if resolver is None:
+        return False, "unknown lane"
+    found = resolver(conn, url, requeue=requeue, commit=True)
+    n = 1 if found else 0
+    verb = "requeued" if requeue else "skipped"
+    return f"Challenge {verb} for {lane} url (queue_rows: {n})."
+
+
+def _do_challenge_requeue(conn, body: dict):
+    return _do_challenge_resolve(conn, body, requeue=True)
+
+
+def _do_challenge_skip(conn, body: dict):
+    return _do_challenge_resolve(conn, body, requeue=False)
+
+
+def _do_challenge_skip_host(conn, body: dict):
+    """Skip (requeue=False) up to 200 parked urls on one host, in one lane. Selects the
+    candidate urls read-only first, then routes each through the SAME
+    resolve_challenge/resolve_linkedin_challenge primitive as challenge_skip -- no new
+    UPDATE of queue rows. host+lane scoped so this can never spill into the other lane
+    or another host."""
+    host = body.get("host")
+    lane = body.get("lane")
+    if not isinstance(host, str) or not host:
+        raise ValueError("host is required")
+    resolver = _LANE_RESOLVERS.get(lane)
+    if resolver is None:
+        return False, "unknown lane"
+    table = "apply_queue" if lane == "apply" else "linkedin_queue"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT url FROM {table} WHERE apply_status='challenge_pending' "
+            "AND (url LIKE %s OR url LIKE %s) LIMIT 200",
+            (f"https://{host}/%", f"https://www.{host}/%"),
+        )
+        urls = [r["url"] for r in cur.fetchall()]
+    n = 0
+    for url in urls:
+        if resolver(conn, url, requeue=False, commit=True):
+            n += 1
+    return f"Skipped {n} parked challenge(s) on {host} ({lane}) (queue_rows: {n})."
+
+
 # Explicit allow-list. The handler indexes THIS dict by the action string; it never
 # eval()s or getattr()s anything derived from the request. Any other action -> 400.
 # NOTE: discovery's expand_searches is PG-only (no brain write); there is deliberately NO
-# brain-ingest ("pull") action and NO LinkedIn action on this surface. The two doctor_*
-# actions are CONSERVATIVE/bookkeeping (revert a conservative knob / dismiss a rec) -- they
-# never apply a recommendation and never do anything activity-increasing.
+# brain-ingest ("pull") action and no LinkedIn APPLY/scrape action on this surface. The
+# challenge_* ops below are an exception carved out deliberately: they never apply,
+# scrape, or resume LinkedIn -- they ONLY resolve a parked auth wall via the existing
+# resolve_challenge/resolve_linkedin_challenge primitives, lane-routed so the two queues
+# can never cross-contaminate, and they never touch rate_governor (a LinkedIn halt is
+# untouched). The two doctor_* actions are CONSERVATIVE/bookkeeping (revert a
+# conservative knob / dismiss a rec) -- they never apply a recommendation and never do
+# anything activity-increasing.
 _ACTIONS = {
     "arm_canary": _do_arm_canary,
     "lift_canary": _do_lift_canary,
@@ -926,20 +1001,30 @@ _ACTIONS = {
     "expand_searches": _do_expand_searches,
     "doctor_revert": _do_doctor_revert,
     "doctor_dismiss": _do_doctor_dismiss,
+    "challenge_requeue": _do_challenge_requeue,
+    "challenge_skip": _do_challenge_skip,
+    "challenge_skip_host": _do_challenge_skip_host,
 }
 
 
 def run_action(body: dict) -> tuple[bool, str]:
     """Validate + dispatch a single allowed action against a short-lived connection.
-    Returns (ok, message). Connection always closed."""
+    Returns (ok, message). Connection always closed.
+
+    An action fn normally returns a success message (str) -> (True, msg). It may
+    instead return a (False, msg) tuple for an expected, non-exceptional failure
+    (e.g. an unknown lane) -- distinct from raising ValueError/Exception, which
+    the HTTP layer maps to 400/500."""
     action = body.get("action")
     fn = _ACTIONS.get(action) if isinstance(action, str) else None
     if fn is None:
         return False, "unknown action"
     conn = pgqueue.connect()
     try:
-        msg = fn(conn, body)
-        return True, msg
+        result = fn(conn, body)
+        if isinstance(result, tuple):
+            return result
+        return True, result
     finally:
         try:
             conn.rollback()
