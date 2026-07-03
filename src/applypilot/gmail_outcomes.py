@@ -22,6 +22,8 @@ import base64
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -585,15 +587,51 @@ def _best_name_match(
     return None, 0.0
 
 
-def match_email_to_job(
+MATCH_GRACE_SECONDS = 3600
+
+
+def _occurred_at_iso(date_header: str) -> str | None:
+    """Parse an RFC-2822 Date header into ISO-8601 (UTC). Mirrors
+    outcome_scan._occurred_at, but returns None on failure instead of
+    falling back to now() -- callers here treat a missing timestamp as
+    "no basis to judge" rather than "just happened"."""
+    try:
+        dt = parsedate_to_datetime(date_header)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_iso(v: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class MatchResult:
+    job: dict[str, Any] | None
+    method: str | None
+    score: float | None
+    status: str  # "attributed" | "needs_review" | "unmatched"
+    reason: str | None = None  # quarantine reason when status == "needs_review"
+
+    def astuple(self):
+        return (self.job, self.method, self.score)
+
+
+def _match_tiers(
     sender: str,
     subject: str,
     body: str,
-    applied_jobs: list[dict[str, Any]],
+    jobs: list[dict[str, Any]],
     *,
-    min_overlap: float = 0.25,
+    min_overlap: float,
 ) -> tuple[dict[str, Any] | None, str | None, float | None]:
-    """Match an email to an applied job.  Returns (job, method, score) or (None, None, None)."""
+    """Run the tier cascade over `jobs` only. Returns (job, method, score) or (None, None, None)."""
     sender_domain = _extract_domain(sender) or ""
     is_ats = sender_domain in _ATS_DOMAINS or any(
         sender_domain.endswith(f".{d}") for d in _ATS_DOMAINS
@@ -603,7 +641,7 @@ def match_email_to_job(
     #     Exact employer match (no fuzzy name guessing); the highest-precision signal.
     email_slugs = _board_slugs(subject) | _board_slugs(body)
     if email_slugs:
-        for job in applied_jobs:
+        for job in jobs:
             js = _job_board_slug(job)
             if js and js in email_slugs:
                 return job, "board_slug", 1.0
@@ -611,7 +649,7 @@ def match_email_to_job(
     # 0b. LinkedIn job id from the email -> applied LinkedIn row's job id (exact).
     email_jids = _linkedin_job_ids(subject + " " + body)
     if email_jids:
-        for job in applied_jobs:
+        for job in jobs:
             jids = _linkedin_job_ids((job.get("url") or "") + " " + (job.get("application_url") or ""))
             if jids & email_jids:
                 return job, "linkedin_job_id", 1.0
@@ -624,13 +662,13 @@ def match_email_to_job(
     # 1. ATS sender: trust the company name extracted from subject/body.
     if is_ats:
         for hint in hints:
-            job, score = _best_name_match(hint, applied_jobs, min_overlap=min_overlap)
+            job, score = _best_name_match(hint, jobs, min_overlap=min_overlap)
             if job:
                 return job, "ats_domain", score
 
     # 2. Company domain: sender domain matches a job URL domain.
     if sender_domain and sender_domain not in _GENERIC_DOMAINS and not is_ats:
-        for job in applied_jobs:
+        for job in jobs:
             for url_key in ("url", "application_url"):
                 job_domain = _url_domain(job.get(url_key) or "")
                 if job_domain and (
@@ -642,7 +680,7 @@ def match_email_to_job(
 
     # 3. Company name in subject/body → fuzzy name match (any sender).
     for hint in hints:
-        job, score = _best_name_match(hint, applied_jobs, min_overlap=min_overlap)
+        job, score = _best_name_match(hint, jobs, min_overlap=min_overlap)
         if job:
             return job, "company_name", score
 
@@ -651,7 +689,7 @@ def match_email_to_job(
     if title_hint:
         best_job: dict[str, Any] | None = None
         best_score = 0.0
-        for job in applied_jobs:
+        for job in jobs:
             s = _token_overlap(title_hint, job.get("title") or "")
             if s > best_score:
                 best_score = s
@@ -660,6 +698,45 @@ def match_email_to_job(
             return best_job, "title", best_score
 
     return None, None, None
+
+
+def match_email_to_job(
+    sender: str,
+    subject: str,
+    body: str,
+    applied_jobs: list[dict[str, Any]],
+    *,
+    min_overlap: float = 0.25,
+    occurred_at: str | None = None,
+) -> MatchResult:
+    """Match an email to an applied job, guarded against attributing an outcome
+    email to a job applied AFTER the email was sent."""
+
+    def _guard_ts(j: dict[str, Any]) -> datetime | None:
+        return _parse_iso(j.get("applied_at") or j.get("guard_after"))
+
+    guarded = [j for j in applied_jobs if _guard_ts(j)]
+    email_dt = _parse_iso(occurred_at)
+    if guarded and email_dt is None:
+        # candidates carry timestamps but the email has no parseable date -> never guess
+        return MatchResult(None, None, None, "needs_review", "no_timestamp")
+
+    def _eligible(j: dict[str, Any]) -> bool:
+        g = _guard_ts(j)
+        return g is None or email_dt + timedelta(seconds=MATCH_GRACE_SECONDS) >= g
+
+    eligible = [j for j in applied_jobs if _eligible(j)] if email_dt else list(applied_jobs)
+
+    job, method, score = _match_tiers(sender, subject, body, eligible, min_overlap=min_overlap)
+    if job is not None:
+        return MatchResult(job, method, score, "attributed")
+
+    if len(eligible) < len(applied_jobs):
+        job, method, score = _match_tiers(sender, subject, body, applied_jobs, min_overlap=min_overlap)
+        if job is not None:
+            return MatchResult(None, None, None, "needs_review", "predates_application")
+
+    return MatchResult(None, None, None, "unmatched")
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +751,7 @@ def get_applied_jobs(conn=None) -> list[dict[str, Any]]:
         conn = get_connection()
     rows = conn.execute("""
         SELECT j.url, j.application_url, j.title, j.site, j.apply_status,
+               j.applied_at,
                a.status AS tracker_status,
                COALESCE(a.company, j.site) AS company
           FROM jobs j
@@ -858,7 +936,10 @@ def scan_inbox(
         if _CONFIDENCE_RANK.get(confidence, 0) < min_rank:
             continue
 
-        matched, method, score = match_email_to_job(sender, subject, body, applied_jobs)
+        m = match_email_to_job(
+            sender, subject, body, applied_jobs, occurred_at=_occurred_at_iso(date)
+        )
+        matched, method, score = m.astuple()
 
         results.append(EmailOutcome(
             message_id=ref["id"],

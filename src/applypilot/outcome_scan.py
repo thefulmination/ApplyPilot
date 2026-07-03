@@ -43,13 +43,15 @@ def build_email_event(msg: dict, applied_jobs: list[dict], *, client=None) -> di
     body = msg.get("body", "") or ""
 
     ex = extract_outcome(subject, body, sender, client=client)
-    job, method, score = match_email_to_job(sender, subject, body, applied_jobs)
+    occurred = _occurred_at(msg.get("date", ""))
+    m = match_email_to_job(sender, subject, body, applied_jobs, occurred_at=occurred)
+    job, method, score = m.job, m.method, m.score
 
     return {
         "message_id": msg["message_id"],
         "thread_id": msg.get("thread_id"),
         "job_url": job.get("url") if job else None,
-        "occurred_at": _occurred_at(msg.get("date", "")),
+        "occurred_at": occurred,
         "sender": sender,
         "sender_domain": _extract_domain(sender),
         "subject": subject,
@@ -60,6 +62,8 @@ def build_email_event(msg: dict, applied_jobs: list[dict], *, client=None) -> di
         "company": ex.company or (job.get("company") if job else None),
         "match_method": method,
         "match_score": score,
+        "match_status": m.status if m.job or m.status == "needs_review" else None,
+        "match_reason": m.reason,
         "confidence": ex.confidence,
         "body_text": body[:20000],
         "snippet": body[:300].replace("\n", " ").strip(),

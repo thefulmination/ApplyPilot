@@ -398,7 +398,7 @@ class TestBoardSlugMatching:
             subject="Thanks for applying!",   # no company in subject
             body="We received it. Track it at https://boards.greenhouse.io/justworks/jobs/9",
             applied_jobs=jobs,
-        )
+        ).astuple()
         assert job is not None and method == "board_slug"
 
 
@@ -430,7 +430,7 @@ class TestLinkedIn:
             sender="jobs-noreply@linkedin.com",
             subject="Jonathan, your application was sent to Startup Resources",
             body="Track it: https://www.linkedin.com/jobs/view/4423505078/",
-            applied_jobs=jobs)
+            applied_jobs=jobs).astuple()
         assert job is not None and method == "linkedin_job_id"
 
 
@@ -473,7 +473,7 @@ class TestMatchEmailToJob:
             subject="Your application at Initech",
             body="",
             applied_jobs=SAMPLE_JOBS,
-        )
+        ).astuple()
         assert job is not None
         assert job["title"] == "Business Development Lead"
         assert method == "company_domain"
@@ -486,7 +486,7 @@ class TestMatchEmailToJob:
             subject="Interview",
             body="",
             applied_jobs=SAMPLE_JOBS,
-        )
+        ).astuple()
         assert job is not None
         assert job["site"] == "Acme Corp"
         assert method == "company_domain"
@@ -498,7 +498,7 @@ class TestMatchEmailToJob:
             subject="Your application at Acme Corp — next steps",
             body="",
             applied_jobs=SAMPLE_JOBS,
-        )
+        ).astuple()
         assert job is not None
         assert "Acme" in (job.get("company") or job.get("site") or "")
 
@@ -508,7 +508,7 @@ class TestMatchEmailToJob:
             subject="Interview with Globex for Strategy Manager",
             body="",
             applied_jobs=SAMPLE_JOBS,
-        )
+        ).astuple()
         assert job is not None
         assert job["site"] == "Globex"
         assert method == "ats_domain"
@@ -519,7 +519,7 @@ class TestMatchEmailToJob:
             subject="Weekly digest",
             body="Your weekly newsletter from...",
             applied_jobs=SAMPLE_JOBS,
-        )
+        ).astuple()
         assert job is None
         assert method is None
 
@@ -529,7 +529,7 @@ class TestMatchEmailToJob:
             subject="Interview",
             body="",
             applied_jobs=[],
-        )
+        ).astuple()
         assert job is None
 
 
@@ -647,3 +647,81 @@ class TestApplyOutcomes:
             assert recorded[0]["status"] == "offer"
         finally:
             app_mod.record_application = original_fn
+
+
+# ---------------------------------------------------------------------------
+# Temporal guard (audit 2026-07-02: 2/26 rejections provably predate their apply)
+# ---------------------------------------------------------------------------
+from applypilot.gmail_outcomes import MatchResult
+
+
+class TestTemporalGuard:
+    def _job(self, **kw):
+        base = {"url": "https://boards.greenhouse.io/checkr/jobs/1",
+                "application_url": "https://boards.greenhouse.io/checkr/jobs/1",
+                "title": "Analyst", "site": "Checkr", "company": "Checkr",
+                "applied_at": "2026-06-28T12:00:00+00:00"}
+        base.update(kw)
+        return base
+
+    def test_email_predating_application_is_quarantined(self):
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io",
+            "Your application to Checkr",
+            "Thank you for applying to Checkr. Unfortunately...",
+            [self._job()],
+            occurred_at="2026-06-20T12:00:00+00:00",   # 8 days BEFORE applied_at
+        )
+        assert isinstance(r, MatchResult)
+        assert r.job is None
+        assert r.status == "needs_review"
+        assert r.reason == "predates_application"
+
+    def test_email_within_grace_passes(self):
+        # acknowledgment 5 minutes BEFORE applied_at stamp (clock skew) still matches
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io",
+            "Your application to Checkr",
+            "Thank you for applying to Checkr.",
+            [self._job()],
+            occurred_at="2026-06-28T11:55:00+00:00",
+        )
+        assert r.status == "attributed"
+        assert r.job is not None
+
+    def test_exact_board_slug_is_also_guarded(self):
+        # spec: the guard applies to EVERY tier, exact ones included
+        job = self._job()
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io",
+            "Update",
+            "See https://boards.greenhouse.io/checkr/jobs/1",
+            [job],
+            occurred_at="2026-06-01T00:00:00+00:00",
+        )
+        assert r.status == "needs_review" and r.reason == "predates_application"
+
+    def test_missing_occurred_at_with_guarded_candidates_quarantines(self):
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io", "Your application to Checkr",
+            "Thanks for applying to Checkr.", [self._job()], occurred_at=None,
+        )
+        assert r.status == "needs_review" and r.reason == "no_timestamp"
+
+    def test_no_timestamps_anywhere_stays_eligible(self):
+        # candidates without applied_at/guard_after are judged as before (back-compat)
+        job = self._job(); del job["applied_at"]
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io", "Your application to Checkr",
+            "Thanks for applying to Checkr.", [job], occurred_at=None,
+        )
+        assert r.status == "attributed" and r.job is not None
+
+    def test_guard_after_is_honored_for_crash_candidates(self):
+        job = self._job(); del job["applied_at"]; job["guard_after"] = "2026-06-28T12:00:00+00:00"
+        r = match_email_to_job(
+            "no-reply@us.greenhouse-mail.io", "Your application to Checkr",
+            "Thanks for applying to Checkr.", [job],
+            occurred_at="2026-06-20T12:00:00+00:00",
+        )
+        assert r.status == "needs_review" and r.reason == "predates_application"

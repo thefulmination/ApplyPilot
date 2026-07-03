@@ -113,7 +113,7 @@ def reconcile(emails: list, jobs: list[dict], *, min_strong: float = MIN_STRONG)
     best: dict[str, Resolution] = {}   # job_url -> best Resolution
     unmatched = 0
     for e in emails:
-        job, method, score = match_email_to_job(e.sender, e.subject, e.body, jobs)
+        job, method, score = match_email_to_job(e.sender, e.subject, e.body, jobs).astuple()
         cls = classify_match(method, score, min_strong=min_strong)
         if job is None or cls is None:
             unmatched += 1
