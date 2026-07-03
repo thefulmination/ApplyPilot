@@ -90,4 +90,23 @@ Schedule 07:00 daily — after the nightly PG backup (03:30), before the owner's
 ## Success criteria
 - Zero `attributed` events whose email predates the application (query in the report).
 - The 2 known-bad live rows flip to `needs_review` on the owner's first `--reaudit`.
+
+## Amendments (2026-07-03 planning + implementation)
+
+1. `match_email_to_job` has THREE production call sites: `scan_inbox`, `outcome_scan.build_email_event`,
+   and `fleet/email_reconcile.reconcile` — all three are guarded by the temporal + ambiguity checks
+   described above. The reconciler's crash-candidate rows carry `guard_after = the PG row's
+   `updated_at`` (not `applied_at`) since crash-candidate rows have no `applied_at` to guard against.
+2. `remediator.py`'s `has_confirming_email` veto deliberately reads ALL `email_events` rows, INCLUDING
+   quarantined (`match_status = 'needs_review'`) ones. Negative evidence (an email exists that could
+   plausibly confirm an apply) stays conservative on purpose — quarantine only strips an event's
+   authority to positively confirm an apply, not its authority to block a remediation. Only
+   positive-evidence consumers (apply confirmation, crash_unconfirmed flips) filter on
+   `job_url IS NOT NULL AND COALESCE(match_status,'attributed') = 'attributed'`.
+3. A fourth `match_reason`, `rematch_mismatch`, exists alongside `predates_application`,
+   `ambiguous_company`, and `no_timestamp`. It is written ONLY by `--reaudit` when a stored
+   attribution (existing `job_url`) re-matches to a different job than the one it currently
+   points to, or fails to re-match to any job at all — i.e. the re-audit's own attribution
+   changed out from under a previously-attributed row, distinct from a plain temporal/ambiguity
+   guard failure on first attribution.
 - Daily scan lands interview/offer events without owner action.
