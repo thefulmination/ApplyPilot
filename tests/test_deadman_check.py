@@ -418,3 +418,65 @@ def test_multiple_conditions_can_fire_together(fleet_db):
     assert "stalled_queue" in kinds
     assert all(isinstance(a.kind, str) and isinstance(a.severity, str) and isinstance(a.detail, str)
                for a in alerts)
+
+
+# ---------------------------------------------------------------------------
+# otp_relay_down (the fleet-wide email-2FA relay: otp_responder + Gmail token)
+# ---------------------------------------------------------------------------
+
+def test_otp_relay_down_when_gmail_token_dead(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=False)
+
+    assert "otp_relay_down" in _kinds(alerts)
+
+
+def test_otp_relay_ok_when_token_alive_and_no_responder_row(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" not in _kinds(alerts)
+
+
+def test_otp_relay_down_when_responder_heartbeat_stale(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(minutes=40))  # was running, now stale
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" in _kinds(alerts)
+
+
+def test_otp_relay_unknown_token_no_responder_does_not_alarm(fleet_db):
+    # gmail_token_ok=None (couldn't check) + no otp_responder row -> not in use, no false alarm.
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=None)
+
+    assert "otp_relay_down" not in _kinds(alerts)

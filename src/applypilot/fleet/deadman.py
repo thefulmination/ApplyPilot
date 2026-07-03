@@ -154,8 +154,29 @@ def _check_running_hot(
     return None, 0
 
 
+def _check_otp_relay(conn, now: dt.datetime, gmail_token_ok: bool | None) -> Alert | None:
+    """The OTP relay (otp_responder + the home Gmail token) gives the WHOLE fleet its
+    email-verification / two-step (2FA) capability: remote workers file otp_request rows and
+    the home box reads Gmail to answer them (otp_relay.answer_pending). It is DOWN if the
+    backing Gmail token is dead (`gmail_token_ok is False` -> the responder can't read codes,
+    so every email-2FA apply stalls) OR if a once-running otp_responder stopped heartbeating.
+    `gmail_token_ok` is injected (None = couldn't check -> skip). The heartbeat is only alarmed
+    when a row EXISTS but is stale (absent = the relay simply isn't in use). Not armed-gated:
+    a dead relay matters whenever the fleet applies."""
+    reasons: list[str] = []
+    if gmail_token_ok is False:
+        reasons.append("Gmail token dead -- can't read verification codes")
+    otp_beat = _max_last_beat(conn, "otp_responder", negate=False)
+    if otp_beat is not None and otp_beat < now - dt.timedelta(minutes=STALE_MIN):
+        reasons.append(f"otp_responder heartbeat stale ({otp_beat.isoformat()})")
+    if reasons:
+        return Alert(kind="otp_relay_down", severity="critical",
+                     detail="OTP relay down: " + "; ".join(reasons))
+    return None
+
+
 def deadman_check(
-    conn, *, now: dt.datetime, prev_hot_streak: int = 0
+    conn, *, now: dt.datetime, prev_hot_streak: int = 0, gmail_token_ok: bool | None = None
 ) -> tuple[list[Alert], int]:
     """Read-only dead-man check. Never writes/commits; ``now`` is always injected.
 
@@ -184,6 +205,10 @@ def deadman_check(
     if selfheal:
         alerts.append(selfheal)
 
+    otp = _check_otp_relay(conn, now, gmail_token_ok)
+    if otp:
+        alerts.append(otp)
+
     hot_alert, new_streak = _check_running_hot(conn, cfg, now, prev_hot_streak)
     if hot_alert:
         alerts.append(hot_alert)
@@ -202,6 +227,34 @@ def _summarize(alerts: list[Alert]) -> str:
     return " | ".join(f"{a.kind}: {a.detail}" for a in alerts)
 
 
+def gmail_token_alive() -> bool | None:
+    """Best-effort: does the home-box Gmail OAuth token still refresh? Returns True/False, or
+    None if it can't be checked (google-auth libs or token file absent, or a network error).
+    Attempts an IN-MEMORY refresh -- no Gmail data is read and the token is NOT persisted.
+    Never raises. Feeds run_deadman -> deadman_check(gmail_token_ok=...) so the fleet-wide OTP
+    relay (which dies every ~7 days on a Testing-mode OAuth app) surfaces as an alert."""
+    try:
+        import json
+        from google.auth.exceptions import RefreshError
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from applypilot.config import APP_DIR
+    except Exception:
+        return None
+    tok = Path(APP_DIR) / "gmail_token.json"
+    if not tok.exists():
+        return None
+    try:
+        info = json.loads(tok.read_text(encoding="utf-8"))
+        creds = Credentials.from_authorized_user_info(info, info.get("scopes"))
+        creds.refresh(Request())  # in-memory only; never saved
+        return True
+    except RefreshError:
+        return False       # invalid_grant -> the token backing the relay is dead
+    except Exception:
+        return None        # network/parse error -> unknown, don't false-alarm
+
+
 def _send_toast(summary: str) -> None:
     """Best-effort Windows toast via BurntToast. Callers MUST wrap this in
     try/except -- a missing module / non-Windows host / no PowerShell is a
@@ -217,7 +270,8 @@ def _send_toast(summary: str) -> None:
     )
 
 
-def run_deadman(conn, *, now: dt.datetime, alert_dir: Path) -> list[Alert]:
+def run_deadman(conn, *, now: dt.datetime, alert_dir: Path,
+                gmail_token_ok: bool | None = None) -> list[Alert]:
     """Persistence + delivery wrapper around ``deadman_check``.
 
     Reads/persists the running_hot streak in ``fleet_config.deadman_hot_streak``,
@@ -232,7 +286,8 @@ def run_deadman(conn, *, now: dt.datetime, alert_dir: Path) -> list[Alert]:
         row = cur.fetchone()
     prev_streak = row["deadman_hot_streak"] if row else 0
 
-    alerts, new_streak = deadman_check(conn, now=now, prev_hot_streak=prev_streak)
+    alerts, new_streak = deadman_check(
+        conn, now=now, prev_hot_streak=prev_streak, gmail_token_ok=gmail_token_ok)
 
     alert_dir = Path(alert_dir)
     alert_path = alert_dir / ALERT_FILENAME
@@ -309,6 +364,7 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
             ensure_schema_v3(conn)
             alerts = run_deadman(
                 conn, now=dt.datetime.now(dt.timezone.utc), alert_dir=Path(args.alert_dir),
+                gmail_token_ok=gmail_token_alive(),  # network probe stays in the untested CLI glue
             )
     except Exception as exc:  # pragma: no cover - defensive: a monitor must not
         # error-spam Task Scheduler. Only a connection/infra failure gets here
