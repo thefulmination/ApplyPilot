@@ -238,7 +238,7 @@ Write-Host " Done = " -ForegroundColor Cyan -NoNewline
 Write-Host "verify these once the tasks have had a chance to run:" -ForegroundColor Cyan
 Write-Host "=================================================================================" -ForegroundColor Cyan
 Write-Host "  [ ] .fleet-logs\verify-live.log, apply-cycle.log, deadman.log are growing"
-Write-Host "  [ ] apply-cycle.log shows 'ApplyCycle done (all steps OK)' after a full run"
+Write-Host "  [ ] apply-cycle.log shows '=== ApplyCycle done (fail=0) ===' after a full run"
 Write-Host "  [ ] Get-ScheduledTask -TaskName 'ApplyPilot *' shows LastTaskResult=0 for all three"
 Write-Host "`n[register-apply-cycle] Get-ScheduledTask -TaskName 'ApplyPilot *' to list what's registered." -ForegroundColor Cyan
 Write-Host "[register-apply-cycle] wrapper scripts live under $wrapperDir (regenerated on every run)." -ForegroundColor Cyan
