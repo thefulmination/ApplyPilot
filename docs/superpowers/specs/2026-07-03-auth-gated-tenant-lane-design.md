@@ -43,19 +43,27 @@ unchanged upstream of it.
   `trusted` with `clean_submits < 3` requires `--force` (prints why).
 - `applypilot tenants halt <host>` / auto-halt (see §5) sets `halted_until` end-of-day.
 
-### 3. Supervised mode (apply path)
+### 3. Supervised mode (apply path)  [AMENDED 2026-07-03 — owner decision]
 `applypilot apply --auth-gated [--tenant <host>] [--limit N]` (home box, owner present):
 - Candidate filter: normal apply-eligibility PLUS `is_auth_gated_application(url)` true PLUS
   tenant status `supervised` or `trusted` PLUS not halted PLUS under daily cap.
 - Browser runs HEADED using the owner's persistent profile (the LinkedIn profile-clone
   mechanism, pointed at the same profile so tenant sessions persist).
-- The agent prompt gains a SUPERVISED CONFIRM gate: complete the entire form, then STOP before
-  the final submit and ask the owner in the console window (`y/n` stdin prompt from the
-  launcher, not the agent): `y` → submit + `clean_submits += 1`; `n` → abandon, record
-  `failed_submits += 1` with the owner's one-line reason in last_result. The RESULT-line
-  contract is unchanged (`RESULT:APPLIED` only after a real submit).
-- If the tenant session is dead (login wall detected), the run pauses that tenant with
-  instructions to re-login; never attempts credential entry itself.
+- **NO confirm-before-submit pause.** The owner chose (2026-07-03) to drop the pause-and-confirm
+  gate in favor of a full headed apply the owner watches and can Ctrl-C to abort — the one-shot
+  agent architecture (subprocess → stdout-to-EOF) made a mid-agent pause+resume brittle, and the
+  owner's physical presence + Ctrl-C is the real safety control. The agent applies FULLY,
+  including the final submit, exactly like a normal apply. The RESULT-line contract is unchanged
+  (`RESULT:APPLIED` only after a real submit).
+- After each auth-gated apply's REAL terminal result, `record_submit(host, ok=(status=='applied'),
+  result=status)` updates the tenant's counters — `clean_submits` reflects REAL successful
+  submits ONLY (never a keystroke), which is what gates graduation to `trusted`. record_submit is
+  called EXACTLY ONCE per apply, at the real terminal, never speculatively.
+- What now distinguishes `supervised` from `trusted`: **supervised** = headed + owner launched it
+  by hand via `apply --auth-gated` (mode=supervised eligible set {supervised,trusted}); **trusted**
+  = eligible for the UNATTENDED home loop (§4). Graduation = 3 real clean submits, owner-flipped.
+- If the tenant session is dead (login wall detected mid-apply), §5's same-day halt fires for that
+  tenant; the tool never attempts credential entry itself.
 
 ### 4. Trusted mode
 Trusted tenants' jobs flow through the NORMAL home supervised-apply loop (`supervise-apply` /
@@ -68,10 +76,10 @@ inter-job throttle, plus the per-tenant daily cap and halt checks. Fleet PG push
   logged-in, identity-tied accounts): sets `halted_until`, skips the tenant's remaining jobs,
   prints loudly. Manual `tenants set` can lift early.
 - Per-tenant `daily_cap` (default 5) enforced at candidate selection, counting submits since
-  local midnight from the applications ledger.
+  UTC midnight from the applications ledger (implementation uses UTC-day, not local — see Task 1).
 - Never-double-apply guards unchanged (dedup_key + applied_at checks run before the tenant
-  filter). Every submit records `tenant_host` + mode (supervised|trusted) in the application
-  event for audit.
+  filter). Every real terminal outcome updates the tenant's clean/failed counters via
+  `record_submit` (§3) for audit + trust graduation.
 
 ## Error handling
 - `--auth-gated` with zero supervised/trusted tenants → exits 0 listing the excluded tenants
