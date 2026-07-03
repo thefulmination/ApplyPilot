@@ -31,6 +31,9 @@ CLAUDE_WALL = (
     "Claude usage limit reached. Your limit will reset at 8pm. "
     "Upgrade to continue, or try again later."
 )
+CLAUDE_SESSION_WALL = (
+    "You've hit your session limit · resets 12:40pm (America/New_York)"
+)
 
 
 def test_usage_limit_transcript_with_no_tool_calls_is_retryable():
@@ -39,6 +42,14 @@ def test_usage_limit_transcript_with_no_tool_calls_is_retryable():
     assert launcher._no_result_status(CLAUDE_WALL, tool_calls=0) == launcher.USAGE_LIMIT_STATUS
     # and it is explicitly NOT the crash-bound no_result_line status
     assert launcher._no_result_status(CODEX_SPARK_WALL, tool_calls=0) != "failed:no_result_line"
+
+
+def test_session_limit_wording_with_no_tool_calls_is_retryable():
+    """Live incident 2026-07-03: Claude CLI switched to 'session limit' wording with a
+    'resets 12:40pm (America/New_York)' reset format. The old regex only matched 'usage
+    limit', so this wall went unclassified and a worker hung silently for 4 hours."""
+    assert launcher._no_result_status(CLAUDE_SESSION_WALL, tool_calls=0) == launcher.USAGE_LIMIT_STATUS
+    assert launcher._no_result_status(CLAUDE_SESSION_WALL, tool_calls=0) != "failed:no_result_line"
 
 
 def test_usage_limit_signature_WITH_tool_calls_stays_no_result_line():
@@ -63,6 +74,8 @@ def test_is_usage_limit_signature_phrases():
         "Switch to another model",
         "try again at 8:10 PM",
         "quota exceeded for this account",
+        "You've hit your session limit",
+        "session limit reached",
     ):
         assert launcher._is_usage_limit_signature(txt) is True
     for txt in ("application submitted", "captcha challenge", "role no longer accepting", ""):

@@ -26,8 +26,12 @@ class Diagnosis:
     details: dict = field(default_factory=dict)
 
 
-_USAGE_LIMIT_RE = re.compile(r"hit your usage limit", re.IGNORECASE)
-_RESET_RE = re.compile(r"try again at\s+(\d{1,2}:\d{2}\s*[AP]M)", re.IGNORECASE)
+_USAGE_LIMIT_RE = re.compile(r"hit your (?:usage|session) limit", re.IGNORECASE)
+_RESET_RE = re.compile(
+    r"try again at\s+(\d{1,2}:\d{2}\s*[AP]M)"
+    r"|resets\s+(\d{1,2}:\d{2}\s*[ap]m)",
+    re.IGNORECASE,
+)
 _MODEL_RE = re.compile(r"usage limit for\s+([\w\-]+(?:\.[\w\-]+)*)", re.IGNORECASE)
 
 
@@ -47,7 +51,7 @@ def tier0_diagnose(ctx: WorkerCtx) -> Diagnosis | None:
         return None
     reset = _RESET_RE.search(text)
     model = _MODEL_RE.search(text)
-    reset_s = reset.group(1) if reset else "unknown"
+    reset_s = (reset.group(1) or reset.group(2)) if reset else "unknown"
     model_s = model.group(1) if model else "the agent model"
     rec = (f"Agent quota exhausted ({model_s}). RE-QUEUE these jobs (do NOT quarantine - they "
            f"were never submitted); switch the worker's model or wait until {reset_s}.")

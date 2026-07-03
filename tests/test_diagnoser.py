@@ -19,6 +19,18 @@ def test_tier0_returns_none_when_no_usage_limit():
     d = diagnoser.tier0_diagnose(WorkerCtx(worker_id="m2-3", recent_log="filling the form, clicked submit"))
     assert d is None
 
+def test_tier0_detects_session_limit_wording_with_new_reset_format():
+    # Live incident 2026-07-03: Claude CLI switched wording from "usage limit" / "try again
+    # at H:MM AM/PM" to "session limit" / "resets 12:40pm (America/New_York)". The old regex
+    # missed it entirely -- the wall went unclassified and a worker hung silently for 4h.
+    log = (FIX / "session_limit.log").read_text(encoding="utf-8")
+    d = diagnoser.tier0_diagnose(WorkerCtx(worker_id="home-0", recent_log=log))
+    assert d is not None
+    assert d.root_cause == "usage_limit"
+    assert d.source == "tier0"
+    assert d.confidence == 1.0
+    assert d.details["reset_at"] == "12:40pm"
+
 
 class _FakeLLM:
     def __init__(self, reply): self.reply = reply; self.last_messages = None
