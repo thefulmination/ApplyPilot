@@ -61,6 +61,7 @@ applypilot-fleet-linkedin = "applypilot.fleet.linkedin_worker_main:main"
 applypilot-fleet-linkedin-home = "applypilot.fleet.linkedin_home_main:main"
 applypilot-fleet-reconcile-email = "applypilot.fleet.email_reconcile_main:main"
 applypilot-fleet-otp-home = "applypilot.fleet.otp_responder_main:main"
+applypilot-fleet-deadman = "applypilot.fleet.deadman:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"

@@ -449,6 +449,15 @@ ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS ats_pause_source      TEXT;
 -- rather than latching recommend-only silently). Reset to 0 on the first non-systemic pass.
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS doctor_systemic_streak INTEGER NOT NULL DEFAULT 0;
 
+-- DeadMan monitor (Task 2): persisted alert state for the read-only fleet dead-man
+-- detector (applypilot.fleet.deadman). deadman_alert is a '|'-joined "kind: detail"
+-- summary of the currently-active alerts (NULL when healthy); deadman_alert_at is
+-- when it was last set; deadman_hot_streak persists the running_hot consecutive-check
+-- counter across invocations (deadman_check is pure and takes/returns it explicitly).
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS deadman_alert TEXT;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS deadman_alert_at TIMESTAMPTZ;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS deadman_hot_streak INTEGER NOT NULL DEFAULT 0;
+
 -- N2 (DOCTOR-OWNED, NON-SHARED ACTUATORS): two columns the Doctor SOLELY owns on a host:<h>
 -- governor scope, so the watchdog breaker (which owns min_gap_seconds/base_min_gap_seconds/
 -- breaker_state) and the Doctor never clobber each other.

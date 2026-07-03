@@ -13,9 +13,13 @@ across invocations and passing it back in as ``prev_hot_streak``.
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import os
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Thresholds (module constants -- tune here, not inline).
@@ -185,3 +189,140 @@ def deadman_check(
         alerts.append(hot_alert)
 
     return alerts, new_streak
+
+
+# ---------------------------------------------------------------------------
+# Task 2: persistence + delivery wrapper around the pure check above.
+# ---------------------------------------------------------------------------
+
+ALERT_FILENAME = "fleet-ALERT.txt"
+
+
+def _summarize(alerts: list[Alert]) -> str:
+    return " | ".join(f"{a.kind}: {a.detail}" for a in alerts)
+
+
+def _send_toast(summary: str) -> None:
+    """Best-effort Windows toast via BurntToast. Callers MUST wrap this in
+    try/except -- a missing module / non-Windows host / no PowerShell is a
+    silent no-op, not a failure of the monitor."""
+    ps_cmd = (
+        "Import-Module BurntToast -ErrorAction Stop; "
+        "New-BurntToastNotification -Text 'ApplyPilot fleet dead-man alert', "
+        f"'{summary}'"
+    )
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_cmd],
+        capture_output=True, timeout=15, check=False,
+    )
+
+
+def run_deadman(conn, *, now: dt.datetime, alert_dir: Path) -> list[Alert]:
+    """Persistence + delivery wrapper around ``deadman_check``.
+
+    Reads/persists the running_hot streak in ``fleet_config.deadman_hot_streak``,
+    writes the current alert summary to ``fleet_config.deadman_alert`` (+ _at) and
+    an ``alert_dir/fleet-ALERT.txt`` file when alerts are active, clears both when
+    healthy, and best-effort attempts a Windows toast notification. Commits its
+    own writes. Never raises on delivery failures (toast / file I/O around the
+    toast is isolated); returns the list of active alerts.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT deadman_hot_streak FROM fleet_config WHERE id=1;")
+        row = cur.fetchone()
+    prev_streak = row["deadman_hot_streak"] if row else 0
+
+    alerts, new_streak = deadman_check(conn, now=now, prev_hot_streak=prev_streak)
+
+    alert_dir = Path(alert_dir)
+    alert_path = alert_dir / ALERT_FILENAME
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET deadman_hot_streak=%s WHERE id=1;",
+            (new_streak,),
+        )
+        if alerts:
+            summary = _summarize(alerts)
+            cur.execute(
+                "UPDATE fleet_config SET deadman_alert=%s, deadman_alert_at=%s WHERE id=1;",
+                (summary, now),
+            )
+        else:
+            cur.execute(
+                "UPDATE fleet_config SET deadman_alert=NULL, deadman_alert_at=NULL WHERE id=1;",
+            )
+    conn.commit()
+
+    if alerts:
+        summary = _summarize(alerts)
+        try:
+            alert_dir.mkdir(parents=True, exist_ok=True)
+            lines = [f"ApplyPilot fleet dead-man alert -- {now.isoformat()}", ""]
+            for a in alerts:
+                lines.append(f"[{a.severity}] {a.kind}: {a.detail}")
+            alert_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass  # best-effort delivery; the DB flag is the source of truth.
+        try:
+            _send_toast(summary)
+        except Exception:
+            pass  # best-effort delivery; never let a toast failure crash the monitor.
+    else:
+        try:
+            if alert_path.exists():
+                alert_path.unlink()
+        except OSError:
+            pass
+
+    return alerts
+
+
+def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
+    p = argparse.ArgumentParser(
+        prog="applypilot-fleet-deadman",
+        description="Read-only fleet dead-man monitor: alerts on silent workers, "
+                    "a stalled queue, a dead self-healer, or a hot cost streak.",
+    )
+    p.add_argument(
+        "--dsn",
+        default=os.environ.get("FLEET_PG_DSN") or os.environ.get("APPLYPILOT_FLEET_DSN"),
+    )
+    p.add_argument(
+        "--alert-dir",
+        default=os.path.join(os.environ.get("LOCALAPPDATA", ""), "ApplyPilot"),
+    )
+    p.add_argument("--once", action="store_true", default=True,
+                    help="run a single pass and exit (default; the scheduled task "
+                         "triggers this once per cadence)")
+    args = p.parse_args(argv)
+
+    if not args.dsn:
+        print("[fleet-deadman] no --dsn / FLEET_PG_DSN / APPLYPILOT_FLEET_DSN set", flush=True)
+        return 1
+
+    from applypilot.apply import pgqueue
+    from applypilot.fleet.schema import ensure_schema_v3
+
+    try:
+        with pgqueue.connect(args.dsn) as conn:
+            ensure_schema_v3(conn)
+            alerts = run_deadman(
+                conn, now=dt.datetime.now(dt.timezone.utc), alert_dir=Path(args.alert_dir),
+            )
+    except Exception as exc:  # pragma: no cover - defensive: a monitor must not
+        # error-spam Task Scheduler. Only a connection/infra failure gets here
+        # (run_deadman itself swallows delivery errors); print + exit 0 so the
+        # scheduled task doesn't show a permanent red X for a transient DB blip.
+        print(f"[fleet-deadman] check failed: {exc}", flush=True)
+        return 0
+
+    if alerts:
+        print(f"[fleet-deadman] ALERT: {_summarize(alerts)}", flush=True)
+    else:
+        print("[fleet-deadman] healthy", flush=True)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
