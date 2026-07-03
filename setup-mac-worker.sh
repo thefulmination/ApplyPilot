@@ -77,6 +77,11 @@ unset PG_PW
 mkdir -p "$INSTALL_DIR/.applypilot" "$INSTALL_DIR/logs"
 ENV_FILE="$INSTALL_DIR/.applypilot/fleet-worker.env"
 CLAUDE_BIN="$(command -v claude || true)"
+if [ -z "$CLAUDE_BIN" ]; then
+  say "WARNING: 'claude' CLI not found on PATH after npm install -g."
+  say "  The worker falls back to a PATH lookup at runtime, but if that also fails, applies will not run."
+  say "  Check 'npm bin -g' is on PATH, then re-run this script (safe to re-run)."
+fi
 # Values are QUOTED: this file is sourced by bash (set -a; . file), and unquoted
 # spaces (the DSN, GIT_SSH_COMMAND) would be parsed as commands.
 cat > "$ENV_FILE" <<EOF
