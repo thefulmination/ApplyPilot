@@ -7,9 +7,13 @@ the seconds between answer and consume, is single-use, and is NEVER logged. Gmai
 is read only by ``answer_pending`` (home box). See the 2026-07-03 relay spec."""
 from __future__ import annotations
 
+import datetime as _dt
 import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
+
+from applypilot import inbox_auth
 
 
 @dataclass(frozen=True)
@@ -69,3 +73,84 @@ def poll_for_code(conn, request_id: int, *, timeout_seconds: int = 300,
         if time.monotonic() >= deadline:
             return None
         time.sleep(max(0.0, poll_seconds))
+
+
+def _parse_email_dt(raw):
+    """Parse an RFC2822 'Date' header to an aware UTC datetime, or None."""
+    if not raw:
+        return None
+    try:
+        d = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if d is None:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    return d.astimezone(_dt.timezone.utc)
+
+
+def answer_pending(conn, gmail_service, *, window_minutes: int = 15,
+                   max_messages: int = 25, skew_seconds: int = 60,
+                   answered_ttl_seconds: int = 120) -> int:
+    """Read Gmail ONCE and answer every pending request whose code arrived after it.
+
+    Home box only (this is the sole function that touches Gmail). Time-based match:
+    a candidate fits a request when its email arrived >= requested_at - skew. Each
+    message_id is assigned to at most one request. The code is NEVER logged."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, requested_at FROM otp_request "
+            "WHERE code IS NULL AND consumed_at IS NULL "
+            "      AND (expires_at IS NULL OR expires_at > now()) "
+            "ORDER BY requested_at"
+        )
+        pending = cur.fetchall()
+    if not pending:
+        return 0
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=gmail_service, minutes=window_minutes, max_messages=max_messages)
+    # Newest first so the freshest code goes to the oldest waiting request.
+    parsed = [(m, _parse_email_dt(m.received_at)) for m in matches]
+    parsed = [(m, ts) for (m, ts) in parsed if ts is not None]
+    parsed.sort(key=lambda mt: mt[1], reverse=True)
+
+    used_messages: set = set()
+    answered = 0
+    for req in pending:
+        req_floor = req["requested_at"] - _dt.timedelta(seconds=skew_seconds)
+        chosen = None
+        for m, ts in parsed:
+            if m.message_id in used_messages:
+                continue
+            if ts >= req_floor:
+                chosen = m
+                break
+        if chosen is None:
+            continue
+        used_messages.add(chosen.message_id)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE otp_request SET code=%s, code_kind=%s, matched_email_ts=%s, "
+                "answered_at=now(), expires_at = now() + make_interval(secs => %s) "
+                "WHERE id=%s AND code IS NULL AND consumed_at IS NULL",
+                (chosen.candidate.value, chosen.candidate.kind,
+                 _parse_email_dt(chosen.received_at), answered_ttl_seconds, req["id"]),
+            )
+            if cur.rowcount:
+                answered += 1
+        conn.commit()
+    return answered
+
+
+def purge_expired(conn) -> int:
+    """Null the code on expired/consumed rows so no code lingers; keep the audit row."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE otp_request SET code = NULL "
+            "WHERE code IS NOT NULL AND expires_at IS NOT NULL AND expires_at <= now()"
+        )
+        n = cur.rowcount
+    conn.commit()
+    return n
