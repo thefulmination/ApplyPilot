@@ -1110,11 +1110,18 @@ USAGE_LIMIT_STATUS = "failed:usage_limit"
 # case-insensitively as substrings. "hit your usage limit" deliberately avoids the
 # you've/you’ve apostrophe variants. Covers Codex-Spark ("You've hit your usage limit / Try
 # again at <time> / Switch to another model") and Claude (usage/weekly/5-hour limit).
+# 2026-07-03: Claude CLI switched wording to "hit your SESSION limit ... resets <time>" --
+# the old "usage limit"-only signatures missed it entirely and a worker hung silently for 4h
+# because the wall was never classified. Both wordings are matched below.
 _USAGE_LIMIT_SIGNATURES = (
     "hit your usage limit",
+    "hit your session limit",
     "usage limit reached",
+    "session limit reached",
     "reached your usage limit",
+    "reached your session limit",
     "usage limit exceeded",
+    "session limit exceeded",
     "exceeded your usage limit",
     "hit your weekly limit",
     "weekly limit reached",
@@ -1582,6 +1589,38 @@ def _inbox_auth_enabled() -> bool:
     }
 
 
+def _inbox_auth_mode() -> str:
+    """'relay' (ask the fleet for the code) or 'local' (read Gmail here, default)."""
+    return os.environ.get("APPLYPILOT_INBOX_AUTH_MODE", "local").strip().lower()
+
+
+def _relay_inbox_auth_hint(job: dict) -> str | None:
+    """Remote-worker path: get the verification code from the fleet OTP relay."""
+    try:
+        from applypilot.apply import pgqueue
+        from applypilot.fleet import otp_relay
+
+        dsn = os.environ.get("FLEET_PG_DSN")
+        if not dsn:
+            return None
+        worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
+        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
+        poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        apply_target = job.get("application_url") or job["url"]
+        with pgqueue.connect(dsn) as conn:
+            rid = otp_relay.request_code(conn, worker_id=worker_id, job_url=job["url"],
+                                         application_url=apply_target, ttl_seconds=timeout)
+            code = otp_relay.poll_for_code(conn, rid, timeout_seconds=timeout, poll_seconds=poll)
+        if code is None:
+            return None
+        if code.kind == "magic_link":
+            return f"magic_link={code.value}\nsource=fleet_relay"
+        return f"code={code.value}\nsource=fleet_relay"
+    except Exception:
+        logger.debug("Relay inbox auth failed", exc_info=True)
+        return None
+
+
 def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
     if match.candidate.kind == "magic_link":
         return f"magic_link={match.candidate.value}\nreason={'; '.join(match.reasons)}"
@@ -1596,6 +1635,10 @@ def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
 
 def _poll_inbox_auth_hint(job: dict) -> str | None:
     """Poll Gmail once for a likely verification code/magic-link for a given job."""
+    if not _inbox_auth_enabled():
+        return None
+    if _inbox_auth_mode() == "relay":
+        return _relay_inbox_auth_hint(job)
     try:
         from urllib.parse import urlparse
 
