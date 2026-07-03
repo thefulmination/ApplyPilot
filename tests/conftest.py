@@ -113,6 +113,9 @@ def fleet_db(fleet_pg):
                         "ats_paused=FALSE, ats_pause_source=NULL, doctor_budget_day=NULL, "
                         "doctor_host_skips_today=0, doctor_pace_actions_today=0, "
                         "doctor_last_pass_at=NULL, doctor_pause_armed_at=NULL, "
-                        "doctor_systemic_streak=0 WHERE id=1;")
+                        "doctor_systemic_streak=0, "
+                        # DeadMan (autonomous-apply Tasks 1-4) -- reset per test.
+                        "deadman_alert=NULL, deadman_alert_at=NULL, deadman_hot_streak=0 "
+                        "WHERE id=1;")
         conn.commit()
     return fleet_pg
