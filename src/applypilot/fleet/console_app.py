@@ -1111,7 +1111,7 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 self._send_json(200, build_challenges())
             except Exception as e:
-                self._send_json(503, {"error": str(e)})
+                self._send_json(500, {"error": str(e)})   # match sibling GET routes
             return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs
