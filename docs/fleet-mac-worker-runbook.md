@@ -48,7 +48,8 @@ UNCHECKED** → Add.
    Keys land ONLY in `~/applypilot-fleet/.applypilot/fleet-worker.env` and
    `~/.pgpass`, both `chmod 600`.
 3. Sanity: `launchctl list | grep applypilot` shows the agent;
-   `tail -f ~/applypilot-fleet/logs/wrapper.log` shows `worker started`.
+   `tail -f ~/applypilot-fleet/logs/wrapper.log ~/applypilot-fleet/.applypilot/logs/worker-0.log`
+   shows `worker started` (wrapper.log) and the live apply-agent transcript (worker-0.log).
 
 ## D. Canary go-live (home box)
 
@@ -85,9 +86,10 @@ only when `pyproject.toml` changed. Force it immediately: on the Mac,
 
 | Symptom | Check |
 |---|---|
-| No heartbeat row for `mac-0` | Mac on? `launchctl list \| grep applypilot`; `logs/wrapper.log` |
+| No heartbeat row for `mac-0` | Mac on? `launchctl list \| grep applypilot`; `logs/wrapper.log`; also check `logs/wrapper.err.log` (launchd load failures surface ONLY there) |
 | `FATAL: no Playwright chromium` in wrapper.log | Re-run `PLAYWRIGHT_BROWSERS_PATH=~/applypilot-fleet/.playwright-browsers ~/applypilot-fleet/.venv/bin/python -m playwright install chromium` |
 | PG connect fails | `tailscale ping <home-ts-ip>` from the Mac; pg_hba rule + firewall rule on home box (`setup-fleet-pg-tailscale.ps1` re-run is safe) |
 | Applies fail with missing profile/resume | Re-run runbook A.4 (asset push), then on the Mac delete `~/applypilot-fleet/.applypilot/profile.json` and re-run `setup-mac-worker.sh` step or copy manually |
 | Worker never updates | `git -C ~/applypilot-fleet fetch origin <branch>` by hand — deploy key revoked? branch deleted? |
 | Gmail/OTP challenges park as auth_challenge | Expected: `APPLYPILOT_ENABLE_GMAIL_MCP=0` on the Mac v1 (no Gmail OAuth creds there). Resolve challenges from the console, or copy Gmail creds + set the flag to 1 later. |
+| Worker throttled oddly / shares limits | `wrapper.log` "egress=" line shows `0.0.0.0` → the boot-time `curl api.ipify.org` failed and the Mac fell into the shared 0.0.0.0 governor bucket; restart the agent (`launchctl kickstart -k gui/$(id -u)/com.applypilot.fleetworker`) once the network is up |

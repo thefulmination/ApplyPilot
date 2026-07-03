@@ -289,11 +289,13 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
-    install_stop_handler()
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
                             model=args.model, agent=args.agent, machine_owner=args.machine_owner,
                             slot=slot)
+    # AFTER build_apply_loop: the launcher import inside it installs its own SIGTERM
+    # handler (launcher.py); ours must be the LAST writer or the drain kills mid-apply.
+    install_stop_handler()
     run_apply(lambda: pgqueue.connect(args.dsn), loop)
     return 0

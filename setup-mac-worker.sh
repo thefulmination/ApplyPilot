@@ -45,7 +45,8 @@ echo ""
 cat "$KEY.pub"
 read -r _
 GIT_SSH="ssh -i $KEY -o IdentitiesOnly=yes"
-printf 'Branch to run [main]: '; read -r BRANCH; BRANCH="${BRANCH:-main}"
+printf 'Branch to run [applypilot-hardening-and-brainstorm-integration]: '; read -r BRANCH
+BRANCH="${BRANCH:-applypilot-hardening-and-brainstorm-integration}"
 if [ ! -d "$INSTALL_DIR/.git" ]; then
   say "Cloning $REPO_SSH ($BRANCH) -> $INSTALL_DIR"
   GIT_SSH_COMMAND="$GIT_SSH" git clone --branch "$BRANCH" "$REPO_SSH" "$INSTALL_DIR"
@@ -82,28 +83,30 @@ if [ -z "$CLAUDE_BIN" ]; then
   say "  The worker falls back to a PATH lookup at runtime, but if that also fails, applies will not run."
   say "  Check 'npm bin -g' is on PATH, then re-run this script (safe to re-run)."
 fi
-# Values are QUOTED: this file is sourced by bash (set -a; . file), and unquoted
-# spaces (the DSN, GIT_SSH_COMMAND) would be parsed as commands.
+# Values are LITERAL-QUOTED (single quotes in the WRITTEN file): this file is sourced
+# by bash (set -a; . file), and a value containing $ or backticks (e.g. a future
+# API-key format) must not re-expand at source time. The heredoc below still expands
+# each $VAR ONCE at write time (unquoted heredoc delimiter); only the output is single-quoted.
 cat > "$ENV_FILE" <<EOF
-FLEET_PG_DSN="$DSN"
-APPLYPILOT_FLEET_DSN="$DSN"
-APPLYPILOT_DIR="$INSTALL_DIR/.applypilot"
-PLAYWRIGHT_BROWSERS_PATH="$INSTALL_DIR/.playwright-browsers"
-APPLYPILOT_DB_PATH="/tmp/fleet_apply_throwaway_0.db"
-APPLYPILOT_ENABLE_GMAIL_MCP="0"
-APPLYPILOT_AGENT_TIMEOUT="600"
-ANTHROPIC_API_KEY="$ANTHROPIC_KEY"
-DEEPSEEK_API_KEY="$DEEPSEEK_KEY"
-CLAUDE_PATH="$CLAUDE_BIN"
-WORKER_LABEL="mac"
-WORKER_SLOT="0"
-WORKER_AGENT="claude"
-WORKER_MODEL="sonnet"
-FLEET_MACHINE_OWNER="mac-$(hostname -s)"
-APPLYPILOT_BRANCH="$BRANCH"
-UPDATE_CHECK_SECONDS="21600"
-RESTART_BACKOFF_SECONDS="30"
-GIT_SSH_COMMAND="$GIT_SSH"
+FLEET_PG_DSN='$DSN'
+APPLYPILOT_FLEET_DSN='$DSN'
+APPLYPILOT_DIR='$INSTALL_DIR/.applypilot'
+PLAYWRIGHT_BROWSERS_PATH='$INSTALL_DIR/.playwright-browsers'
+APPLYPILOT_DB_PATH='/tmp/fleet_apply_throwaway_0.db'
+APPLYPILOT_ENABLE_GMAIL_MCP='0'
+APPLYPILOT_AGENT_TIMEOUT='600'
+ANTHROPIC_API_KEY='$ANTHROPIC_KEY'
+DEEPSEEK_API_KEY='$DEEPSEEK_KEY'
+CLAUDE_PATH='$CLAUDE_BIN'
+WORKER_LABEL='mac'
+WORKER_SLOT='0'
+WORKER_AGENT='claude'
+WORKER_MODEL='sonnet'
+FLEET_MACHINE_OWNER='mac-$(hostname -s)'
+APPLYPILOT_BRANCH='$BRANCH'
+UPDATE_CHECK_SECONDS='21600'
+RESTART_BACKOFF_SECONDS='30'
+GIT_SSH_COMMAND='$GIT_SSH'
 EOF
 chmod 600 "$ENV_FILE"
 unset ANTHROPIC_KEY DEEPSEEK_KEY

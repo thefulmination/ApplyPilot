@@ -53,3 +53,15 @@ def test_run_apply_exits_immediately_if_stop_already_requested(monkeypatch):
     loop.run_once.assert_not_called()
     assert counts == {"applied": 0, "halted": 0, "idle": 0, "error": 0}
     awm._STOP_REQUESTED.clear()
+
+
+def test_stop_handler_survives_launcher_import():
+    """launcher.py installs its own SIGTERM handler at import time (non-Windows).
+    install_stop_handler must be called AFTER that import (main() does) so the
+    graceful handler is the last writer; this pins getsignal to request_stop."""
+    import signal
+
+    from applypilot.apply import launcher  # noqa: F401 - the handler-installing import
+
+    awm.install_stop_handler()
+    assert signal.getsignal(signal.SIGTERM) is awm.request_stop
