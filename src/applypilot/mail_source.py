@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass
 from email.header import decode_header
 from email.message import Message
+from typing import Any, Protocol
 
 
 @dataclass
@@ -185,3 +186,77 @@ def _extract_raw_bytes(fetch_data) -> bytes | None:
             if isinstance(candidate, bytes):
                 return candidate
     return None
+
+
+class MailSource(Protocol):
+    """Structural type for a mail source: anything with a matching .fetch()."""
+
+    def fetch(self, *, since_days: int, max_messages: int) -> list[MailMessage]:
+        ...
+
+
+def _gmail_headers(payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        h["name"].lower(): h["value"]
+        for h in payload.get("headers", [])
+    }
+
+
+class GmailApiMailSource:
+    """Backward-compat Gmail read access via the OAuth-backed Gmail API.
+
+    Fallback path used when no IMAP app password is configured (see
+    get_mail_source() below). The OAuth token this depends on expires every
+    7 days for unverified apps -- ImapMailSource is the permanent successor.
+    """
+
+    def __init__(self, build_service=None):
+        if build_service is None:
+            from applypilot.gmail_outcomes import build_gmail_service
+
+            build_service = build_gmail_service
+        self._build_service = build_service
+
+    def fetch(self, *, since_days: int, max_messages: int) -> list[MailMessage]:
+        from applypilot.gmail_outcomes import _get_text_body
+
+        service = self._build_service()
+        resp = (
+            service.users()
+            .messages()
+            .list(userId="me", q=f"newer_than:{since_days}d", maxResults=max_messages)
+            .execute()
+        )
+
+        messages: list[MailMessage] = []
+        for ref in resp.get("messages", []):
+            msg = (
+                service.users()
+                .messages()
+                .get(userId="me", id=ref["id"], format="full")
+                .execute()
+            )
+            payload = msg.get("payload", {})
+            headers = _gmail_headers(payload)
+            messages.append(
+                MailMessage(
+                    id=ref["id"],
+                    thread_id=ref.get("threadId", ref["id"]),
+                    subject=headers.get("subject", ""),
+                    sender=headers.get("from", ""),
+                    date=headers.get("date", ""),
+                    body=_get_text_body(payload),
+                )
+            )
+        return messages
+
+
+def get_mail_source() -> MailSource:
+    """Pick the mail source backend: IMAP (permanent, app-password-backed) when
+    configured, else the legacy OAuth-backed Gmail API path."""
+    from applypilot import config
+
+    creds = config.load_gmail_app_password()
+    if creds:
+        return ImapMailSource(creds[0], creds[1])
+    return GmailApiMailSource()
