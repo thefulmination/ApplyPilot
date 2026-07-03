@@ -29,10 +29,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hmac
+import http.cookies
 import ipaddress
 import json
 import math
 import os
+import secrets
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -899,6 +902,49 @@ def resolve_host(requested: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Mutation token gate (audit finding: the console had zero auth). Every POST
+# /api/action must present the token via X-Console-Token header or the
+# console_token cookie. GET / can arm the cookie one time via ?token=<t>.
+# NEVER print or log the token except the one arm-URL line at startup.
+# ---------------------------------------------------------------------------
+_CACHED_TOKEN: str | None = None
+_TOKEN_COOKIE_NAME = "console_token"
+_TOKEN_HEADER_NAME = "X-Console-Token"
+
+
+def get_console_token() -> str:
+    """Returns APPLYPILOT_CONSOLE_TOKEN if set, else a process-cached random token
+    generated once via secrets.token_urlsafe(24)."""
+    global _CACHED_TOKEN
+    env_tok = os.environ.get("APPLYPILOT_CONSOLE_TOKEN")
+    if env_tok:
+        return env_tok
+    if _CACHED_TOKEN is None:
+        _CACHED_TOKEN = secrets.token_urlsafe(24)
+    return _CACHED_TOKEN
+
+
+def _token_ok(handler: Any) -> bool:
+    """Checks the request's X-Console-Token header, falling back to the
+    console_token cookie, against get_console_token() via a constant-time compare."""
+    expected = get_console_token()
+    header_tok = handler.headers.get(_TOKEN_HEADER_NAME)
+    if header_tok and hmac.compare_digest(header_tok, expected):
+        return True
+    cookie_header = handler.headers.get("Cookie")
+    if cookie_header:
+        jar = http.cookies.SimpleCookie()
+        try:
+            jar.load(cookie_header)
+        except Exception:
+            return False
+        morsel = jar.get(_TOKEN_COOKIE_NAME)
+        if morsel and hmac.compare_digest(morsel.value, expected):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class _Handler(BaseHTTPRequestHandler):
@@ -925,6 +971,18 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path == "/":
+            import urllib.parse as _up
+            qs = _up.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            tok = (qs.get("token") or [None])[0]
+            if tok and hmac.compare_digest(tok, get_console_token()):
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header(
+                    "Set-Cookie", f"{_TOKEN_COOKIE_NAME}={tok}; HttpOnly; Path=/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._send(200, _INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/api/status":
@@ -971,6 +1029,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not _token_ok(self):
+            self._send_json(401, {"ok": False, "error": "bad token"})
+            return
         path = self.path.split("?", 1)[0]
         if path != "/api/action":
             self._send_json(404, {"error": "not found"})
@@ -1527,6 +1588,8 @@ def main(argv=None) -> int:
     # Do NOT print the DSN or any secret -- only the LAN URL the owner should open.
     print(f"ApplyPilot fleet console (LAN-only) -> http://{host}:{args.port}")
     print("Open this from a machine on your LAN. Do NOT port-forward it.")
+    print(f"One-tap arm URL (sets the mutation-auth cookie): "
+          f"http://{host}:{args.port}/?token={get_console_token()}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
