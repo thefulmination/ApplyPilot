@@ -111,41 +111,27 @@ def upsert_email_event(conn, row: dict, *, reextract: bool = False) -> str:
 def _gmail_fetch(
     days: int, credentials_path: Path | None, max_messages: int = 200
 ) -> Callable[[], list[dict]]:
-    """Default fetch: pull up to `max_messages` candidate messages from Gmail
-    (read-only), paginating with nextPageToken (a Gmail page maxes at 500).
-    Returns a thunk so the network call is deferred until scan time."""
+    """Default fetch: pull up to `max_messages` candidate messages via the
+    configured mail source (IMAP app-password when set, else the legacy
+    OAuth-backed Gmail API -- see mail_source.get_mail_source()).
+    Returns a thunk so the network call is deferred until scan time.
+
+    `credentials_path` is retained for signature back-compat; it only has an
+    effect on the legacy Gmail-API fallback path (ignored under IMAP)."""
     def _fetch() -> list[dict]:
-        from applypilot.gmail_outcomes import build_gmail_service, _get_text_body, _search_query
-        service = build_gmail_service(credentials_path=credentials_path)
-        query = _search_query(days)
-        out: list[dict] = []
-        page_token: str | None = None
-        while len(out) < max_messages:
-            resp = service.users().messages().list(
-                userId="me", q=query,
-                maxResults=min(500, max_messages - len(out)),
-                pageToken=page_token,
-            ).execute()
-            for ref in resp.get("messages", []):
-                tid = ref.get("threadId", ref["id"])
-                full = service.users().messages().get(
-                    userId="me", id=ref["id"], format="full"
-                ).execute()
-                headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
-                out.append({
-                    "message_id": ref["id"],
-                    "thread_id": tid,
-                    "subject": headers.get("subject", ""),
-                    "sender": headers.get("from", ""),
-                    "date": headers.get("date", ""),
-                    "body": _get_text_body(full.get("payload", {})),
-                })
-                if len(out) >= max_messages:
-                    break
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-        return out
+        from applypilot.mail_source import get_mail_source
+        msgs = get_mail_source().fetch(since_days=days, max_messages=max_messages)
+        return [
+            {
+                "message_id": m.id,
+                "thread_id": m.thread_id,
+                "subject": m.subject,
+                "sender": m.sender,
+                "date": m.date,
+                "body": m.body,
+            }
+            for m in msgs
+        ]
     return _fetch
 
 

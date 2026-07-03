@@ -1,6 +1,7 @@
 # tests/test_outcome_scan.py
 import applypilot.outcome_scan as S
 from applypilot import database
+from applypilot.mail_source import MailMessage
 
 
 class FakeClient:
@@ -118,3 +119,68 @@ def test_scan_persists_quarantine_columns(tmp_path):
     assert row["job_url"] is None
     assert row["match_status"] == "needs_review"
     assert row["match_reason"] == "predates_application"
+
+
+class FakeMailSource:
+    """Stand-in for mail_source.MailSource: returns a fixed list of MailMessage."""
+    def __init__(self, messages): self._messages = messages
+    def fetch(self, *, since_days, max_messages): return self._messages
+
+
+def test_gmail_fetch_default_maps_mail_source_messages(monkeypatch):
+    """_gmail_fetch's default thunk routes through get_mail_source() and maps
+    MailMessage -> the {message_id,thread_id,subject,sender,date,body} dict shape."""
+    mail_msg = MailMessage(
+        id="m1", thread_id="t1",
+        subject="Update on your application to Acme",
+        sender="Acme Careers <careers@acme.com>",
+        date="Wed, 03 Jun 2026 10:00:00 +0000",
+        body="We went with another candidate.",
+    )
+    fake_source = FakeMailSource([mail_msg])
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: fake_source
+    )
+
+    fetch = S._gmail_fetch(30, None, max_messages=200)
+    out = fetch()
+
+    assert out == [{
+        "message_id": "m1",
+        "thread_id": "t1",
+        "subject": "Update on your application to Acme",
+        "sender": "Acme Careers <careers@acme.com>",
+        "date": "Wed, 03 Jun 2026 10:00:00 +0000",
+        "body": "We went with another candidate.",
+    }]
+
+
+def test_scan_outcomes_default_fetch_routes_through_mail_source(tmp_path, monkeypatch):
+    """End-to-end: scan_outcomes with NO fetch_messages injection (the default
+    path) still classifies + persists a message coming from get_mail_source()."""
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed_applied_job(conn)
+    monkeypatch.setattr(S, "get_connection", lambda: conn)
+
+    mail_msg = MailMessage(
+        id="m-rej-1", thread_id="t-rej-1",
+        subject="Update on your application to Acme",
+        sender="Acme Careers <careers@acme.com>",
+        date="Wed, 03 Jun 2026 10:00:00 +0000",
+        body="We went with another candidate.",
+    )
+    fake_source = FakeMailSource([mail_msg])
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: fake_source
+    )
+
+    reply = '{"stage":"rejected","outcome":"rejected","reason":"chose another candidate","title":"Quant Analyst","company":"Acme","confidence":"high"}'
+    counts = S.scan_outcomes(client=FakeClient(reply), conn=conn)
+
+    assert counts["inserted"] == 1
+    row = conn.execute(
+        "SELECT stage, outcome, sender_domain FROM email_events WHERE message_id='m-rej-1'"
+    ).fetchone()
+    assert row["stage"] == "rejected"
+    assert row["outcome"] == "rejected"
+    assert row["sender_domain"] == "acme.com"

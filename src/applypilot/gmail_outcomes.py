@@ -937,34 +937,35 @@ def scan_inbox(
     max_messages: int = 200,
     min_confidence: str = "low",
 ) -> list[EmailOutcome]:
-    """Scan Gmail for application-related emails and classify outcomes.
+    """Scan for application-related emails and classify outcomes.
 
-    Requires optional deps: google-auth-oauthlib google-api-python-client
-    On first run, opens a browser for OAuth consent (read-only scope).
+    Fetches via the configured mail source (IMAP app-password when set, else
+    the legacy OAuth-backed Gmail API -- see mail_source.get_mail_source()).
+    `credentials_path`/`token_path` are retained for signature back-compat;
+    they only have an effect on the legacy Gmail-API fallback path (ignored
+    under IMAP).
+
+    Requires optional deps for the legacy Gmail-API fallback path:
+    google-auth-oauthlib google-api-python-client. On first run of that path,
+    opens a browser for OAuth consent (read-only scope).
 
     Args:
         days:             How many days back to search.
-        credentials_path: Path to OAuth client secrets JSON.
-                          Defaults to ~/.applypilot/gmail_credentials.json.
-        token_path:       Path to cached token JSON.
-                          Defaults to ~/.applypilot/gmail_token.json.
+        credentials_path: Path to OAuth client secrets JSON (legacy Gmail-API
+                          fallback only). Defaults to
+                          ~/.applypilot/gmail_credentials.json.
+        token_path:       Path to cached token JSON (legacy Gmail-API
+                          fallback only). Defaults to
+                          ~/.applypilot/gmail_token.json.
         max_messages:     Safety cap on messages fetched.
         min_confidence:   Drop results below this level ("low"|"medium"|"high").
 
     Returns:
         List of EmailOutcome objects (one per thread).
     """
-    service = build_gmail_service(
-        credentials_path=credentials_path,
-        token_path=token_path,
-    )
+    from applypilot.mail_source import get_mail_source
 
-    query = _search_query(days)
-    log.info("Gmail query: %s", query)
-    resp = service.users().messages().list(
-        userId="me", q=query, maxResults=max_messages
-    ).execute()
-    messages = resp.get("messages", [])
+    messages = get_mail_source().fetch(since_days=days, max_messages=max_messages)
     log.info("Fetching %d candidate message(s)", len(messages))
 
     applied_jobs = get_applied_jobs()
@@ -973,28 +974,16 @@ def scan_inbox(
     results: list[EmailOutcome] = []
     seen_threads: set[str] = set()
 
-    for ref in messages:
-        thread_id = ref.get("threadId", ref["id"])
+    for mail_msg in messages:
+        thread_id = mail_msg.thread_id or mail_msg.id
         if thread_id in seen_threads:
             continue  # one result per thread
         seen_threads.add(thread_id)
 
-        try:
-            msg = service.users().messages().get(
-                userId="me", id=ref["id"], format="full"
-            ).execute()
-        except Exception as exc:
-            log.warning("Could not fetch message %s: %s", ref["id"], exc)
-            continue
-
-        headers = {
-            h["name"].lower(): h["value"]
-            for h in msg.get("payload", {}).get("headers", [])
-        }
-        subject = headers.get("subject", "")
-        sender = headers.get("from", "")
-        date = headers.get("date", "")
-        body = _get_text_body(msg.get("payload", {}))
+        subject = mail_msg.subject
+        sender = mail_msg.sender
+        date = mail_msg.date
+        body = mail_msg.body
 
         outcome, confidence, signals = classify_email_outcome(subject, body, sender)
 
@@ -1005,13 +994,13 @@ def scan_inbox(
         if _CONFIDENCE_RANK.get(confidence, 0) < min_rank:
             continue
 
-        m = match_email_to_job(
+        match_result = match_email_to_job(
             sender, subject, body, applied_jobs, occurred_at=_occurred_at_iso(date)
         )
-        matched, method, score = m.astuple()
+        matched, method, score = match_result.astuple()
 
         results.append(EmailOutcome(
-            message_id=ref["id"],
+            message_id=mail_msg.id,
             date=date,
             sender=sender,
             subject=subject,
