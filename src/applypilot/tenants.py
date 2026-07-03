@@ -156,9 +156,12 @@ def is_halted(conn: sqlite3.Connection, host: str, now_iso: str) -> bool:
     """True if the tenant has a halted_until timestamp that is still in the
     future relative to now_iso (ISO-8601 strings compare lexicographically
     when in the same, zero-padded format)."""
-    row = conn.execute(
-        "SELECT halted_until FROM ats_tenants WHERE host = ?", (host,)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT halted_until FROM ats_tenants WHERE host = ?", (host,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False  # pre-migration brain: not halted (mirrors tenant_status/daily_cap)
     if row is None:
         return False
     halted_until = row["halted_until"] if isinstance(row, sqlite3.Row) else row[0]
