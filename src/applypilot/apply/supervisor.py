@@ -63,6 +63,20 @@ def _apply_cost_total() -> float:
         return -1.0
 
 
+_ORPHAN_PATTERN = "_npx|playwright|modelcontextprotocol|@playwright"
+
+
+def _orphan_kill_cmd() -> list[str]:
+    """Platform command to kill orphaned Playwright-MCP node servers. Matched by command
+    line so the desktop app / unrelated node processes are never touched."""
+    if sys.platform == "win32":
+        return ["powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+                f"Where-Object {{ $_.CommandLine -match '{_ORPHAN_PATTERN}' }} | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"]
+    return ["pkill", "-f", _ORPHAN_PATTERN]
+
+
 def _cleanup_orphans(log) -> None:
     """Between attempts: free the CDP port (kill any leftover Chrome) and kill orphaned
     Playwright-MCP node servers so a fresh agent can't be hijacked. A hard-killed run
@@ -75,10 +89,7 @@ def _cleanup_orphans(log) -> None:
     # command line so we never touch the desktop app or unrelated node processes.
     try:
         subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-             "Where-Object { $_.CommandLine -match '_npx|playwright|modelcontextprotocol|@playwright' } | "
-             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+            _orphan_kill_cmd(),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
         )
     except Exception:
