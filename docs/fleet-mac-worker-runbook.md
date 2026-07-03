@@ -91,5 +91,5 @@ only when `pyproject.toml` changed. Force it immediately: on the Mac,
 | PG connect fails | `tailscale ping <home-ts-ip>` from the Mac; pg_hba rule + firewall rule on home box (`setup-fleet-pg-tailscale.ps1` re-run is safe) |
 | Applies fail with missing profile/resume | Re-run runbook A.4 (asset push), then on the Mac delete `~/applypilot-fleet/.applypilot/profile.json` and re-run `setup-mac-worker.sh` step or copy manually |
 | Worker never updates | `git -C ~/applypilot-fleet fetch origin <branch>` by hand — deploy key revoked? branch deleted? |
-| Gmail/OTP challenges park as auth_challenge | Expected: `APPLYPILOT_ENABLE_GMAIL_MCP=0` on the Mac v1 (no Gmail OAuth creds there). Resolve challenges from the console, or copy Gmail creds + set the flag to 1 later. |
+| Email-verification jobs fail/park | The Mac now uses the fleet OTP relay (`APPLYPILOT_INBOX_AUTH_MODE=relay`). Ensure `applypilot-fleet-otp-home` is running on the home box — see docs/fleet-otp-relay-runbook.md. |
 | Worker throttled oddly / shares limits | `wrapper.log` "egress=" line shows `0.0.0.0` → the boot-time `curl api.ipify.org` failed and the Mac fell into the shared 0.0.0.0 governor bucket; restart the agent (`launchctl kickstart -k gui/$(id -u)/com.applypilot.fleetworker`) once the network is up |
