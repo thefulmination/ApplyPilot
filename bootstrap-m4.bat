@@ -22,6 +22,9 @@ git stash
 git pull
 
 echo.
+echo === [2a/3] hydrating Gmail MCP creds (email-verification) from Postgres ===
+for %%P in ("C:\ApplyPilot\.venv\Scripts\python.exe" "C:\ApplyPilot\.conda-env\python.exe") do if exist %%P %%P "C:\ApplyPilot\hydrate-gmail.py"
+
 echo === [2/3] registering m4 fleet tasks (FleetAgent + ComputeScore) ===
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\ApplyPilot\register-fleet-tasks.ps1" -Machine m4
 

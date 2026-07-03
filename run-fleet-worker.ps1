@@ -1,5 +1,5 @@
-# run-fleet-worker.ps1 [-Slot N] [-Agent claude|codex|deepseek] [-Model name] [-Label name]
-#                      [-FallbackAgent "codex,deepseek"]
+# run-fleet-worker.ps1 [-Slot N] [-Agent claude|codex] [-Model name] [-Label name]
+#                      [-FallbackAgent "codex"]
 #   Launch ONE offsite apply worker. Use a DISTINCT -Slot per worker on the same machine
 #   (slot keys the browser profile + CDP port + logs so they don't collide).
 #   Use a DISTINCT -Label per MACHINE (home box = "home", second box = e.g. "m2") so the
@@ -9,10 +9,9 @@
 #   Requires FLEET_PG_DSN already set (the setup script persists it). LinkedIn never runs here.
 #
 #   -FallbackAgent: an ordered chain the worker switches to when -Agent hits its usage/session
-#   limit (each an INDEPENDENT quota pool), e.g. "codex,deepseek". Defaults to the
+#   limit (each an INDEPENDENT quota pool), e.g. "codex". Defaults to the
 #   APPLYPILOT_FALLBACK_AGENT env var, else "codex" when -Agent is claude (so a Claude
-#   session-limit wall fails over to Codex instead of stalling). 'deepseek' needs
-#   DEEPSEEK_API_KEY (config loads ~/.applypilot/.env) and runs on the Codex runtime.
+#   session-limit wall fails over to Codex instead of stalling).
 param([int]$Slot = 0, [string]$Agent = "claude", [string]$Model = "", [string]$Label = "home",
       [string]$FallbackAgent = $env:APPLYPILOT_FALLBACK_AGENT)
 $WorkerId = "$Label-$Slot"
@@ -45,29 +44,22 @@ $chromium = Get-ChildItem -Path $env:PLAYWRIGHT_BROWSERS_PATH -Directory -Filter
 if ($chromium) { $env:CHROME_PATH = Join-Path $chromium.FullName "chrome-win64\chrome.exe" }
 $env:Path = "C:\Program Files\nodejs;$env:Path"
 
-# Apply-agent CLI path (must be the AUTHENTICATED one): claude, codex, or deepseek.
-# deepseek runs on the Codex runtime pointed at DeepSeek's API, so it needs codex.cmd too.
+# Apply-agent CLI path (must be the AUTHENTICATED one): claude or codex.
 if ($Agent -eq "claude") {
   $a = Join-Path $env:APPDATA "npm\claude.cmd"; if (Test-Path $a) { $env:CLAUDE_PATH = $a }
   if (-not $Model) { $Model = "sonnet" }
 } elseif ($Agent -eq "codex") {
   $a = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $a) { $env:CODEX_PATH = $a }
   # leave $Model empty -> codex uses its default model
-} elseif ($Agent -eq "deepseek") {
-  $a = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $a) { $env:CODEX_PATH = $a }
-  # leave $Model empty -> the deepseek command builder uses APPLYPILOT_DEEPSEEK_MODEL
-} else { throw "unknown -Agent '$Agent' (use claude, codex, or deepseek)" }
+} else { throw "unknown -Agent '$Agent' (use claude or codex)" }
 
 # Failover chain: default a claude worker to codex so a Claude session-limit wall fails over
 # instead of stalling. Resolve the CLI path for every fallback agent so the switcher can
-# actually launch it, and warn (don't fail) if a deepseek link lacks its key.
+# actually launch it.
 if (-not $FallbackAgent -and $Agent -eq "claude") { $FallbackAgent = "codex" }
 foreach ($fa in ($FallbackAgent -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
   if ($fa -eq "claude") { $c = Join-Path $env:APPDATA "npm\claude.cmd"; if (Test-Path $c) { $env:CLAUDE_PATH = $c } }
-  elseif ($fa -in @("codex", "deepseek")) { $c = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $c) { $env:CODEX_PATH = $c } }
-  if (($fa -eq "deepseek" -or $Agent -eq "deepseek") -and -not $env:DEEPSEEK_API_KEY) {
-    Write-Warning "[fleet-worker] deepseek in the agent chain but DEEPSEEK_API_KEY is not set -- deepseek runs will wall. Set it in ~/.applypilot/.env."
-  }
+  elseif ($fa -eq "codex") { $c = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $c) { $env:CODEX_PATH = $c } }
 }
 
 # Per-LAUNCH throwaway cost-DB (never the real brain), Gmail verification, 10-min timeout.
@@ -81,6 +73,17 @@ Get-ChildItem (Join-Path $env:TEMP "fleet_apply_throwaway_*.db*") -ErrorAction S
 $env:APPLYPILOT_DB_PATH = Join-Path $env:TEMP "fleet_apply_throwaway_${Slot}_$PID.db"
 $env:APPLYPILOT_ENABLE_GMAIL_MCP = "1"
 $env:APPLYPILOT_AGENT_TIMEOUT = "600"
+# Self-heal the Gmail MCP creds: the @gongrzhe MCP server reads ~/.gmail-mcp/{gcp-oauth.keys,
+# credentials}.json to fetch ATS email-verification codes. A worker box (m4) that lacks them
+# fills+submits then walls at AUTH_REQUIRED. Hydrate once from the fleet_assets blob store (the
+# same PG the box already talks to) -- no manual credential copy. Skips if already present.
+if (-not (Test-Path (Join-Path $HOME ".gmail-mcp\credentials.json"))) {
+  $pyH = @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($pyH) {
+    Write-Host "[fleet-worker] hydrating Gmail MCP creds from fleet Postgres ..."
+    & $pyH (Join-Path $ProjectRoot "hydrate-gmail.py") 2>&1 | ForEach-Object { Write-Host "  $_" }
+  }
+}
 # Cheap read-only liveness probe before each agent launch: ~15% of queued postings are dead
 # (expired/closed) and would otherwise burn a full agent launch. linkedin.com is guarded in
 # liveness.py (never probed). Container/supervisor lanes already run with this ON.
