@@ -25,11 +25,12 @@ load_env() {
 }
 
 resolve_chrome_path() {
-  # Newest Playwright chromium build's mac app-bundle binary.
+  # Newest Playwright chromium build (version sort: chromium-999 < chromium-1140);
+  # exclude nested Helper bundles, whose binaries also live under Contents/MacOS.
   local d bin
-  d=$(ls -d "$PLAYWRIGHT_BROWSERS_PATH"/chromium-* 2>/dev/null | sort | tail -1)
+  d=$(ls -d "$PLAYWRIGHT_BROWSERS_PATH"/chromium-* 2>/dev/null | sort -V | tail -1)
   [ -n "$d" ] || return 1
-  bin=$(find "$d" -type f -path "*/Contents/MacOS/*" 2>/dev/null | head -1)
+  bin=$(find "$d" -type f -path "*/Contents/MacOS/*" -not -path "*Helper*" 2>/dev/null | head -1)
   [ -n "$bin" ] || return 1
   printf '%s' "$bin"
 }
