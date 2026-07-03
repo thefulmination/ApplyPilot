@@ -596,56 +596,36 @@ def _tenant_bypasses_auth_gate(conn, apply_url: str) -> bool:
     return True
 
 
-def resolve_supervised_confirm(sentinel_seen: bool, owner_input: str) -> tuple[bool, str]:
-    """Pure decision function for the SUPERVISED confirm-before-submit gate.
+def record_tenant_outcome(conn, apply_url: str, status: str) -> None:
+    """Record the REAL terminal outcome of a supervised apply run against the
+    tenant registry, exactly once, from the run's actual terminal status.
 
-    The apply agent, when run in supervised mode, completes the entire form
-    then emits a distinct sentinel line (RESULT:AWAIT_CONFIRM) INSTEAD of
-    clicking Submit, and stops. The launcher then asks the owner (who is
-    present by definition in supervised mode) for a y/n on stdin.
-
-    This function is the testable seam: it takes whether the sentinel was
-    actually observed and the raw owner input, and returns (submit?, reason).
-    It performs no I/O and touches no database -- callers wire the stdin
-    prompt and the tenants.record_submit(ok=..., result=...) call around it.
+    Owner decision 2026-07-03 (spec amendment 0b2fead): supervised mode is a
+    full headed apply -- the agent submits and the owner watches + can
+    Ctrl-C -- there is no pause-and-confirm checkpoint anymore. This replaces
+    the old confirm-before-submit gate (commit 6565936), which had a CRITICAL
+    bug: it called tenants.record_submit(ok=True) on the owner's "y"
+    keystroke BEFORE any real submit happened, inflating clean_submits toward
+    "trusted" without a real apply ever occurring. This function fixes that
+    by construction -- it is only ever called AFTER the run's real terminal
+    result is known, and ok is derived from that real status.
 
     Args:
-        sentinel_seen: True only if the agent actually emitted
-            RESULT:AWAIT_CONFIRM. If False, the agent never reached (or
-            skipped) the confirm checkpoint -- NEVER submit in that case,
-            regardless of owner_input.
-        owner_input: Raw text read from stdin. Recognized forms (case- and
-            whitespace-insensitive):
-              "y"                -> submit, no reason
-              "n"                -> do not submit, reason "abandoned"
-              "n: <reason>"      -> do not submit, reason "<reason>"
-              "skip: <reason>"   -> do not submit, reason "<reason>"
-            Anything else is treated as a decline (safest default -- never
-            auto-submit on unrecognized input).
+        conn: Database connection to pass through to tenants.record_submit.
+        apply_url: The job's apply URL; the tenant host is derived from it.
+        status: The run's terminal status string (e.g. "applied",
+            "expired", "failed:no_confirmation", "failed:timeout").
+            ok=True only when status == "applied".
 
-    Returns:
-        (submit, reason): submit is True only for a bare "y". reason is ""
-        when submit is True, else a short human-readable reason string.
+    Exception-guarded: a registry write failure must never crash the apply
+    run, so any error here is swallowed (and logged at debug level).
     """
-    if not sentinel_seen:
-        return False, "no confirm sentinel"
-
-    normalized = (owner_input or "").strip()
-    lowered = normalized.lower()
-
-    if lowered == "y":
-        return True, ""
-
-    if lowered == "n":
-        return False, "abandoned"
-
-    for prefix in ("n:", "skip:"):
-        if lowered.startswith(prefix):
-            reason = normalized[len(prefix):].strip()
-            return False, reason or "abandoned"
-
-    # Unrecognized input -- never auto-submit.
-    return False, "abandoned"
+    try:
+        host = tenants_mod._host_of(apply_url)
+        tenants_mod.record_submit(conn, host, ok=(status == "applied"), result=status)
+    except Exception:
+        logger.debug("record_tenant_outcome failed for %s (status=%s)",
+                     (apply_url or "")[:80], status, exc_info=True)
 
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
@@ -1308,19 +1288,45 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     """Spawn an apply-agent session for one job application.
 
     Args:
-        supervised: When True, the prompt instructs the agent to complete
-            the entire form and then emit RESULT:AWAIT_CONFIRM INSTEAD of
-            clicking Submit (auth-gated-tenant-lane Task 4). The owner
-            (present by definition in a supervised run) is then asked for a
-            y/n on stdin; see resolve_supervised_confirm. Zero effect on the
-            prompt or RESULT handling when False -- the sentinel is never
-            mentioned to the agent and never recognized in the parser.
+        supervised: When True, the browser session runs in full headed mode
+            so the owner can watch (headed-ness itself is Task 5's
+            `apply --auth-gated` concern, not this function's). The agent
+            fills the form and submits exactly as in the unattended path --
+            the PROMPT is byte-identical for supervised True/False. The
+            ONLY effect of supervised here is accounting: once the run's
+            REAL terminal status is known, record_tenant_outcome() is
+            called exactly once against the tenant registry (owner decision
+            2026-07-03, amendment 0b2fead -- replaces the dropped
+            pause-and-confirm gate from commit 6565936, which had a
+            premature-ok=True bug).
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    status, duration_ms = _run_job_impl(
+        job, port, worker_id=worker_id, model=model, dry_run=dry_run,
+        agent=agent, inbox_auth_hint=inbox_auth_hint,
+    )
+    if supervised:
+        apply_url = job.get("application_url") or job.get("url") or ""
+        try:
+            conn = get_connection()
+            record_tenant_outcome(conn, apply_url, status)
+        except Exception:
+            logger.debug("supervised record_tenant_outcome failed", exc_info=True)
+    return status, duration_ms
+
+
+def _run_job_impl(job: dict, port: int, worker_id: int = 0,
+                   model: str | None = "sonnet", dry_run: bool = False,
+                   agent: str = "claude",
+                   inbox_auth_hint: str | None = None) -> tuple[str, int]:
+    """Actual apply-agent run. See run_job for the public contract; this has
+    no `supervised` parameter -- the prompt built here is IDENTICAL
+    regardless of supervised mode (accounting is layered on by the run_job
+    wrapper, not the run itself)."""
     # Read tailored resume text
     resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -1341,7 +1347,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         dry_run=dry_run,
         worker_id=worker_id,
         inbox_auth_hint=inbox_auth_hint,
-        supervised=supervised,
     )
 
     # Write per-worker MCP config
@@ -1599,42 +1604,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
-        # SUPERVISED confirm-before-submit gate (auth-gated-tenant-lane Task 4):
-        # the agent completed the form and stopped at the sentinel INSTEAD of
-        # submitting. Ask the owner (present by definition in a supervised
-        # run) for y/n on stdin, then record the outcome to the tenant
-        # registry. NEVER auto-submit here -- resolve_supervised_confirm only
-        # returns submit=True for an explicit "y".
-        if supervised and "RESULT:AWAIT_CONFIRM" in result_source:
-            apply_url = job.get("application_url") or job.get("url") or ""
-            host = tenants_mod._host_of(apply_url)
-            try:
-                owner_input = input(
-                    f"[W{worker_id}] Supervised confirm for {job['title'][:50]} "
-                    f"@ {job.get('site', '')} -- submit? (y/n): "
-                )
-            except EOFError:
-                owner_input = ""
-            submit, reason = resolve_supervised_confirm(True, owner_input)
-            try:
-                conn = get_connection()
-                tenants_mod.record_submit(conn, host, ok=submit, result=reason or None)
-            except Exception:
-                logger.debug("supervised record_submit failed", exc_info=True)
-            if not submit:
-                add_event(f"[W{worker_id}] SUPERVISED ABANDON ({elapsed}s): {reason}")
-                update_state(worker_id, status="failed",
-                             last_action=f"abandoned: {reason[:25]}")
-                return f"failed:{reason}", duration_ms
-            # Owner approved -- the caller is expected to re-invoke the agent
-            # to actually click Submit; this run itself never submitted, so
-            # it is NOT recorded as 'applied' here. Surface a distinct status
-            # so the caller can drive the follow-up submit step.
-            add_event(f"[W{worker_id}] SUPERVISED CONFIRMED ({elapsed}s): proceeding to submit")
-            update_state(worker_id, status="awaiting_submit",
-                         last_action=f"confirmed ({elapsed}s)")
-            return "await_confirm:confirmed", duration_ms
-
         # Dry run: the agent reviewed/filled the form but intentionally did NOT
         # submit. Never let this be recorded as 'applied'.
         if "RESULT:DRY_RUN" in result_source:
@@ -1644,16 +1613,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "AUTH_REQUIRED"]:
             if f"RESULT:{result_status}" in result_source:
-                if supervised and result_status == "APPLIED":
-                    # This run followed a confirmed AWAIT_CONFIRM and actually
-                    # submitted -- record the clean submit against the tenant.
-                    apply_url = job.get("application_url") or job.get("url") or ""
-                    host = tenants_mod._host_of(apply_url)
-                    try:
-                        conn = get_connection()
-                        tenants_mod.record_submit(conn, host, ok=True, result=None)
-                    except Exception:
-                        logger.debug("supervised record_submit(ok=True) failed", exc_info=True)
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")

@@ -467,8 +467,7 @@ def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False,
                  worker_id: int = 0,
-                 inbox_auth_hint: str | None = None,
-                 supervised: bool = False) -> str:
+                 inbox_auth_hint: str | None = None) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -483,13 +482,13 @@ def build_prompt(job: dict, tailored_resume: str,
         worker_id: Worker identifier. Upload files are staged in a
             per-worker directory so parallel workers can't overwrite each
             other's resume/cover-letter mid-application.
-        supervised: If True (auth-gated-tenant-lane Task 4), instruct the
-            agent to complete the ENTIRE form and then output
-            RESULT:AWAIT_CONFIRM INSTEAD of clicking Submit, then stop --
-            the owner confirms via the launcher before any submit happens.
-            When False (default), this instruction and the AWAIT_CONFIRM
-            sentinel are entirely absent from the prompt -- zero behavior
-            change to the normal autonomous-submit path.
+
+    Note: this prompt is IDENTICAL for supervised and unsupervised apply
+    runs (owner decision 2026-07-03, amendment 0b2fead). Supervised mode
+    now means "full headed apply, owner watches + can Ctrl-C" -- it has no
+    effect on the agent's instructions or submit behavior, only on how the
+    browser is launched (Task 5's `apply --auth-gated` concern) and on
+    post-run accounting (see launcher.record_tenant_outcome).
 
     Returns:
         Complete prompt string for the AI agent.
@@ -584,15 +583,6 @@ def build_prompt(job: dict, tailored_resume: str,
     # applied -- which would permanently exclude it from real future attempts.
     if dry_run:
         submit_instruction = "IMPORTANT: This is a DRY RUN. Do NOT click the final Submit/Apply button. Review the form and verify all fields are filled correctly, then output RESULT:DRY_RUN with a one-line note on what you verified. Do NOT output RESULT:APPLIED -- nothing was submitted."
-    elif supervised:
-        # SUPERVISED-CONFIRM (auth-gated-tenant-lane Task 4): complete the
-        # WHOLE form -- fields, uploads, screening answers, everything -- but
-        # STOP before the final submit click. Emit the distinct sentinel
-        # RESULT:AWAIT_CONFIRM instead and wait; the owner (present by
-        # definition in a supervised run) reviews and confirms before any
-        # submit happens. This instruction/sentinel is entirely absent when
-        # supervised is off.
-        submit_instruction = "SUPERVISED MODE: take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. Fix anything wrong or missing. Then STOP -- do NOT click Submit/Apply. Output RESULT:AWAIT_CONFIRM with a one-line note confirming the form is complete and ready. A human owner will review and decide whether to submit. Do NOT output RESULT:APPLIED -- nothing was submitted yet."
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
@@ -618,13 +608,6 @@ If this is a link, open it and continue immediately.
 If the hint is rejected, stop and output RESULT:AUTH_REQUIRED so manual review can take over."""
     else:
         inbox_hint_section = ""
-
-    # Only present in the RESULT CODES list when supervised -- the sentinel
-    # must not leak into (or be discoverable from) the non-supervised prompt.
-    await_confirm_code_line = (
-        "RESULT:AWAIT_CONFIRM -- supervised mode: form fully completed, stopped before Submit, awaiting owner confirmation\n"
-        if supervised else ""
-    )
 
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
@@ -719,7 +702,7 @@ This is the owner's REAL LinkedIn account -- protect it above all else:
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
 RESULT:DRY_RUN -- dry run only: form reviewed/filled but intentionally NOT submitted
-{await_confirm_code_line}RESULT:EXPIRED -- job closed or no longer accepting applications
+RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
 RESULT:LOGIN_ISSUE -- could not sign in or create account
 RESULT:AUTH_REQUIRED -- login, account creation, email verification, SSO, or 2FA requires human action
