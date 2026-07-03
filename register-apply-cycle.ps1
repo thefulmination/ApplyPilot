@@ -187,26 +187,30 @@ function Step(`$stepName, [ScriptBlock]`$action) {
   return `$code
 }
 Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle start ===')
+# Best-effort: run ALL steps even if one fails (a transient verify-live/pull hiccup must not skip
+# the apply push+resume for a whole 4h cycle -- the steps are largely independent). Track the last
+# failure and exit non-zero at the end so Task Scheduler's Last-Result still surfaces it.
+`$fail = 0
 `$rc = Step 'verify-live' { & '$runApplyPilotPs1' verify-live --limit 300 }
-if (`$rc -ne 0) { Add-Content -Path `$log -Value 'ApplyCycle ABORT: verify-live failed'; exit `$rc }
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: verify-live FAILED (continuing best-effort)' }
 `$rc = Step 'push' { & '$applyHomeExe' push --score-floor 7 }
-if (`$rc -ne 0) { Add-Content -Path `$log -Value 'ApplyCycle ABORT: push failed'; exit `$rc }
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: push FAILED (continuing best-effort)' }
 `$rc = Step 'approve' { & '$applyHomeExe' approve --all-pushed }
-if (`$rc -ne 0) { Add-Content -Path `$log -Value 'ApplyCycle ABORT: approve failed'; exit `$rc }
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: approve FAILED (continuing best-effort)' }
 `$rc = Step 'lift-canary' { & '$applyHomeExe' lift-canary }
-if (`$rc -ne 0) { Add-Content -Path `$log -Value 'ApplyCycle ABORT: lift-canary failed'; exit `$rc }
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: lift-canary FAILED (continuing best-effort)' }
 `$rc = Step 'resume-if-safe' { & '$applyHomeExe' resume-if-safe }
-if (`$rc -ne 0) { Add-Content -Path `$log -Value 'ApplyCycle ABORT: resume-if-safe failed'; exit `$rc }
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: resume-if-safe FAILED (continuing best-effort)' }
 `$rc = Step 'pull' { & '$applyHomeExe' pull }
-if (`$rc -ne 0) { Add-Content -Path `$log -Value 'ApplyCycle ABORT: pull failed'; exit `$rc }
-Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle done (all steps OK) ===')
-exit 0
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: pull FAILED (continuing best-effort)' }
+Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle done (fail=' + `$fail + ') ===')
+exit `$fail
 "@
 $applyCycleWrapper = Write-Wrapper "apply-cycle-task" $applyCycleWrapperContent
 $applyCycleTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 4) -RepetitionDuration (New-TimeSpan -Days 3650)
 $applyCycleSettings = New-CadenceSettings -restartCount 3 -restartInterval (New-TimeSpan -Minutes 1) -executionTimeLimit (New-TimeSpan -Hours 1)
 Register-CadenceTask -Name "${TaskPrefix}ApplyCycle" -WrapperPath $applyCycleWrapper -Trigger $applyCycleTrigger -Settings $applyCycleSettings `
-  -Description "ApplyPilot autonomous apply cycle: verify-live -> push -> approve --all-pushed -> lift-canary -> resume-if-safe -> pull, every 4h. Aborts on first failed step."
+  -Description "ApplyPilot autonomous apply cycle: verify-live -> push -> approve --all-pushed -> lift-canary -> resume-if-safe -> pull, every 4h. Best-effort: runs all steps, exits non-zero if any failed."
 
 # ---------------------------------------------------------------------------------------------
 # DeadMan -- every 20 min. Read-only watcher; FLEET_PG_DSN set inline in the wrapper.
