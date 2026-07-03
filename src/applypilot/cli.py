@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime as _dt, time as _time, timezone as _tz
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -2353,6 +2354,115 @@ def doctor() -> None:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI or Codex CLI + Chrome + Node.js)[/dim]")
 
     console.print()
+
+
+tenants_app = typer.Typer(
+    name="tenants",
+    help="Manage the ats_tenants registry (login-gated ATS rollout: excluded/supervised/trusted).",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
+app.add_typer(tenants_app)
+
+
+def _tenants_list() -> None:
+    from applypilot.database import get_connection
+    from applypilot import tenants
+
+    conn = get_connection()
+    rows = tenants.list_tenants(conn)
+
+    table = Table(title="ATS Tenants", show_header=True, header_style="bold cyan")
+    table.add_column("Host")
+    table.add_column("Status")
+    table.add_column("Clean", justify="right")
+    table.add_column("Failed", justify="right")
+    table.add_column("Daily cap", justify="right")
+    table.add_column("Halted?")
+    table.add_column("Eligible jobs", justify="right")
+
+    now_iso = _dt.now(_tz.utc).isoformat()
+    for row in rows:
+        host = row["host"]
+        halted = tenants.is_halted(conn, host, now_iso)
+        eligible = conn.execute(
+            "SELECT url, application_url FROM jobs WHERE applied_at IS NULL "
+            "AND (url IS NOT NULL OR application_url IS NOT NULL)"
+        ).fetchall()
+        eligible_count = sum(
+            1 for j in eligible
+            if tenants._host_of(j["application_url"] or "") == host
+            or tenants._host_of(j["url"] or "") == host
+        )
+        table.add_row(
+            host,
+            row["status"],
+            str(row["clean_submits"]),
+            str(row["failed_submits"]),
+            str(row["daily_cap"]),
+            "yes" if halted else "no",
+            str(eligible_count),
+        )
+
+    if rows:
+        console.print(table)
+    else:
+        console.print("[dim]No tenants registered yet.[/dim]")
+
+
+@tenants_app.callback(invoke_without_command=True)
+def tenants_default(ctx: typer.Context) -> None:
+    """List tenants when invoked bare (`applypilot tenants`)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _bootstrap()
+    _tenants_list()
+
+
+@tenants_app.command("list")
+def tenants_list_command() -> None:
+    """List all registered ATS tenants (host, status, submit counts, halted?, eligible jobs)."""
+    _bootstrap()
+    _tenants_list()
+
+
+@tenants_app.command("set")
+def tenants_set_command(
+    host: str = typer.Argument(..., help="ATS tenant host, e.g. acme.wd1.myworkdayjobs.com."),
+    status: str = typer.Argument(..., help="excluded | supervised | trusted."),
+    force: bool = typer.Option(False, "--force", help="Override the >=3-clean-submits evidence requirement for 'trusted'."),
+) -> None:
+    """Set a tenant's rollout status (excluded/supervised/trusted)."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot import tenants
+
+    conn = get_connection()
+    try:
+        row = tenants.set_tenant(conn, host, status, force=force)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[bold green]{host}[/bold green] set to [bold]{row['status']}[/bold]")
+
+
+@tenants_app.command("halt")
+def tenants_halt_command(
+    host: str = typer.Argument(..., help="ATS tenant host to halt until end of the current UTC day."),
+) -> None:
+    """Halt a tenant (block submits) until the end of the current UTC day."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot import tenants
+
+    conn = get_connection()
+    until_iso = _dt.combine(
+        _dt.now(_tz.utc).date(), _time(23, 59, 59), tzinfo=_tz.utc
+    ).isoformat()
+    tenants.halt_tenant(conn, host, until_iso)
+
+    console.print(f"[bold yellow]{host}[/bold yellow] halted until [bold]{until_iso}[/bold]")
 
 
 if __name__ == "__main__":
