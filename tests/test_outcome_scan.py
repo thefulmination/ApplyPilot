@@ -96,3 +96,25 @@ def test_scan_outcomes_concurrent_inserts_all_and_is_idempotent(tmp_path):
     counts2 = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: messages, conn=conn, concurrency=4)
     assert counts2["skipped"] == 6
     assert counts2["inserted"] == 0
+
+
+def test_scan_persists_quarantine_columns(tmp_path):
+    from applypilot import database
+    from applypilot.outcome_scan import scan_outcomes
+    conn = database.init_db(tmp_path / "brain.db")
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, apply_status, applied_at) VALUES (?,?,?,?,?)",
+        ("https://boards.greenhouse.io/checkr/jobs/1", "Analyst", "Checkr",
+         "applied", "2026-06-28T12:00:00+00:00"))
+    conn.commit()
+    msg = {"message_id": "m1", "thread_id": "t1",
+           "subject": "Your application to Checkr",
+           "sender": "no-reply@us.greenhouse-mail.io",
+           "date": "Sat, 20 Jun 2026 12:00:00 +0000",   # predates the apply
+           "body": "Thank you for applying to Checkr."}
+    counts = scan_outcomes(conn=conn, fetch_messages=lambda: [msg], client=None, concurrency=1)
+    assert counts["needs_review"] == 1
+    row = conn.execute("SELECT job_url, match_status, match_reason FROM email_events WHERE message_id='m1'").fetchone()
+    assert row["job_url"] is None
+    assert row["match_status"] == "needs_review"
+    assert row["match_reason"] == "predates_application"

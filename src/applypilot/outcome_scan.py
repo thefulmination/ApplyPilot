@@ -76,6 +76,7 @@ _COLUMNS = (
     "message_id", "thread_id", "job_url", "occurred_at", "sender", "sender_domain",
     "subject", "stage", "outcome", "reason", "title", "company", "match_method",
     "match_score", "confidence", "body_text", "snippet", "extracted_by", "scanned_at",
+    "match_status", "match_reason",
 )
 
 
@@ -170,10 +171,16 @@ def scan_outcomes(
     fetch = fetch_messages or _gmail_fetch(days, credentials_path, max_messages)
 
     applied_jobs = get_applied_jobs(conn)
-    counts = {"inserted": 0, "skipped": 0, "updated": 0, "errors": 0}
+    counts = {"inserted": 0, "skipped": 0, "updated": 0, "errors": 0, "needs_review": 0}
+    needs_review_reasons = {"predates_application": 0, "ambiguous_company": 0, "no_timestamp": 0}
     messages = list(fetch())
 
     def _upsert(row: dict) -> None:
+        if row.get("match_status") == "needs_review":
+            counts["needs_review"] += 1
+            reason = row.get("match_reason")
+            if reason in needs_review_reasons:
+                needs_review_reasons[reason] += 1
         counts[upsert_email_event(conn, row, reextract=reextract)] += 1
 
     if concurrency and concurrency > 1 and len(messages) > 1:
@@ -203,4 +210,5 @@ def scan_outcomes(
             except Exception:
                 log.exception("outcome scan: failed to process message %s", msg.get("message_id"))
                 counts["errors"] += 1
+    counts["needs_review_reasons"] = needs_review_reasons
     return counts

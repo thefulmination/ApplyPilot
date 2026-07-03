@@ -1697,6 +1697,16 @@ def outcomes_scan_command(
         table.add_row(k, str(counts.get(k, 0)))
     console.print(table)
 
+    needs_review = counts.get("needs_review", 0)
+    if needs_review:
+        reasons = counts.get("needs_review_reasons", {}) or {}
+        console.print(
+            f"needs_review: {needs_review} "
+            f"(predates={reasons.get('predates_application', 0)} "
+            f"ambiguous={reasons.get('ambiguous_company', 0)} "
+            f"no_timestamp={reasons.get('no_timestamp', 0)})"
+        )
+
 
 @app.command("outcomes-dashboard")
 def outcomes_dashboard_command(

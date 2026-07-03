@@ -9,6 +9,7 @@ def test_email_events_table_created(tmp_path):
         "sender_domain", "subject", "stage", "outcome", "reason", "title",
         "company", "match_method", "match_score", "confidence", "body_text",
         "snippet", "extracted_by", "scanned_at",
+        "match_status", "match_reason", "prev_job_url",
     }
 
 

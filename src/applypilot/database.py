@@ -637,6 +637,13 @@ def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_email_events_job ON email_events(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_email_events_occurred ON email_events(occurred_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_email_events_stage ON email_events(stage)")
+
+    # Match-quarantine tier (outcome-loop-integrity Task 3). ADDITIVE + idempotent.
+    ee_existing = {row[1] for row in conn.execute("PRAGMA table_info(email_events)").fetchall()}
+    for col in ("match_status", "match_reason", "prev_job_url"):
+        if col not in ee_existing:
+            conn.execute(f"ALTER TABLE email_events ADD COLUMN {col} TEXT")
+
     conn.commit()
 
 
