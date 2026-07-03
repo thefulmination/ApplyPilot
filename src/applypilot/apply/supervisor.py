@@ -74,7 +74,11 @@ def _orphan_kill_cmd() -> list[str]:
                 "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
                 f"Where-Object {{ $_.CommandLine -match '{_ORPHAN_PATTERN}' }} | "
                 "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"]
-    return ["pkill", "-f", _ORPHAN_PATTERN]
+    # Mirror the Windows branch's Name='node.exe' pre-filter: require a node
+    # executable at the start of the command line so ONLY node processes
+    # (the MCP servers) can match -- never Chromium or python tooling whose
+    # paths merely contain 'playwright'.
+    return ["pkill", "-f", f"(^|/)node .*({_ORPHAN_PATTERN})"]
 
 
 def _cleanup_orphans(log) -> None:

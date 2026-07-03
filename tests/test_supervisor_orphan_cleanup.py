@@ -15,5 +15,7 @@ def test_orphan_kill_cmd_windows(monkeypatch):
 def test_orphan_kill_cmd_posix_uses_pkill(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     cmd = supervisor._orphan_kill_cmd()
-    assert cmd == ["pkill", "-f", "_npx|playwright|modelcontextprotocol|@playwright"]
+    assert cmd[0] == "pkill" and cmd[1] == "-f"
+    # node-scoped, mirroring the Windows Name='node.exe' pre-filter
+    assert cmd[2] == "(^|/)node .*(_npx|playwright|modelcontextprotocol|@playwright)"
     assert "powershell" not in " ".join(cmd)
