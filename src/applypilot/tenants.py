@@ -197,3 +197,20 @@ def submits_today(
         if url and _host_of(url) == host:
             count += 1
     return count
+
+
+def daily_cap(conn: sqlite3.Connection, host: str) -> int:
+    """Return the tenant's configured daily_cap, or 5 (the table default) if
+    there's no row for this host yet or the table doesn't exist (defensive
+    against pre-migration DBs)."""
+    try:
+        row = conn.execute(
+            "SELECT daily_cap FROM ats_tenants WHERE host = ?", (host,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 5
+
+    if row is None:
+        return 5
+    value = row["daily_cap"] if isinstance(row, sqlite3.Row) else row[0]
+    return 5 if value is None else int(value)

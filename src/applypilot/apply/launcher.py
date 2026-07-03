@@ -25,6 +25,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
+from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
@@ -182,9 +183,33 @@ def _make_mcp_config(cdp_port: int) -> dict:
 
 def _normalize_agent(agent: str | None) -> str:
     normalized = (agent or "claude").strip().lower()
-    if normalized not in {"claude", "codex"}:
-        raise ValueError("agent must be either 'claude' or 'codex'")
+    if normalized not in {"claude", "codex", "deepseek"}:
+        raise ValueError("agent must be one of 'claude', 'codex', or 'deepseek'")
     return normalized
+
+
+def _deepseek_model() -> str:
+    """DeepSeek model that drives the apply agent (OpenAI-compatible chat model)."""
+    return os.environ.get("APPLYPILOT_DEEPSEEK_MODEL", "deepseek-chat")
+
+
+def _deepseek_provider_args() -> list[str]:
+    """Codex ``-c`` overrides that route the run to DeepSeek's OpenAI-compatible API via a
+    custom model_provider -- no LiteLLM proxy, just DEEPSEEK_API_KEY in the worker env.
+    DeepSeek reuses the Codex runtime (which drives the Playwright MCP browser); only the
+    model + endpoint change."""
+    base_url = os.environ.get("APPLYPILOT_DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    overrides = [
+        'model_provider="deepseek"',
+        'model_providers.deepseek.name="DeepSeek"',
+        f'model_providers.deepseek.base_url="{base_url}"',
+        'model_providers.deepseek.env_key="DEEPSEEK_API_KEY"',
+        'model_providers.deepseek.wire_api="chat"',
+    ]
+    args: list[str] = []
+    for override in overrides:
+        args.extend(["-c", override])
+    return args
 
 
 # Claude model TIER names. The fleet/CLI default --model is "sonnet" (a Claude tier),
@@ -301,11 +326,18 @@ def build_apply_agent_command(
             "--verbose", "-",
         ]
 
-    model_args = _codex_model_args(model)
+    # codex, or deepseek (= the Codex runtime pointed at DeepSeek's provider).
+    if agent == "deepseek":
+        model_args = ["--model", _deepseek_model()]
+        provider_args = _deepseek_provider_args()
+    else:
+        model_args = _codex_model_args(model)
+        provider_args = []
     return [
         config.get_codex_path(),
         "exec",
         *model_args,
+        *provider_args,
         "--json",
         *_codex_isolation_args(),
         "--sandbox", "read-only",
@@ -328,11 +360,17 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
             "--no-session-persistence",
             prompt,
         ]
-    model_args = _codex_model_args(model)
+    if agent == "deepseek":
+        model_args = ["--model", _deepseek_model()]
+        provider_args = _deepseek_provider_args()
+    else:
+        model_args = _codex_model_args(model)
+        provider_args = []
     return [
         config.get_codex_path(),
         "exec",
         *model_args,
+        *provider_args,
         *_codex_isolation_args(),
         "--ephemeral",
         "--sandbox", "read-only",
@@ -517,6 +555,46 @@ def audit_duplicate_applications(conn=None) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Database operations
 # ---------------------------------------------------------------------------
+
+def _tenant_bypasses_auth_gate(conn, apply_url: str) -> bool:
+    """True if `apply_url`'s host is an eligible ats_tenants tenant for THIS
+    run and should be let through the auth-gate skip instead of parked.
+
+    HOME LANE ONLY -- this is consulted solely from acquire_job's auth-gated
+    skip block. apply/fleet_sync.py's auth-gated exclusion is untouched by
+    this helper and must never call it: fleet workers must never receive
+    auth-gated jobs regardless of tenant status.
+
+    Mode (APPLYPILOT_AUTH_GATED_MODE) scopes which tenant statuses are
+    eligible this run:
+      - "supervised" -> {supervised, trusted} (a human-supervised run)
+      - "trusted" or unset/empty -> {trusted} only (the safe default for a
+        normal unattended home run: supervised tenants NEVER apply
+        unattended)
+
+    Beyond status+mode eligibility, the tenant must not be halted and must
+    be under its configured daily_cap.
+    """
+    host = tenants_mod._host_of(apply_url)
+    if not host:
+        return False
+
+    mode = os.environ.get("APPLYPILOT_AUTH_GATED_MODE", "").strip().lower()
+    eligible_statuses = {"supervised", "trusted"} if mode == "supervised" else {"trusted"}
+
+    status = tenants_mod.tenant_status(conn, host)
+    if status not in eligible_statuses:
+        return False
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if tenants_mod.is_halted(conn, host, now_iso):
+        return False
+
+    if tenants_mod.submits_today(conn, host) >= tenants_mod.daily_cap(conn, host):
+        return False
+
+    return True
+
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0, exclude_linkedin: bool = False,
@@ -732,7 +810,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             if (os.environ.get("APPLYPILOT_SKIP_AUTH_GATED", "1").strip().lower()
                     not in ("0", "false", "no", "off")
                     and not assisted
-                    and config.is_auth_gated_application(apply_url)):
+                    and config.is_auth_gated_application(apply_url)
+                    and not _tenant_bypasses_auth_gate(conn, apply_url)):
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'auth_required', apply_error = 'auth_gate', "
                     "apply_attempts = 99 WHERE url = ?",
