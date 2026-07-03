@@ -172,15 +172,16 @@ def submits_today(
 ) -> int:
     """Count applications submitted today for the given tenant host.
 
-    Simplest-correct implementation: joins `applications` (applied_at) to
-    `jobs` (url) and filters by hostname derived from jobs.url via LIKE on the
-    host substring, then filters applied_at to the given local day (defaults
-    to today's UTC date, ISO 'YYYY-MM-DD'). This assumes applied_at is stored
-    as an ISO-8601 string prefixed by the date (true for every writer seen in
-    database.py's applications/backfill code). A precise hostname match would
-    require parsing every url in Python; since ATS tenant hosts are already
-    distinctive subdomains, a LIKE on '%host%' with a following '/' or end-of-
-    string boundary is sufficiently unambiguous for the daily-cap use case.
+    Selects `applications.job_url` for rows whose `applied_at` starts with the
+    day prefix, then filters host-equality in Python via `_host_of` (the same
+    hostname derivation Task 3's acquire filter uses, so the daily-cap counts
+    the same host key). No SQL JOIN — `applications` has no host column.
+
+    The day is a UTC calendar day by default (`today_iso` = today's UTC date,
+    ISO 'YYYY-MM-DD'), so the per-tenant cap resets at 00:00 UTC, not local
+    midnight. Pass an explicit `today_iso` to count a different day. Assumes
+    `applied_at` is an ISO-8601 string prefixed by its date (true for every
+    writer in database.py's applications/backfill code).
     """
     if today_iso is None:
         today_iso = datetime.now(timezone.utc).date().isoformat()
