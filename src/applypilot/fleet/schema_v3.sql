@@ -245,6 +245,16 @@ CREATE TABLE IF NOT EXISTS otp_request (
     consumed_at      TIMESTAMPTZ
 );
 
+-- Relay transport columns (2026-07-03): the CODE lives here only for the seconds
+-- between the home responder answering and the worker consuming it, then is nulled.
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS code        TEXT;
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS code_kind   TEXT;   -- 'code' | 'magic_link'
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS expires_at  TIMESTAMPTZ;
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ;
+-- The responder's pending-scan: unanswered, unconsumed requests.
+CREATE INDEX IF NOT EXISTS idx_otp_pending ON otp_request (requested_at)
+    WHERE code IS NULL AND consumed_at IS NULL;
+
 -- ---------------------------------------------------------------------------
 -- inbox_events: outcome tracking / feedback loop (R8). Written by the inbox
 -- scanner on the TRUSTED spot (owner box / broker), keyed by dedup_key.
