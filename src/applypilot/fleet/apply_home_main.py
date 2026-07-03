@@ -64,6 +64,27 @@ def approve(conn, *, urls=None, all_pushed=False) -> str:
     return token
 
 
+def resume_if_safe(conn) -> bool:
+    """Guarded self-resume: clears ONLY a plain `paused` flag so the autonomous
+    ApplyCycle can self-resume after a cap window frees capacity. SAFETY-CRITICAL --
+    must NEVER override a Doctor/LinkedIn safety pause (ats_paused) and must never
+    resume into an exceeded cost cap.
+
+    The `AND ats_paused=FALSE` in the WHERE clause is the catastrophe guard: it is
+    mandatory so a Doctor safety pause is never overridden by this self-resume path.
+    """
+    if queue._cost_cap_exceeded(conn):
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET paused=FALSE, updated_at=now() "
+            "WHERE id=1 AND paused=TRUE AND ats_paused=FALSE"
+        )
+        n = cur.rowcount
+    conn.commit()
+    return n > 0
+
+
 def resolve_challenge_cmd(conn, url: str, *, skip: bool) -> bool:
     return queue.resolve_challenge(conn, url, requeue=not skip)
 
@@ -99,6 +120,7 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     chp = sub.add_parser("challenges"); chp.add_argument("--grouped", action="store_true")
     rc = sub.add_parser("resolve-challenge"); rc.add_argument("url"); rc.add_argument("--skip", action="store_true")
     sub.add_parser("status")
+    sub.add_parser("resume-if-safe")
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
@@ -122,6 +144,13 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
             print("resolved", resolve_challenge_cmd(conn, args.url, skip=args.skip))
         elif args.cmd == "status":
             _print_status(conn)
+        elif args.cmd == "resume-if-safe":
+            if queue._cost_cap_exceeded(conn):
+                print("left-paused (cap exceeded)")
+            elif resume_if_safe(conn):
+                print("resumed")
+            else:
+                print("left-paused (ats_paused or already running)")
     return 0
 
 
