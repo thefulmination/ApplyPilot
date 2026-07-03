@@ -98,7 +98,11 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> 
             action = res.get("action")
             if action == "applied":
                 counts["applied"] += 1
-            elif action == "idle":
+            elif action == "stop":
+                logger.info("remote %s command: exiting between jobs (supervisor respawns)",
+                            res.get("command"))
+                break
+            elif action in ("idle", "paused"):
                 counts["idle"] += 1
                 if idle_sleep:
                     time.sleep(idle_sleep)

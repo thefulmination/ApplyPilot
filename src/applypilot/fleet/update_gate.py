@@ -14,11 +14,13 @@ from __future__ import annotations
 
 HEARTBEAT_FRESH_SECONDS = 150  # console liveness bar; stale beats are dead workers
 
+# 'paused' counts as between-jobs: a remotely-paused worker is heartbeating but by
+# definition holds no job, so it must not block a code update (it respawns paused-aware).
 _HB_BUSY = """
 SELECT worker_id, state
   FROM worker_heartbeat
  WHERE worker_id LIKE %(prefix)s
-   AND state <> 'idle'
+   AND state NOT IN ('idle', 'paused')
    AND last_beat > now() - make_interval(secs => %(fresh)s)
 """
 

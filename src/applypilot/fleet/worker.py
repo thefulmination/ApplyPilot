@@ -235,6 +235,9 @@ class WorkerLoop:
         self._last_error: Optional[str] = None
         self._events: collections.deque = collections.deque(maxlen=40)
         self._log_tail_fn = log_tail_fn
+        # Remote-command state: a 'pause' flips this until 'resume'; consumed in
+        # run_once BETWEEN jobs (never mid-apply). See _handle_commands.
+        self._paused = False
         if compute_fns is not None:
             self.compute_fns = compute_fns
             self._legacy_score_fn = None
@@ -265,6 +268,45 @@ class WorkerLoop:
         except Exception:
             pass
 
+    # -- remote commands (owner -> worker, consumed BETWEEN jobs) --------------
+    def _handle_commands(self, conn) -> Optional[str]:
+        """Consume open remote_commands for this worker at the top of run_once --
+        i.e. strictly BETWEEN jobs, never mid-apply. Every command is acked (a
+        broadcast '*' is acked per-worker so it reaches the whole fleet).
+
+        pause/resume flip ``self._paused``; restart/drain return the command name so
+        the caller exits the process (the supervisor -- fleet-agent reconcile or the
+        scheduled task -- respawns it); self_update is acked as a no-op (superseded
+        by the fleet-agent pull-updater, spec 2026-07-03). Fail-safe: a poll error
+        returns None and the tick proceeds -- a DB blip must never stop a worker."""
+        from applypilot.fleet import heartbeat as _hb
+        try:
+            cmds = _hb.poll_commands(conn, self.worker_id)
+        except Exception:
+            return None
+        stop: Optional[str] = None
+        for c in cmds:
+            cmd = c.get("command")
+            try:
+                _hb.ack_command(conn, c["id"], self.worker_id)
+            except Exception:
+                continue  # never acked -> re-delivered next tick; do not act twice
+            if cmd == "pause":
+                self._paused = True
+                self._record_event("command: pause (idling until resume)")
+            elif cmd == "resume":
+                self._paused = False
+                self._record_event("command: resume")
+            elif cmd in ("restart", "drain"):
+                self._record_event(f"command: {cmd} -> exiting between jobs")
+                stop = cmd
+            elif cmd == "self_update":
+                self._record_event(
+                    "command: self_update acked as no-op (fleet-agent pull-updater owns code rollout)")
+            else:
+                self._record_event(f"command: unknown {cmd!r} acked + ignored")
+        return stop
+
     # -- the single tick ------------------------------------------------------
     def run_once(self) -> dict:
         """Lease one unit of work for this role, process it, heartbeat, and return
@@ -280,8 +322,17 @@ class WorkerLoop:
             ``skipped``           -- an apply wall that no human can solve (cf /
                                      invisible_block): closed as blocked.
             ``idle``              -- nothing eligible to lease.
+            ``paused``            -- a remote 'pause' is in effect: heartbeat only.
+            ``stop``              -- a remote 'restart'/'drain' arrived: the caller
+                                     must exit this worker process (between jobs).
         """
         with self._connect() as conn:
+            stop = self._handle_commands(conn)
+            if stop is not None:
+                return {"action": "stop", "command": stop}
+            if self._paused:
+                self._beat(conn, state="paused")
+                return {"action": "paused"}
             if self.role == ROLE_COMPUTE:
                 return self._tick_compute(conn)
             if self.role == ROLE_DISCOVERY:
@@ -583,5 +634,7 @@ class WorkerLoop:
                 except Exception:
                     pass
                 res = {"action": "error"}
-            if res.get("action") == "idle":
+            if res.get("action") == "stop":
+                return  # remote restart/drain: exit between jobs; supervisor respawns
+            if res.get("action") in ("idle", "paused"):
                 time.sleep(idle_sleep_seconds)

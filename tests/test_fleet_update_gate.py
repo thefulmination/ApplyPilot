@@ -44,6 +44,13 @@ def test_idle_heartbeat_and_other_label_do_not_block(fleet_db):
         assert update_gate.busy_reasons(conn, "m2") == []
 
 
+def test_paused_worker_does_not_block(fleet_db):
+    # a remotely-paused worker holds no job by definition -> safe to update
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "m2-0", machine_owner="m2", role="apply", state="paused")
+        assert update_gate.busy_reasons(conn, "m2") == []
+
+
 def test_discovery_worker_ids_match_label_prefix(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         heartbeat.beat(conn, "m2-disc-1", machine_owner="m2", role="discovery",

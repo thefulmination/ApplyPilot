@@ -78,7 +78,9 @@ def main(argv=None) -> int:
             res = loop.run_once()
         except Exception:
             res = {"action": "error"}
-        if res.get("action") == "idle":
+        if res.get("action") == "stop":
+            return 0  # remote restart/drain: exit between jobs; supervisor respawns
+        if res.get("action") in ("idle", "paused"):
             time.sleep(5.0)
         iteration += 1
         if iteration % _VERSION_CHECK_INTERVAL == 0:
