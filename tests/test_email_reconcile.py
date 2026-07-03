@@ -363,6 +363,45 @@ def test_email_predating_crash_attempt_cannot_confirm():
     assert result.unmatched_emails == 1
 
 
+def test_reconcile_forwards_occurred_at_and_guard_fires_for_the_right_reason(monkeypatch):
+    """Pins the Task-4 wiring itself: the black-box test above also passes when
+    reconcile() DROPS occurred_at (the matcher then refuses via no_timestamp — same
+    unmatched outcome, wrong path). Spy on the matcher to prove reconcile forwards the
+    email's occurred_at and the refusal is the TEMPORAL guard, not the missing-timestamp
+    fallback."""
+    from applypilot.fleet import email_reconcile as mod
+    from applypilot.gmail_outcomes import match_email_to_job as real_match
+
+    seen: list[dict] = []
+
+    def spy(sender, subject, body, jobs, **kw):
+        r = real_match(sender, subject, body, jobs, **kw)
+        seen.append({"occurred_at": kw.get("occurred_at"), "status": r.status, "reason": r.reason})
+        return r
+
+    monkeypatch.setattr(mod, "match_email_to_job", spy)
+    emails = [mod.OutcomeEmail(
+        message_id="m1", sender="no-reply@us.greenhouse-mail.io",
+        subject="Your application to Acme",
+        body="Thank you for applying to Acme. See https://boards.greenhouse.io/acme/jobs/1",
+        company="Acme", title="Analyst", job_url=None, stage="applied_confirmation",
+        occurred_at="2026-06-01T00:00:00+00:00",
+    )]
+    jobs = [{"url": "https://boards.greenhouse.io/acme/jobs/1",
+             "application_url": "https://boards.greenhouse.io/acme/jobs/1",
+             "company": "Acme", "title": "Analyst", "site": "boards.greenhouse.io",
+             "dedup_key": "k1", "guard_after": "2026-06-29T12:00:00+00:00"}]
+
+    result = mod.reconcile(emails, jobs)
+
+    assert result.confirmed == [] and result.unmatched_emails == 1
+    assert seen == [{
+        "occurred_at": "2026-06-01T00:00:00+00:00",       # reconcile forwarded the email's timestamp
+        "status": "needs_review",
+        "reason": "predates_application",                  # temporal guard, NOT no_timestamp
+    }]
+
+
 def test_reconcile_fuzzy_below_threshold_is_probable():
     # Sender is on a generic domain so company_domain strong path does NOT fire.
     # Subject contains only "Acme" (1 of 3 tokens in "Acme Robotics Incorporated"),
