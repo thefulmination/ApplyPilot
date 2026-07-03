@@ -158,6 +158,55 @@ def test_scale_ten_preserves_decimal(monkeypatch, tmp_path):
     assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 9.9
 
 
+def test_approval_never_demotes_prior_effective(monkeypatch, tmp_path):
+    # A kept job the production ranker already had ABOVE the gate must stay there,
+    # even when the res_build score is lower (approval is the decision; the score
+    # is only a rank). The raw res score lands in external_decision_score.
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
+    _insert_job(conn, "https://x.io/j", fit_score=5, audit_score=8.2, audit_label="audit")
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 4.5}])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 1
+    row = conn.execute(
+        "SELECT audit_score, external_decision_score, decision_source FROM jobs WHERE url=?",
+        ("https://x.io/j",)).fetchone()
+    assert row["audit_score"] == 8.2
+    assert row["external_decision_score"] == 4.5
+    assert row["decision_source"] == "res_build"
+
+
+def test_approval_floors_gate_at_apply_threshold(monkeypatch, tmp_path):
+    # A kept job the ranker buries must become apply-eligible: the gate write is
+    # floored at the apply threshold even when the res_build score is below it.
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
+    _insert_job(conn, "https://x.io/j", fit_score=3)
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 4.5}])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 1
+    row = conn.execute(
+        "SELECT audit_score, external_decision_score FROM jobs WHERE url=?",
+        ("https://x.io/j",)).fetchone()
+    assert row["audit_score"] == 6.0
+    assert row["external_decision_score"] == 4.5
+
+
+def test_unit_scale_floor_and_benchmark_score(monkeypatch, tmp_path):
+    # unit-scale input: raw rescales to the ten band BEFORE flooring, so the floor
+    # can never be re-rescaled into a clamped 10 by the importer.
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
+    _insert_job(conn, "https://x.io/j", fit_score=3)
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 0.45}])
+    mod.promote(path, source="res_build", scale="unit", snapshot_path=tmp_path / "snap.json")
+    row = conn.execute(
+        "SELECT audit_score, external_decision_score FROM jobs WHERE url=?",
+        ("https://x.io/j",)).fetchone()
+    assert row["audit_score"] == 6.0
+    assert row["external_decision_score"] == 4.5
+
+
 def test_revert_skips_rows_no_longer_ours(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
     _insert_job(conn, "https://x.io/j", fit_score=5)

@@ -47,7 +47,7 @@ if ($Revert) {
 # 1) Export the jobs you kept (res_build; file I/O only, no brain access).
 Write-Host "[bridge] exporting kept jobs from res_build (decider=$Decider)..." -ForegroundColor Cyan
 if (-not (Test-Path -LiteralPath $ResBuild)) { throw "res_build tree not found at $ResBuild (pass the right path)." }
-$tsx = Join-Path $ResBuild "node_modules\.bin\tsx"
+$tsx = Join-Path $ResBuild "node_modules\.bin\tsx.cmd"
 if (-not (Test-Path -LiteralPath $tsx)) { throw "tsx not found at $tsx -- run 'npm install' in res_build first." }
 Push-Location $ResBuild
 try {

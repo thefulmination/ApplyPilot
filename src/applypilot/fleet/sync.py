@@ -213,16 +213,39 @@ def pull_apply_results(
     status->count summary. Per row: write home FIRST, then stamp the PG row synced -- a
     crash in between just re-pulls next time (the WHERE guards make the replay a no-op,
     and a confirmed apply is never demoted). Mirrors ``fleet_sync.pull_results``."""
+    return _pull_results("apply_queue", sqlite_conn=sqlite_conn, pg_conn=pg_conn, batch=batch)
+
+
+def pull_linkedin_results(
+    *,
+    sqlite_conn: sqlite3.Connection | None = None,
+    pg_conn: Any | None = None,
+    batch: int = 500,
+) -> dict[str, int]:
+    """Ingest terminal linkedin_queue results into the brain -- same contract as
+    pull_apply_results (linkedin_queue is schema-identical). Before this existed the
+    LinkedIn lane's ``pull`` was a report-only stub, so LinkedIn applies never reached
+    the brain: any brain-driven path saw those employers as never-applied."""
+    return _pull_results("linkedin_queue", sqlite_conn=sqlite_conn, pg_conn=pg_conn, batch=batch)
+
+
+def _pull_results(
+    table: str,
+    *,
+    sqlite_conn: sqlite3.Connection | None = None,
+    pg_conn: Any | None = None,
+    batch: int = 500,
+) -> dict[str, int]:
     own_sq, own_pg = sqlite_conn is None, pg_conn is None
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
     counts: dict[str, int] = {}
     try:
-        for res in pgqueue.fetch_pending_results(pg, limit=batch):
+        for res in pgqueue.fetch_pending_results(pg, limit=batch, table=table):
             url, status = res["url"], res["status"]
             if not sq.execute("SELECT 1 FROM jobs WHERE url = ?", (url,)).fetchone():
                 counts["skipped"] = counts.get("skipped", 0) + 1
-                pgqueue.mark_synced(pg, url)        # home is source of truth; drop stragglers
+                pgqueue.mark_synced(pg, url, table=table)   # home is source of truth; drop stragglers
                 continue
             if status == "applied":
                 sq.execute(_PULL_APPLIED, {
@@ -236,7 +259,7 @@ def pull_apply_results(
                     "apply_duration_ms": res["apply_duration_ms"],
                 })
             sq.commit()
-            pgqueue.mark_synced(pg, url)
+            pgqueue.mark_synced(pg, url, table=table)
             counts[status] = counts.get(status, 0) + 1
         return counts
     finally:

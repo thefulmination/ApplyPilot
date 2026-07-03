@@ -48,6 +48,16 @@ def test_sibling_row_excluded_by_company_and_title(conn):
     assert L.acquire_job(min_score=7) is None
 
 
+def test_target_url_acquires_unattempted_null_status_job(conn):
+    _seed(conn, "https://www.linkedin.com/jobs/view/4415558624", company="",
+          application_url=None, apply_status=None)
+
+    job = L.acquire_job(target_url="https://www.linkedin.com/jobs/view/4415558624", min_score=7)
+
+    assert job is not None
+    assert job["url"] == "https://www.linkedin.com/jobs/view/4415558624"
+
+
 def test_sibling_row_excluded_by_effective_url(conn):
     # Two rows that resolve to the SAME ATS form but have no/empty company.
     _seed(conn, "https://hiring.cafe/viewjob/a", company="",

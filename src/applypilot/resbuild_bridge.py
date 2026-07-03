@@ -12,6 +12,10 @@ safety rails the raw importer lacks:
   * applyable-only   -- skip rows already applied or marked ``duplicate_of_url``
   * limit            -- promote the top-N by the user's own score (smallest safe
                         canary batch first)
+  * gate floor       -- the gate write is max(res score, prior effective score,
+                        apply threshold): approval always clears the gate and never
+                        demotes a row the production ranker already had eligible.
+                        The raw res score is kept in ``external_decision_score``.
   * snapshot+revert  -- capture each touched row's prior state BEFORE the write
                         so the whole promotion is one-command reversible
   * dry-run          -- preview (how many are promotable, and how many the bridge
@@ -167,7 +171,11 @@ def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
         }, indent=2), encoding="utf-8")
 
     # Reuse import_decisions for the actual UPDATE (DRY): write the filtered subset
-    # to a temp jsonl tagged with our source, then import it.
+    # to a temp jsonl tagged with our source, then import it. The human APPROVAL is
+    # the decision; the score is only a rank. So the gate write is floored at
+    # max(res score, prior effective score, apply threshold): an approved job always
+    # clears the gate and is never DEMOTED below where the production ranker had it.
+    # The raw res score is preserved in external_decision_score as the benchmark.
     fd, tmpname = tempfile.mkstemp(prefix="resbuild_promote_", suffix=".jsonl")
     os.close(fd)
     tmp = Path(tmpname)
@@ -177,8 +185,20 @@ def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
                 out = dict(r)
                 out["url"] = u
                 out["source"] = source
+                raw = _imp._rescale_score(
+                    _imp._field(r, "decision_score", "decisionScore", "score", "fitScore"),
+                    scale,
+                )
+                if raw is not None:
+                    prior = _eff(existing[u]) if u in existing else None
+                    floors = [raw, float(threshold)]
+                    if prior is not None:
+                        floors.append(float(prior))
+                    out["decision_score"] = raw          # ten band; benchmark score
+                    out["gate_score"] = max(floors)      # ten band; what the gate sees
                 fh.write(json.dumps(out) + "\n")
-        counts = _imp.import_decisions(tmp, scale=scale, default_source=source)
+        # decision_score/gate_score were pre-rescaled to the ten band above.
+        counts = _imp.import_decisions(tmp, scale="ten", default_source=source)
     finally:
         tmp.unlink(missing_ok=True)
 

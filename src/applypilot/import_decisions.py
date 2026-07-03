@@ -175,6 +175,13 @@ def import_decisions(
         if gate_score is None:
             counts["skipped_no_score"] += 1
             continue
+        # external_decision_score always keeps the sender's raw (rescaled) score as the
+        # benchmark datapoint; an explicit gate_score field may override what the apply
+        # gate sees (e.g. resbuild_bridge floors approvals at the apply threshold).
+        external_score = gate_score
+        gate_override = _rescale_score(_field(rec, "gate_score", "gateScore"), scale)
+        if gate_override is not None:
+            gate_score = gate_override
 
         reason = str(_field(rec, "reason", "reasoning", "explanation", "notes") or "")[:2000]
         decided_at = _field(rec, "decided_at", "decidedAt", "decision_at") or now
@@ -183,7 +190,7 @@ def import_decisions(
 
         cur = conn.execute(
             _DECISION_UPDATE,
-            (gate_score, reason, decided_at, source, verdict_l, gate_score,
+            (gate_score, reason, decided_at, source, verdict_l, external_score,
              decided_at, application_url, url),
         )
 
@@ -224,7 +231,7 @@ def import_decisions(
                 continue
             conn.execute(
                 _DECISION_UPDATE,
-                (gate_score, reason, decided_at, source, verdict_l, gate_score,
+                (gate_score, reason, decided_at, source, verdict_l, external_score,
                  decided_at, application_url, url),
             )
             counts["inserted"] += 1

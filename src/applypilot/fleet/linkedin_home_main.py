@@ -166,12 +166,10 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
                 print(f"note: {unscored} apply-shaped LinkedIn jobs are UNSCORED and held out "
                       f"of the push -- run the scorer to fold them into the candidate pool")
         elif args.cmd == "pull":
-            # LinkedIn apply results are recorded in linkedin_queue by the worker;
-            # the pull here reports the current terminal breakdown.
-            with conn.cursor() as cur:
-                cur.execute("SELECT status, count(*) AS n FROM linkedin_queue "
-                            "WHERE status IN ('applied','blocked','crash_unconfirmed','failed') GROUP BY status")
-                print({r["status"]: r["n"] for r in cur.fetchall()})
+            # Ingest terminal linkedin_queue results into the brain and stamp them
+            # synced (idempotent; a confirmed apply is never demoted). This used to be
+            # a report-only stub -- LinkedIn applies never reached the brain.
+            print("pulled", sync.pull_linkedin_results(pg_conn=conn))
         elif args.cmd == "linkedin-canary":
             set_linkedin_canary(conn, args.k)
             print("linkedin canary armed", args.k)

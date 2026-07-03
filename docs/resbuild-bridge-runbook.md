@@ -8,8 +8,16 @@ kept) into ApplyPilot's apply gate. Until now the apply pipeline selected jobs p
 selected — **including the ones ApplyPilot's own ranker scores below the apply threshold.**
 
 **Safety properties**
+- **Approval always clears the gate, never demotes.** The gate write is
+  `max(res score, prior effective score, apply threshold)`: a kept job the ranker buries is
+  floored up to the threshold, and a kept job the ranker already had above the gate keeps its
+  higher score. The raw res_build score is preserved in `external_decision_score` as the
+  benchmark datapoint. *(Added 2026-07-02 — the v1 write used the raw res score, which left
+  low-scored keeps still buried and could demote already-eligible rows.)*
 - **Reversible.** Every real promote writes a snapshot of each touched row's prior state first;
   `-Revert` restores it. Revert only touches rows still tagged `decision_source='res_build'`.
+  NOTE: a re-run overwrites the snapshot with the *current* (post-promote) state — always
+  `-Revert` first if you intend to re-promote, so priors are pristine.
 - **LinkedIn excluded by default.** The LinkedIn lane is separate/supervised; v1 promotes the
   offsite-ATS subset only.
 - **Applyable-only.** Rows already applied, or marked `duplicate_of_url`, are skipped.

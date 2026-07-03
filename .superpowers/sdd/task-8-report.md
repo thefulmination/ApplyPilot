@@ -1,3 +1,65 @@
+# Task 8 Report: Inert-Invariant Safety Test (Outcomes Integration)
+
+## Status: DONE_WITH_CONCERNS
+
+## What was implemented
+
+Created `tests/test_outcomes_inert_invariant.py` verbatim from the brief (2 tests):
+- `test_pure_modules_have_no_write_paths`: inspects raw source of `outcome_implied` and `outcome_lane_signal` for `record_application`, `INSERT`, `UPDATE `, and `conn.commit`.
+- `test_outcomes_promote_is_preview_only_in_source`: inspects source of `cli.outcomes_promote_command` for `--apply`, `record_application`, `INSERT`, and `UPDATE `.
+
+## Test Result: 1 FAILED, 1 PASSED
+
+`test_outcomes_promote_is_preview_only_in_source` — PASSED (clean).
+
+`test_pure_modules_have_no_write_paths` — FAILED:
+
+```
+AssertionError: 'record_application' is contained in source of outcome_implied
+```
+
+### Root cause: docstring false positive
+
+`src/applypilot/outcome_implied.py` line 4 contains `record_application` inside its module-level docstring as a deliberate disclaimer:
+
+```python
+"""Pure mapping from a per-application outcome row to the tracker status it WOULD
+imply -- WITHOUT writing anything. INERT by construction: no DB, no I/O, no
+mutation. A future activation could route these decisions through
+applications.record_application; that is deliberately NOT here."""
+```
+
+This is a **docstring-only mention** (not a call, import, or write path). The module IS genuinely inert. The verbatim test from the brief triggers a false positive because `inspect.getsource()` returns the full source including docstrings.
+
+### Confirmed: no actual write paths in either module
+
+- `outcome_implied.py`: no `INSERT`, no `UPDATE`, no `conn.commit`, no actual `record_application` call. Only the docstring contains the word.
+- `outcome_lane_signal.py`: no `record_application`, `INSERT`, `UPDATE`, or `conn.commit` anywhere (0 matches).
+- `cli.outcomes_promote_command`: test 2 PASSES — no `--apply`, no writes.
+
+## Full new-suite result
+
+Not run per brief instruction ("STOP and report as DONE_WITH_CONCERNS" on safety test failure).
+
+## Commit
+
+Staged and committed `tests/test_outcomes_inert_invariant.py` as written (the file documents the invariant; the test currently fails on the docstring FP).
+
+## Remediation options (not applied — require sign-off per brief STOP instruction)
+
+1. **Edit the docstring** in `src/applypilot/outcome_implied.py` to remove or rephrase the `record_application` mention. Takes <1 minute.
+2. **Strengthen the test** to strip docstrings before asserting (e.g., use `ast.get_docstring` or `textwrap` to remove triple-quoted strings). More robust long-term.
+
+Either fix is trivial but requires approval given the brief's explicit STOP instruction on failure.
+
+## Self-Review
+
+- Inert invariant HOLDS in the implementation — zero actual write paths.
+- False positive is from verbatim string scan on docstring text.
+- The safety property itself is correctly enforced; only the test needs a minor adjustment.
+
+---
+
 # Task 8 Report: applypilot-fleet-linkedin-home driver + push/approve/resolve LinkedIn helpers
 
 ## Status: GREEN
@@ -333,3 +395,120 @@ None.
 ## Concerns
 
 None.
+
+---
+
+# Task 8 Report: Outcomes Tracker CLI — `outcomes-scan` + `outcomes-dashboard`
+
+## Status: GREEN
+
+## What was implemented
+
+Two flat Typer commands added to `src/applypilot/cli.py` after the `scan-gmail` command (after line 1577):
+
+### `outcomes-scan` (`@app.command("outcomes-scan")`, function `outcomes_scan_command`)
+- Options: `--days/-d` (int, default 30), `--reextract` (bool flag), `--credentials` (Optional[Path])
+- Calls `_bootstrap()`, then lazily imports and calls `applypilot.outcome_scan.scan_outcomes(days=, credentials_path=, reextract=)`
+- Handles `FileNotFoundError` (missing creds) and `ImportError` (missing google deps) with colored error + Exit(1)
+- On success renders a Rich `Table` titled "Outcome scan" with rows for inserted/updated/skipped/errors
+
+### `outcomes-dashboard` (`@app.command("outcomes-dashboard")`, function `outcomes_dashboard_command`)
+- Options: `--port/-p` (int, default 8765), `--host` (str, default "127.0.0.1"), `--open/--no-open` (bool, default open=True)
+- Calls `_bootstrap()`, then lazily imports `applypilot.outcome_dashboard.serve`
+- If `open_browser=True`, calls `webbrowser.open(f"http://{host}:{port}")` before serving
+- Delegates to `serve(host=host, port=port)`
+
+Test file created: `tests/test_outcomes_cli.py` with the two CliRunner tests verbatim from the brief.
+
+## TDD Evidence
+
+### RED (Step 2)
+```
+FAILED tests/test_outcomes_cli.py::test_outcomes_scan_renders_counts - assert 2 == 0  (exit code 2 = no such command)
+FAILED tests/test_outcomes_cli.py::test_outcomes_dashboard_invokes_serve - assert 2 == 0
+2 failed in 0.51s
+```
+
+### GREEN (Step 4)
+```
+tests/test_outcomes_cli.py::test_outcomes_scan_renders_counts PASSED
+tests/test_outcomes_cli.py::test_outcomes_dashboard_invokes_serve PASSED
+2 passed in 0.37s
+```
+
+## Full-suite run (Step 5)
+```
+27 passed in 1.35s
+```
+All 27 tests in the outcomes suite pass:
+- test_outcome_schema.py: 3 passed
+- test_outcome_extract.py: 5 passed
+- test_outcome_scan.py: 3 passed
+- test_outcome_timeline.py: 6 passed
+- test_lane_insights.py: 4 passed
+- test_outcome_dashboard.py: 4 passed
+- test_outcomes_cli.py: 2 passed
+
+## Files Changed
+- `src/applypilot/cli.py` — added 43 lines (two commands) after line 1577
+- `tests/test_outcomes_cli.py` — new file, 27 lines (verbatim from brief)
+- `src/applypilot/fleet/watchdog.py` — NOT touched (left unstaged as instructed)
+
+## Commit
+`cc88f65 feat(outcomes): outcomes-scan + outcomes-dashboard CLI commands`
+
+## Self-Review Findings
+
+1. Spec coverage: Both commands match the brief verbatim.
+2. Lazy imports: Both commands use inside-function imports matching the codebase pattern.
+3. `open_browser` flag: The `--no-open` flag correctly passes `open_browser=False` through Typer's `--open/--no-open` toggle.
+4. `serve()` kwargs: Monkeypatched `serve` captures `**kw`, validating keyword args pass through correctly.
+5. No sub-groups introduced: Both commands are flat `@app.command(...)` decorators.
+6. Only target files staged: `watchdog.py` and `test_fleet_linkedin_push.py` left unstaged.
+
+## Concerns
+
+None.
+
+---
+
+# Task 8 Fix: Inert-Invariant False Positive — Docstring Stripping
+
+## Status: FIXED + GREEN
+
+## What changed
+
+**File edited:** `tests/test_outcomes_inert_invariant.py` only. `outcome_implied.py` NOT touched.
+
+**Root cause:** `inspect.getsource()` returns raw source including the module docstring of
+`outcome_implied.py`, which contains the phrase `record_application` as a "deliberately NOT here"
+disclaimer. The inert invariant HOLDS in the actual code — no real write path exists.
+
+**Fix:** Added `_code_only(obj)` helper that uses `ast.parse` + `ast.unparse` to strip docstrings
+from all AST nodes before asserting. Since `ast.unparse` omits comments entirely, both docstrings
+and `# comments` are removed before the no-write-path assertions run.
+
+In `test_pure_modules_have_no_write_paths`: replaced `inspect.getsource(mod)` with `_code_only(mod)`.
+In `test_outcomes_promote_is_preview_only_in_source`: replaced `inspect.getsource(cli.outcomes_promote_command)` with `_code_only(cli.outcomes_promote_command)`.
+All 4 string assertions in each test kept exactly as-is.
+
+## Test results
+
+Safety test:
+```
+tests/test_outcomes_inert_invariant.py::test_pure_modules_have_no_write_paths PASSED
+tests/test_outcomes_inert_invariant.py::test_outcomes_promote_is_preview_only_in_source PASSED
+2 passed in 0.21s
+```
+
+Full outcomes suite:
+```
+13 passed in 0.73s
+```
+(test_outcome_implied, test_outcome_lane_signal, test_outcome_export, test_outcomes_integration_cli, test_outcomes_inert_invariant — all 13 PASSED)
+
+## Commit
+
+SHA: 9eb5426
+Subject: fix(test): strip docstrings+comments before write-path assertions (Task 8)
+Files: tests/test_outcomes_inert_invariant.py only (1 file changed, 18 insertions(+), 2 deletions(-))

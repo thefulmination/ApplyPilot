@@ -383,10 +383,14 @@ def push_jobs(conn: psycopg.Connection, rows: Iterable[dict[str, Any]]) -> int:
     return len(rows)
 
 
+# PULL works for both lanes: linkedin_queue is schema-identical to apply_queue
+# (LIKE apply_queue). Table names come ONLY from this allowlist -- never from input.
+_PULL_TABLES = ("apply_queue", "linkedin_queue")
+
 _PULL_SQL = """
 SELECT url, status, apply_status, apply_error, verification_confidence,
        agent_model, est_cost_usd, applied_at, worker_id, apply_duration_ms
-FROM apply_queue
+FROM {table}
 WHERE status IN ('applied','failed','blocked','crash_unconfirmed')
   AND synced_to_home_at IS NULL
 ORDER BY updated_at
@@ -394,19 +398,27 @@ LIMIT %(limit)s;
 """
 
 
-def fetch_pending_results(conn: psycopg.Connection, *, limit: int = 500) -> list[dict[str, Any]]:
+def _check_pull_table(table: str) -> str:
+    if table not in _PULL_TABLES:
+        raise ValueError(f"unknown pull table {table!r} (allowed: {_PULL_TABLES})")
+    return table
+
+
+def fetch_pending_results(conn: psycopg.Connection, *, limit: int = 500,
+                          table: str = "apply_queue") -> list[dict[str, Any]]:
     """PULL step A: terminal rows not yet ingested into home SQLite."""
     with conn.cursor() as cur:
-        cur.execute(_PULL_SQL, {"limit": limit})
+        cur.execute(_PULL_SQL.format(table=_check_pull_table(table)), {"limit": limit})
         rows = cur.fetchall()
     conn.rollback()
     return rows
 
 
-def mark_synced(conn: psycopg.Connection, url: str) -> None:
+def mark_synced(conn: psycopg.Connection, url: str, *, table: str = "apply_queue") -> None:
     """Stamp a row ingested-home so PULL is idempotent."""
     with conn.cursor() as cur:
-        cur.execute("UPDATE apply_queue SET synced_to_home_at = now() WHERE url = %s", (url,))
+        cur.execute(f"UPDATE {_check_pull_table(table)} SET synced_to_home_at = now() WHERE url = %s",
+                    (url,))
     conn.commit()
 
 

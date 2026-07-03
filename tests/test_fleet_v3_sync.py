@@ -249,3 +249,48 @@ def test_pull_compute_results_is_advisory_only_and_idempotent(fleet_db, tmp_path
 
         # re-pull is a no-op
         assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 0
+
+
+# ---------------------------------------------------------------------------
+# LINKEDIN pull (regression: pull was a report-only stub -- LinkedIn applies
+# never reached the brain, so brain-driven paths saw them as never-applied)
+# ---------------------------------------------------------------------------
+
+def test_pull_linkedin_results_maps_applied_and_idempotent(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    url = "https://www.linkedin.com/jobs/view/12345"
+    _add_job(sq, url, company="Acme", title="COS")
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score, status, applied_at) "
+                "VALUES (%s,%s,%s,'applied', now())", (url, url, 8.0))
+        pg.commit()
+
+        assert sync.pull_linkedin_results(sqlite_conn=sq, pg_conn=pg).get("applied") == 1
+        brain = sq.execute("SELECT apply_status, applied_at FROM jobs WHERE url=?", (url,)).fetchone()
+        assert brain["apply_status"] == "applied"
+        assert brain["applied_at"] is not None
+
+        # re-pull is a no-op (linkedin_queue row stamped synced_to_home_at)
+        assert sync.pull_linkedin_results(sqlite_conn=sq, pg_conn=pg) == {}
+
+
+def test_lane_pulls_do_not_cross_consume(fleet_db, tmp_path):
+    """The ATS pull must not stamp/ingest linkedin_queue rows and vice versa."""
+    sq = _home_sqlite(tmp_path)
+    li_url = "https://www.linkedin.com/jobs/view/777"
+    _add_job(sq, li_url, company="L", title="COS")
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score, status, applied_at) "
+                "VALUES (%s,%s,%s,'applied', now())", (li_url, li_url, 8.0))
+        pg.commit()
+
+        assert sync.pull_apply_results(sqlite_conn=sq, pg_conn=pg) == {}   # ats pull: no-op
+        with pg.cursor() as cur:
+            cur.execute("SELECT synced_to_home_at FROM linkedin_queue WHERE url=%s", (li_url,))
+            assert cur.fetchone()["synced_to_home_at"] is None             # untouched
+
+        assert sync.pull_linkedin_results(sqlite_conn=sq, pg_conn=pg).get("applied") == 1

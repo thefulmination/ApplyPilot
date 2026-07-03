@@ -570,7 +570,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       AND duplicate_of_url IS NULL
                       AND COALESCE(liveness_status, '') != 'dead'
                       AND COALESCE(apply_status, '') != 'applied'
-                      AND apply_status != 'in_progress'
+                      AND COALESCE(apply_status, '') != 'in_progress'
                     ORDER BY CASE WHEN url = ? OR application_url = ? THEN 0 ELSE 1 END
                     LIMIT 1
                 """, (target_url, target_url, like, like, target_url, target_url)).fetchone()

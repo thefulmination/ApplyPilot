@@ -13,6 +13,9 @@ param(
   [string]$Db = "applypilot_fleet"
 )
 $ErrorActionPreference = "Stop"
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+  ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) { throw "Run from an ELEVATED PowerShell -- the firewall step needs admin, and the check runs FIRST so a non-elevated run mutates nothing." }
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
@@ -32,8 +35,12 @@ Write-Host "[pg-tailscale] home box tailnet address: $tsIp"
 
 # 1. Role (password prompted; passed to python via env so it never appears in argv).
 $sec = Read-Host -AsSecureString "New password for PG role '$Role' (re-running rotates it)"
-$env:APPLYPILOT_PG_ROLE_PW = [Runtime.InteropServices.Marshal]::PtrToStringUni(
-  [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($sec))
+$ptr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($sec)
+try {
+  $env:APPLYPILOT_PG_ROLE_PW = [Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)
+} finally {
+  [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr)
+}
 $env:APPLYPILOT_PG_ROLE = $Role
 $env:APPLYPILOT_SUPER_DSN = $SuperDsn
 & $py -c "import os; from applypilot.apply import pgqueue; from applypilot.fleet import pg_roles; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); pg_roles.ensure_fleet_worker_role(conn, os.environ['APPLYPILOT_PG_ROLE_PW'], role=os.environ['APPLYPILOT_PG_ROLE']); conn.close(); print('[pg-tailscale] role ensured')"
@@ -41,18 +48,22 @@ if ($LASTEXITCODE -ne 0) { throw "role creation failed" }
 
 # 2. pg_hba.conf: tailnet-only rule (idempotent append).
 $hba = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW hba_file'); print(cur.fetchone()[0]); conn.close()").Trim()
+if ($LASTEXITCODE -ne 0 -or -not $hba) { throw "could not read hba_file location from Postgres (is the local superuser DSN working?)" }
 $rule = "host    $Db    $Role    $TailnetCidr    scram-sha-256"
 $hbaText = Get-Content $hba -Raw
-if ($hbaText -notmatch [regex]::Escape($TailnetCidr)) {
+$rulePattern = "(?m)^\s*host\s+$([regex]::Escape($Db))\s+$([regex]::Escape($Role))\s+$([regex]::Escape($TailnetCidr))"
+if ($hbaText -notmatch $rulePattern) {
   Add-Content -Path $hba -Value "`n# ApplyPilot remote fleet workers (Tailscale only)`n$rule"
   Write-Host "[pg-tailscale] pg_hba rule appended: $rule"
 } else {
-  Write-Host "[pg-tailscale] pg_hba already has a $TailnetCidr rule; left as-is"
+  Write-Host "[pg-tailscale] pg_hba already has an active rule for $Role@$Db from $TailnetCidr; left as-is"
 }
 & $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SELECT pg_reload_conf()'); conn.close(); print('[pg-tailscale] config reloaded')"
+if ($LASTEXITCODE -ne 0) { throw "pg_reload_conf() failed (could not reload Postgres config)" }
 
 # 3. listen_addresses must cover the tailnet interface ('*' does).
 $listen = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW listen_addresses'); print(cur.fetchone()[0]); conn.close()").Trim()
+if ($LASTEXITCODE -ne 0 -or -not $listen) { throw "could not read listen_addresses from Postgres (is the local superuser DSN working?)" }
 if ($listen -ne "*" -and $listen -notmatch [regex]::Escape($tsIp)) {
   Write-Warning "listen_addresses='$listen' does not cover $tsIp. Edit postgresql.conf to 'listen_addresses = ''*''' (or add $tsIp) and RESTART the PostgreSQL service."
 } else {
