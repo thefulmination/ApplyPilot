@@ -167,7 +167,12 @@ while ($true) {
   $want = [int]$f[0]; $agent = $f[1]; $model = $f[2]; $gen = [int]$f[3]
 
   $procs = Get-LocalWorkers
-  $have = $procs.Count
+  # A worker is TWO OS processes (the pip .exe wrapper + its python.exe child), both carrying the
+  # same --worker-id. Count DISTINCT SLOTS, never raw processes: counting processes reads 1 worker
+  # as 2 -> "over target" -> kill -> next poll sees 0 -> respawn, forever (live 7/03: this loop
+  # leaked 51 launcher windows in 40 min on home and killed home-0 mid-apply every ~42s).
+  $slotGroups = @($procs | Group-Object { Slot-Of $_ })
+  $have = $slotGroups.Count
 
   # generation bump -> the home box asked for a clean restart: kill all local, then re-spawn to $want
   if ($null -ne $lastGen -and $gen -ne $lastGen) {
@@ -178,7 +183,7 @@ while ($true) {
   $lastGen = $gen
 
   if ($have -lt $want) {
-    $running = @($procs | ForEach-Object { Slot-Of $_ })
+    $running = @($slotGroups | ForEach-Object { [int]$_.Name })
     $started = 0; $slot = 0
     while ($started -lt ($want - $have) -and $slot -le 20) {
       if ($running -notcontains $slot) {
@@ -186,7 +191,9 @@ while ($true) {
         # so a repo path containing spaces (home's OneDrive checkout) otherwise truncates to
         # "-File C:\...\New" and the child exits before the launcher ever runs (m2/m4's
         # C:\ApplyPilot masked this for days).
-        $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$worker`"", "-Slot", $slot, "-Agent", $agent, "-Label", $Label)
+        # No -NoExit: a launcher window must close when its worker exits, or every worker death
+        # leaves an eternal window (transcripts live in .applypilot\logs\worker-<slot>.log).
+        $argList = @("-ExecutionPolicy", "Bypass", "-File", "`"$worker`"", "-Slot", $slot, "-Agent", $agent, "-Label", $Label)
         if ($model) { $argList += @("-Model", $model) }
         Start-Process powershell.exe -ArgumentList $argList -WorkingDirectory $repo
         Write-Host "[fleet-agent:$Label] +start $Label-$slot ($agent$(if($model){"/$model"}))" -ForegroundColor Green
@@ -196,9 +203,10 @@ while ($true) {
     }
   }
   elseif ($have -gt $want) {
-    $procs | Sort-Object { Slot-Of $_ } -Descending | Select-Object -First ($have - $want) | ForEach-Object {
-      Write-Host "[fleet-agent:$Label] -stop $Label-$(Slot-Of $_) (scale-down / offload)" -ForegroundColor Yellow
-      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    # Scale down by SLOT (highest first), killing every process of that slot (exe wrapper + python child).
+    $slotGroups | Sort-Object { [int]$_.Name } -Descending | Select-Object -First ($have - $want) | ForEach-Object {
+      Write-Host "[fleet-agent:$Label] -stop $Label-$($_.Name) (scale-down / offload)" -ForegroundColor Yellow
+      $_.Group | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     }
   }
   Start-Sleep -Seconds $PollSec
