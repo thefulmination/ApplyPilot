@@ -9,9 +9,33 @@ import argparse
 import logging
 import os
 import re
+import signal
+import threading
 import time
 
 logger = logging.getLogger("applypilot.fleet.apply_worker_main")
+
+# --- graceful stop (SIGTERM) -------------------------------------------------
+# The macOS launchd wrapper (run-worker-mac.sh) and `launchctl unload` send SIGTERM to
+# restart the worker for a code update. Mid-apply death parks the job crash_unconfirmed
+# ("may-have-submitted"), so instead: SIGTERM sets a flag, the CURRENT job finishes, and
+# run_apply exits before the next lease. SIGINT (Ctrl+C) keeps default abort behavior.
+_STOP_REQUESTED = threading.Event()
+
+
+def request_stop(signum=None, frame=None) -> None:
+    _STOP_REQUESTED.set()
+
+
+def stop_requested() -> bool:
+    return _STOP_REQUESTED.is_set()
+
+
+def install_stop_handler() -> None:
+    try:
+        signal.signal(signal.SIGTERM, request_stop)
+    except (ValueError, OSError):  # pragma: no cover - non-main thread / exotic platform
+        pass
 
 
 def _setup_apply_env() -> None:
@@ -214,7 +238,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dic
     from applypilot.apply import pgqueue
     counts = {"applied": 0, "halted": 0, "idle": 0, "error": 0}
     it = 0
-    while max_iterations is None or it < max_iterations:
+    while not _STOP_REQUESTED.is_set() and (max_iterations is None or it < max_iterations):
         it += 1
         try:
             with conn_factory() as conn:
@@ -245,6 +269,8 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dic
             counts["error"] += 1
             if idle_sleep:
                 time.sleep(idle_sleep)
+    if _STOP_REQUESTED.is_set():
+        logger.info("stop requested (SIGTERM); exiting after current job, before next lease")
     return counts
 
 
@@ -263,6 +289,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
+    install_stop_handler()
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
