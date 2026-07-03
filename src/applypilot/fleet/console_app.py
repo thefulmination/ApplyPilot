@@ -504,6 +504,107 @@ def build_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# READ: /api/challenges -- unions open auth_challenge rows with PARKED rows
+# (apply_status='challenge_pending') from BOTH lanes, grouped kind -> host, so the
+# operator can see the whole captcha/OTP backlog (including rows a worker parked
+# but that never raised/kept an auth_challenge row) in one place.
+# ---------------------------------------------------------------------------
+def _host_of(url: str | None) -> str:
+    """netloc of url, www. stripped. Best-effort -- never raises on a malformed url."""
+    import urllib.parse as _up
+    if not url:
+        return ""
+    try:
+        host = _up.urlsplit(url).hostname or ""
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _age_hours(ts: Any, now: _dt.datetime) -> float | None:
+    if ts is None or not hasattr(ts, "tzinfo"):
+        return None
+    t = ts if ts.tzinfo is not None else ts.replace(tzinfo=_dt.timezone.utc)
+    return round((now - t).total_seconds() / 3600.0, 1)
+
+
+def _challenges_data(conn) -> dict:
+    """READ-ONLY: open auth_challenge rows + parked rows from apply_queue/linkedin_queue,
+    unioned by url, grouped kind -> host. Parked rows with no matching open challenge
+    group under kind '(no challenge row)'. conn.rollback() marks it read-only."""
+    now = _utcnow()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, kind, machine_owner, screenshot_url, raised_at "
+            "FROM auth_challenge WHERE resolved_at IS NULL")
+        open_challenges = cur.fetchall()
+        cur.execute(
+            "SELECT url, company, title, score, updated_at "
+            "FROM apply_queue WHERE apply_status='challenge_pending'")
+        parked_apply = cur.fetchall()
+        cur.execute(
+            "SELECT url, company, title, score, updated_at "
+            "FROM linkedin_queue WHERE apply_status='challenge_pending'")
+        parked_linkedin = cur.fetchall()
+    conn.rollback()  # read-only
+
+    challenge_by_url: dict[str, dict] = {r["url"]: r for r in open_challenges}
+    parked_by_url: dict[str, tuple[str, dict]] = {}
+    for r in parked_apply:
+        parked_by_url[r["url"]] = ("apply", r)
+    for r in parked_linkedin:
+        parked_by_url[r["url"]] = ("linkedin", r)
+
+    urls = set(challenge_by_url) | set(parked_by_url)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for url in urls:
+        ch = challenge_by_url.get(url)
+        lane, park = parked_by_url.get(url, (None, None))
+        kind = ch["kind"] if ch else "(no challenge row)"
+        host = _host_of(url)
+        raised_at = ch["raised_at"] if ch else None
+        updated_at = park["updated_at"] if park else None
+        row = {
+            "url": url,
+            "lane": lane,
+            "company": park["company"] if park else None,
+            "title": park["title"] if park else None,
+            "score": park["score"] if park else None,
+            "kind": kind,
+            "machine": ch["machine_owner"] if ch else None,
+            "screenshot_url": ch["screenshot_url"] if ch else None,
+            "age_hours": _age_hours(raised_at if ch else updated_at, now),
+        }
+        groups.setdefault((kind, host), []).append(row)
+
+    return {
+        "groups": [
+            {"kind": kind, "host": host, "rows": rows}
+            for (kind, host), rows in groups.items()
+        ],
+        "counts": {
+            "open_challenges": len(open_challenges),
+            "parked": len(parked_by_url),
+        },
+    }
+
+
+def build_challenges() -> dict:
+    """Open a short-lived connection, build the /api/challenges payload, always close."""
+    conn = pgqueue.connect()  # reads APPLYPILOT_FLEET_DSN / DATABASE_URL
+    try:
+        return _challenges_data(conn)
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # READ: per-worker crash + log tail (separate endpoint; NOT in the 4s /api/status
 # poll, so the big text blobs never bloat it). The worker already scrubbed this text
 # before storing it; we scrub AGAIN on read (defense in depth -- S1) and cap sizes (S3).
@@ -1005,6 +1106,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, outcomes())
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
+            return
+        if path == "/api/challenges":
+            try:
+                self._send_json(200, build_challenges())
+            except Exception as e:
+                self._send_json(503, {"error": str(e)})
             return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs
