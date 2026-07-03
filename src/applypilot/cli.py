@@ -1674,9 +1674,34 @@ def outcomes_scan_command(
     concurrency: int = typer.Option(8, "--concurrency", "-j", help="Parallel LLM extractions (network-bound, so higher = faster)."),
     reextract: bool = typer.Option(False, "--reextract", help="Re-run LLM extraction on already-seen emails."),
     credentials: Optional[Path] = typer.Option(None, "--credentials", help="Path to gmail_credentials.json."),
+    reaudit: bool = typer.Option(
+        False, "--reaudit",
+        help="Re-run match guards over stored email_events (no Gmail calls); reversible via prev_job_url."),
 ) -> None:
     """Scan Gmail and populate the email_events outcome timeline (LLM extraction)."""
     _bootstrap()
+
+    if reaudit:
+        from applypilot.database import get_connection
+        from applypilot.outcome_reaudit import reaudit_email_events
+        conn = get_connection()
+        report = reaudit_email_events(conn)
+
+        table = Table(title="Outcome re-audit", show_header=True, header_style="bold")
+        table.add_column("Result", style="bold")
+        table.add_column("Count", justify="right")
+        table.add_row("checked", str(report["checked"]))
+        table.add_row("backfilled", str(report["backfilled"]))
+        table.add_row("flipped", str(sum(report["flipped"].values())))
+        console.print(table)
+
+        if report["flipped"]:
+            reasons = report["flipped"]
+            console.print(
+                "flipped reasons: " + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
+            )
+        return
+
     from applypilot.outcome_scan import scan_outcomes
     try:
         counts = scan_outcomes(
