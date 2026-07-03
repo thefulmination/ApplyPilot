@@ -50,6 +50,10 @@ if ($Agent -eq "claude") {
 $env:APPLYPILOT_DB_PATH = Join-Path $env:TEMP "fleet_apply_throwaway_$Slot.db"
 $env:APPLYPILOT_ENABLE_GMAIL_MCP = "1"
 $env:APPLYPILOT_AGENT_TIMEOUT = "600"
+# Cheap read-only liveness probe before each agent launch: ~15% of queued postings are dead
+# (expired/closed) and would otherwise burn a full agent launch. linkedin.com is guarded in
+# liveness.py (never probed). Container/supervisor lanes already run with this ON.
+$env:APPLYPILOT_PREFLIGHT_LIVENESS = "1"
 $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 
 if (-not $env:FLEET_PG_DSN) { throw "FLEET_PG_DSN is not set (the setup script persists it; open a fresh window)." }
