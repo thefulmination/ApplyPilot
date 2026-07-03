@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-SCRIPTS = ["run-worker-mac.sh"]  # Task 6 appends "setup-mac-worker.sh"
+SCRIPTS = ["run-worker-mac.sh", "setup-mac-worker.sh"]
 
 
 def _find_bash():
