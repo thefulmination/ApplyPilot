@@ -832,6 +832,7 @@ def build_gmail_service(
 ):
     """Build a gmail service instance using read-only OAuth credentials."""
     try:
+        from google.auth.exceptions import RefreshError
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
@@ -862,9 +863,18 @@ def build_gmail_service(
     if tok_path.exists():
         creds = Credentials.from_authorized_user_file(str(tok_path), GMAIL_SCOPES)
     if not creds or not creds.valid:
+        refreshed = False
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+                refreshed = True
+            except RefreshError:
+                # Token revoked or expired beyond refresh (e.g. an unverified OAuth app in
+                # "Testing" status expires refresh tokens after 7 days). Fall through to a
+                # fresh interactive consent instead of crashing on invalid_grant.
+                log.warning("Gmail refresh token revoked/expired; re-consent required")
+                creds = None
+        if not refreshed:
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), GMAIL_SCOPES)
             creds = flow.run_local_server(port=0)
         tok_path.write_text(creds.to_json(), encoding="utf-8")
