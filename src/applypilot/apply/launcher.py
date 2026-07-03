@@ -628,6 +628,40 @@ def record_tenant_outcome(conn, apply_url: str, status: str) -> None:
                      (apply_url or "")[:80], status, exc_info=True)
 
 
+# Challenge-class terminal statuses run_job can return: a wall the agent
+# cannot solve unattended. During an --auth-gated (supervised) run, hitting
+# one of these means the tenant needs a same-day halt (see
+# handle_auth_gated_result below) rather than a retry-storm against a wall
+# that won't clear itself within the run.
+AUTH_GATED_CHALLENGE_STATUSES: frozenset[str] = frozenset({
+    "captcha", "login_issue", "auth_required",
+})
+
+
+def handle_auth_gated_result(conn, host: str, status: str) -> bool:
+    """Halt `host` for the rest of the UTC day if `status` is a challenge-class
+    terminal result (captcha / login_issue / auth_required) from an
+    --auth-gated (supervised) apply run.
+
+    Uses the SAME end-of-UTC-day ISO format as the `tenants halt` CLI
+    (datetime.combine(today, time(23,59,59), tzinfo=utc).isoformat()) so
+    tenants.is_halted's lexicographic ISO comparison is correct.
+
+    Returns:
+        True if the tenant was halted (status was challenge-class), else False.
+    """
+    if status not in AUTH_GATED_CHALLENGE_STATUSES:
+        return False
+
+    from datetime import time as _time
+
+    until_iso = datetime.combine(
+        datetime.now(timezone.utc).date(), _time(23, 59, 59), tzinfo=timezone.utc
+    ).isoformat()
+    tenants_mod.halt_tenant(conn, host, until_iso)
+    return True
+
+
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0, exclude_linkedin: bool = False,
                 exclude_urls: set[str] | None = None,
@@ -713,6 +747,15 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     eff = "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END)"
                     host_clause = " ".join(f"AND {eff} NOT LIKE ?" for _ in exclude_hosts)
                     params.extend(f"%{h}%" for h in exclude_hosts)
+                # --auth-gated --tenant <host>: scope candidate selection to a single
+                # tenant host (positive filter). Env-driven like the other run-scoped
+                # filters above so it doesn't need a new acquire_job parameter.
+                tenant_scope = (os.environ.get("APPLYPILOT_AUTH_GATED_TENANT_HOST") or "").strip().lower()
+                tenant_clause = ""
+                if tenant_scope:
+                    eff2 = "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END)"
+                    tenant_clause = f"AND {eff2} LIKE ?"
+                    params.append(f"%{tenant_scope}%")
                 # Optional freshness filter: skip very-stale postings (discovered_at older
                 # than APPLYPILOT_MAX_JOB_AGE_DAYS) that aren't liveness-confirmed -- they
                 # have a much higher expired-on-visit rate, so applying to them wastes a
@@ -798,6 +841,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       {li_clause}
                       {seen_clause}
                       {host_clause}
+                      {tenant_clause}
                       {fresh_clause}
                       {lane_clause}
                     ORDER BY COALESCE(audit_score, fit_score) DESC,
@@ -2162,7 +2206,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 model: str | None = "sonnet", dry_run: bool = False,
-                agent: str = "claude", browser: str | None = None) -> tuple[int, int]:
+                agent: str = "claude", browser: str | None = None,
+                supervised: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -2176,6 +2221,12 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         agent: Apply-agent CLI to run: claude or codex.
         browser: Browser to drive (chrome/edge/...). A browser whose profile lacks the
             LinkedIn session (e.g. edge) is auto-restricted to the offsite lane.
+        supervised: When True (the --auth-gated owner-supervised lane), passed
+            through to run_job so record_tenant_outcome fires on the real
+            terminal status, and a challenge-class result (captcha/
+            login_issue/auth_required) halts that tenant for the rest of the
+            UTC day via handle_auth_gated_result -- the loop then continues
+            with other hosts instead of retry-storming a wall it can't solve.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -2362,7 +2413,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run,
-                                            agent=agent)
+                                            agent=agent, supervised=supervised)
 
             if (
                 not dry_run
@@ -2381,7 +2432,22 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                         dry_run=dry_run,
                         agent=agent,
                         inbox_auth_hint=inbox_hint,
+                        supervised=supervised,
                     )
+
+            # --auth-gated same-day halt: a challenge-class result means this
+            # tenant hit a wall the agent can't solve unattended -- halt it
+            # for the rest of the UTC day and keep applying to other hosts
+            # rather than retry-storming the same wall.
+            if supervised and not dry_run:
+                try:
+                    _host = tenants_mod._host_of(_apply_target(job))
+                    if _host and handle_auth_gated_result(get_connection(), _host, result):
+                        with _host_halt_lock:
+                            _offsite_halted_hosts.add(_host)
+                        add_event(f"[W{worker_id}] {_host} halted for the day (auth-gated challenge: {result})")
+                except Exception:
+                    logger.debug("[W%d] handle_auth_gated_result failed", worker_id, exc_info=True)
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -2491,7 +2557,8 @@ def main(limit: int = 1, target_url: str | None = None,
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
          agent: str = "claude", agents: list[str] | None = None,
-         browsers: list[str] | None = None) -> None:
+         browsers: list[str] | None = None,
+         supervised: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -2510,6 +2577,10 @@ def main(limit: int = 1, target_url: str | None = None,
             process -- which keeps the per-host throttle, jitter, and offsite breaker
             (all in-memory) SHARED across the mixed agents. The shared queue lease
             still guarantees each job is taken by exactly one worker.
+        supervised: The --auth-gated owner-supervised lane (Task 5). Threaded
+            through to worker_loop/run_job so record_tenant_outcome fires on
+            the real terminal status and a challenge-class result halts that
+            tenant for the day.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = int(os.environ.get("APPLYPILOT_POLL_INTERVAL") or poll_interval)
@@ -2693,6 +2764,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     dry_run=dry_run,
                     agent=worker_agents[0],
                     browser=worker_browsers[0],
+                    supervised=supervised,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -2718,6 +2790,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             dry_run=dry_run,
                             agent=worker_agents[i],
                             browser=worker_browsers[i],
+                            supervised=supervised,
                         ): i
                         for i in range(workers)
                     }

@@ -823,6 +823,8 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset failed jobs for retry (skips possibly-submitted crash_unconfirmed/no_confirmation jobs to avoid double-applying)."),
+    auth_gated: bool = typer.Option(False, "--auth-gated", help="Owner-supervised auth-gated lane: headed + home-box, applies to supervised/trusted ATS tenants only. You watch; the agent applies fully (no confirm pause). A challenge (CAPTCHA/login wall) halts that tenant for the rest of the UTC day."),
+    tenant: Optional[str] = typer.Option(None, "--tenant", help="With --auth-gated: scope this run to a single tenant host (e.g. acme.myworkdayjobs.com)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
@@ -883,6 +885,45 @@ def apply(
     elif inbox_auth is False:
         import os
         os.environ["APPLYPILOT_INBOX_AUTH"] = "0"
+
+    # --auth-gated: owner-supervised lane (Task 5 of the auth-gated-tenant-lane
+    # plan). Headed + home-box only; scoped to supervised/trusted ATS tenants.
+    # Supervised design (owner decision 2026-07-03, amendment 0b2fead): no
+    # confirm-before-submit pause -- the owner watches, the agent applies
+    # fully, and record_tenant_outcome() records the real terminal status.
+    if auth_gated:
+        import os
+        from applypilot.database import get_connection as _get_conn
+        from applypilot import tenants as _tenants
+
+        os.environ["APPLYPILOT_AUTH_GATED_MODE"] = "supervised"
+        # Force headed (the owner must be able to watch) and home-box (this
+        # lane never runs on the fleet -- fleet_sync.py excludes auth-gated
+        # jobs regardless of tenant status, per Task 3).
+        headless = False
+        os.environ.pop("FLEET_PG_DSN", None)
+        if tenant:
+            os.environ["APPLYPILOT_AUTH_GATED_TENANT_HOST"] = tenant.strip().lower()
+        else:
+            os.environ.pop("APPLYPILOT_AUTH_GATED_TENANT_HOST", None)
+
+        _conn = _get_conn()
+        _rows = _tenants.list_tenants(_conn)
+        _enabled = [r for r in _rows if r["status"] in ("supervised", "trusted")]
+        if tenant:
+            _enabled = [r for r in _enabled if r["host"] == tenant.strip().lower()]
+        if not _enabled:
+            _excluded = [r["host"] for r in _rows if r["status"] == "excluded"]
+            if tenant:
+                console.print(f"[red]No supervised/trusted tenant found for --tenant {tenant}.[/red]")
+            else:
+                console.print("[red]No supervised or trusted ATS tenants are registered -- nothing to run.[/red]")
+            if _excluded:
+                console.print(f"[dim]Excluded tenants: {', '.join(_excluded)}[/dim]")
+            console.print(
+                "[dim]Enable one with: [bold]applypilot tenants set <host> supervised[/bold][/dim]"
+            )
+            return
 
     # --- Utility modes (no Chrome/apply-agent needed) ---
 
@@ -1045,6 +1086,7 @@ def apply(
         agent=agent,
         agents=agent_list,
         browsers=browser_list,
+        supervised=auth_gated,
     )
 
 
