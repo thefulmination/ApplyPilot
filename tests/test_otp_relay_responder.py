@@ -85,6 +85,52 @@ def test_two_requests_get_distinct_codes_one_message_each(fleet_db, monkeypatch)
     assert vals == {"111111", "222222"}  # distinct codes, no double-assignment
 
 
+def test_oldest_request_gets_earliest_code(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match("mEarly", _rfc(now + dt.timedelta(seconds=20)), "111111"),
+        _Match("mLate", _rfc(now + dt.timedelta(seconds=40)), "222222"),
+    ]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        r_old = _pending(conn, worker_id="mac-0")   # filed first
+        r_new = _pending(conn, worker_id="m2-0")    # filed second
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 2
+        c_old = otp_relay.poll_for_code(conn, r_old, timeout_seconds=1, poll_seconds=0.1)
+        c_new = otp_relay.poll_for_code(conn, r_new, timeout_seconds=1, poll_seconds=0.1)
+    # oldest request gets the earliest code (nearest-in-time pairing)
+    assert c_old.value == "111111" and c_new.value == "222222"
+
+
+def test_answer_does_not_shorten_request_window(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("m1", _rfc(now + dt.timedelta(seconds=10)), "334455")]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        rid = otp_relay.request_code(conn, worker_id="mac-0", job_url="j",
+                                     application_url="https://greenhouse.io/a", ttl_seconds=300)
+        # answered_ttl (120s) is shorter than the 300s request ttl; must not shorten expiry
+        otp_relay.answer_pending(conn, _FakeGmail(matches), answered_ttl_seconds=120)
+        with conn.cursor() as cur:
+            cur.execute("SELECT expires_at, (expires_at > now() + interval '200 seconds') AS still_long "
+                        "FROM otp_request WHERE id=%s", (rid,))
+            row = cur.fetchone()
+    assert row["still_long"] is True  # window preserved near the original 300s, not cut to 120s
+
+
+def test_unparseable_email_date_is_skipped(fleet_db, monkeypatch):
+    matches = [_Match("mBad", "not-a-real-date", "000000")]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        rid = _pending(conn)
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+    assert got is None
+
+
 def test_purge_expired_nulls_code_keeps_row(fleet_db, monkeypatch):
     monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **kw: [])
     with _fresh(fleet_db) as conn:

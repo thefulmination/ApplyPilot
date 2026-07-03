@@ -111,10 +111,13 @@ def answer_pending(conn, gmail_service, *, window_minutes: int = 15,
 
     matches = inbox_auth.scan_gmail_for_auth_codes(
         service=gmail_service, minutes=window_minutes, max_messages=max_messages)
-    # Newest first so the freshest code goes to the oldest waiting request.
+    # Oldest email first: pair each request (iterated oldest-first) with the EARLIEST
+    # eligible code, so request order maps to email-arrival order (spec: nearest
+    # received_at > requested_at). Newest-first would hand the oldest request the
+    # newest code and mis-pair concurrent same-window applies.
     parsed = [(m, _parse_email_dt(m.received_at)) for m in matches]
     parsed = [(m, ts) for (m, ts) in parsed if ts is not None]
-    parsed.sort(key=lambda mt: mt[1], reverse=True)
+    parsed.sort(key=lambda mt: mt[1])
 
     used_messages: set = set()
     answered = 0
@@ -133,7 +136,7 @@ def answer_pending(conn, gmail_service, *, window_minutes: int = 15,
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE otp_request SET code=%s, code_kind=%s, matched_email_ts=%s, "
-                "answered_at=now(), expires_at = now() + make_interval(secs => %s) "
+                "answered_at=now(), expires_at = GREATEST(expires_at, now() + make_interval(secs => %s)) "
                 "WHERE id=%s AND code IS NULL AND consumed_at IS NULL",
                 (chosen.candidate.value, chosen.candidate.kind,
                  _parse_email_dt(chosen.received_at), answered_ttl_seconds, req["id"]),

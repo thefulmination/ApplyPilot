@@ -1,9 +1,10 @@
 """Home-box OTP responder loop (entrypoint: applypilot-fleet-otp-home).
 
 Runs alongside the watchdog/doctor on the box that holds the Gmail token. Each
-cycle reads Gmail once (only when requests are pending), answers matching
-requests, purges expired codes, and heartbeats. The verification code is never
-logged. See the 2026-07-03 relay spec."""
+cycle builds the Gmail service and, inside answer_pending, scans Gmail only when
+requests are pending; it then answers matching requests, purges expired codes,
+and heartbeats. The verification code is never logged. See the 2026-07-03 relay
+spec."""
 from __future__ import annotations
 
 import argparse
