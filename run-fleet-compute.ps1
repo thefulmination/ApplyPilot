@@ -56,6 +56,17 @@ if (Test-Path $envFile) {
   }
 }
 
+# NO local key? Fetch it from the fleet Postgres (fleet_assets, stored once from home) -- the
+# same box already holds the DSN, so a worker machine needs NO manual .env copy. This is what
+# lets m4 come up key-less. (Children spawned below inherit this env, so only the parent fetches.)
+if (-not $env:DEEPSEEK_API_KEY) {
+  $pyKey = @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($pyKey) {
+    $k = (& $pyKey (Join-Path $ProjectRoot "fleet-secret.py") get deepseek_api_key 2>$null | Out-String).Trim()
+    if ($k) { $env:DEEPSEEK_API_KEY = $k; Write-Host "[fleet-compute] DeepSeek key loaded from fleet Postgres (no .env needed)." -ForegroundColor Gray }
+  }
+}
+
 function Start-OneWorker([string]$wid) {
   Write-Host "[fleet-compute] worker $wid  providers=$Providers  (IP-free score/audit, cost-cap gated)"
   & $exe --dsn $env:FLEET_PG_DSN --worker-id "$wid" --home-ip "0.0.0.0" --machine-owner $Label
