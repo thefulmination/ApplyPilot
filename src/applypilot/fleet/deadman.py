@@ -39,10 +39,12 @@ class Alert:
 def _fleet_config(conn) -> dict:
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT paused, ats_paused, cost_cap_daily_usd FROM fleet_config WHERE id=1;"
+            "SELECT paused, ats_paused, cost_cap_daily_usd, doctor_last_pass_at "
+            "FROM fleet_config WHERE id=1;"
         )
         row = cur.fetchone()
-    return dict(row) if row else {"paused": True, "ats_paused": True, "cost_cap_daily_usd": 0}
+    return dict(row) if row else {"paused": True, "ats_paused": True,
+                                  "cost_cap_daily_usd": 0, "doctor_last_pass_at": None}
 
 
 def _is_armed(cfg: dict) -> bool:
@@ -101,15 +103,23 @@ def _check_stalled_queue(conn, cfg: dict, now: dt.datetime) -> Alert | None:
     )
 
 
-def _check_selfheal_dead(conn, now: dt.datetime) -> Alert | None:
-    max_beat = _max_last_beat(conn, "watchdog", negate=False)
+def _check_selfheal_dead(conn, cfg: dict, now: dt.datetime) -> Alert | None:
+    """Fires if EITHER self-healer is down. There are two: the Watchdog (Layer A
+    deterministic reclaim/breakers -- beats worker_heartbeat worker_id='watchdog') AND the
+    Fleet Doctor (the primary 5-min self-fixer -- stamps fleet_config.doctor_last_pass_at,
+    doctor.py H18). Both must be alive; a dead self-healer is critical regardless of pause
+    state (nothing heals a stuck fleet), so this is intentionally NOT armed-gated."""
     stale_before = now - dt.timedelta(minutes=STALE_MIN)
-    if max_beat is None or max_beat < stale_before:
-        detail = (
-            "no watchdog heartbeat" if max_beat is None
-            else f"last watchdog heartbeat at {max_beat.isoformat()}"
-        )
-        return Alert(kind="selfheal_dead", severity="critical", detail=detail)
+    down: list[str] = []
+    wd_beat = _max_last_beat(conn, "watchdog", negate=False)
+    if wd_beat is None or wd_beat < stale_before:
+        down.append("watchdog (" + ("no heartbeat" if wd_beat is None else wd_beat.isoformat()) + ")")
+    doc_pass = cfg.get("doctor_last_pass_at")
+    if doc_pass is None or doc_pass < stale_before:
+        down.append("doctor (" + ("no pass recorded" if doc_pass is None else doc_pass.isoformat()) + ")")
+    if down:
+        return Alert(kind="selfheal_dead", severity="critical",
+                     detail="self-healer down: " + "; ".join(down))
     return None
 
 
@@ -148,6 +158,13 @@ def deadman_check(
     Returns (alerts, new_hot_streak) -- the caller is responsible for persisting
     ``new_hot_streak`` and passing it back in as ``prev_hot_streak`` on the next call.
     """
+    # Robustness over strictness for a safety monitor: a naive `now` (an easy caller
+    # mistake -- datetime.now() vs datetime.now(timezone.utc)) would otherwise raise a
+    # bare TypeError deep in an aware-vs-naive comparison and crash the whole watcher --
+    # strictly worse than a missed alert. All repo timestamps are UTC, so coerce.
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+
     cfg = _fleet_config(conn)
     alerts: list[Alert] = []
 
@@ -159,7 +176,7 @@ def deadman_check(
     if stalled:
         alerts.append(stalled)
 
-    selfheal = _check_selfheal_dead(conn, now)
+    selfheal = _check_selfheal_dead(conn, cfg, now)
     if selfheal:
         alerts.append(selfheal)
 

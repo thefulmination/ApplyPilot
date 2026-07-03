@@ -50,6 +50,11 @@ def _llm_usage(cur, cost_usd, ts=None):
     )
 
 
+def _doctor_pass(cur, ts):
+    # The Fleet Doctor stamps fleet_config.doctor_last_pass_at each pass (its liveness signal).
+    cur.execute("UPDATE fleet_config SET doctor_last_pass_at=%s WHERE id=1;", (ts,))
+
+
 def _kinds(alerts):
     return {a.kind for a in alerts}
 
@@ -64,6 +69,7 @@ def test_all_healthy_returns_no_alerts_and_zero_streak(fleet_db):
             _arm(cur)
             _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
             _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
         conn.commit()
 
         alerts, streak = deadman.deadman_check(conn, now=NOW)
@@ -243,17 +249,52 @@ def test_selfheal_dead_when_watchdog_beat_stale(fleet_db):
     assert "selfheal_dead" in _kinds(alerts)
 
 
-def test_selfheal_dead_clears_with_recent_watchdog_beat(fleet_db):
+def test_selfheal_dead_clears_when_both_watchdog_and_doctor_fresh(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
             _arm(cur)
             _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
             _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
         conn.commit()
 
         alerts, _ = deadman.deadman_check(conn, now=NOW)
 
     assert "selfheal_dead" not in _kinds(alerts)
+
+
+def test_selfheal_dead_when_doctor_pass_stale_even_if_watchdog_alive(fleet_db):
+    # The Fleet Doctor is the PRIMARY self-healer (5-min cadence). A fresh watchdog must
+    # not mask a dead Doctor -- selfheal_dead fires when doctor_last_pass_at is stale/NULL.
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))  # watchdog alive
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=40))             # doctor stale
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW)
+
+    assert "selfheal_dead" in _kinds(alerts)
+
+
+def test_naive_now_is_coerced_not_crashed(fleet_db):
+    # A naive `now` (datetime.now() vs datetime.now(timezone.utc)) must NOT crash the
+    # monitor with a bare TypeError deep in an aware-vs-naive comparison. Seed a real
+    # silent_death and pass a NAIVE now: the check still computes correctly.
+    naive_now = dt.datetime(2026, 7, 3, 12, 0, 0)  # no tzinfo
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=40))  # stale
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=naive_now)  # must not raise
+
+    assert "silent_death" in _kinds(alerts)
 
 
 def test_selfheal_dead_fires_even_when_paused(fleet_db):
