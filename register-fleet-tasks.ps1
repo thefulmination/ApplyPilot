@@ -153,11 +153,28 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Forc
 # ---- Phase-1.1 / S2 safety guard: refuse to register FleetAgent if desired_workers=0 without ----
 # ---- an explicit -AllowZero. Registering with 0 is a real trap: fleet-agent's first poll kills ----
 # ---- ANY locally-running workers (including ones a canary loader just started) to match 0.     ----
-$psql = Get-Psql
 Write-Host "`n[register-fleet-tasks] pre-flight: reading fleet_desired_state row for machine_owner='$Machine' via DSN '$effectiveDsn'..." -ForegroundColor Cyan
-$rowRaw = & $psql $effectiveDsn -t -A -F '|' -c "SELECT desired_workers, agent, model, generation FROM fleet_desired_state WHERE machine_owner='$Machine';" 2>&1
-if ($LASTEXITCODE -ne 0) {
-  Write-Host "[register-fleet-tasks] WARNING: could not read fleet_desired_state (psql exit $LASTEXITCODE): $rowRaw" -ForegroundColor Yellow
+# Worker boxes (m2/m4) have no psql.exe -- read via the python helper (psycopg ships with every
+# bootstrap; fleet-agent.ps1 already relies on it). psql is only a fallback for odd setups.
+$rowRaw = $null; $readOk = $false
+$pyPre = @((Join-Path $repo ".venv\Scripts\python.exe"), (Join-Path $repo ".conda-env\python.exe")) |
+  Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($pyPre) {
+  $prevDsn = $env:FLEET_PG_DSN; $env:FLEET_PG_DSN = $effectiveDsn
+  $line = (& $pyPre (Join-Path $repo "fleet-agent-query.py") $Machine 2>$null | Select-Object -Last 1)
+  if ($null -ne $prevDsn) { $env:FLEET_PG_DSN = $prevDsn } else { Remove-Item Env:FLEET_PG_DSN -ErrorAction SilentlyContinue }
+  # helper prints "workers|agent|model|gen" (missing row -> "0|claude||0"; DB error -> "KEEP|||")
+  if ("$line" -match '^\d+\|') { $rowRaw = "$line"; $readOk = $true }
+}
+if (-not $readOk) {
+  $psql = try { Get-Psql } catch { $null }
+  if ($psql) {
+    $rowRaw = & $psql $effectiveDsn -t -A -F '|' -c "SELECT desired_workers, agent, model, generation FROM fleet_desired_state WHERE machine_owner='$Machine';" 2>&1
+    $readOk = ($LASTEXITCODE -eq 0)
+  }
+}
+if (-not $readOk) {
+  Write-Host "[register-fleet-tasks] WARNING: could not read fleet_desired_state (python helper + psql both failed): $rowRaw" -ForegroundColor Yellow
   Write-Host "[register-fleet-tasks] Cannot verify desired_workers before registering FleetAgent. Continuing is riskier without this check." -ForegroundColor Yellow
   if (-not $AllowZero) {
     throw "Refusing to register without a readable fleet_desired_state row (pass -AllowZero to override, or fix the DSN/connectivity first)."
