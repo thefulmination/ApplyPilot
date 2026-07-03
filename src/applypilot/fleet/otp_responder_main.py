@@ -1,7 +1,8 @@
 """Home-box OTP responder loop (entrypoint: applypilot-fleet-otp-home).
 
-Runs alongside the watchdog/doctor on the box that holds the Gmail token. Each
-cycle builds the Gmail service and, inside answer_pending, scans Gmail only when
+Runs alongside the watchdog/doctor on the box that holds the mail credentials.
+Each cycle, inside answer_pending, the mailbox (IMAP app-password via
+get_mail_source(), falling back to the legacy Gmail API) is read only when
 requests are pending; it then answers matching requests, purges expired codes,
 and heartbeats. The verification code is never logged. See the 2026-07-03 relay
 spec."""
@@ -17,7 +18,7 @@ from applypilot.fleet import otp_relay
 logger = logging.getLogger(__name__)
 
 
-def run_once(conn, gmail_service) -> dict:
+def run_once(conn, gmail_service=None) -> dict:
     answered = otp_relay.answer_pending(conn, gmail_service)
     purged = otp_relay.purge_expired(conn)
     return {"answered": answered, "purged": purged}
@@ -43,14 +44,12 @@ def main(argv=None) -> int:  # pragma: no cover - long-running loop
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
     from applypilot.apply import pgqueue
-    from applypilot.gmail_outcomes import build_gmail_service
 
     while True:
         try:
-            gmail_service = build_gmail_service()
             with pgqueue.connect(args.dsn) as conn:
                 _beat(conn, machine_owner=args.machine_owner, state="busy")
-                out = run_once(conn, gmail_service)
+                out = run_once(conn)
                 _beat(conn, machine_owner=args.machine_owner, state="idle")
             logger.info("otp responder cycle: answered=%s purged=%s",
                         out["answered"], out["purged"])

@@ -1823,8 +1823,6 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
     try:
         from urllib.parse import urlparse
 
-        from applypilot.gmail_outcomes import build_gmail_service
-
         if not _inbox_auth_enabled():
             return None
 
@@ -1853,9 +1851,7 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         inbox_auth.mark_auth_challenge_attempt(challenge_id, "polling")
         inbox_auth.expire_stale_challenges()
 
-        service = build_gmail_service()
         match = inbox_auth.watch_gmail_for_auth_code(
-            service=service,
             timeout_seconds=timeout,
             poll_seconds=poll,
             max_errors=max_errors,

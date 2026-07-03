@@ -90,14 +90,18 @@ def _parse_email_dt(raw):
     return d.astimezone(_dt.timezone.utc)
 
 
-def answer_pending(conn, gmail_service, *, window_minutes: int = 15,
+def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
                    max_messages: int = 25, skew_seconds: int = 60,
                    answered_ttl_seconds: int = 120) -> int:
     """Read Gmail ONCE and answer every pending request whose code arrived after it.
 
     Home box only (this is the sole function that touches Gmail). Time-based match:
     a candidate fits a request when its email arrived >= requested_at - skew. Each
-    message_id is assigned to at most one request. The code is NEVER logged."""
+    message_id is assigned to at most one request. The code is NEVER logged.
+
+    When `gmail_service` is None (the default), the mailbox is read via
+    get_mail_source() (IMAP app-password, falling back to the legacy Gmail API);
+    passing a `gmail_service` explicitly preserves the old direct-service path."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id, requested_at FROM otp_request "
@@ -109,8 +113,16 @@ def answer_pending(conn, gmail_service, *, window_minutes: int = 15,
     if not pending:
         return 0
 
-    matches = inbox_auth.scan_gmail_for_auth_codes(
-        service=gmail_service, minutes=window_minutes, max_messages=max_messages)
+    if gmail_service is None:
+        from applypilot.mail_source import get_mail_source
+
+        since_days = max(1, (window_minutes + 1439) // 1440)
+        msgs = get_mail_source().fetch(since_days=since_days, max_messages=max_messages)
+        matches = inbox_auth.scan_gmail_for_auth_codes(
+            messages=msgs, minutes=window_minutes, max_messages=max_messages)
+    else:
+        matches = inbox_auth.scan_gmail_for_auth_codes(
+            service=gmail_service, minutes=window_minutes, max_messages=max_messages)
     # Oldest email first: pair each request (iterated oldest-first) with the EARLIEST
     # eligible code, so request order maps to email-arrival order (spec: nearest
     # received_at > requested_at). Newest-first would hand the oldest request the

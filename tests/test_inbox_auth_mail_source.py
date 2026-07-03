@@ -1,0 +1,235 @@
+"""Proves the OTP/2FA path is parser-identical when routed through
+get_mail_source() (MailMessage) instead of the legacy Gmail-API `service`.
+extract_verification_candidates (the parser) is UNCHANGED; only the fetch swaps."""
+from __future__ import annotations
+
+import datetime as dt
+
+from applypilot import inbox_auth
+from applypilot.fleet import otp_relay
+from applypilot.mail_source import MailMessage
+
+
+def test_scan_gmail_for_auth_codes_messages_path_extracts_code():
+    msg = MailMessage(
+        id="m1",
+        thread_id="t1",
+        subject="Your Greenhouse verification code",
+        sender="no-reply@greenhouse.io",
+        date="Mon, 01 Jan 2024 12:00:00 +0000",
+        body="Use verification code 123456 to continue your application.",
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(messages=[msg])
+
+    assert len(matches) == 1
+    match = matches[0]
+    assert match.message_id == "m1"
+    assert match.thread_id == "t1"
+    assert match.candidate.kind == "code"
+    assert match.candidate.value == "123456"
+
+
+def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
+    """Same subject/sender/body through both paths -> identical candidate value
+    and confidence, proving the parser itself is untouched."""
+    subject = "Verify your email"
+    sender = "no-reply@greenhouse.io"
+    body = "Use verification code 839214 to continue your application."
+
+    msg = MailMessage(
+        id="m2", thread_id="t2", subject=subject, sender=sender,
+        date="Mon, 01 Jan 2024 12:00:00 +0000", body=body,
+    )
+    via_messages = inbox_auth.scan_gmail_for_auth_codes(messages=[msg])
+
+    class _FakeRequest:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def execute(self):
+            return self._payload
+
+    class _FakeMessages:
+        def list(self, userId, q, maxResults):
+            return _FakeRequest({"messages": [{"id": "m2", "threadId": "t2"}]})
+
+        def get(self, userId, id, format):  # noqa: A002
+            import base64
+
+            encoded = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii").rstrip("=")
+            payload = {
+                "headers": [
+                    {"name": "Subject", "value": subject},
+                    {"name": "From", "value": sender},
+                    {"name": "Date", "value": "Mon, 01 Jan 2024 12:00:00 +0000"},
+                ],
+                "mimeType": "text/plain",
+                "body": {"data": encoded},
+            }
+            return _FakeRequest({"payload": payload})
+
+    class _FakeUsers:
+        def messages(self):
+            return _FakeMessages()
+
+    class _FakeService:
+        def users(self):
+            return _FakeUsers()
+
+    via_service = inbox_auth.scan_gmail_for_auth_codes(service=_FakeService())
+
+    assert len(via_messages) == 1
+    assert len(via_service) == 1
+    assert via_messages[0].candidate.value == via_service[0].candidate.value
+    assert via_messages[0].candidate.confidence == via_service[0].candidate.confidence
+
+
+def test_scan_gmail_for_auth_codes_messages_path_dedupes_by_thread():
+    common = dict(
+        subject="Verify your email",
+        sender="no-reply@greenhouse.io",
+        date="Mon, 01 Jan 2024 12:00:00 +0000",
+        body="Use verification code 111222 to continue.",
+    )
+    msgs = [
+        MailMessage(id="a", thread_id="dup", **common),
+        MailMessage(id="b", thread_id="dup", **common),
+    ]
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(messages=msgs)
+
+    assert len(matches) == 1
+    assert matches[0].message_id == "a"
+
+
+def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
+    """service=None -> resolves via get_mail_source().fetch(...) then scans."""
+    seen = {}
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages):
+            seen["since_days"] = since_days
+            seen["max_messages"] = max_messages
+            return [
+                MailMessage(
+                    id="m3", thread_id="t3", subject="Verify your email",
+                    sender="no-reply@greenhouse.io", date="Mon, 01 Jan 2024 12:00:00 +0000",
+                    body="Use verification code 654321 to continue.",
+                )
+            ]
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _FakeSource()
+    )
+
+    match = inbox_auth.watch_gmail_for_auth_code(
+        timeout_seconds=1, poll_seconds=0, max_errors=1, minutes=10, max_messages=25,
+    )
+
+    assert match is not None
+    assert match.candidate.value == "654321"
+    assert seen["max_messages"] == 25
+    assert seen["since_days"] == 1
+
+
+def test_answer_pending_defaults_to_mail_source(monkeypatch):
+    """gmail_service=None -> answer_pending resolves via get_mail_source() and
+    passes the fetched MailMessage list into scan_gmail_for_auth_codes(messages=...)."""
+    fetch_calls = {}
+    scan_calls = {}
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages):
+            fetch_calls["since_days"] = since_days
+            fetch_calls["max_messages"] = max_messages
+            return ["sentinel-messages"]
+
+    def _fake_scan(*, messages=None, service=None, minutes=10, max_messages=25):
+        scan_calls["messages"] = messages
+        scan_calls["minutes"] = minutes
+        scan_calls["max_messages"] = max_messages
+        return []
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _FakeSource()
+    )
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes", _fake_scan)
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *a, **kw):
+            pass
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def cursor(self):
+            return _FakeCursor(self._rows)
+
+        def commit(self):
+            pass
+
+    pending_row = {"id": 1, "requested_at": dt.datetime.now(dt.timezone.utc)}
+    conn = _FakeConn([pending_row])
+
+    n = otp_relay.answer_pending(conn, window_minutes=15, max_messages=25)
+
+    assert n == 0
+    assert scan_calls["messages"] == ["sentinel-messages"]
+    assert fetch_calls["max_messages"] == 25
+
+
+def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):
+    """End-to-end against the real fleet_db harness: a seeded otp_request row is
+    answered when get_mail_source() is monkeypatched to a fake IMAP-backed source."""
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages):
+            return [
+                MailMessage(
+                    id="m9", thread_id="t9", subject="Verify your email",
+                    sender="no-reply@greenhouse.io",
+                    date=_rfc(now + dt.timedelta(seconds=30)),
+                    body="Use verification code 998877 to continue.",
+                )
+            ]
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _FakeSource()
+    )
+
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.ensure_schema_v3(conn)
+        rid = otp_relay.request_code(
+            conn, worker_id="mac-0", job_url="j",
+            application_url="https://greenhouse.io/a",
+        )
+        n = otp_relay.answer_pending(conn)
+        assert n == 1
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+
+    assert got is not None
+    assert got.value == "998877"
+
+
+def _rfc(when: dt.datetime) -> str:
+    from email.utils import format_datetime
+
+    return format_datetime(when)

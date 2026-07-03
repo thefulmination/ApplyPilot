@@ -452,19 +452,80 @@ def _payload_text(payload: dict[str, Any]) -> str:
     return "\n".join(pieces)
 
 
+def _high_confidence_matches(
+    *,
+    message_id: str,
+    thread_id: str | None,
+    subject: str,
+    sender: str,
+    received_at: str | None,
+    body: str,
+) -> list[AuthEmailMatch]:
+    """Run the FROZEN parser (extract_verification_candidates) over one message's
+    subject/body/sender and build AuthEmailMatch rows for the high-confidence
+    candidates. Shared by both the Gmail-API `service` path and the MailMessage
+    (`messages=`) path so the parsing/confidence logic never forks."""
+    matches: list[AuthEmailMatch] = []
+    candidates = extract_verification_candidates(subject, body, sender)
+    for candidate in candidates:
+        if candidate.confidence != "high":
+            continue
+        matches.append(
+            AuthEmailMatch(
+                message_id=message_id,
+                thread_id=thread_id,
+                sender=sender,
+                subject=subject,
+                received_at=received_at,
+                snippet=body[:240].replace("\n", " ").strip(),
+                candidate=candidate,
+                reasons=candidate.reasons,
+            )
+        )
+    return matches
+
+
 def scan_gmail_for_auth_codes(
     *,
-    service,
+    service=None,
+    messages=None,
     minutes: int = 10,
     max_messages: int = 25,
 ) -> list[AuthEmailMatch]:
+    """Scan for high-confidence auth codes/magic links.
+
+    Two mutually exclusive input paths:
+    - `messages`: a list[MailMessage] (from get_mail_source().fetch(...)) --
+      iterated directly through the frozen parser.
+    - `service`: legacy Gmail-API service object -- back-compat path.
+    """
+    if messages is not None:
+        matches: list[AuthEmailMatch] = []
+        seen_threads: set[str] = set()
+        for m in messages:
+            thread_id = m.thread_id or m.id
+            if thread_id in seen_threads:
+                continue
+            seen_threads.add(thread_id)
+            matches.extend(
+                _high_confidence_matches(
+                    message_id=m.id,
+                    thread_id=m.thread_id,
+                    subject=m.subject,
+                    sender=m.sender,
+                    received_at=m.date,
+                    body=m.body,
+                )
+            )
+        return matches
+
     window_minutes = max(1, int(minutes))
     max_older_days = max(1, (window_minutes + 1439) // 1440)
     query = (
         f'newer_than:{max_older_days}d (verification OR verify OR code OR "one-time" '
         f'OR "one time" OR "confirm your email" OR "magic link")'
     )
-    messages = (
+    gmail_messages = (
         service.users()
         .messages()
         .list(userId="me", q=query, maxResults=max_messages)
@@ -472,9 +533,9 @@ def scan_gmail_for_auth_codes(
         .get("messages", [])
     )
 
-    matches: list[AuthEmailMatch] = []
-    seen_threads: set[str] = set()
-    for ref in messages:
+    matches = []
+    seen_threads = set()
+    for ref in gmail_messages:
         thread_id = ref.get("threadId", ref["id"])
         if thread_id in seen_threads:
             continue
@@ -492,31 +553,24 @@ def scan_gmail_for_auth_codes(
         sender = hdrs.get("from", "")
         received_at = hdrs.get("date")
         body = _payload_text(payload)
-        candidates = extract_verification_candidates(subject, body, sender)
 
-        for candidate in candidates:
-            if candidate.confidence != "high":
-                continue
-
-            matches.append(
-                AuthEmailMatch(
-                    message_id=ref["id"],
-                    thread_id=ref.get("threadId"),
-                    sender=sender,
-                    subject=subject,
-                    received_at=received_at,
-                    snippet=body[:240].replace("\n", " ").strip(),
-                    candidate=candidate,
-                    reasons=candidate.reasons,
-                )
+        matches.extend(
+            _high_confidence_matches(
+                message_id=ref["id"],
+                thread_id=ref.get("threadId"),
+                subject=subject,
+                sender=sender,
+                received_at=received_at,
+                body=body,
             )
+        )
 
     return matches
 
 
 def watch_gmail_for_auth_code(
     *,
-    service,
+    service=None,
     timeout_seconds: int = 300,
     poll_seconds: int = 5,
     max_errors: int = 3,
@@ -527,11 +581,22 @@ def watch_gmail_for_auth_code(
     errors = 0
     while time.monotonic() < deadline:
         try:
-            matches = scan_gmail_for_auth_codes(
-                service=service,
-                minutes=minutes,
-                max_messages=max_messages,
-            )
+            if service is None:
+                from applypilot.mail_source import get_mail_source
+
+                since_days = max(1, (minutes + 1439) // 1440)
+                msgs = get_mail_source().fetch(since_days=since_days, max_messages=max_messages)
+                matches = scan_gmail_for_auth_codes(
+                    messages=msgs,
+                    minutes=minutes,
+                    max_messages=max_messages,
+                )
+            else:
+                matches = scan_gmail_for_auth_codes(
+                    service=service,
+                    minutes=minutes,
+                    max_messages=max_messages,
+                )
             if matches:
                 return matches[0]
             errors = 0
