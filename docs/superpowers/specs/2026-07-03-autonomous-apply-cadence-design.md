@@ -39,10 +39,17 @@ the live PG:
 2. `approve --all-pushed` — stamp `approved_batch` so they are leasable (push alone does NOT).
 3. Ensure the canary is NOT the blocker: `lift-canary` (owner chose spend-cap-only, so the
    canary one-time gate is disabled; the rolling daily cap is the throttle).
-4. `pull` — sync terminal results back into the brain (idempotent; never demotes an apply).
-The already-running FleetAgent workers do the applying. ApplyCycle **never touches `paused`** —
-if a cap paused the fleet, the caps/Doctor own resume; ApplyCycle just keeps the queue full,
-approved, and pulled so applies resume automatically when the rolling window frees capacity.
+4. **Guarded self-resume** (required for true autonomy — the `paused` flag is STICKY, only ever
+   SET by the lease gate, never auto-cleared): if `queue._cost_cap_exceeded(conn)` is False, clear
+   a plain pause — `UPDATE fleet_config SET paused=FALSE WHERE id=1 AND ats_paused=FALSE`. This
+   self-resumes the fleet after a rolling-cap window frees capacity. **HARD SAFETY RULE: never
+   touch `ats_paused`/`ats_pause_source` (Doctor-owned, H8 catastrophe guard) or any LinkedIn halt
+   — the `AND ats_paused=FALSE` guard means a Doctor safety pause is NEVER overridden.** If the
+   daily cap IS currently exceeded, leave `paused` as-is (the cap owns it; it resumes next cycle
+   once 24h spend ages out).
+5. `pull` — sync terminal results back into the brain (idempotent; never demotes an apply).
+The already-running FleetAgent workers do the applying. Cadence = every 4h keeps the queue full,
+approved, liveness-fresh, and self-resumed whenever the rolling window has headroom.
 
 ### C. DeadMan scheduled task (home, every 20 min) — the circuit breaker
 Reads the fleet PG (SELECT-only) and raises an ALERT on any of:
@@ -51,8 +58,12 @@ Reads the fleet PG (SELECT-only) and raises an ALERT on any of:
    signal.
 2. **Stalled queue:** `apply_queue` has `queued`+`approved` rows AND zero `status='applied'` in the
    last 3h while armed (workers running but nothing progressing).
-3. **Approaching the lifetime backstop:** `SUM(apply_queue.est_cost_usd) >= 0.9 * spend_cap_usd`
-   (the permanent-pause ceiling) — warn BEFORE it silently pauses the lane.
+3. **Spend running hot:** the lifetime `spend_cap_usd` cap was REMOVED by the owner (2026-07-03,
+   set to 0) — the rolling `cost_cap_daily_usd` ($100/24h) is now the only throttle. So instead of
+   warning on a lifetime ceiling: the DeadMan ALWAYS surfaces cumulative total spend
+   (`SUM(llm_usage.cost_usd)`) on the console, and ALERTS if rolling-24h spend ≥ 95% of
+   `cost_cap_daily_usd` for ≥2 consecutive checks (the fleet is pinned at the daily ceiling =
+   spending at max rate continuously — the owner should know, since there is no lifetime backstop).
 4. **Watchdog/Doctor dead:** their heartbeats stale (they are the self-heal; if they die, nothing
    heals).
 Alert delivery on a headless box (no email infra): (a) write a `doctor`/`ats_paused`-independent
