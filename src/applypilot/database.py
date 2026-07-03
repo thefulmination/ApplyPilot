@@ -183,6 +183,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     ensure_pipeline_tables(conn)
     ensure_research_tables(conn)
     ensure_outcome_tables(conn)
+    ensure_tenant_tables(conn)
 
     return conn
 
@@ -643,6 +644,32 @@ def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
     for col in ("match_status", "match_reason", "prev_job_url"):
         if col not in ee_existing:
             conn.execute(f"ALTER TABLE email_events ADD COLUMN {col} TEXT")
+
+    conn.commit()
+
+
+def ensure_tenant_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create the ats_tenants registry (auth-gated-tenant-lane Task 1). ADDITIVE +
+    idempotent. Tracks per-host (e.g. a Workday tenant subdomain) rollout status for
+    login-gated ATS lanes: excluded (never attempted) -> supervised (human-in-the-loop
+    submits) -> trusted (autonomous submits allowed once evidence clears the bar).
+    Stores NO credentials/secrets -- status + counters only."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ats_tenants (
+            host             TEXT PRIMARY KEY,
+            status           TEXT NOT NULL DEFAULT 'excluded',
+            clean_submits    INTEGER NOT NULL DEFAULT 0,
+            failed_submits   INTEGER NOT NULL DEFAULT 0,
+            daily_cap        INTEGER NOT NULL DEFAULT 5,
+            halted_until     TEXT,
+            last_result      TEXT,
+            updated_at       TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ats_tenants_status ON ats_tenants(status)")
 
     conn.commit()
 
