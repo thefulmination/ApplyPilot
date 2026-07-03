@@ -388,7 +388,8 @@ def _doctor_signal(conn) -> dict:
     Also surfaces ats_paused provenance (H8) so the banner can label a Doctor pause vs operator."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT doctor_last_pass_at, ats_paused, ats_pause_source FROM fleet_config WHERE id=1")
+            "SELECT doctor_last_pass_at, ats_paused, ats_pause_source, "
+            "deadman_alert, deadman_alert_at FROM fleet_config WHERE id=1")
         cfg = cur.fetchone() or {}
         cur.execute(
             "SELECT count(*) AS n, max(created_at) AS newest, max(id) AS newest_id "
@@ -402,6 +403,8 @@ def _doctor_signal(conn) -> dict:
         "newest_auto_fix_id": k.get("newest_id"),
         "ats_paused": bool(cfg.get("ats_paused")),
         "ats_pause_source": cfg.get("ats_pause_source"),
+        "deadman_alert": cfg.get("deadman_alert"),
+        "deadman_alert_at": _iso(cfg.get("deadman_alert_at")),
     }
 
 
@@ -501,6 +504,12 @@ def build_status() -> dict:
         "linkedin": linkedin,
         "doctor": doctor_sig,
         "discovery": discovery,
+        # H19: the DeadMan alert (fleet_config.deadman_alert/_at, written by
+        # applypilot.fleet.deadman's run_deadman) surfaced top-level -- NOT nested
+        # under "doctor" -- so a silent fleet death/stall/running-hot is visible
+        # even when the Doctor signal itself failed to load.
+        "deadman_alert": (doctor_sig or {}).get("deadman_alert"),
+        "deadman_alert_at": (doctor_sig or {}).get("deadman_alert_at"),
     }
 
 
@@ -1342,10 +1351,15 @@ _INDEX_HTML = r"""<!doctype html>
     color:#1a0000;font-weight:700;text-align:center;padding:10px 14px;font-size:13px;
     display:none}
   .tokbanner.show{display:block}
+  .deadmanbanner{position:fixed;top:0;left:0;right:0;z-index:1001;background:var(--red2);
+    color:#1a0000;font-weight:700;text-align:center;padding:10px 14px;font-size:13px;
+    display:none}
+  .deadmanbanner.show{display:block}
 </style>
 </head>
 <body>
 <div class="tokbanner" id="tokBanner">token expired — open the ?token= URL printed by the console window</div>
+<div class="deadmanbanner" id="deadmanBanner"></div>
 <header>
   <div>
     <h1>ApplyPilot Fleet Console</h1>
@@ -1512,6 +1526,19 @@ function render(s){
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
   const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
+
+  // DeadMan: a RED fixed banner when fleet_config.deadman_alert is set (silent
+  // fleet death / stall / running-hot) so the owner sees it even glancing at a phone.
+  const dmBanner = document.getElementById("deadmanBanner");
+  if(dmBanner){
+    if(s.deadman_alert){
+      dmBanner.textContent = "DEADMAN ALERT: " + s.deadman_alert + " (" + rel(s.deadman_alert_at) + ")";
+      dmBanner.className = "deadmanbanner show";
+    } else {
+      dmBanner.textContent = "";
+      dmBanner.className = "deadmanbanner";
+    }
+  }
   // H8: an ATS-only Doctor pause (ats_paused, source='doctor') is a distinct, milder state than a
   // full operator/cost halt -- label it so the operator knows the LinkedIn lane is untouched and
   // that it auto-reverts. The shared paused/spend-cap halt still shows as the hard PAUSE/HALTED.
