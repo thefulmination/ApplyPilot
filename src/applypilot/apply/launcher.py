@@ -1733,19 +1733,46 @@ def _is_permanent_failure(result: str) -> bool:
     )
 
 
+def _local_gmail_available() -> bool:
+    """True if THIS machine has its own Gmail OAuth credentials (i.e. the home box)."""
+    try:
+        from applypilot.config import APP_DIR
+
+        return (APP_DIR / "gmail_credentials.json").exists()
+    except Exception:
+        return False
+
+
+def _auto_relay() -> bool:
+    """A remote worker with a fleet DB connection but NO local Gmail creds can only use
+    the fleet OTP relay for email verification -- so auto-enable relay mode there. This
+    lets an offsite worker clear verification with zero local config; without it such a
+    worker silently fails every verification-gated job (email_verification_required)."""
+    return bool(os.environ.get("FLEET_PG_DSN")) and not _local_gmail_available()
+
+
 def _inbox_auth_enabled() -> bool:
-    """Return True when authenticated inbox automation should be used."""
-    return os.environ.get("APPLYPILOT_INBOX_AUTH", "").strip().lower() in {
+    """Return True when authenticated inbox automation should be used. Explicit
+    APPLYPILOT_INBOX_AUTH wins; otherwise a credential-less remote worker (which can only
+    reach codes via the relay) auto-enables."""
+    if os.environ.get("APPLYPILOT_INBOX_AUTH", "").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
-    }
+    }:
+        return True
+    return _auto_relay()
 
 
 def _inbox_auth_mode() -> str:
-    """'relay' (ask the fleet for the code) or 'local' (read Gmail here, default)."""
-    return os.environ.get("APPLYPILOT_INBOX_AUTH_MODE", "local").strip().lower()
+    """'relay' (ask the fleet for the code) or 'local' (read Gmail here). Explicit
+    APPLYPILOT_INBOX_AUTH_MODE wins; otherwise a credential-less remote worker
+    auto-selects 'relay', and everything else defaults to 'local'."""
+    mode = os.environ.get("APPLYPILOT_INBOX_AUTH_MODE", "").strip().lower()
+    if mode in {"relay", "local"}:
+        return mode
+    return "relay" if _auto_relay() else "local"
 
 
 def _relay_inbox_auth_hint(job: dict) -> str | None:
