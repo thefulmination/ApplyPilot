@@ -55,6 +55,21 @@ def test_run_apply_exits_immediately_if_stop_already_requested(monkeypatch):
     awm._STOP_REQUESTED.clear()
 
 
+def test_run_apply_beats_while_halted(monkeypatch):
+    # A halted (ats_paused / canary-exhausted) worker must still emit a heartbeat, else a
+    # correctly-PAUSED fleet is indistinguishable from a DEAD one -- live 2026-07-03: paused
+    # workers went stale, looked crashed to the watchdog and the console.
+    awm._STOP_REQUESTED.clear()
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: True)
+    loop = MagicMock()
+    counts = awm.run_apply(_conn_factory, loop, max_iterations=3, idle_sleep=0)
+    assert counts["halted"] == 3
+    loop.run_once.assert_not_called()                     # halted -> never leases a job
+    assert loop._beat.call_count == 3                     # ...but beats every tick
+    assert all(c.kwargs.get("state") == "paused" for c in loop._beat.call_args_list)
+    awm._STOP_REQUESTED.clear()
+
+
 def test_stop_handler_survives_launcher_import():
     """launcher.py installs its own SIGTERM handler at import time (non-Windows).
     install_stop_handler must be called AFTER that import (main() does) so the

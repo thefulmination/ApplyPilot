@@ -181,6 +181,25 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage (ts);
 ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS provider TEXT;
+-- provider indexed for the rolling per-agent apply-spend sum (agent_budget).
+CREATE INDEX IF NOT EXISTS idx_llm_usage_provider_ts ON llm_usage (provider, ts);
+
+-- ---------------------------------------------------------------------------
+-- agent_availability: FLEET-WIDE apply-agent block state (one row per agent).
+-- Two writers, one channel: (1) a worker that hits a usage/session wall records
+-- blocked_until = the reset time so the WHOLE fleet skips that agent (not just the
+-- one worker that discovered it -- the fleet-wide upgrade over per-worker memory);
+-- (2) the predictive monitor (agent_budget.evaluate_soft_blocks) pre-emptively blocks
+-- an agent whose rolling apply spend crosses its soft cap, BEFORE it walls. Workers
+-- read this each tick and feed it into their AgentSwitcher. Layered ON TOP of the
+-- per-worker reactive switch; never replaces it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_availability (
+    agent         TEXT PRIMARY KEY,          -- 'claude' | 'codex' | 'deepseek'
+    blocked_until TIMESTAMPTZ,               -- NULL or past = available now
+    reason        TEXT,                      -- 'usage_limit_wall' | 'predictive_spend'
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- ---------------------------------------------------------------------------
 -- applied_set: cross-board posting-level dedup / double-apply guard (R9).

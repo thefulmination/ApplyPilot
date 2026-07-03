@@ -519,9 +519,21 @@ class WorkerLoop:
         -> crash_unconfirmed (possibly submitted, never re-leased); else -> failed."""
         run_status = res.get("run_status") or ""
         cost = res.get("est_cost_usd", 0)
+        agent = res.get("agent")   # which apply agent ran -> attributes the spend (agent_budget)
+        # Agent usage/session-limit wall (turn-1, page never touched -> launcher returns
+        # failed:usage_limit): RE-QUEUE, never park. This lease provably did nothing, so
+        # re-queuing cannot double-submit; crash_unconfirmed would strand it permanently.
+        # The driver reads action=='usage_limit' to back off + switch agents (agent_switch).
+        from applypilot.apply.launcher import is_usage_limit_result
+        if is_usage_limit_result(run_status):
+            queue.requeue_apply(conn, self.worker_id, url, apply_error=run_status[:200])
+            self._record_event(f"requeued apply (usage_limit) {url}")
+            self._beat(conn, state="idle")
+            return {"action": "usage_limit", "url": url}
         if run_status == "applied":
             queue.write_apply_result(conn, self.worker_id, url, status="applied", apply_status="applied",
-                                     target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost, outcome="success")
+                                     target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
+                                     outcome="success", agent=agent)
             self._record_event(f"wrote apply applied {url}")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
@@ -534,13 +546,15 @@ class WorkerLoop:
         if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
             queue.write_apply_result(conn, self.worker_id, url, status="crash_unconfirmed",
                                      apply_status="crash_unconfirmed", apply_error=run_status[:200],
-                                     target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost)
+                                     target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
+                                     agent=agent)
             self._record_event(f"wrote apply crash_unconfirmed {url} ({run_status})")
             self._beat(conn, state="idle")
             return {"action": "crash_unconfirmed", "url": url}
         queue.write_apply_result(conn, self.worker_id, url, status="failed", apply_status="failed",
                                  apply_error=(run_status or "unknown")[:200],
-                                 target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost)
+                                 target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
+                                 agent=agent)
         self._record_event(f"wrote apply failed {url} ({run_status or 'unknown'})")
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}

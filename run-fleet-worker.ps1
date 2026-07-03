@@ -1,4 +1,5 @@
-# run-fleet-worker.ps1 [-Slot N] [-Agent claude|codex] [-Model name] [-Label name]
+# run-fleet-worker.ps1 [-Slot N] [-Agent claude|codex|deepseek] [-Model name] [-Label name]
+#                      [-FallbackAgent "codex,deepseek"]
 #   Launch ONE offsite apply worker. Use a DISTINCT -Slot per worker on the same machine
 #   (slot keys the browser profile + CDP port + logs so they don't collide).
 #   Use a DISTINCT -Label per MACHINE (home box = "home", second box = e.g. "m2") so the
@@ -6,7 +7,14 @@
 #   "home-0" and lease attribution / monitoring can't tell them apart.
 #   Run each in its own window:  .\run-fleet-worker.ps1 -Slot 0 -Agent codex -Label m2
 #   Requires FLEET_PG_DSN already set (the setup script persists it). LinkedIn never runs here.
-param([int]$Slot = 0, [string]$Agent = "claude", [string]$Model = "", [string]$Label = "home")
+#
+#   -FallbackAgent: an ordered chain the worker switches to when -Agent hits its usage/session
+#   limit (each an INDEPENDENT quota pool), e.g. "codex,deepseek". Defaults to the
+#   APPLYPILOT_FALLBACK_AGENT env var, else "codex" when -Agent is claude (so a Claude
+#   session-limit wall fails over to Codex instead of stalling). 'deepseek' needs
+#   DEEPSEEK_API_KEY (config loads ~/.applypilot/.env) and runs on the Codex runtime.
+param([int]$Slot = 0, [string]$Agent = "claude", [string]$Model = "", [string]$Label = "home",
+      [string]$FallbackAgent = $env:APPLYPILOT_FALLBACK_AGENT)
 $WorkerId = "$Label-$Slot"
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -37,14 +45,30 @@ $chromium = Get-ChildItem -Path $env:PLAYWRIGHT_BROWSERS_PATH -Directory -Filter
 if ($chromium) { $env:CHROME_PATH = Join-Path $chromium.FullName "chrome-win64\chrome.exe" }
 $env:Path = "C:\Program Files\nodejs;$env:Path"
 
-# Apply-agent CLI path (must be the AUTHENTICATED one): claude or codex
+# Apply-agent CLI path (must be the AUTHENTICATED one): claude, codex, or deepseek.
+# deepseek runs on the Codex runtime pointed at DeepSeek's API, so it needs codex.cmd too.
 if ($Agent -eq "claude") {
   $a = Join-Path $env:APPDATA "npm\claude.cmd"; if (Test-Path $a) { $env:CLAUDE_PATH = $a }
   if (-not $Model) { $Model = "sonnet" }
 } elseif ($Agent -eq "codex") {
   $a = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $a) { $env:CODEX_PATH = $a }
   # leave $Model empty -> codex uses its default model
-} else { throw "unknown -Agent '$Agent' (use claude or codex)" }
+} elseif ($Agent -eq "deepseek") {
+  $a = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $a) { $env:CODEX_PATH = $a }
+  # leave $Model empty -> the deepseek command builder uses APPLYPILOT_DEEPSEEK_MODEL
+} else { throw "unknown -Agent '$Agent' (use claude, codex, or deepseek)" }
+
+# Failover chain: default a claude worker to codex so a Claude session-limit wall fails over
+# instead of stalling. Resolve the CLI path for every fallback agent so the switcher can
+# actually launch it, and warn (don't fail) if a deepseek link lacks its key.
+if (-not $FallbackAgent -and $Agent -eq "claude") { $FallbackAgent = "codex" }
+foreach ($fa in ($FallbackAgent -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+  if ($fa -eq "claude") { $c = Join-Path $env:APPDATA "npm\claude.cmd"; if (Test-Path $c) { $env:CLAUDE_PATH = $c } }
+  elseif ($fa -in @("codex", "deepseek")) { $c = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $c) { $env:CODEX_PATH = $c } }
+  if (($fa -eq "deepseek" -or $Agent -eq "deepseek") -and -not $env:DEEPSEEK_API_KEY) {
+    Write-Warning "[fleet-worker] deepseek in the agent chain but DEEPSEEK_API_KEY is not set -- deepseek runs will wall. Set it in ~/.applypilot/.env."
+  }
+}
 
 # Per-LAUNCH throwaway cost-DB (never the real brain), Gmail verification, 10-min timeout.
 # Unique per launch (slot+PID): a corrupt leftover husk from a crashed run (seen live 7/03:
@@ -66,5 +90,6 @@ $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 if (-not $env:FLEET_PG_DSN) { throw "FLEET_PG_DSN is not set (the setup script persists it; open a fresh window)." }
 
 $margs = @(); if ($Model) { $margs = @("--model", $Model) }
-Write-Host "[fleet-worker] worker $WorkerId  agent=$Agent  model=$(if($Model){$Model}else{'default'})  -> logs .applypilot\logs\worker-$Slot.log"
-& $exe --dsn $env:FLEET_PG_DSN --worker-id "$WorkerId" --chrome-slot $Slot --agent $Agent @margs
+$fargs = @(); if ($FallbackAgent) { $fargs = @("--fallback-agent", $FallbackAgent) }
+Write-Host "[fleet-worker] worker $WorkerId  agent=$Agent  model=$(if($Model){$Model}else{'default'})  fallback=$(if($FallbackAgent){$FallbackAgent}else{'none'})  -> logs .applypilot\logs\worker-$Slot.log"
+& $exe --dsn $env:FLEET_PG_DSN --worker-id "$WorkerId" --chrome-slot $Slot --agent $Agent @margs @fargs

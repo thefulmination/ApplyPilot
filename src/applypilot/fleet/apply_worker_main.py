@@ -123,7 +123,8 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
         try:
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
-            out = {"run_status": status, "est_cost_usd": _real_cost(stats, model)}
+            # agent flows to write_apply_result -> llm_usage.provider for per-agent spend.
+            out = {"run_status": status, "est_cost_usd": _real_cost(stats, model), "agent": agent}
             if status == "applied":
                 # Record the apply channel from the STILL-OPEN tabs (the finally below kills
                 # Chrome). Best-effort: never let recording break a confirmed apply.
@@ -231,16 +232,108 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="claude",
                       log_tail_fn=make_log_tail_fn(slot))
 
 
-def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dict:
+# When all agents are usage-limit-walled the worker pauses until the nearer reset. Cap a
+# single sleep so a SIGTERM/stop is still honored within a few minutes rather than after a
+# multi-hour reset wait.
+_PAUSE_CEILING = 300.0
+
+
+class PgAgentBudget:
+    """PG-backed fleet agent budget injected into run_apply. Two jobs, both best-effort
+    (run_apply guards every call): (1) share this worker's reactive walls + read other
+    workers'/the monitor's blocks via the agent_availability table -- the FLEET-WIDE
+    reactive layer; (2) run the throttled predictive spend monitor
+    (agent_budget.evaluate_soft_blocks), which pre-emptively blocks an agent over its
+    soft cap. With no soft caps the predictive half is inert (fleet-wide reactive still
+    works). Blocked-until times cross the boundary as epochs (run_apply speaks epochs)."""
+
+    def __init__(self, *, soft_caps=None, window_seconds=18000.0, cooldown_seconds=1800.0,
+                 eval_interval_seconds=120.0, time_fn=None):
+        self.soft_caps = soft_caps or {}
+        self.window_seconds = float(window_seconds)
+        self.cooldown_seconds = float(cooldown_seconds)
+        self.eval_interval_seconds = float(eval_interval_seconds)
+        self._time = time_fn or time.time
+        self._last_eval = None  # None = never evaluated -> first maybe_evaluate runs
+
+    def blocks(self, conn) -> dict:
+        from applypilot.fleet import agent_budget
+        return {a: dt.timestamp() for a, dt in agent_budget.get_blocks(conn).items()}
+
+    def record_wall(self, conn, agent, blocked_until_epoch) -> None:
+        from datetime import datetime, timezone
+        from applypilot.fleet import agent_budget
+        agent_budget.record_block(
+            conn, agent, datetime.fromtimestamp(blocked_until_epoch, tz=timezone.utc),
+            "usage_limit_wall")
+
+    def maybe_evaluate(self, conn) -> None:
+        if not any(c and c > 0 for c in self.soft_caps.values()):
+            return  # predictive monitor is opt-in (no caps set)
+        now = self._time()
+        if self._last_eval is not None and now - self._last_eval < self.eval_interval_seconds:
+            return
+        self._last_eval = now
+        from applypilot.fleet import agent_budget
+        agent_budget.evaluate_soft_blocks(
+            conn, soft_caps=self.soft_caps, window_seconds=self.window_seconds,
+            cooldown_seconds=self.cooldown_seconds)
+
+
+def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
+              switcher=None, rebuild_apply_fn=None, time_fn=None, now_local_fn=None,
+              budget=None) -> dict:
     """Drive the apply loop. Before each iteration check should_halt (paused/spend cap)
     and idle when halted. A per-tick error backs off (no hot crash loop). Returns a
-    counts dict (testable). Production calls with max_iterations=None (forever)."""
+    counts dict (testable). Production calls with max_iterations=None (forever).
+
+    Dynamic agent switching (optional): when a ``switcher`` (AgentSwitcher) and
+    ``rebuild_apply_fn(agent) -> apply_fn`` are supplied, each tick selects the agent whose
+    usage-limit window is open (preferred, else fallback), rebuilding loop.apply_fn when it
+    changes. A ``usage_limit`` tick (agent walled, page never touched) records the wall --
+    at the reset time parsed from the transcript when present, else a cooldown -- so the
+    walled agent is skipped until it resets. When NO agent is open the worker pauses until
+    the nearer reset instead of churning the queue. Without a switcher, behavior is
+    unchanged."""
     from applypilot.apply import pgqueue
+    from applypilot.fleet.agent_switch import parse_reset_at
+    _time = time_fn or time.time
+    from datetime import datetime
+    _now_local = now_local_fn or (lambda: datetime.now().astimezone())
     counts = {"applied": 0, "halted": 0, "idle": 0, "error": 0}
+    current_agent = None
     it = 0
     while not _STOP_REQUESTED.is_set() and (max_iterations is None or it < max_iterations):
         it += 1
         try:
+            # Fleet-wide + predictive layer (optional): pull the shared agent_availability
+            # blocks (another worker's reactive wall, or the predictive spend monitor) and
+            # feed them into THIS worker's switcher, and run the throttled spend evaluator.
+            # Layered on top of the per-worker reactive switch below; never replaces it.
+            if budget is not None and switcher is not None:
+                now0 = _time()
+                with conn_factory() as bconn:
+                    try:
+                        budget.maybe_evaluate(bconn)
+                        for blk_agent, blk_until in budget.blocks(bconn).items():
+                            switcher.note_wall(blk_agent, now0, reset_at=blk_until)
+                    except Exception:  # pragma: no cover - best-effort; never block the worker
+                        logger.debug("agent budget sync failed", exc_info=True)
+            if switcher is not None:
+                now = _time()
+                agent = switcher.effective_agent(now)
+                if agent is None:
+                    # Every agent is walled -> pause until the nearer reset (capped).
+                    counts["idle"] += 1
+                    if idle_sleep:
+                        resume = switcher.resume_at(now)
+                        nap = min(max(resume - now, 0.0), _PAUSE_CEILING) if resume is not None else idle_sleep
+                        if nap:
+                            time.sleep(nap)
+                    continue
+                if agent != current_agent and rebuild_apply_fn is not None:
+                    loop.apply_fn = rebuild_apply_fn(agent)
+                    current_agent = agent
             with conn_factory() as conn:
                 # Re-resolve the Doctor's agent_timeout_override on EVERY tick (not just at
                 # startup): the Doctor sets the override mid-flight while this worker is already
@@ -253,6 +346,14 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dic
                 # plain should_halt(), so a Doctor ATS pause never halts the LinkedIn lane.
                 if pgqueue.ats_should_halt(conn):
                     counts["halted"] += 1
+                    # Beat while halted: a paused worker that stops beating is indistinguishable
+                    # from a dead one -- the watchdog treats it as stuck and the console shows the
+                    # fleet as down (live 2026-07-03). state='paused' says "alive, intentionally
+                    # idle". Best-effort: a beat write failure must not crash the halt loop.
+                    try:
+                        loop._beat(conn, state="paused")
+                    except Exception:  # pragma: no cover - never fatal
+                        logger.debug("halted heartbeat failed", exc_info=True)
                     if idle_sleep:
                         time.sleep(idle_sleep)
                     continue
@@ -260,6 +361,31 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dic
             action = res.get("action")
             if action == "applied":
                 counts["applied"] += 1
+            elif action == "usage_limit":
+                # The current agent hit a usage/session wall (job was re-queued in the loop).
+                # Record the wall so the switcher skips this agent until it resets; prefer the
+                # reset time parsed from the transcript, else the switcher's cooldown.
+                counts["idle"] += 1
+                if switcher is not None and current_agent is not None:
+                    reset_at = None
+                    tail_fn = getattr(loop, "_log_tail_fn", None)
+                    tail = tail_fn() if callable(tail_fn) else None
+                    dt = parse_reset_at(tail, now_local=_now_local()) if tail else None
+                    if dt is not None:
+                        reset_at = dt.timestamp()
+                    switcher.note_wall(current_agent, _time(), reset_at=reset_at)
+                    # Propagate the wall fleet-wide so every worker skips this agent too,
+                    # not just the one that discovered it. Use the parsed reset when known,
+                    # else the switcher's cooldown (matches the local block).
+                    if budget is not None:
+                        blocked_epoch = reset_at if reset_at is not None else _time() + switcher.cooldown_seconds
+                        try:
+                            with conn_factory() as wconn:
+                                budget.record_wall(wconn, current_agent, blocked_epoch)
+                        except Exception:  # pragma: no cover - best-effort; never block the worker
+                            logger.debug("recording fleet wall failed", exc_info=True)
+                if idle_sleep:
+                    time.sleep(idle_sleep)
             elif action == "stop":
                 logger.info("remote %s command: exiting between jobs (supervisor respawns)",
                             res.get("command"))
@@ -285,6 +411,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     p.add_argument("--home-ip", default=os.environ.get("FLEET_HOME_IP", "0.0.0.0"))
     p.add_argument("--model", default="sonnet")
     p.add_argument("--agent", default="claude")
+    p.add_argument("--fallback-agent", default=os.environ.get("APPLYPILOT_FALLBACK_AGENT"),
+                   help="Comma-separated ordered fallback agents to switch to when --agent "
+                        "hits its usage/session limit, e.g. 'codex,deepseek' (each an "
+                        "independent quota pool). Omit for none: the worker then pauses until "
+                        "the primary agent's window resets. 'deepseek' needs DEEPSEEK_API_KEY.")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
     p.add_argument("--chrome-slot", type=int, default=None,
                    help="Browser slot (Chrome profile + CDP port + logs). Auto-derived from "
@@ -295,11 +426,45 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
         raise SystemExit("set --dsn or FLEET_PG_DSN")
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
+    from applypilot.fleet.agent_switch import AgentSwitcher
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
                             model=args.model, agent=args.agent, machine_owner=args.machine_owner,
                             slot=slot)
     # AFTER build_apply_loop: the launcher import inside it installs its own SIGTERM
     # handler (launcher.py); ours must be the LAST writer or the drain kills mid-apply.
     install_stop_handler()
-    run_apply(lambda: pgqueue.connect(args.dsn), loop)
+    # Dynamic agent failover: prefer --agent; on its usage/session wall, switch down the
+    # --fallback-agent chain (each an independent quota pool) until an earlier agent's window
+    # resets. With no fallback the switcher still pauses the worker until the reset (vs
+    # churning the queue). Chain order = [primary, *fallbacks].
+    try:
+        cooldown = float(os.environ.get("APPLYPILOT_USAGE_LIMIT_COOLDOWN_SECONDS") or 3600)
+    except (TypeError, ValueError):
+        cooldown = 3600.0
+    fallbacks = [a.strip() for a in (args.fallback_agent or "").split(",") if a.strip()]
+    switcher = AgentSwitcher(agents=[args.agent, *fallbacks], cooldown_seconds=cooldown)
+
+    # Fleet-wide + predictive layer: reactive walls are shared via agent_availability so ONE
+    # worker's wall skips the agent fleet-wide; a per-agent soft $ cap (env, opt-in) pre-empts
+    # the wall by shifting leases before the agent is exhausted. Spend window + caps from env.
+    def _envf(name, default):
+        try:
+            return float(os.environ.get(name) or default)
+        except (TypeError, ValueError):
+            return default
+    soft_caps = {}
+    for a in ("claude", "codex", "deepseek"):
+        cap = _envf(f"APPLYPILOT_{a.upper()}_SOFT_CAP_USD", 0.0)
+        if cap > 0:
+            soft_caps[a] = cap
+    budget = PgAgentBudget(
+        soft_caps=soft_caps,
+        window_seconds=_envf("APPLYPILOT_AGENT_WINDOW_SECONDS", 18000.0),   # 5h rolling
+        cooldown_seconds=_envf("APPLYPILOT_AGENT_SOFT_BLOCK_COOLDOWN_SECONDS", 1800.0),
+        eval_interval_seconds=_envf("APPLYPILOT_AGENT_EVAL_INTERVAL_SECONDS", 120.0),
+    )
+    run_apply(lambda: pgqueue.connect(args.dsn), loop,
+              switcher=switcher,
+              rebuild_apply_fn=lambda agent: make_apply_fn(args.model, agent, slot),
+              budget=budget)
     return 0

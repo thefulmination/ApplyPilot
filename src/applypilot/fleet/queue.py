@@ -101,8 +101,39 @@ def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200):
     return dict(row) if row else None
 
 
+_REQUEUE_APPLY_SQL = """
+UPDATE apply_queue
+SET status           = 'queued'::apply_queue_status,
+    apply_error      = %(apply_error)s,
+    -- Undo the lease-time attempt bump: a usage/quota wall hit on turn 1 PROVABLY never
+    -- touched the page, so this lease did nothing. NOT pinned to 99 (that is
+    -- crash_unconfirmed / reclaim). GREATEST guards against underflow.
+    attempts         = GREATEST(attempts - 1, 0),
+    lease_owner      = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE url = %(url)s
+  AND lease_owner = %(worker)s          -- only the lease holder may re-queue it
+RETURNING url;
+"""
+
+
+def requeue_apply(conn, worker_id, url, *, apply_error=None) -> bool:
+    """Return a leased apply job to 'queued' so it can be re-leased -- the RETRYABLE
+    counterpart to write_apply_result. Use ONLY when the run provably never touched the
+    form (an agent usage/quota wall before any browser tool call): re-queuing can NEVER
+    double-submit. Lease-owner guarded, so a reclaimed/foreign row is never clobbered.
+    Returns True only if this worker held the lease."""
+    with conn.cursor() as cur:
+        cur.execute(_REQUEUE_APPLY_SQL, {"apply_error": apply_error, "worker": worker_id, "url": url})
+        landed = cur.fetchone() is not None
+    conn.commit()
+    return landed
+
+
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
-                       apply_status=None, apply_error=None, est_cost_usd=0, outcome=None):
+                       apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
+                       agent=None):
     """Close the apply (lease-owner guarded), record the governor outcome on
     global+host+home_ip (bump cap on a confirmed apply), and UPSERT applied_set
     so the posting can never be applied to again. One transaction.
@@ -151,9 +182,11 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         # 'apply_agent' matches the existing SQLite-brain stage convention (see
         # apply.supervisor._apply_cost_total). Only a real, positive cost is worth a row.
         if est_cost_usd is not None and float(est_cost_usd) > 0:
+            # provider = the apply agent that spent it (claude/codex/deepseek) so
+            # agent_budget.rolling_spend can sum per-agent spend for the predictive monitor.
             cur.execute(
-                "INSERT INTO llm_usage (worker_id, task, cost_usd) VALUES (%s,%s,%s)",
-                (worker_id, "apply_agent", est_cost_usd),
+                "INSERT INTO llm_usage (worker_id, task, provider, cost_usd) VALUES (%s,%s,%s,%s)",
+                (worker_id, "apply_agent", agent, est_cost_usd),
             )
     conn.commit()
     return True
