@@ -183,33 +183,9 @@ def _make_mcp_config(cdp_port: int) -> dict:
 
 def _normalize_agent(agent: str | None) -> str:
     normalized = (agent or "claude").strip().lower()
-    if normalized not in {"claude", "codex", "deepseek"}:
-        raise ValueError("agent must be one of 'claude', 'codex', or 'deepseek'")
+    if normalized not in {"claude", "codex"}:
+        raise ValueError("agent must be either 'claude' or 'codex'")
     return normalized
-
-
-def _deepseek_model() -> str:
-    """DeepSeek model that drives the apply agent (OpenAI-compatible chat model)."""
-    return os.environ.get("APPLYPILOT_DEEPSEEK_MODEL", "deepseek-chat")
-
-
-def _deepseek_provider_args() -> list[str]:
-    """Codex ``-c`` overrides that route the run to DeepSeek's OpenAI-compatible API via a
-    custom model_provider -- no LiteLLM proxy, just DEEPSEEK_API_KEY in the worker env.
-    DeepSeek reuses the Codex runtime (which drives the Playwright MCP browser); only the
-    model + endpoint change."""
-    base_url = os.environ.get("APPLYPILOT_DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    overrides = [
-        'model_provider="deepseek"',
-        'model_providers.deepseek.name="DeepSeek"',
-        f'model_providers.deepseek.base_url="{base_url}"',
-        'model_providers.deepseek.env_key="DEEPSEEK_API_KEY"',
-        'model_providers.deepseek.wire_api="chat"',
-    ]
-    args: list[str] = []
-    for override in overrides:
-        args.extend(["-c", override])
-    return args
 
 
 # Claude model TIER names. The fleet/CLI default --model is "sonnet" (a Claude tier),
@@ -326,18 +302,11 @@ def build_apply_agent_command(
             "--verbose", "-",
         ]
 
-    # codex, or deepseek (= the Codex runtime pointed at DeepSeek's provider).
-    if agent == "deepseek":
-        model_args = ["--model", _deepseek_model()]
-        provider_args = _deepseek_provider_args()
-    else:
-        model_args = _codex_model_args(model)
-        provider_args = []
+    model_args = _codex_model_args(model)
     return [
         config.get_codex_path(),
         "exec",
         *model_args,
-        *provider_args,
         "--json",
         *_codex_isolation_args(),
         "--sandbox", "read-only",
@@ -360,17 +329,11 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
             "--no-session-persistence",
             prompt,
         ]
-    if agent == "deepseek":
-        model_args = ["--model", _deepseek_model()]
-        provider_args = _deepseek_provider_args()
-    else:
-        model_args = _codex_model_args(model)
-        provider_args = []
+    model_args = _codex_model_args(model)
     return [
         config.get_codex_path(),
         "exec",
         *model_args,
-        *provider_args,
         *_codex_isolation_args(),
         "--ephemeral",
         "--sandbox", "read-only",

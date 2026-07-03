@@ -413,9 +413,9 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     p.add_argument("--agent", default="claude")
     p.add_argument("--fallback-agent", default=os.environ.get("APPLYPILOT_FALLBACK_AGENT"),
                    help="Comma-separated ordered fallback agents to switch to when --agent "
-                        "hits its usage/session limit, e.g. 'codex,deepseek' (each an "
-                        "independent quota pool). Omit for none: the worker then pauses until "
-                        "the primary agent's window resets. 'deepseek' needs DEEPSEEK_API_KEY.")
+                        "hits its usage/session limit, e.g. 'codex' (an independent quota "
+                        "pool). Omit for none: the worker then pauses until the primary "
+                        "agent's window resets.")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
     p.add_argument("--chrome-slot", type=int, default=None,
                    help="Browser slot (Chrome profile + CDP port + logs). Auto-derived from "
@@ -453,7 +453,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
         except (TypeError, ValueError):
             return default
     soft_caps = {}
-    for a in ("claude", "codex", "deepseek"):
+    for a in ("claude", "codex"):
         cap = _envf(f"APPLYPILOT_{a.upper()}_SOFT_CAP_USD", 0.0)
         if cap > 0:
             soft_caps[a] = cap
