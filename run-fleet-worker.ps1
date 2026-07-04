@@ -140,4 +140,4 @@ $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 $margs = @(); if ($Model) { $margs = @("--model", $Model) }
 $fargs = @(); if ($FallbackAgent) { $fargs = @("--fallback-agent", $FallbackAgent) }
 Write-Host "[fleet-worker] worker $WorkerId  owner=$Label  home_ip=$HomeIp  agent=$Agent  model=$(if($Model){$Model}else{'default'})  fallback=$(if($FallbackAgent){$FallbackAgent}else{'none'})  -> logs .applypilot\logs\worker-$Slot.log"
-& $exe --worker-id "$WorkerId" --home-ip "$HomeIp" --machine-owner "$Label" --chrome-slot $Slot --agent $Agent @margs @fargs
+& $exe --dsn $env:FLEET_PG_DSN --worker-id "$WorkerId" --home-ip "$HomeIp" --machine-owner "$Label" --chrome-slot $Slot --agent $Agent @margs @fargs
