@@ -6,6 +6,7 @@ worker profile setup/cloning, and cross-platform process cleanup.
 
 import json
 import logging
+import os
 import platform
 import shutil
 import subprocess
@@ -17,8 +18,15 @@ from applypilot import config
 
 logger = logging.getLogger(__name__)
 
-# CDP port base — each worker uses BASE_CDP_PORT + worker_id
-BASE_CDP_PORT = 9222
+# CDP port base — each worker uses BASE_CDP_PORT + worker_id. Default 9400 deliberately AVOIDS
+# Chrome's universal default debug port 9222: any stray/other Chrome on a box (e.g. an
+# interactive scoring/login window) grabs 9222, which broke slot 0 (port 9222+0) specifically
+# on GGGTower 2026-07-04 while slots 1-3 on 9223-9225 were fine. Override with
+# APPLYPILOT_BASE_CDP_PORT; must not overlap LINKEDIN_LOGIN_CDP_PORT (9333) for the slot range.
+try:
+    BASE_CDP_PORT = int(os.environ.get("APPLYPILOT_BASE_CDP_PORT") or 9400)
+except (TypeError, ValueError):
+    BASE_CDP_PORT = 9400
 
 # Dedicated Chrome profile holding the one-time LinkedIn login (the li_at session). Apply
 # workers clone from it so they inherit the authenticated LinkedIn session. Populated by

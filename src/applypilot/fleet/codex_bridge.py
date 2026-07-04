@@ -190,3 +190,10 @@ def main() -> int:  # pragma: no cover - stdio server loop, not unit-testable
     """Entry point: run the FastMCP server over stdio. No DB access here."""
     mcp.run()
     return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # So `python -m applypilot.fleet.codex_bridge` actually starts the server. Without this
+    # guard, -m imported the module and exited without calling main() -> the MCP client saw
+    # the process close on `initialize` (Codex Bridge silently failed to start, 2026-07-04).
+    raise SystemExit(main())
