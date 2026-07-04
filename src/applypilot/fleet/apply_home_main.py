@@ -65,6 +65,22 @@ def approve(conn, *, urls=None, all_pushed=False) -> str:
     return token
 
 
+def arm_canary_if_safe(conn, k: int) -> bool:
+    """Guarded ApplyCycle arm: re-open canary leasing only when safety flags allow it."""
+    if queue._cost_cap_exceeded(conn):
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config "
+            "SET canary_enabled=TRUE, canary_remaining=%s, paused=FALSE, updated_at=now() "
+            "WHERE id=1 AND ats_paused=FALSE",
+            (k,),
+        )
+        n = cur.rowcount
+    conn.commit()
+    return n > 0
+
+
 def resume_if_safe(conn) -> bool:
     """Guarded self-resume: clears ONLY a plain `paused` flag so the autonomous
     ApplyCycle can self-resume after a cap window frees capacity. SAFETY-CRITICAL --
@@ -193,6 +209,7 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     sub.add_parser("pull")
     ca = sub.add_parser("canary"); ca.add_argument("k", type=int)
     sub.add_parser("lift-canary")
+    ac = sub.add_parser("arm-canary-if-safe"); ac.add_argument("k", type=int)
     ap = sub.add_parser("approve"); ap.add_argument("--all-pushed", action="store_true")
     chp = sub.add_parser("challenges"); chp.add_argument("--grouped", action="store_true")
     rc = sub.add_parser("resolve-challenge"); rc.add_argument("url"); rc.add_argument("--skip", action="store_true")
@@ -214,6 +231,12 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
             set_canary(conn, args.k); print("canary armed", args.k)
         elif args.cmd == "lift-canary":
             lift_canary(conn); print("canary lifted")
+        elif args.cmd == "arm-canary-if-safe":
+            if arm_canary_if_safe(conn, args.k):
+                print("canary armed", args.k)
+            else:
+                print("left-disarmed (ats_paused or cost cap exceeded)")
+                return 2
         elif args.cmd == "approve":
             print("approved batch", approve(conn, all_pushed=args.all_pushed))
         elif args.cmd == "challenges":
