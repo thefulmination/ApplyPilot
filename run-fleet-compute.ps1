@@ -93,7 +93,8 @@ if ($Workers -le 1) { Start-OneWorker "$Label-score-0"; return }
 # --- multi-worker: clean slate, then one window per worker on a DISTINCT id ---
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
   $_.Name -eq 'applypilot-fleet-compute.exe' -or
-  ($_.Name -eq 'python.exe' -and $_.CommandLine -match 'fleet-compute')
+  ($_.Name -eq 'python.exe' -and $_.CommandLine -match 'fleet-compute') -or
+  ($_.Name -eq 'powershell.exe' -and $_.CommandLine -match [regex]::Escape($self) -and $_.CommandLine -match '\s-Index\s+\d+')
 }
 if ($existing) {
   Write-Host ("Stopping {0} existing compute worker process(es) for a clean slate..." -f @($existing).Count) -ForegroundColor Yellow
@@ -103,7 +104,7 @@ if ($existing) {
 
 $self = $MyInvocation.MyCommand.Path
 for ($i = 0; $i -lt $Workers; $i++) {
-  $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$self`"",
+  $argList = @("-ExecutionPolicy", "Bypass", "-File", "`"$self`"",
                "-Index", $i, "-Label", $Label, "-Providers", $Providers)
   Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $ProjectRoot
   Write-Host ("  launched {0}-score-{1}" -f $Label, $i) -ForegroundColor Green
