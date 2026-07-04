@@ -240,6 +240,42 @@ def rescore_jobs(
     console.print(f"  Time:          {result['elapsed']:.1f}s")
 
 
+@app.command("score-jobs")
+def score_jobs(
+    limit: int = typer.Option(
+        400,
+        "--limit",
+        "-l",
+        help="Maximum unscored jobs to score with the current LLM and preference profile. Use 0 for all.",
+    ),
+    workers: int = typer.Option(
+        1,
+        "--workers",
+        "-w",
+        help="Parallel scoring workers. Keep at 1 on the home box.",
+    ),
+) -> None:
+    """Score unscored jobs with an explicit per-run cap."""
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    from applypilot.scoring.scorer import run_scoring
+
+    check_tier(2, "AI scoring")
+    if limit < 0:
+        console.print("[red]Invalid --limit:[/red] use 0 or a positive number.")
+        raise typer.Exit(code=1)
+    if workers < 1:
+        console.print("[red]Invalid --workers:[/red] use 1 or a positive number.")
+        raise typer.Exit(code=1)
+
+    result = run_scoring(limit=limit, rescore=False, workers=workers)
+    console.print("\n[bold green]Scoring complete[/bold green]")
+    console.print(f"  Jobs scored: {result['scored']}")
+    console.print(f"  Errors:      {result['errors']}")
+    console.print(f"  Time:        {result['elapsed']:.1f}s")
+
+
 @app.command("dedupe-jobs")
 def dedupe_jobs_command(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview duplicate markings without changing the database."),

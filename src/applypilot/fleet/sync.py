@@ -425,6 +425,18 @@ WHERE duplicate_of_url IS NULL
 ORDER BY score DESC
 """
 
+_PUSH_COMPUTE_UNSCORED = """
+SELECT url, company, title, application_url, full_description,
+       CAST(NULL AS REAL) AS score
+FROM jobs
+WHERE duplicate_of_url IS NULL
+  AND audit_score IS NULL
+  AND fit_score IS NULL
+  AND research_fit_score IS NULL
+  AND TRIM(COALESCE(full_description, '')) != ''
+ORDER BY discovered_at DESC
+"""
+
 
 def push_compute_eligible(
     *,
@@ -433,6 +445,7 @@ def push_compute_eligible(
     task: str,
     score_floor: int = 0,
     limit: int | None = None,
+    unscored_only: bool = False,
 ) -> int:
     """Push brain jobs needing a compute ``task`` (score|audit|tailor|enrich) into
     ``compute_queue`` (S8). Each row carries the minimal ``payload`` the task needs
@@ -443,7 +456,7 @@ def push_compute_eligible(
     pg = pg_conn or pgqueue.connect()
     try:
         out: list[dict[str, Any]] = []
-        sql, params = _PUSH_COMPUTE_SELECT, [score_floor]
+        sql, params = (_PUSH_COMPUTE_UNSCORED, []) if unscored_only else (_PUSH_COMPUTE_SELECT, [score_floor])
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))

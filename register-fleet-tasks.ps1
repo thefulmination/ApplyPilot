@@ -421,7 +421,7 @@ Set-Location '$repo'
 `$ErrorActionPreference = 'Continue'
 `$env:FLEET_PG_DSN = '$effectiveDsn'
 Set-Location '$repo'
-& '$computeIngestPs1' -Once *>> '$computeIngestLog'
+& '$computeIngestPs1' -Once -IncludeUnscored *>> '$computeIngestLog'
 "@
   $computeIngestWrapper = Write-Wrapper "compute-ingest-task" $computeIngestWrapperContent
   $computeIngestTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Days 3650)

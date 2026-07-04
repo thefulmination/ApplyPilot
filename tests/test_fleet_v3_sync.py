@@ -31,7 +31,8 @@ CREATE TABLE jobs (
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
     applied_at TEXT, agent_id TEXT, verification_confidence TEXT,
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0,
-    research_fit_score REAL, research_decision TEXT
+    research_fit_score REAL, research_decision TEXT,
+    discovered_at TEXT
 );
 """
 
@@ -261,6 +262,70 @@ def test_push_compute_eligible_enqueues_with_payload(fleet_db, tmp_path):
     assert rows[0]["task"] == "score"
     assert rows[0]["status"] == "queued"
     assert rows[0]["payload"]["company"] == "Co"
+
+
+def test_push_compute_eligible_default_floor_excludes_null_score_rows(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://co/jobs/scored", company="Co", title="Analyst", audit_score=8.0)
+    _add_job(sq, "https://co/jobs/unscored", company="Co", title="PM",
+             audit_score=None, fit_score=None, full_description="real JD")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score", score_floor=7)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM compute_queue ORDER BY url")
+            rows = cur.fetchall()
+
+    assert [r["url"] for r in rows] == ["https://co/jobs/scored"]
+
+
+def test_push_compute_eligible_unscored_only_selects_described_nondup_research_unscored(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://co/jobs/fresh", company="Co", title="Fresh",
+             audit_score=None, fit_score=None, full_description="fresh JD",
+             discovered_at="2026-07-04T09:00:00")
+    _add_job(sq, "https://co/jobs/older", company="Co", title="Older",
+             audit_score=None, fit_score=None, full_description="older JD",
+             discovered_at="2026-07-03T09:00:00")
+    _add_job(sq, "https://co/jobs/scored", company="Co", title="Scored",
+             audit_score=8.0, fit_score=None, full_description="scored JD")
+    _add_job(sq, "https://co/jobs/research", company="Co", title="Research",
+             audit_score=None, fit_score=None, research_fit_score=8.5,
+             full_description="already research scored")
+    _add_job(sq, "https://co/jobs/blank", company="Co", title="Blank",
+             audit_score=None, fit_score=None, full_description=" ")
+    _add_job(sq, "https://co/jobs/dup", company="Co", title="Dup",
+             audit_score=None, fit_score=None, full_description="dup JD",
+             duplicate_of_url="https://co/jobs/fresh")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score", unscored_only=True)
+        assert n == 2
+        with pg.cursor() as cur:
+            cur.execute("SELECT url, payload FROM compute_queue ORDER BY url")
+            rows = cur.fetchall()
+
+    assert [r["url"] for r in rows] == ["https://co/jobs/fresh", "https://co/jobs/older"]
+    assert {r["payload"]["full_description"] for r in rows} == {"fresh JD", "older JD"}
+
+
+def test_push_compute_eligible_unscored_only_respects_limit(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://co/jobs/first", company="Co", title="First",
+             audit_score=None, fit_score=None, full_description="first JD",
+             discovered_at="2026-07-04T10:00:00")
+    _add_job(sq, "https://co/jobs/second", company="Co", title="Second",
+             audit_score=None, fit_score=None, full_description="second JD",
+             discovered_at="2026-07-03T10:00:00")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score",
+                                       unscored_only=True, limit=1)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM compute_queue")
+            rows = cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://co/jobs/first"
 
 
 def test_pull_compute_results_is_advisory_only_and_idempotent(fleet_db, tmp_path):

@@ -7,14 +7,16 @@ import argparse
 from applypilot.fleet import sync
 
 
-def push_backlog(*, sqlite_conn=None, pg_conn=None, task="score", score_floor=7, limit=None) -> int:
+def push_backlog(*, sqlite_conn=None, pg_conn=None, task="score", score_floor=7,
+                 limit=None, unscored_only=False) -> int:
     # score_floor=7 here is intentional: the home driver applies a quality floor
     # so only jobs worth a second LLM pass are queued for compute.  The underlying
     # sync.push_compute_eligible defaults to score_floor=0 (score everything) — that
     # default is intentional for the raw sync function, which callers may use with
     # their own floor.  Do not change sync.py to match this default.
     return sync.push_compute_eligible(sqlite_conn=sqlite_conn, pg_conn=pg_conn,
-                                      task=task, score_floor=score_floor, limit=limit)
+                                      task=task, score_floor=score_floor, limit=limit,
+                                      unscored_only=unscored_only)
 
 
 def pull_results(*, sqlite_conn=None, pg_conn=None) -> int:
@@ -31,9 +33,11 @@ def main(argv=None) -> int:
     p.add_argument("--task", default="score")
     p.add_argument("--score-floor", type=int, default=7)
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--unscored-only", action="store_true")
     args = p.parse_args(argv)
     if args.cmd == "push":
-        print("pushed", push_backlog(task=args.task, score_floor=args.score_floor, limit=args.limit))
+        print("pushed", push_backlog(task=args.task, score_floor=args.score_floor,
+                                     limit=args.limit, unscored_only=args.unscored_only))
     elif args.cmd == "pull":
         print("pulled", pull_results())
     else:

@@ -26,6 +26,30 @@ def test_rescore_jobs_command_calls_scoring_in_rescore_mode(monkeypatch) -> None
     assert "Jobs rescored: 3" in result.output
 
 
+def test_score_jobs_command_calls_scoring_without_rescore_and_threads_workers(monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from applypilot import cli, config
+
+    called: dict[str, object] = {}
+
+    def fake_run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = None) -> dict:
+        called["limit"] = limit
+        called["rescore"] = rescore
+        called["workers"] = workers
+        return {"scored": 4, "errors": 0, "elapsed": 2.5, "distribution": [(8, 4)]}
+
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+    monkeypatch.setattr(config, "check_tier", lambda _tier, _feature: None)
+    monkeypatch.setattr(scorer, "run_scoring", fake_run_scoring)
+
+    result = CliRunner().invoke(cli.app, ["score-jobs", "--limit", "25", "--workers", "2"])
+
+    assert result.exit_code == 0
+    assert called == {"limit": 25, "rescore": False, "workers": 2}
+    assert "Jobs scored: 4" in result.output
+
+
 def test_load_preference_profile_uses_env_path_at_call_time(tmp_path, monkeypatch) -> None:
     from applypilot import config
 
@@ -169,4 +193,3 @@ def test_score_job_includes_knowledge_graph_in_llm_prompt(monkeypatch) -> None:
     assert "Cite specific graph node IDs" in system_msg
     assert "APPLYPILOT KNOWLEDGE GRAPH" in user_msg
     assert "Mock Graph content here." in user_msg
-

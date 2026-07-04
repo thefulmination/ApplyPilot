@@ -13,6 +13,8 @@ param(
   [int]$ScoreFloor = 7,
   [string]$Task = "score",
   [int]$IntervalSec = 900,
+  [switch]$IncludeUnscored,
+  [int]$UnscoredLimit = 500,
   [switch]$Once
 )
 $ErrorActionPreference = "Stop"
@@ -74,6 +76,9 @@ function Invoke-ComputeHomeStep {
 Write-Host "[compute-home] push (fill compute_queue) + pull (harvest results) every ${IntervalSec}s (Ctrl-C to stop) ..." -ForegroundColor Cyan
 while ($true) {
   Invoke-ComputeHomeStep -Name "push" -ArgsList @("push", "--task", $Task, "--score-floor", "$ScoreFloor")
+  if ($IncludeUnscored) {
+    Invoke-ComputeHomeStep -Name "push-unscored" -ArgsList @("push", "--task", "score", "--unscored-only", "--limit", "$UnscoredLimit")
+  }
   Invoke-ComputeHomeStep -Name "pull" -ArgsList @("pull")
   if ($Once) { break }
   Start-Sleep -Seconds $IntervalSec
