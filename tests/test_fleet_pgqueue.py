@@ -393,7 +393,7 @@ def test_write_result_unconditional_cost_zero(db):
 _JOBS_DDL = """
 CREATE TABLE jobs (
     url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
-    audit_score REAL, fit_score INTEGER, liveness_status TEXT,
+    audit_score REAL, fit_score INTEGER, full_description TEXT, liveness_status TEXT,
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
     applied_at TEXT, agent_id TEXT, verification_confidence TEXT,
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0
@@ -410,7 +410,8 @@ def _home_sqlite(tmp_path):
 
 
 def _add_job(conn, url, **kw):
-    cols = {"url": url, "application_url": url, "audit_score": 8.0, "liveness_status": "live"}
+    cols = {"url": url, "application_url": url, "audit_score": 8.0,
+            "liveness_status": "live", "full_description": "x" * 600}
     cols.update(kw)
     conn.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                  list(cols.values()))
@@ -429,6 +430,7 @@ def test_push_offsite_filters(db, tmp_path, monkeypatch):
     _add_job(sq, "https://www.linkedin.com/jobs/view/123", audit_score=9.0)         # linkedin -> skip
     _add_job(sq, "https://boards.greenhouse.io/x/jobs/2", apply_status="applied")   # applied -> skip
     _add_job(sq, "https://boards.greenhouse.io/y/jobs/3", audit_score=5.0)          # below floor -> skip
+    _add_job(sq, "https://boards.greenhouse.io/thin/jobs/4", full_description="x" * 499)  # too thin -> skip
 
     with pgqueue.connect(db) as pg:
         assert fleet_sync.push_offsite_jobs(sqlite_conn=sq, pg_conn=pg, score_floor=7) == 1

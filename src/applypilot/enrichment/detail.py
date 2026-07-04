@@ -25,7 +25,9 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
+from applypilot.database import MIN_GOOD_DESCRIPTION_CHARS as _MIN_GOOD_DESCRIPTION_CHARS
 from applypilot.database import init_db
+from applypilot.discovery import desc_quality
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -656,7 +658,7 @@ MAX_DETAIL_ATTEMPTS = 3
 # A stored description shorter than this is considered too thin to be a usable
 # job description (matches the brainstorm JD-validity gate + jobspy's own
 # full_description promotion threshold).
-MIN_GOOD_DESCRIPTION_CHARS = 200
+MIN_GOOD_DESCRIPTION_CHARS = _MIN_GOOD_DESCRIPTION_CHARS
 
 
 def scrape_detail_page(page, url: str) -> dict:
@@ -811,6 +813,7 @@ def scrape_site_batch(
                 if status in ("ok", "partial"):
                     stats[status] += 1
                     fd = result.get("full_description")
+                    flags, score = desc_quality.assess_description(result.get("title"), fd)
                     # Keep the LONGER description: a re-scrape that yields a
                     # shorter stub must not clobber a good description already
                     # stored (relevant when re-enriching thin descriptions).
@@ -818,8 +821,11 @@ def scrape_site_batch(
                         "UPDATE jobs SET full_description = CASE "
                         "  WHEN ? IS NOT NULL AND LENGTH(?) >= LENGTH(COALESCE(full_description, '')) "
                         "  THEN ? ELSE full_description END, "
-                        "application_url = ?, detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (fd, fd, fd, result.get("application_url"), now, url),
+                        "application_url = ?, company = COALESCE(?, company), "
+                        "desc_quality_flags = ?, desc_quality_score = ?, desc_quality_at = ?, "
+                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
+                        (fd, fd, fd, result.get("application_url"), result.get("company"),
+                         ",".join(flags), score, now, now, url),
                     )
                 elif result.get("retryable"):
                     # Transient failure (429/5xx): record the error and bump the
@@ -1078,6 +1084,7 @@ def reenrich_thin_descriptions(
     min_chars: int = MIN_GOOD_DESCRIPTION_CHARS,
     limit: int = 0,
     workers: int = 1,
+    source_board: str | None = None,
 ) -> dict:
     """Re-attempt enrichment for already-scraped jobs whose description is missing
     or too thin to be usable.
@@ -1092,19 +1099,36 @@ def reenrich_thin_descriptions(
     """
     conn = init_db()
     skip_filter = " AND ".join("site != ?" for _ in SKIP_DETAIL_SITES)
+    params: list = []
+    if source_board:
+        source_filter = "source_board = ?"
+        thin_filter = (
+            "(full_description IS NULL OR LENGTH(full_description) < ? "
+            "OR full_description LIKE 'Requirements Summary:%')"
+        )
+        order_by = "COALESCE(audit_score, fit_score) DESC"
+        params.extend([source_board, min_chars])
+    else:
+        source_filter = "1=1"
+        thin_filter = "(full_description IS NULL OR LENGTH(full_description) < ?)"
+        order_by = "site"
+        params.append(min_chars)
+    params.extend([MAX_DETAIL_ATTEMPTS, *SKIP_DETAIL_SITES])
     rows = conn.execute(
         f"""
-        SELECT url, title, site FROM jobs
+        SELECT url, title, site, full_description, fit_score FROM jobs
          WHERE duplicate_of_url IS NULL
+           AND {source_filter}
            AND detail_scraped_at IS NOT NULL
-           AND (full_description IS NULL OR LENGTH(full_description) < ?)
+           AND {thin_filter}
            AND COALESCE(detail_attempts, 0) < ?
            {("AND " + skip_filter) if skip_filter else ""}
-         ORDER BY site
+         ORDER BY {order_by}
         """,
-        (min_chars, MAX_DETAIL_ATTEMPTS, *SKIP_DETAIL_SITES),
+        tuple(params),
     ).fetchall()
 
+    before = {r[0]: {"full_description": r[3], "fit_score": r[4]} for r in rows}
     eligible = [(r[0], r[1], r[2]) for r in rows]
     if limit and limit > 0:
         eligible = eligible[:limit]
@@ -1135,6 +1159,31 @@ def reenrich_thin_descriptions(
             scrape_site_batch(conn, site, jobs, delay=SITE_DELAYS.get(site, 2.0))
         except Exception as e:
             log.error("%s: re-enrich batch failed: %s", site, e)
+
+    for u in urls:
+        old = before.get(u, {})
+        if old.get("fit_score") is None:
+            continue
+        row = conn.execute(
+            "SELECT full_description FROM jobs WHERE url = ?",
+            (u,),
+        ).fetchone()
+        new_desc = row[0] if row else None
+        if new_desc != old.get("full_description") and len(new_desc or "") >= min_chars:
+            conn.execute(
+                """
+                UPDATE jobs
+                   SET fit_score = NULL,
+                       scored_at = NULL,
+                       fit_verdict = NULL,
+                       audit_score = CASE WHEN COALESCE(audit_label,'') = 'approved_external' THEN audit_score ELSE NULL END,
+                       audit_label = CASE WHEN COALESCE(audit_label,'') = 'approved_external' THEN audit_label ELSE NULL END,
+                       audited_at = CASE WHEN COALESCE(audit_label,'') = 'approved_external' THEN audited_at ELSE NULL END
+                 WHERE url = ?
+                """,
+                (u,),
+            )
+    conn.commit()
 
     improved = sum(1 for u in urls if _full_description_len(conn, u) >= min_chars)
     return {

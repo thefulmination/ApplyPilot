@@ -147,6 +147,37 @@ def test_breaker_pauses_high_challenge_host(fleet_db):
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
 
 
+def test_lease_ignores_expired_pause_but_keeps_demotion_sticky(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        sk = governor.host_scope("cooldown.io")
+        governor.ensure_scope(conn, sk, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rate_governor SET breaker_state='paused', "
+                "breaker_until=now() - interval '1 minute' WHERE scope_key=%s",
+                (sk,),
+            )
+        conn.commit()
+        _seed_apply(conn, "expired-pause", host="cooldown.io")
+
+        leased = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+        assert leased is not None
+        assert leased["url"] == "expired-pause"
+
+        sk = governor.host_scope("demoted.io")
+        governor.ensure_scope(conn, sk, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rate_governor SET breaker_state='demoted', "
+                "breaker_until=now() - interval '1 minute' WHERE scope_key=%s",
+                (sk,),
+            )
+        conn.commit()
+        _seed_apply(conn, "expired-demotion", host="demoted.io")
+
+        assert queue.lease_apply(conn, "w2", home_ip="1.1.1.1") is None
+
+
 def test_breaker_pauses_at_exact_threshold_boundary(fleet_db):
     # Regression: a rate landing EXACTLY on the pause cut (1.5x captcha_threshold)
     # must pause, not throttle. 4 success + 6 captcha -> challenge_rate 6/10 = 0.6,

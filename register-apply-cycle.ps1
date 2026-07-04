@@ -14,7 +14,7 @@
 #     ApplyPilot ApplyCycle  -- every 4h.  Wrapper chain, each step logged, wrapper exits non-zero
 #                                if ANY step fails (Task Scheduler Last-Result visibility):
 #                                  1. run-applypilot.ps1 verify-live --limit 300   (fresh pre-push check)
-#                                  2. applypilot-fleet-apply-home push --score-floor 7
+#                                  2. applypilot-fleet-apply-home push --score-floor 7 --include-research
 #                                  3. applypilot-fleet-apply-home arm-canary-if-safe <K>
 #                                  4. applypilot-fleet-apply-home approve --all-pushed
 #                                  5. applypilot-fleet-apply-home resume-if-safe
@@ -157,9 +157,33 @@ $verifyLiveWrapperContent = @"
 `$env:FLEET_PG_DSN = '$effectiveDsn'
 Set-Location '$repo'
 `$log = '$verifyLiveLog'
+function Invoke-VerifyLive {
+  param([ScriptBlock]`$Action)
+  `$mutex = New-Object System.Threading.Mutex(`$false, 'Global\ApplyPilotVerifyLive')
+  `$acquired = `$false
+  try {
+    try {
+      `$acquired = `$mutex.WaitOne([TimeSpan]::FromMinutes(15))
+    } catch [System.Threading.AbandonedMutexException] {
+      `$acquired = `$true
+    }
+    if (-not `$acquired) {
+      Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] verify-live skipped: mutex wait timeout (15m)')
+      return 0
+    }
+    try {
+      & `$Action
+      return `$LASTEXITCODE
+    } finally {
+      if (`$acquired) { `$null = `$mutex.ReleaseMutex() }
+    }
+  } finally {
+    `$mutex = `$null
+  }
+}
+
 Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === VerifyLive start ===')
-& '$runApplyPilotPs1' verify-live *>> `$log
-`$code = `$LASTEXITCODE
+`$code = Invoke-VerifyLive { & '$runApplyPilotPs1' verify-live --max-age-days 3 --limit 1200 *>> `$log }
 Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] verify-live exit=' + `$code)
 exit `$code
 "@
@@ -181,6 +205,30 @@ $applyCycleWrapperContent = @"
 `$env:FLEET_PG_DSN = '$effectiveDsn'
 Set-Location '$repo'
 `$log = '$applyCycleLog'
+function Invoke-VerifyLive {
+  param([ScriptBlock]`$Action)
+  `$mutex = New-Object System.Threading.Mutex(`$false, 'Global\ApplyPilotVerifyLive')
+  `$acquired = `$false
+  try {
+    try {
+      `$acquired = `$mutex.WaitOne([TimeSpan]::FromMinutes(15))
+    } catch [System.Threading.AbandonedMutexException] {
+      `$acquired = `$true
+    }
+    if (-not `$acquired) {
+      Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] verify-live skipped: mutex wait timeout (15m)')
+      return 0
+    }
+    try {
+      & `$Action
+      return `$LASTEXITCODE
+    } finally {
+      if (`$acquired) { `$null = `$mutex.ReleaseMutex() }
+    }
+  } finally {
+    `$mutex = `$null
+  }
+}
 function Step(`$stepName, [ScriptBlock]`$action) {
   Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] --- ' + `$stepName + ' start ---')
   & `$action *>> `$log
@@ -193,9 +241,9 @@ Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle
 # the apply push+resume for a whole 4h cycle -- the steps are largely independent). Track the last
 # failure and exit non-zero at the end so Task Scheduler's Last-Result still surfaces it.
 `$fail = 0
-`$rc = Step 'verify-live' { & '$runApplyPilotPs1' verify-live --limit 300 }
+`$rc = Step 'verify-live' { Invoke-VerifyLive { & '$runApplyPilotPs1' verify-live --max-age-days 3 --limit 300 } }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: verify-live FAILED (continuing best-effort)' }
-`$rc = Step 'push' { & '$applyHomeExe' push --score-floor 7 }
+`$rc = Step 'push' { & '$applyHomeExe' push --score-floor 7 --include-research }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: push FAILED (continuing best-effort)' }
 `$rc = Step 'arm-canary' { & '$applyHomeExe' arm-canary-if-safe $CanaryK }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: arm-canary FAILED (continuing best-effort)' }

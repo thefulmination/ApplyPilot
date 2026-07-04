@@ -36,6 +36,7 @@ owns the connection lifecycle so it can reconnect after a transient DB blip.
 from __future__ import annotations
 
 import collections
+import datetime as _dt
 import os
 import re
 from typing import Any, Callable, Optional
@@ -235,6 +236,7 @@ class WorkerLoop:
         self._last_error: Optional[str] = None
         self._events: collections.deque = collections.deque(maxlen=40)
         self._log_tail_fn = log_tail_fn
+        self._started_at = _dt.datetime.now(_dt.timezone.utc)
         # Remote-command state: a 'pause' flips this until 'resume'; consumed in
         # run_once BETWEEN jobs (never mid-apply). See _handle_commands.
         self._paused = False
@@ -298,6 +300,10 @@ class WorkerLoop:
                 self._paused = False
                 self._record_event("command: resume")
             elif cmd in ("restart", "drain"):
+                issued_at = c.get("issued_at")
+                if c.get("worker_id") == self.worker_id and issued_at and issued_at < self._started_at:
+                    self._record_event(f"command: stale {cmd} ignored")
+                    continue
                 self._record_event(f"command: {cmd} -> exiting between jobs")
                 stop = cmd
             elif cmd == "self_update":

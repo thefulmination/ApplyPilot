@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import datetime as _dt, time as _time, timezone as _tz
+import json
+from collections import defaultdict
+from datetime import datetime as _dt, time as _time, timedelta as _td, timezone as _tz
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -302,6 +304,11 @@ def verify_live_command(
         "priority,recommended", "--tiers",
         help="Comma-separated audit_label tiers to verify.",
     ),
+    score_floor: float = typer.Option(
+        -1.0, "--score-floor",
+        help=("Minimum effective score floor for score-based auto-include candidates. "
+              "-1 = APPLYPILOT_MIN_SCORE, 0 = disable score floor and use tiers only."),
+    ),
     max_age_days: int = typer.Option(
         7, "--max-age-days",
         help="Skip jobs already verified within this many days (0 = re-check all).",
@@ -328,6 +335,14 @@ def verify_live_command(
     if limit < 0:
         console.print("[red]Invalid --limit:[/red] use 0 or a positive number.")
         raise typer.Exit(code=1)
+    if score_floor == 0:
+        score_floor = None
+    elif score_floor == -1:
+        from applypilot import config
+        score_floor = float(config.get_min_score())
+    elif score_floor < 0:
+        console.print("[red]Invalid --score-floor:[/red] use -1, 0, or a positive number.")
+        raise typer.Exit(code=1)
 
     tier_list = [t.strip() for t in tiers.split(",") if t.strip()]
     conn = get_connection()
@@ -336,7 +351,7 @@ def verify_live_command(
         console.print(f"  probed {done}/{total}…", end="\r")
 
     result = liveness.verify_jobs(
-        conn, tiers=tier_list, max_age_days=max_age_days,
+        conn, tiers=tier_list, score_floor=score_floor, max_age_days=max_age_days,
         limit=limit, workers=workers, dry_run=dry_run, progress=_progress,
     )
     by = result["by_status"]
@@ -829,6 +844,194 @@ def smart_health_command(
 
     console.print(table)
     console.print(f"Health file: {smartextract.SMART_HEALTH_PATH}")
+
+
+@app.command("parse-health")
+def parse_health_command() -> None:
+    """Run parse-quality refresh + drift snapshot and print threshold alerts."""
+    from applypilot import config, database
+
+    _bootstrap()
+    conn = database.init_db(config.DB_PATH)
+    database.refresh_desc_quality(conn, limit=None)
+    snapshot = database.snapshot_desc_quality(conn, window_days=7)
+
+    rows = sorted(
+        snapshot["rows"],
+        key=lambda row: (row["board"] == "__all__", str(row["board"])),
+    )
+
+    table = Table(title="Parse-quality Drift Snapshot")
+    table.add_column("Board")
+    table.add_column("Window", justify="right")
+    table.add_column("Total", justify="right")
+    table.add_column("Null Rate", justify="right")
+    table.add_column("Stub Rate", justify="right")
+    table.add_column("Short <500", justify="right")
+    table.add_column("HTML", justify="right")
+
+    for row in rows:
+        table.add_row(
+            str(row["board"]),
+            "7",
+            str(row["total"]),
+            f"{float(row['null_rate']):.2%}",
+            f"{float(row['stub_rate']):.2%}",
+            f"{float(row['short_rate']):.2%}",
+            f"{float(row['html_rate']):.2%}",
+        )
+    console.print(table)
+
+    alerts = []
+    for row in rows:
+        if row["board"] == "__all__":
+            continue
+        if float(row["null_rate"]) > 0.02:
+            alerts.append(f"ALERT {row['board']}: null_rate={float(row['null_rate']):.2%}")
+        if float(row["short_rate"]) > 0.05:
+            alerts.append(f"ALERT {row['board']}: short_rate={float(row['short_rate']):.2%}")
+        if float(row["html_rate"]) > 0.01:
+            alerts.append(f"ALERT {row['board']}: html_rate={float(row['html_rate']):.2%}")
+    if alerts:
+        for alert in alerts:
+            console.print(f"[red]{alert}[/red]")
+    else:
+        console.print("[green]No parse-quality drift alerts.[/green]")
+
+
+@app.command("parse-spot-audit")
+def parse_spot_audit_command(
+    sample: int = typer.Option(50, "--sample", help="Max jobs to sample across board×band."),
+    window_days: int = typer.Option(30, "--window-days", help="Lookback window in days."),
+) -> None:
+    """Sample jobs for lightweight parse-quality spot checks and persist results."""
+    from applypilot import config, database, llm
+
+    _bootstrap()
+    if sample < 0:
+        console.print("[red]Invalid --sample: must be >= 0[/red]")
+        raise typer.Exit(code=1)
+    if window_days <= 0:
+        console.print("[red]Invalid --window-days: must be > 0[/red]")
+        raise typer.Exit(code=1)
+
+    conn = database.get_connection(config.DB_PATH)
+    cutoff = (_dt.now(_tz.utc) - _td(days=window_days)).isoformat()
+    raw_rows = conn.execute(
+        """
+        SELECT
+            url,
+            title,
+            COALESCE(source_board, strategy, site, 'unknown') AS board,
+            COALESCE(audit_score, fit_score) AS score,
+            full_description
+        FROM jobs
+        WHERE duplicate_of_url IS NULL
+          AND discovered_at IS NOT NULL
+          AND datetime(discovered_at) >= datetime(?)
+        ORDER BY discovered_at DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    def _band(score: float | int | None) -> str:
+        if score is None:
+            return "unscored"
+        return "high" if float(score) >= 6 else "low"
+
+    buckets: defaultdict[str, list[tuple[str, str, str | None]]] = defaultdict(list)
+    for row in raw_rows:
+        b = str(row["board"])
+        buckets[(b, _band(row["score"]))].append((row["url"], row["title"], row["full_description"]))
+
+    if not buckets:
+        console.print("[yellow]No jobs available for parse-spot audit.[/yellow]")
+        return
+
+    if sample == 0:
+        sample = len(raw_rows)
+
+    grouped = sorted(buckets.items(), key=lambda kv: (kv[0][0], {"unscored": 2, "low": 1, "high": 0}.get(kv[0][1], 99)))
+    cursor = {key: 0 for key, _ in grouped}
+    sampled: list[tuple[str, str, str, str]] = []
+    while len(sampled) < sample:
+        progressed = False
+        for (board, band), rowset in grouped:
+            i = cursor[(board, band)]
+            if i < len(rowset):
+                url, title, description = rowset[i]
+                sampled.append((board, band, str(url), str(title or "")))
+                cursor[(board, band)] += 1
+                progressed = True
+                if len(sampled) >= sample:
+                    break
+        if not progressed:
+            break
+
+    client = llm.get_client(stage="parse_audit")
+    sampled_at = _dt.now(_tz.utc).isoformat()
+    by_board = defaultdict(lambda: {"total": 0, "complete": 0})
+
+    for board, band, url, title in sampled:
+        row = conn.execute("SELECT full_description FROM jobs WHERE url = ?", (url,)).fetchone()
+        desc = row["full_description"] if row else None
+        short_desc = (desc or "")
+        if len(short_desc) > 8000:
+            short_desc = short_desc[:8000]
+
+        prompt = (
+            "You are a strict job-description quality checker. Return JSON only.\n\n"
+            f"Title: {title}\nDescription:\n{short_desc}"
+        )
+        try:
+            raw = client.chat([
+                {"role": "system", "content": "Return only compact JSON."},
+                {"role": "user", "content": prompt},
+            ], max_tokens=200)
+        except Exception:
+            raw = "{}"
+        complete = 0
+        defects = []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                complete = 1 if str(parsed.get("complete", "n")).strip().lower() in {"y", "yes", "1", "true"} else 0
+                raw_defects = parsed.get("defects", [])
+                if isinstance(raw_defects, list):
+                    defects = [str(v) for v in raw_defects]
+        except Exception:
+            complete = 0
+            defects = []
+
+        by_board[board]["total"] += 1
+        by_board[board]["complete"] += complete
+        conn.execute(
+            """
+            INSERT INTO parse_spot_audit (
+                audited_at, url, board, band, complete, defects, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """
+            ,
+            (
+                sampled_at,
+                url,
+                board,
+                band,
+                complete,
+                json.dumps(defects),
+                getattr(client, "model", None),
+            ),
+        )
+    conn.commit()
+
+    for board, stat in sorted(by_board.items(), key=lambda kv: kv[0]):
+        total = int(stat["total"])
+        complete_n = int(stat["complete"])
+        ratio = (complete_n / total) if total else 0.0
+        console.print(f"board={board} complete={ratio:.0%} ({complete_n}/{total})")
+        if ratio < 0.9:
+            console.print(f"[red]ALERT board={board}: complete rate below 90%[/red]")
+    console.print(f"[green]parse-spot-audit sampled {len(sampled)} jobs[/green]")
 
 
 @app.command()
@@ -2086,6 +2289,8 @@ def resbuild_promote_command(
         console.print("\n[dim]Re-run without --dry-run to apply. Reverse later with resbuild-revert.[/dim]")
     else:
         console.print(f"  Promoted (gate-authoritative): {r['promoted']}")
+        console.print(f"  Excluded (fleet cross-check applied): {r['excluded_fleet_applied']}")
+        console.print(f"  Fleet cross-check mode: {r['fleet_cross_check']}")
         c = r["import_counts"]
         if c.get("not_found_insufficient_metadata"):
             console.print(f"  [yellow]Apply-list URLs not in brain (skipped, never inserted): "
@@ -2122,6 +2327,7 @@ def reenrich_command(
     min_chars: int = typer.Option(200, "--min-chars", help="Re-scrape jobs whose stored description is shorter than this."),
     limit: int = typer.Option(0, "--limit", "-l", help="Max jobs to re-enrich. 0 = all eligible."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel site-batch workers."),
+    source_board: str | None = typer.Option(None, "--source-board", help="Limit re-enrichment to one source_board, e.g. hiringcafe."),
 ) -> None:
     """Re-fetch descriptions for jobs with a missing or too-thin description.
 
@@ -2134,7 +2340,7 @@ def reenrich_command(
 
     from applypilot.enrichment.detail import reenrich_thin_descriptions
 
-    r = reenrich_thin_descriptions(min_chars=min_chars, limit=limit, workers=workers)
+    r = reenrich_thin_descriptions(min_chars=min_chars, limit=limit, workers=workers, source_board=source_board)
 
     console.print("\n[bold green]Re-enrichment complete[/bold green]")
     console.print(f"  Eligible (thin/missing):     {r['eligible']}")

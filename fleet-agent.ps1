@@ -27,6 +27,17 @@ $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repo
 
+# ---- host-identity guard: never run another machine's workers on this box ----
+# A box declares its OWN fleet label in APPLYPILOT_FLEET_LABEL (home/m2/m4). Running this
+# agent with a foreign -Label (e.g. `-Label m2` on the HOME box) would reconcile+spawn that
+# machine's workers HERE -- the live 2026-07-04 incident where home's desired=0 yet 4 m2
+# (TARPON) workers ran on the home box. If this box is labeled and disagrees, refuse to start.
+# Unset label = unknown identity = permissive (back-compat for not-yet-labeled boxes).
+$boxLabel = "$env:APPLYPILOT_FLEET_LABEL".Trim()
+if ($boxLabel -and ($boxLabel -ne $Label)) {
+  throw "[fleet-agent:$Label] host-identity guard: this box is '$boxLabel' but the agent was started with -Label '$Label'. Refusing to spawn another machine's workers here (e.g. m2/TARPON workers must never run on the home box). Re-run with -Label $boxLabel, or start this agent on the '$Label' box."
+}
+
 $py = $null
 foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) { if (Test-Path $d) { $py = (Resolve-Path $d).Path; break } }
 if (-not $py) { throw "python not found (.conda-env or .venv) -- run the box setup first." }

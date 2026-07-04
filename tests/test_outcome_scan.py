@@ -184,3 +184,52 @@ def test_scan_outcomes_default_fetch_routes_through_mail_source(tmp_path, monkey
     assert row["stage"] == "rejected"
     assert row["outcome"] == "rejected"
     assert row["sender_domain"] == "acme.com"
+
+
+def test_position_filled_scan_stamps_liveness_on_attributed_match(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed_applied_job(conn)
+    row_msg = {
+        "message_id": "filled-1", "thread_id": "t-filled",
+        "subject": "Position no longer available",
+        "sender": "careers@acme.com",
+        "date": "Wed, 03 Jun 2026 10:00:00 +0000",
+        "body": "This role has been filled.",
+    }
+    reply = '{"stage":"position_filled","outcome":"position_filled","reason":"role closed","title":"Quant Analyst","company":"Acme","confidence":"high"}'
+    counts = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: [row_msg], conn=conn)
+    assert counts["inserted"] == 1
+    job = conn.execute("SELECT liveness_status, liveness_reason FROM jobs WHERE url='https://boards.greenhouse.io/acme/jobs/1'").fetchone()
+    assert job["liveness_status"] == "dead"
+    assert job["liveness_reason"] == "email_position_filled"
+
+
+def test_position_filled_scan_does_not_stamp_if_unmatched_or_needs_review(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed_applied_job(conn)
+    mismatch_msg = {
+        "message_id": "filled-2", "thread_id": "t-filled",
+        "subject": "Update on your application",
+        "sender": "other@other.com",
+        "date": "Wed, 03 Jun 2026 10:00:00 +0000",
+        "body": "This position has been filled.",
+    }
+    reply = '{"stage":"position_filled","outcome":"position_filled","reason":"role closed","title":null,"company":null,"confidence":"high"}'
+    # needs_review path from temporal guard:
+    stale_msg = {
+        "message_id": "filled-3", "thread_id": "t-filled",
+        "subject": "Update on your application to Acme",
+        "sender": "careers@acme.com",
+        "date": "Sat, 20 Jun 2026 12:00:00 +0000",
+        "body": "Position no longer available.",
+    }
+    conn.execute(
+        "UPDATE jobs SET applied_at='2026-06-28T12:00:00+00:00' WHERE url='https://boards.greenhouse.io/acme/jobs/1'"
+    )
+    conn.commit()
+    counts = S.scan_outcomes(client=FakeClient(reply), fetch_messages=lambda: [mismatch_msg, stale_msg], conn=conn, concurrency=1)
+    assert counts["inserted"] == 2
+    assert counts["needs_review"] == 1
+    job = conn.execute("SELECT liveness_status, liveness_reason FROM jobs WHERE url='https://boards.greenhouse.io/acme/jobs/1'").fetchone()
+    assert job["liveness_status"] is None
+    assert job["liveness_reason"] is None

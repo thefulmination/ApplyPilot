@@ -221,6 +221,14 @@ class TestConditionalRejectionIsNotRejection:
         )
         assert outcome == "rejected"
 
+    def test_position_filled_is_distinct_from_rejection(self):
+        outcome, _, _ = classify_email_outcome(
+            subject="Update on your application",
+            body="Great momentum, but the position has been filled. We will keep your resume on file.",
+            sender="recruiting@initech.com",
+        )
+        assert outcome == "position_filled"
+
 
 class TestAtsMailDomains:
     """ATS platforms send from *-mail.* subdomains (greenhouse-mail.io, teamtailor-mail

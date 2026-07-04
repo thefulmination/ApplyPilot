@@ -25,8 +25,9 @@ from urllib.parse import urlsplit
 
 import pandas as pd
 
-from applypilot import config
+from applypilot import config, database
 from applypilot.apply import pgqueue
+from applypilot.database import THIN_DESCRIPTION_CHARS
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import queue as _queue
 from applypilot.discovery.jobspy import store_jobspy_results
@@ -39,15 +40,17 @@ from applypilot.discovery.jobspy import store_jobspy_results
 # Eligibility mirrors fleet_sync._PUSH_SELECT (the offsite-apply predicate, S2/S9.3):
 #   not a dedup duplicate; score floor on COALESCE(audit_score, fit_score); not dead;
 #   not already applied/in-flight; a real http(s) offsite (non-LinkedIn) target.
+#   The research score lane stays opt-in for apply staging via ``include_research``.
 # crash_unconfirmed / no_confirmation are EXCLUDED (v1 parity): a posting that may
 # already have been submitted under the user's name must never be re-pushed/re-applied.
 _PUSH_APPLY_SELECT = """
 SELECT url, company, title, application_url,
-       CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
+       CAST({score_expr} AS REAL) AS score
 FROM jobs
 WHERE duplicate_of_url IS NULL
-  AND COALESCE(audit_score, fit_score) >= ?
+  AND {score_expr} >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
   AND application_url LIKE 'http%'
@@ -138,6 +141,7 @@ def push_apply_eligible(
     score_floor: int = 7,
     approved_batch: str | None = None,
     limit: int | None = None,
+    include_research: bool = False,
 ) -> int:
     """Push approved offsite-eligible jobs from the brain into ``apply_queue`` (idempotent).
 
@@ -153,7 +157,16 @@ def push_apply_eligible(
         # Build the eligibility SQL; append the ledger cross-check when the home brain
         # has an applications table (the check is a no-op on minimal test fixtures).
         company_blocklist, company_params = _company_blocklist_sql()
-        base_sql = _PUSH_APPLY_SELECT.format(company_blocklist=company_blocklist)
+        score_expr = (
+            "COALESCE(audit_score, fit_score, research_fit_score)"
+            if include_research
+            else "COALESCE(audit_score, fit_score)"
+        )
+        base_sql = _PUSH_APPLY_SELECT.format(
+            score_expr=score_expr,
+            company_blocklist=company_blocklist,
+            thin_description_chars=THIN_DESCRIPTION_CHARS,
+        )
         if _applications_table_exists(sq):
             # Inject the cross-check before the ORDER BY clause.
             base_sql = base_sql.replace(
@@ -311,6 +324,7 @@ FROM jobs
 WHERE duplicate_of_url IS NULL
   AND COALESCE(audit_score, fit_score) >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
   AND TRIM(COALESCE(company, '')) != ''
@@ -357,6 +371,7 @@ def push_linkedin_eligible(
         sql = _PUSH_LINKEDIN_SELECT.format(
             company_blocklist=company_blocklist,
             recency=recency,
+            thin_description_chars=THIN_DESCRIPTION_CHARS,
         )
         params.extend(company_params)
         params.extend(recency_params)
@@ -694,5 +709,9 @@ def _home_conn() -> sqlite3.Connection:
     """Open an isolated connection to the authoritative home SQLite (not the app's shared
     singleton, so the sync never contends with a live run's connection)."""
     conn = sqlite3.connect(str(config.DB_PATH), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.row_factory = sqlite3.Row
+    database.ensure_columns(conn)
+    database.ensure_job_indexes(conn)
     return conn

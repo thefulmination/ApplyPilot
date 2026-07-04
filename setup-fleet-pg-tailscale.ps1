@@ -47,7 +47,7 @@ $env:APPLYPILOT_SUPER_DSN = $SuperDsn
 if ($LASTEXITCODE -ne 0) { throw "role creation failed" }
 
 # 2. pg_hba.conf: tailnet-only rule (idempotent append).
-$hba = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW hba_file'); print(cur.fetchone()[0]); conn.close()").Trim()
+$hba = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW hba_file'); row = cur.fetchone(); print(row['hba_file']); conn.close()").Trim()
 if ($LASTEXITCODE -ne 0 -or -not $hba) { throw "could not read hba_file location from Postgres (is the local superuser DSN working?)" }
 $rule = "host    $Db    $Role    $TailnetCidr    scram-sha-256"
 $hbaText = Get-Content $hba -Raw
@@ -62,7 +62,7 @@ if ($hbaText -notmatch $rulePattern) {
 if ($LASTEXITCODE -ne 0) { throw "pg_reload_conf() failed (could not reload Postgres config)" }
 
 # 3. listen_addresses must cover the tailnet interface ('*' does).
-$listen = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW listen_addresses'); print(cur.fetchone()[0]); conn.close()").Trim()
+$listen = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW listen_addresses'); row = cur.fetchone(); print(row['listen_addresses']); conn.close()").Trim()
 if ($LASTEXITCODE -ne 0 -or -not $listen) { throw "could not read listen_addresses from Postgres (is the local superuser DSN working?)" }
 if ($listen -ne "*" -and $listen -notmatch [regex]::Escape($tsIp)) {
   Write-Warning "listen_addresses='$listen' does not cover $tsIp. Edit postgresql.conf to 'listen_addresses = ''*''' (or add $tsIp) and RESTART the PostgreSQL service."

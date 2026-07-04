@@ -758,17 +758,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     eff2 = "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END)"
                     tenant_clause = f"AND {eff2} LIKE ?"
                     params.append(f"%{tenant_scope}%")
-                # Optional freshness filter: skip very-stale postings (discovered_at older
-                # than APPLYPILOT_MAX_JOB_AGE_DAYS) that aren't liveness-confirmed -- they
-                # have a much higher expired-on-visit rate, so applying to them wastes a
-                # Chrome launch + agent run. 0 (default) = off, so normal runs are
-                # unaffected; liveness_status='live' rows are kept regardless of age, and
-                # rows with no discovered_at are kept (unknown age, don't penalize).
+                # Optional freshness filter: skip stale postings (posted/discovered timestamp)
+                # older than APPLYPILOT_MAX_JOB_AGE_DAYS that aren't liveness-confirmed.
+                # The value is now default-on for safety; 0 explicitly disables.
                 fresh_clause = ""
-                _max_age = int(os.environ.get("APPLYPILOT_MAX_JOB_AGE_DAYS") or 0)
+                _raw_age = os.environ.get("APPLYPILOT_MAX_JOB_AGE_DAYS")
+                _max_age = 45 if not _raw_age else int(_raw_age)
                 if _max_age > 0:
                     _cut = (datetime.now(timezone.utc) - timedelta(days=_max_age)).isoformat()
-                    fresh_clause = ("AND (discovered_at IS NULL OR discovered_at >= ? "
+                    fresh_clause = ("AND (COALESCE(posted_at, discovered_at) IS NULL OR "
+                                    "COALESCE(posted_at, discovered_at) >= ? "
                                     "OR COALESCE(liveness_status, '') = 'live')")
                     params.append(_cut)
                 # Lane filter (off-lane drift guard): the ORDER BY ranks on-lane roles
@@ -854,6 +853,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                                OR audit_flags LIKE '%"operations_leadership"%') DESC,
                              role_fit_score DESC,
                              (COALESCE(liveness_status, '') = 'live') DESC,
+                             COALESCE(discovered_at, posted_at) DESC,
+                             COALESCE(posted_at, discovered_at) DESC,
                              fit_score DESC, url
                     LIMIT 1
                 """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
@@ -1048,10 +1049,10 @@ def mark_result(url: str, status: str, error: str | None = None,
 
 def _preflight_liveness_enabled() -> bool:
     """Whether to HTTP-probe each candidate for closure before launching Chrome.
-    Off by default (adds a per-job request); the supervised/production run turns it
-    on via APPLYPILOT_PREFLIGHT_LIVENESS=1 to avoid burning launches on dead postings."""
-    return os.environ.get("APPLYPILOT_PREFLIGHT_LIVENESS", "").strip().lower() in (
-        "1", "true", "yes", "on")
+    On by default; callers can set APPLYPILOT_PREFLIGHT_LIVENESS to 0/false/no/off
+    to disable the additional network probe."""
+    return os.environ.get("APPLYPILOT_PREFLIGHT_LIVENESS", "").strip().lower() not in (
+        "0", "false", "no", "off")
 
 
 def _stamp_liveness_dead(url: str, reason: str) -> None:

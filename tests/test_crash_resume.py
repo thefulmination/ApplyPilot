@@ -15,9 +15,10 @@ def _insert_job(conn: sqlite3.Connection, url: str, title: str, *, scored: bool 
             url, title, site, location, description, full_description,
             fit_score, scored_at
         )
-        VALUES (?, ?, 'TestCo', 'Remote', 'Short description', 'Full job description', ?, ?)
+        VALUES (?, ?, 'TestCo', 'Remote', 'Short description', ?, ?, ?)
         """,
-        (url, title, 7 if scored else None, "2026-05-07T00:00:00+00:00" if scored else None),
+        (url, title, "Full job description " * 20,
+         7 if scored else None, "2026-05-07T00:00:00+00:00" if scored else None),
     )
     conn.commit()
 

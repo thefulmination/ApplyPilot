@@ -368,7 +368,7 @@ def _store_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
     for job in jobs:
         status = insert_discovered_job(
             conn,
-            {**job, "detail_scraped_at": now if job.get("full_description") else None},
+            {**job, "detail_scraped_at": None},
             site=job.get("company") or "HiringCafe",
             strategy="hiringcafe_next_data",
             source_board="hiringcafe",

@@ -26,6 +26,8 @@ def conn(tmp_path, monkeypatch):
 
 def test_preflight_enabled_reads_env(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_PREFLIGHT_LIVENESS", raising=False)
+    assert L._preflight_liveness_enabled() is True
+    monkeypatch.setenv("APPLYPILOT_PREFLIGHT_LIVENESS", "0")
     assert L._preflight_liveness_enabled() is False
     monkeypatch.setenv("APPLYPILOT_PREFLIGHT_LIVENESS", "on")
     assert L._preflight_liveness_enabled() is True

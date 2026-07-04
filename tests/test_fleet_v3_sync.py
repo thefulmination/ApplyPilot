@@ -45,7 +45,8 @@ def _home_sqlite(tmp_path):
 
 
 def _add_job(conn, url, **kw):
-    cols = {"url": url, "application_url": url, "audit_score": 8.0, "liveness_status": "live"}
+    cols = {"url": url, "application_url": url, "audit_score": 8.0,
+            "liveness_status": "live", "full_description": "x" * 600}
     cols.update(kw)
     conn.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                  list(cols.values()))
@@ -67,6 +68,8 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
              company="X", title="Analyst", apply_status="in_progress")        # in-flight -> skip
     _add_job(sq, "https://boards.greenhouse.io/y/jobs/4",
              company="Y", title="PM", audit_score=5.0)                        # below floor -> skip
+    _add_job(sq, "https://boards.greenhouse.io/thin/jobs/7",
+             company="Thin", title="PM", full_description="x" * 499)           # too thin -> skip
     _add_job(sq, "https://boards.greenhouse.io/z/jobs/5",
              company="Z", title="Eng", audit_score=9.0,
              liveness_status="dead")                                          # dead -> skip
@@ -95,6 +98,29 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"]
     from applypilot.fleet import dedup
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
+
+
+def test_push_apply_eligible_can_opt_into_research_scores(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/research/jobs/1",
+             company="Research Co", title="Strategy Lead",
+             audit_score=None, fit_score=None, research_fit_score=8.0)
+
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A"
+        ) == 0
+        assert sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A",
+            include_research=True,
+        ) == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url, score FROM apply_queue")
+            rows = cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["url"].endswith("/research/jobs/1")
+    assert float(rows[0]["score"]) == 8.0
 
 
 def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):

@@ -35,7 +35,7 @@ liveness of apply-eligible jobs so dead postings are filtered before the ApplyCy
 ### B. ApplyCycle scheduled task (home, every 4h) — the autonomous loop
 A wrapper that runs, in sequence, the existing `applypilot-fleet-apply-home` subcommands against
 the live PG:
-1. `push --score-floor 7` — move fresh live gate-passers (offsite, score≥7) into `apply_queue`.
+1. `push --score-floor 7 --include-research` — move fresh live gate-passers (offsite, canonical or fleet research score≥7) into `apply_queue`.
 2. `approve --all-pushed` — stamp `approved_batch` so they are leasable (push alone does NOT).
 3. Ensure the canary is NOT the blocker: `lift-canary` (owner chose spend-cap-only, so the
    canary one-time gate is disabled; the rolling daily cap is the throttle).

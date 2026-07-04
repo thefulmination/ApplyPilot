@@ -9,6 +9,8 @@ single-account mutex (R1).
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import urllib.parse as _urlparse
 
 from applypilot import config
@@ -31,7 +33,7 @@ from applypilot.fleet import governor
 # ---------------------------------------------------------------------------
 _LEASE_APPLY = """
 WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
-     home AS (SELECT count_24h, daily_cap, breaker_state FROM rate_governor WHERE scope_key = %(home_scope)s),
+     home AS (SELECT count_24h, daily_cap, breaker_state, breaker_until FROM rate_governor WHERE scope_key = %(home_scope)s),
      glob AS (SELECT count_24h, daily_cap FROM rate_governor WHERE scope_key = 'global'),
      next_job AS (
        SELECT q.url
@@ -50,9 +52,11 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_
          AND (COALESCE(cfg.spend_cap_usd, 0) <= 0
               OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
          AND (glob.count_24h IS NULL OR glob.count_24h < glob.daily_cap)
-         AND COALESCE(home.breaker_state, 'ok') NOT IN ('paused','demoted')
+         AND COALESCE(home.breaker_state, 'ok') != 'demoted'
+         AND COALESCE(NOT (home.breaker_state = 'paused' AND COALESCE(home.breaker_until, 'infinity'::timestamptz) >= now()), TRUE)
          AND (home.count_24h IS NULL OR home.count_24h < home.daily_cap)
-         AND COALESCE(g.breaker_state, 'ok') NOT IN ('paused','demoted')
+         AND COALESCE(g.breaker_state, 'ok') != 'demoted'
+         AND COALESCE(NOT (g.breaker_state = 'paused' AND COALESCE(g.breaker_until, 'infinity'::timestamptz) >= now()), TRUE)
          AND COALESCE(g.count_24h, 0) < COALESCE(g.daily_cap, 2000000000)
          -- H6: the Doctor's host_skip is a self-expiring lease FILTER (doctor_skip_until),
          -- NOT an approved_batch=NULL un-approve -- so vetted owner approval is preserved and
@@ -377,7 +381,8 @@ WITH next AS (
   SELECT s.task_id FROM search_tasks s
   LEFT JOIN rate_governor g ON g.scope_key = 'board:' || s.board
   WHERE s.status='queued' AND s.enabled AND s.next_due_at <= now()
-    AND COALESCE(g.breaker_state, 'ok') NOT IN ('paused','demoted')
+    AND COALESCE(g.breaker_state, 'ok') != 'demoted'
+    AND COALESCE(NOT (g.breaker_state = 'paused' AND COALESCE(g.breaker_until, 'infinity'::timestamptz) >= now()), TRUE)
     AND COALESCE(g.count_24h, 0) < COALESCE(g.daily_cap, 2000000000)
     AND (COALESCE(g.last_applied_at, g.last_attempt_at) IS NULL
          OR COALESCE(g.last_applied_at, g.last_attempt_at) < now()
@@ -450,7 +455,7 @@ def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, err
 _LEASE_LINKEDIN = """
 WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM fleet_config WHERE id=1 FOR UPDATE),
      acct AS (
-       SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state, halted_until
+       SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state, breaker_until, halted_until
        FROM rate_governor WHERE scope_key = 'account:linkedin' FOR UPDATE
      ),
      next AS (
@@ -459,7 +464,8 @@ WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM flee
          AND (NOT COALESCE(cfg.linkedin_canary_enabled, FALSE) OR cfg.linkedin_canary_remaining > 0)
          AND (a.halted_until IS NULL OR a.halted_until < now())
          AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
-         AND COALESCE(a.breaker_state, 'ok') NOT IN ('paused','demoted')
+         AND COALESCE(a.breaker_state, 'ok') != 'demoted'
+         AND COALESCE(NOT (a.breaker_state = 'paused' AND COALESCE(a.breaker_until, 'infinity'::timestamptz) >= now()), TRUE)
          AND (a.last_applied_at IS NULL OR a.last_applied_at < now() - make_interval(secs => COALESCE(a.min_gap_seconds, 1200)))
          AND NOT (
            LOWER(TRIM(COALESCE(q.company,''))) = ANY(%(blocked_names)s)
@@ -552,6 +558,16 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
 # ---------------------------------------------------------------------------
 # DISCOVERY staging -- lean workers push raw JobSpy postings here; home box ingests.
 # ---------------------------------------------------------------------------
+def _json_safe(value):
+    if isinstance(value, numbers.Real) and not math.isfinite(float(value)):
+        return None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def push_discovered(conn, *, task_id, source_label, worker_id, postings, commit=True) -> int:
     """Stage raw JobSpy postings (dicts) from a discovery worker into discovered_postings.
     The home box later ingests them into the brain (sync.pull_discovered)."""
@@ -561,7 +577,7 @@ def push_discovered(conn, *, task_id, source_label, worker_id, postings, commit=
             cur.execute(
                 "INSERT INTO discovered_postings (task_id, source_label, posting, worker_id) "
                 "VALUES (%s,%s,%s,%s)",
-                (task_id, source_label, json.dumps(p, default=str), worker_id),
+                (task_id, source_label, json.dumps(_json_safe(p), default=str, allow_nan=False), worker_id),
             )
             n += 1
     if commit:

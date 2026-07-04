@@ -19,6 +19,7 @@ from typing import Any
 from applypilot import config
 from applypilot.apply import pgqueue
 from applypilot.apply.launcher import _apply_target, _throttle_host
+from applypilot.database import THIN_DESCRIPTION_CHARS
 
 # Blocked sites/patterns loaded once at import (mirrors acquire_job in launcher.py).
 _BLOCKED_SITES, _BLOCKED_PATTERNS = config.load_blocked_sites()
@@ -33,6 +34,7 @@ FROM jobs
 WHERE duplicate_of_url IS NULL
   AND COALESCE(audit_score, fit_score) >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress'))
   -- offsite ATS only: a real http(s) target, never LinkedIn (no cookies offsite)
   AND application_url LIKE 'http%'
@@ -91,7 +93,8 @@ def push_offsite_jobs(
     pg = pg_conn or pgqueue.connect()
     try:
         out: list[dict[str, Any]] = []
-        for r in sq.execute(_PUSH_SELECT, (score_floor,)).fetchall():
+        sql = _PUSH_SELECT.format(thin_description_chars=THIN_DESCRIPTION_CHARS)
+        for r in sq.execute(sql, (score_floor,)).fetchall():
             if not _eligible(r):
                 continue
             out.append({

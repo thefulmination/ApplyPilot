@@ -16,7 +16,8 @@ def _home_sqlite(tmp_path):
     conn.row_factory = sqlite3.Row
     conn.executescript(
         "CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT, "
-        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, liveness_status TEXT, duplicate_of_url TEXT);"
+        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, full_description TEXT, "
+        "liveness_status TEXT, duplicate_of_url TEXT);"
         "CREATE TABLE applications (job_url TEXT, application_url TEXT, status TEXT);")
     return conn
 
@@ -180,7 +181,8 @@ def test_push_home_invokes_push_inbox_outcomes(fleet_db, tmp_path, monkeypatch):
     sq.row_factory = sqlite3.Row
     sq.executescript(
         "CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT, "
-        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, liveness_status TEXT, duplicate_of_url TEXT);"
+        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, full_description TEXT, "
+        "liveness_status TEXT, duplicate_of_url TEXT);"
         "CREATE TABLE email_events(message_id TEXT PRIMARY KEY, job_url TEXT, occurred_at TEXT, "
         "sender_domain TEXT, stage TEXT, outcome TEXT, title TEXT, company TEXT, confidence TEXT);"
     )
@@ -208,7 +210,8 @@ def test_push_home_survives_inbox_outcomes_failure(fleet_db, tmp_path, monkeypat
     sq.row_factory = sqlite3.Row
     sq.executescript(
         "CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT, "
-        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, liveness_status TEXT, duplicate_of_url TEXT);"
+        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, full_description TEXT, "
+        "liveness_status TEXT, duplicate_of_url TEXT);"
     )
     sq.commit()
 

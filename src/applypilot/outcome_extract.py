@@ -10,20 +10,23 @@ from dataclasses import dataclass
 
 from applypilot.gmail_outcomes import classify_email_outcome
 
-STAGES = ("acknowledged", "screen", "assessment", "interview", "offer", "rejected", "other")
-_OUTCOMES = ("offer", "rejected")
+STAGES = (
+    "acknowledged", "screen", "assessment", "interview", "offer", "rejected", "position_filled", "other"
+)
+_OUTCOMES = ("offer", "rejected", "position_filled")
 _CONFIDENCE = ("high", "medium", "low")
 
 # classify_email_outcome label -> our stage vocabulary
 _HEURISTIC_STAGE = {
     "offer": "offer", "interview": "interview", "rejected": "rejected",
+    "position_filled": "position_filled",
     "acknowledged": "acknowledged", "ambiguous": "other", "not_job": "other",
 }
 
 _SYSTEM = (
     "You read one recruiting email about a job application and return STRICT JSON only. "
-    "Fields: stage (one of acknowledged, screen, assessment, interview, offer, rejected, other), "
-    "outcome (offer, rejected, or null), reason (short plain-text reason for a rejection/offer or null), "
+    "Fields: stage (one of acknowledged, screen, assessment, interview, offer, rejected, position_filled, other), "
+    "outcome (offer, rejected, position_filled, or null), reason (short plain-text reason for a rejection/offer or null), "
     "title (the job title or null), company (the company or null), confidence (high, medium, low). "
     "acknowledged = an application-received receipt. screen = recruiter screen. assessment = a test/HackerRank. "
     "Return ONLY the JSON object, no prose."

@@ -404,6 +404,39 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
     return counts
 
 
+def enforce_host_identity(machine_owner, *, env=None) -> None:
+    """Refuse to run a worker that belongs to a DIFFERENT machine than this box.
+
+    Each box declares its own fleet identity in APPLYPILOT_FLEET_LABEL (set once per box:
+    'home', 'm2', 'm4'); --machine-owner names WHICH machine's slots a worker fills. If a
+    labeled box is asked to run another machine's workers -- e.g. a `-Label m2` agent
+    started on the HOME box -- the workers physically run on the wrong host (the live
+    2026-07-04 "TARPON/m2 workers spawned on the home box" incident, where home's own
+    desired count is 0). When the box is labeled and the two disagree, refuse to start.
+
+    Backward-compatible: an unset/blank APPLYPILOT_FLEET_LABEL means the box identity is
+    unknown, so we cannot guard -- allow (with a warning) rather than break as-yet
+    unlabeled boxes.
+    """
+    env = os.environ if env is None else env
+    box = (env.get("APPLYPILOT_FLEET_LABEL") or "").strip()
+    owner = (machine_owner or "").strip()
+    if not box:
+        logger.warning(
+            "APPLYPILOT_FLEET_LABEL is not set on this box; host-identity guard is OFF "
+            "(set it to this machine's fleet label -- home/m2/m4 -- to refuse cross-host "
+            "worker spawns)."
+        )
+        return
+    if owner and owner.lower() != box.lower():
+        raise SystemExit(
+            f"host-identity guard: this box is '{box}' but was asked to run "
+            f"machine-owner '{owner}' workers -- refusing cross-host spawn. "
+            f"(e.g. m2/TARPON workers must never run on the home box.) Start this "
+            f"agent/worker on the '{owner}' box, or correct the label to '{box}'."
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="applypilot-fleet-apply")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
@@ -431,6 +464,9 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     args = build_parser().parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
+    # Defense-in-depth: refuse to physically host another machine's workers (the fleet-agent
+    # / run-fleet-worker launchers early-reject too, but this backstops manual + SSH launches).
+    enforce_host_identity(args.machine_owner)
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
     from applypilot.fleet.agent_switch import AgentSwitcher

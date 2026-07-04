@@ -48,7 +48,8 @@ def _iso(days_ago: int) -> str:
 def _add_li(conn, url, **kw):
     """Insert a LinkedIn job (effective host linkedin.com) with sane defaults."""
     cols = {"url": url, "application_url": url, "company": "Acme", "title": "Chief of Staff",
-            "audit_score": 9.0, "liveness_status": "uncertain", "discovered_at": _iso(1)}
+            "audit_score": 9.0, "liveness_status": "uncertain", "discovered_at": _iso(1),
+            "full_description": "x" * 600}
     cols.update(kw)
     conn.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                  list(cols.values()))
@@ -70,6 +71,16 @@ def test_push_linkedin_pushes_clean_eligible(fleet_db, tmp_path):
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
         assert n == 1
         assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/1"}
+
+
+def test_push_linkedin_excludes_thin_description(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_li(sq, "https://www.linkedin.com/jobs/view/ok", full_description="x" * 600)
+    _add_li(sq, "https://www.linkedin.com/jobs/view/thin", full_description="x" * 499)
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
+        assert n == 1
+        assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/ok"}
 
 
 # --- Issue 2: null/empty company or title is unapplyable + over-dedups ------
@@ -132,9 +143,9 @@ def test_push_linkedin_uses_url_when_application_url_null(fleet_db, tmp_path):
     # Common from scraping: the linkedin link is the primary `url`, application_url is NULL.
     # Eligibility matches (effective host = url), but linkedin_queue.application_url is NOT NULL,
     # so the push must stage the EFFECTIVE url, not the raw NULL.
-    sq.execute("INSERT INTO jobs (url, application_url, company, title, audit_score, discovered_at) "
-               "VALUES (?,?,?,?,?,?)",
-               ("https://www.linkedin.com/jobs/view/999", None, "Acme", "COS", 9.0, _iso(1)))
+    sq.execute("INSERT INTO jobs (url, application_url, company, title, audit_score, discovered_at, full_description) "
+               "VALUES (?,?,?,?,?,?,?)",
+               ("https://www.linkedin.com/jobs/view/999", None, "Acme", "COS", 9.0, _iso(1), "x" * 600))
     sq.commit()
     with pgqueue.connect(fleet_db) as pg:
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)

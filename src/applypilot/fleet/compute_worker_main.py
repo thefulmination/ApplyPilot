@@ -76,11 +76,20 @@ def main(argv=None) -> int:
     while True:  # pragma: no cover
         try:
             res = loop.run_once()
-        except Exception:
+        except Exception as exc:
+            try:
+                import traceback
+                tb = traceback.format_exc()
+                loop._last_error = tb[:4000]
+                loop._record_event(f"ERROR: {exc}")
+                with pgqueue.connect(args.dsn) as conn:
+                    loop._beat(conn, state="error")
+            except Exception:
+                pass
             res = {"action": "error"}
         if res.get("action") == "stop":
             return 0  # remote restart/drain: exit between jobs; supervisor respawns
-        if res.get("action") in ("idle", "paused"):
+        if res.get("action") in ("idle", "paused", "error"):
             time.sleep(5.0)
         iteration += 1
         if iteration % _VERSION_CHECK_INTERVAL == 0:

@@ -51,7 +51,7 @@ the home box already submitted, then push eligible jobs into `apply_queue`:
 applypilot-fleet-apply-home --dsn $FLEET_PG_DSN pull
 
 # Push eligible jobs (score >= 7, status queued in brain, not in applied_set)
-applypilot-fleet-apply-home --dsn $FLEET_PG_DSN push --score-floor 7
+applypilot-fleet-apply-home --dsn $FLEET_PG_DSN push --score-floor 7 --include-research
 ```
 
 Verify the queue depth:
@@ -211,7 +211,7 @@ warning — they simply stop leasing.
 | Goal | Command |
 |------|---------|
 | Seed applied_set + sync results home | `apply-home pull` |
-| Push eligible jobs to PG | `apply-home push [--score-floor N] [--limit N]` |
+| Push eligible jobs to PG | `apply-home push [--score-floor N] [--limit N] [--include-research]` |
 | Arm canary | `apply-home canary <K>` |
 | Approve current batch | `apply-home approve --all-pushed` |
 | Start apply worker | `applypilot-fleet-apply --dsn ... --worker-id ... --home-ip ...` |

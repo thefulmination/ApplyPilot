@@ -54,6 +54,7 @@ CLOSED_PATTERNS = [
 ]
 CLOSED_RE = re.compile("|".join(re.escape(p) for p in CLOSED_PATTERNS), re.I)
 VALID_THROUGH_RE = re.compile(r'"validThrough"\s*:\s*"([^"]+)"')
+DATE_POSTED_RE = re.compile(r'"datePosted"\s*:\s*"([^"]+)"')
 
 SPA_HOSTS = {"eightfold.ai", "oraclecloud.com", "careerpuck.com", "siriusxm.com",
              "icims.com", "avature.net"}
@@ -143,7 +144,13 @@ def _fetch(url: str, accept: str | None = None) -> tuple[int, str, str]:
         _THROTTLE.release(h)
 
 
-def _classify_body(status: int, final_url: str, body: str) -> tuple[str, str]:
+def _classify_body(
+    status: int,
+    final_url: str,
+    body: str,
+    *,
+    meta: dict[str, str | None] | None = None,
+) -> tuple[str, str]:
     if status in (404, 410):
         return DEAD, f"http_{status}"
     if status in (401, 403, 429, 999):
@@ -155,6 +162,10 @@ def _classify_body(status: int, final_url: str, body: str) -> tuple[str, str]:
     m = CLOSED_RE.search(body)
     if m:
         return DEAD, f"text:{m.group(0)[:40]!r}"
+    if meta is not None:
+        dp = DATE_POSTED_RE.search(body)
+        if dp and not meta.get("posted_at"):
+            meta["posted_at"] = dp.group(1).strip()
     vt = VALID_THROUGH_RE.search(body)
     if vt:
         try:
@@ -170,18 +181,22 @@ def _classify_body(status: int, final_url: str, body: str) -> tuple[str, str]:
                 return DEAD, f"jsonld_validThrough_{vt.group(1)[:10]}"
         except Exception:
             pass
+    if meta is not None and not meta.get("valid_through"):
+        vt = VALID_THROUGH_RE.search(body)
+        if vt:
+            meta["valid_through"] = vt.group(1).strip()
     if base_host(host_of(final_url)) in SPA_HOSTS and len(body) < 1500:
         return UNCERTAIN, "spa_shell"
     return LIVE, "ok_200"
 
 
-def _greenhouse(url: str) -> tuple[str, str]:
+def _greenhouse(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
     host = host_of(url)
     if host == "grnh.se":
         st, final, body = _fetch(url)
         if host_of(final) != "grnh.se":
-            return _dispatch(final)
-        return _classify_body(st, final, body)
+            return _dispatch(final, meta=meta)
+        return _classify_body(st, final, body, meta=meta)
     p = urllib.parse.urlparse(url)
     parts = [x for x in p.path.split("/") if x]
     qs = urllib.parse.parse_qs(p.query)
@@ -193,7 +208,7 @@ def _greenhouse(url: str) -> tuple[str, str]:
         if i + 1 < len(parts):
             job_id = re.sub(r"\D", "", parts[i + 1]) or parts[i + 1]
     if not token and "gh_jid" in qs:
-        return _classify_body(*_fetch(url))
+        return _classify_body(*_fetch(url), meta=meta)
     if token and job_id:
         api = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{job_id}"
         st, final, body = _fetch(api, accept="application/json")
@@ -205,11 +220,11 @@ def _greenhouse(url: str) -> tuple[str, str]:
             if stl == 200:
                 return DEAD, "gh_api_404"
             return UNCERTAIN, "gh_token_unconfirmed"
-        return _classify_body(st, final, body)
-    return _classify_body(*_fetch(url))
+        return _classify_body(st, final, body, meta=meta)
+    return _classify_body(*_fetch(url), meta=meta)
 
 
-def _lever(url: str) -> tuple[str, str]:
+def _lever(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
     p = urllib.parse.urlparse(url)
     parts = [x for x in p.path.split("/") if x and x != "apply"]
     if len(parts) >= 2:
@@ -223,11 +238,11 @@ def _lever(url: str) -> tuple[str, str]:
             if st2 in (404, 410) or CLOSED_RE.search(body2):
                 return DEAD, "lever_api_404+page"
             return UNCERTAIN, "lever_api404_page200"
-        return _classify_body(st, final, body)
-    return _classify_body(*_fetch(url))
+        return _classify_body(st, final, body, meta=meta)
+    return _classify_body(*_fetch(url), meta=meta)
 
 
-def _ashby(url: str) -> tuple[str, str]:
+def _ashby(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
     p = urllib.parse.urlparse(url)
     parts = [x for x in p.path.split("/") if x]
     if len(parts) >= 2:
@@ -251,11 +266,11 @@ def _ashby(url: str) -> tuple[str, str]:
             if st2 in (404, 410) or CLOSED_RE.search(body2):
                 return DEAD, "ashby_board404+page_gone"
             return UNCERTAIN, "ashby_board404_page200"
-        return _classify_body(st, final, body)
-    return _classify_body(*_fetch(url))
+        return _classify_body(st, final, body, meta=meta)
+    return _classify_body(*_fetch(url), meta=meta)
 
 
-def _workday(url: str) -> tuple[str, str]:
+def _workday(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
     p = urllib.parse.urlparse(url)
     host = host_of(url)
     tenant = host.split(".")[0]
@@ -277,23 +292,23 @@ def _workday(url: str) -> tuple[str, str]:
     return UNCERTAIN, "workday_unparsed"
 
 
-def _dispatch(url: str) -> tuple[str, str]:
+def _dispatch(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
     host = host_of(url)
     if base_host(host) in BLOCKED_HOSTS:
         return UNCERTAIN, "blocked_host_policy"
     if (host in ("boards.greenhouse.io", "job-boards.greenhouse.io", "grnh.se")
             or "gh_jid" in (urllib.parse.urlparse(url).query or "")):
-        return _greenhouse(url)
+        return _greenhouse(url, meta=meta)
     if host == "jobs.lever.co":
-        return _lever(url)
+        return _lever(url, meta=meta)
     if host == "jobs.ashbyhq.com":
-        return _ashby(url)
+        return _ashby(url, meta=meta)
     if host.endswith("myworkdayjobs.com"):
-        return _workday(url)
-    return _classify_body(*_fetch(url))
+        return _workday(url, meta=meta)
+    return _classify_body(*_fetch(url), meta=meta)
 
 
-def probe_url(url: str) -> tuple[str, str]:
+def probe_url(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
     """Return (status, reason) for a single posting URL. Never raises.
 
     status is one of "live" / "dead" / "uncertain". Read-only: issues only
@@ -302,7 +317,7 @@ def probe_url(url: str) -> tuple[str, str]:
     if not url or not url.startswith(("http://", "https://")):
         return UNCERTAIN, "no_http_url"
     try:
-        return _dispatch(url)
+        return _dispatch(url, meta=meta)
     except urllib.error.URLError as e:
         return UNCERTAIN, f"neterr:{getattr(e, 'reason', e)}"[:80]
     except Exception as e:  # never let one URL break a batch
@@ -322,8 +337,8 @@ def is_recent(iso_ts: str | None, max_age_days: int) -> bool:
         return False
 
 
-def verify_jobs(conn, *, tiers=("priority", "recommended"), max_age_days: int = 7,
-                limit: int = 0, workers: int = 16, dry_run: bool = False,
+def verify_jobs(conn, *, tiers=("priority", "recommended"), score_floor: float | None = None,
+                max_age_days: int = 7, limit: int = 0, workers: int = 16, dry_run: bool = False,
                 progress=None) -> dict:
     """Batch-verify posting liveness and stamp the liveness_* columns.
 
@@ -342,16 +357,23 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), max_age_days: int = 
     Returns a summary dict: {checked, by_status, skipped_fresh, candidates, wrote}.
     """
     placeholders = ",".join("?" * len(tiers))
+    floor_clause = ""
+    params: list[object] = list(tiers)
+    if score_floor is not None:
+        floor_clause = " OR COALESCE(audit_score, fit_score) >= ?"
+        params.append(score_floor)
+
     rows = conn.execute(
         f"""SELECT url, application_url, liveness_status, last_verified_live
-              FROM jobs
-             WHERE audit_label IN ({placeholders})
-               AND duplicate_of_url IS NULL
-               AND (application_url LIKE 'http%' OR url LIKE 'http%')""",
-        list(tiers),
+             FROM jobs
+            WHERE (audit_label IN ({placeholders}){floor_clause})
+              AND duplicate_of_url IS NULL
+              AND (application_url LIKE 'http%' OR url LIKE 'http%')
+            ORDER BY (last_verified_live IS NOT NULL), last_verified_live""",
+        params,
     ).fetchall()
 
-    todo = []
+    todo: list[tuple[str, str, dict[str, str | None]]] = []
     skipped_fresh = 0
     for r in rows:
         if max_age_days > 0 and is_recent(r["last_verified_live"], max_age_days):
@@ -363,27 +385,30 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), max_age_days: int = 
         # covered too, not silently left unchecked.
         app = r["application_url"]
         effective = app if (app or "").startswith(("http://", "https://")) else r["url"]
-        todo.append((r["url"], effective))
+        todo.append((r["url"], effective, {}))
     if limit > 0:
         todo = todo[:limit]
 
-    results: list[tuple[str, str, str]] = []
+    results: list[tuple[str, str, str, dict[str, str | None]]] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(probe_url, app): (url, app) for (url, app) in todo}
+        futs = {
+            ex.submit(probe_url, app, meta=meta): (url, app, meta)
+            for (url, app, meta) in todo
+        }
         done = 0
         for fut in as_completed(futs):
-            url, _app = futs[fut]
+            url, _app, meta = futs[fut]
             status, reason = fut.result()
-            results.append((url, status, reason))
+            results.append((url, status, reason, meta))
             done += 1
             if progress and (done % 50 == 0 or done == len(todo)):
                 progress(done, len(todo), results)
 
-    counts = Counter(s for _, s, _ in results)
+    counts = Counter(s for _, s, _, _ in results)
     wrote = 0
+    now = datetime.now(timezone.utc).isoformat()
     if not dry_run:
-        now = datetime.now(timezone.utc).isoformat()
-        for i, (url, status, reason) in enumerate(results):
+        for i, (url, status, reason, meta) in enumerate(results):
             # Transient fetch failures: record the status but leave
             # last_verified_live untouched so the job is re-checked next run.
             transient = reason.startswith(("neterr", "error"))
@@ -394,8 +419,16 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), max_age_days: int = 
             else:
                 conn.execute(
                     "UPDATE jobs SET liveness_status = ?, liveness_reason = ?, "
+                    "posted_at = COALESCE(posted_at, ?), "
+                    "valid_through = COALESCE(valid_through, ?), "
                     "last_verified_live = ? WHERE url = ?",
-                    (status, reason, now, url))
+                    (
+                        status, reason,
+                        (meta.get("posted_at") if meta else None),
+                        (meta.get("valid_through") if meta else None),
+                        now,
+                        url,
+                    ))
             wrote += 1
             if i % 200 == 0:
                 conn.commit()

@@ -21,3 +21,30 @@ def test_score_job_forwards_provider_override(monkeypatch):
     out = scorer.score_job("RESUME", job, provider="gemini")
     assert seen["stage"] == "score" and seen["provider_override"] == "gemini"
     assert out["score"] == 8
+
+
+def test_score_job_uses_company_with_site_fallback(monkeypatch):
+    prompts = []
+
+    class FakeClient:
+        model = "gemini-2.0-flash"
+        provider_name = "gemini"
+
+        def chat(self, *a, **k):
+            prompts.append(a[0][1]["content"])
+            return "SCORE: 8\nKEYWORDS: ops\nVERDICT: Good fit - test\nREASONING: test reasoning"
+
+    monkeypatch.setattr(scorer, "get_client", lambda **_kwargs: FakeClient())
+
+    scorer.score_job("RESUME", {
+        "title": "Chief of Staff", "site": "linkedin", "company": "RealCo",
+        "location": "Remote", "full_description": "x" * 600,
+    })
+    scorer.score_job("RESUME", {
+        "title": "Chief of Staff", "site": "FallbackSite",
+        "location": "Remote", "full_description": "x" * 600,
+    })
+
+    assert "COMPANY: RealCo" in prompts[0]
+    assert "COMPANY: linkedin" not in prompts[0]
+    assert "COMPANY: FallbackSite" in prompts[1]

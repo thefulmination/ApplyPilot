@@ -14,6 +14,7 @@ def _patch_worker_io(monkeypatch, launcher, run_job_result, jobs):
     monkeypatch.setattr(launcher, "launch_chrome", lambda *a, **k: object())
     monkeypatch.setattr(launcher, "cleanup_worker", lambda *a, **k: None)
     monkeypatch.setattr(launcher, "run_job", lambda *a, **k: run_job_result)
+    monkeypatch.setenv("APPLYPILOT_PREFLIGHT_LIVENESS", "0")
 
     def fake_acquire(**kwargs):
         return jobs.pop(0) if jobs else None

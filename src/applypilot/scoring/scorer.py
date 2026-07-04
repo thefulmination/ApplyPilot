@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 # antigravity: python-scorer-integration-v1
 from applypilot import database
 from applypilot.config import RESUME_PATH, load_preference_profile, KNOWLEDGE_GRAPH_PROMPT_PATH
+from applypilot.database import MIN_GOOD_DESCRIPTION_CHARS
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
@@ -65,6 +66,11 @@ REQUIREMENTS_MARKER_RE = re.compile(
 # (a likely schema mismatch with the recommendation engine).
 _PREFERENCE_FIELDS = ("promptSummary", "summary", "positiveSignals",
                       "negativeSignals", "fitMapRules", "examples")
+_RESCORE_QUERY = (
+    "SELECT * FROM jobs WHERE full_description IS NOT NULL "
+    f"AND LENGTH(full_description) >= {MIN_GOOD_DESCRIPTION_CHARS} "
+    "AND duplicate_of_url IS NULL"
+)
 
 
 def _as_list(value) -> list:
@@ -248,7 +254,7 @@ def score_job(
 
     Args:
         resume_text: The candidate's full resume text.
-        job: Job dict with keys: title, site, location, full_description.
+        job: Job dict with keys: title, company/site, location, full_description.
         preference_profile: Human preference calibration data.
         knowledge_graph_prompt: Factual knowledge graph prompt pack.
         provider: Optional LLM provider override.
@@ -258,7 +264,7 @@ def score_job(
     """
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"COMPANY: {job.get('company') or job.get('site') or 'Unknown'}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{select_description(job.get('full_description'))}"
     )
@@ -395,7 +401,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
     conn = get_connection()
 
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL AND duplicate_of_url IS NULL"
+        query = _RESCORE_QUERY
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
