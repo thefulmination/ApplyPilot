@@ -55,6 +55,12 @@ _MAX_PREFERENCE_CHARS = 12000
 # 32k covers the current compact KG pack; +~2.8k input tokens costs about
 # $0.0008/job at the DeepSeek input rate cited in the 2026-07-04 audit.
 _MAX_KNOWLEDGE_GRAPH_CHARS = 32000
+_MAX_DESCRIPTION_CHARS = int(os.getenv("APPLYPILOT_SCORE_DESC_CAP", "15000"))
+DESCRIPTION_TRUNCATION_MARKER = "\n[...TRUNCATED: description exceeded limit...]"
+DESCRIPTION_OMISSION_MARKER = "[...middle of description omitted...]"
+REQUIREMENTS_MARKER_RE = re.compile(
+    r"(?i)(requirements|qualifications|what you.ll need|what we.re looking for|who you are|must[- ]haves?)"
+)
 # Fields the scorer calibrates on; used to detect a present-but-empty profile
 # (a likely schema mismatch with the recommendation engine).
 _PREFERENCE_FIELDS = ("promptSummary", "summary", "positiveSignals",
@@ -97,6 +103,30 @@ def _preference_profile_prompt(preference_profile: dict | None) -> str:
     return text
 
 
+def select_description(full_description, cap=None) -> str:
+    desc = full_description or ""
+    cap = int(cap or _MAX_DESCRIPTION_CHARS)
+    if len(desc) <= cap:
+        return desc
+
+    match = REQUIREMENTS_MARKER_RE.search(desc)
+    if not match:
+        return desc[:cap] + DESCRIPTION_TRUNCATION_MARKER
+
+    joiner = f"\n{DESCRIPTION_OMISSION_MARKER}\n"
+    tail = desc[match.start():]
+    min_head = min(500, cap)
+    available = max(0, cap - len(joiner))
+    if len(tail) >= available - min_head:
+        head_budget = min_head
+        tail_budget = max(0, available - head_budget)
+        tail = tail[:tail_budget]
+    else:
+        head_budget = max(min_head, available - len(tail))
+    head = desc[:head_budget]
+    return f"{head}{joiner}{tail}{DESCRIPTION_TRUNCATION_MARKER}"
+
+
 def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge_graph_prompt=None) -> str:
     """The combined prompt text for a single-string backend (e.g. `codex exec`).
     Same instructions + context as score_job, flattened to one prompt."""
@@ -104,7 +134,7 @@ def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job.get('site', '')}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{select_description(job.get('full_description'))}"
     )
     parts = [SCORE_PROMPT, f"RESUME:\n{resume_text}"]
     pref = _preference_profile_prompt(preference_profile)
@@ -230,7 +260,7 @@ def score_job(
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{select_description(job.get('full_description'))}"
     )
 
     preference_prompt = _preference_profile_prompt(preference_profile)
