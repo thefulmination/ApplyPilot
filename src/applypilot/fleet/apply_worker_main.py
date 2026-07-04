@@ -221,7 +221,7 @@ def _apply_timeout_override(dsn=None, *, conn=None) -> None:
         logger.debug("could not resolve agent_timeout_override; using env/default", exc_info=True)
 
 
-def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="claude", machine_owner=None, slot=0):
+def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", machine_owner=None, slot=0):
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
@@ -404,16 +404,19 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
     return counts
 
 
-def main(argv=None) -> int:  # pragma: no cover - long-running
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="applypilot-fleet-apply")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
     p.add_argument("--worker-id", required=True)
     p.add_argument("--home-ip", default=os.environ.get("FLEET_HOME_IP", "0.0.0.0"))
     p.add_argument("--model", default="sonnet")
-    p.add_argument("--agent", default="claude")
+    # Default agent is Codex (ChatGPT quota pool) so fleet apply stays OFF the
+    # Claude Max subscription by default. Pass --agent claude to override, or set
+    # --fallback-agent claude to spill over only when Codex hits its wall.
+    p.add_argument("--agent", default="codex")
     p.add_argument("--fallback-agent", default=os.environ.get("APPLYPILOT_FALLBACK_AGENT"),
                    help="Comma-separated ordered fallback agents to switch to when --agent "
-                        "hits its usage/session limit, e.g. 'codex' (an independent quota "
+                        "hits its usage/session limit, e.g. 'claude' (an independent quota "
                         "pool). Omit for none: the worker then pauses until the primary "
                         "agent's window resets.")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
@@ -421,7 +424,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
                    help="Browser slot (Chrome profile + CDP port + logs). Auto-derived from "
                         "--worker-id's trailing digits; set explicitly (0,1,2,...) to run "
                         "multiple workers on ONE machine without browser collisions.")
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:  # pragma: no cover - long-running
+    args = build_parser().parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
     slot = _chrome_slot(args.worker_id, args.chrome_slot)

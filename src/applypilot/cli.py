@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime as _dt, time as _time, timezone as _tz
 from pathlib import Path
 from typing import Mapping, Optional
@@ -799,7 +800,7 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(2, "--workers", "-w", help="Number of parallel browser workers. Account-safe: the LinkedIn daily cap and per-host throttle are process-global, shared across workers."),
     min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score for job selection. Defaults to APPLYPILOT_MIN_SCORE or 7."),
-    agent: str = typer.Option("claude", "--agent", help="Apply agent CLI to run: claude or codex."),
+    agent: str = typer.Option("codex", "--agent", help="Apply agent CLI to run: claude or codex. Defaults to codex to keep apply off the Claude Max subscription."),
     agents: Optional[str] = typer.Option(None, "--agents", help="Comma-separated per-worker agents (round-robin), e.g. 'claude,codex' to run BOTH concurrently in one process. Overrides --agent; needs --workers >= the number of agents."),
     browsers: Optional[str] = typer.Option(None, "--browsers", help="Comma-separated per-worker browsers (round-robin), e.g. 'chrome,edge' to run real Chrome + real Edge. Edge has no Chrome LinkedIn session -> auto-restricted to the offsite lane."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Apply-agent model name. Defaults to sonnet for Claude; Codex uses its configured default when omitted."),
@@ -1254,6 +1255,66 @@ def track_command(
 
     rows = list_applications(status=status, active_only=active and status is None, limit=limit)
     _print_tracker(rows, "Application Tracker")
+
+
+@app.command("answer")
+def answer_command(
+    question: str = typer.Option(..., "--question", "-q", help="The application question to answer."),
+    title: str = typer.Option("", "--title", help="Job title, for context."),
+    company: str = typer.Option("", "--company", help="Company name, for context."),
+    description: str = typer.Option("", "--description", help="Job description snippet, for context."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="Question kind hint: motivation | behavioral | open."),
+    remember: bool = typer.Option(False, "--remember", help="Save the verified answer to the corpus for future retrieval."),
+) -> None:
+    """Generate ONE verified free-text application answer with the cheap model.
+
+    Retrieves the candidate's past approved answers, asks the answer-stage LLM
+    (DeepSeek by default), and runs the deterministic verifier. Prints the answer
+    only if it passes; otherwise exits non-zero so an optional field is left blank
+    or escalated to a human.
+    """
+    _bootstrap()
+
+    # Model answers routinely contain em-dashes / curly quotes; force UTF-8 so a
+    # Windows cp1252 console doesn't UnicodeEncodeError on the printed answer.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    from applypilot import config
+    from applypilot.apply.answerer import (
+        AnswerCorpus,
+        answer_question,
+        default_corpus_path,
+        remember_answer,
+    )
+
+    profile = config.load_profile()
+    resume_text = ""
+    if config.RESUME_PATH.exists():
+        resume_text = config.RESUME_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    job = {"title": title, "site": company, "description": description}
+    corpus = AnswerCorpus.from_jsonl(default_corpus_path())
+    res = answer_question(question, job=job, profile=profile,
+                          resume_text=resume_text, corpus=corpus, kind=kind)
+
+    if not res.verified:
+        console.print(
+            f"[yellow]No verified answer (failed: {', '.join(res.checks) or 'unknown'}). "
+            f"Leave blank if optional, or answer manually.[/yellow]"
+        )
+        raise typer.Exit(code=2)
+
+    console.print(res.text)
+    console.print(
+        f"[dim][verified] via {res.model} in {res.attempts} attempt(s); "
+        f"used {len(res.retrieved)} past answer(s)[/dim]"
+    )
+    if remember:
+        remember_answer(question, res.text, job=job)
+        console.print("[dim]saved to corpus[/dim]")
 
 
 @app.command("preapply-check")
