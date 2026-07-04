@@ -22,6 +22,7 @@ from applypilot.apply.launcher import _apply_target, _throttle_host
 
 # Blocked sites/patterns loaded once at import (mirrors acquire_job in launcher.py).
 _BLOCKED_SITES, _BLOCKED_PATTERNS = config.load_blocked_sites()
+_BLOCKED_COMPANY_NAMES, _BLOCKED_COMPANY_PATTERNS = config.load_blocked_companies()
 
 # --- PUSH -------------------------------------------------------------------
 
@@ -65,6 +66,15 @@ def _eligible(row: sqlite3.Row) -> bool:
             needle = pat.strip("%").lower()
             if needle and needle in t_lower:
                 return False
+    company = (row["company"] or "").strip().lower()
+    if company and company in _BLOCKED_COMPANY_NAMES:
+        return False
+    url_lower = (row["url"] or "").lower()
+    app_lower = (row["application_url"] or "").lower()
+    for pat in _BLOCKED_COMPANY_PATTERNS:
+        needle = pat.strip("%").lower()
+        if needle and (needle in url_lower or needle in app_lower):
+            return False
     return True
 
 

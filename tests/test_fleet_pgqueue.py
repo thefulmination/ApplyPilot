@@ -200,6 +200,36 @@ def test_lease_orders_by_score_desc(db):
     assert first["url"].endswith("/4")
 
 
+def test_lease_one_skips_company_blocklist_match(db):
+    with pgqueue.connect(db) as conn:
+        pgqueue.push_jobs(conn, [
+            {
+                "url": "https://jobs.example.com/openai",
+                "company": "OpenAI",
+                "title": "Strategy",
+                "application_url": "https://jobs.ashbyhq.com/openai/1",
+                "score": 10.0,
+                "apply_domain": "ashbyhq.com",
+            },
+            {
+                "url": "https://jobs.example.com/acme",
+                "company": "Acme",
+                "title": "Chief of Staff",
+                "application_url": "https://boards.greenhouse.io/acme/1",
+                "score": 9.0,
+                "apply_domain": "greenhouse.io",
+            },
+        ])
+        with conn.cursor() as cur:
+            cur.execute("UPDATE apply_queue SET approved_batch='b0'")
+        conn.commit()
+
+        job = pgqueue.lease_one(conn, "w", politeness_seconds=0)
+
+    assert job is not None
+    assert job["url"] == "https://jobs.example.com/acme"
+
+
 def test_reclaim_parks_all_stale_leases_never_requeues(db):
     """An expired lease == a hard crash (a clean finish always writes terminal status). Because
     `attempts` is bumped only at lease time it cannot tell a never-launched lease (attempts=1)
@@ -408,6 +438,22 @@ def test_push_offsite_filters(db, tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["url"].endswith("/acme/jobs/1")
     assert rows[0]["apply_domain"] == "boards.greenhouse.io"
+
+
+def test_push_offsite_skips_company_blocklist_matches(db, tmp_path, monkeypatch):
+    _no_host_filters(monkeypatch)
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1", company="Acme", title="COS")
+    _add_job(sq, "https://boards.greenhouse.io/openai/jobs/2", company="OpenAI", title="Strategy")
+    _add_job(sq, "https://hiring.cafe/viewjob/openai-3", company="HiringCafe", title="Ops",
+             application_url="https://jobs.ashbyhq.com/openai/3")
+
+    with pgqueue.connect(db) as pg:
+        assert fleet_sync.push_offsite_jobs(sqlite_conn=sq, pg_conn=pg, score_floor=7) == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
 
 
 def test_push_drops_auth_gated(db, tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ import logging
 import os
 import uuid
 
+from applypilot import config
 from applypilot.apply import pgqueue
 from applypilot.fleet import queue, sync
 
@@ -108,6 +109,82 @@ def print_challenges_grouped(conn) -> None:
         print(f"{r['kind']}\t{r['host']}\t{r['count']}")
 
 
+def _blocklist_match_sql(*, pg: bool) -> tuple[str, dict | list]:
+    names, patterns = config.load_blocked_companies()
+    if pg:
+        return (
+            "(LOWER(TRIM(COALESCE(company,''))) = ANY(%(blocked_names)s) "
+            "OR url ILIKE ANY(%(blocked_pats)s) "
+            "OR COALESCE(application_url,'') ILIKE ANY(%(blocked_pats)s))",
+            {"blocked_names": list(names), "blocked_pats": patterns},
+        )
+    clauses: list[str] = []
+    params: list[str] = []
+    if names:
+        placeholders = ",".join("?" * len(names))
+        clauses.append(f"LOWER(TRIM(COALESCE(company,''))) IN ({placeholders})")
+        params.extend(sorted(names))
+    for pattern in patterns:
+        clauses.append("url LIKE ?")
+        clauses.append("COALESCE(application_url,'') LIKE ?")
+        params.extend([pattern, pattern])
+    if not clauses:
+        return "0", []
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def blocklist_backfill(*, sqlite_conn=None, pg_conn=None, execute: bool = False) -> dict[str, int]:
+    own_sq, own_pg = sqlite_conn is None, pg_conn is None
+    sq = sqlite_conn or sync._home_conn()
+    pg = pg_conn or pgqueue.connect()
+    counts: dict[str, int] = {}
+    brain_match, brain_params = _blocklist_match_sql(pg=False)
+    pg_match, pg_params = _blocklist_match_sql(pg=True)
+    try:
+        brain_where = (
+            f"{brain_match} "
+            "AND COALESCE(apply_status,'') NOT IN ('applied','in_progress','crash_unconfirmed')"
+        )
+        counts["brain_matches"] = sq.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE " + brain_where,
+            brain_params,
+        ).fetchone()["n"]
+        with pg.cursor() as cur:
+            for table in ("apply_queue", "linkedin_queue"):
+                key = f"{table}_matches"
+                cur.execute(
+                    f"SELECT COUNT(*) AS n FROM {table} WHERE status='queued' AND {pg_match}",
+                    pg_params,
+                )
+                counts[key] = cur.fetchone()["n"]
+        if not execute:
+            pg.rollback()
+            return counts
+
+        cur = sq.execute(
+            "UPDATE jobs SET apply_status='blocked', apply_error='company_blocklist' "
+            "WHERE " + brain_where,
+            brain_params,
+        )
+        counts["brain_blocked"] = cur.rowcount
+        sq.commit()
+        with pg.cursor() as cur:
+            for table in ("apply_queue", "linkedin_queue"):
+                cur.execute(
+                    f"UPDATE {table} SET status='blocked', apply_error='company_blocklist', updated_at=now() "
+                    f"WHERE status='queued' AND {pg_match}",
+                    pg_params,
+                )
+                counts[f"{table}_blocked"] = cur.rowcount
+        pg.commit()
+        return counts
+    finally:
+        if own_sq:
+            sq.close()
+        if own_pg:
+            pg.close()
+
+
 def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     p = argparse.ArgumentParser(prog="applypilot-fleet-apply-home")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
@@ -121,6 +198,10 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     rc = sub.add_parser("resolve-challenge"); rc.add_argument("url"); rc.add_argument("--skip", action="store_true")
     sub.add_parser("status")
     sub.add_parser("resume-if-safe")
+    bf = sub.add_parser("blocklist-backfill")
+    mode = bf.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", default=True)
+    mode.add_argument("--execute", action="store_true")
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
@@ -151,6 +232,8 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
                 print("resumed")
             else:
                 print("left-paused (ats_paused or already running)")
+        elif args.cmd == "blocklist-backfill":
+            print(blocklist_backfill(pg_conn=conn, execute=bool(args.execute)))
     return 0
 
 

@@ -112,6 +112,41 @@ def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
 
+
+def _load_blocked_companies():
+    from applypilot.config import load_blocked_companies
+    return load_blocked_companies()
+
+
+def _company_blocked(row, names: set[str], patterns: list[str]) -> bool:
+    company = (row["company"] or "").strip().lower()
+    if company and company in names:
+        return True
+    url = (row["url"] or "").lower()
+    application_url = (row["application_url"] or "").lower()
+    for pattern in patterns:
+        needle = pattern.strip("%").lower()
+        if needle and (needle in url or needle in application_url):
+            return True
+    return False
+
+
+def _company_blocklist_clause(names: set[str], patterns: list[str]) -> tuple[str, list]:
+    clauses: list[str] = []
+    params: list = []
+    if names:
+        placeholders = ",".join("?" * len(names))
+        clauses.append(f"LOWER(TRIM(COALESCE(company,''))) NOT IN ({placeholders})")
+        params.extend(sorted(names))
+    for pattern in patterns:
+        clauses.append("url NOT LIKE ?")
+        clauses.append("COALESCE(application_url,'') NOT LIKE ?")
+        params.extend([pattern, pattern])
+    if not clauses:
+        return "", []
+    return "AND " + "\n                      AND ".join(clauses), params
+
+
 # How often to poll the DB when the queue is empty (seconds). Tunable via
 # APPLYPILOT_POLL_INTERVAL / --poll-interval (lower = a worker idles less between
 # empty polls; only matters once the queue drains).
@@ -655,6 +690,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     tailored_clause = "" if config.base_resume_enabled() else "AND tailored_resume_path IS NOT NULL"
     blocked_sites: list = []
     blocked_patterns: list = []
+    blocked_company_names, blocked_company_patterns = _load_blocked_companies()
     if not target_url:
         blocked_sites, blocked_patterns = _load_blocked()
 
@@ -693,6 +729,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 if blocked_patterns:
                     url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                     params.extend(blocked_patterns)
+                company_block_clause, company_block_params = _company_blocklist_clause(
+                    blocked_company_names, blocked_company_patterns)
+                params.extend(company_block_params)
                 # LinkedIn lane gating: when the daily cap / same-day halt is in
                 # effect, skip Easy-Apply jobs so the run keeps flowing offsite.
                 li_clause = f"AND NOT {_LINKEDIN_LANE_SQL}" if exclude_linkedin else ""
@@ -801,6 +840,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       AND COALESCE(audit_score, fit_score) >= ?
                       {site_clause}
                       {url_clauses}
+                      {company_block_clause}
                       {li_clause}
                       {seen_clause}
                       {host_clause}
@@ -819,12 +859,45 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
             if not row:
+                if not target_url and (blocked_company_names or blocked_company_patterns):
+                    company_block_clause, company_block_params = _company_blocklist_clause(
+                        blocked_company_names, blocked_company_patterns)
+                    if company_block_clause:
+                        cur = conn.execute(
+                            f"""
+                            UPDATE jobs
+                            SET apply_status='blocked', apply_error='company_blocklist'
+                            WHERE url IN (
+                                SELECT url FROM jobs
+                                WHERE duplicate_of_url IS NULL
+                                  {tailored_clause}
+                                  AND COALESCE(liveness_status, '') != 'dead'
+                                  AND (apply_status IS NULL OR apply_status = 'failed')
+                                  AND COALESCE(audit_score, fit_score) >= ?
+                                  AND NOT ({company_block_clause[4:]})
+                            )
+                            """,
+                            [min_score] + company_block_params,
+                        )
+                        if cur.rowcount:
+                            conn.commit()
+                            return None
                 conn.rollback()
                 return None
 
             # Skip manual ATS sites (unsolvable CAPTCHAs): mark + continue to the
             # next candidate rather than returning None.
             apply_url = row["application_url"] or row["url"]
+            if _company_blocked(row, blocked_company_names, blocked_company_patterns):
+                conn.execute(
+                    "UPDATE jobs SET apply_status='blocked', apply_error='company_blocklist' WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                logger.info("Skipping blocked company: %s", row["url"][:80])
+                if target_url:
+                    return None
+                continue
             if is_manual_ats(apply_url):
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",

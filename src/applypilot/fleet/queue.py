@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import urllib.parse as _urlparse
 
+from applypilot import config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
 
@@ -57,6 +58,11 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_
          -- NOT an approved_batch=NULL un-approve -- so vetted owner approval is preserved and
          -- the skip auto-reverts at its TTL exactly like the breaker's breaker_until.
          AND COALESCE(g.doctor_skip_until, '-infinity'::timestamptz) < now()
+         AND NOT (
+           LOWER(TRIM(COALESCE(q.company,''))) = ANY(%(blocked_names)s)
+           OR q.url ILIKE ANY(%(blocked_pats)s)
+           OR COALESCE(q.application_url,'') ILIKE ANY(%(blocked_pats)s)
+         )
          -- H4: the effective min-gap is GREATEST(breaker-owned min_gap, Doctor-owned floor), so
          -- a Doctor pace is monotone-by-construction and the watchdog breaker's min_gap restore
          -- can never silently wipe a still-active Doctor pace (and vice-versa).
@@ -91,10 +97,12 @@ RETURNING q.url, q.company, q.title, q.application_url,
 
 
 def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200):
+    blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         cur.execute(_LEASE_APPLY, {
             "worker": worker_id, "home_ip": home_ip,
             "home_scope": governor.home_ip_scope(home_ip), "ttl": ttl_seconds,
+            "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
         })
         row = cur.fetchone()
     conn.commit()
@@ -453,6 +461,11 @@ WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM flee
          AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
          AND COALESCE(a.breaker_state, 'ok') NOT IN ('paused','demoted')
          AND (a.last_applied_at IS NULL OR a.last_applied_at < now() - make_interval(secs => COALESCE(a.min_gap_seconds, 1200)))
+         AND NOT (
+           LOWER(TRIM(COALESCE(q.company,''))) = ANY(%(blocked_names)s)
+           OR q.url ILIKE ANY(%(blocked_pats)s)
+           OR COALESCE(q.application_url,'') ILIKE ANY(%(blocked_pats)s)
+         )
          AND NOT EXISTS (SELECT 1 FROM applied_set s WHERE s.dedup_key = q.dedup_key)
        ORDER BY q.score DESC, q.url LIMIT 1 FOR UPDATE OF q SKIP LOCKED
      ),
@@ -480,6 +493,7 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
     worker. They must match or the lease is refused outright."""
     if public_ip is None or owner_ip is None or public_ip != owner_ip:
         return None  # LinkedIn never from a different IP than the owner's
+    blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         # Ensure the account governor row EXISTS so the FOR UPDATE mutex has a row to
         # lock (otherwise concurrent leases wouldn't serialize). Preserves an existing cap.
@@ -488,7 +502,10 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
             "VALUES ('account:linkedin', %s, %s, %s) ON CONFLICT (scope_key) DO NOTHING",
             (daily_cap, min_gap_seconds, min_gap_seconds),
         )
-        cur.execute(_LEASE_LINKEDIN, {"worker": worker_id, "ttl": ttl_seconds})
+        cur.execute(_LEASE_LINKEDIN, {
+            "worker": worker_id, "ttl": ttl_seconds,
+            "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
+        })
         row = cur.fetchone()
     conn.commit()
     return dict(row) if row else None

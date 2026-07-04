@@ -52,6 +52,7 @@ WHERE duplicate_of_url IS NULL
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
   AND application_url LIKE 'http%'
   AND application_url NOT LIKE '%linkedin.com%'
+  {company_blocklist}
 ORDER BY score DESC
 """
 
@@ -70,6 +71,23 @@ def _applications_table_exists(sqlite_conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'"
     ).fetchone()
     return row is not None
+
+
+def _company_blocklist_sql() -> tuple[str, list[str]]:
+    names, patterns = config.load_blocked_companies()
+    clauses: list[str] = []
+    params: list[str] = []
+    if names:
+        placeholders = ",".join("?" * len(names))
+        clauses.append(f"LOWER(TRIM(COALESCE(company,''))) NOT IN ({placeholders})")
+        params.extend(sorted(names))
+    for pattern in patterns:
+        clauses.append("url NOT LIKE ?")
+        clauses.append("COALESCE(application_url,'') NOT LIKE ?")
+        params.extend([pattern, pattern])
+    if not clauses:
+        return "", []
+    return "  AND " + "\n  AND ".join(clauses), params
 
 
 def backfill_applied_set(sqlite_conn: sqlite3.Connection, pg_conn: Any) -> int:
@@ -134,7 +152,8 @@ def push_apply_eligible(
         out: list[dict[str, Any]] = []
         # Build the eligibility SQL; append the ledger cross-check when the home brain
         # has an applications table (the check is a no-op on minimal test fixtures).
-        base_sql = _PUSH_APPLY_SELECT
+        company_blocklist, company_params = _company_blocklist_sql()
+        base_sql = _PUSH_APPLY_SELECT.format(company_blocklist=company_blocklist)
         if _applications_table_exists(sq):
             # Inject the cross-check before the ORDER BY clause.
             base_sql = base_sql.replace(
@@ -143,7 +162,7 @@ def push_apply_eligible(
             )
         # Push the limit into SQL so we fetch only the top-N (not the whole eligible
         # set on a 70k+ job brain); keep the Python break as belt-and-suspenders.
-        sql, params = base_sql, [score_floor]
+        sql, params = base_sql, [score_floor] + company_params
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -297,6 +316,7 @@ WHERE duplicate_of_url IS NULL
   AND TRIM(COALESCE(company, '')) != ''
   AND TRIM(COALESCE(title, '')) != ''
   AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+  {company_blocklist}
   {recency}
 ORDER BY score DESC
 """
@@ -328,11 +348,18 @@ def push_linkedin_eligible(
     try:
         out = []
         params = [score_floor]
+        recency_params: list[str] = []
         recency = ""
         if max_age_days and int(max_age_days) > 0:
             recency = "AND discovered_at IS NOT NULL AND julianday(discovered_at) >= julianday('now', ?)"
-            params.append(f"-{int(max_age_days)} days")
-        sql = _PUSH_LINKEDIN_SELECT.format(recency=recency)
+            recency_params.append(f"-{int(max_age_days)} days")
+        company_blocklist, company_params = _company_blocklist_sql()
+        sql = _PUSH_LINKEDIN_SELECT.format(
+            company_blocklist=company_blocklist,
+            recency=recency,
+        )
+        params.extend(company_params)
+        params.extend(recency_params)
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))

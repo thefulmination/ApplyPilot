@@ -96,6 +96,45 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
 
 
+def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
+             company="Acme Inc", title="Chief of Staff")                       # eligible
+    _add_job(sq, "https://boards.greenhouse.io/openai/jobs/2",
+             company="OpenAI", title="Strategy")                               # blocked by company
+    _add_job(sq, "https://hiring.cafe/viewjob/openai-3",
+             company="HiringCafe", title="Ops",
+             application_url="https://jobs.ashbyhq.com/openai/3")              # blocked by app url
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_linkedin_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://www.linkedin.com/jobs/view/acme",
+             company="Acme", title="Chief of Staff", audit_score=9.0)
+    _add_job(sq, "https://www.linkedin.com/jobs/view/openai",
+             company="OpenAI", title="Strategy", audit_score=10.0)
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg,
+                                        score_floor=7, approved_batch="batch-L", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM linkedin_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://www.linkedin.com/jobs/view/acme"}
+
+
 def test_push_apply_eligible_excludes_crash_unconfirmed(fleet_db, tmp_path):
     # A posting that may already have been submitted under the user's name (a
     # crash_unconfirmed / no_confirmation terminal) must NEVER be re-pushed.
