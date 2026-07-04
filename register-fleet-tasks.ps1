@@ -234,7 +234,8 @@ function Register-FleetTask {
   Remove-FleetTask $Name
   $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WrapperPath`""
   $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument -WorkingDirectory $repo
-  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+  $taskUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger -Settings $Settings `
     -Principal $principal -Description $Description -Force | Out-Null
   Write-Host "  registered $Name -> $WrapperPath" -ForegroundColor Green
