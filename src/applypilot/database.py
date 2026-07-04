@@ -827,6 +827,14 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
             created_at            TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scoring_context_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            event                 TEXT NOT NULL,
+            detail                TEXT,
+            created_at            TEXT NOT NULL
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started_at ON pipeline_runs(started_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
@@ -841,6 +849,7 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
         conn.execute("ALTER TABLE llm_usage ADD COLUMN prompt_variant TEXT")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_variant ON llm_usage(prompt_variant)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scoring_context_events_event ON scoring_context_events(event)")
 
     conn.commit()
 
@@ -885,6 +894,27 @@ def record_llm_usage(
         conn.commit()
     except Exception:
         pass  # usage logging must never break a real LLM call
+
+
+def record_scoring_context_event(
+    event: str,
+    detail: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Persist scorer context anomalies (best-effort; never raises)."""
+    try:
+        if conn is None:
+            conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO scoring_context_events (event, detail, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (event, detail, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 def get_llm_usage_summary(conn: sqlite3.Connection | None = None) -> dict:

@@ -6,6 +6,7 @@ profile and resume file.
 """
 
 import logging
+import json
 import os
 import re
 import time
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # antigravity: python-scorer-integration-v1
+from applypilot import database
 from applypilot.config import RESUME_PATH, load_preference_profile, KNOWLEDGE_GRAPH_PROMPT_PATH
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
@@ -50,7 +52,9 @@ REASONING: [2-3 sentences in plain English: what matches, what is missing, and w
 # Recommendation calibration is produced by an external engine ("brainstorm"),
 # so treat its content defensively: cap sizes and tolerate wrong-typed fields.
 _MAX_PREFERENCE_CHARS = 12000
-_MAX_KNOWLEDGE_GRAPH_CHARS = 16000
+# 32k covers the current compact KG pack; +~2.8k input tokens costs about
+# $0.0008/job at the DeepSeek input rate cited in the 2026-07-04 audit.
+_MAX_KNOWLEDGE_GRAPH_CHARS = 32000
 # Fields the scorer calibrates on; used to detect a present-but-empty profile
 # (a likely schema mismatch with the recommendation engine).
 _PREFERENCE_FIELDS = ("promptSummary", "summary", "positiveSignals",
@@ -112,21 +116,40 @@ def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge
     return "\n\n---\n\n".join(parts)
 
 
+def _load_knowledge_graph_prompt() -> str | None:
+    try:
+        if not KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
+            return None
+        kg_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
+        if kg_prompt and len(kg_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
+            log.error(
+                "Knowledge graph prompt is %d chars; truncating to %d to control "
+                "token cost (it is injected into every scoring call).",
+                len(kg_prompt), _MAX_KNOWLEDGE_GRAPH_CHARS,
+            )
+            database.record_scoring_context_event(
+                "kg_prompt_truncated",
+                json.dumps({
+                    "path": str(KNOWLEDGE_GRAPH_PROMPT_PATH),
+                    "original_chars": len(kg_prompt),
+                    "cap": _MAX_KNOWLEDGE_GRAPH_CHARS,
+                }),
+            )
+            kg_prompt = kg_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
+        if not (kg_prompt or "").strip():
+            return None
+        return kg_prompt
+    except Exception as e:
+        log.warning("Could not read knowledge graph prompt from %s: %s", KNOWLEDGE_GRAPH_PROMPT_PATH, e)
+        return None
+
+
 def load_score_context() -> dict:
     """Resume / preference profile / KG prompt from the same sources run_scoring reads.
     For the frontier pass + any standalone scorer caller."""
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     preference_profile = load_preference_profile()
-    kg_prompt = None
-    try:
-        if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
-            kg_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
-            if kg_prompt and len(kg_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
-                kg_prompt = kg_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
-            if not (kg_prompt or "").strip():
-                kg_prompt = None
-    except OSError:
-        kg_prompt = None
+    kg_prompt = _load_knowledge_graph_prompt()
     return {"resume_text": resume_text, "preference_profile": preference_profile, "kg_prompt": kg_prompt}
 
 
@@ -334,27 +357,10 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
             )
 
     # antigravity: python-scorer-integration-v1
-    knowledge_graph_prompt = None
-    if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
-        try:
-            knowledge_graph_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
-            if len(knowledge_graph_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
-                log.warning(
-                    "Knowledge graph prompt is %d chars; truncating to %d to control "
-                    "token cost (it is injected into every scoring call).",
-                    len(knowledge_graph_prompt), _MAX_KNOWLEDGE_GRAPH_CHARS,
-                )
-                knowledge_graph_prompt = (
-                    knowledge_graph_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
-                )
-            if not knowledge_graph_prompt.strip():
-                knowledge_graph_prompt = None
-            else:
-                log.info("Loaded job knowledge graph prompt for scoring calibration (%d chars).",
-                         len(knowledge_graph_prompt))
-        except Exception as e:
-            log.warning("Could not read knowledge graph prompt from %s: %s", KNOWLEDGE_GRAPH_PROMPT_PATH, e)
-            knowledge_graph_prompt = None
+    knowledge_graph_prompt = _load_knowledge_graph_prompt()
+    if knowledge_graph_prompt:
+        log.info("Loaded job knowledge graph prompt for scoring calibration (%d chars).",
+                 len(knowledge_graph_prompt))
 
     conn = get_connection()
 
