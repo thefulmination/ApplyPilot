@@ -13,6 +13,7 @@
 #   APPLYPILOT_FALLBACK_AGENT env var, else "codex" when -Agent is claude (so a Claude
 #   session-limit wall fails over to Codex instead of stalling).
 param([int]$Slot = 0, [string]$Agent = "claude", [string]$Model = "", [string]$Label = "home",
+      [string]$HomeIp = $env:FLEET_HOME_IP,
       [string]$FallbackAgent = $env:APPLYPILOT_FALLBACK_AGENT)
 $WorkerId = "$Label-$Slot"
 $ErrorActionPreference = "Stop"
@@ -36,6 +37,25 @@ foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
   if (Test-Path $cand) { $exe = (Resolve-Path $cand).Path; break }
 }
 if (-not $exe) { throw "applypilot-fleet-apply not found in .conda-env or .venv -- run the setup script first." }
+
+function Resolve-FleetHomeIp([string]$Candidate) {
+  $ip = "$Candidate".Trim()
+  if ($ip -and $ip -ne "0.0.0.0" -and $ip -ne "::") { return $ip }
+
+  $tailscale = Get-Command "tailscale.exe" -ErrorAction SilentlyContinue
+  if ($tailscale) {
+    $tsIp = (& $tailscale.Source ip -4 2>$null | Where-Object { $_ -like "100.*" } | Select-Object -First 1)
+    if ($tsIp) { return "$tsIp".Trim() }
+  }
+  return $null
+}
+
+$HomeIp = Resolve-FleetHomeIp $HomeIp
+if (-not $HomeIp -or $HomeIp -eq "0.0.0.0" -or $HomeIp -eq "::") {
+  throw "Refusing to start worker '$WorkerId': FLEET_HOME_IP is missing/invalid and tailscale.exe ip -4 did not return a 100.x address. Set FLEET_HOME_IP to this machine's Tailscale IP, then restart FleetAgent."
+}
+$env:FLEET_HOME_IP = $HomeIp
+$env:FLEET_MACHINE_OWNER = $Label
 
 $env:APPLYPILOT_DIR = Join-Path $ProjectRoot ".applypilot"
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $ProjectRoot ".playwright-browsers"
@@ -94,5 +114,5 @@ if (-not $env:FLEET_PG_DSN) { throw "FLEET_PG_DSN is not set (the setup script p
 
 $margs = @(); if ($Model) { $margs = @("--model", $Model) }
 $fargs = @(); if ($FallbackAgent) { $fargs = @("--fallback-agent", $FallbackAgent) }
-Write-Host "[fleet-worker] worker $WorkerId  agent=$Agent  model=$(if($Model){$Model}else{'default'})  fallback=$(if($FallbackAgent){$FallbackAgent}else{'none'})  -> logs .applypilot\logs\worker-$Slot.log"
-& $exe --dsn $env:FLEET_PG_DSN --worker-id "$WorkerId" --chrome-slot $Slot --agent $Agent @margs @fargs
+Write-Host "[fleet-worker] worker $WorkerId  owner=$Label  home_ip=$HomeIp  agent=$Agent  model=$(if($Model){$Model}else{'default'})  fallback=$(if($FallbackAgent){$FallbackAgent}else{'none'})  -> logs .applypilot\logs\worker-$Slot.log"
+& $exe --dsn $env:FLEET_PG_DSN --worker-id "$WorkerId" --home-ip "$HomeIp" --machine-owner "$Label" --chrome-slot $Slot --agent $Agent @margs @fargs
