@@ -1,0 +1,194 @@
+"""Tests for the deterministic Greenhouse submit path.
+
+plan_form_actions turns an AnswerPlan into an ordered list of deterministic
+browser actions; execute_form runs them against an injected page. The safety
+contract: execute_form DEFAULTS to dry-run and never clicks submit unless
+explicitly told to. No real browser and no real submission in these tests.
+"""
+
+from applypilot.apply.greenhouse_adapter import AnswerPlan
+from applypilot.apply.greenhouse_submit import (
+    adapter_enabled,
+    apply_greenhouse,
+    decide_route,
+    execute_form,
+    plan_form_actions,
+)
+
+
+QUESTIONS = [
+    {"fields": [{"name": "first_name", "type": "input_text"}]},
+    {"fields": [{"name": "email", "type": "input_text"}]},
+    {"fields": [{"name": "resume", "type": "input_file"}]},
+    {"fields": [{"name": "resume_text", "type": "textarea"}]},
+    {"fields": [{"name": "question_1", "type": "textarea"}]},
+    {"fields": [{"name": "question_2", "type": "multi_value_single_select",
+                 "values": [{"label": "Yes", "value": 1}]}]},
+]
+
+
+def _ready_plan():
+    return AnswerPlan(
+        fields={"first_name": "Jordan", "email": "j@x.com", "resume_text": "REAL RESUME",
+                "question_1": "why text", "question_2": 1},
+        resume_field="resume", free_text={"question_1": "why text"},
+        unmapped_required=[], ready=True,
+    )
+
+
+class FakePage:
+    def __init__(self):
+        self.calls = []
+
+    def fill(self, selector, value):
+        self.calls.append(("fill", selector, value))
+
+    def set_input_files(self, selector, value):
+        self.calls.append(("file", selector, value))
+
+    def select_option(self, selector, value):
+        self.calls.append(("select", selector, value))
+
+    def click(self, selector):
+        self.calls.append(("click", selector))
+
+
+# --- plan_form_actions -----------------------------------------------------
+
+def test_plan_form_actions_maps_each_type_to_the_right_action():
+    acts = [(a.kind, a.selector, a.value)
+            for a in plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")]
+    assert ("file", "#resume", "/r.pdf") in acts
+    assert ("fill", "#first_name", "Jordan") in acts
+    assert ("textarea", "#resume_text", "REAL RESUME") in acts
+    assert ("textarea", "#question_1", "why text") in acts
+    assert ("select", "#question_2", 1) in acts
+
+
+def test_plan_form_actions_puts_submit_last():
+    acts = plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")
+    assert acts[-1].kind == "submit"
+    assert [a for a in acts if a.kind == "submit"][0].selector == "#submit_app"
+
+
+def test_plan_form_actions_never_touches_unplanned_fields():
+    acts = plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")
+    selectors = {a.selector for a in acts}
+    assert "#question_3" not in selectors  # not in the plan -> no action
+
+
+# --- execute_form (safety-critical) ----------------------------------------
+
+def test_execute_form_dry_run_fills_but_NEVER_clicks_submit():
+    page = FakePage()
+    rep = execute_form(plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"), page)
+    assert rep.dry_run is True
+    assert rep.submitted is False
+    assert rep.skipped_submit is True
+    assert ("click", "#submit_app") not in page.calls
+    assert ("fill", "#first_name", "Jordan") in page.calls
+    assert ("file", "#resume", "/r.pdf") in page.calls
+
+
+def test_execute_form_clicks_submit_only_when_dry_run_false():
+    page = FakePage()
+    rep = execute_form(plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+                       page, dry_run=False)
+    assert rep.submitted is True
+    assert ("click", "#submit_app") in page.calls
+
+
+# --- decide_route (the "both 1 and 2" glue) --------------------------------
+
+def test_decide_route_is_deterministic_when_plan_ready():
+    assert decide_route(_ready_plan())[0] == "deterministic"
+
+
+def test_decide_route_is_agent_fallback_when_not_ready():
+    plan = AnswerPlan(fields={"first_name": "J", "email": "e"}, resume_field="resume",
+                      free_text={}, unmapped_required=["Describe a hard problem"], ready=False)
+    route, reasons = decide_route(plan)
+    assert route == "agent_fallback"
+    assert "Describe a hard problem" in reasons
+
+
+# --- apply_greenhouse orchestrator (both 1 and 2, end to end) --------------
+
+_READY_QS = [
+    {"required": True, "label": "First Name", "fields": [{"name": "first_name", "type": "input_text"}]},
+    {"required": True, "label": "Last Name", "fields": [{"name": "last_name", "type": "input_text"}]},
+    {"required": True, "label": "Email", "fields": [{"name": "email", "type": "input_text"}]},
+    {"required": True, "label": "Resume", "fields": [{"name": "resume", "type": "input_file"}]},
+    {"required": False, "label": "Why?", "fields": [{"name": "question_1", "type": "textarea"}]},
+]
+_UNREADY_QS = _READY_QS + [
+    {"required": True, "label": "Favorite color?",
+     "fields": [{"name": "q_c", "type": "multi_value_single_select", "values": [{"label": "Red", "value": 1}]}]},
+]
+_PROFILE = {"personal": {"full_name": "Jordan Rivera", "email": "j@x.com", "phone": "5551234567"},
+            "work_authorization": {}}
+_RESUME = "Quant developer, Python, supported a $300M book."
+
+
+class _Ans:
+    def __init__(self):
+        self.verified = True
+        self.text = "Because your Python risk work matches my background."
+        self.escalate = False
+        self.checks = []
+        self.model = "fake"
+        self.attempts = 1
+        self.retrieved = []
+
+
+def _good(question, **kw):
+    return _Ans()
+
+
+def test_apply_greenhouse_deterministic_path_is_dry_run_by_default():
+    page = FakePage()
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good,
+    )
+    assert res["route"] == "deterministic"
+    assert res["report"].submitted is False
+    assert res["report"].skipped_submit is True
+    assert ("fill", "#first_name", "Jordan") in page.calls
+    assert ("click", "#submit_app") not in page.calls
+
+
+def test_apply_greenhouse_falls_back_to_agent_and_never_touches_the_form():
+    page = FakePage()
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _UNREADY_QS}, answer_fn=_good,
+    )
+    assert res["route"] == "agent_fallback"
+    assert any("favorite color" in u.lower() for u in res["unmapped"])
+    assert page.calls == []
+
+
+def test_apply_greenhouse_ignores_non_greenhouse_urls():
+    res = apply_greenhouse(
+        "https://jobs.lever.co/acme/1",
+        profile=_PROFILE, resume_text=_RESUME, resume_path=None, page=FakePage(),
+        fetch=lambda u: {}, answer_fn=_good,
+    )
+    assert res["route"] == "not_greenhouse"
+
+
+# --- adapter_enabled (default OFF opt-in gate for the live-flow hook) -------
+
+def test_adapter_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_GREENHOUSE_ADAPTER", raising=False)
+    assert adapter_enabled() is False
+
+
+def test_adapter_enabled_when_flag_truthy(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_GREENHOUSE_ADAPTER", "on")
+    assert adapter_enabled() is True
+    monkeypatch.setenv("APPLYPILOT_GREENHOUSE_ADAPTER", "0")
+    assert adapter_enabled() is False

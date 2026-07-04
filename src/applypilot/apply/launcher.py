@@ -1361,6 +1361,50 @@ def is_usage_limit_result(status: str | None) -> bool:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
+def _maybe_greenhouse_shadow(job: dict, port: int, *, resume_text: str, resume_path) -> None:
+    """Opt-in SHADOW validation of the deterministic Greenhouse adapter.
+
+    OFF by default (APPLYPILOT_GREENHOUSE_ADAPTER). When enabled and the job is a
+    Greenhouse URL, this connects to the worker's Chrome, deterministically fills
+    the application form in a scratch tab in DRY-RUN (never clicks submit), logs
+    the resulting plan, then closes the tab and returns -- the apply agent still
+    owns the actual application. This proves the adapter works on live forms
+    before it is ever trusted to own a real submission. Never raises.
+    """
+    try:
+        from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
+        from applypilot.apply.greenhouse_submit import adapter_enabled, apply_greenhouse
+    except Exception:
+        return
+    if not adapter_enabled():
+        return
+    url = job.get("application_url") or job.get("url") or ""
+    if not parse_greenhouse_url(url):
+        return
+    try:
+        from playwright.sync_api import sync_playwright
+        profile = config.load_profile()
+        pdf = str(Path(resume_path).with_suffix(".pdf")) if resume_path else None
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                res = apply_greenhouse(url, profile=profile, resume_text=resume_text,
+                                       resume_path=pdf, page=page, dry_run=True)
+                plan = res.get("plan")
+                logger.info(
+                    "greenhouse shadow: route=%s ready=%s free_text=%s unmapped=%s",
+                    res.get("route"), res.get("ready"),
+                    list(plan.free_text) if plan else [], res.get("unmapped"),
+                )
+            finally:
+                page.close()
+    except Exception:
+        logger.debug("greenhouse shadow failed (non-fatal); agent proceeds", exc_info=True)
+
+
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str | None = "sonnet", dry_run: bool = False,
             agent: str = "claude", inbox_auth_hint: str | None = None,
@@ -1413,6 +1457,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     resume_text = ""
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
+
+    # Opt-in shadow validation of the deterministic Greenhouse adapter (no-op
+    # unless APPLYPILOT_GREENHOUSE_ADAPTER is set). Never affects the agent run.
+    _maybe_greenhouse_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
 
     # Reset the worker's isolated working directory FIRST. build_prompt stages
     # upload files under worker-{id}/current and reset_worker_dir wipes
