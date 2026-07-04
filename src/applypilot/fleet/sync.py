@@ -487,6 +487,14 @@ ORDER BY updated_at
 LIMIT %(limit)s
 """
 
+_REOPEN_COMPUTE_RESULTS = """
+UPDATE compute_queue
+SET synced_to_home_at = NULL,
+    updated_at = now()
+WHERE status = ANY(%(statuses)s)
+  AND synced_to_home_at IS NOT NULL
+"""
+
 
 def _advisory_fields(result: Any) -> tuple[Any, Any]:
     """Extract the advisory (research_fit_score, research_decision) from a compute result
@@ -541,6 +549,21 @@ def pull_compute_results(
     finally:
         if own_sq:
             sq.close()
+        if own_pg:
+            pg.close()
+
+
+def reopen_compute_results(*, pg_conn: Any | None = None, statuses: tuple[str, ...] = ("done", "failed")) -> int:
+    """Re-serve completed compute results for a later home pull without touching the brain."""
+    own_pg = pg_conn is None
+    pg = pg_conn or pgqueue.connect()
+    try:
+        with pg.cursor() as cur:
+            cur.execute(_REOPEN_COMPUTE_RESULTS, {"statuses": list(statuses)})
+            n = cur.rowcount
+        pg.commit()
+        return n
+    finally:
         if own_pg:
             pg.close()
 

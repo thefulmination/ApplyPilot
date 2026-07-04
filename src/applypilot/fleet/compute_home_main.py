@@ -21,15 +21,21 @@ def pull_results(*, sqlite_conn=None, pg_conn=None) -> int:
     return sync.pull_compute_results(sqlite_conn=sqlite_conn, pg_conn=pg_conn)
 
 
+def reopen_results(*, pg_conn=None) -> int:
+    return sync.reopen_compute_results(pg_conn=pg_conn)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="applypilot-fleet-compute-home")
-    p.add_argument("cmd", choices=["push", "pull"])
+    p.add_argument("cmd", choices=["push", "pull", "reopen"])
     p.add_argument("--task", default="score")
     p.add_argument("--score-floor", type=int, default=7)
     p.add_argument("--limit", type=int, default=None)
     args = p.parse_args(argv)
     if args.cmd == "push":
         print("pushed", push_backlog(task=args.task, score_floor=args.score_floor, limit=args.limit))
-    else:
+    elif args.cmd == "pull":
         print("pulled", pull_results())
+    else:
+        print("reopened", reopen_results())
     return 0

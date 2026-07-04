@@ -46,13 +46,35 @@ if (-not (Test-Path $env:APPLYPILOT_DB_PATH)) {
 Write-Host "[compute-home] brain: $($env:APPLYPILOT_DB_PATH)" -ForegroundColor Gray
 Write-Host "[compute-home] DSN:   $($env:FLEET_PG_DSN)  task=$Task floor=$ScoreFloor" -ForegroundColor Gray
 
+function Invoke-ComputeHomeStep {
+  param(
+    [string]$Name,
+    [string[]]$ArgsList
+  )
+
+  $ts = Get-Date -Format "HH:mm:ss"
+  $oldEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $out = & $exe @ArgsList 2>&1
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $oldEap
+  }
+
+  if ($code -ne 0) {
+    Write-Host "[$ts] $Name FAILED (exit $code):" -ForegroundColor Yellow
+    foreach ($line in $out) { Write-Host $line }
+    return
+  }
+
+  Write-Host "[$ts] $(($out | ForEach-Object { "$_" }) -join ' ')"
+}
+
 Write-Host "[compute-home] push (fill compute_queue) + pull (harvest results) every ${IntervalSec}s (Ctrl-C to stop) ..." -ForegroundColor Cyan
 while ($true) {
-  $ts = Get-Date -Format "HH:mm:ss"
-  try { $p = (& $exe push --task $Task --score-floor $ScoreFloor 2>&1) -join " "; Write-Host "[$ts] $p" }
-  catch { Write-Host "[$ts] push error: $_" -ForegroundColor Yellow }
-  try { $q = (& $exe pull 2>&1) -join " "; Write-Host "[$ts] $q" }
-  catch { Write-Host "[$ts] pull error: $_" -ForegroundColor Yellow }
+  Invoke-ComputeHomeStep -Name "push" -ArgsList @("push", "--task", $Task, "--score-floor", "$ScoreFloor")
+  Invoke-ComputeHomeStep -Name "pull" -ArgsList @("pull")
   if ($Once) { break }
   Start-Sleep -Seconds $IntervalSec
 }

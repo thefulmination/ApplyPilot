@@ -290,6 +290,38 @@ def test_pull_compute_results_is_advisory_only_and_idempotent(fleet_db, tmp_path
         assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 0
 
 
+def test_reopen_compute_results_recovers_stranded_advisory_scores(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    url = "https://co/jobs/restore"
+    _add_job(sq, url, company="Co", title="Analyst", audit_score=8.0, fit_score=6)
+    with pgqueue.connect(fleet_db) as pg:
+        sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score")
+        job = fleet_queue.lease_compute(pg, "c1")
+        assert job is not None and job["url"] == url
+        fleet_queue.write_compute_result(
+            pg, "c1", url,
+            result={"research_fit_score": 9.5, "research_decision": "strong_qualified"},
+            status="done", cost_usd=0.01, model="deepseek-chat", task="score")
+
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 1
+        sq.execute(
+            "UPDATE jobs SET research_fit_score=NULL, research_decision=NULL WHERE url=?",
+            (url,),
+        )
+        sq.commit()
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 0
+
+        assert sync.reopen_compute_results(pg_conn=pg) == 1
+        assert sync.reopen_compute_results(pg_conn=pg) == 0
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 1
+        row = sq.execute("SELECT research_fit_score, research_decision, fit_score, audit_score "
+                         "FROM jobs WHERE url=?", (url,)).fetchone()
+        assert row["research_fit_score"] == 9.5
+        assert row["research_decision"] == "strong_qualified"
+        assert row["fit_score"] == 6
+        assert row["audit_score"] == 8.0
+
+
 # ---------------------------------------------------------------------------
 # LINKEDIN pull (regression: pull was a report-only stub -- LinkedIn applies
 # never reached the brain, so brain-driven paths saw them as never-applied)
