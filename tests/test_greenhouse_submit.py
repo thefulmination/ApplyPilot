@@ -11,8 +11,10 @@ from applypilot.apply.greenhouse_submit import (
     adapter_enabled,
     apply_greenhouse,
     decide_route,
+    detect_confirmation,
     execute_form,
     plan_form_actions,
+    submit_enabled,
 )
 
 
@@ -39,6 +41,13 @@ def _ready_plan():
 class FakePage:
     def __init__(self):
         self.calls = []
+        self._content = ""
+
+    def set_content(self, html):
+        self._content = html
+
+    def content(self):
+        return self._content
 
     def fill(self, selector, value):
         self.calls.append(("fill", selector, value))
@@ -192,3 +201,59 @@ def test_adapter_enabled_when_flag_truthy(monkeypatch):
     assert adapter_enabled() is True
     monkeypatch.setenv("APPLYPILOT_GREENHOUSE_ADAPTER", "0")
     assert adapter_enabled() is False
+
+
+# --- submit ownership: second gate + confirmation detection ----------------
+
+def test_submit_ownership_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT", raising=False)
+    assert submit_enabled() is False
+
+
+def test_submit_ownership_enabled_when_flag_on(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT", "yes")
+    assert submit_enabled() is True
+
+
+def test_detect_confirmation_recognizes_a_success_state():
+    page = FakePage()
+    page.set_content("<h1>Thank you for applying!</h1> Your application has been submitted.")
+    assert detect_confirmation(page) == "applied"
+
+
+def test_detect_confirmation_defaults_to_no_confirmation_when_unproven():
+    page = FakePage()
+    page.set_content("<form>...<span>This field is required</span></form>")
+    assert detect_confirmation(page) == "failed:no_confirmation"
+
+
+def test_detect_confirmation_never_raises():
+    class Boom:
+        def content(self):
+            raise RuntimeError("boom")
+    assert detect_confirmation(Boom()) == "failed:no_confirmation"
+
+
+def test_apply_greenhouse_owns_submit_and_reports_applied_on_confirmation():
+    page = FakePage()
+    page.set_content("Your application has been submitted. Thanks for applying!")
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
+    )
+    assert res["report"].submitted is True
+    assert ("click", "#submit_app") in page.calls
+    assert res["status"] == "applied"
+
+
+def test_apply_greenhouse_reports_no_confirmation_when_success_not_seen():
+    page = FakePage()
+    page.set_content("<form>Please correct the errors below.</form>")
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
+    )
+    assert res["report"].submitted is True
+    assert res["status"] == "failed:no_confirmation"

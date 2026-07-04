@@ -1361,26 +1361,40 @@ def is_usage_limit_result(status: str | None) -> bool:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
-def _maybe_greenhouse_shadow(job: dict, port: int, *, resume_text: str, resume_path) -> None:
-    """Opt-in SHADOW validation of the deterministic Greenhouse adapter.
+def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
+                            resume_text: str, resume_path) -> tuple[str, int] | None:
+    """Opt-in deterministic Greenhouse path. Returns (status, duration_ms) if it
+    OWNED the application, else None so the apply agent proceeds. Never raises.
 
-    OFF by default (APPLYPILOT_GREENHOUSE_ADAPTER). When enabled and the job is a
-    Greenhouse URL, this connects to the worker's Chrome, deterministically fills
-    the application form in a scratch tab in DRY-RUN (never clicks submit), logs
-    the resulting plan, then closes the tab and returns -- the apply agent still
-    owns the actual application. This proves the adapter works on live forms
-    before it is ever trusted to own a real submission. Never raises.
+    Two independent gates:
+      * APPLYPILOT_GREENHOUSE_ADAPTER  -> SHADOW: deterministically fill the form
+        in a scratch tab in DRY-RUN, log the plan, then fall through (agent still
+        submits). Proves the adapter works on live forms.
+      * + APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT -> OWN: for a ready plan on a real
+        (non-dry) run, fill + submit + confirm, and return the resulting status;
+        the agent is skipped. An incomplete plan (agent_fallback) always defers.
+
+    This runs INSIDE _run_job_impl, so the job has already cleared the apply
+    loop's lease / canary / cost gates before we get here.
     """
     try:
         from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
-        from applypilot.apply.greenhouse_submit import adapter_enabled, apply_greenhouse
+        from applypilot.apply.greenhouse_submit import (
+            adapter_enabled,
+            apply_greenhouse,
+            submit_enabled,
+        )
     except Exception:
-        return
+        return None
     if not adapter_enabled():
-        return
+        return None
     url = job.get("application_url") or job.get("url") or ""
     if not parse_greenhouse_url(url):
-        return
+        return None
+
+    own = submit_enabled() and not dry_run  # may we actually submit and own the outcome?
+    t0 = time.time()
+    res = None
     try:
         from playwright.sync_api import sync_playwright
         profile = config.load_profile()
@@ -1392,17 +1406,27 @@ def _maybe_greenhouse_shadow(job: dict, port: int, *, resume_text: str, resume_p
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 res = apply_greenhouse(url, profile=profile, resume_text=resume_text,
-                                       resume_path=pdf, page=page, dry_run=True)
-                plan = res.get("plan")
-                logger.info(
-                    "greenhouse shadow: route=%s ready=%s free_text=%s unmapped=%s",
-                    res.get("route"), res.get("ready"),
-                    list(plan.free_text) if plan else [], res.get("unmapped"),
-                )
+                                       resume_path=pdf, page=page, dry_run=not own)
             finally:
                 page.close()
     except Exception:
-        logger.debug("greenhouse shadow failed (non-fatal); agent proceeds", exc_info=True)
+        logger.debug("greenhouse adapter failed (non-fatal); agent proceeds", exc_info=True)
+        return None
+
+    if not res or res.get("route") != "deterministic":
+        logger.info("greenhouse adapter: deferring to agent (route=%s unmapped=%s)",
+                    (res or {}).get("route"), (res or {}).get("unmapped"))
+        return None
+    if not own:
+        plan = res.get("plan")
+        logger.info("greenhouse shadow OK: ready=%s free_text=%s",
+                    res.get("ready"), list(plan.free_text) if plan else [])
+        return None  # shadow: agent still owns the submission
+
+    status = res.get("status", "failed:no_confirmation")
+    duration_ms = int((time.time() - t0) * 1000)
+    logger.info("greenhouse adapter OWNED submit for %s -> %s", url, status)
+    return (status, duration_ms)
 
 
 def run_job(job: dict, port: int, worker_id: int = 0,
@@ -1458,9 +1482,13 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    # Opt-in shadow validation of the deterministic Greenhouse adapter (no-op
-    # unless APPLYPILOT_GREENHOUSE_ADAPTER is set). Never affects the agent run.
-    _maybe_greenhouse_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
+    # Opt-in deterministic Greenhouse adapter (no-op unless
+    # APPLYPILOT_GREENHOUSE_ADAPTER is set). Owns the application only with the
+    # second submit gate on a ready plan; otherwise validates + falls through.
+    gh_result = _maybe_greenhouse_apply(job, port, dry_run=dry_run,
+                                        resume_text=resume_text, resume_path=resume_path)
+    if gh_result is not None:
+        return gh_result
 
     # Reset the worker's isolated working directory FIRST. build_prompt stages
     # upload files under worker-{id}/current and reset_worker_dir wipes

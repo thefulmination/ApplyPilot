@@ -20,10 +20,48 @@ from dataclasses import dataclass, field
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 
 
+def _flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def adapter_enabled() -> bool:
     """Opt-in gate for the live-apply hook. OFF by default so production apply
     behaviour is unchanged until the owner sets APPLYPILOT_GREENHOUSE_ADAPTER."""
-    return os.environ.get("APPLYPILOT_GREENHOUSE_ADAPTER", "").strip().lower() in {"1", "true", "yes", "on"}
+    return _flag("APPLYPILOT_GREENHOUSE_ADAPTER")
+
+
+def submit_enabled() -> bool:
+    """Second, independent gate: lets the adapter OWN a real submission (fill +
+    click submit + record the outcome). OFF by default so turning on shadow
+    validation can never accidentally start submitting. Requires
+    APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT in addition to the adapter flag."""
+    return _flag("APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT")
+
+
+# Positive proof that the application went through. Absent any of these we report
+# no_confirmation -- a false "applied" is worse than a failure.
+_SUCCESS_MARKERS = (
+    "thank you for applying",
+    "thanks for applying",
+    "application received",
+    "application submitted",
+    "your application has been submitted",
+    "we've received your application",
+    "we have received your application",
+    "successfully submitted",
+)
+
+
+def detect_confirmation(page) -> str:
+    """Inspect the post-submit page. Return 'applied' only on positive
+    confirmation, else 'failed:no_confirmation'. Never raises."""
+    try:
+        html = (page.content() or "").lower()
+    except Exception:
+        return "failed:no_confirmation"
+    if any(marker in html for marker in _SUCCESS_MARKERS):
+        return "applied"
+    return "failed:no_confirmation"
 
 # Greenhouse hosted-form input ids equal the API field name (e.g. id="first_name",
 # id="question_12074265004"); the submit button is id="submit_app".
@@ -136,5 +174,8 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
 
     actions = plan_form_actions(plan, questions, resume_path=resume_path)
     report = execute_form(actions, page, dry_run=dry_run)
-    return {"route": "deterministic", "plan": plan, "actions": actions,
-            "report": report, "ready": True}
+    result = {"route": "deterministic", "plan": plan, "actions": actions,
+              "report": report, "ready": True}
+    if report.submitted:
+        result["status"] = detect_confirmation(page)
+    return result
