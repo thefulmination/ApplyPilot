@@ -145,8 +145,29 @@ def decide_route(plan: AnswerPlan) -> tuple[str, list]:
     return ("agent_fallback", list(plan.unmapped_required))
 
 
+def capture_answers(plan, questions, job, *, remember_fn=None) -> int:
+    """Append each verified free-text answer to the corpus (question label ->
+    answer) so retrieval compounds over time. Returns how many were captured."""
+    if remember_fn is None:
+        from applypilot.apply.answerer import remember_answer as remember_fn
+
+    labels: dict = {}
+    for q in questions or []:
+        for f in q.get("fields", []) or []:
+            labels[f.get("name")] = q.get("label", "")
+
+    captured = 0
+    for name, text in (plan.free_text or {}).items():
+        label = labels.get(name)
+        if label and text:
+            remember_fn(label, text, job=job)
+            captured += 1
+    return captured
+
+
 def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
-                     corpus=None, fetch=None, answer_fn=None, dry_run: bool = True) -> dict:
+                     corpus=None, fetch=None, answer_fn=None, remember_fn=None,
+                     dry_run: bool = True) -> dict:
     """End-to-end: parse -> fetch questions -> plan -> route.
 
     When the plan is complete (``ready``) it fills the form deterministically
@@ -178,4 +199,7 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
               "report": report, "ready": True}
     if report.submitted:
         result["status"] = detect_confirmation(page)
+        if result["status"] == "applied":
+            result["captured"] = capture_answers(plan, questions, {"site": board},
+                                                  remember_fn=remember_fn)
     return result

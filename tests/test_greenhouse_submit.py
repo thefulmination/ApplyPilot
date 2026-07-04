@@ -10,6 +10,7 @@ from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply.greenhouse_submit import (
     adapter_enabled,
     apply_greenhouse,
+    capture_answers,
     decide_route,
     detect_confirmation,
     execute_form,
@@ -257,3 +258,52 @@ def test_apply_greenhouse_reports_no_confirmation_when_success_not_seen():
     )
     assert res["report"].submitted is True
     assert res["status"] == "failed:no_confirmation"
+
+
+# --- remember_answer capture loop ------------------------------------------
+
+def test_capture_answers_stores_question_label_and_answer():
+    calls = []
+
+    def spy(question, answer, **kw):
+        calls.append((question, answer))
+
+    plan = AnswerPlan(fields={"question_1": "my grounded answer"}, resume_field=None,
+                      free_text={"question_1": "my grounded answer"},
+                      unmapped_required=[], ready=True)
+    questions = [{"label": "Why do you want this role?",
+                  "fields": [{"name": "question_1", "type": "textarea"}]}]
+    n = capture_answers(plan, questions, {"site": "acme"}, remember_fn=spy)
+    assert n == 1
+    assert ("Why do you want this role?", "my grounded answer") in calls
+
+
+def _apply(page, *, dry_run, remember_fn):
+    return apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good,
+        dry_run=dry_run, remember_fn=remember_fn,
+    )
+
+
+def test_capture_happens_only_on_a_confirmed_submit():
+    calls = []
+    page = FakePage()
+    page.set_content("Your application has been submitted. Thanks for applying!")
+    _apply(page, dry_run=False, remember_fn=lambda q, a, **k: calls.append(q))
+    assert calls  # the free-text answer was captured
+
+
+def test_no_capture_on_dry_run():
+    calls = []
+    _apply(FakePage(), dry_run=True, remember_fn=lambda q, a, **k: calls.append(q))
+    assert calls == []
+
+
+def test_no_capture_when_submit_not_confirmed():
+    calls = []
+    page = FakePage()
+    page.set_content("<form>This field is required</form>")
+    _apply(page, dry_run=False, remember_fn=lambda q, a, **k: calls.append(q))
+    assert calls == []
