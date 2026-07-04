@@ -1429,6 +1429,53 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     return (status, duration_ms)
 
 
+def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) -> None:
+    """Opt-in SHADOW validation of the deterministic Lever adapter.
+
+    Lever's submit is hCaptcha-gated, so the adapter never owns submission: this
+    discovers + deterministically fills the form in a scratch tab (no submit
+    action is ever emitted), logs the plan, then closes the tab. The apply agent
+    still owns the real submission. Gated by APPLYPILOT_GREENHOUSE_ADAPTER (the
+    shared adapter flag). Never raises.
+    """
+    try:
+        from applypilot.apply.greenhouse_submit import adapter_enabled, execute_form
+        from applypilot.apply.lever_adapter import (
+            build_lever_plan,
+            discover_fields,
+            parse_lever_url,
+            plan_lever_form_actions,
+        )
+    except Exception:
+        return
+    if not adapter_enabled():
+        return
+    url = job.get("application_url") or job.get("url") or ""
+    if not parse_lever_url(url):
+        return
+    try:
+        from playwright.sync_api import sync_playwright
+        profile = config.load_profile()
+        pdf = str(Path(resume_path).with_suffix(".pdf")) if resume_path else None
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                fields = discover_fields(page)
+                plan = build_lever_plan(fields, profile=profile, resume_text=resume_text,
+                                        job={"site": job.get("site", "")})
+                execute_form(plan_lever_form_actions(plan, fields, resume_path=pdf),
+                             page, dry_run=True)
+                logger.info("lever shadow: fields=%d ready=%s free_text=%s unmapped=%s",
+                            len(fields), plan.ready, list(plan.free_text), plan.unmapped_required)
+            finally:
+                page.close()
+    except Exception:
+        logger.debug("lever shadow failed (non-fatal); agent proceeds", exc_info=True)
+
+
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str | None = "sonnet", dry_run: bool = False,
             agent: str = "claude", inbox_auth_hint: str | None = None,
@@ -1489,6 +1536,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         resume_text=resume_text, resume_path=resume_path)
     if gh_result is not None:
         return gh_result
+    _maybe_lever_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
 
     # Reset the worker's isolated working directory FIRST. build_prompt stages
     # upload files under worker-{id}/current and reset_worker_dir wipes

@@ -8,11 +8,13 @@ agent still owns submission -- out of scope for these read+map tests.
 No browser here: the page's field-discovery result and the answerer are injected.
 """
 
+from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply.lever_adapter import (
     build_lever_plan,
     discover_fields,
     normalize_fields,
     parse_lever_url,
+    plan_lever_form_actions,
 )
 
 
@@ -146,3 +148,28 @@ def test_required_unmappable_card_blocks_ready():
     plan = _plan(q)
     assert plan.ready is False
     assert any("favorite framework" in u.lower() for u in plan.unmapped_required)
+
+
+# --- plan_lever_form_actions (name-attr selectors, never submits) -----------
+
+def test_lever_form_actions_use_name_selectors_and_never_submit():
+    plan = AnswerPlan(
+        fields={"name": "Jordan Rivera", "email": "j@x.com",
+                "cards[u][field0]": "my answer", "cards[u][field1]": "Yes"},
+        resume_field="resume", free_text={"cards[u][field0]": "my answer"},
+        unmapped_required=[], ready=True,
+    )
+    fields = [
+        {"name": "name", "type": "text"},
+        {"name": "email", "type": "text"},
+        {"name": "cards[u][field0]", "type": "textarea"},
+        {"name": "cards[u][field1]", "type": "select"},
+    ]
+    actions = plan_lever_form_actions(plan, fields, resume_path="/r.pdf")
+    got = [(a.kind, a.selector, a.value) for a in actions]
+    assert ("file", 'input[name="resume"]', "/r.pdf") in got
+    assert ("fill", '[name="name"]', "Jordan Rivera") in got
+    assert ("textarea", '[name="cards[u][field0]"]', "my answer") in got
+    assert ("select", '[name="cards[u][field1]"]', "Yes") in got
+    # Lever submit is hCaptcha-gated -> the deterministic path never emits a submit.
+    assert all(a.kind != "submit" for a in actions)

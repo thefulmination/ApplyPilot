@@ -196,3 +196,28 @@ def build_lever_plan(fields, *, profile, resume_text, corpus=None,
     ready = bool(out.get("name") and out.get("email")) and not unmapped
     return AnswerPlan(fields=out, resume_field=resume_field, free_text=free_text,
                       unmapped_required=unmapped, ready=ready)
+
+
+def plan_lever_form_actions(plan, fields, *, resume_path=None):
+    """Turn a Lever AnswerPlan into deterministic form actions.
+
+    Lever inputs are keyed by their ``name`` attribute (not id). NOTE there is no
+    submit action: Lever's submit is hCaptcha-gated, so the deterministic path
+    fills the form and the apply agent still owns the actual submission.
+    """
+    from applypilot.apply.greenhouse_submit import FormAction
+
+    types = {f.get("name"): f.get("type", "") for f in fields or []}
+    actions = []
+    if plan.resume_field and resume_path:
+        actions.append(FormAction("file", f'input[name="{plan.resume_field}"]', resume_path))
+    for name, value in plan.fields.items():
+        selector = f'[name="{name}"]'
+        ftype = types.get(name)
+        if ftype == "select":
+            actions.append(FormAction("select", selector, value))
+        elif ftype == "textarea":
+            actions.append(FormAction("textarea", selector, value))
+        else:
+            actions.append(FormAction("fill", selector, value))
+    return actions
