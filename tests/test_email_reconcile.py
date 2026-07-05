@@ -141,7 +141,27 @@ def test_reconcile_rejects_probable_when_email_company_disagrees_with_job_compan
     assert res.unmatched_emails == 1
 
 
-def test_reconcile_keeps_probable_when_email_company_agrees_with_job_company():
+def test_reconcile_keeps_probable_when_email_company_agrees_but_title_differs():
+    jobs = [{"url": "https://meta.example/jobs/1", "application_url": "https://www.metacareers.com/jobs/1",
+             "company": "Meta", "title": "Strategic Partnerships Data Center Power Lead",
+             "site": "www.metacareers.com"}]
+    emails = [_email(
+        message_id="m-meta",
+        sender="careers@meta.com",
+        subject="Your Application to Meta",
+        body="We received your application for the Business Operations Manager role.",
+        company="Meta",
+        title="Business Operations Manager",
+    )]
+
+    res = er.reconcile(emails, jobs)
+
+    assert res.confirmed == []
+    assert len(res.probable) == 1
+    assert res.probable[0].job_url == "https://meta.example/jobs/1"
+
+
+def test_reconcile_promotes_exact_company_and_title_evidence_to_confirmed():
     jobs = [{"url": "https://www.indeed.com/viewjob?jk=anduril", "application_url": "https://grnh.se/anduril",
              "company": "Anduril", "title": "Talent Acquisition Operations Manager, Analytics",
              "site": "grnh.se"}]
@@ -156,9 +176,28 @@ def test_reconcile_keeps_probable_when_email_company_agrees_with_job_company():
 
     res = er.reconcile(emails, jobs)
 
+    assert len(res.confirmed) == 1
+    assert res.confirmed[0].job_url == "https://www.indeed.com/viewjob?jk=anduril"
+    assert res.probable == []
+
+
+def test_reconcile_rejects_generic_company_token_only_overlap():
+    jobs = [{"url": "https://hiring.cafe/viewjob/luma", "application_url": "https://jobs.gem.com/lumalabs-ai/1",
+             "company": "Luma AI", "title": "Revenue Operations Lead", "site": "jobs.gem.com"}]
+    emails = [_email(
+        message_id="m-featherless",
+        sender="Featherless AI Hiring Team <no-reply@ashbyhq.com>",
+        subject="Thanks for applying to Featherless AI!",
+        body="Thank you for applying for the Founding Business Development Rep role at Featherless AI.",
+        company="Featherless AI",
+        title="Founding Business Development Rep",
+    )]
+
+    res = er.reconcile(emails, jobs)
+
     assert res.confirmed == []
-    assert len(res.probable) == 1
-    assert res.probable[0].job_url == "https://www.indeed.com/viewjob?jk=anduril"
+    assert res.probable == []
+    assert res.unmatched_emails == 1
 
 
 def test_reconcile_resolves_each_job_once():
