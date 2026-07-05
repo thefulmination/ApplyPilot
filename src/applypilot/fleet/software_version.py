@@ -52,7 +52,7 @@ def git_identity(
         branch = runner(["git", "rev-parse", "--abbrev-ref", "HEAD"], root).strip()
         commit = runner(["git", "rev-parse", "HEAD"], root).strip()
         tree = runner(["git", "rev-parse", "HEAD^{tree}"], root).strip()
-        dirty = bool(runner(["git", "status", "--porcelain"], root).strip())
+        dirty = bool(runner(["git", "status", "--porcelain", "--untracked-files=no"], root).strip())
     except Exception:
         return GitIdentity(
             package_version=package_version,
