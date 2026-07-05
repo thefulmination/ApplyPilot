@@ -71,12 +71,19 @@ def classify_match(method: str | None, score: float | None, *, min_strong: float
 _COMPANY_TOKEN_STOP = frozenset({
     "the", "a", "an", "and", "of", "for", "at", "inc", "incorporated", "llc", "ltd",
     "co", "corp", "corporation", "company", "group", "holdings", "systems",
+    "ai", "bank", "global", "health", "markets", "medical", "network", "space",
 })
+_TITLE_TOKEN_STOP = frozenset({"the", "a", "an", "and", "of", "for", "at", "to"})
 
 
 def _company_tokens(value: str | None) -> set[str]:
     text = (value or "").casefold().replace("&", " and ")
     return {t for t in re.findall(r"[a-z0-9]+", text) if t not in _COMPANY_TOKEN_STOP}
+
+
+def _title_tokens(value: str | None) -> set[str]:
+    text = (value or "").casefold().replace("&", " and ")
+    return {t for t in re.findall(r"[a-z0-9]+", text) if t not in _TITLE_TOKEN_STOP}
 
 
 def _company_agrees(email_company: str | None, job_company: str | None) -> bool:
@@ -95,6 +102,16 @@ def _match_evidence_consistent(email: OutcomeEmail, job: Mapping[str, object], m
     if method in STRONG_METHODS:
         return True
     return _company_agrees(email.company, str(job.get("company") or ""))
+
+
+def _exact_company_title_evidence(email: OutcomeEmail, job: Mapping[str, object]) -> bool:
+    email_title_tokens = _title_tokens(email.title)
+    job_title_tokens = _title_tokens(str(job.get("title") or ""))
+    return (
+        bool(email_title_tokens)
+        and email_title_tokens == job_title_tokens
+        and _company_agrees(email.company, str(job.get("company") or ""))
+    )
 
 
 def load_outcome_emails(conn) -> list:
@@ -227,6 +244,8 @@ def reconcile(
         if not _match_evidence_consistent(e, job, method):
             unmatched += 1
             continue
+        if cls == "probable" and _exact_company_title_evidence(e, job):
+            cls = "confirmed"
         url = job["url"]
         cand = Resolution(job_url=url, message_id=e.message_id, method=method, score=float(score),
                           stage=e.stage, occurred_at=e.occurred_at, classification=cls)
