@@ -185,7 +185,9 @@ def test_dashboard_summarizes_apply_readiness_gates(live_server):
     assert "Agent failover" in html
     assert "blocked provider" in html
     assert "still available" in html
-    assert "Browser walls" in html
+    assert "Browser auth walls" in html
+    assert "Browser backend" in html
+    assert "restart browser backend" in html
     assert "Stale workers" in html
     assert "Stale active workers" in html
     assert "still marked active" in html

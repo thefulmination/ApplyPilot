@@ -2289,7 +2289,12 @@ function renderApplyReadiness(){
   const paused = Boolean(gate.paused || gate.should_halt || ats.paused || ats.ats_paused || doctor.ats_paused);
   const leaseable = Number(ats.leaseable || 0);
   const approved = Number(ats.approved || 0);
-  const wallCount = wallRows.length || Number(browserCounts.login_gate || 0) + Number(browserCounts.captcha || 0);
+  const authKinds = ["login_gate", "captcha", "email_otp"];
+  const backendKinds = ["browser_backend_crashed", "browser_service_unavailable", "browser_server_unavailable"];
+  const authWallCount = authKinds.reduce((total, kind) => total + Number(browserCounts[kind] || 0), 0) ||
+    wallRows.filter(row => authKinds.includes(row.kind || "")).length;
+  const browserBackendCount = backendKinds.reduce((total, kind) => total + Number(browserCounts[kind] || 0), 0) ||
+    wallRows.filter(row => backendKinds.includes(row.kind || "")).length;
   const goalConfigured = Boolean(dailyGoal.configured);
   const leaseableHint = leaseable > 0
     ? approved + " approved and leaseable"
@@ -2313,8 +2318,10 @@ function renderApplyReadiness(){
       blockedAgents.length
         ? (readyAgents.length ? readyAgents.join(", ") + " still available" : "no provider still available")
         : (readyAgents.length ? "no blocked provider reported" : "waiting for provider availability")],
-    ["Browser walls", wallCount ? "warn" : "ok", wallCount,
-      wallCount ? "login/captcha walls need review" : "no browser wall samples"],
+    ["Browser auth walls", authWallCount ? "warn" : "ok", authWallCount,
+      authWallCount ? "login/captcha/OTP needs operator review" : "no auth wall samples"],
+    ["Browser backend", browserBackendCount ? "warn" : "ok", browserBackendCount,
+      browserBackendCount ? "restart browser backend or worker service" : "no backend crash/server samples"],
     ["Stale workers", staleApply.length ? "warn" : "ok", staleApply.length,
       staleApply.length ? staleMachineSummary : "all apply heartbeats fresh"],
     ["Stale active workers", staleActiveApply.length ? "warn" : "ok", staleActiveApply.length,
