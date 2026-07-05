@@ -93,6 +93,38 @@ def _company_blocklist_sql() -> tuple[str, list[str]]:
     return "  AND " + "\n  AND ".join(clauses), params
 
 
+def _lane_filter_sql() -> tuple[str, list[str]]:
+    off_needles, on_tags = config.load_lane_filter()
+    params: list[str] = []
+    lane_parts = [
+        "COALESCE(fit_gap_category, '') != 'wrong_role_lane'",
+        "COALESCE(recommended_action, '') != 'ignore'",
+    ]
+    if off_needles:
+        tnorm = "LOWER(' ' || COALESCE(title, '') || ' ')"
+        title_or = " OR ".join(f"{tnorm} LIKE ?" for _ in off_needles)
+        params.extend(f"%{needle}%" for needle in off_needles)
+        flag_guard = ""
+        if on_tags:
+            flag_guard = " AND " + " AND ".join(
+                "COALESCE(audit_flags, '') NOT LIKE ?" for _ in on_tags
+            )
+            params.extend(f'%"{tag}"%' for tag in on_tags)
+        lane_parts.append(f"NOT (({title_or}){flag_guard})")
+    return (
+        "\n  AND (decision_source IS NOT NULL OR ("
+        + " AND ".join(lane_parts)
+        + "))",
+        params,
+    )
+
+
+def _inject_before_order_by(sql: str, clause: str) -> str:
+    if not clause:
+        return sql
+    return sql.replace("ORDER BY score DESC", clause + "\nORDER BY score DESC")
+
+
 def backfill_applied_set(sqlite_conn: sqlite3.Connection, pg_conn: Any) -> int:
     """Seed PG applied_set (the lease-time R9 dedup) from the home brain's apply history,
     so the fleet never re-applies a job already applied OUTSIDE the fleet. Idempotent."""
@@ -142,6 +174,7 @@ def push_apply_eligible(
     approved_batch: str | None = None,
     limit: int | None = None,
     include_research: bool = False,
+    lane_filter: bool = True,
 ) -> int:
     """Push approved offsite-eligible jobs from the brain into ``apply_queue`` (idempotent).
 
@@ -169,13 +202,17 @@ def push_apply_eligible(
         )
         if _applications_table_exists(sq):
             # Inject the cross-check before the ORDER BY clause.
-            base_sql = base_sql.replace(
-                "ORDER BY score DESC",
-                _PUSH_APPLY_LEDGER_CROSS_CHECK + "ORDER BY score DESC",
+            base_sql = _inject_before_order_by(
+                base_sql,
+                _PUSH_APPLY_LEDGER_CROSS_CHECK.rstrip("\n"),
             )
+        lane_params: list[str] = []
+        if lane_filter:
+            lane_sql, lane_params = _lane_filter_sql()
+            base_sql = _inject_before_order_by(base_sql, lane_sql)
         # Push the limit into SQL so we fetch only the top-N (not the whole eligible
         # set on a 70k+ job brain); keep the Python break as belt-and-suspenders.
-        sql, params = base_sql, [score_floor] + company_params
+        sql, params = base_sql, [score_floor] + company_params + lane_params
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -344,6 +381,7 @@ def push_linkedin_eligible(
     max_age_days: int | None = None,
     approved_batch=None,
     limit=None,
+    lane_filter: bool = True,
 ) -> int:
     """Push LinkedIn-eligible jobs from the brain into ``linkedin_queue`` (idempotent).
 
@@ -373,8 +411,13 @@ def push_linkedin_eligible(
             recency=recency,
             thin_description_chars=THIN_DESCRIPTION_CHARS,
         )
+        lane_params: list[str] = []
+        if lane_filter:
+            lane_sql, lane_params = _lane_filter_sql()
+            sql = _inject_before_order_by(sql, lane_sql)
         params.extend(company_params)
         params.extend(recency_params)
+        params.extend(lane_params)
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))

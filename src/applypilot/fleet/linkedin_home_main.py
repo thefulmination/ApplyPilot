@@ -143,6 +143,8 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
                          "LinkedIn can't be network-probed; stale postings are likely dead). "
                          "Pass 0 to disable.")
     sp.add_argument("--limit", type=int, default=None)
+    sp.add_argument("--no-lane-filter", action="store_true",
+                    help="Disable the default off-lane drift filter for this push.")
 
     sub.add_parser("pull")
 
@@ -172,7 +174,8 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     with pgqueue.connect(args.dsn) as conn:
         if args.cmd == "push":
             n = sync.push_linkedin_eligible(pg_conn=conn, score_floor=args.score_floor,
-                                            max_age_days=args.max_age_days, limit=args.limit)
+                                            max_age_days=args.max_age_days, limit=args.limit,
+                                            lane_filter=not args.no_lane_filter)
             print("pushed", n)
             unscored = sync.count_linkedin_unscored()
             if unscored:

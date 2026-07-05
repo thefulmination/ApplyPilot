@@ -29,7 +29,8 @@ CREATE TABLE jobs (
     url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
     audit_score REAL, fit_score INTEGER, full_description TEXT, liveness_status TEXT,
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
-    applied_at TEXT, discovered_at TEXT
+    applied_at TEXT, discovered_at TEXT, decision_source TEXT,
+    fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT
 );
 """
 
@@ -81,6 +82,39 @@ def test_push_linkedin_excludes_thin_description(fleet_db, tmp_path):
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
         assert n == 1
         assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/ok"}
+
+
+def test_push_linkedin_filters_off_lane_by_default(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_li(sq, "https://www.linkedin.com/jobs/view/onlane", title="Chief of Staff")
+    _add_li(sq, "https://www.linkedin.com/jobs/view/offlane",
+            title="Enterprise Account Executive")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
+        assert n == 1
+        assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/onlane"}
+
+
+def test_push_linkedin_keeps_human_decision_off_lane_rows(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_li(sq, "https://www.linkedin.com/jobs/view/human",
+            title="Enterprise Account Executive", decision_source="human_review",
+            fit_gap_category="wrong_role_lane", recommended_action="ignore")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
+        assert n == 1
+        assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/human"}
+
+
+def test_push_linkedin_can_disable_lane_filter(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_li(sq, "https://www.linkedin.com/jobs/view/offlane",
+            title="Enterprise Account Executive")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7,
+                                        lane_filter=False)
+        assert n == 1
+        assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/offlane"}
 
 
 # --- Issue 2: null/empty company or title is unapplyable + over-dedups ------

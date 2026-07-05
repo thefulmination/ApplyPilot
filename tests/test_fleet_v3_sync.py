@@ -32,7 +32,8 @@ CREATE TABLE jobs (
     applied_at TEXT, agent_id TEXT, verification_confidence TEXT,
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0,
     research_fit_score REAL, research_decision TEXT,
-    discovered_at TEXT
+    discovered_at TEXT, decision_source TEXT, fit_gap_category TEXT,
+    recommended_action TEXT, audit_flags TEXT
 );
 """
 
@@ -142,6 +143,82 @@ def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path)
             urls = {r["url"] for r in cur.fetchall()}
 
     assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_apply_eligible_filters_off_lane_by_default(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
+             company="Acme Inc", title="Chief of Staff")
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/2",
+             company="Sales Co", title="Enterprise Account Executive")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_apply_eligible_keeps_human_decision_off_lane_rows(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/1",
+             company="Sales Co", title="Enterprise Account Executive",
+             decision_source="human_review")
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/2",
+             company="Sales Co", title="Enterprise Account Executive",
+             decision_source="human_review", fit_gap_category="wrong_role_lane",
+             recommended_action="ignore")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 2
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {
+        "https://boards.greenhouse.io/sales/jobs/1",
+        "https://boards.greenhouse.io/sales/jobs/2",
+    }
+
+
+def test_push_apply_eligible_keeps_audit_flag_positive_override(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
+             company="Acme Inc", title="Enterprise Account Executive to CRO",
+             audit_flags='["chief_of_staff"]')
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_apply_eligible_can_disable_lane_filter(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/1",
+             company="Sales Co", title="Enterprise Account Executive")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A",
+                                     limit=None, lane_filter=False)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/sales/jobs/1"}
 
 
 def test_push_linkedin_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):

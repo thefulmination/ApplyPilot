@@ -18,7 +18,7 @@ logger = logging.getLogger("applypilot.fleet.apply_home_main")
 
 
 def push_home(conn, *, sqlite_conn=None, score_floor: int = 7, limit: int | None = None,
-              include_research: bool = False) -> int:
+              include_research: bool = False, lane_filter: bool = True) -> int:
     """The home 'push' cadence: stage apply-eligible jobs (+ backfill applied_set,
     inside push_apply_eligible), and best-effort push the brain's email_events outcome
     summaries into PG inbox_outcomes (R8 feedback loop). The outcomes push is advisory
@@ -26,7 +26,8 @@ def push_home(conn, *, sqlite_conn=None, score_floor: int = 7, limit: int | None
     apply queue, so it is logged and swallowed rather than raised."""
     pushed = sync.push_apply_eligible(sqlite_conn=sqlite_conn, pg_conn=conn,
                                        score_floor=score_floor, limit=limit,
-                                       include_research=include_research)
+                                       include_research=include_research,
+                                       lane_filter=lane_filter)
     try:
         sync.push_inbox_outcomes(sqlite_conn=sqlite_conn, pg_conn=conn)
     except Exception:
@@ -210,6 +211,8 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     sp = sub.add_parser("push"); sp.add_argument("--score-floor", type=int, default=7); sp.add_argument("--limit", type=int, default=None)
     sp.add_argument("--include-research", action="store_true",
                     help="Also stage jobs whose fleet research_fit_score meets the score floor.")
+    sp.add_argument("--no-lane-filter", action="store_true",
+                    help="Disable the default off-lane drift filter for this push.")
     sub.add_parser("pull")
     ca = sub.add_parser("canary"); ca.add_argument("k", type=int)
     sub.add_parser("lift-canary")
@@ -229,7 +232,8 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     with pgqueue.connect(args.dsn) as conn:
         if args.cmd == "push":
             print("pushed", push_home(conn, score_floor=args.score_floor, limit=args.limit,
-                                      include_research=args.include_research))
+                                      include_research=args.include_research,
+                                      lane_filter=not args.no_lane_filter))
         elif args.cmd == "pull":
             print("pulled", sync.pull_apply_results(pg_conn=conn))
         elif args.cmd == "canary":

@@ -44,7 +44,8 @@ def _setup_apply_env() -> None:
     to a home SQLite; the fleet has none, so sink it to a throwaway DB and read the REAL
     cost from launcher._last_run_stats."""
     os.environ["APPLYPILOT_BASE_RESUME"] = "1"
-    os.environ["APPLYPILOT_LANE_FILTER"] = "0"
+    # Fleet row selection is lane-filtered at push time; keep worker-side acquire opt-in.
+    os.environ.setdefault("APPLYPILOT_LANE_FILTER", "0")
     os.environ.setdefault("APPLYPILOT_DB_PATH", os.path.join(os.environ.get("TEMP", "/tmp"), "fleet_apply_throwaway.db"))
     os.environ.setdefault("CHROME_WORKER_DIR", os.path.join(os.environ.get("TEMP", "/tmp"), "chrome-workers"))
     os.environ.setdefault("APPLY_WORKER_DIR", os.path.join(os.environ.get("TEMP", "/tmp"), "apply-workers"))
