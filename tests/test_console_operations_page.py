@@ -79,3 +79,13 @@ def test_index_contains_operations_sections(live_server):
 
     assert "/api/diagnosis" in html
     assert "/api/agents" in html
+
+
+def test_agent_routing_table_is_responsively_contained(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert ".table-scroll" in html
+    assert "overflow-x:auto" in html
+    assert 'id="agentRouting"' in html
+    assert '<div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>' in html

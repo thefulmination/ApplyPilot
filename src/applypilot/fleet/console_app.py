@@ -1408,6 +1408,8 @@ _INDEX_HTML = r"""<!doctype html>
   .fstep{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px;min-height:70px}
   .fstep span{display:block;color:var(--muted);font-size:11px}
   .fstep b{font-size:22px}
+  .table-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .table-scroll table{min-width:620px}
   section{background:var(--panel);border:1px solid var(--border);border-radius:10px;
     padding:14px 16px;margin-bottom:16px}
   section h2{font-size:13px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
@@ -1531,8 +1533,8 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="agentRouting">
     <h2>Agent Routing</h2>
     <div id="agentVerdict" class="sub"></div>
-    <table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>
-      <tbody id="agentWorkers"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table>
+    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>
+      <tbody id="agentWorkers"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
   </section>
 
   <section id="machineHealth">
