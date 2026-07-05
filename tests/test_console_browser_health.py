@@ -165,3 +165,25 @@ def test_summarize_worker_logs_returns_actionable_wall_queue():
             "sample": "CapSolver ERROR_INVALID_TASK_DATA",
         },
     ]
+
+
+def test_summarize_worker_logs_prioritizes_browser_backend_errors():
+    summary = B.summarize_worker_logs([
+        {
+            "worker_id": "m2-0",
+            "machine_owner": "m2",
+            "last_error": "CapSolver ERROR_INVALID_TASK_DATA",
+            "recent_log": "hCaptcha appeared",
+        },
+        {
+            "worker_id": "m4-0",
+            "machine_owner": "m4",
+            "last_error": "ECONNREFUSED on port 9400; browser_unavailable",
+            "recent_log": "",
+        },
+    ])
+
+    assert [row["kind"] for row in summary["wall_queue"]] == [
+        "browser_service_unavailable",
+        "captcha",
+    ]

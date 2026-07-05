@@ -50,6 +50,8 @@ _ACTIONS = {
     "no_result_line": "Inspect the worker log before trusting the attempted apply outcome.",
 }
 
+_SEVERITY_RANK = {"error": 0, "warn": 1, "info": 2}
+
 
 def classify_text(text: str | None) -> dict:
     lower = (text or "").lower()
@@ -72,7 +74,7 @@ def summarize_worker_logs(rows: list[dict]) -> dict:
     counts: dict[str, int] = {}
     examples: dict[str, dict] = {}
     wall_queue: list[dict] = []
-    for row in rows:
+    for index, row in enumerate(rows):
         text = "\n".join(str(row.get(k) or "") for k in ("last_error", "recent_log"))
         cls = classify_text(text)
         kind = cls["kind"]
@@ -91,6 +93,7 @@ def summarize_worker_logs(rows: list[dict]) -> dict:
             "logs_url": f"/api/logs?worker={quote(str(worker_id or ''))}",
         })
         wall_queue.append({
+            "_order": index,
             "kind": kind,
             "severity": cls["severity"],
             "worker_id": worker_id,
@@ -100,4 +103,12 @@ def summarize_worker_logs(rows: list[dict]) -> dict:
             "action": _ACTIONS.get(kind, "Open logs and inspect before scaling applies."),
             "sample": _sample(row),
         })
+    wall_queue.sort(
+        key=lambda row: (
+            _SEVERITY_RANK.get(row.get("severity"), 99),
+            row.get("_order", 0),
+        )
+    )
+    for row in wall_queue:
+        row.pop("_order", None)
     return {"counts": counts, "examples": examples, "wall_queue": wall_queue[:12]}
