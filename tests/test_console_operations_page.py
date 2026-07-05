@@ -119,6 +119,10 @@ def test_dashboard_uses_friendly_machine_names(live_server):
     assert "machine_display_name" in html
     assert "w.machine_display_name" in html
     assert "machines[k].display_name" in html
+    assert "function displayMachineName" in html
+    assert '"m2": "TARPON"' in html
+    assert '"m4": "GGGTower"' in html
+    assert "displayMachineName(c.machine)" in html
 
 
 def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live_server):

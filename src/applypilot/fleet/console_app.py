@@ -1962,8 +1962,21 @@ function money(v){
   return "$" + Number(v).toFixed(2);
 }
 
+function displayMachineName(value){
+  const raw = value == null ? "" : String(value).trim();
+  if(!raw) return "(unknown)";
+  const names = {
+    "home": "Home",
+    "m2": "TARPON",
+    "m4": "GGGTower",
+    "mac": "Paloma Mac",
+    "mac-mac": "Paloma Mac",
+  };
+  return names[raw.toLowerCase()] || raw;
+}
+
 function machineName(obj, fallback){
-  return (obj && obj.machine_display_name) || fallback || "(unknown)";
+  return displayMachineName((obj && obj.machine_display_name) || fallback);
 }
 
 function isUsefulHomeIp(ip){
@@ -2767,7 +2780,7 @@ function renderDiagnostics(d){
   if(!d.clusters || !d.clusters.length){ ct.innerHTML = '<tr><td colspan="4" class="mut">no failure clusters in the window</td></tr>'; }
   else ct.innerHTML = d.clusters.map(c=>
     '<tr><td>'+esc(c.reason)+'</td><td class="mut">'+esc(c.host)+'</td><td class="mut">'+
-    esc(c.machine)+'</td><td>'+(c.sample_count||0)+'</td></tr>').join("");
+    esc(displayMachineName(c.machine))+'</td><td>'+(c.sample_count||0)+'</td></tr>').join("");
 
   const at = document.getElementById("docAuto");
   if(!d.auto_fixes || !d.auto_fixes.length){ at.innerHTML = '<tr><td colspan="5" class="mut">no active auto-fixes</td></tr>'; }
