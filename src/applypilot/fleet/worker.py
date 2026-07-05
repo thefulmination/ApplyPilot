@@ -527,6 +527,20 @@ class WorkerLoop:
             self._record_event(f"wrote linkedin applied {url}")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
+        if (run_status in ("login_issue", "auth_required")
+                and (out or {}).get("apply_channel") == "external"):
+            external_host = (out or {}).get("apply_external_host")
+            apply_error = "external_auth_required"
+            if external_host:
+                apply_error = f"{apply_error}:{str(external_host)[:160]}"
+            queue.write_linkedin_result(conn, self.worker_id, url, status="failed",
+                                        apply_status="auth_required", apply_error=apply_error[:200],
+                                        est_cost_usd=cost,
+                                        apply_channel=(out or {}).get("apply_channel"),
+                                        apply_external_host=external_host)
+            self._record_event(f"wrote linkedin external auth_required {url}")
+            self._beat(conn, state="idle")
+            return {"action": "external_auth_required", "url": url}
         if run_status in self._WALL_STATUSES:
             queue.park_linkedin_challenge(conn, self.worker_id, url, halt_seconds=self._linkedin_halt_seconds())
             _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,

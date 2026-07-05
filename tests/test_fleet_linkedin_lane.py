@@ -85,6 +85,51 @@ def test_linkedin_should_halt_ignores_apply_queue_spend_cap(fleet_db):
         assert pgqueue.linkedin_should_halt(conn) is True
 
 
+def test_linkedin_external_auth_required_closes_job_without_account_halt(fleet_db):
+    from applypilot.fleet.worker import WorkerLoop
+
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_li(conn, 1)
+
+    def external_auth(_job):
+        return {
+            "run_status": "auth_required",
+            "est_cost_usd": 0.02,
+            "apply_channel": "external",
+            "apply_external_host": "workdayjobs.com",
+        }
+
+    loop = WorkerLoop(
+        lambda: pgqueue.connect(fleet_db),
+        "w-ext-auth",
+        home_ip="1.1.1.1",
+        role="linkedin",
+        public_ip="1.1.1.1",
+        owner_ip="1.1.1.1",
+        apply_fn=external_auth,
+    )
+
+    assert loop.run_once() == {"action": "external_auth_required", "url": "li0"}
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT status::text, apply_status, apply_error, apply_channel, apply_external_host "
+            "FROM linkedin_queue WHERE url='li0'"
+        )
+        row = cur.fetchone()
+        assert row["status"] == "failed"
+        assert row["apply_status"] == "auth_required"
+        assert row["apply_error"] == "external_auth_required:workdayjobs.com"
+        assert row["apply_channel"] == "external"
+        assert row["apply_external_host"] == "workdayjobs.com"
+
+        cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
+        assert cur.fetchone()["n"] == 0
+        cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
+        governor = cur.fetchone()
+        assert governor is not None and governor["halted_until"] is None
+
+
 def test_linkedin_driver_uses_lane_specific_halt(monkeypatch):
     from applypilot.fleet import linkedin_worker_main as lm
 
@@ -197,11 +242,9 @@ def test_linkedin_setup_env_prefers_repo_local_profile(monkeypatch, tmp_path):
     assert os.environ["APPLYPILOT_DB_PATH"].endswith("fleet_apply_throwaway.db")
 
 
-from applypilot.fleet import governor
-
-
 def test_park_linkedin_sets_halt_one_tx_even_without_account_row(fleet_db):
     from applypilot.fleet import queue
+
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, lease_owner) "
                     "VALUES ('lp','https://linkedin.com/jobs/x','9','leased','ats','w1')")
@@ -210,18 +253,21 @@ def test_park_linkedin_sets_halt_one_tx_even_without_account_row(fleet_db):
         cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
         assert cur.fetchone()["halted_until"] is not None       # account row was INSERTed + halted
         cur.execute("SELECT status, apply_status FROM linkedin_queue WHERE url='lp'")
-        r = cur.fetchone(); assert r["status"] == "leased" and r["apply_status"] == "challenge_pending"  # frozen, not closed
+        r = cur.fetchone()
+        assert r["status"] == "leased" and r["apply_status"] == "challenge_pending"  # frozen, not closed
 
 
 def test_reclaim_linkedin_crash_unconfirmed_only(fleet_db):
     from applypilot.fleet import queue
+
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, lease_owner, lease_expires_at, attempts) "
                     "VALUES ('lr','https://linkedin.com/jobs/y','9','leased','ats','wDead', now()-interval '5 min', 1)")
         conn.commit()
         assert queue.reclaim_linkedin(conn) == 1
         cur.execute("SELECT status, attempts FROM linkedin_queue WHERE url='lr'")
-        r = cur.fetchone(); assert r["status"] == "crash_unconfirmed" and r["attempts"] == 99  # NEVER re-queued
+        r = cur.fetchone()
+        assert r["status"] == "crash_unconfirmed" and r["attempts"] == 99  # NEVER re-queued
 
 
 def test_clear_and_kill_halt(fleet_db):
