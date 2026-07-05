@@ -1,0 +1,66 @@
+from applypilot.apply import pgqueue
+from applypilot.fleet import queue_diagnosis
+
+
+def _seed_apply_row(
+    cur,
+    *,
+    url,
+    status="queued",
+    company="Acme",
+    title="Analyst",
+    dedup_key="dk",
+    approved=True,
+    apply_error=None,
+):
+    cur.execute(
+        "INSERT INTO apply_queue "
+        "(url, application_url, score, status, lane, apply_domain, target_host, "
+        "dedup_key, approved_batch, company, title, apply_error) "
+        "VALUES (%s,%s,9,%s,'ats','boards.greenhouse.io','boards.greenhouse.io',"
+        "%s,%s,%s,%s,%s)",
+        (
+            url,
+            f"https://example.test/{url}",
+            status,
+            dedup_key,
+            "batch-1" if approved else None,
+            company,
+            title,
+            apply_error,
+        ),
+    )
+
+
+def test_queue_diagnosis_counts_base_leaseable_and_dedup_blocked_rows(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="leaseable", dedup_key="dk-open")
+        _seed_apply_row(cur, url="unapproved", dedup_key="dk-unapproved", approved=False)
+        _seed_apply_row(cur, url="blocked-stale", company="HiringCafe", dedup_key="dk-board")
+        cur.execute(
+            "INSERT INTO applied_set (dedup_key, company) VALUES ('dk-board','HiringCafe')"
+        )
+        _seed_apply_row(
+            cur,
+            url="crash-source",
+            status="crash_unconfirmed",
+            dedup_key="dk-crash",
+            apply_error="failed:timeout",
+        )
+        _seed_apply_row(cur, url="blocked-crash", dedup_key="dk-crash")
+        cur.execute(
+            "INSERT INTO applied_set (dedup_key, company) VALUES ('dk-crash','Acme')"
+        )
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        result = queue_diagnosis.queue_diagnosis(conn)
+
+    assert result["queued"]["total"] == 4
+    assert result["queued"]["approved_ats"] == 3
+    assert result["queued"]["dedup_blocked"] == 2
+    assert result["queued"]["base_leaseable"] == 1
+    assert result["dedup"]["blocked_sources"]["has_crash_source"] == 1
+    assert result["dedup"]["blocked_sources"]["no_current_queue_source"] == 1
+    assert result["dedup"]["overbroad_groups"][0]["dedup_key"] == "dk-board"
+    assert result["dedup"]["overbroad_groups"][0]["queued_rows"] == 1

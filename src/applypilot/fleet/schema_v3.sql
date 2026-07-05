@@ -237,17 +237,6 @@ CREATE TABLE IF NOT EXISTS applied_set (
 -- (CREATE TABLE IF NOT EXISTS above is a no-op on an already-existing table).
 ALTER TABLE applied_set ADD COLUMN IF NOT EXISTS got_response BOOLEAN NOT NULL DEFAULT FALSE;
 
-CREATE TABLE IF NOT EXISTS dedup_repair_actions (
-    id             BIGSERIAL PRIMARY KEY,
-    url            TEXT NOT NULL,
-    old_dedup_key  TEXT NOT NULL,
-    new_dedup_key  TEXT NOT NULL,
-    reason         TEXT,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_dedup_repair_actions_old_key
-    ON dedup_repair_actions (old_dedup_key, created_at);
-
 -- ---------------------------------------------------------------------------
 -- answer_bank: screening-question answers, broker-served, defer-on-unknown (R10).
 -- ---------------------------------------------------------------------------
@@ -560,6 +549,31 @@ CREATE INDEX IF NOT EXISTS idx_fleet_diagnoses_status
 CREATE INDEX IF NOT EXISTS idx_fleet_diagnoses_cluster
     ON fleet_diagnoses (cluster_key) WHERE status IN ('auto_applied','recommended','open');
 
+-- autotriage_actions: audit trail for autonomous bounded LLM/rule triage.
+-- The LLM may choose only from a fixed action menu, and the executor validates
+-- each action before mutating fleet state. This table records both applied and
+-- rejected choices so the loop is inspectable and reversible.
+CREATE TABLE IF NOT EXISTS autotriage_actions (
+    id                 BIGSERIAL PRIMARY KEY,
+    url                TEXT,
+    worker_id          TEXT,
+    chosen_action      TEXT,
+    decision_source    TEXT,
+    confidence         REAL,
+    reason             TEXT,
+    action_status      TEXT NOT NULL DEFAULT 'planned',
+    prior_status       TEXT,
+    prior_attempts     INTEGER,
+    prior_apply_error  TEXT,
+    evidence           JSONB,
+    how_to_reverse     TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_autotriage_url
+    ON autotriage_actions (url, created_at);
+CREATE INDEX IF NOT EXISTS idx_autotriage_status
+    ON autotriage_actions (action_status, created_at);
+
 -- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on
 -- the diagnosis row, so a Reverse / audit can report exactly which/how-many rows were affected,
 -- how many prior incidents, and how broad the block was -- without re-deriving from transient state.
@@ -592,3 +606,5 @@ CREATE TABLE IF NOT EXISTS dedup_repair_actions (
     how_to_reverse  TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_dedup_repair_actions_old_key
+    ON dedup_repair_actions (old_dedup_key, created_at);

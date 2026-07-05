@@ -129,6 +129,28 @@ Use SSH over Tailscale for bootstrap/repair only:
 
 The default check is intentionally quick and bounded; add `-RunHealth` when you want the slower remote `fleet-health.ps1 -SkipRemote` probe. The apply mode runs the same idempotent repair path on each target: branch-specific `git fetch`, optional branch checkout, `git merge --ff-only`, fleet-task/process stop, `pip install -e .`, and scheduled-task registration. Run health as a separate `-RunHealth` check after repair. Do not use SSH to hand-edit fleet files; fix the repo, publish the branch/tag, then let auto-update converge.
 
+### Fleet Queue Repair
+
+Use the read-only repair report before changing queue state:
+
+```powershell
+applypilot-fleet-repair-report --dsn $env:FLEET_PG_DSN
+applypilot-fleet-repair-report --dsn $env:FLEET_PG_DSN --json
+```
+
+If the report finds outcome-email-confirmed `crash_unconfirmed` jobs, flip only the confirmed matches with a cap:
+
+```powershell
+applypilot-fleet-reconcile-email --dsn $env:FLEET_PG_DSN --no-scan --apply --confirmed-only --max-flips 1
+```
+
+If the report finds approved rows blocked by an overbroad aggregator dedup key, dry-run first and apply only the proposed row-specific repair:
+
+```powershell
+applypilot-fleet-dedup-repair --dsn $env:FLEET_PG_DSN --dedup-key <key> --json
+applypilot-fleet-dedup-repair --dsn $env:FLEET_PG_DSN --dedup-key <key> --apply --max-rows 25
+```
+
 ---
 
 ## Configuration

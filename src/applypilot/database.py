@@ -5,6 +5,7 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import os
 import re
 import sqlite3
 import threading
@@ -17,6 +18,30 @@ from applypilot.config import DB_PATH
 
 MIN_GOOD_DESCRIPTION_CHARS = 200
 THIN_DESCRIPTION_CHARS = 500
+DEFAULT_LLM_MAX_JOB_AGE_DAYS = 45
+
+
+def _llm_max_job_age_days() -> int:
+    raw = os.environ.get("APPLYPILOT_MAX_LLM_JOB_AGE_DAYS")
+    if not raw:
+        return DEFAULT_LLM_MAX_JOB_AGE_DAYS
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_MAX_JOB_AGE_DAYS
+
+
+def llm_stage_liveness_sql() -> str:
+    """SQL guard for token-spending stages."""
+    max_age_days = _llm_max_job_age_days()
+    freshness = ""
+    if max_age_days > 0:
+        freshness = (
+            "AND (COALESCE(posted_at, discovered_at) IS NULL "
+            f"OR julianday(COALESCE(posted_at, discovered_at)) >= julianday('now', '-{max_age_days} days') "
+            "OR COALESCE(liveness_status, '') = 'live')"
+        )
+    return f"AND COALESCE(liveness_status, '') != 'dead' {freshness}"
 
 def _ensure_desc_quality(row: dict[str, Any]) -> tuple[str, int]:
     """Compute deterministic description-quality telemetry for one job row."""
@@ -2040,13 +2065,14 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if conn is None:
         conn = get_connection()
 
+    liveness_guard = llm_stage_liveness_sql()
     conditions = {
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL AND duplicate_of_url IS NULL",
         "enriched": "full_description IS NOT NULL AND duplicate_of_url IS NULL",
         "pending_score": (
             f"full_description IS NOT NULL AND LENGTH(full_description) >= {MIN_GOOD_DESCRIPTION_CHARS} "
-            "AND fit_score IS NULL AND duplicate_of_url IS NULL"
+            f"AND fit_score IS NULL AND duplicate_of_url IS NULL {liveness_guard}"
         ),
         "scored": "fit_score IS NOT NULL AND duplicate_of_url IS NULL",
         "pending_diagnosis": (
@@ -2060,7 +2086,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
             "COALESCE(audit_score, fit_score) >= ? AND full_description IS NOT NULL "
             f"AND LENGTH(COALESCE(full_description,'')) >= {THIN_DESCRIPTION_CHARS} "
             "AND duplicate_of_url IS NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            f"AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5 {liveness_guard}"
         ),
         "tailored": "tailored_resume_path IS NOT NULL AND duplicate_of_url IS NULL",
         "pending_apply": (
@@ -2068,7 +2094,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
             "AND duplicate_of_url IS NULL "
             "AND (apply_status IS NULL OR apply_status = 'failed') "
             f"AND LENGTH(COALESCE(full_description,'')) >= {THIN_DESCRIPTION_CHARS} "
-            "AND COALESCE(audit_score, fit_score, 0) >= 7"
+            f"AND COALESCE(audit_score, fit_score, 0) >= 7 {liveness_guard}"
         ),
         "applied": "applied_at IS NOT NULL AND duplicate_of_url IS NULL",
     }

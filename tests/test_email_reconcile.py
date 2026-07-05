@@ -66,12 +66,20 @@ def test_load_crash_jobs_shapes_candidates_for_matcher():
     assert jobs[0]["guard_after"] == "2026-06-29T12:00:00+00:00"   # updated_at -> guard_after
 
 
-def test_load_crash_jobs_filters_no_result_line_bucket():
+def test_load_crash_jobs_includes_all_crash_unconfirmed_buckets():
     fc = _FakeConn([])
     er.load_crash_jobs(fc)
     sql = fc._cur.executed[0][0].replace(" ", "")
     assert "status='crash_unconfirmed'" in sql
-    assert "failed:no_result_line" in sql
+    assert "failed:no_result_line" not in sql
+
+
+def test_load_crash_jobs_accepts_limit():
+    fc = _FakeConn([])
+    er.load_crash_jobs(fc, limit=25)
+    sql, params = fc._cur.executed[0]
+    assert "LIMIT %s" in sql
+    assert params == (25,)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +196,21 @@ def test_apply_resolutions_includes_probable_when_opted_in():
     conn = _ScriptConn(rowcounts=[1, 1])
     counts = er.apply_resolutions(conn, _res(probable=[_r("u2", cls="probable")]), include_probable=True)
     assert counts == {"flipped": 1, "skipped": 0}
+
+
+def test_apply_resolutions_stops_at_max_flips():
+    conn = _ScriptConn(rowcounts=[1, 1])
+    counts = er.apply_resolutions(
+        conn,
+        _res(confirmed=[_r("u1"), _r("u2")]),
+        max_flips=1,
+    )
+    assert counts == {"flipped": 1, "skipped": 0}
+    apply_updates = [
+        e for e in conn._cur.executed
+        if e[0].strip().upper().startswith("UPDATE APPLY_QUEUE")
+    ]
+    assert len(apply_updates) == 1
 
 
 # ---------------------------------------------------------------------------

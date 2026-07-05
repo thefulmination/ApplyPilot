@@ -97,6 +97,28 @@ Verify the queue depth:
 applypilot-fleet-apply-home --dsn $FLEET_PG_DSN status
 ```
 
+If raw queue counts look nonzero but nothing leases, run the read-only repair
+report before changing state:
+
+```bash
+applypilot-fleet-repair-report --dsn $FLEET_PG_DSN
+```
+
+Use its recommendations in order.  Confirmed outcome-email matches can be flipped
+with a small cap:
+
+```bash
+applypilot-fleet-reconcile-email --dsn $FLEET_PG_DSN --no-scan --apply --confirmed-only --max-flips 1
+```
+
+Overbroad aggregator dedup keys are dry-run first, then applied only to queued
+rows:
+
+```bash
+applypilot-fleet-dedup-repair --dsn $FLEET_PG_DSN --dedup-key <key> --json
+applypilot-fleet-dedup-repair --dsn $FLEET_PG_DSN --dedup-key <key> --apply --max-rows 25
+```
+
 ### Step 2 — Arm the canary (set K)
 
 K is the maximum number of applications the fleet may submit before auto-pausing

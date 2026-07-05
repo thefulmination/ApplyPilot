@@ -46,6 +46,20 @@ def test_build_compute_loop_wires_both_handlers(fleet_db):
     assert version == "v1"
 
 
+def test_build_compute_loop_rejects_missing_resume_context(fleet_db):
+    from applypilot.fleet import compute_worker_main as cwm
+    from applypilot.apply import pgqueue
+
+    with pgqueue.connect(fleet_db) as conn:
+        try:
+            cwm.build_compute_loop(conn, dsn=fleet_db, worker_id="w-empty", home_ip="1.1.1.1",
+                                   providers=["deepseek"], fallback=[], ensemble=False)
+        except RuntimeError as exc:
+            assert "ctx:resume" in str(exc)
+        else:
+            raise AssertionError("missing ctx:resume must fail before any compute job is scored")
+
+
 def test_maybe_refresh_context_rebuilds_on_version_change(fleet_db):
     from applypilot.fleet import compute_context as cc
     from applypilot.fleet import compute_worker_main as cwm

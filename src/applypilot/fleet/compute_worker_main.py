@@ -17,11 +17,21 @@ from applypilot.fleet.worker import WorkerLoop
 _VERSION_CHECK_INTERVAL = 10
 
 
+def _require_context(ctx, version: str) -> None:
+    if not ctx.resume_text.strip():
+        detail = "ctx:resume is empty" if version else "ctx:version and ctx:resume are missing"
+        raise RuntimeError(
+            f"published compute context invalid: {detail}; run "
+            "applypilot-fleet-compute-home publish-context on the home machine"
+        )
+
+
 def build_compute_loop(conn, *, dsn, worker_id, home_ip, providers, fallback, ensemble,
                        machine_owner=None) -> tuple[WorkerLoop, str]:
     """Build the WorkerLoop and return (loop, initial_version) so callers can
     implement periodic re-fetch without calling load_context a second time."""
     ctx, version = cc.load_context(conn, providers=providers, fallback=fallback, ensemble=ensemble)
+    _require_context(ctx, version)
     fns = {"score": make_score_fn(ctx), "audit": make_audit_fn(ctx)}
     loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="compute",
                       compute_fns=fns, machine_owner=machine_owner)
@@ -40,6 +50,7 @@ def maybe_refresh_context(conn, loop: WorkerLoop, *, current_version: str,
     ctx, new_version = cc.load_context(conn, providers=providers, fallback=fallback,
                                        ensemble=ensemble)
     if new_version and new_version != current_version:
+        _require_context(ctx, new_version)
         loop.compute_fns = {"score": make_score_fn(ctx), "audit": make_audit_fn(ctx)}
         return new_version
     return current_version

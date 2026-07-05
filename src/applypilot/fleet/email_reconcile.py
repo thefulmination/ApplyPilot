@@ -109,14 +109,20 @@ def load_outcome_emails(conn) -> list:
     return out
 
 
-def load_crash_jobs(conn) -> list[dict]:
-    """Read the crash_unconfirmed / no_result_line jobs and shape them as match_email_to_job
-    candidates (site = apply_domain). Read-only."""
+def load_crash_jobs(conn, *, limit: int | None = None) -> list[dict]:
+    """Read crash_unconfirmed jobs and shape them as match_email_to_job candidates
+    (site = apply_domain). Read-only."""
+    sql = (
+        "SELECT url, application_url, company, title, apply_domain, dedup_key, updated_at "
+        "FROM apply_queue WHERE status='crash_unconfirmed' "
+        "ORDER BY updated_at DESC, url"
+    )
+    params = None
+    if limit is not None:
+        sql += " LIMIT %s"
+        params = (max(int(limit), 0),)
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT url, application_url, company, title, apply_domain, dedup_key, updated_at "
-            "FROM apply_queue WHERE status='crash_unconfirmed' AND apply_error='failed:no_result_line'"
-        )
+        cur.execute(sql, params)
         out = []
         for r in cur.fetchall():
             out.append({
@@ -155,11 +161,19 @@ def reconcile(emails: list, jobs: list[dict], *, min_strong: float = MIN_STRONG)
                            unmatched_emails=unmatched, jobs_total=len(jobs))
 
 
-def apply_resolutions(conn, result: ReconcileResult, *, include_probable: bool = False) -> dict:
+def apply_resolutions(
+    conn,
+    result: ReconcileResult,
+    *,
+    include_probable: bool = False,
+    max_flips: int | None = None,
+) -> dict:
     """Flip confirmed (and, if opted-in, probable) jobs crash_unconfirmed -> applied, guarded on
     the current status so it is idempotent and never clobbers a row another process moved. Writes
     one audit row per flip. One transaction per job."""
     targets = list(result.confirmed) + (list(result.probable) if include_probable else [])
+    if max_flips is not None:
+        targets = targets[: max(int(max_flips), 0)]
     flipped = skipped = 0
     for r in targets:
         try:

@@ -12,7 +12,7 @@ import uuid
 
 from applypilot import config
 from applypilot.apply import pgqueue
-from applypilot.fleet import queue, sync
+from applypilot.fleet import queue, queue_diagnosis, sync
 
 logger = logging.getLogger("applypilot.fleet.apply_home_main")
 
@@ -280,4 +280,5 @@ def _print_status(conn) -> None:
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
         open_ch = cur.fetchone()["n"]
     print({"queue": depth, "paused": cfg["paused"], "canary_remaining": cfg["canary_remaining"],
-           "spend_cap_usd": float(cfg["spend_cap_usd"] or 0), "apply_spend": spend, "open_challenges": open_ch})
+           "spend_cap_usd": float(cfg["spend_cap_usd"] or 0), "apply_spend": spend,
+           "open_challenges": open_ch, "queue_diagnosis": queue_diagnosis.queue_diagnosis(conn)})

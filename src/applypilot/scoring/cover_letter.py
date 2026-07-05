@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile, load_resume_strategy
-from applypilot.database import get_connection
+from applypilot.database import get_connection, llm_stage_liveness_sql
 from applypilot.llm import get_client
 from applypilot.scoring.filenames import safe_job_prefix
 from applypilot.scoring.validator import (
@@ -302,6 +302,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 900,
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < ? "
+        f"{llm_stage_liveness_sql()} "
         "ORDER BY COALESCE(audit_score, fit_score) DESC, fit_score DESC"
     )
     params: list = [min_score, MAX_ATTEMPTS]

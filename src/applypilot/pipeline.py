@@ -32,6 +32,7 @@ from applypilot.database import (
     get_connection,
     get_stats,
     init_db,
+    llm_stage_liveness_sql,
     start_pipeline_stage,
 )
 
@@ -511,7 +512,7 @@ _PENDING_SQL: dict[str, str] = {
     "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of_url IS NULL",
     "score": (
         "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL "
-        "AND fit_score IS NULL AND duplicate_of_url IS NULL"
+        "AND fit_score IS NULL AND duplicate_of_url IS NULL {llm_liveness}"
     ),
     "audit":  (
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL "
@@ -531,14 +532,14 @@ _PENDING_SQL: dict[str, str] = {
         "AND full_description IS NOT NULL "
         "AND duplicate_of_url IS NULL "
         "AND tailored_resume_path IS NULL "
-        "AND COALESCE(tailor_attempts, 0) < 5"
+        "AND COALESCE(tailor_attempts, 0) < 5 {llm_liveness}"
     ),
     "cover": (
         "SELECT COUNT(*) FROM jobs WHERE COALESCE(audit_score, fit_score) >= ? "
         "AND tailored_resume_path IS NOT NULL "
         "AND duplicate_of_url IS NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
-        "AND COALESCE(cover_attempts, 0) < 5"
+        "AND COALESCE(cover_attempts, 0) < 5 {llm_liveness}"
     ),
     "pdf": (
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
@@ -556,6 +557,7 @@ def _count_pending(stage: str, min_score: int = 7) -> int:
     sql = _PENDING_SQL.get(stage)
     if sql is None:
         return 0
+    sql = sql.format(llm_liveness=llm_stage_liveness_sql())
     conn = get_connection()
     if "?" in sql:
         return conn.execute(sql, (min_score,)).fetchone()[0]

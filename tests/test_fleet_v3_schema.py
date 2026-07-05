@@ -1,6 +1,8 @@
 """v3 schema: loads cleanly against real Postgres, idempotent, all tables + columns present."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import schema as fleet_schema
 
@@ -8,7 +10,7 @@ EXPECTED_TABLES = {
     "apply_queue", "fleet_config", "fleet_assets",  # base
     "compute_queue", "search_tasks", "linkedin_queue", "rate_governor", "llm_usage",
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
-    "workers", "worker_heartbeat", "poison_jobs", "remote_commands",
+    "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "autotriage_actions",
 }
 
 
@@ -32,6 +34,22 @@ def test_v3_schema_idempotent(fleet_db):
         fleet_schema.ensure_schema_v3(conn)
         got = _tables(conn)
     assert {"rate_governor", "search_tasks", "compute_queue"} <= got
+
+
+def test_v3_schema_declares_dedup_repair_actions_once():
+    schema = (Path(__file__).resolve().parents[1] / "src" / "applypilot" / "fleet" / "schema_v3.sql").read_text(
+        encoding="utf-8"
+    )
+
+    assert schema.count("CREATE TABLE IF NOT EXISTS dedup_repair_actions") == 1
+
+
+def test_v3_schema_declares_autotriage_actions_once():
+    schema = (Path(__file__).resolve().parents[1] / "src" / "applypilot" / "fleet" / "schema_v3.sql").read_text(
+        encoding="utf-8"
+    )
+
+    assert schema.count("CREATE TABLE IF NOT EXISTS autotriage_actions") == 1
 
 
 def test_v3_schema_migrates_compute_queue_url_primary_key(fleet_pg):
@@ -96,6 +114,18 @@ def test_fleet_config_v3_columns(fleet_db):
     for c in ("approval_threshold", "approval_policy", "approval_sampling_rate",
               "cost_cap_daily_usd", "cost_cap_total_usd", "pinned_worker_version"):
         assert c in cols, f"fleet_config missing {c}"
+
+
+def test_autotriage_actions_schema(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='autotriage_actions'")
+        cols = {r["column_name"] for r in cur.fetchall()}
+    for c in (
+        "url", "worker_id", "chosen_action", "decision_source", "confidence",
+        "action_status", "prior_status", "prior_apply_error", "evidence",
+        "how_to_reverse",
+    ):
+        assert c in cols, f"autotriage_actions missing {c}"
 
 
 def test_challenge_rate_is_generated(fleet_db):

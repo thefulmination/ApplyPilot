@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from applypilot.apply import pgqueue
+from applypilot.fleet import compute_context as cc
 from applypilot.fleet import compute_home_main as chm
 
 _DDL = """CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
@@ -69,6 +70,26 @@ def test_main_push_threads_unscored_only_and_limit(monkeypatch, capsys):
     assert called["unscored_only"] is True
     assert called["limit"] == 25
     assert capsys.readouterr().out == "pushed 7\n"
+
+
+def test_publish_context_from_app_dir_writes_versioned_compute_assets(fleet_db, tmp_path):
+    app_dir = tmp_path / ".applypilot"
+    app_dir.mkdir()
+    (app_dir / "resume.txt").write_text("REAL RESUME", encoding="utf-8")
+    (app_dir / "job_preference_profile.json").write_text('{"promptSummary":"prefs"}', encoding="utf-8")
+    (app_dir / "job_knowledge_graph_prompt.md").write_text("KG PROMPT", encoding="utf-8")
+    (app_dir / "searches.yaml").write_text("score_audit:\n  floor: 7\n", encoding="utf-8")
+
+    with pgqueue.connect(fleet_db) as pg:
+        version = chm.publish_context_from_app_dir(app_dir=app_dir, pg_conn=pg)
+        ctx, loaded_version = cc.load_context(pg, providers=["deepseek"])
+
+    assert version.startswith("ctx-")
+    assert loaded_version == version
+    assert ctx.resume_text == "REAL RESUME"
+    assert ctx.preference_profile == {"promptSummary": "prefs"}
+    assert ctx.kg_prompt == "KG PROMPT"
+    assert ctx.search_cfg == {"score_audit": {"floor": 7}}
 
 
 def test_reopen_results_exposes_compute_reopen_command(fleet_db):

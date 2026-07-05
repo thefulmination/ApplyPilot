@@ -337,6 +337,88 @@ def is_recent(iso_ts: str | None, max_age_days: int) -> bool:
         return False
 
 
+def _row_get(row, key: str):
+    if isinstance(row, dict):
+        return row.get(key)
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _effective_url(row) -> str:
+    app = str(_row_get(row, "application_url") or "")
+    if app.startswith(("http://", "https://")):
+        return app
+    return str(_row_get(row, "url") or "")
+
+
+def _write_liveness_results(conn, results: list[tuple[str, str, str, dict[str, str | None]]], *,
+                            dry_run: bool = False) -> int:
+    wrote = 0
+    now = datetime.now(timezone.utc).isoformat()
+    if dry_run:
+        return wrote
+    for i, (url, status, reason, meta) in enumerate(results):
+        transient = reason.startswith(("neterr", "error"))
+        if transient:
+            conn.execute(
+                "UPDATE jobs SET liveness_status = ?, liveness_reason = ? WHERE url = ?",
+                (status, reason, url))
+        else:
+            conn.execute(
+                "UPDATE jobs SET liveness_status = ?, liveness_reason = ?, "
+                "posted_at = COALESCE(posted_at, ?), "
+                "valid_through = COALESCE(valid_through, ?), "
+                "last_verified_live = ? WHERE url = ?",
+                (
+                    status, reason,
+                    (meta.get("posted_at") if meta else None),
+                    (meta.get("valid_through") if meta else None),
+                    now,
+                    url,
+                ))
+        wrote += 1
+        if i % 200 == 0:
+            conn.commit()
+    conn.commit()
+    return wrote
+
+
+def verify_candidate_rows(conn, rows, *, max_age_days: int = 1, workers: int = 16,
+                          dry_run: bool = False) -> dict:
+    """Verify exact candidate rows before token-spending stages run."""
+    row_list = list(rows)
+    todo: list[tuple[str, str, dict[str, str | None]]] = []
+    skipped_fresh = 0
+    for row in row_list:
+        if max_age_days > 0 and is_recent(_row_get(row, "last_verified_live"), max_age_days):
+            skipped_fresh += 1
+            continue
+        effective = _effective_url(row)
+        if not effective.startswith(("http://", "https://")):
+            continue
+        todo.append((str(_row_get(row, "url") or ""), effective, {}))
+
+    results: list[tuple[str, str, str, dict[str, str | None]]] = []
+    if todo:
+        worker_count = max(1, int(workers or 1))
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            futs = {
+                ex.submit(probe_url, app, meta=meta): (url, app, meta)
+                for (url, app, meta) in todo
+            }
+            for fut in as_completed(futs):
+                url, _app, meta = futs[fut]
+                status, reason = fut.result()
+                results.append((url, status, reason, meta))
+
+    counts = Counter(s for _, s, _, _ in results)
+    wrote = _write_liveness_results(conn, results, dry_run=dry_run)
+    return {"checked": len(results), "by_status": dict(counts),
+            "skipped_fresh": skipped_fresh, "candidates": len(row_list), "wrote": wrote}
+
+
 def verify_jobs(conn, *, tiers=("priority", "recommended"), score_floor: float | None = None,
                 max_age_days: int = 7, limit: int = 0, workers: int = 16, dry_run: bool = False,
                 progress=None) -> dict:
@@ -405,34 +487,7 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), score_floor: float |
                 progress(done, len(todo), results)
 
     counts = Counter(s for _, s, _, _ in results)
-    wrote = 0
-    now = datetime.now(timezone.utc).isoformat()
-    if not dry_run:
-        for i, (url, status, reason, meta) in enumerate(results):
-            # Transient fetch failures: record the status but leave
-            # last_verified_live untouched so the job is re-checked next run.
-            transient = reason.startswith(("neterr", "error"))
-            if transient:
-                conn.execute(
-                    "UPDATE jobs SET liveness_status = ?, liveness_reason = ? WHERE url = ?",
-                    (status, reason, url))
-            else:
-                conn.execute(
-                    "UPDATE jobs SET liveness_status = ?, liveness_reason = ?, "
-                    "posted_at = COALESCE(posted_at, ?), "
-                    "valid_through = COALESCE(valid_through, ?), "
-                    "last_verified_live = ? WHERE url = ?",
-                    (
-                        status, reason,
-                        (meta.get("posted_at") if meta else None),
-                        (meta.get("valid_through") if meta else None),
-                        now,
-                        url,
-                    ))
-            wrote += 1
-            if i % 200 == 0:
-                conn.commit()
-        conn.commit()
+    wrote = _write_liveness_results(conn, results, dry_run=dry_run)
 
     return {"checked": len(results), "by_status": dict(counts),
             "skipped_fresh": skipped_fresh, "candidates": len(rows), "wrote": wrote}

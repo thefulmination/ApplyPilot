@@ -234,8 +234,8 @@ def _parse_score_response(response: str) -> dict:
 
     # Fallbacks when the model ignores the format entirely.
     if not reasoning:
-        leftover = [l.strip() for l in response.split("\n")
-                    if l.strip() and not re.match(r"(?i)^[-*#\s]*(SCORE|KEYWORDS|VERDICT)\s*:", l)]
+        leftover = [line.strip() for line in response.split("\n")
+                    if line.strip() and not re.match(r"(?i)^[-*#\s]*(SCORE|KEYWORDS|VERDICT)\s*:", line)]
         reasoning = " ".join(leftover).strip() or response.strip()
     if not verdict and reasoning:
         verdict = re.split(r"(?<=[.!?])\s+", reasoning, maxsplit=1)[0][:300]
@@ -360,6 +360,75 @@ def _score_worker_count(workers: int | None = None) -> int:
         return 1
 
 
+def _score_preflight_liveness_enabled() -> bool:
+    return os.environ.get("APPLYPILOT_SCORE_PREFLIGHT_LIVENESS", "").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _score_preflight_max_age_days() -> int:
+    raw = os.environ.get("APPLYPILOT_SCORE_PREFLIGHT_MAX_AGE_DAYS", "1")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _score_preflight_workers(default_workers: int) -> int:
+    raw = os.environ.get("APPLYPILOT_SCORE_PREFLIGHT_WORKERS")
+    if raw is None:
+        return max(1, min(16, default_workers if default_workers > 1 else 16))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _dead_liveness_urls(conn, urls: list[str]) -> set[str]:
+    dead: set[str] = set()
+    for i in range(0, len(urls), 900):
+        chunk = urls[i:i + 900]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT url FROM jobs WHERE liveness_status='dead' AND url IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        dead.update(row["url"] for row in rows)
+    return dead
+
+
+def _preflight_scoring_liveness(conn, jobs: list[dict], worker_count: int) -> list[dict]:
+    if not _score_preflight_liveness_enabled() or not jobs:
+        return jobs
+    from applypilot.apply import liveness
+
+    summary = liveness.verify_candidate_rows(
+        conn,
+        jobs,
+        max_age_days=_score_preflight_max_age_days(),
+        workers=_score_preflight_workers(worker_count),
+        dry_run=False,
+    )
+    by_status = summary.get("by_status", {}) or {}
+    if summary.get("checked", 0):
+        log.info(
+            "Pre-score liveness checked %d candidates (live=%d, dead=%d, uncertain=%d; skipped fresh=%d).",
+            summary.get("checked", 0),
+            by_status.get("live", 0),
+            by_status.get("dead", 0),
+            by_status.get("uncertain", 0),
+            summary.get("skipped_fresh", 0),
+        )
+
+    dead_urls = _dead_liveness_urls(conn, [str(job.get("url") or "") for job in jobs])
+    if not dead_urls:
+        return jobs
+    filtered = [job for job in jobs if job.get("url") not in dead_urls]
+    log.info("Skipped %d dead postings before scoring.", len(jobs) - len(filtered))
+    return filtered
+
+
 def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = None) -> dict:
     """Score unscored jobs that have full descriptions.
 
@@ -401,7 +470,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
     conn = get_connection()
 
     if rescore:
-        query = _RESCORE_QUERY
+        query = f"{_RESCORE_QUERY} {database.llm_stage_liveness_sql()}"
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
@@ -418,6 +487,11 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
         jobs = [dict(zip(columns, row)) for row in jobs]
 
     worker_count = _score_worker_count(workers)
+    jobs = _preflight_scoring_liveness(conn, jobs, worker_count)
+    if not jobs:
+        log.info("No live unscored jobs with descriptions found after liveness preflight.")
+        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
+
     log.info("Scoring %d jobs with %d worker(s)...", len(jobs), worker_count)
     t0 = time.time()
     completed = 0

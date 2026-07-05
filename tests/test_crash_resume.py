@@ -104,6 +104,7 @@ def test_scoring_persists_each_job_before_a_later_crash(tmp_path: Path, monkeypa
     resume_path = tmp_path / "resume.txt"
     resume_path.write_text("Resume text", encoding="utf-8")
 
+    from applypilot.apply import liveness
     from applypilot.scoring import scorer
 
     calls = 0
@@ -116,6 +117,7 @@ def test_scoring_persists_each_job_before_a_later_crash(tmp_path: Path, monkeypa
             raise RuntimeError("simulated crash")
         return {"score": 9, "keywords": "operations", "reasoning": f"matched {job['title']}"}
 
+    monkeypatch.setattr(liveness, "probe_url", lambda _url, **_kwargs: (liveness.LIVE, "ok_200"))
     monkeypatch.setattr(scorer, "RESUME_PATH", resume_path)
     monkeypatch.setattr(scorer, "get_connection", lambda: conn)
     monkeypatch.setattr(scorer, "score_job", fake_score_job)
@@ -141,12 +143,14 @@ def test_llm_score_errors_remain_retryable(tmp_path: Path, monkeypatch: pytest.M
     resume_path = tmp_path / "resume.txt"
     resume_path.write_text("Resume text", encoding="utf-8")
 
+    from applypilot.apply import liveness
     from applypilot.scoring import scorer
 
     # antigravity: test-crash-resume-fix-2
     def fake_score_job(_resume_text: str, _job: dict, preference_profile: dict | None = None, **kwargs) -> dict:
         return {"score": 0, "keywords": "", "reasoning": "LLM error: provider unavailable", "error": "provider unavailable"}
 
+    monkeypatch.setattr(liveness, "probe_url", lambda _url, **_kwargs: (liveness.LIVE, "ok_200"))
     monkeypatch.setattr(scorer, "RESUME_PATH", resume_path)
     monkeypatch.setattr(scorer, "get_connection", lambda: conn)
     monkeypatch.setattr(scorer, "score_job", fake_score_job)
@@ -171,6 +175,57 @@ def test_llm_score_errors_remain_retryable(tmp_path: Path, monkeypatch: pytest.M
     assert row["score_error_at"] is not None
     assert row["score_attempts"] == 1
     assert database.get_jobs_by_stage(conn, "pending_score", limit=10)[0]["url"] == "https://example.com/one"
+
+
+def test_scoring_preflight_liveness_skips_dead_rows_before_llm_spend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "applypilot.db"
+    conn = database.init_db(db_path)
+    _insert_job(conn, "https://example.com/dead", "Dead Role")
+    _insert_job(conn, "https://example.com/live", "Live Role")
+
+    resume_path = tmp_path / "resume.txt"
+    resume_path.write_text("Resume text", encoding="utf-8")
+
+    from applypilot.apply import liveness
+    from applypilot.scoring import scorer
+
+    scored_urls: list[str] = []
+
+    def fake_probe_url(url: str, **_kwargs) -> tuple[str, str]:
+        if url.endswith("/dead"):
+            return liveness.DEAD, "http_404"
+        return liveness.LIVE, "ok_200"
+
+    def fake_score_job(_resume_text: str, job: dict, preference_profile: dict | None = None, **kwargs) -> dict:
+        scored_urls.append(job["url"])
+        return {"score": 9, "keywords": "operations", "reasoning": f"matched {job['title']}"}
+
+    monkeypatch.setattr(liveness, "probe_url", fake_probe_url)
+    monkeypatch.setattr(scorer, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(scorer, "get_connection", lambda: conn)
+    monkeypatch.setattr(scorer, "score_job", fake_score_job)
+
+    result = scorer.run_scoring(workers=1)
+
+    dead = conn.execute(
+        "SELECT liveness_status, liveness_reason, fit_score FROM jobs WHERE url = ?",
+        ("https://example.com/dead",),
+    ).fetchone()
+    live = conn.execute(
+        "SELECT liveness_status, fit_score FROM jobs WHERE url = ?",
+        ("https://example.com/live",),
+    ).fetchone()
+
+    assert result["scored"] == 1
+    assert scored_urls == ["https://example.com/live"]
+    assert dead["liveness_status"] == "dead"
+    assert dead["liveness_reason"] == "http_404"
+    assert dead["fit_score"] is None
+    assert live["liveness_status"] == "live"
+    assert live["fit_score"] == 9
 
 
 def test_audit_persists_each_job_before_a_later_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
