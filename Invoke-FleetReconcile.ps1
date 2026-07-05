@@ -123,7 +123,7 @@ function Invoke-RemoteCommand([hashtable]$Target, [string]$Command) {
 function New-WindowsBody([hashtable]$Target) {
   $mode = if ($Apply) { "APPLY" } else { "CHECK-ONLY" }
   $applyLiteral = if ($Apply) { '$true' } else { '$false' }
-  $runHealthLiteral = if ($Apply -or $RunHealth) { '$true' } else { '$false' }
+  $runHealthLiteral = if ($RunHealth) { '$true' } else { '$false' }
   $branchLiteral = $Branch.Replace("'", "''")
   $repoLiteral = $Target.RepoPath.Replace("'", "''")
   $machineLiteral = $Target.Machine.Replace("'", "''")
@@ -176,7 +176,21 @@ if ($applyLiteral) {
   Write-Output "APPLY: stop ApplyPilotFleet tasks/processes before reinstall"
   Get-ScheduledTask -TaskName 'ApplyPilotFleet-*' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 3
-  Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -like '*$repoLiteral*' } | ForEach-Object {
+  Get-CimInstance Win32_Process | Where-Object {
+    `$cmd = `$_.CommandLine
+    `$name = `$_.Name
+    `$_.ProcessId -ne `$PID -and (
+      `$name -like 'applypilot-*' -or (
+        `$name -in @('python.exe', 'powershell.exe', 'pwsh.exe', 'cmd.exe') -and
+        (`$cmd -like '*applypilot-fleet-*' -or
+         `$cmd -like '*fleet-agent.ps1*' -or
+         `$cmd -like '*run-fleet-worker.ps1*' -or
+         `$cmd -like '*run-fleet-workers.ps1*' -or
+         `$cmd -like '*run-fleet-compute.ps1*' -or
+         `$cmd -like '*.fleet-logs*')
+      )
+    )
+  } | ForEach-Object {
     Write-Output "APPLY: stop process `$(`$_.ProcessId) `$(`$_.Name)"
     Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue
   }
@@ -210,7 +224,7 @@ if ($runHealthLiteral -and (Test-Path .\fleet-health.ps1)) {
 function New-MacBody([hashtable]$Target) {
   $mode = if ($Apply) { "APPLY" } else { "CHECK-ONLY" }
   $applyLiteral = if ($Apply) { "1" } else { "0" }
-  $runHealthLiteral = if ($Apply -or $RunHealth) { "1" } else { "0" }
+  $runHealthLiteral = if ($RunHealth) { "1" } else { "0" }
   $branchLiteral = $Branch.Replace("'", "'\''")
 @"
 set -u

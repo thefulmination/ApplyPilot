@@ -31,6 +31,7 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "stop ApplyPilotFleet tasks/processes before reinstall",
         "Stop-ScheduledTask",
         "Stop-Process",
+        "applypilot-fleet-*",
         "pip install -e .",
         "register-fleet-tasks.ps1",
         "fleet-health.ps1",
@@ -40,7 +41,9 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         assert text in script
 
     assert "192.168.1.187" not in script
+    assert "checkout -B" not in script
     assert "git fetch --all" not in script
+    assert "-like '*$repoLiteral*'" not in script
 
 
 def test_readme_documents_reconcile_as_repair_not_normal_deploy() -> None:

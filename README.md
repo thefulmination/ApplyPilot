@@ -127,7 +127,7 @@ Use SSH over Tailscale for bootstrap/repair only:
 .\Invoke-FleetReconcile.ps1 -Apply -Branch codex/fleet-applier-hardening
 ```
 
-The default check is intentionally quick and bounded; add `-RunHealth` when you want the slower remote `fleet-health.ps1 -SkipRemote` probe. The apply mode runs the same idempotent repair path on each target: `git fetch`, optional branch checkout, `git merge --ff-only`, `pip install -e .`, scheduled-task registration, and `fleet-health.ps1 -SkipRemote`. Do not use SSH to hand-edit fleet files; fix the repo, publish the branch/tag, then let auto-update converge.
+The default check is intentionally quick and bounded; add `-RunHealth` when you want the slower remote `fleet-health.ps1 -SkipRemote` probe. The apply mode runs the same idempotent repair path on each target: branch-specific `git fetch`, optional branch checkout, `git merge --ff-only`, fleet-task/process stop, `pip install -e .`, and scheduled-task registration. Run health as a separate `-RunHealth` check after repair. Do not use SSH to hand-edit fleet files; fix the repo, publish the branch/tag, then let auto-update converge.
 
 ---
 
