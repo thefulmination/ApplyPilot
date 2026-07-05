@@ -18,6 +18,7 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$INSTALL_DIR/.applypilot/fleet-worker.env"
 
 log() { printf '%s [wrapper] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+caffeinate_pid=0
 
 load_env() {
   # shellcheck disable=SC1090
@@ -40,6 +41,17 @@ detect_egress_ip() {
   curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || printf '0.0.0.0'
 }
 
+start_caffeinate() {
+  # Prevent idle sleep from taking an otherwise healthy Mac off Tailscale. This cannot
+  # keep a powered-off or closed-lid laptop online, and it is intentionally opt-out for
+  # machines where the owner wants normal sleep behavior.
+  if [ "${APPLYPILOT_MAC_CAFFEINATE:-1}" != "0" ] && command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -dims -w $$ &
+    caffeinate_pid=$!
+    log "caffeinate active pid=$caffeinate_pid"
+  fi
+}
+
 updates_available() {
   git -C "$INSTALL_DIR" fetch --quiet origin "$APPLYPILOT_BRANCH" || return 1
   [ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" != "$(git -C "$INSTALL_DIR" rev-parse "origin/$APPLYPILOT_BRANCH")" ]
@@ -59,6 +71,7 @@ apply_update() {
 main() {
   load_env
   mkdir -p "$INSTALL_DIR/logs"
+  start_caffeinate
   CHROME_PATH="$(resolve_chrome_path)" || { log "FATAL: no Playwright chromium under $PLAYWRIGHT_BROWSERS_PATH"; exit 1; }
   export CHROME_PATH
   FLEET_HOME_IP="$(detect_egress_ip)"
@@ -76,7 +89,7 @@ main() {
   fi
 
   child=0
-  trap 'log "SIGTERM: draining worker"; [ "$child" -gt 0 ] && kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT
+  trap 'log "SIGTERM: draining worker"; [ "$child" -gt 0 ] && kill -TERM "$child" 2>/dev/null; [ "$caffeinate_pid" -gt 0 ] && kill "$caffeinate_pid" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT
 
   while true; do
     if updates_available; then apply_update || log "WARN: update failed; running current code"; fi

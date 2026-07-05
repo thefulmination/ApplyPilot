@@ -111,7 +111,7 @@ function Get-ShortSha([string]$sha) { if ($sha -and $sha.Length -ge 9) { $sha.Su
 
 # Files whose change requires the agent itself to restart (exit 1 -> scheduled-task relaunch).
 $selfFiles = @("fleet-agent.ps1", "fleet-agent-query.py", "fleet-agent-update-gate.py",
-               "src/applypilot/fleet/update_gate.py")
+               "fleet-agent-version.py", "src/applypilot/fleet/update_gate.py")
 $script:lastUpdateCheck = [datetime]::MinValue
 $script:updatePending = $false
 $script:updBranch = $null
@@ -133,6 +133,39 @@ function Invoke-AutoUpdate {
   }
   $branch = $script:updBranch; $remote = $script:updRemote
   if (-not $branch -or -not $remote) { $script:updatePending = $false; return $false }
+  # Pin-aware guard: branch heads are transport; fleet_config.pinned_worker_version is
+  # the release contract. This prevents a clean worker from pulling an unpinned branch
+  # tip just because someone pushed ahead of the fleet pin.
+  $versionLine = (& $py "fleet-agent-version.py" 2>$null | Select-Object -Last 1)
+  $vf = "$versionLine" -split '\|', 4
+  if ($vf.Count -lt 4 -or $vf[0] -ne "OK") {
+    Log-Update "skip: could not read pinned_worker_version via fleet-agent-version.py (got '$versionLine')" "Yellow"
+    $script:updatePending = $false; return $false
+  }
+  $currentVersion = $vf[1]
+  $pinnedVersion = $vf[2]
+  $packageVersion = $currentVersion
+  if ($packageVersion -match '^(.+)\+git\.') { $packageVersion = $matches[1] } else { $packageVersion = "0.3.0" }
+  $targetTree = (& git rev-parse "$remote/$branch^{tree}" 2>$null)
+  $targetVersion = $null
+  if ($targetTree) {
+    $targetTree = "$targetTree".Trim()
+    if ($targetTree.Length -ge 7) { $targetVersion = "$packageVersion+git.tree.$($targetTree.Substring(0, 7))" }
+  }
+  if ($pinnedVersion) {
+    if (-not $targetVersion) {
+      Log-Update "UPDATE BLOCKED: pinned version $pinnedVersion but could not resolve remote tree for $remote/$branch" "Red"
+      $script:updatePending = $false; return $false
+    }
+    if ($targetVersion -ne $pinnedVersion) {
+      if ($currentVersion -eq $pinnedVersion) {
+        Log-Update "skip: remote tree $targetVersion is not pinned $pinnedVersion" "Yellow"
+      } else {
+        Log-Update "UPDATE BLOCKED: pinned version $pinnedVersion but remote tree $targetVersion is not pinned" "Red"
+      }
+      $script:updatePending = $false; return $false
+    }
+  }
   $local = (& git rev-parse HEAD 2>$null)
   $target = (& git rev-parse "$remote/$branch" 2>$null)
   if (-not $target -or $local -eq $target) { $script:updatePending = $false; return $false }

@@ -589,9 +589,9 @@ def _seed_linkedin_job(conn, url="li0", dk="lidk0"):
 
 def test_H1_doctor_pause_cannot_halt_linkedin_lane(fleet_db):
     """H1 CATASTROPHE: arm a LinkedIn worker context, fire a Doctor lane-PAUSE, and assert the
-    LinkedIn lane is UNAFFECTED -- it still leases AND linkedin should_halt() == False. This is the
+    LinkedIn lane is UNAFFECTED -- it still leases AND linkedin_should_halt() == False. This is the
     single most important proof: the Doctor's pause writes ats_paused, never fleet_config.paused
-    (which the LinkedIn loop reads via should_halt)."""
+    (which the LinkedIn loop reads via linkedin_should_halt)."""
     from applypilot.fleet import linkedin_worker_main as lm
     with pgqueue.connect(fleet_db) as conn:
         _seed_linkedin_job(conn)
@@ -604,8 +604,8 @@ def test_H1_doctor_pause_cannot_halt_linkedin_lane(fleet_db):
         assert res["applied"]
         # The ATS lane IS halted...
         assert pgqueue.ats_should_halt(conn) is True
-        # ...but the LinkedIn lane's should_halt is FALSE (it reads only paused/spend cap).
-        assert pgqueue.should_halt(conn) is False
+        # ...but the LinkedIn lane's halt gate is FALSE (it reads only the shared kill switch).
+        assert pgqueue.linkedin_should_halt(conn) is False
         # And the LinkedIn lease STILL returns a job (the catastrophe lane keeps running).
         leased = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1",
                                       min_gap_seconds=0)

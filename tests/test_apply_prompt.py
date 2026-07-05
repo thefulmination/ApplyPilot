@@ -140,6 +140,23 @@ def test_screening_section_is_truthful_not_swe_templated() -> None:
     assert "never invent" in low and "resume" in low
 
 
+def test_screening_section_allows_us_relocation_when_configured() -> None:
+    section = prompt._build_screening_section(
+        _make_profile(),
+        {
+            "location": {
+                "accept_any_us": True,
+                "accept_patterns": ["San Francisco", "New York", "Remote", "United States"],
+            }
+        },
+    )
+    low = section.lower()
+    assert "cannot relocate" not in low
+    assert "san francisco" in low
+    assert "new york" in low
+    assert "willing to relocate anywhere in the united states" in low
+
+
 def test_screening_target_role_no_swe_default() -> None:
     # With no target_role/current_job_title, the fallback must NOT be "software engineer".
     profile = _make_profile()

@@ -50,6 +50,10 @@ UNCHECKED** → Add.
 3. Sanity: `launchctl list | grep applypilot` shows the agent;
    `tail -f ~/applypilot-fleet/logs/wrapper.log ~/applypilot-fleet/.applypilot/logs/worker-0.log`
    shows `worker started` (wrapper.log) and the live apply-agent transcript (worker-0.log).
+   The wrapper sets a macOS `caffeinate` assertion by default so idle sleep does not
+   silently remove the worker from Tailscale; set `APPLYPILOT_MAC_CAFFEINATE=0` in
+   `~/applypilot-fleet/.applypilot/fleet-worker.env` only if you intentionally want
+   normal sleep behavior.
 
 ## D. Canary go-live (home box)
 
@@ -89,6 +93,7 @@ only when `pyproject.toml` changed. Force it immediately: on the Mac,
 | No heartbeat row for `mac-0` | Mac on? `launchctl list \| grep applypilot`; `logs/wrapper.log`; also check `logs/wrapper.err.log` (launchd load failures surface ONLY there) |
 | `FATAL: no Playwright chromium` in wrapper.log | Re-run `PLAYWRIGHT_BROWSERS_PATH=~/applypilot-fleet/.playwright-browsers ~/applypilot-fleet/.venv/bin/python -m playwright install chromium` |
 | PG connect fails | `tailscale ping <home-ts-ip>` from the Mac; pg_hba rule + firewall rule on home box (`setup-fleet-pg-tailscale.ps1` re-run is safe) |
+| Mac disappears from Tailscale while otherwise healthy | Confirm `APPLYPILOT_MAC_CAFFEINATE=1` in `~/applypilot-fleet/.applypilot/fleet-worker.env`; the wrapper should log `caffeinate active`. This prevents idle sleep but cannot keep a powered-off or closed-lid Mac online |
 | Applies fail with missing profile/resume | Re-run runbook A.4 (asset push), then on the Mac delete `~/applypilot-fleet/.applypilot/profile.json` and re-run `setup-mac-worker.sh` step or copy manually |
 | Worker never updates | `git -C ~/applypilot-fleet fetch origin <branch>` by hand — deploy key revoked? branch deleted? |
 | Email-verification jobs fail/park | The Mac now uses the fleet OTP relay (`APPLYPILOT_INBOX_AUTH_MODE=relay`). Ensure `applypilot-fleet-otp-home` is running on the home box — see docs/fleet-otp-relay-runbook.md. |

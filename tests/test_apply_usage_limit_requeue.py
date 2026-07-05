@@ -7,10 +7,11 @@ browser/MCP tool call). run_job returned `failed:no_result_line`, which the flee
 maps to `crash_unconfirmed` (the "may have submitted, never re-lease" bucket). In minutes
 ~283 good, never-touched jobs were poisoned into a never-retried state.
 
-A usage-limit failure with ZERO tool calls in the transcript PROVABLY never touched the
-page -> it is safe to re-queue (status back to 'queued', attempts not pinned). These tests
-pin that behavior AND the load-bearing safety gate: a GENUINE mid-apply crash (any tool
-calls happened) must STILL be classified no_result_line -> crash_unconfirmed.
+A usage-limit failure with ZERO application-touching tool calls in the transcript
+PROVABLY never touched the page -> it is safe to re-queue (status back to 'queued',
+attempts not pinned). These tests pin that behavior AND the load-bearing safety gate:
+a GENUINE mid-apply crash (any browser/form tool calls happened) must STILL be
+classified no_result_line -> crash_unconfirmed.
 """
 from __future__ import annotations
 
@@ -53,11 +54,29 @@ def test_session_limit_wording_with_no_tool_calls_is_retryable():
 
 
 def test_usage_limit_signature_WITH_tool_calls_stays_no_result_line():
-    """Safety gate: if ANY tool call happened the agent may have driven the form (a real
-    mid-apply crash). It must STAY no_result_line -> crash_unconfirmed, NOT be re-queued --
-    even if the late transcript happens to mention a usage limit."""
+    """Safety gate: if any browser/form tool call happened the agent may have driven
+    the form (a real mid-apply crash). It must STAY no_result_line ->
+    crash_unconfirmed, NOT be re-queued -- even if the late transcript happens to
+    mention a usage limit."""
     assert launcher._no_result_status(CODEX_SPARK_WALL, tool_calls=3) == "failed:no_result_line"
     assert launcher._no_result_status(CODEX_SPARK_WALL, tool_calls=1) == "failed:no_result_line"
+
+
+def test_toolsearch_only_usage_wall_is_retryable():
+    """Codex can emit ToolSearch before reporting a weekly/session wall. ToolSearch
+    does not touch the application page, so it must not poison the job into
+    crash_unconfirmed."""
+    assert launcher._tool_call_touches_application("ToolSearch") is False
+    assert launcher._tool_call_touches_application("tool_search") is False
+    assert launcher._no_result_status(
+        "  >> ToolSearch\nYou've hit your weekly limit · resets 3am (America/New_York)",
+        tool_calls=0,
+    ) == launcher.USAGE_LIMIT_STATUS
+
+
+def test_browser_tool_still_counts_as_application_touch():
+    assert launcher._tool_call_touches_application("browser_navigate") is True
+    assert launcher._tool_call_touches_application("mcp_tool_call") is True
 
 
 def test_plain_no_result_transcript_stays_no_result_line():

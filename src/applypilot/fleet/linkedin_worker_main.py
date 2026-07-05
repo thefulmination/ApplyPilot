@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
+import sys
 import time
 
 logger = logging.getLogger("applypilot.fleet.linkedin_worker_main")
@@ -21,6 +23,20 @@ logger = logging.getLogger("applypilot.fleet.linkedin_worker_main")
 
 def _setup_apply_env() -> None:
     """Mirror apply_worker_main._setup_apply_env (home-box flavored)."""
+    repo_app_dir = Path(__file__).resolve().parents[3] / ".applypilot"
+    if (repo_app_dir / "profile.json").exists():
+        os.environ.setdefault("APPLYPILOT_DIR", str(repo_app_dir))
+        for env_name, filename in (
+            ("APPLYPILOT_PROFILE_PATH", "profile.json"),
+            ("APPLYPILOT_RESUME_PATH", "resume.txt"),
+            ("APPLYPILOT_RESUME_PDF_PATH", "resume.pdf"),
+            ("APPLYPILOT_RESUME_STRATEGY_PATH", "resume_strategy.yaml"),
+            ("APPLYPILOT_PREFERENCE_PROFILE_PATH", "job_preference_profile.json"),
+            ("APPLYPILOT_KNOWLEDGE_GRAPH_PROMPT_PATH", "job_knowledge_graph_prompt.md"),
+        ):
+            path = repo_app_dir / filename
+            if path.exists():
+                os.environ.setdefault(env_name, str(path))
     os.environ["APPLYPILOT_BASE_RESUME"] = "1"
     # Fleet row selection is lane-filtered at push time; keep worker-side acquire opt-in.
     os.environ.setdefault("APPLYPILOT_LANE_FILTER", "0")
@@ -28,6 +44,26 @@ def _setup_apply_env() -> None:
     os.environ.setdefault("CHROME_WORKER_DIR", os.path.join(os.environ.get("TEMP", "/tmp"), "chrome-workers"))
     os.environ.setdefault("APPLY_WORKER_DIR", os.path.join(os.environ.get("TEMP", "/tmp"), "apply-workers"))
     os.environ.setdefault("APPLYPILOT_AGENT_TIMEOUT", "300")
+
+    # Some callers import pgqueue/config before building the LinkedIn loop. Refresh the
+    # path constants so load_profile()/resume lookup still sees the env set above.
+    cfg = sys.modules.get("applypilot.config")
+    if cfg is not None:
+        app_dir = Path(os.environ.get("APPLYPILOT_DIR", str(cfg.APP_DIR)))
+        cfg.APP_DIR = app_dir
+        cfg.DB_PATH = Path(os.environ.get("APPLYPILOT_DB_PATH", str(cfg.DB_PATH)))
+        cfg.PROFILE_PATH = Path(os.environ.get("APPLYPILOT_PROFILE_PATH", str(app_dir / "profile.json")))
+        cfg.RESUME_PATH = Path(os.environ.get("APPLYPILOT_RESUME_PATH", str(app_dir / "resume.txt")))
+        cfg.RESUME_PDF_PATH = Path(os.environ.get("APPLYPILOT_RESUME_PDF_PATH", str(app_dir / "resume.pdf")))
+        cfg.RESUME_STRATEGY_PATH = Path(
+            os.environ.get("APPLYPILOT_RESUME_STRATEGY_PATH", str(app_dir / "resume_strategy.yaml"))
+        )
+        cfg.PREFERENCE_PROFILE_PATH = Path(
+            os.environ.get("APPLYPILOT_PREFERENCE_PROFILE_PATH", str(app_dir / "job_preference_profile.json"))
+        )
+        cfg.KNOWLEDGE_GRAPH_PROMPT_PATH = Path(
+            os.environ.get("APPLYPILOT_KNOWLEDGE_GRAPH_PROMPT_PATH", str(app_dir / "job_knowledge_graph_prompt.md"))
+        )
 
 
 def acquire_linkedin_interlock(conn) -> bool:
@@ -48,7 +84,7 @@ def acquire_linkedin_interlock(conn) -> bool:
     return bool(ok)
 
 
-def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="claude", machine_owner=None):
+def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="codex", machine_owner=None):
     """Construct a WorkerLoop for the linkedin role.
 
     public_ip and owner_ip are both set to *owner_ip*: the LinkedIn driver always
@@ -79,8 +115,9 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="clau
 def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dict:
     """Drive the LinkedIn apply loop (mirrors run_apply from apply_worker_main).
 
-    Before each iteration check should_halt (paused / spend cap) and idle when
-    halted. A per-tick error backs off without crashing. Returns a counts dict
+    Before each iteration check the LinkedIn-specific shared kill switch and idle when
+    halted. Lease-time gates still enforce the LinkedIn canary, account halt, daily cap,
+    and mutex. A per-tick error backs off without crashing. Returns a counts dict
     (testable). Production calls with max_iterations=None (forever).
     """
     from applypilot.apply import pgqueue
@@ -90,7 +127,7 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> 
         it += 1
         try:
             with conn_factory() as conn:
-                if pgqueue.should_halt(conn):
+                if pgqueue.linkedin_should_halt(conn):
                     counts["halted"] += 1
                     if idle_sleep:
                         time.sleep(idle_sleep)
@@ -103,7 +140,7 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> 
                 logger.info("remote %s command: exiting between jobs (supervisor respawns)",
                             res.get("command"))
                 break
-            elif action in ("idle", "paused"):
+            elif action in ("idle", "paused", "usage_limit"):
                 counts["idle"] += 1
                 if idle_sleep:
                     time.sleep(idle_sleep)
@@ -121,12 +158,15 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     p.add_argument("--worker-id", required=True)
     p.add_argument("--owner-ip", default=os.environ.get("FLEET_OWNER_IP", "0.0.0.0"))
     p.add_argument("--model", default="sonnet")
-    p.add_argument("--agent", default="claude")
+    # Match the apply-lane default: Codex uses the ChatGPT quota pool and avoids
+    # burning the Claude Max subscription unless the operator explicitly opts in.
+    p.add_argument("--agent", default="codex")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
+    _setup_apply_env()
     from applypilot.apply import pgqueue
 
     # Open a DEDICATED long-lived connection solely for holding the advisory lock.

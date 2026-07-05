@@ -141,7 +141,9 @@ def _insert_challenge(conn, *, url, worker_id, machine_owner, home_ip, kind, rou
 
 
 def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_job=None,
-               sw_version=None, last_error=None, recent_log=None, commit=True) -> None:
+               sw_version=None, last_error=None, recent_log=None, current_agent=None,
+               current_model=None, agent_chain=None, last_agent_switch_at=None,
+               last_agent_switch_reason=None, commit=True) -> None:
     """UPSERT this worker's ``worker_heartbeat`` row (~every iteration, spec §11/R5).
     A missing heartbeat for > lease TTL is what lets the reclaim sweep re-queue a
     crashed worker's job (§5 stateless self-resume).
@@ -151,14 +153,21 @@ def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_
     previously reported version when a beat omits it."""
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, last_error, recent_log, last_beat) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
+            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, "
+            "sw_version, last_error, recent_log, current_agent, current_model, agent_chain, "
+            "last_agent_switch_at, last_agent_switch_reason, last_beat) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
             "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
             "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
             "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
-            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, last_beat=now()",
+            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, "
+            "current_agent=EXCLUDED.current_agent, current_model=EXCLUDED.current_model, "
+            "agent_chain=EXCLUDED.agent_chain, last_agent_switch_at=COALESCE(EXCLUDED.last_agent_switch_at, worker_heartbeat.last_agent_switch_at), "
+            "last_agent_switch_reason=COALESCE(EXCLUDED.last_agent_switch_reason, worker_heartbeat.last_agent_switch_reason), "
+            "last_beat=now()",
             (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
-             last_error, recent_log),
+             last_error, recent_log, current_agent, current_model, agent_chain,
+             last_agent_switch_at, last_agent_switch_reason),
         )
     if commit:
         conn.commit()
@@ -241,6 +250,11 @@ class WorkerLoop:
         self._events: collections.deque = collections.deque(maxlen=40)
         self._log_tail_fn = log_tail_fn
         self._started_at = _dt.datetime.now(_dt.timezone.utc)
+        self.current_agent: Optional[str] = None
+        self.current_model: Optional[str] = None
+        self.agent_chain: Optional[str] = None
+        self.last_agent_switch_at: Optional[_dt.datetime] = None
+        self.last_agent_switch_reason: Optional[str] = None
         # Remote-command state: a 'pause' flips this until 'resume'; consumed in
         # run_once BETWEEN jobs (never mid-apply). See _handle_commands.
         self._paused = False
@@ -489,7 +503,8 @@ class WorkerLoop:
         # halt pre-check; the interlock is held by the entrypoint for the worker's life.
         job = queue.lease_linkedin(conn, self.worker_id, public_ip=self.public_ip, owner_ip=self.owner_ip)
         if job is None:
-            self._beat(conn, state="idle"); return {"action": "idle"}
+            self._beat(conn, state="idle")
+            return {"action": "idle"}
         url = job["url"]
         self._record_event(f"leased linkedin {url}")
         self._beat(conn, state="applying", current_job=url)
@@ -498,13 +513,20 @@ class WorkerLoop:
         out = self.apply_fn(job)
         run_status = (out or {}).get("run_status") or ""
         cost = (out or {}).get("est_cost_usd", 0)
+        from applypilot.apply.launcher import is_usage_limit_result
+        if is_usage_limit_result(run_status):
+            queue.requeue_linkedin(conn, self.worker_id, url, apply_error=run_status[:200])
+            self._record_event(f"requeued linkedin (usage_limit) {url}")
+            self._beat(conn, state="idle")
+            return {"action": "usage_limit", "url": url}
         if run_status == "applied":
             queue.write_linkedin_result(conn, self.worker_id, url, status="applied", apply_status="applied",
                                         est_cost_usd=cost, outcome="success",
                                         apply_channel=(out or {}).get("apply_channel"),
                                         apply_external_host=(out or {}).get("apply_external_host"))
             self._record_event(f"wrote linkedin applied {url}")
-            self._beat(conn, state="idle"); return {"action": "applied", "url": url}
+            self._beat(conn, state="idle")
+            return {"action": "applied", "url": url}
         if run_status in self._WALL_STATUSES:
             queue.park_linkedin_challenge(conn, self.worker_id, url, halt_seconds=self._linkedin_halt_seconds())
             _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
@@ -517,11 +539,13 @@ class WorkerLoop:
             queue.write_linkedin_result(conn, self.worker_id, url, status="crash_unconfirmed",
                                         apply_status="crash_unconfirmed", apply_error=run_status[:200], est_cost_usd=cost)
             self._record_event(f"wrote linkedin crash_unconfirmed {url} ({run_status})")
-            self._beat(conn, state="idle"); return {"action": "crash_unconfirmed", "url": url}
+            self._beat(conn, state="idle")
+            return {"action": "crash_unconfirmed", "url": url}
         queue.write_linkedin_result(conn, self.worker_id, url, status="failed", apply_status="failed",
                                     apply_error=(run_status or "unknown")[:200], est_cost_usd=cost)
         self._record_event(f"wrote linkedin failed {url} ({run_status or 'unknown'})")
-        self._beat(conn, state="idle"); return {"action": "failed", "url": url}
+        self._beat(conn, state="idle")
+        return {"action": "failed", "url": url}
 
     def _apply_status_passthrough(self, conn, url, target_host, res: dict) -> dict:
         """Route off run_job's terminal status (the agent already classified by SEEING
@@ -634,6 +658,9 @@ class WorkerLoop:
             conn, worker_id=self.worker_id, machine_owner=self.machine_owner,
             home_ip=self.home_ip, role=self.role, state=state, current_job=current_job,
             sw_version=self.sw_version, last_error=last_error, recent_log=recent_log,
+            current_agent=self.current_agent, current_model=self.current_model,
+            agent_chain=self.agent_chain, last_agent_switch_at=self.last_agent_switch_at,
+            last_agent_switch_reason=self.last_agent_switch_reason,
         )
 
     # -- long-running driver (not exercised by unit tests) --------------------

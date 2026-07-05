@@ -1,8 +1,8 @@
 """applypilot-fleet-apply: an OFFSITE apply worker for owner-controlled machines.
 Wraps the proven launcher.run_job into an apply_fn and drives WorkerLoop(role='apply').
 Respects the shared kill switch AND the Fleet Doctor's ATS-only pause via ats_should_halt
-(H1); never leases through a pause/canary-pause. The LinkedIn lane uses plain should_halt so
-a Doctor ATS pause can never halt it."""
+(H1); never leases through a pause/canary-pause. The LinkedIn lane uses its own
+linkedin_should_halt gate so a Doctor ATS pause can never halt it."""
 from __future__ import annotations
 
 import argparse
@@ -304,6 +304,11 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
     counts = {"applied": 0, "halted": 0, "idle": 0, "error": 0}
     current_agent = None
     it = 0
+    if switcher is not None:
+        try:
+            loop.agent_chain = ",".join(switcher.agents)
+        except Exception:
+            pass
     while not _STOP_REQUESTED.is_set() and (max_iterations is None or it < max_iterations):
         it += 1
         try:
@@ -339,6 +344,11 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 now = _time()
                 agent = switcher.effective_agent(now)
                 if agent is None:
+                    try:
+                        loop.current_agent = None
+                        loop.last_agent_switch_reason = "all_agents_walled"
+                    except Exception:
+                        pass
                     # Every agent is walled -> pause until the nearer reset (capped).
                     counts["idle"] += 1
                     beat = getattr(loop, "_beat", None)
@@ -356,6 +366,13 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                     continue
                 if agent != current_agent and rebuild_apply_fn is not None:
                     loop.apply_fn = rebuild_apply_fn(agent)
+                    try:
+                        loop.current_agent = agent
+                        loop.current_model = None if agent == "codex" else getattr(loop, "current_model", None)
+                        loop.last_agent_switch_at = _now_local()
+                        loop.last_agent_switch_reason = "agent_available"
+                    except Exception:
+                        pass
                     current_agent = agent
             with conn_factory() as conn:
                 # Re-resolve the Doctor's agent_timeout_override on EVERY tick (not just at
@@ -366,7 +383,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 _apply_timeout_override(conn=conn)
                 # H1: the APPLY lane honors the Doctor's ATS-only pause (ats_paused) in addition
                 # to the shared kill switch; ats_should_halt OR-s it in. The LinkedIn worker keeps
-                # plain should_halt(), so a Doctor ATS pause never halts the LinkedIn lane.
+                # its own linkedin_should_halt(), so a Doctor ATS pause never halts that lane.
                 if pgqueue.ats_should_halt(conn):
                     counts["halted"] += 1
                     # Beat while halted: a paused worker that stops beating is indistinguishable

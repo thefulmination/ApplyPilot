@@ -202,6 +202,8 @@ def test_run_apply_respects_fleet_wide_block(monkeypatch):
 
     assert rebuilt == ["codex"]        # fleet-blocked claude -> codex, without a local wall
     assert budget.evaluated >= 1       # ran the predictive evaluator
+    assert loop.current_agent == "codex"
+    assert loop.agent_chain == "claude,codex"
     awm._STOP_REQUESTED.clear()
 
 

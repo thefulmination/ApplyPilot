@@ -183,7 +183,39 @@ Decision tree:
 6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
 
 
-def _build_screening_section(profile: dict) -> str:
+def _build_screening_location_line(profile: dict, search_config: dict | None = None) -> str:
+    personal = profile["personal"]
+    city = personal.get("city", "their city")
+    location_cfg = (search_config or {}).get("location", {}) or {}
+    accept_patterns = {str(pattern).strip().lower() for pattern in location_cfg.get("accept_patterns", [])}
+
+    if location_cfg.get("accept_any_us"):
+        bases: list[str] = []
+
+        def add_base(label: str) -> None:
+            if label not in bases:
+                bases.append(label)
+
+        city_l = city.lower()
+        if "san francisco" in city_l or {"san francisco", "sf", "bay area"} & accept_patterns:
+            add_base("San Francisco/Bay Area")
+        if "new york" in city_l or {"new york", "nyc", "manhattan", "brooklyn"} & accept_patterns:
+            add_base("New York City")
+        if not bases:
+            add_base(city)
+
+        return (
+            f"lives in {' and '.join(bases)}; "
+            "willing to relocate anywhere in the United States for the right role"
+        )
+
+    return (
+        f"lives in {city}; answer location and relocation questions truthfully "
+        "from the profile and the LOCATION CHECK above"
+    )
+
+
+def _build_screening_section(profile: dict, search_config: dict | None = None) -> str:
     """Build the screening questions guidance section.
 
     Domain-neutral and truthful. The old version was hard-templated for a
@@ -193,16 +225,16 @@ def _build_screening_section(profile: dict) -> str:
     the profile/resume, period; behavioral answers use real resume experiences
     and never invent specifics.
     """
-    personal = profile["personal"]
     exp = profile.get("experience", {})
-    city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
+    personal = profile["personal"]
     target_role = exp.get("target_role") or personal.get("current_job_title") or "this role"
     work_auth = profile["work_authorization"]
+    location_line = _build_screening_location_line(profile, search_config)
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
+  - Location/relocation: {location_line}
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
@@ -556,7 +588,7 @@ def build_prompt(job: dict, tailored_resume: str,
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
-    screening_section = _build_screening_section(profile)
+    screening_section = _build_screening_section(profile, search_config)
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
 
