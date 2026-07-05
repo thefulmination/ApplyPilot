@@ -434,6 +434,82 @@ def test_recommendation_for_browser_server_unavailable():
     assert [r["code"] for r in result] == ["restart_browser_backend"]
 
 
+def test_recommendation_for_paused_fleet():
+    queue = {
+        "state": {"code": "paused"},
+        "ats": {
+            "approved": 12,
+            "leaseable": 0,
+            "dedup_blocked": 0,
+            "paused": True,
+            "ats_paused": True,
+        },
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {}}
+
+    result = console_diagnosis.recommendations_from(queue, browser)
+
+    assert result[0]["code"] == "review_fleet_pause"
+    assert result[0]["severity"] == "halted"
+    assert "paused" in result[0]["reason"].lower()
+
+
+def test_recommendation_for_ats_lane_pause():
+    queue = {
+        "state": {"code": "ats_paused"},
+        "ats": {
+            "approved": 12,
+            "leaseable": 0,
+            "dedup_blocked": 0,
+            "paused": False,
+            "ats_paused": True,
+        },
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {}}
+
+    result = console_diagnosis.recommendations_from(queue, browser)
+
+    assert result[0]["code"] == "review_ats_pause"
+    assert result[0]["severity"] == "halted"
+    assert "ATS lane" in result[0]["title"]
+
+
+def test_recommendation_for_login_or_captcha_browser_walls():
+    queue = {
+        "state": {"code": "ready_to_apply"},
+        "ats": {"approved": 12, "leaseable": 12, "dedup_blocked": 0},
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {"login_gate": 2, "captcha": 3}}
+
+    result = console_diagnosis.recommendations_from(queue, browser)
+
+    assert result[0]["code"] == "review_browser_walls"
+    assert result[0]["severity"] == "warn"
+    assert "5" in result[0]["reason"]
+
+
+def test_recommendation_for_missing_agent_telemetry():
+    queue = {
+        "state": {"code": "ready_to_apply"},
+        "ats": {"approved": 12, "leaseable": 12, "dedup_blocked": 0},
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {}}
+    agents = {
+        "verdict": {"code": "telemetry_missing"},
+        "workers": [{"worker_id": "m2-0", "sw_version": "0.3.0+git.old"}],
+    }
+
+    result = console_diagnosis.recommendations_from(queue, browser, agents=agents)
+
+    assert result[0]["code"] == "redeploy_apply_workers_for_telemetry"
+    assert result[0]["severity"] == "warn"
+    assert "redeploy" in result[0]["reason"].lower()
+
+
 def test_operational_rollups_include_machines_hosts_forecast_goals_and_workers(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:

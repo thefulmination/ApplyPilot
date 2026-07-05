@@ -424,10 +424,31 @@ def operational_rollups(conn) -> dict:
     }
 
 
-def recommendations_from(queue: dict, browser: dict) -> list[dict]:
+def recommendations_from(queue: dict, browser: dict, *, agents: dict | None = None) -> list[dict]:
     recs: list[dict] = []
     ats = queue["ats"]
     linkedin = queue["linkedin"]
+    state_code = (queue.get("state") or {}).get("code")
+    if ats.get("paused") or state_code == "paused":
+        recs.append({
+            "code": "review_fleet_pause",
+            "severity": "halted",
+            "lane": "fleet",
+            "title": "Fleet is paused",
+            "reason": "The shared fleet is paused; workers are alive but cannot lease ATS work.",
+            "action_type": "manual_operator",
+            "command": "Review fleet_config paused/ats_paused and only resume from the apply-lane runbook when safe.",
+        })
+    elif ats.get("ats_paused") or state_code == "ats_paused":
+        recs.append({
+            "code": "review_ats_pause",
+            "severity": "halted",
+            "lane": "ats",
+            "title": "ATS lane is paused",
+            "reason": "The ATS-specific pause is active; LinkedIn safety state is separate.",
+            "action_type": "manual_operator",
+            "command": "Review Doctor/ATS pause reason before clearing ats_paused.",
+        })
     if ats["approved"] > 0 and ats["leaseable"] == 0 and ats["dedup_blocked"] == ats["approved"]:
         recs.append({
             "code": "reconcile_dedup_blocked_queue",
@@ -448,6 +469,19 @@ def recommendations_from(queue: dict, browser: dict) -> list[dict]:
             "action_type": "manual_operator",
             "command": "Use the LinkedIn lane runbook to re-arm a small canary if you want LinkedIn active.",
         })
+    browser_wall_count = int(browser["counts"].get("login_gate") or 0) + int(
+        browser["counts"].get("captcha") or 0
+    )
+    if browser_wall_count:
+        recs.append({
+            "code": "review_browser_walls",
+            "severity": "warn",
+            "lane": "ats",
+            "title": "Browser login/captcha walls detected",
+            "reason": f"{browser_wall_count} recent apply-worker log sample(s) include login or captcha walls.",
+            "action_type": "manual_review",
+            "command": "Open Browser Health log links and resolve or quarantine the affected jobs before scaling applies.",
+        })
     if browser["counts"].get("browser_service_unavailable") or browser["counts"].get(
         "browser_backend_crashed"
     ) or browser["counts"].get(
@@ -461,6 +495,16 @@ def recommendations_from(queue: dict, browser: dict) -> list[dict]:
             "reason": "Recent worker logs include browser backend crash or server unavailable failures.",
             "action_type": "manual_machine",
             "command": "Restart the affected machine's browser/apply worker stack, then verify heartbeat.",
+        })
+    if (agents or {}).get("verdict", {}).get("code") == "telemetry_missing":
+        recs.append({
+            "code": "redeploy_apply_workers_for_telemetry",
+            "severity": "warn",
+            "lane": "apply",
+            "title": "Apply workers need telemetry redeploy",
+            "reason": "Apply workers are heartbeating but not reporting current agent/model fields; redeploy/restart current worker code.",
+            "action_type": "manual_deploy",
+            "command": "Deploy the current branch to apply workers, restart between jobs, then verify /api/agents.",
         })
     if not recs:
         recs.append({
@@ -479,9 +523,12 @@ def full_diagnosis(conn) -> dict:
     queue = queue_diagnosis(conn)
     browser = browser_health(conn)
     rollups = operational_rollups(conn)
+    from applypilot.fleet import console_agents
+    agents = console_agents.agent_summary(conn)
     return {
         "queue": queue,
         "browser": browser,
         "rollups": rollups,
-        "recommendations": recommendations_from(queue, browser),
+        "agents": agents,
+        "recommendations": recommendations_from(queue, browser, agents=agents),
     }
