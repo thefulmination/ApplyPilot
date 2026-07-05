@@ -195,8 +195,19 @@ try:
                 "SELECT fc.pinned_worker_version, wh.sw_version, count(*) AS workers "
                 "FROM worker_heartbeat wh CROSS JOIN fleet_config fc "
                 "WHERE wh.role IN ('apply', 'compute', 'discovery') "
+                "AND wh.last_beat > now() - interval '5 minutes' "
                 "GROUP BY fc.pinned_worker_version, wh.sw_version "
                 "ORDER BY wh.sw_version",
+            )
+            show_rows(
+                "Stale worker versions",
+                cur,
+                "SELECT wh.worker_id, wh.role, wh.sw_version, "
+                "round(EXTRACT(EPOCH FROM (now() - wh.last_beat)))::int AS age_s "
+                "FROM worker_heartbeat wh "
+                "WHERE wh.role IN ('apply', 'compute', 'discovery') "
+                "AND wh.last_beat <= now() - interval '5 minutes' "
+                "ORDER BY wh.worker_id",
             )
             show_rows(
                 "open remote_commands",

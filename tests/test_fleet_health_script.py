@@ -29,6 +29,9 @@ def test_fleet_health_script_covers_current_fleet_topology() -> None:
         "pinned_worker_version",
         "sw_version",
         "role IN ('apply', 'compute', 'discovery')",
+        "last_beat > now() - interval '5 minutes'",
+        "Stale worker versions",
+        "last_beat <= now() - interval '5 minutes'",
         "git status --short --branch",
         "git rev-parse --short HEAD",
     ):
