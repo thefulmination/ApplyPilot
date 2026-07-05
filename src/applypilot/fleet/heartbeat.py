@@ -102,12 +102,14 @@ def beat(
 # Stuck / dead worker detection (R7).
 # ---------------------------------------------------------------------------
 _DETECT_STUCK = """
-SELECT worker_id, reason FROM (
-    SELECT worker_id, 'no_heartbeat' AS reason
+SELECT worker_id, reason, machine_owner FROM (
+    SELECT worker_id, 'no_heartbeat' AS reason, machine_owner
     FROM worker_heartbeat
     WHERE last_beat < now() - make_interval(secs => %(hb_timeout)s)
+      AND role IN ('apply', 'compute', 'discovery', 'linkedin')
+      AND NOT (role = 'discovery' AND state = 'idle')
     UNION ALL
-    SELECT worker_id, 'job_over_max' AS reason
+    SELECT worker_id, 'job_over_max' AS reason, machine_owner
     FROM worker_heartbeat
     WHERE state = 'applying'
       AND job_started_at IS NOT NULL
@@ -127,7 +129,28 @@ def detect_stuck(conn, *, heartbeat_timeout=90, job_max_seconds=600) -> list[dic
             "hb_timeout": heartbeat_timeout,
             "job_max": job_max_seconds,
         })
-        out = [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT to_regclass('fleet_desired_state') AS rel")
+        has_desired_state = cur.fetchone()["rel"] is not None
+        desired_owners: set[str] = set()
+        if has_desired_state:
+            cur.execute(
+                "SELECT machine_owner FROM fleet_desired_state "
+                "WHERE desired_workers > 0"
+            )
+            desired_owners = {r["machine_owner"] for r in cur.fetchall()}
+        out = []
+        for row in rows:
+            owner = row.get("machine_owner")
+            if (
+                has_desired_state
+                and row["reason"] == "no_heartbeat"
+                and owner
+                and owner not in desired_owners
+            ):
+                continue
+            row.pop("machine_owner", None)
+            out.append(row)
     conn.rollback()  # read-only: don't leave an idle-in-transaction (cf. pgqueue reads)
     return out
 

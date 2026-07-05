@@ -93,6 +93,6 @@ Write-Host "Starting $Count HOME apply worker(s) (label=home, agent=$Agent) ..."
 & (Join-Path $Root "run-fleet-workers.ps1") -Count $Count -Agent $Agent -Label home
 
 Write-Host ""
-Write-Host ("HOME canary loaded: K={0}, {1} worker(s), cap=`${2}. Watch: http://192.168.1.187:8787" -f $Canary,$Count,$SpendCapUsd) -ForegroundColor Green
+Write-Host ("HOME canary loaded: K={0}, {1} worker(s), cap=`${2}. Watch: http://100.90.104.99:8787" -f $Canary,$Count,$SpendCapUsd) -ForegroundColor Green
 Write-Host ("Fleet auto-pauses after {0} applies (canary) or `${1} spend, whichever comes first." -f $Canary,$SpendCapUsd) -ForegroundColor Green
 Write-Host "Scale the throughput on the REMOTE box: .\load-canary-remote.ps1" -ForegroundColor Green

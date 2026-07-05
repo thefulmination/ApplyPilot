@@ -80,6 +80,66 @@ def test_detect_stuck_flags_dead_and_overrunning(fleet_db):
     assert ("slow", "no_heartbeat") not in found
 
 
+def test_detect_stuck_ignores_stale_idle_discovery_worker(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "m2-disc", role="discovery", state="idle")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat "
+                "SET last_beat = now() - make_interval(secs => 600) "
+                "WHERE worker_id='m2-disc'"
+            )
+        conn.commit()
+
+        found = {(r["worker_id"], r["reason"]) for r in heartbeat.detect_stuck(conn)}
+
+    assert ("m2-disc", "no_heartbeat") not in found
+
+
+def test_detect_stuck_ignores_stale_service_heartbeats(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "fleet_doctor", role="doctor", state="busy")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat "
+                "SET last_beat = now() - make_interval(secs => 600) "
+                "WHERE worker_id='fleet_doctor'"
+            )
+        conn.commit()
+
+        found = {(r["worker_id"], r["reason"]) for r in heartbeat.detect_stuck(conn)}
+
+    assert ("fleet_doctor", "no_heartbeat") not in found
+
+
+def test_detect_stuck_ignores_unmanaged_machine_owner_when_desired_state_exists(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TEMP TABLE fleet_desired_state ("
+                "machine_owner TEXT PRIMARY KEY, desired_workers INTEGER NOT NULL"
+                ") ON COMMIT PRESERVE ROWS"
+            )
+            cur.execute(
+                "INSERT INTO fleet_desired_state (machine_owner, desired_workers) "
+                "VALUES ('m2', 4), ('m4', 4)"
+            )
+        conn.commit()
+
+        heartbeat.beat(conn, "mac-0", machine_owner="mac-Mac", role="apply", state="idle")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat "
+                "SET last_beat = now() - make_interval(secs => 600) "
+                "WHERE worker_id='mac-0'"
+            )
+        conn.commit()
+
+        found = {(r["worker_id"], r["reason"]) for r in heartbeat.detect_stuck(conn)}
+
+    assert ("mac-0", "no_heartbeat") not in found
+
+
 def test_beat_keepalive_preserves_in_flight_job_started_at(fleet_db):
     # A keepalive on the SAME job that doesn't re-pass job_started_at must NOT clear
     # it -- else job_over_max stuck-detection is silently disabled for that job.

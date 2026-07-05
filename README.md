@@ -28,7 +28,7 @@ Three commands. That's it.
 
 ```bash
 pip install applypilot
-pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
+pip install --no-deps python-jobspy && pip install "numpy==1.26.3" pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot run           # discover > enrich > score > tailor > cover letters
@@ -38,7 +38,7 @@ applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
 ```
 
-> **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
+> **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata. The `--no-deps` flag keeps pip's resolver from fighting the main install, and the second command installs JobSpy's import-time runtime dependencies, including `numpy==1.26.3` and `tls-client`.
 
 ---
 
@@ -102,7 +102,17 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|
 | CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
 
-> **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
+> **Note:** python-jobspy is installed separately with `--no-deps`; keep `numpy==1.26.3` and `tls-client` installed so `jobspy` imports cleanly and `pip check` stays green.
+
+### Fleet Health
+
+For the home/Tarpon/GGGTower/Paloma fleet, run the read-only status report from the repo root:
+
+```powershell
+.\fleet-health.ps1
+```
+
+It prints local scheduled tasks/processes, Postgres fleet tables, and SSH probes for the remote workers.
 
 ---
 

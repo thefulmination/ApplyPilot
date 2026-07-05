@@ -2732,6 +2732,28 @@ def capsolver_check(
         raise typer.Exit(code=1)
 
 
+@app.command("fleet-capsolver-check")
+def fleet_capsolver_check(
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable status JSON."),
+) -> None:
+    """Verify this machine is ready to handle fleet CAPTCHA solving."""
+    from applypilot.apply import capsolver as capsolver_mod
+
+    readiness = capsolver_mod.check_fleet_readiness()
+    if json_output:
+        typer.echo(json.dumps(readiness.to_dict(), sort_keys=True))
+    else:
+        if readiness.ready:
+            balance = f" Balance: ${readiness.balance:.2f}." if readiness.balance is not None else ""
+            console.print(f"[green]OK[/green] CapSolver fleet readiness passed.{balance}")
+        else:
+            detail = f"{readiness.error_code or 'error'}: {readiness.error_description or readiness.note}"
+            console.print(f"[red]FAILED[/red] CapSolver fleet readiness failed. {detail}")
+
+    if not readiness.ready:
+        raise typer.Exit(code=1)
+
+
 tenants_app = typer.Typer(
     name="tenants",
     help="Manage the ats_tenants registry (login-gated ATS rollout: excluded/supervised/trusted).",

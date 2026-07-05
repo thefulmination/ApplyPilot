@@ -46,6 +46,9 @@ foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
   if (Test-Path $cand) { $exe = (Resolve-Path $cand).Path; break }
 }
 if (-not $exe) { throw "applypilot-fleet-apply not found in .conda-env or .venv -- run the setup script first." }
+$scriptsDir = Split-Path -Parent $exe
+$applypilotCli = Join-Path $scriptsDir "applypilot.exe"
+if (-not (Test-Path $applypilotCli)) { throw "applypilot.exe not found next to applypilot-fleet-apply.exe -- run pip install -e . first." }
 
 function Resolve-FleetHomeIp([string]$Candidate) {
   $ip = "$Candidate".Trim()
@@ -67,6 +70,11 @@ $env:FLEET_HOME_IP = $HomeIp
 $env:FLEET_MACHINE_OWNER = $Label
 
 $env:APPLYPILOT_DIR = Join-Path $ProjectRoot ".applypilot"
+Write-Host "[fleet-worker] checking CapSolver fleet readiness ..."
+$capProbe = & $applypilotCli fleet-capsolver-check --json 2>&1
+if ($LASTEXITCODE -ne 0) {
+  throw "Refusing to start worker '$WorkerId': CapSolver fleet readiness failed. $($capProbe -join ' ')"
+}
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $ProjectRoot ".playwright-browsers"
 $chromium = Get-ChildItem -Path $env:PLAYWRIGHT_BROWSERS_PATH -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue |
     Sort-Object Name -Descending | Select-Object -First 1

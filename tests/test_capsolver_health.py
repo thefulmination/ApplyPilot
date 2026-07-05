@@ -102,3 +102,75 @@ def test_capsolver_check_json_is_single_line(monkeypatch) -> None:
     assert result.exit_code == 0
     assert result.output.count("\n") == 1
     assert json.loads(result.output)["balance"] == 9.99
+
+
+def test_capsolver_fleet_readiness_requires_account_and_prompt_fast_fail() -> None:
+    from applypilot.apply import capsolver
+
+    status = capsolver.CapSolverStatus(
+        configured=True,
+        ok=True,
+        balance=7.50,
+        note="CapSolver account reachable.",
+    )
+    prompt_text = (
+        "ERROR_INVALID_TASK_DATA ERROR_TASK_NOT_SUPPORTED "
+        "unsupported service RESULT:CAPTCHA"
+    )
+
+    readiness = capsolver.check_fleet_readiness(
+        balance_check=lambda: status,
+        captcha_section=prompt_text,
+    )
+
+    assert readiness.ready is True
+    assert readiness.account_ok is True
+    assert readiness.prompt_fast_fail is True
+    assert readiness.balance == 7.50
+
+
+def test_capsolver_fleet_readiness_fails_when_prompt_fast_fail_missing() -> None:
+    from applypilot.apply import capsolver
+
+    status = capsolver.CapSolverStatus(
+        configured=True,
+        ok=True,
+        balance=7.50,
+        note="CapSolver account reachable.",
+    )
+
+    readiness = capsolver.check_fleet_readiness(
+        balance_check=lambda: status,
+        captcha_section="CapSolver account is configured but prompt lacks the guard.",
+    )
+
+    assert readiness.ready is False
+    assert readiness.account_ok is True
+    assert readiness.prompt_fast_fail is False
+    assert readiness.error_code == "prompt_missing_fast_fail"
+
+
+def test_fleet_capsolver_check_json_is_single_line(monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from applypilot import cli
+    from applypilot.apply import capsolver
+
+    monkeypatch.setattr(
+        capsolver,
+        "check_fleet_readiness",
+        lambda: capsolver.CapSolverFleetReadiness(
+            configured=True,
+            account_ok=True,
+            prompt_fast_fail=True,
+            ready=True,
+            balance=9.99,
+            note="CapSolver fleet readiness passed.",
+        ),
+    )
+
+    result = CliRunner().invoke(cli.app, ["fleet-capsolver-check", "--json"])
+
+    assert result.exit_code == 0
+    assert result.output.count("\n") == 1
+    assert json.loads(result.output)["ready"] is True

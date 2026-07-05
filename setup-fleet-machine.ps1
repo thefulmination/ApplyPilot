@@ -2,11 +2,11 @@
 ================================================================================
   setup-fleet-machine.ps1
   Set up a SECOND machine to run Codex and talk to the ApplyPilot fleet Postgres,
-  over your private home LAN (both machines on the 192.168.1.x router -- NO Tailscale).
+  preferably over Tailscale so Wi-Fi/Ethernet LAN address changes do not break it.
 
-  The home box's LAN IP is 192.168.1.187 (gateway 192.168.1.1). Reserve that IP on
-  the router (DHCP reservation) so it doesn't change. Both machines must be on the
-  SAME router/network for this to work.
+  The home box's current Tailscale IP is 100.90.104.99. Both machines must be on
+  the same Tailscale tailnet, or you must override the prompt below with a valid
+  private LAN address for the home box.
 
   --------------------------------------------------------------------------------
   STEP 0 -- DO THIS ONCE ON THE HOME BOX (the machine that has Postgres), AS ADMIN:
@@ -27,12 +27,27 @@
 
 $ErrorActionPreference = "Stop"
 function Say($m,$c="White"){ Write-Host $m -ForegroundColor $c }
+function Set-CapSolverKey([string]$InstallDir) {
+  $capKey = (Read-Host "CapSolver API key (Enter to skip)").Trim()
+  if (-not $capKey) { Say "  SKIPPED -- set CAPSOLVER_API_KEY before launching apply workers." Yellow; return }
 
-Say "`n=== ApplyPilot fleet -- second-machine setup (LAN) ===" Cyan
+  [Environment]::SetEnvironmentVariable("CAPSOLVER_API_KEY", $capKey, "User")
+  $env:CAPSOLVER_API_KEY = $capKey
+  $appDir = Join-Path $InstallDir ".applypilot"
+  New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+  $envFile = Join-Path $appDir ".env"
+  $lines = @()
+  if (Test-Path $envFile) { $lines = @(Get-Content $envFile | Where-Object { $_ -notmatch '^CAPSOLVER_API_KEY=' }) }
+  $lines += "CAPSOLVER_API_KEY=$capKey"
+  Set-Content -Path $envFile -Value $lines -Encoding ascii
+  Say "  [ok] CapSolver key saved for this Windows user and $envFile" Green
+}
+
+Say "`n=== ApplyPilot fleet -- second-machine setup ===" Cyan
 
 # --- Prereqs this script can't automate (interactive sign-ins) ---
 Say "`nBefore continuing, make sure:" Yellow
-Say "  [ ] This machine is on the SAME router as the home box (a 192.168.1.x address)"
+Say "  [ ] This machine can reach the home box over Tailscale or the same private LAN"
 Say "  [ ] The home box STEP 0 above is done (PG opened to the LAN, service restarted)"
 Say "  [ ] Codex CLI is installed + signed in here (npm i -g @openai/codex ; codex login)"
 if ((Read-Host "All set? (y/n)") -ne 'y') { Say "Finish those, then re-run." Yellow; exit 1 }
@@ -54,16 +69,16 @@ Ensure "Python 3.12" "Python.Python.3.12" "python"
 Ensure "Node.js LTS" "OpenJS.NodeJS.LTS"  "node"
 
 # --- 2. Inputs ---
-$homeIp = (Read-Host "Home box LAN IP [default 192.168.1.187]").Trim()
-if (-not $homeIp){ $homeIp = "192.168.1.187" }
+$homeIp = (Read-Host "Home box IP [default 100.90.104.99]").Trim()
+if (-not $homeIp){ $homeIp = "100.90.104.99" }
 $pgPw   = (Read-Host "Postgres password (the home box's 'postgres' user password)").Trim()
 $installDir = (Read-Host "Folder to install the code [default C:\ApplyPilot]").Trim()
 if (-not $installDir){ $installDir = "C:\ApplyPilot" }
 
 # --- 3. Reachability check BEFORE the heavy install ---
-Say "`n  checking the home box is reachable on the LAN ..." Cyan
+Say "`n  checking the home box is reachable ..." Cyan
 if (-not (Test-Connection -ComputerName $homeIp -Count 2 -Quiet)) {
-  Say "  Could not ping $homeIp. Confirm both machines are on the same router and the IP is right." Yellow
+  Say "  Could not ping $homeIp. Confirm Tailscale/private LAN connectivity and the IP is right." Yellow
   if ((Read-Host "Continue anyway? (y/n)") -ne 'y') { exit 1 }
 }
 
@@ -74,6 +89,9 @@ if (-not (Test-Path (Join-Path $installDir ".git"))){
   git clone $repo $installDir
 } else { Say "  [ok] repo already at $installDir" Green }
 Set-Location $installDir
+
+Say "`n  configuring CapSolver CAPTCHA service ..." Cyan
+Set-CapSolverKey $installDir
 
 # --- 5. Python env + install (bridge needs psycopg + mcp; pyyaml for config) ---
 if (-not (Test-Path ".\.venv")){ python -m venv .venv }
@@ -93,9 +111,9 @@ $dsn = "host=$homeIp port=5432 dbname=applypilot_fleet user=postgres connect_tim
 $env:FLEET_PG_DSN = $dsn
 $env:APPLYPILOT_FLEET_DSN = $dsn
 
-# --- 7. Test the actual Postgres connection over the LAN ---
-Say "`n  testing Postgres over the LAN ..." Cyan
-& $py -c "from applypilot.apply import pgqueue; pgqueue.connect(); print('CONNECTED to the fleet Postgres over the LAN')"
+# --- 7. Test the actual Postgres connection ---
+Say "`n  testing Postgres connectivity ..." Cyan
+& $py -c "from applypilot.apply import pgqueue; pgqueue.connect(); print('CONNECTED to the fleet Postgres')"
 
 # --- 8. Wire the Codex bridge into ~/.codex/config.toml (single-quoted = literal Windows paths) ---
 $codexDir = Join-Path $env:USERPROFILE ".codex"

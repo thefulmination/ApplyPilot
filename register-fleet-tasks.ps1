@@ -74,7 +74,7 @@ if (-not $isAdmin) {
 function Get-DefaultDsn([string]$m) {
   switch ($m) {
     "home" { return "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
-    "m2"   { return "host=192.168.1.187 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
+    "m2"   { return "host=100.90.104.99 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
     "m4"   { return "host=100.90.104.99 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
   }
 }
@@ -295,6 +295,20 @@ if ($Machine -eq "home") {
 `$ErrorActionPreference = 'Continue'
 `$env:FLEET_PG_DSN = '$effectiveDsn'
 Set-Location '$repo'
+function Stop-StaleWatchdogProcesses {
+  `$self = `$PID
+  `$repoRoot = '$repo'
+  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      `$_.ProcessId -ne `$self -and `$_.CommandLine -and
+      `$_.CommandLine -like "*`$repoRoot*" -and
+      (`$_.CommandLine -like '*applypilot-fleet-watchdog.exe*' -or `$_.CommandLine -like '*watchdog-task.ps1*')
+    } |
+    ForEach-Object {
+      Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+Stop-StaleWatchdogProcesses
 & '$watchdogExe' --dsn `$env:FLEET_PG_DSN
 "@
     $watchdogWrapper = Write-Wrapper "watchdog-task" $watchdogWrapperContent

@@ -2,7 +2,7 @@
 ================================================================================
   setup-fleet-discovery.ps1
   Bootstrap a FRESH Windows machine into an ApplyPilot DISCOVERY worker:
-  it leases search tasks from the home box's Postgres over your private LAN,
+  it leases search tasks from the home box's Postgres over Tailscale or your private LAN,
   scrapes job boards with JobSpy, and stages the raw postings back to Postgres.
   The home box alone ingests them into the brain (see run-discovery-home-loop.ps1).
 
@@ -17,7 +17,7 @@
   step, so a worker set up with them imports fine but dies the moment it scrapes.
 
   PREREQS:
-    - This machine is on the SAME router as the home box (a 192.168.1.x IP).
+    - This machine can reach the home box's Tailscale IP, or both boxes are on the same private LAN.
     - The home box already serves Postgres to the LAN -- it does: pg_hba +
       firewall rule + listen_addresses='*' are all set. NOTHING to do there.
     - This should NOT be the machine that holds your LinkedIn / apply session.
@@ -27,7 +27,7 @@
       powershell -ExecutionPolicy Bypass -File .\setup-fleet-discovery.ps1
 ================================================================================
 #>
-param([string]$HomeIp = "192.168.1.187", [string]$InstallDir = "C:\ApplyPilot")
+param([string]$HomeIp = "100.90.104.99", [string]$InstallDir = "C:\ApplyPilot")
 $ErrorActionPreference = "Stop"
 function Say($m,$c="White"){ Write-Host $m -ForegroundColor $c }
 function Refresh-Path { $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") }
@@ -107,6 +107,7 @@ $py = (Resolve-Path $py).Path
 # (the package already declares jobspy's import-time runtime deps).
 & $py -m pip install --no-deps python-jobspy --quiet
 & $py -c "import jobspy; print('  jobspy import OK')"
+& $py -m pip check
 
 # --- 5. Postgres connectivity (LAN, passwordless via pgpass) ---
 Say "`n[5/6] Postgres connection ..." Cyan
@@ -117,7 +118,7 @@ $dsn = "host=$HomeIp port=5432 dbname=applypilot_fleet user=postgres connect_tim
 [Environment]::SetEnvironmentVariable("FLEET_PG_DSN", $dsn, "User")
 [Environment]::SetEnvironmentVariable("APPLYPILOT_FLEET_DSN", $dsn, "User")
 $env:FLEET_PG_DSN = $dsn; $env:APPLYPILOT_FLEET_DSN = $dsn
-& $py -c "from applypilot.apply import pgqueue; pgqueue.connect(); print('  CONNECTED to the fleet Postgres over the LAN')"
+& $py -c "from applypilot.apply import pgqueue; pgqueue.connect(); print('  CONNECTED to the fleet Postgres')"
 
 # --- 6. Done ---
 Say "`n[6/6] done." Green

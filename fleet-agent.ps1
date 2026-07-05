@@ -6,7 +6,7 @@
 #   m2=4 from the home box makes this agent bring m2 to 4 workers; setting m2=0 stops them.
 #
 #   Enroll once per box (ideally as a Task Scheduler "At log on" task so it auto-starts):
-#     m2:  $env:FLEET_PG_DSN="host=192.168.1.187 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+#     m2:  $env:FLEET_PG_DSN="host=100.90.104.99 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
 #          cd C:\ApplyPilot ;  .\fleet-agent.ps1 -Label m2 -AutoUpdate
 #     m4:  $env:FLEET_PG_DSN="host=100.90.104.99 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
 #          cd C:\ApplyPilot ;  .\fleet-agent.ps1 -Label m4 -AutoUpdate
@@ -41,6 +41,11 @@ if ($boxLabel -and ($boxLabel -ne $Label)) {
 $py = $null
 foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) { if (Test-Path $d) { $py = (Resolve-Path $d).Path; break } }
 if (-not $py) { throw "python not found (.conda-env or .venv) -- run the box setup first." }
+$applypilotCli = $null
+foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
+  $cand = Join-Path $d "applypilot.exe"
+  if (Test-Path $cand) { $applypilotCli = (Resolve-Path $cand).Path; break }
+}
 if (-not $env:FLEET_PG_DSN) { $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
 $worker = Join-Path $repo "run-fleet-worker.ps1"
 if (-not (Test-Path $worker)) { throw "run-fleet-worker.ps1 not found next to fleet-agent.ps1 ($worker)" }
@@ -50,6 +55,14 @@ Write-Host "[fleet-agent:$Label] pre-flight (DSN=$env:FLEET_PG_DSN)..." -Foregro
 $pf = @()
 & $py -c "import applypilot" 2>$null; if (-not $?) { $pf += "applypilot not importable -> $py -m pip install -e ." }
 if (-not (@(".\.conda-env\Scripts\applypilot-fleet-apply.exe", ".\.venv\Scripts\applypilot-fleet-apply.exe") | Where-Object { Test-Path $_ })) { $pf += "applypilot-fleet-apply.exe MISSING -> pip install -e ." }
+if (-not $applypilotCli) {
+  $pf += "CapSolver readiness UNKNOWN: applypilot.exe MISSING -> pip install -e ."
+} else {
+  $capProbe = & $applypilotCli fleet-capsolver-check --json 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    $pf += "CapSolver readiness FAILED on this box -> set CAPSOLVER_API_KEY and verify with applypilot fleet-capsolver-check --json (got '$($capProbe -join ' ')')"
+  }
+}
 if (-not (Get-ChildItem ".\.playwright-browsers\chromium-*" -Directory -ErrorAction SilentlyContinue)) { $pf += "Chromium MISSING in .playwright-browsers (set PLAYWRIGHT_BROWSERS_PATH + reinstall)" }
 $probe = (& $py "fleet-agent-query.py" $Label 2>$null | Select-Object -Last 1)
 if ("$probe" -notmatch '^\d+\|') {

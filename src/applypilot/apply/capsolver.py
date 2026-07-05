@@ -36,7 +36,23 @@ class CapSolverStatus:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CapSolverFleetReadiness:
+    configured: bool
+    account_ok: bool
+    prompt_fast_fail: bool
+    ready: bool
+    balance: float | None = None
+    error_code: str | None = None
+    error_description: str | None = None
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 PostFn = Callable[..., Any]
+BalanceCheckFn = Callable[[], CapSolverStatus]
 
 
 def _api_key() -> str:
@@ -98,4 +114,83 @@ def check_balance(*, timeout: float = 8.0, post: PostFn | None = None) -> CapSol
         ok=True,
         balance=balance,
         note="CapSolver account reachable.",
+    )
+
+
+def _captcha_section() -> str:
+    from applypilot.apply import prompt
+
+    return prompt._build_captcha_section()
+
+
+def _has_prompt_fast_fail(captcha_section: str) -> bool:
+    required = (
+        "ERROR_INVALID_TASK_DATA",
+        "ERROR_TASK_NOT_SUPPORTED",
+        "RESULT:CAPTCHA",
+    )
+    return all(token in captcha_section for token in required)
+
+
+def check_fleet_readiness(
+    *,
+    timeout: float = 8.0,
+    balance_check: BalanceCheckFn | None = None,
+    captcha_section: str | None = None,
+) -> CapSolverFleetReadiness:
+    """Return the full apply-worker CapSolver readiness gate.
+
+    A fleet apply worker is CAPTCHA-capable only when the CapSolver account is
+    reachable and the agent prompt has the fast-fail guard for unsupported
+    CapSolver task responses. This keeps workers from burning attempts on
+    challenge types the service already rejected.
+    """
+    account = balance_check() if balance_check else check_balance(timeout=timeout)
+    try:
+        section = captcha_section if captcha_section is not None else _captcha_section()
+        prompt_fast_fail = _has_prompt_fast_fail(section)
+    except Exception as exc:
+        prompt_fast_fail = False
+        if account.ok:
+            return CapSolverFleetReadiness(
+                configured=account.configured,
+                account_ok=True,
+                prompt_fast_fail=False,
+                ready=False,
+                balance=account.balance,
+                error_code="prompt_check_error",
+                error_description=str(exc),
+                note="Could not verify the CapSolver prompt fast-fail guard.",
+            )
+
+    if not account.ok:
+        return CapSolverFleetReadiness(
+            configured=account.configured,
+            account_ok=False,
+            prompt_fast_fail=prompt_fast_fail,
+            ready=False,
+            balance=account.balance,
+            error_code=account.error_code,
+            error_description=account.error_description,
+            note=account.note,
+        )
+
+    if not prompt_fast_fail:
+        return CapSolverFleetReadiness(
+            configured=account.configured,
+            account_ok=True,
+            prompt_fast_fail=False,
+            ready=False,
+            balance=account.balance,
+            error_code="prompt_missing_fast_fail",
+            note="Apply prompt is missing the unsupported-CapSolver fast-fail guard.",
+        )
+
+    return CapSolverFleetReadiness(
+        configured=account.configured,
+        account_ok=True,
+        prompt_fast_fail=True,
+        ready=True,
+        balance=account.balance,
+        note="CapSolver fleet readiness passed.",
     )

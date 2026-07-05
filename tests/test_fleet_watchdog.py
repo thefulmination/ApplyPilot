@@ -133,6 +133,76 @@ def test_watchdog_dedupes_open_restart_for_stuck_worker(fleet_db):
             assert cur.fetchone()["n"] == 1
 
 
+def test_watchdog_does_not_restart_stale_idle_discovery_worker(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, role, state, last_beat) "
+                "VALUES ('m2-disc','discovery','idle', now() - interval '10 minutes')"
+            )
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+
+        assert all(e["worker_id"] != "m2-disc" for e in summary["stuck_handled"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM remote_commands "
+                "WHERE worker_id='m2-disc' AND command='restart' AND acked_at IS NULL"
+            )
+            assert cur.fetchone()["n"] == 0
+
+
+def test_watchdog_does_not_restart_stale_fleet_doctor_heartbeat(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, role, state, last_beat) "
+                "VALUES ('fleet_doctor','doctor','busy', now() - interval '10 minutes')"
+            )
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+
+        assert all(e["worker_id"] != "fleet_doctor" for e in summary["stuck_handled"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM remote_commands "
+                "WHERE worker_id='fleet_doctor' AND command='restart' AND acked_at IS NULL"
+            )
+            assert cur.fetchone()["n"] == 0
+
+
+def test_watchdog_does_not_restart_unmanaged_machine_owner(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TEMP TABLE fleet_desired_state ("
+                "machine_owner TEXT PRIMARY KEY, desired_workers INTEGER NOT NULL"
+                ") ON COMMIT PRESERVE ROWS"
+            )
+            cur.execute(
+                "INSERT INTO fleet_desired_state (machine_owner, desired_workers) "
+                "VALUES ('m2', 4), ('m4', 4)"
+            )
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, role, state, last_beat) "
+                "VALUES ('mac-0','mac-Mac','apply','idle', now() - interval '10 minutes')"
+            )
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+
+        assert all(e["worker_id"] != "mac-0" for e in summary["stuck_handled"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM remote_commands "
+                "WHERE worker_id='mac-0' AND command='restart' AND acked_at IS NULL"
+            )
+            assert cur.fetchone()["n"] == 0
+
+
 def test_watchdog_never_restarts_itself(fleet_db):
     cfg = watchdog.WatchdogConfig()
     with pgqueue.connect(fleet_db) as conn:

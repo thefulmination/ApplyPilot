@@ -17,13 +17,13 @@
 #   Examples:
 #     .\load-canary-remote.ps1                       # auto-size workers from this box's RAM
 #     .\load-canary-remote.ps1 -Count 8              # force 8 workers
-#     .\load-canary-remote.ps1 -HomeIp 192.168.1.187 -Label m2 -Agent codex
+#     .\load-canary-remote.ps1 -HomeIp 100.90.104.99 -Label m2 -Agent codex
 #
 param(
   [int]$Count          = 0,                    # 0 = auto-size from TOTAL RAM (this box is the workhorse)
   [string]$Agent       = "codex",              # codex rides the ChatGPT plan (no per-apply $)
   [string]$Label       = "m2",                 # MUST differ from home so worker-ids don't collide
-  [string]$HomeIp      = "192.168.1.187",      # home box LAN IP (where Postgres lives)
+  [string]$HomeIp      = "100.90.104.99",      # home box Tailscale IP (where Postgres lives)
   [string]$MachineOwner= $env:COMPUTERNAME,    # heartbeat attribution (captcha inbox / monitoring)
   [string]$EgressIp    = ""                    # this box's residential egress IP (governor key); auto-detected if blank
 )

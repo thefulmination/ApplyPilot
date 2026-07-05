@@ -2,10 +2,10 @@
 ================================================================================
   setup-fleet-worker.ps1
   Bootstrap a FRESH Windows machine into a full ApplyPilot APPLY WORKER (Codex
-  agent), talking to the home box's Postgres over your private LAN.
+  agent), talking to the home box's Postgres over Tailscale or your private LAN.
 
   PREREQS:
-    - This machine and the home box are on the SAME router (a 192.168.1.x IP).
+    - This machine can reach the home box's Tailscale IP, or both boxes are on the same private LAN.
     - The home box already opened Postgres to the LAN (see setup-fleet-machine.ps1).
 
   MANUAL bits the script can't do (interactive logins / personal files):
@@ -18,10 +18,25 @@
       powershell -ExecutionPolicy Bypass -File .\setup-fleet-worker.ps1
 ================================================================================
 #>
-param([string]$HomeIp = "192.168.1.187", [string]$InstallDir = "C:\ApplyPilot")
+param([string]$HomeIp = "100.90.104.99", [string]$InstallDir = "C:\ApplyPilot")
 $ErrorActionPreference = "Stop"
 function Say($m,$c="White"){ Write-Host $m -ForegroundColor $c }
 function Refresh-Path { $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") }
+function Set-CapSolverKey([string]$InstallDir) {
+  $capKey = (Read-Host "  CapSolver API key (Enter to skip)").Trim()
+  if (-not $capKey) { Say "  SKIPPED -- set CAPSOLVER_API_KEY before launching apply workers." Yellow; return }
+
+  [Environment]::SetEnvironmentVariable("CAPSOLVER_API_KEY", $capKey, "User")
+  $env:CAPSOLVER_API_KEY = $capKey
+  $appDir = Join-Path $InstallDir ".applypilot"
+  New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+  $envFile = Join-Path $appDir ".env"
+  $lines = @()
+  if (Test-Path $envFile) { $lines = @(Get-Content $envFile | Where-Object { $_ -notmatch '^CAPSOLVER_API_KEY=' }) }
+  $lines += "CAPSOLVER_API_KEY=$capKey"
+  Set-Content -Path $envFile -Value $lines -Encoding ascii
+  Say "  [ok] CapSolver key saved for this Windows user and $envFile" Green
+}
 
 Say "`n=== ApplyPilot fleet -- WORKER bootstrap (Codex agent) ===" Cyan
 
@@ -85,6 +100,9 @@ if (-not (Test-Path (Join-Path $dest "profile.json"))) {
   } else { Say "  SKIPPED -- copy profile.json + resume.pdf + resume.txt + searches.yaml into $dest before launching a worker." Yellow }
 } else { Say "  [ok] profile already present" Green }
 
+Say "`n[6b/8] CapSolver CAPTCHA service ..." Cyan
+Set-CapSolverKey $InstallDir
+
 # --- 7. Postgres connectivity (LAN, passwordless via pgpass) ---
 Say "`n[7/8] Postgres connection ..." Cyan
 $pgPw = (Read-Host "  Postgres password (home box's 'postgres' user)").Trim()
@@ -94,7 +112,7 @@ $dsn = "host=$HomeIp port=5432 dbname=applypilot_fleet user=postgres connect_tim
 [Environment]::SetEnvironmentVariable("FLEET_PG_DSN", $dsn, "User")
 [Environment]::SetEnvironmentVariable("APPLYPILOT_FLEET_DSN", $dsn, "User")
 $env:FLEET_PG_DSN = $dsn; $env:APPLYPILOT_FLEET_DSN = $dsn
-& $py -c "from applypilot.apply import pgqueue; pgqueue.connect(); print('  CONNECTED to the fleet Postgres over the LAN')"
+& $py -c "from applypilot.apply import pgqueue; pgqueue.connect(); print('  CONNECTED to the fleet Postgres')"
 
 # --- 8. Codex fleet bridge (so this machine can also MONITOR the fleet from Codex) ---
 Say "`n[8/8] wiring the Codex fleet bridge into ~/.codex/config.toml ..." Cyan
