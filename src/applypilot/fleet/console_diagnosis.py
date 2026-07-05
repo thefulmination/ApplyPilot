@@ -281,39 +281,41 @@ def browser_health(conn) -> dict:
 
 
 def operational_rollups(conn) -> dict:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT worker_id, machine_owner, role, state, last_beat, current_agent, current_model "
-            "FROM worker_heartbeat ORDER BY machine_owner NULLS LAST, worker_id"
-        )
-        worker_rows = cur.fetchall()
-        cur.execute(
-            "SELECT COALESCE(target_host, apply_domain, '(unknown)') AS host, "
-            "COUNT(*) AS total, "
-            "COUNT(*) FILTER (WHERE status='applied') AS applied, "
-            "COUNT(*) FILTER (WHERE status='failed') AS failed, "
-            "COUNT(*) FILTER (WHERE apply_status='challenge_pending') AS challenges "
-            "FROM apply_queue GROUP BY 1 ORDER BY total DESC LIMIT 25"
-        )
-        host_rows = cur.fetchall()
-        cur.execute(
-            "SELECT COUNT(*) FILTER (WHERE status='applied' AND updated_at > now() - interval '1 hour') AS applied_1h, "
-            "COUNT(*) FILTER (WHERE status='applied' AND updated_at > now() - interval '24 hours') AS applied_24h, "
-            "MAX(updated_at) FILTER (WHERE status='applied') AS last_apply_at "
-            "FROM apply_queue"
-        )
-        throughput = cur.fetchone() or {}
-        cur.execute(
-            "SELECT worker_id, COUNT(*) AS total, "
-            "COUNT(*) FILTER (WHERE status='applied') AS applied, "
-            "COUNT(*) FILTER (WHERE status='failed') AS failed, "
-            "COUNT(*) FILTER (WHERE status='crash_unconfirmed') AS crash_unconfirmed, "
-            "COALESCE(SUM(est_cost_usd),0) AS cost_usd "
-            "FROM apply_queue WHERE worker_id IS NOT NULL "
-            "GROUP BY worker_id ORDER BY applied DESC, total DESC, worker_id LIMIT 50"
-        )
-        worker_cmp = cur.fetchall()
-    conn.rollback()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id, machine_owner, role, state, last_beat, current_agent, current_model "
+                "FROM worker_heartbeat ORDER BY machine_owner NULLS LAST, worker_id"
+            )
+            worker_rows = cur.fetchall()
+            cur.execute(
+                "SELECT COALESCE(target_host, apply_domain, '(unknown)') AS host, "
+                "COUNT(*) AS total, "
+                "COUNT(*) FILTER (WHERE status='applied') AS applied, "
+                "COUNT(*) FILTER (WHERE status='failed') AS failed, "
+                "COUNT(*) FILTER (WHERE apply_status='challenge_pending') AS challenges "
+                "FROM apply_queue GROUP BY 1 ORDER BY total DESC, host ASC LIMIT 25"
+            )
+            host_rows = cur.fetchall()
+            cur.execute(
+                "SELECT COUNT(*) FILTER (WHERE status='applied' AND updated_at > now() - interval '1 hour') AS applied_1h, "
+                "COUNT(*) FILTER (WHERE status='applied' AND updated_at > now() - interval '24 hours') AS applied_24h, "
+                "MAX(updated_at) FILTER (WHERE status='applied') AS last_apply_at "
+                "FROM apply_queue"
+            )
+            throughput = cur.fetchone() or {}
+            cur.execute(
+                "SELECT worker_id, COUNT(*) AS total, "
+                "COUNT(*) FILTER (WHERE status='applied') AS applied, "
+                "COUNT(*) FILTER (WHERE status='failed') AS failed, "
+                "COUNT(*) FILTER (WHERE status='crash_unconfirmed') AS crash_unconfirmed, "
+                "COALESCE(SUM(est_cost_usd),0) AS cost_usd "
+                "FROM apply_queue WHERE worker_id IS NOT NULL "
+                "GROUP BY worker_id ORDER BY applied DESC, total DESC, worker_id LIMIT 50"
+            )
+            worker_cmp = cur.fetchall()
+    finally:
+        conn.rollback()
 
     machines: dict[str, dict] = {}
     for row in worker_rows:

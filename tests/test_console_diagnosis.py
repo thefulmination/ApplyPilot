@@ -302,6 +302,34 @@ def test_browser_health_rolls_back_when_query_raises(failure):
     assert conn.rolled_back is True
 
 
+def test_operational_rollups_rolls_back_when_query_raises():
+    class RaisingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    class Conn:
+        def __init__(self):
+            self.rolled_back = False
+
+        def cursor(self):
+            return RaisingCursor()
+
+        def rollback(self):
+            self.rolled_back = True
+
+    conn = Conn()
+    with pytest.raises(RuntimeError, match="boom"):
+        console_diagnosis.operational_rollups(conn)
+
+    assert conn.rolled_back is True
+
+
 def test_browser_health_counts_apply_workers_and_skips_non_apply_and_unknown(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
