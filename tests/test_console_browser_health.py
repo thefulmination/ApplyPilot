@@ -24,6 +24,33 @@ def test_classify_login_gate():
     assert c["kind"] == "login_gate"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "parked challenge https://x (login_gate->owner_tray)",
+        "RESULT:FAILED:login_issue",
+    ],
+)
+def test_classify_login_gate_live_aliases(text):
+    c = B.classify_text(text)
+    assert c["kind"] == "login_gate"
+    assert c["severity"] == "warn"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "parked challenge https://x (email_otp->auto_otp)",
+        "RESULT:FAILED:email_verification_required",
+        "Please enter the security code sent to your email.",
+    ],
+)
+def test_classify_email_otp_live_aliases(text):
+    c = B.classify_text(text)
+    assert c["kind"] == "email_otp"
+    assert c["severity"] == "warn"
+
+
 def test_classify_employer_application_cap():
     c = B.classify_text("we limit the number of applications so our team can review")
     assert c["kind"] == "employer_application_cap"

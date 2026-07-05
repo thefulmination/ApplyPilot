@@ -300,3 +300,28 @@ def test_browser_health_rolls_back_when_query_raises(failure):
         console_diagnosis.browser_health(conn)
 
     assert conn.rolled_back is True
+
+
+def test_browser_health_counts_apply_workers_and_skips_non_apply_and_unknown(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, role, state, last_error, recent_log, last_beat) "
+                "VALUES "
+                "('apply-known', 'm4', 'apply', 'idle', 'RESULT:FAILED:login_issue', '', now()), "
+                "('apply-unknown', 'm4', 'apply', 'idle', '', 'ordinary heartbeat', now()), "
+                "('linkedin-known', 'home', 'linkedin', 'idle', 'RESULT:FAILED:login_issue', '', now())"
+            )
+        conn.commit()
+
+        result = console_diagnosis.browser_health(conn)
+
+    assert result["counts"] == {"login_gate": 1}
+    assert result["examples"] == {
+        "login_gate": {
+            "worker_id": "apply-known",
+            "machine_owner": "m4",
+            "severity": "warn",
+        }
+    }
