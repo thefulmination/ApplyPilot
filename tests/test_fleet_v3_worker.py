@@ -592,6 +592,58 @@ def test_tick_linkedin_routes(fleet_db):
         assert cur.fetchone()["n"] == 1
 
 
+def test_heartbeat_degrades_when_agent_telemetry_columns_missing(fleet_db):
+    from applypilot.apply import pgqueue
+    from applypilot.fleet.worker import _heartbeat
+
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE worker_heartbeat "
+                "DROP COLUMN current_agent, "
+                "DROP COLUMN current_model, "
+                "DROP COLUMN agent_chain, "
+                "DROP COLUMN last_agent_switch_at, "
+                "DROP COLUMN last_agent_switch_reason"
+            )
+        conn.commit()
+
+        _heartbeat(
+            conn,
+            worker_id="legacy-m4-0",
+            machine_owner="m4",
+            home_ip="100.69.68.103",
+            role="apply",
+            state="applying",
+            current_job="https://example.test/job",
+            sw_version="0.3.0",
+            last_error="last error",
+            recent_log="recent log",
+            current_agent="claude",
+            current_model="sonnet",
+            agent_chain="claude>codex",
+            last_agent_switch_reason="startup",
+        )
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT machine_owner, home_ip, role, state, current_job, sw_version, "
+                "last_error, recent_log, last_beat "
+                "FROM worker_heartbeat WHERE worker_id='legacy-m4-0'"
+            )
+            row = cur.fetchone()
+
+    assert row["machine_owner"] == "m4"
+    assert row["home_ip"] == "100.69.68.103"
+    assert row["role"] == "apply"
+    assert row["state"] == "applying"
+    assert row["current_job"] == "https://example.test/job"
+    assert row["sw_version"] == "0.3.0"
+    assert row["last_error"] == "last error"
+    assert row["recent_log"] == "recent log"
+    assert row["last_beat"] is not None
+
+
 def test_heartbeat_persists_agent_model_telemetry(fleet_db):
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import _heartbeat

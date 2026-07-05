@@ -41,6 +41,8 @@ import os
 import re
 from typing import Any, Callable, Optional
 
+import psycopg.errors as _pg_errors
+
 from applypilot.fleet import captcha as _captcha
 from applypilot.fleet import governor
 from applypilot.fleet import queue
@@ -151,28 +153,43 @@ def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_
     ``last_error`` / ``recent_log`` (crash-visibility, scrubbed by the caller) OVERWRITE
     on every beat (set ...=EXCLUDED.x), unlike ``sw_version`` which COALESCEs to keep a
     previously reported version when a beat omits it."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, "
-            "last_error, recent_log, current_agent, current_model, agent_chain, last_agent_switch_at, "
-            "last_agent_switch_reason, last_beat) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
-            "CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, %s, now()) "
-            "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
-            "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
-            "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
-            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, "
-            "current_agent=COALESCE(EXCLUDED.current_agent, worker_heartbeat.current_agent), "
-            "current_model=COALESCE(EXCLUDED.current_model, worker_heartbeat.current_model), "
-            "agent_chain=COALESCE(EXCLUDED.agent_chain, worker_heartbeat.agent_chain), "
-            "last_agent_switch_at=CASE WHEN EXCLUDED.last_agent_switch_reason IS NULL "
-            "THEN worker_heartbeat.last_agent_switch_at ELSE EXCLUDED.last_agent_switch_at END, "
-            "last_agent_switch_reason=COALESCE(EXCLUDED.last_agent_switch_reason, worker_heartbeat.last_agent_switch_reason), "
-            "last_beat=now()",
-            (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
-             last_error, recent_log, current_agent, current_model, agent_chain,
-             last_agent_switch_reason, last_agent_switch_reason),
-        )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, "
+                "last_error, recent_log, current_agent, current_model, agent_chain, last_agent_switch_at, "
+                "last_agent_switch_reason, last_beat) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
+                "CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, %s, now()) "
+                "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
+                "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
+                "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
+                "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, "
+                "current_agent=COALESCE(EXCLUDED.current_agent, worker_heartbeat.current_agent), "
+                "current_model=COALESCE(EXCLUDED.current_model, worker_heartbeat.current_model), "
+                "agent_chain=COALESCE(EXCLUDED.agent_chain, worker_heartbeat.agent_chain), "
+                "last_agent_switch_at=CASE WHEN EXCLUDED.last_agent_switch_reason IS NULL "
+                "THEN worker_heartbeat.last_agent_switch_at ELSE EXCLUDED.last_agent_switch_at END, "
+                "last_agent_switch_reason=COALESCE(EXCLUDED.last_agent_switch_reason, worker_heartbeat.last_agent_switch_reason), "
+                "last_beat=now()",
+                (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
+                 last_error, recent_log, current_agent, current_model, agent_chain,
+                 last_agent_switch_reason, last_agent_switch_reason),
+            )
+    except _pg_errors.UndefinedColumn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, "
+                "last_error, recent_log, last_beat) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now()) "
+                "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
+                "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
+                "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
+                "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, last_beat=now()",
+                (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
+                 last_error, recent_log),
+            )
     if commit:
         conn.commit()
 
