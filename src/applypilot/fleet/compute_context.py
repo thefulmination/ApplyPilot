@@ -36,6 +36,7 @@ def load_context(conn, *, providers, fallback=(), ensemble=False) -> tuple[Compu
         preference_profile=json.loads(pref) if pref else None,
         kg_prompt=_txt(conn, _KG) or None,
         search_cfg=json.loads(cfg) if cfg else None,
+        ctx_version=version,
         providers=list(providers), fallback=list(fallback), ensemble=bool(ensemble),
     )
     return ctx, version

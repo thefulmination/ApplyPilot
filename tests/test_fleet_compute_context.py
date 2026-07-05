@@ -10,6 +10,7 @@ def test_publish_then_load_roundtrip(fleet_db):
         ctx, version = cc.load_context(conn, providers=["deepseek"], fallback=["gemini"], ensemble=True)
     assert version == "v1"
     assert ctx.resume_text == "RESUME" and ctx.kg_prompt == "KG"
+    assert ctx.ctx_version == "v1"
     assert ctx.preference_profile == {"weights": 1} and ctx.search_cfg == {"score_audit": {}}
     assert ctx.providers == ["deepseek"] and ctx.fallback == ["gemini"] and ctx.ensemble is True
 

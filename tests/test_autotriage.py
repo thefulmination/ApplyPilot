@@ -231,6 +231,85 @@ def test_load_contexts_ignores_stale_worker_heartbeat_log(fleet_db):
     assert ctx.last_error == ""
 
 
+def test_load_contexts_skips_recent_already_applied_action(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        autotriage.ensure_schema(conn)
+        _seed_ats_job(
+            conn,
+            url="u-open-challenge",
+            worker_id="m2-2",
+            status="crash_unconfirmed",
+            apply_error="email_reconcile_review_required",
+            dedup_key="dk-open-challenge",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO autotriage_actions "
+                "(url, worker_id, chosen_action, decision_source, confidence, reason, "
+                " action_status, prior_status, prior_attempts, prior_apply_error) "
+                "VALUES ('u-open-challenge', 'm2-2', 'defer_manual_auth', 'llm', 0.9, "
+                "'challenge already open', 'already_applied', 'crash_unconfirmed', 1, "
+                "'email_reconcile_review_required')"
+            )
+        conn.commit()
+
+        contexts = autotriage.load_contexts(conn, limit=10)
+
+    assert [ctx.url for ctx in contexts] == []
+
+
+def test_load_contexts_skips_recent_terminal_audit_action(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        autotriage.ensure_schema(conn)
+        _seed_ats_job(
+            conn,
+            url="u-no-action",
+            worker_id="m2-2",
+            status="failed",
+            apply_error="failed:budget_exhausted_mid_application",
+            dedup_key="dk-no-action",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO autotriage_actions "
+                "(url, worker_id, chosen_action, decision_source, confidence, reason, "
+                " action_status, prior_status, prior_attempts, prior_apply_error) "
+                "VALUES ('u-no-action', 'm2-2', 'no_action', 'llm', 0.9, "
+                "'ambiguous budget exhaustion', 'no_action', 'failed', 1, "
+                "'failed:budget_exhausted_mid_application')"
+            )
+        conn.commit()
+
+        contexts = autotriage.load_contexts(conn, limit=10)
+
+    assert [ctx.url for ctx in contexts] == []
+
+
+def test_load_contexts_skips_known_terminal_noop_errors(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        autotriage.ensure_schema(conn)
+        _seed_ats_job(
+            conn,
+            url="u-dedup",
+            worker_id="m2-2",
+            status="failed",
+            apply_error="dedup:already_applied",
+            dedup_key="dk-dedup",
+        )
+        _seed_ats_job(
+            conn,
+            url="u-expired",
+            worker_id="m2-3",
+            status="failed",
+            apply_error="expired",
+            dedup_key="dk-expired",
+        )
+
+        contexts = autotriage.load_contexts(conn, limit=10)
+
+    assert [ctx.url for ctx in contexts] == []
+
+
 def test_llm_can_defer_email_reconcile_review_required():
     ctx = autotriage.TriageContext(
         url="u-email-review",

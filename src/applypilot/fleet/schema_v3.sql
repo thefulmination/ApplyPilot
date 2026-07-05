@@ -574,6 +574,32 @@ CREATE INDEX IF NOT EXISTS idx_autotriage_url
 CREATE INDEX IF NOT EXISTS idx_autotriage_status
     ON autotriage_actions (action_status, created_at);
 
+-- apply_result_events: durable per-job terminal evidence written by the worker when
+-- it closes a lease. worker_heartbeat.recent_log is only a moving tail; repair tools
+-- should prefer this table for job-specific result evidence.
+CREATE TABLE IF NOT EXISTS apply_result_events (
+    id                  BIGSERIAL PRIMARY KEY,
+    queue_name          TEXT NOT NULL DEFAULT 'apply_queue',
+    url                 TEXT NOT NULL,
+    worker_id           TEXT,
+    status              TEXT,
+    apply_status        TEXT,
+    apply_error         TEXT,
+    target_host         TEXT,
+    home_ip             TEXT,
+    agent               TEXT,
+    agent_model         TEXT,
+    est_cost_usd        REAL,
+    apply_duration_ms   INTEGER,
+    result_line         TEXT,
+    source              TEXT NOT NULL DEFAULT 'worker',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS queue_name TEXT NOT NULL DEFAULT 'apply_queue';
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'worker';
+CREATE INDEX IF NOT EXISTS idx_apply_result_events_url_created
+    ON apply_result_events (queue_name, url, created_at DESC);
+
 -- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on
 -- the diagnosis row, so a Reverse / audit can report exactly which/how-many rows were affected,
 -- how many prior incidents, and how broad the block was -- without re-deriving from transient state.

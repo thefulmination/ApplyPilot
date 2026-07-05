@@ -143,6 +143,13 @@ def requeue_apply(conn, worker_id, url, *, apply_error=None) -> bool:
     return landed
 
 
+def _result_line(status, apply_status=None, apply_error=None) -> str:
+    if status == "applied":
+        return "RESULT:APPLIED"
+    token = apply_error or apply_status or status or "unknown"
+    return f"RESULT:{token}"
+
+
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                         apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
                         agent=None, agent_model=None, apply_duration_ms=None):
@@ -193,6 +200,28 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 "ON CONFLICT (dedup_key) DO NOTHING",
                 (url,),
             )
+        cur.execute(
+            "INSERT INTO apply_result_events ("
+            "queue_name, url, worker_id, status, apply_status, apply_error, target_host, home_ip, "
+            "agent, agent_model, est_cost_usd, apply_duration_ms, result_line, source"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s)",
+            (
+                "apply_queue",
+                url,
+                worker_id,
+                status,
+                apply_status,
+                apply_error,
+                target_host,
+                home_ip,
+                agent,
+                agent_model,
+                est_cost_usd,
+                apply_duration_ms,
+                _result_line(status, apply_status=apply_status, apply_error=apply_error),
+                "worker",
+            ),
+        )
         # Phase 2.1: the apply lane spends real agent money but never recorded it to
         # llm_usage, so every cost cap (_cost_cap_exceeded, fleet_config spend caps)
         # read $0 while real cost was incurred. Mirrors write_compute_result's insert;

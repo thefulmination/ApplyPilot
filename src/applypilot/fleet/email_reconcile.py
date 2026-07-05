@@ -2,6 +2,7 @@
 application-outcome emails (email_events) and flip confirmed ones to 'applied'. Advisory/
 dry-run by default; writes only to the fleet Postgres. Reuses gmail_outcomes.match_email_to_job."""
 from __future__ import annotations
+import re
 import sqlite3
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
@@ -65,6 +66,35 @@ def classify_match(method: str | None, score: float | None, *, min_strong: float
     if method in CONFIRMABLE_FUZZY_METHODS and score is not None and score >= min_strong:
         return "confirmed"
     return "probable"
+
+
+_COMPANY_TOKEN_STOP = frozenset({
+    "the", "a", "an", "and", "of", "for", "at", "inc", "incorporated", "llc", "ltd",
+    "co", "corp", "corporation", "company", "group", "holdings", "systems",
+})
+
+
+def _company_tokens(value: str | None) -> set[str]:
+    text = (value or "").casefold().replace("&", " and ")
+    return {t for t in re.findall(r"[a-z0-9]+", text) if t not in _COMPANY_TOKEN_STOP}
+
+
+def _company_agrees(email_company: str | None, job_company: str | None) -> bool:
+    """Reject fuzzy/probable matches when parsed email company contradicts the queue row."""
+    email_tokens = _company_tokens(email_company)
+    if not email_tokens:
+        return True
+    job_tokens = _company_tokens(job_company)
+    if not job_tokens:
+        return False
+    overlap = email_tokens & job_tokens
+    return bool(overlap) and (len(overlap) / min(len(email_tokens), len(job_tokens))) >= 0.5
+
+
+def _match_evidence_consistent(email: OutcomeEmail, job: Mapping[str, object], method: str | None) -> bool:
+    if method in STRONG_METHODS:
+        return True
+    return _company_agrees(email.company, str(job.get("company") or ""))
 
 
 def load_outcome_emails(conn) -> list:
@@ -192,6 +222,9 @@ def reconcile(
         job, method, score = r.job, r.method, r.score
         cls = classify_match(method, score, min_strong=min_strong)
         if job is None or cls is None:
+            unmatched += 1
+            continue
+        if not _match_evidence_consistent(e, job, method):
             unmatched += 1
             continue
         url = job["url"]

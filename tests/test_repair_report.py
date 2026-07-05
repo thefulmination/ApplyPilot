@@ -143,6 +143,25 @@ def test_repair_report_ignores_stale_worker_heartbeat_result_lines(fleet_db):
     assert sample["last_result_line"] is None
 
 
+def test_repair_report_uses_durable_result_event(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="event-crash", apply_error="failed:no_result_line", worker_id="w-event")
+        cur.execute(
+            "INSERT INTO apply_result_events "
+            "(queue_name, url, worker_id, status, apply_status, apply_error, result_line) "
+            "VALUES ('apply_queue','event-crash','w-event','crash_unconfirmed',"
+            "'crash_unconfirmed','failed:no_result_line','RESULT:failed:no_result_line')"
+        )
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        report = repair_report.build_report(conn, sample_limit=3)
+
+    sample = report["crash"]["buckets"]["no_result_line"]["samples"][0]
+    assert sample["worker_id"] == "w-event"
+    assert sample["last_result_line"] == "RESULT:failed:no_result_line"
+
+
 class _Conn:
     def __enter__(self):
         return self

@@ -291,6 +291,43 @@ def test_write_apply_result_records_model_and_duration(fleet_db):
         assert row["apply_duration_ms"] == 4567
 
 
+def test_write_apply_result_records_durable_result_event(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "event1", host="ashbyhq.com", company="Epsilon", title="Staff Engineer")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        ok = queue.write_apply_result(
+            conn,
+            "w1",
+            a["url"],
+            status="crash_unconfirmed",
+            apply_status="crash_unconfirmed",
+            apply_error="failed:no_result_line",
+            target_host="ashbyhq.com",
+            home_ip="1.2.3.4",
+            est_cost_usd=0.03,
+            agent="claude",
+            agent_model="claude-sonnet-4",
+            apply_duration_ms=4567,
+        )
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT url, worker_id, status, apply_error, target_host, home_ip, "
+                "agent, agent_model, apply_duration_ms, result_line "
+                "FROM apply_result_events WHERE url='event1'"
+            )
+            row = cur.fetchone()
+        assert row["worker_id"] == "w1"
+        assert row["status"] == "crash_unconfirmed"
+        assert row["apply_error"] == "failed:no_result_line"
+        assert row["target_host"] == "ashbyhq.com"
+        assert row["home_ip"] == "1.2.3.4"
+        assert row["agent"] == "claude"
+        assert row["agent_model"] == "claude-sonnet-4"
+        assert row["apply_duration_ms"] == 4567
+        assert row["result_line"] == "RESULT:failed:no_result_line"
+
+
 def test_write_apply_result_no_llm_usage_row_when_cost_zero_or_none(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "cost2", host="greenhouse.io", company="Delta", title="Engineer")

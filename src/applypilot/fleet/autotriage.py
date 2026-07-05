@@ -124,11 +124,19 @@ def load_contexts(conn, *, limit: int = 50, window_minutes: int = 1440) -> list[
             LEFT JOIN worker_heartbeat h ON h.worker_id = q.worker_id
             WHERE q.lane = 'ats'
               AND q.status IN ('failed', 'blocked', 'crash_unconfirmed')
+              AND COALESCE(q.apply_error, '') NOT IN ('dedup:already_applied', 'expired')
               AND q.updated_at > now() - make_interval(mins => %(window)s)
               AND NOT EXISTS (
                   SELECT 1 FROM autotriage_actions a
                   WHERE a.url = q.url
-                    AND a.action_status = 'applied'
+                    AND a.action_status IN (
+                        'applied',
+                        'already_applied',
+                        'no_action',
+                        'rejected',
+                        'vetoed_applied_set',
+                        'vetoed_email'
+                    )
                     AND a.created_at > now() - interval '1 day'
               )
             ORDER BY q.updated_at DESC, q.url

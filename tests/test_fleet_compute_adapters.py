@@ -3,7 +3,8 @@ from applypilot.fleet import compute_adapters as ca
 
 def _ctx(**kw):
     base = dict(resume_text="RESUME", preference_profile=None, kg_prompt=None,
-                search_cfg=None, providers=["deepseek"], fallback=[], ensemble=False)
+                search_cfg=None, providers=["deepseek"], fallback=[], ensemble=False,
+                ctx_version="ctx-test")
     base.update(kw); return ca.ComputeContext(**base)
 
 
@@ -26,6 +27,7 @@ def test_score_fn_maps_payload_and_captures_cost(monkeypatch):
     assert calls["job"]["full_description"] == "ops role" and calls["provider"] == "deepseek"
     assert result["research_fit_score"] == 9 and result["status"] == "done"
     assert result["provider"] == "deepseek" and result["model"] == "deepseek-v4-flash"
+    assert result["ctx_version"] == "ctx-test"
     assert cost == 0.0004
 
 
@@ -65,6 +67,7 @@ def test_ensemble_scores_all_providers_and_aggregates(monkeypatch):
     assert result["research_fit_score"] == 7  # round(mean(8,6))
     assert {e["provider"] for e in result["ensemble"]} == {"deepseek", "gemini"}
     assert 0.0 <= result["agreement"] <= 1.0
+    assert result["ctx_version"] == "ctx-test"
     assert round(cost, 4) == 0.002
 
 
@@ -76,4 +79,5 @@ def test_audit_fn_maps_scoreaudit_to_decision():
     assert result["task"] == "audit" and result["status"] == "done"
     assert isinstance(result["research_decision"], str) and result["research_fit_score"] is None
     assert "audit_score" in result and isinstance(result["flags"], list)
+    assert result["ctx_version"] == "ctx-test"
     assert cost == 0.0

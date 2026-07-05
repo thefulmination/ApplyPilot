@@ -122,6 +122,45 @@ def test_reconcile_no_overlap_is_unmatched():
     assert res.confirmed == [] and res.probable == [] and res.unmatched_emails == 1
 
 
+def test_reconcile_rejects_probable_when_email_company_disagrees_with_job_company():
+    jobs = [{"url": "https://hiring.cafe/viewjob/warp", "application_url": "https://jobs.ashbyhq.com/warp/1",
+             "company": "Warp", "title": "Business Operations", "site": "jobs.ashbyhq.com"}]
+    emails = [_email(
+        message_id="m-factory",
+        sender="Factory Hiring Team <no-reply@ashbyhq.com>",
+        subject="Factory Application - Jonathan Stallone",
+        body="Thank you for applying to the Business Operations role at Factory.",
+        company="Factory",
+        title="Business Operations",
+    )]
+
+    res = er.reconcile(emails, jobs)
+
+    assert res.confirmed == []
+    assert res.probable == []
+    assert res.unmatched_emails == 1
+
+
+def test_reconcile_keeps_probable_when_email_company_agrees_with_job_company():
+    jobs = [{"url": "https://www.indeed.com/viewjob?jk=anduril", "application_url": "https://grnh.se/anduril",
+             "company": "Anduril", "title": "Talent Acquisition Operations Manager, Analytics",
+             "site": "grnh.se"}]
+    emails = [_email(
+        message_id="m-anduril",
+        sender="no-reply@anduril.com",
+        subject="Your Application to Anduril",
+        body="We received your application for the Talent Acquisition Operations Manager, Analytics role.",
+        company="Anduril",
+        title="Talent Acquisition Operations Manager, Analytics",
+    )]
+
+    res = er.reconcile(emails, jobs)
+
+    assert res.confirmed == []
+    assert len(res.probable) == 1
+    assert res.probable[0].job_url == "https://www.indeed.com/viewjob?jk=anduril"
+
+
 def test_reconcile_resolves_each_job_once():
     # Two emails both match the same job; it must resolve to exactly one Resolution (dedupe).
     jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",

@@ -20,6 +20,7 @@ class ComputeContext:
     preference_profile: dict | None = None
     kg_prompt: str | None = None
     search_cfg: dict | None = None
+    ctx_version: str = ""
     providers: list[str] = field(default_factory=list)  # ordered; providers[0] is primary
     fallback: list[str] = field(default_factory=list)    # tried in order on an error result
     ensemble: bool = False
@@ -61,7 +62,8 @@ def make_score_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
                  "research_decision": None,
                  "keywords": raw.get("keywords", "") if ok else "",
                  "reasoning": raw.get("reasoning") or raw.get("error") or "",
-                 "model": raw.get("model"), "provider": provider, "status": status}, cost)
+                 "model": raw.get("model"), "provider": provider, "status": status,
+                 "ctx_version": ctx.ctx_version}, cost)
 
     def score_fn(payload: dict) -> tuple[dict, float]:
         job = _job_from_payload(payload)
@@ -81,7 +83,8 @@ def make_score_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
             res = {"task": "score", "research_fit_score": round(mean), "research_decision": None,
                    "keywords": "", "reasoning": "ensemble", "model": None,
                    "provider": "+".join(m["provider"] for m in members),
-                   "ensemble": members, "agreement": round(1.0 - spread, 3), "status": "done"}
+                   "ensemble": members, "agreement": round(1.0 - spread, 3), "status": "done",
+                   "ctx_version": ctx.ctx_version}
             return res, total_cost
         # failover loop from Task 4
         total_cost = 0.0
@@ -105,5 +108,6 @@ def make_audit_fn(ctx: ComputeContext) -> Callable[[dict], tuple[dict, float]]:
         a = audit_job(job, ctx.search_cfg)
         return ({"task": "audit", "research_fit_score": None, "research_decision": a.audit_label,
                  "audit_score": a.audit_score, "role_fit_score": a.role_fit_score,
-                 "flags": list(a.flags), "reason": a.reason, "status": "done"}, 0.0)
+                 "flags": list(a.flags), "reason": a.reason, "status": "done",
+                 "ctx_version": ctx.ctx_version}, 0.0)
     return audit_fn

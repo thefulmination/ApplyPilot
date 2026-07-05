@@ -65,10 +65,18 @@ def _crash_summary(conn, *, sample_limit: int = 5) -> dict[str, Any]:
               q.updated_at,
               wh.machine_owner,
               wh.home_ip,
+              ar.result_line,
               CASE WHEN wh.current_job = q.url THEN wh.recent_log ELSE NULL END AS recent_log,
               CASE WHEN wh.current_job = q.url THEN wh.last_error ELSE NULL END AS last_error
             FROM apply_queue q
             LEFT JOIN worker_heartbeat wh ON wh.worker_id = q.worker_id
+            LEFT JOIN LATERAL (
+              SELECT result_line
+              FROM apply_result_events e
+              WHERE e.queue_name = 'apply_queue' AND e.url = q.url
+              ORDER BY e.created_at DESC, e.id DESC
+              LIMIT 1
+            ) ar ON TRUE
             WHERE q.status='crash_unconfirmed'
             ORDER BY q.updated_at DESC, q.url
             """
@@ -104,7 +112,7 @@ def _crash_summary(conn, *, sample_limit: int = 5) -> dict[str, Any]:
                 "apply_duration_ms": row["apply_duration_ms"],
                 "est_cost_usd": float(row["est_cost_usd"] or 0),
                 "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
-                "last_result_line": _last_result_line(row["recent_log"], row["last_error"]),
+                "last_result_line": _last_result_line(row["result_line"], row["recent_log"], row["last_error"]),
             }
         )
 
