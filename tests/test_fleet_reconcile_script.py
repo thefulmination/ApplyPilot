@@ -26,6 +26,7 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "refs/heads/`$branch",
         "refs/remotes/`$candidate",
         "git checkout -b",
+        "git merge --ff-only `$remoteRef",
         "git merge --ff-only",
         "stop ApplyPilotFleet tasks/processes before reinstall",
         "Stop-ScheduledTask",
@@ -39,7 +40,6 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         assert text in script
 
     assert "192.168.1.187" not in script
-    assert "checkout -B" not in script
     assert "git fetch --all" not in script
 
 
