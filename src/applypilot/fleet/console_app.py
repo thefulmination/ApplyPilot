@@ -1188,17 +1188,19 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/agents":
             from applypilot.fleet import console_agents
 
-            conn = pgqueue.connect()
+            conn = None
             try:
+                conn = pgqueue.connect()
                 self._send_json(200, console_agents.agent_summary(conn))
             except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                self._send_json(500, {"error": _scrub(str(e))[:500]})
             finally:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                conn.close()
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    conn.close()
             return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs

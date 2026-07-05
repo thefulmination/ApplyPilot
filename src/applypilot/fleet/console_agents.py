@@ -19,30 +19,72 @@ def _chain_agents(chain: str | None) -> list[str]:
     return [part.strip() for part in chain.replace(",", ">").split(">") if part.strip()]
 
 
+def _configured_agents(worker: dict[str, Any]) -> list[str]:
+    chain = _chain_agents(worker.get("agent_chain"))
+    if chain:
+        return chain
+    current = worker.get("current_agent")
+    return [current] if current else []
+
+
 def _num(v: Any) -> float:
     if isinstance(v, Decimal):
         return float(v)
     return float(v or 0)
 
 
-def _verdict(workers: list[dict[str, Any]], availability: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _make_verdict(code: str, severity: str, reason: str) -> dict[str, str]:
+    return {"code": code, "severity": severity, "reason": reason}
+
+
+def _verdict(
+    workers: list[dict[str, Any]],
+    availability: dict[str, dict[str, Any]],
+    spend_24h: list[dict[str, Any]],
+) -> dict[str, str]:
     if not workers:
-        return {"code": "unknown"}
+        return _make_verdict("unknown", "unknown", "No apply workers have reported heartbeat state.")
 
     blocked_agents = {agent for agent, row in availability.items() if row["blocked"]}
     chain_agents = {
         agent
         for worker in workers
-        for agent in _chain_agents(worker.get("agent_chain"))
+        for agent in _configured_agents(worker)
     }
     if chain_agents and chain_agents.issubset(blocked_agents):
-        return {"code": "all_agents_blocked"}
+        return _make_verdict(
+            "all_agents_blocked",
+            "critical",
+            "Every configured apply agent is currently blocked.",
+        )
 
-    if any((worker.get("last_agent_switch_reason") or "").startswith("switch:") for worker in workers):
-        return {"code": "working"}
-    if blocked_agents:
-        return {"code": "partial"}
-    return {"code": "not_triggered"}
+    switched_workers = [
+        worker
+        for worker in workers
+        if (worker.get("last_agent_switch_reason") or "").startswith("switch:")
+    ]
+    spend_providers = {
+        row.get("provider")
+        for row in spend_24h
+        if row.get("provider") and int(row.get("count") or 0) > 0
+    }
+    if switched_workers and any(worker.get("current_agent") in spend_providers for worker in switched_workers):
+        return _make_verdict(
+            "working",
+            "ok",
+            "Agent fallback is active and recent apply-agent spend confirms work on the fallback.",
+        )
+    if blocked_agents or switched_workers:
+        return _make_verdict(
+            "partial",
+            "warn",
+            "Agent blocks or switches exist, but recent fallback apply work is not confirmed.",
+        )
+    return _make_verdict(
+        "not_triggered",
+        "ok",
+        "No active agent block requires fallback switching.",
+    )
 
 
 def agent_summary(conn) -> dict[str, Any]:
@@ -70,7 +112,7 @@ def agent_summary(conn) -> dict[str, Any]:
                         "current_agent": row.get("current_agent"),
                         "current_model": row.get("current_model"),
                         "agent_chain": row.get("agent_chain"),
-                        "chain_agents": _chain_agents(row.get("agent_chain")),
+                        "chain_agents": _configured_agents(row),
                         "last_agent_switch_at": _iso(row.get("last_agent_switch_at")),
                         "last_agent_switch_reason": row.get("last_agent_switch_reason"),
                     }
@@ -93,7 +135,7 @@ def agent_summary(conn) -> dict[str, Any]:
             }
 
             cur.execute(
-                "SELECT provider, model, SUM(cost_usd) AS cost_usd "
+                "SELECT provider, model, COUNT(*) AS count, SUM(cost_usd) AS cost_usd "
                 "FROM llm_usage "
                 "WHERE task = 'apply_agent' AND ts >= now() - interval '24 hours' "
                 "GROUP BY provider, model "
@@ -103,6 +145,7 @@ def agent_summary(conn) -> dict[str, Any]:
                 {
                     "provider": row.get("provider"),
                     "model": row.get("model"),
+                    "count": int(row.get("count") or 0),
                     "cost_usd": _num(row.get("cost_usd")),
                 }
                 for row in cur.fetchall()
@@ -112,7 +155,7 @@ def agent_summary(conn) -> dict[str, Any]:
             "workers": workers,
             "availability": availability,
             "spend_24h": spend_24h,
-            "verdict": _verdict(workers, availability),
+            "verdict": _verdict(workers, availability, spend_24h),
         }
     finally:
         try:
