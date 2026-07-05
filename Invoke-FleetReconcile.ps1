@@ -28,6 +28,7 @@ $FleetTargets = @(
   @{ Name = "GGGTower"; Machine = "m4"; Kind = "windows"; Target = "backoffice@gggtower"; RepoPath = "C:\ApplyPilot" },
   @{ Name = "Paloma"; Machine = "mac"; Kind = "mac"; Target = "palomaperez@palomas-macbook-air"; RepoPath = '$HOME/applypilot-fleet' }
 )
+$script:RemoteFailures = 0
 
 function Write-Section([string]$Title) {
   Write-Host ""
@@ -117,6 +118,7 @@ function Invoke-RemoteCommand([hashtable]$Target, [string]$Command) {
   if ($stderr) { Write-Host $stderr.TrimEnd() -ForegroundColor DarkYellow }
   if ($proc.ExitCode -ne 0) {
     Write-Host "[$($Target.Name)] remote command exited $($proc.ExitCode)" -ForegroundColor Red
+    $script:RemoteFailures += 1
   }
 }
 
@@ -238,38 +240,42 @@ function New-MacBody([hashtable]$Target) {
   $runHealthLiteral = if ($RunHealth) { "1" } else { "0" }
   $branchLiteral = $Branch.Replace("'", "'\''")
 @"
-set -u
+set -eu
 echo 'mode: $mode'
 cd "$($Target.RepoPath)" 2>/dev/null || cd "`$HOME/applypilot-fleet"
 echo 'repo:' "`$PWD"
+if [ -f ./.applypilot/fleet-worker.env ]; then
+  set -a
+  . ./.applypilot/fleet-worker.env
+  set +a
+fi
 echo 'git status --short --branch'
 git status --short --branch
 echo 'git rev-parse --short HEAD'
 git rev-parse --short HEAD
 if [ "$applyLiteral" = "1" ]; then
   branch='$branchLiteral'
-  if [ -n "$branch" ]; then
+  if [ -n "`$branch" ]; then
     remote_ref=''
     for remote_name in myfork origin homebundle; do
-      if ! git remote get-url "$remote_name" >/dev/null 2>&1; then continue; fi
-      echo "APPLY: git fetch $remote_name $branch"
-      git fetch "$remote_name" "+refs/heads/$branch:refs/remotes/$remote_name/$branch" --prune || continue
-      candidate="$remote_name/$branch"
-      if git show-ref --verify --quiet "refs/remotes/$candidate"; then remote_ref="$candidate"; break; fi
+      if ! git remote get-url "`$remote_name" >/dev/null 2>&1; then continue; fi
+      echo "APPLY: git fetch `$remote_name `$branch"
+      git fetch "`$remote_name" "+refs/heads/`$branch:refs/remotes/`$remote_name/`$branch" --prune || continue
+      candidate="`$remote_name/`$branch"
+      if git show-ref --verify --quiet "refs/remotes/`$candidate"; then remote_ref="`$candidate"; break; fi
     done
-    if [ -n "$remote_ref" ]; then
-      if git show-ref --verify --quiet "refs/heads/$branch"; then
-        echo "APPLY: git checkout $branch"
-        git checkout "$branch"
-        echo "APPLY: git merge --ff-only $remote_ref"
-        git merge --ff-only "$remote_ref"
+    if [ -z "`$remote_ref" ]; then
+      echo "ERROR: could not fetch branch '`$branch' from configured remotes" >&2
+      exit 1
+    fi
+    if git show-ref --verify --quiet "refs/heads/`$branch"; then
+      echo "APPLY: git checkout `$branch"
+      git checkout "`$branch"
+      echo "APPLY: git merge --ff-only `$remote_ref"
+      git merge --ff-only "`$remote_ref"
       else
-        echo "APPLY: git checkout -b $branch $remote_ref"
-        git checkout -b "$branch" "$remote_ref"
-      fi
-    else
-      echo "APPLY: git checkout $branch"
-      git checkout "$branch"
+      echo "APPLY: git checkout -b `$branch `$remote_ref"
+      git checkout -b "`$branch" "`$remote_ref"
     fi
   else
     echo 'APPLY: git fetch'
@@ -279,12 +285,12 @@ if [ "$applyLiteral" = "1" ]; then
   fi
   if [ -x ./.venv/bin/python ]; then py_cmd=./.venv/bin/python; else py_cmd=python3; fi
   echo 'APPLY: clean stale pip invalid distribution artifacts (~pplypilot*)'
-  "$py_cmd" -c 'import site; print("\n".join(p for p in set(site.getsitepackages() + [site.getusersitepackages()]) if p))' |
+  "`$py_cmd" -c 'import site; print("\n".join(p for p in set(site.getsitepackages() + [site.getusersitepackages()]) if p))' |
   while IFS= read -r site_dir; do
-    [ -d "$site_dir" ] && (cd "$site_dir" && find . -maxdepth 1 -name '~pplypilot*' -print -exec rm -rf {} +)
+    [ -d "`$site_dir" ] && (cd "`$site_dir" && find . -maxdepth 1 -name '~pplypilot*' -print -exec rm -rf {} +)
   done
   echo 'APPLY: pip install -e .'
-  "$py_cmd" -m pip install -e .
+  "`$py_cmd" -m pip install -e .
   if [ -f ./setup-mac-worker.sh ]; then echo 'APPLY: setup-mac-worker.sh present; run manually if launchd needs re-registration'; fi
   if command -v launchctl >/dev/null 2>&1; then echo 'APPLY: launchd restart remains manual on mac target'; fi
 else
@@ -324,4 +330,8 @@ foreach ($target in $targets) {
 }
 
 Write-Section "End"
+if ($script:RemoteFailures -gt 0) {
+  Write-Host "Fleet reconcile failed on $script:RemoteFailures remote command(s)." -ForegroundColor Red
+  exit 1
+}
 Write-Host "Fleet reconcile finished."

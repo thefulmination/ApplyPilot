@@ -20,12 +20,15 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "palomaperez@palomas-macbook-air",
         '$HOME/applypilot-fleet',
         "git status --short --branch",
+        "$script:RemoteFailures",
         "git fetch `$remoteName `$branch",
-        "git fetch \"$remote_name\"",
+        "git fetch \"`$remote_name\"",
         '"myfork", "origin", "homebundle"',
         "for remote_name in myfork origin homebundle",
         "refs/heads/`$branch",
         "refs/remotes/`$candidate",
+        ".applypilot/fleet-worker.env",
+        "ERROR: could not fetch branch",
         "git checkout -b",
         "git merge --ff-only `$remoteRef",
         "git merge --ff-only",
@@ -43,11 +46,13 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "fleet-health.ps1",
         "pass -RunHealth to include it",
         "EncodedCommand",
+        "Fleet reconcile failed on",
     ):
         assert text in script
 
     assert "192.168.1.187" not in script
     assert '$HOME/ApplyPilot' not in script
+    assert 'git fetch "$remote_name"' not in script
     assert "checkout -B" not in script
     assert "git fetch --all" not in script
     assert "-like '*$repoLiteral*'" not in script
