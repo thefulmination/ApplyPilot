@@ -1559,6 +1559,8 @@ _INDEX_HTML = r"""<!doctype html>
   .action-item .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px;overflow-wrap:anywhere}
   .action-item .t{font-weight:700;margin-top:3px;overflow-wrap:anywhere}
   .action-item .r{color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}
+  .action-item .cmd{font-size:12px;margin-top:7px;padding-top:7px;border-top:1px solid var(--border);overflow-wrap:anywhere}
+  .action-item .cmd b{color:var(--muted);font-weight:600}
   .metric-grid,.diagnosis-grid,.machine-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
   .mini{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
   .mini span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
@@ -2084,7 +2086,8 @@ function renderRecommendationList(recs){
     return '<div class="action-item '+esc(sev)+'"><div class="k">'+
       esc([sev, r.lane, r.action_type].filter(Boolean).join(" / "))+'</div><div class="t">'+
       esc(r.title || r.code || "Recommendation")+'</div><div class="r">'+
-      esc(r.reason || "")+'</div></div>';
+      esc(r.reason || "")+'</div><div class="cmd"><b>Operator step:</b> '+
+      esc(r.command || "Review the linked runbook before taking action.")+'</div></div>';
   }).join("");
 }
 

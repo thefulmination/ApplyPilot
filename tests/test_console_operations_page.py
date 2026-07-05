@@ -130,6 +130,8 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert 'id="recommendationList"' in html
     assert 'id="laneActivity"' in html
     assert 'id="agentSummary"' in html
+    assert "Operator step" in html
+    assert "r.command" in html
     assert "Apply lane" in html
     assert "Compute lane" in html
     assert "Discovery lane" in html
