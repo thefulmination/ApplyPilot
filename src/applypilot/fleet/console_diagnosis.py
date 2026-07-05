@@ -5,36 +5,36 @@ uses parameterized SQL, and rolls back its read transaction before returning.
 """
 from __future__ import annotations
 
-from typing import Any
-
-
-def _scalar(row: Any, key: str, default=0):
-    if row is None:
-        return default
-    try:
-        return row[key]
-    except Exception:
-        return default
-
-
 def _queue_counts(cur, table: str) -> dict[str, int]:
     cur.execute(f"SELECT status, COUNT(*) AS n FROM {table} GROUP BY status")
     return {r["status"]: int(r["n"]) for r in cur.fetchall()}
 
 
-def _approved_count(cur, table: str) -> int:
+def _lane_predicate(lane: str | None) -> tuple[str, dict[str, str]]:
+    if lane is None:
+        return "", {}
+    return "AND q.lane = %(lane)s ", {"lane": lane}
+
+
+def _approved_count(cur, table: str, *, lane: str | None = None) -> int:
+    lane_sql, params = _lane_predicate(lane)
     cur.execute(
-        f"SELECT COUNT(*) AS n FROM {table} "
-        "WHERE status='queued' AND approved_batch IS NOT NULL"
+        f"SELECT COUNT(*) AS n FROM {table} q "
+        "WHERE q.status='queued' AND q.approved_batch IS NOT NULL "
+        f"{lane_sql}",
+        params,
     )
     return int(cur.fetchone()["n"])
 
 
-def _dedup_blocked_count(cur, table: str) -> int:
+def _dedup_blocked_count(cur, table: str, *, lane: str | None = None) -> int:
+    lane_sql, params = _lane_predicate(lane)
     cur.execute(
         f"SELECT COUNT(*) AS n FROM {table} q "
         "WHERE q.status='queued' AND q.approved_batch IS NOT NULL "
-        "AND EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)"
+        f"{lane_sql}"
+        "AND EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)",
+        params,
     )
     return int(cur.fetchone()["n"])
 
@@ -43,21 +43,52 @@ def _leaseable_count(
     cur,
     table: str,
     *,
+    lane: str | None = None,
     canary_column: str | None = None,
     canary_enabled_column: str | None = None,
+    ats_guards: bool = False,
+    linkedin_account_guards: bool = False,
 ) -> int:
+    lane_sql, params = _lane_predicate(lane)
     canary_predicate = ""
     if canary_column and canary_enabled_column:
         canary_predicate = (
             f"AND (NOT COALESCE(cfg.{canary_enabled_column}, FALSE) "
             f"     OR COALESCE(cfg.{canary_column}, 0) > 0) "
         )
+    ats_predicate = ""
+    if ats_guards:
+        ats_predicate = (
+            "AND NOT COALESCE(cfg.paused, FALSE) "
+            "AND NOT COALESCE(cfg.ats_paused, FALSE) "
+            "AND (COALESCE(cfg.spend_cap_usd, 0) <= 0 "
+            "     OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd) "
+        )
+    account_join = ""
+    account_predicate = ""
+    if linkedin_account_guards:
+        account_join = "LEFT JOIN rate_governor acct ON acct.scope_key = 'account:linkedin' "
+        account_predicate = (
+            "AND (acct.halted_until IS NULL OR acct.halted_until < now()) "
+            "AND (acct.count_24h IS NULL OR acct.count_24h < acct.daily_cap) "
+            "AND COALESCE(acct.breaker_state, 'ok') != 'demoted' "
+            "AND COALESCE(NOT (acct.breaker_state = 'paused' "
+            "                  AND COALESCE(acct.breaker_until, 'infinity'::timestamptz) >= now()), TRUE) "
+            "AND (acct.last_applied_at IS NULL "
+            "     OR acct.last_applied_at < now() - make_interval(secs => COALESCE(acct.min_gap_seconds, 1200))) "
+        )
     cur.execute(
         f"WITH cfg AS (SELECT * FROM fleet_config WHERE id=1) "
-        f"SELECT COUNT(*) AS n FROM {table} q, cfg "
+        f"SELECT COUNT(*) AS n FROM {table} q "
+        "CROSS JOIN cfg "
+        f"{account_join}"
         "WHERE q.status='queued' AND q.approved_batch IS NOT NULL "
+        f"{lane_sql}"
         f"{canary_predicate}"
-        "AND NOT EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)"
+        f"{ats_predicate}"
+        f"{account_predicate}"
+        "AND NOT EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)",
+        params,
     )
     return int(cur.fetchone()["n"])
 
@@ -87,13 +118,15 @@ def queue_diagnosis(conn) -> dict:
             "failed": ats_depth.get("failed", 0),
             "blocked": ats_depth.get("blocked", 0),
             "crash_unconfirmed": ats_depth.get("crash_unconfirmed", 0),
-            "approved": _approved_count(cur, "apply_queue"),
-            "dedup_blocked": _dedup_blocked_count(cur, "apply_queue"),
+            "approved": _approved_count(cur, "apply_queue", lane="ats"),
+            "dedup_blocked": _dedup_blocked_count(cur, "apply_queue", lane="ats"),
             "leaseable": _leaseable_count(
                 cur,
                 "apply_queue",
+                lane="ats",
                 canary_enabled_column="canary_enabled",
                 canary_column="canary_remaining",
+                ats_guards=True,
             ),
             "canary_enabled": bool(cfg.get("canary_enabled")),
             "canary_remaining": cfg.get("canary_remaining"),
@@ -114,6 +147,7 @@ def queue_diagnosis(conn) -> dict:
                 "linkedin_queue",
                 canary_enabled_column="linkedin_canary_enabled",
                 canary_column="linkedin_canary_remaining",
+                linkedin_account_guards=True,
             ),
             "canary_enabled": bool(cfg.get("linkedin_canary_enabled")),
             "canary_remaining": cfg.get("linkedin_canary_remaining"),
