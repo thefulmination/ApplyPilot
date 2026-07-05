@@ -278,7 +278,7 @@ CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regar
 1. Run CAPTCHA DETECT to get the type and sitekey
 2. Run CAPTCHA SOLVE (createTask -> poll -> inject) with the CapSolver API
 3. ONLY go to MANUAL FALLBACK if CapSolver returns errorId > 0
-Do NOT skip the API call based on what the CAPTCHA looks like. CapSolver solves CAPTCHAs server-side -- it does NOT need to see or interact with images, puzzles, or games. Even "drag the pipe" or "click all traffic lights" hCaptchas are solved via API token, not visually. ALWAYS try the API first.
+Do NOT skip the API call based on what the CAPTCHA looks like. CapSolver solves token-based CAPTCHAs server-side -- it does NOT need to see or interact with ordinary image grids. ALWAYS try the API first.
 
 --- CAPTCHA DETECT ---
 Run this browser_evaluate after every navigation, Apply/Submit/Login click, or when a page feels stuck.
@@ -375,7 +375,11 @@ For recaptchav3: add "pageAction": "submit" to the task object (or the actual ac
 For turnstile: add "metadata": {{"action": "...", "cdata": "..."}} if those were in detect result.
 
 Response: {{"errorId": 0, "taskId": "abc123"}} on success.
-If errorId > 0 -> CAPTCHA SOLVE failed. Go to MANUAL FALLBACK.
+If errorId > 0 -> capture errorCode and errorDescription exactly, then go to MANUAL FALLBACK.
+Fast-fail rule: if errorCode is ERROR_INVALID_TASK_DATA or ERROR_TASK_NOT_SUPPORTED, or the
+description says "unsupported service", "invalid task data", or "not supported", do not keep
+trying accessibility, audio, or alternate hCaptcha puzzle paths. Output RESULT:CAPTCHA with the
+short reason. This is a service unsupported/invalid-parameter failure, not a human-solvable task.
 
 STEP 2 -- POLL (replace TASK_ID with the taskId from step 1):
 Loop: browser_wait_for time: 3, then run:
@@ -457,6 +461,7 @@ After injecting: browser_wait_for time: 2, then snapshot.
 --- MANUAL FALLBACK ---
 You should ONLY be here if CapSolver createTask returned errorId > 0. If you haven't tried CapSolver yet, GO BACK and try it first.
 If CapSolver genuinely failed (errorId > 0):
+0. If errorCode is ERROR_INVALID_TASK_DATA or ERROR_TASK_NOT_SUPPORTED, or errorDescription says "unsupported service", "invalid task data", or "not supported": stop immediately and output RESULT:CAPTCHA with that exact reason; do not keep trying accessibility/audio for hCaptcha visual puzzles.
 1. Audio challenge: Look for "audio" or "accessibility" button -> click it for an easier challenge.
 2. Text/logic puzzles: Solve them yourself. Think step by step. Common tricks: "All but 9 die" = 9 left. "3 sisters and 4 brothers, how many siblings?" = 7.
 3. Simple text captchas ("What is 3+7?", "Type the word") -> solve them.

@@ -2643,13 +2643,22 @@ def doctor() -> None:
         results.append(("Node.js (npx)", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
-    # CapSolver (optional)
-    capsolver = os.environ.get("CAPSOLVER_API_KEY")
-    if capsolver:
-        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
-    else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
+    # CapSolver (optional, but if configured it should be live and funded).
+    from applypilot.apply import capsolver as capsolver_mod
+
+    cap_status = capsolver_mod.check_balance(timeout=5.0)
+    if not cap_status.configured:
+        results.append(("CapSolver account", "[dim]optional[/dim]",
                         "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+    elif cap_status.ok:
+        bal = f"; balance ${cap_status.balance:.2f}" if cap_status.balance is not None else ""
+        results.append(("CapSolver account", ok_mark, f"API reachable{bal}"))
+    elif cap_status.error_code == "network_error":
+        results.append(("CapSolver account", warn_mark,
+                        f"{cap_status.note} {cap_status.error_description or ''}".strip()))
+    else:
+        detail = f"{cap_status.error_code}: {cap_status.error_description}".strip(": ")
+        results.append(("CapSolver account", fail_mark, detail or cap_status.note))
 
     # --- Recommendation calibration (optional) ---
     # These files are produced by the external recommendation engine
@@ -2698,7 +2707,29 @@ def doctor() -> None:
     elif tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI or Codex CLI + Chrome + Node.js)[/dim]")
 
-    console.print()
+
+@app.command("capsolver-check")
+def capsolver_check(
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable status JSON."),
+) -> None:
+    """Verify CapSolver key/account reachability without printing the secret."""
+    from applypilot.apply import capsolver as capsolver_mod
+
+    status = capsolver_mod.check_balance()
+    if json_output:
+        typer.echo(json.dumps(status.to_dict(), sort_keys=True))
+    else:
+        if status.ok:
+            balance = f" Balance: ${status.balance:.2f}." if status.balance is not None else ""
+            console.print(f"[green]OK[/green] CapSolver account reachable.{balance}")
+        elif not status.configured:
+            console.print("[yellow]MISSING[/yellow] CAPSOLVER_API_KEY is not set.")
+        else:
+            detail = f"{status.error_code or 'error'}: {status.error_description or status.note}"
+            console.print(f"[red]FAILED[/red] {detail}")
+
+    if not status.ok:
+        raise typer.Exit(code=1)
 
 
 tenants_app = typer.Typer(

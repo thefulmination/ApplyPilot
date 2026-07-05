@@ -168,3 +168,16 @@ def test_build_prompt_dry_run_emits_dry_run_code(tmp_path: Path, monkeypatch) ->
 
     assert "RESULT:DRY_RUN" in text
     assert "Do NOT output RESULT:APPLIED" in text
+
+
+def test_captcha_prompt_exits_fast_on_unsupported_capsolver_errors(monkeypatch) -> None:
+    monkeypatch.setenv("CAPSOLVER_API_KEY", "CAI-test-key")
+    monkeypatch.setattr(prompt.config, "load_env", lambda: None)
+
+    text = prompt._build_captcha_section()
+
+    assert "ERROR_INVALID_TASK_DATA" in text
+    assert "ERROR_TASK_NOT_SUPPORTED" in text
+    assert "errorCode" in text
+    assert "RESULT:CAPTCHA" in text
+    assert "do not keep trying accessibility" in text.lower()
