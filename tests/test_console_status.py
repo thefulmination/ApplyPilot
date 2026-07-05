@@ -36,8 +36,18 @@ def test_deployment_info_reports_console_schema_and_worker_versions(fleet_db, mo
     assert result["schema"]["agent_telemetry"] is True
     assert result["schema"]["audit_table"] is True
     assert result["worker_versions"] == [
-        {"version": "(unknown)", "workers": 1},
-        {"version": "worker-new", "workers": 1},
+        {
+            "version": "(unknown)",
+            "workers": 1,
+            "machines": ["TARPON"],
+            "worker_ids": ["m2-0"],
+        },
+        {
+            "version": "worker-new",
+            "workers": 1,
+            "machines": ["GGGTower"],
+            "worker_ids": ["m4-0"],
+        },
     ]
 
 

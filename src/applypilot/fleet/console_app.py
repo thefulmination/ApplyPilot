@@ -112,13 +112,24 @@ def _deployment_info(conn) -> dict[str, Any]:
         cur.execute("SELECT to_regclass('public.fleet_console_audit') AS audit_table")
         audit_table = cur.fetchone()["audit_table"]
         cur.execute(
-            "SELECT COALESCE(sw_version, '(unknown)') AS version, COUNT(*) AS workers "
-            "FROM worker_heartbeat GROUP BY 1 ORDER BY 1"
+            "SELECT COALESCE(sw_version, '(unknown)') AS version, worker_id, machine_owner "
+            "FROM worker_heartbeat ORDER BY 1, worker_id"
         )
-        worker_versions = [
-            {"version": r["version"], "workers": int(r["workers"] or 0)}
-            for r in cur.fetchall()
-        ]
+        version_groups: dict[str, dict[str, Any]] = {}
+        for r in cur.fetchall():
+            version = r["version"]
+            worker_id = r["worker_id"]
+            machine_owner = console_machines.infer_machine_owner(worker_id, r.get("machine_owner"))
+            machine = console_machines.display_name(machine_owner)
+            group = version_groups.setdefault(
+                version,
+                {"version": version, "workers": 0, "machines": [], "worker_ids": []},
+            )
+            group["workers"] += 1
+            group["worker_ids"].append(worker_id)
+            if machine not in group["machines"]:
+                group["machines"].append(machine)
+        worker_versions = list(version_groups.values())
     conn.rollback()
     return {
         "console": {
@@ -1762,8 +1773,8 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="deploymentDrift">
     <h2>Deployment Drift</h2>
     <div id="deploymentDriftSummary" class="sub"></div>
-    <div class="table-scroll"><table><thead><tr><th>Version</th><th>Workers</th><th>Status</th></tr></thead>
-      <tbody id="deploymentDriftRows"><tr><td colspan="3" class="mut">loading</td></tr></tbody></table></div>
+    <div class="table-scroll"><table><thead><tr><th>Version</th><th>Count</th><th>Machines</th><th>Workers</th><th>Status</th></tr></thead>
+      <tbody id="deploymentDriftRows"><tr><td colspan="5" class="mut">loading</td></tr></tbody></table></div>
   </section>
 
   <section id="browserHealth">
@@ -2324,7 +2335,7 @@ function renderDeploymentDrift(dep){
   const versions = (dep && dep.worker_versions) || [];
   if(!versions.length){
     summaryEl.textContent = "No worker versions reported.";
-    rowsEl.innerHTML = '<tr><td colspan="3" class="mut">no worker version telemetry</td></tr>';
+    rowsEl.innerHTML = '<tr><td colspan="5" class="mut">no worker version telemetry</td></tr>';
     return;
   }
   const total = versions.reduce((n, row) => n + Number(row.workers || 0), 0);
@@ -2333,11 +2344,12 @@ function renderDeploymentDrift(dep){
   const unknown = versions.filter(row => classifyBuild(row.version) === "unknown build")
     .reduce((n, row) => n + Number(row.workers || 0), 0);
   summaryEl.textContent = total + " worker heartbeat(s) across " + versions.length +
-    " version group(s)" + (dirty || unknown ? " — reconcile dirty/unknown builds before comparing telemetry." : ".");
+    " version group(s)" + (dirty || unknown ? " - reconcile these machines before comparing telemetry." : ".");
   rowsEl.innerHTML = versions.map(row => {
     const status = classifyBuild(row.version);
     return '<tr><td>'+esc(row.version || "(unknown)")+'</td><td>'+esc(row.workers || 0)+
-      '</td><td>'+esc(status)+'</td></tr>';
+      '</td><td>'+esc((row.machines || []).join(", ") || "(unknown)")+'</td><td>'+
+      esc((row.worker_ids || []).join(", ") || "(none)")+'</td><td>'+esc(status)+'</td></tr>';
   }).join("");
 }
 

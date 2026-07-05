@@ -195,6 +195,17 @@ def test_dashboard_promotes_discovery_backlog_visibility(live_server):
     assert "Found 24h" in html
 
 
+def test_dashboard_shows_deployment_drift_targets(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert "<th>Machines</th>" in html
+    assert "<th>Workers</th>" in html
+    assert "row.machines" in html
+    assert "row.worker_ids" in html
+    assert "reconcile these machines before comparing telemetry" in html
+
+
 def test_dashboard_has_explicit_lane_state_safety_rails(live_server):
     with urllib.request.urlopen(f"{live_server}/") as resp:
         html = resp.read().decode("utf-8")
