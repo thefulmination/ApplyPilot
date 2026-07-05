@@ -36,3 +36,12 @@ def test_mac_shell_script_parses(name):
     script = str(REPO / name).replace("\\", "/")  # Git Bash prefers forward slashes
     r = subprocess.run([bash, "-n", script], capture_output=True, text=True)
     assert r.returncode == 0, f"{name} failed bash -n:\n{r.stderr}"
+
+
+def test_mac_worker_wrapper_prevents_idle_sleep_by_default():
+    script = (REPO / "run-worker-mac.sh").read_text(encoding="utf-8")
+    setup = (REPO / "setup-mac-worker.sh").read_text(encoding="utf-8")
+
+    assert "APPLYPILOT_MAC_CAFFEINATE" in script
+    assert "caffeinate -dims -w" in script
+    assert "APPLYPILOT_MAC_CAFFEINATE='1'" in setup

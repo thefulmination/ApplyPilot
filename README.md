@@ -118,6 +118,14 @@ It prints local scheduled tasks/processes, Postgres fleet tables, and SSH probes
 
 Normal fleet consistency is git release plus `fleet-agent.ps1 -AutoUpdate`, not manual SSH patching. Worker boxes should be clean clones; the agent fast-forwards between jobs, reinstalls the editable package when needed, and restarts workers through its normal reconcile loop.
 
+Use this after publishing the branch you want live:
+
+```powershell
+.\Invoke-FleetMakeCurrent.ps1
+```
+
+It pins the current tree version in `fleet_config.pinned_worker_version`, reconciles Tarpon/GGGTower, reconciles Paloma only when it is reachable over Tailscale SSH, and then runs `fleet-health.ps1 -SkipRemote`.
+
 Use SSH over Tailscale for bootstrap/repair only:
 
 ```powershell
