@@ -187,6 +187,8 @@ def test_dashboard_summarizes_apply_readiness_gates(live_server):
     assert "still available" in html
     assert "Browser walls" in html
     assert "Stale workers" in html
+    assert "Stale active workers" in html
+    assert "still marked active" in html
     assert "Daily goal" in html
     assert "Unsafe to scale" in html
     assert "Ready to apply carefully" in html

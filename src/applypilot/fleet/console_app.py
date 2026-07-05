@@ -2272,6 +2272,7 @@ function renderApplyReadiness(){
   const versions = deployment.worker_versions || [];
   const applyWorkers = (s.workers || []).filter(w => (w.role || "apply") === "apply");
   const staleApply = applyWorkers.filter(w => w.alive === false);
+  const staleActiveApply = staleApply.filter(w => ["applying", "challenge_pending"].includes(w.state || ""));
   const agentWorkers = agents.workers || [];
   const availability = agents.availability || {};
   const availabilityNames = Object.keys(availability);
@@ -2294,6 +2295,7 @@ function renderApplyReadiness(){
     ? approved + " approved and leaseable"
     : (approved > 0 ? approved + " approved but not leaseable" : "no approved ATS queue ready");
   const staleMachineSummary = formatMachineCounts(staleApply);
+  const staleActiveMachineSummary = formatMachineCounts(staleActiveApply);
   const checks = [
     ["Pause gates", paused ? "blocked" : "ok", paused ? "blocked" : "clear",
       paused ? "shared or ATS pause is active" : "no pause gate reported"],
@@ -2315,6 +2317,8 @@ function renderApplyReadiness(){
       wallCount ? "login/captcha walls need review" : "no browser wall samples"],
     ["Stale workers", staleApply.length ? "warn" : "ok", staleApply.length,
       staleApply.length ? staleMachineSummary : "all apply heartbeats fresh"],
+    ["Stale active workers", staleActiveApply.length ? "warn" : "ok", staleActiveApply.length,
+      staleActiveApply.length ? staleActiveMachineSummary + " still marked active" : "no stale applying/challenge workers"],
     ["Daily goal", goalConfigured ? "ok" : "warn",
       goalConfigured ? String(dailyGoal.applied_today || 0) + " / " + String(dailyGoal.target || 0) : "not set",
       goalConfigured ? String(dailyGoal.remaining == null ? "unknown" : dailyGoal.remaining) + " remaining today" : "set a daily target before unattended scale"],
