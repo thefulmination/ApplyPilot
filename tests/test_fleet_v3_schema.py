@@ -64,3 +64,21 @@ def test_challenge_rate_is_generated(fleet_db):
             cur.execute("SELECT challenge_rate FROM rate_governor WHERE scope_key='host:example.com'")
             rate = cur.fetchone()["challenge_rate"]
     assert abs(rate - 0.2) < 1e-6  # (1+1)/(8+1+1)
+
+
+def test_worker_heartbeat_agent_model_columns(fleet_db):
+    from applypilot.apply import pgqueue
+
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='worker_heartbeat'"
+            )
+            cols = {r["column_name"] for r in cur.fetchall()}
+
+    assert "current_agent" in cols
+    assert "current_model" in cols
+    assert "agent_chain" in cols
+    assert "last_agent_switch_at" in cols
+    assert "last_agent_switch_reason" in cols

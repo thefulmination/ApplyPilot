@@ -141,7 +141,9 @@ def _insert_challenge(conn, *, url, worker_id, machine_owner, home_ip, kind, rou
 
 
 def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_job=None,
-               sw_version=None, last_error=None, recent_log=None, commit=True) -> None:
+               sw_version=None, last_error=None, recent_log=None, current_agent=None,
+               current_model=None, agent_chain=None, last_agent_switch_reason=None,
+               commit=True) -> None:
     """UPSERT this worker's ``worker_heartbeat`` row (~every iteration, spec §11/R5).
     A missing heartbeat for > lease TTL is what lets the reclaim sweep re-queue a
     crashed worker's job (§5 stateless self-resume).
@@ -151,14 +153,25 @@ def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_
     previously reported version when a beat omits it."""
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, last_error, recent_log, last_beat) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
+            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, sw_version, "
+            "last_error, recent_log, current_agent, current_model, agent_chain, last_agent_switch_at, "
+            "last_agent_switch_reason, last_beat) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, "
+            "CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, %s, now()) "
             "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
             "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
             "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
-            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, last_beat=now()",
+            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, "
+            "current_agent=COALESCE(EXCLUDED.current_agent, worker_heartbeat.current_agent), "
+            "current_model=COALESCE(EXCLUDED.current_model, worker_heartbeat.current_model), "
+            "agent_chain=COALESCE(EXCLUDED.agent_chain, worker_heartbeat.agent_chain), "
+            "last_agent_switch_at=CASE WHEN EXCLUDED.last_agent_switch_reason IS NULL "
+            "THEN worker_heartbeat.last_agent_switch_at ELSE EXCLUDED.last_agent_switch_at END, "
+            "last_agent_switch_reason=COALESCE(EXCLUDED.last_agent_switch_reason, worker_heartbeat.last_agent_switch_reason), "
+            "last_beat=now()",
             (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
-             last_error, recent_log),
+             last_error, recent_log, current_agent, current_model, agent_chain,
+             last_agent_switch_reason, last_agent_switch_reason),
         )
     if commit:
         conn.commit()

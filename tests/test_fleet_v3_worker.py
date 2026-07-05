@@ -590,3 +590,33 @@ def test_tick_linkedin_routes(fleet_db):
         assert cur.fetchone()["halted_until"] is not None
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='kp' AND resolved_at IS NULL")
         assert cur.fetchone()["n"] == 1
+
+
+def test_heartbeat_persists_agent_model_telemetry(fleet_db):
+    from applypilot.apply import pgqueue
+    from applypilot.fleet.worker import _heartbeat
+
+    with pgqueue.connect(fleet_db) as conn:
+        _heartbeat(
+            conn,
+            worker_id="m4-0",
+            machine_owner="m4",
+            home_ip="100.69.68.103",
+            role="apply",
+            state="idle",
+            current_agent="claude",
+            current_model="sonnet",
+            agent_chain="claude>codex",
+            last_agent_switch_reason="startup",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT current_agent, current_model, agent_chain, last_agent_switch_reason "
+                "FROM worker_heartbeat WHERE worker_id='m4-0'"
+            )
+            row = cur.fetchone()
+
+    assert row["current_agent"] == "claude"
+    assert row["current_model"] == "sonnet"
+    assert row["agent_chain"] == "claude>codex"
+    assert row["last_agent_switch_reason"] == "startup"

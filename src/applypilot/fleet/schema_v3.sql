@@ -358,6 +358,13 @@ CREATE INDEX IF NOT EXISTS idx_heartbeat_stale ON worker_heartbeat (last_beat);
 -- recent_log <= 8000) so this one-row-per-worker table cannot grow unbounded.
 ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS last_error  TEXT;
 ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS recent_log  TEXT;
+-- Live apply-agent/model telemetry for the fleet console. Workers own these
+-- fields; the console reads them to explain Claude/Codex routing and switching.
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS current_agent TEXT;
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS current_model TEXT;
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS agent_chain TEXT;
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS last_agent_switch_at TIMESTAMPTZ;
+ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS last_agent_switch_reason TEXT;
 
 -- ---------------------------------------------------------------------------
 -- poison_jobs: quarantine for jobs that crash/hang whoever claims them (R7).
