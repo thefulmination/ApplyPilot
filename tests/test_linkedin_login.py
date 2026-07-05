@@ -61,6 +61,33 @@ class TestHasLinkedInSession:
             con.close()
 
 
+class TestLinkedInLoginPersistence:
+    def test_cdp_cookie_alone_does_not_report_success(self, tmp_path, monkeypatch):
+        from applypilot import config
+
+        class FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
+        monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
+        monkeypatch.setattr(chrome, "_kill_on_port", lambda port: None)
+        monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: None)
+        monkeypatch.setattr(chrome.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+        monkeypatch.setattr(chrome, "_has_linkedin_session_cdp", lambda port: True)
+        monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile_dir: False)
+        times = [0.0, 0.0, 11.0]
+        monkeypatch.setattr(chrome.time, "time", lambda: times.pop(0) if times else 11.0)
+        monkeypatch.setattr(chrome.time, "sleep", lambda seconds: None)
+
+        ok, seed = chrome.linkedin_login(timeout_seconds=10, poll_seconds=0)
+
+        assert ok is False
+        assert seed == tmp_path / chrome.SEED_PROFILE_NAME
+
+
 class TestSeedClonePreference:
     def test_worker_clones_from_linkedin_seed(self, tmp_path, monkeypatch):
         from applypilot import config

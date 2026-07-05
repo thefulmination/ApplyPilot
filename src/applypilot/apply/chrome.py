@@ -390,6 +390,22 @@ def _has_linkedin_session_cdp(port: int) -> bool:
     return False
 
 
+def _close_browser_cdp(port: int) -> bool:
+    """Ask the login Chrome to close cleanly so profile data is flushed to disk."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=5000)
+            browser.close()
+            return True
+    except Exception:
+        logger.debug("CDP browser close failed on port %d", port, exc_info=True)
+        return False
+
+
 def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                    poll_seconds: float = 4.0):
     """Open a VISIBLE Chrome on the dedicated LinkedIn seed profile so the user logs in
@@ -416,27 +432,46 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     deadline = time.time() + timeout_seconds
     ok = False
 
-    def _logged_in() -> bool:
-        # Prefer the live-browser CDP read (detects login while the window is still open);
-        # fall back to the file-copy check. This is what lets the command auto-complete
-        # instead of waiting for the user to close the window to unlock the Cookies file.
-        return _has_linkedin_session_cdp(LINKEDIN_LOGIN_CDP_PORT) or has_linkedin_session(seed)
+    def _wait_for_persisted_session(until: float) -> bool:
+        while time.time() < until:
+            if has_linkedin_session(seed):
+                return True
+            time.sleep(max(poll_seconds, 0.25))
+        return has_linkedin_session(seed)
 
     try:
         while time.time() < deadline:
             if proc.poll() is not None:  # user closed the window -> file check (close flushes)
                 ok = has_linkedin_session(seed)
                 break
-            if _logged_in():
+            if has_linkedin_session(seed):
                 ok = True
+                break
+            if _has_linkedin_session_cdp(LINKEDIN_LOGIN_CDP_PORT):
+                # CDP can see the in-memory cookie before Chrome has persisted it. Workers
+                # clone the disk profile, so require the persisted cookie before success.
+                flush_deadline = min(deadline, time.time() + 20.0)
+                ok = _wait_for_persisted_session(flush_deadline)
+                if not ok:
+                    _close_browser_cdp(LINKEDIN_LOGIN_CDP_PORT)
+                    try:
+                        proc.wait(timeout=15)
+                    except (AttributeError, subprocess.TimeoutExpired, OSError):
+                        pass
+                    ok = _wait_for_persisted_session(min(deadline, time.time() + 5.0))
                 break
             time.sleep(poll_seconds)
         else:
-            ok = _logged_in()
+            ok = has_linkedin_session(seed)
     finally:
         # Close the seed Chrome so the profile is unlocked for workers to clone.
         if proc.poll() is None:
-            time.sleep(1.0)  # let a just-detected cookie flush to disk
+            _close_browser_cdp(LINKEDIN_LOGIN_CDP_PORT)
+            try:
+                proc.wait(timeout=15)
+            except (AttributeError, subprocess.TimeoutExpired, OSError):
+                pass
+        if proc.poll() is None:
             _kill_process_tree(proc.pid)
     return ok, seed
 
