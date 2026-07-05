@@ -13,6 +13,7 @@ _RULES = [
     ("browser_server_unavailable", "error", ("browser server unavailable",)),
     ("captcha", "warn", ("captcha",)),
     ("captcha", "warn", ("hcaptcha",)),
+    ("captcha", "warn", ("error_invalid_task_data",)),
     ("login_gate", "warn", ("login_gate",)),
     ("login_gate", "warn", ("login_issue",)),
     ("login_gate", "warn", ("auth_required",)),

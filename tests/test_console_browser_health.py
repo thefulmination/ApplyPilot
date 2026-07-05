@@ -19,6 +19,12 @@ def test_classify_captcha():
     assert c["kind"] == "captcha"
 
 
+def test_classify_captcha_invalid_task_data_without_hcaptcha():
+    c = B.classify_text("CapSolver ERROR_INVALID_TASK_DATA")
+    assert c["kind"] == "captcha"
+    assert c["severity"] == "warn"
+
+
 def test_classify_login_gate():
     c = B.classify_text("RESULT:AUTH_REQUIRED login page detected")
     assert c["kind"] == "login_gate"
