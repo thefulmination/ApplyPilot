@@ -138,12 +138,17 @@ git status --short --branch
 Write-Output "git rev-parse --short HEAD"
 git rev-parse --short HEAD
 if ($applyLiteral) {
-  Write-Output "APPLY: git fetch --all --prune"
-  git fetch --all --prune
   `$branch = '$branchLiteral'
   if (`$branch) {
     `$remoteRef = `$null
-    foreach (`$candidate in @("myfork/`$branch", "origin/`$branch", "homebundle/`$branch")) {
+    foreach (`$remoteName in @("myfork", "origin", "homebundle")) {
+      git remote get-url `$remoteName *> `$null
+      if (`$LASTEXITCODE -ne 0) { continue }
+      Write-Output "APPLY: git fetch `$remoteName `$branch"
+      `$refspec = "+refs/heads/`$(`$branch):refs/remotes/`$(`$remoteName)/`$(`$branch)"
+      git fetch `$remoteName `$refspec --prune
+      if (`$LASTEXITCODE -ne 0) { continue }
+      `$candidate = "`$remoteName/`$branch"
       git show-ref --verify --quiet "refs/remotes/`$candidate"
       if (`$LASTEXITCODE -eq 0) { `$remoteRef = `$candidate; break }
     }
@@ -163,9 +168,19 @@ if ($applyLiteral) {
       git checkout `$branch
     }
   } else {
+    Write-Output "APPLY: git fetch"
+    git fetch
     Write-Output "APPLY: git merge --ff-only"
     git merge --ff-only
   }
+  Write-Output "APPLY: stop ApplyPilotFleet tasks/processes before reinstall"
+  Get-ScheduledTask -TaskName 'ApplyPilotFleet-*' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 3
+  Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -like '*$repoLiteral*' } | ForEach-Object {
+    Write-Output "APPLY: stop process `$(`$_.ProcessId) `$(`$_.Name)"
+    Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 2
   `$py = `$null
   foreach (`$candidate in @('.\.conda-env\python.exe', '.\.venv\Scripts\python.exe')) {
     if (Test-Path `$candidate) { `$py = (Resolve-Path `$candidate).Path; break }
@@ -207,12 +222,14 @@ git status --short --branch
 echo 'git rev-parse --short HEAD'
 git rev-parse --short HEAD
 if [ "$applyLiteral" = "1" ]; then
-  echo 'APPLY: git fetch --all --prune'
-  git fetch --all --prune
   branch='$branchLiteral'
   if [ -n "$branch" ]; then
     remote_ref=''
-    for candidate in "myfork/$branch" "origin/$branch" "homebundle/$branch"; do
+    for remote_name in myfork origin homebundle; do
+      if ! git remote get-url "$remote_name" >/dev/null 2>&1; then continue; fi
+      echo "APPLY: git fetch $remote_name $branch"
+      git fetch "$remote_name" "+refs/heads/$branch:refs/remotes/$remote_name/$branch" --prune || continue
+      candidate="$remote_name/$branch"
       if git show-ref --verify --quiet "refs/remotes/$candidate"; then remote_ref="$candidate"; break; fi
     done
     if [ -n "$remote_ref" ]; then
@@ -230,6 +247,8 @@ if [ "$applyLiteral" = "1" ]; then
       git checkout "$branch"
     fi
   else
+    echo 'APPLY: git fetch'
+    git fetch
     echo 'APPLY: git merge --ff-only'
     git merge --ff-only
   fi

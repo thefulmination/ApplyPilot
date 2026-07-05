@@ -19,12 +19,17 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "backoffice@gggtower",
         "palomaperez@palomas-macbook-air",
         "git status --short --branch",
-        "git fetch --all --prune",
-        "myfork/`$branch",
+        "git fetch `$remoteName `$branch",
+        "git fetch \"$remote_name\"",
+        '"myfork", "origin", "homebundle"',
+        "for remote_name in myfork origin homebundle",
         "refs/heads/`$branch",
         "refs/remotes/`$candidate",
         "git checkout -b",
         "git merge --ff-only",
+        "stop ApplyPilotFleet tasks/processes before reinstall",
+        "Stop-ScheduledTask",
+        "Stop-Process",
         "pip install -e .",
         "register-fleet-tasks.ps1",
         "fleet-health.ps1",
@@ -35,6 +40,7 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
 
     assert "192.168.1.187" not in script
     assert "checkout -B" not in script
+    assert "git fetch --all" not in script
 
 
 def test_readme_documents_reconcile_as_repair_not_normal_deploy() -> None:
