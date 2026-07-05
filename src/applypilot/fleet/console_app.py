@@ -2261,6 +2261,7 @@ function renderApplyReadiness(){
   const agents = agentsSnapshot || {};
   const q = d.queue || s.fleet_diagnosis || {};
   const ats = q.ats || {};
+  const linkedin = q.linkedin || {};
   const gate = s.gate || {};
   const doctor = s.doctor || {};
   const deployment = s.deployment || {};
@@ -2289,6 +2290,10 @@ function renderApplyReadiness(){
   const paused = Boolean(gate.paused || gate.should_halt || ats.paused || ats.ats_paused || doctor.ats_paused);
   const leaseable = Number(ats.leaseable || 0);
   const approved = Number(ats.approved || 0);
+  const linkedinLeaseable = Number(linkedin.leaseable || 0);
+  const linkedinQueued = Number(linkedin.queued || 0);
+  const linkedinOwnerBlocked = linkedin.owner_ip_context_known && !linkedin.owner_ip_ready;
+  const linkedinCanaryExhausted = Boolean(linkedin.canary_exhausted);
   const authKinds = ["login_gate", "captcha", "email_otp"];
   const backendKinds = ["browser_backend_crashed", "browser_service_unavailable", "browser_server_unavailable"];
   const authWallCount = authKinds.reduce((total, kind) => total + Number(browserCounts[kind] || 0), 0) ||
@@ -2306,6 +2311,10 @@ function renderApplyReadiness(){
       paused ? "shared or ATS pause is active" : "no pause gate reported"],
     ["Leaseable queue", leaseable > 0 ? "ok" : "blocked", leaseable,
       leaseableHint],
+    ["LinkedIn readiness",
+      linkedinLeaseable > 0 ? "ok" : ((linkedinQueued || linkedinOwnerBlocked || linkedinCanaryExhausted) ? "warn" : "ok"),
+      linkedinLeaseable > 0 ? linkedinLeaseable + " leaseable" : (linkedinQueued ? linkedinQueued + " queued" : "idle"),
+      linkedinOwnerBlocked ? "owner IP blocked" : (linkedinCanaryExhausted ? "canary exhausted" : (linkedinQueued && !linkedinLeaseable ? "queued but not leaseable" : "catastrophe lane ready"))],
     ["Worker versions", (mixedVersions || dirtyOrUnknown) ? "warn" : "ok",
       versions.length ? versions.length + " group(s)" : "unknown",
       (mixedVersions || dirtyOrUnknown) ? "reconcile dirty/unknown workers before scale" : "one reported worker build"],

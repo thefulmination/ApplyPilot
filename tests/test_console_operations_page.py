@@ -180,6 +180,8 @@ def test_dashboard_summarizes_apply_readiness_gates(live_server):
     assert "renderApplyReadiness" in html
     assert "Pause gates" in html
     assert "Leaseable queue" in html
+    assert "LinkedIn readiness" in html
+    assert "owner IP blocked" in html
     assert "Worker versions" in html
     assert "Model telemetry" in html
     assert "Agent failover" in html
