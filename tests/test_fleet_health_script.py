@@ -19,5 +19,7 @@ def test_fleet_health_script_covers_current_fleet_topology() -> None:
         "Get-ScheduledTask",
         "pip check",
         "ssh",
+        "fleet-capsolver-check --json",
+        "CapSolver readiness",
     ):
         assert text in script

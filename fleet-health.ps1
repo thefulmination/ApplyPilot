@@ -56,6 +56,30 @@ function Get-RepoPython {
   return $null
 }
 
+function Get-ApplyPilotCli {
+  foreach ($candidate in @(
+    (Join-Path $repo ".conda-env\Scripts\applypilot.exe"),
+    (Join-Path $repo ".venv\Scripts\applypilot.exe")
+  )) {
+    if (Test-Path $candidate) { return $candidate }
+  }
+  return $null
+}
+
+function Show-CapSolverReadiness {
+  $cli = Get-ApplyPilotCli
+  if (-not $cli) {
+    Write-Host "ERROR: applypilot.exe not found at .conda-env\Scripts or .venv\Scripts" -ForegroundColor Red
+    return
+  }
+
+  Write-Host "CapSolver readiness"
+  & $cli fleet-capsolver-check --json
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: CapSolver readiness failed with exit code $LASTEXITCODE" -ForegroundColor Red
+  }
+}
+
 function Show-LocalScheduledTasks {
   $tasks = Get-ScheduledTask -TaskName "ApplyPilotFleet-*" -ErrorAction SilentlyContinue
   if (-not $tasks) {
@@ -231,12 +255,17 @@ Invoke-QuietProbe "tailscale status" {
 }
 Invoke-QuietProbe "ApplyPilotFleet scheduled tasks" { Show-LocalScheduledTasks }
 Invoke-QuietProbe "ApplyPilot processes" { Show-ApplyPilotProcesses }
+Invoke-QuietProbe "CapSolver readiness" { Show-CapSolverReadiness }
 Invoke-QuietProbe "Postgres fleet tables" { Show-DatabaseHealth }
 
 Write-Section "Remote Fleet"
 $windowsTaskProbe = @"
 hostname
 Set-Location C:\ApplyPilot
+Write-Output 'CapSolver readiness'
+`$cli = `$null
+foreach (`$candidate in @('.\.conda-env\Scripts\applypilot.exe', '.\.venv\Scripts\applypilot.exe')) { if (Test-Path `$candidate) { `$cli = (Resolve-Path `$candidate).Path; break } }
+if (`$cli) { & `$cli fleet-capsolver-check --json } else { Write-Output 'ERROR: applypilot.exe not found' }
 Get-ScheduledTask -TaskName 'ApplyPilotFleet-*' -ErrorAction SilentlyContinue | ForEach-Object {
   `$i = Get-ScheduledTaskInfo -TaskName `$_.TaskName -ErrorAction SilentlyContinue
   [pscustomobject]@{ TaskName=`$_.TaskName; State=`$_.State; LastTaskResult=if (`$i) { `$i.LastTaskResult } else { `$null } }
@@ -250,6 +279,10 @@ hostname
 Set-Location C:\ApplyPilot
 git branch --show-current
 git log --oneline -1
+Write-Output 'CapSolver readiness'
+`$cli = `$null
+foreach (`$candidate in @('.\.conda-env\Scripts\applypilot.exe', '.\.venv\Scripts\applypilot.exe')) { if (Test-Path `$candidate) { `$cli = (Resolve-Path `$candidate).Path; break } }
+if (`$cli) { & `$cli fleet-capsolver-check --json } else { Write-Output 'ERROR: applypilot.exe not found' }
 Get-ScheduledTask -TaskName 'ApplyPilotFleet-*' -ErrorAction SilentlyContinue | ForEach-Object {
   `$i = Get-ScheduledTaskInfo -TaskName `$_.TaskName -ErrorAction SilentlyContinue
   [pscustomobject]@{ TaskName=`$_.TaskName; State=`$_.State; LastTaskResult=if (`$i) { `$i.LastTaskResult } else { `$null } }
