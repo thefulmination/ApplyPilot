@@ -596,6 +596,62 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
     return dict(row) if row else None
 
 
+_REQUEUE_LINKEDIN_SQL = """
+UPDATE linkedin_queue
+SET status           = 'queued',
+    apply_status     = NULL,
+    apply_error      = %(apply_error)s,
+    attempts         = GREATEST(attempts - 1, 0),
+    lease_owner      = NULL,
+    lease_expires_at = NULL,
+    updated_at       = now()
+WHERE url = %(url)s
+  AND lease_owner = %(worker)s
+RETURNING url;
+"""
+
+_REFUND_LINKEDIN_CANARY_SQL = """
+UPDATE fleet_config
+SET linkedin_canary_remaining = COALESCE(linkedin_canary_remaining, 0) + 1
+WHERE id = 1
+  AND linkedin_canary_enabled;
+"""
+
+_REFUND_LINKEDIN_ACCOUNT_SQL = """
+WITH previous_attempt AS (
+  SELECT MAX(last_attempted_at) AS last_at
+  FROM linkedin_queue
+  WHERE url <> %(url)s
+    AND status <> 'queued'
+    AND last_attempted_at IS NOT NULL
+)
+UPDATE rate_governor g
+SET count_24h = GREATEST(COALESCE(g.count_24h, 0) - 1, 0),
+    last_applied_at = previous_attempt.last_at,
+    updated_at = now()
+FROM previous_attempt
+WHERE g.scope_key = 'account:linkedin';
+"""
+
+
+def requeue_linkedin(conn, worker_id, url, *, apply_error=None) -> bool:
+    """Return a leased LinkedIn job to queued after a pre-browser usage/quota wall.
+
+    `failed:usage_limit` is emitted only when the agent made zero browser tool calls, so
+    re-queuing cannot double-submit. Lease-owner guarded like `requeue_apply`.
+    Because the LinkedIn lease reserves the canary and account cap at claim time, this
+    no-op path also refunds that reservation so a quota wall does not block real applies.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_REQUEUE_LINKEDIN_SQL, {"apply_error": apply_error, "worker": worker_id, "url": url})
+        landed = cur.fetchone() is not None
+        if landed:
+            cur.execute(_REFUND_LINKEDIN_CANARY_SQL)
+            cur.execute(_REFUND_LINKEDIN_ACCOUNT_SQL, {"url": url})
+    conn.commit()
+    return landed
+
+
 def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, apply_error=None,
                           est_cost_usd=0, outcome=None, apply_channel=None, apply_external_host=None):
     """Close a LinkedIn lease (lease-owner guarded) in linkedin_queue -- NOT apply_queue --
@@ -672,7 +728,8 @@ def park_linkedin_challenge(conn, worker_id, url, *, halt_seconds, commit=True) 
             "lease_expires_at = now() + interval '3650 days', updated_at=now() "
             "WHERE url=%s AND lease_owner=%s", (url, worker_id))
         if cur.rowcount == 0:
-            conn.rollback(); return False
+            conn.rollback()
+            return False
         cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING",
                     (governor.LINKEDIN_ACCOUNT,))
         cur.execute("UPDATE rate_governor SET halted_until = now() + make_interval(secs => %s), updated_at=now() "

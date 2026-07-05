@@ -193,11 +193,33 @@ def should_halt(conn: psycopg.Connection) -> bool:
     against the POC budget.
 
     NOTE (H1): this reads ONLY the shared kill switch (fleet_config.paused) + spend cap. It
-    deliberately does NOT read ats_paused -- the LinkedIn worker calls should_halt(), so adding
-    ats_paused here would re-introduce the catastrophe coupling. The ATS lane uses
-    ats_should_halt() instead (which OR-s in ats_paused); the LinkedIn lane keeps should_halt()."""
+    deliberately does NOT read ats_paused. The ATS lane uses ats_should_halt() instead
+    (which OR-s in ats_paused); the LinkedIn lane uses linkedin_should_halt() to avoid
+    reading apply_queue from the catastrophe lane's pre-flight tick."""
     with conn.cursor() as cur:
         cur.execute(_HALT_SQL)
+        row = cur.fetchone()
+    conn.rollback()  # read-only
+    return bool(row["should_halt"]) if row else False
+
+
+_LINKEDIN_HALT_SQL = """
+SELECT COALESCE(fc.paused, FALSE) AS should_halt
+FROM fleet_config fc
+WHERE fc.id = 1;
+"""
+
+
+def linkedin_should_halt(conn: psycopg.Connection) -> bool:
+    """LinkedIn-lane pre-lease halt gate.
+
+    This intentionally reads only the shared operator kill switch. LinkedIn's lane-specific
+    blast-radius controls (account halt, canary, daily cap, min-gap, and mutex) are enforced
+    atomically by queue.lease_linkedin(). The pre-flight tick must not read apply_queue:
+    that couples LinkedIn to ATS spend state and can deadlock with schema maintenance.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_LINKEDIN_HALT_SQL)
         row = cur.fetchone()
     conn.rollback()  # read-only
     return bool(row["should_halt"]) if row else False
@@ -218,7 +240,7 @@ WHERE fc.id = 1;
 def ats_should_halt(conn: psycopg.Connection) -> bool:
     """ATS-lane pre-lease halt gate: the shared kill switch (paused/spend cap) OR the
     Fleet Doctor's ATS-only ats_paused (H1). The LinkedIn worker must NEVER call this -- it
-    uses should_halt() so a Doctor ATS pause can never stop the LinkedIn lane."""
+    uses linkedin_should_halt() so a Doctor ATS pause can never stop the LinkedIn lane."""
     with conn.cursor() as cur:
         cur.execute(_ATS_HALT_SQL)
         row = cur.fetchone()

@@ -1236,7 +1236,7 @@ def _apply_pace_or_pause(conn, action, ttl) -> dict:
     from applypilot.apply import pgqueue
     sub = action["op_kind"]
     if sub == "pause":
-        # H1: ATS-ONLY pause. The LinkedIn lane reads should_halt() (paused/spend-cap) only and
+        # H1: ATS-ONLY pause. The LinkedIn lane reads linkedin_should_halt() (shared kill switch) only and
         # never ats_paused, so this can NOT stop LinkedIn. source='doctor' records provenance so
         # the Doctor auto-reverts only its OWN pause and the console can label it.
         pgqueue.set_ats_paused(conn, True, source="doctor")

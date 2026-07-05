@@ -1,3 +1,5 @@
+import os
+
 from applypilot.apply import pgqueue
 
 
@@ -65,6 +67,134 @@ def test_linkedin_schema_columns(fleet_db):
         cur.execute("INSERT INTO rate_governor (scope_key) VALUES ('account:linkedin')")
         cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
         assert cur.fetchone()["halted_until"] is None
+
+
+def test_linkedin_should_halt_ignores_apply_queue_spend_cap(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, score, status, est_cost_usd) "
+            "VALUES ('ats-spend', 'https://example.com/apply', 9, 'applied', 2.0)"
+        )
+        conn.commit()
+
+        pgqueue.set_spend_cap(conn, 1.0)
+        assert pgqueue.should_halt(conn) is True
+        assert pgqueue.linkedin_should_halt(conn) is False
+
+        pgqueue.set_paused(conn, True)
+        assert pgqueue.linkedin_should_halt(conn) is True
+
+
+def test_linkedin_driver_uses_lane_specific_halt(monkeypatch):
+    from applypilot.fleet import linkedin_worker_main as lm
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Loop:
+        def run_once(self):
+            return {"action": "idle"}
+
+    calls = []
+
+    def _legacy_should_halt(_conn):
+        raise AssertionError("LinkedIn driver must not read the ATS/apply halt path")
+
+    def _linkedin_should_halt(_conn):
+        calls.append("linkedin")
+        return False
+
+    monkeypatch.setattr(pgqueue, "should_halt", _legacy_should_halt)
+    monkeypatch.setattr(pgqueue, "linkedin_should_halt", _linkedin_should_halt, raising=False)
+
+    counts = lm.run_linkedin(lambda: _Conn(), _Loop(), max_iterations=1, idle_sleep=0)
+    assert counts["error"] == 0
+    assert calls == ["linkedin"]
+
+
+def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
+    from applypilot.fleet import apply_worker_main as awm
+    from applypilot.fleet import linkedin_worker_main as lm
+
+    captured = {}
+
+    def _fake_make_apply_fn(model, agent):
+        captured["model"] = model
+        captured["agent"] = agent
+        return lambda job: {"run_status": "failed:usage_limit", "est_cost_usd": 0.0}
+
+    monkeypatch.setattr(awm, "make_apply_fn", _fake_make_apply_fn)
+
+    lm.build_linkedin_loop(dsn="postgresql://example.invalid/db", worker_id="w", owner_ip="1.1.1.1")
+
+    assert captured["agent"] == "codex"
+
+
+def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
+    from applypilot.fleet import linkedin_worker_main as lm
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Loop:
+        def run_once(self):
+            return {"action": "usage_limit", "url": "li-wall"}
+
+    sleeps = []
+    monkeypatch.setattr(pgqueue, "linkedin_should_halt", lambda conn: False)
+    monkeypatch.setattr(lm.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    counts = lm.run_linkedin(lambda: _Conn(), _Loop(), max_iterations=1, idle_sleep=7)
+    assert counts["idle"] == 1
+    assert sleeps == [7]
+
+
+def test_linkedin_setup_env_prefers_repo_local_profile(monkeypatch, tmp_path):
+    from applypilot.fleet import linkedin_worker_main as lm
+
+    fake_module = tmp_path / "src" / "applypilot" / "fleet" / "linkedin_worker_main.py"
+    fake_module.parent.mkdir(parents=True)
+    fake_module.write_text("", encoding="utf-8")
+    repo_app = tmp_path / ".applypilot"
+    repo_app.mkdir()
+    for name in (
+        "profile.json",
+        "resume.txt",
+        "resume.pdf",
+        "resume_strategy.yaml",
+        "job_preference_profile.json",
+        "job_knowledge_graph_prompt.md",
+    ):
+        (repo_app / name).write_text("x", encoding="utf-8")
+
+    for name in (
+        "APPLYPILOT_DIR",
+        "APPLYPILOT_PROFILE_PATH",
+        "APPLYPILOT_RESUME_PATH",
+        "APPLYPILOT_RESUME_PDF_PATH",
+        "APPLYPILOT_RESUME_STRATEGY_PATH",
+        "APPLYPILOT_PREFERENCE_PROFILE_PATH",
+        "APPLYPILOT_KNOWLEDGE_GRAPH_PROMPT_PATH",
+        "APPLYPILOT_DB_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(lm, "__file__", str(fake_module))
+
+    lm._setup_apply_env()
+
+    assert os.environ["APPLYPILOT_DIR"] == str(repo_app)
+    assert os.environ["APPLYPILOT_PROFILE_PATH"] == str(repo_app / "profile.json")
+    assert os.environ["APPLYPILOT_RESUME_PATH"] == str(repo_app / "resume.txt")
+    assert os.environ["APPLYPILOT_RESUME_PDF_PATH"] == str(repo_app / "resume.pdf")
+    assert os.environ["APPLYPILOT_DB_PATH"].endswith("fleet_apply_throwaway.db")
 
 
 from applypilot.fleet import governor

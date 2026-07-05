@@ -1,8 +1,8 @@
 """applypilot-fleet-apply: an OFFSITE apply worker for owner-controlled machines.
 Wraps the proven launcher.run_job into an apply_fn and drives WorkerLoop(role='apply').
 Respects the shared kill switch AND the Fleet Doctor's ATS-only pause via ats_should_halt
-(H1); never leases through a pause/canary-pause. The LinkedIn lane uses plain should_halt so
-a Doctor ATS pause can never halt it."""
+(H1); never leases through a pause/canary-pause. The LinkedIn lane uses its own
+linkedin_should_halt gate so a Doctor ATS pause can never halt it."""
 from __future__ import annotations
 
 import argparse
@@ -366,7 +366,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 _apply_timeout_override(conn=conn)
                 # H1: the APPLY lane honors the Doctor's ATS-only pause (ats_paused) in addition
                 # to the shared kill switch; ats_should_halt OR-s it in. The LinkedIn worker keeps
-                # plain should_halt(), so a Doctor ATS pause never halts the LinkedIn lane.
+                # its own linkedin_should_halt(), so a Doctor ATS pause never halts that lane.
                 if pgqueue.ats_should_halt(conn):
                     counts["halted"] += 1
                     # Beat while halted: a paused worker that stops beating is indistinguishable

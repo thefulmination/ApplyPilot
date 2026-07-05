@@ -1337,13 +1337,32 @@ def _is_usage_limit_signature(text: str | None) -> bool:
     return any(sig in low for sig in _USAGE_LIMIT_SIGNATURES)
 
 
+_SAFE_PREPAGE_TOOL_NAMES = {
+    "toolsearch",
+    "tool_search",
+}
+
+
+def _tool_call_touches_application(name: str | None) -> bool:
+    """False only for agent/meta tools that cannot inspect or modify the application.
+
+    Unknown tool names stay conservative: count them as page-touching so a later missing
+    RESULT line remains crash_unconfirmed instead of being re-queued.
+    """
+    normalized = (name or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized not in _SAFE_PREPAGE_TOOL_NAMES
+
+
 def _no_result_status(transcript: str | None, tool_calls: int) -> str:
     """Classify a run that printed NO RESULT: line.
 
-    A usage/quota wall hit on the FIRST turn (tool_calls == 0 -> the agent never drove the
-    browser) provably never submitted -> RETRYABLE USAGE_LIMIT_STATUS (re-queued upstream).
-    ANY tool call means the agent may have reached/filled the form (a real mid-apply crash)
-    -> the conservative no_result_line, which is parked crash_unconfirmed and NEVER re-leased.
+    A usage/quota wall hit before any application-touching tool call (tool_calls == 0)
+    provably never submitted -> RETRYABLE USAGE_LIMIT_STATUS (re-queued upstream).
+    Any browser/MCP/form tool call means the agent may have reached/filled the form (a
+    real mid-apply crash) -> conservative no_result_line, parked crash_unconfirmed and
+    NEVER re-leased.
     """
     if tool_calls == 0 and _is_usage_limit_signature(transcript):
         return USAGE_LIMIT_STATUS
@@ -1612,10 +1631,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         text_parts: list[str] = []
         final_result_text: list[str] = []  # text from the final 'result' message
         stats_holder: dict = {}
-        # Count browser/MCP tool calls. ZERO tool calls + a usage-limit signature == the
-        # agent hit a wall on turn 1 and never touched the page -> safely re-queuable (see
-        # _no_result_status). A list so the daemon-thread closure can mutate it.
-        tool_calls = [0]
+        # Count only application-touching tool calls. ZERO app tool calls + a usage-limit
+        # signature == the agent hit a wall before touching the page -> safely re-queuable
+        # (see _no_result_status). A list so the daemon-thread closure can mutate it.
+        application_tool_calls = [0]
 
         def _consume_stream() -> None:
             """Read the agent's stream-json stdout to EOF.
@@ -1640,12 +1659,13 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     text_parts.append(block["text"])
                                     lf.write(block["text"] + "\n")
                                 elif bt == "tool_use":
-                                    tool_calls[0] += 1
                                     name = (
                                         block.get("name", "")
                                         .replace("mcp__playwright__", "")
                                         .replace("mcp__gmail__", "gmail:")
                                     )
+                                    if _tool_call_touches_application(name):
+                                        application_tool_calls[0] += 1
                                     inp = block.get("input", {})
                                     if "url" in inp:
                                         desc = f"{name} {inp['url'][:60]}"
@@ -1688,8 +1708,9 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     final_result_text.append(text)
                                     lf.write(text + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
-                                tool_calls[0] += 1
                                 name = item.get("name") or item.get("tool_name") or item_type
+                                if _tool_call_touches_application(str(name)):
+                                    application_tool_calls[0] += 1
                                 lf.write(f"  >> {name}\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
@@ -1847,7 +1868,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         # No RESULT: line. Distinguish an agent usage/quota wall hit on turn 1 (no tool
         # calls -> the page was never touched -> RETRYABLE, re-queued upstream) from a
         # genuine ran-but-no-clean-result crash (-> no_result_line -> crash_unconfirmed).
-        status = _no_result_status(output, tool_calls[0])
+        status = _no_result_status(output, application_tool_calls[0])
         if status == USAGE_LIMIT_STATUS:
             add_event(f"[W{worker_id}] USAGE-LIMIT wall, page never touched ({elapsed}s) -- retryable")
             update_state(worker_id, status="failed", last_action=f"usage-limit ({elapsed}s)")
