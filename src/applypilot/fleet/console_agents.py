@@ -95,7 +95,8 @@ def _has_scoped_activity(worker: dict[str, Any], recent_usage: list[dict[str, An
             continue
         if row.get("provider") != current_agent:
             continue
-        if current_model and row.get("model") != current_model:
+        row_model = row.get("model")
+        if current_model and row_model is not None and row_model != current_model:
             continue
         if switch_at is not None and row.get("last_usage_at") and row["last_usage_at"] < switch_at:
             continue

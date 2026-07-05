@@ -135,6 +135,33 @@ def test_agent_summary_ignores_other_worker_spend_for_switch_confirmation(fleet_
     assert result["verdict"]["code"] == "partial"
 
 
+def test_agent_summary_accepts_null_usage_model_for_switched_worker(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, role, state, last_beat, current_agent, current_model, "
+                "agent_chain, last_agent_switch_at, last_agent_switch_reason) "
+                "VALUES ('m4-2','apply','idle',now(),'codex','sonnet','claude>codex',"
+                "now() - interval '1 hour','switch:claude->codex')"
+            )
+            cur.execute(
+                "INSERT INTO agent_availability (agent, blocked_until, reason) "
+                "VALUES ('claude', now() + interval '1 hour', 'usage_limit_wall')"
+            )
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id, task, provider, cost_usd, ts) "
+                "VALUES ('m4-2','apply_agent','codex',0.31,now())"
+            )
+        conn.commit()
+
+        result = console_agents.agent_summary(conn)
+
+    assert result["spend_24h"][0]["provider"] == "codex"
+    assert result["spend_24h"][0]["model"] is None
+    assert result["verdict"]["code"] == "working"
+
+
 def test_agent_summary_treats_current_agent_as_configured_when_chain_empty(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
