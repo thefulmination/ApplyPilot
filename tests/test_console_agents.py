@@ -29,9 +29,10 @@ def test_agent_summary_reads_worker_heartbeat_blocks_and_spend(fleet_db):
             cur.execute(
                 "INSERT INTO worker_heartbeat "
                 "(worker_id, machine_owner, home_ip, role, state, last_beat, "
-                "current_agent, current_model, agent_chain, last_agent_switch_reason) "
+                "sw_version, current_agent, current_model, agent_chain, last_agent_switch_reason) "
                 "VALUES ('m4-0','m4','100.69.68.103','apply','idle',now(),"
-                "'codex','sonnet','claude>codex','switch:claude->codex')"
+                "'0.3.0+git.codex.abc123','codex','sonnet','claude>codex',"
+                "'switch:claude->codex')"
             )
             cur.execute(
                 "INSERT INTO agent_availability (agent, blocked_until, reason) "
@@ -49,6 +50,7 @@ def test_agent_summary_reads_worker_heartbeat_blocks_and_spend(fleet_db):
 
     assert result["workers"][0]["worker_id"] == "m4-0"
     assert result["workers"][0]["machine_display_name"] == "GGGTower"
+    assert result["workers"][0]["sw_version"] == "0.3.0+git.codex.abc123"
     assert result["workers"][0]["current_agent"] == "codex"
     assert result["workers"][0]["current_model"] == "sonnet"
     assert result["availability"]["claude"]["blocked"] is True
@@ -75,6 +77,7 @@ def test_agent_summary_flags_workers_waiting_for_model_telemetry(fleet_db):
 
     assert result["verdict"]["code"] == "telemetry_missing"
     assert result["verdict"]["severity"] == "warn"
+    assert "redeploy/restart" in result["verdict"]["reason"]
     assert result["workers"][0]["machine_display_name"] == "TARPON"
     assert result["workers"][0]["telemetry_status"] == "missing"
 

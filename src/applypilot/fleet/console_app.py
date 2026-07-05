@@ -1691,8 +1691,8 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="agentRouting">
     <h2>Agent Routing</h2>
     <div id="agentVerdict" class="sub"></div>
-    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>
-      <tbody id="agentWorkers"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
+    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Version</th><th>Switch</th></tr></thead>
+      <tbody id="agentWorkers"><tr><td colspan="7" class="mut">loading</td></tr></tbody></table></div>
   </section>
 
   <section id="machineHealth">
@@ -1957,8 +1957,9 @@ function renderAgents(d){
   body.innerHTML = rows.length ? rows.map(w =>
     '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_display_name||w.machine_owner||"")+'</td><td>'+
     esc(w.current_agent||"unknown")+'</td><td>'+esc(w.current_model||"unknown")+'</td><td>'+
-    esc(w.agent_chain||"")+'</td><td>'+esc(w.last_agent_switch_reason||"")+'</td></tr>'
-  ).join("") : '<tr><td colspan="6" class="mut">no apply worker agent telemetry</td></tr>';
+    esc(w.agent_chain||"")+'</td><td>'+esc(w.sw_version||"unknown")+'</td><td>'+
+    esc(w.last_agent_switch_reason||"")+'</td></tr>'
+  ).join("") : '<tr><td colspan="7" class="mut">no apply worker agent telemetry</td></tr>';
 }
 
 function renderWorkerComparison(rows){

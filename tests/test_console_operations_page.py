@@ -94,7 +94,7 @@ def test_agent_routing_table_is_responsively_contained(live_server):
     assert "overflow-x:auto" in html
     assert "overflow-wrap:anywhere" in html
     assert 'id="agentRouting"' in html
-    assert '<div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>' in html
+    assert '<div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Version</th><th>Switch</th></tr></thead>' in html
     assert html.count("<table") == len(re.findall(r'class="table-scroll"[^>]*><table', html))
 
 

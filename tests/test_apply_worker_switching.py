@@ -269,3 +269,25 @@ def test_run_apply_without_switcher_is_unchanged(monkeypatch):
     counts = awm.run_apply(_conn_factory, loop, max_iterations=1, idle_sleep=0)
     assert counts["applied"] == 1
     awm._STOP_REQUESTED.clear()
+
+
+def test_build_apply_loop_reports_worker_version(monkeypatch):
+    monkeypatch.setattr(awm, "_setup_apply_env", lambda: None)
+    monkeypatch.setattr(awm, "_apply_timeout_override", lambda dsn=None, conn=None: None)
+    monkeypatch.setattr(awm, "make_apply_fn", lambda model, agent, slot: lambda job: {})
+    monkeypatch.setattr(awm, "make_log_tail_fn", lambda slot: lambda: None)
+    monkeypatch.setattr(awm, "worker_version", lambda: "0.3.0+git.test.abc123")
+
+    loop = awm.build_apply_loop(
+        dsn="postgres://unused",
+        worker_id="m4-0",
+        home_ip="100.64.0.1",
+        model="sonnet",
+        agent="codex",
+        machine_owner="m4",
+        slot=0,
+    )
+
+    assert loop.sw_version == "0.3.0+git.test.abc123"
+    assert loop._current_agent == "codex"
+    assert loop._current_model == "sonnet"

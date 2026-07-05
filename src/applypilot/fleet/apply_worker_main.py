@@ -13,6 +13,8 @@ import signal
 import threading
 import time
 
+from applypilot.fleet.version import worker_version
+
 logger = logging.getLogger("applypilot.fleet.apply_worker_main")
 
 # --- graceful stop (SIGTERM) -------------------------------------------------
@@ -230,7 +232,7 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     _apply_timeout_override(dsn)
     loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
-                      log_tail_fn=make_log_tail_fn(slot))
+                      sw_version=worker_version(), log_tail_fn=make_log_tail_fn(slot))
     loop.set_agent_telemetry(current_agent=agent, current_model=model, agent_chain=agent)
     return loop
 

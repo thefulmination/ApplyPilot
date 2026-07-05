@@ -53,7 +53,8 @@ def _verdict(
         return _make_verdict(
             "telemetry_missing",
             "warn",
-            "Apply workers are heartbeating, but none has reported current agent/model telemetry yet.",
+            "Apply workers are heartbeating, but none has reported current agent/model telemetry yet. "
+            "Schema is installed; redeploy/restart apply workers so heartbeat includes agent/model fields.",
         )
 
     blocked_agents = {agent for agent, row in availability.items() if row["blocked"]}
@@ -119,7 +120,7 @@ def _read_workers(conn) -> tuple[list[dict[str, Any]], bool]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT worker_id, machine_owner, home_ip, role, state, last_beat, "
+                "SELECT worker_id, machine_owner, home_ip, role, state, sw_version, last_beat, "
                 "current_agent, current_model, agent_chain, last_agent_switch_at, "
                 "last_agent_switch_reason "
                 "FROM worker_heartbeat "
@@ -131,7 +132,7 @@ def _read_workers(conn) -> tuple[list[dict[str, Any]], bool]:
         conn.rollback()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT worker_id, machine_owner, home_ip, role, state, last_beat "
+                "SELECT worker_id, machine_owner, home_ip, role, state, sw_version, last_beat "
                 "FROM worker_heartbeat "
                 "WHERE role = 'apply' "
                 "ORDER BY worker_id"
@@ -161,6 +162,7 @@ def _read_workers(conn) -> tuple[list[dict[str, Any]], bool]:
             "home_ip": row.get("home_ip"),
             "role": row.get("role"),
             "state": row.get("state"),
+            "sw_version": row.get("sw_version"),
             "last_beat": _iso(row.get("last_beat")),
             "current_agent": row.get("current_agent") if telemetry_available else None,
             "current_model": row.get("current_model") if telemetry_available else None,
