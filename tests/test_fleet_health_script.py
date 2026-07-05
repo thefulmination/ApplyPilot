@@ -28,6 +28,7 @@ def test_fleet_health_script_covers_current_fleet_topology() -> None:
         "Version drift",
         "pinned_worker_version",
         "sw_version",
+        "role IN ('apply', 'compute', 'discovery')",
         "git status --short --branch",
         "git rev-parse --short HEAD",
     ):

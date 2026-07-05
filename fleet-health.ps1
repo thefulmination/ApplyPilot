@@ -194,6 +194,7 @@ try:
                 cur,
                 "SELECT fc.pinned_worker_version, wh.sw_version, count(*) AS workers "
                 "FROM worker_heartbeat wh CROSS JOIN fleet_config fc "
+                "WHERE wh.role IN ('apply', 'compute', 'discovery') "
                 "GROUP BY fc.pinned_worker_version, wh.sw_version "
                 "ORDER BY wh.sw_version",
             )

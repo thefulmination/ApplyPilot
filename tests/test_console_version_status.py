@@ -39,6 +39,15 @@ def test_build_status_exposes_worker_version_drift(fleet_db, monkeypatch) -> Non
             state="idle",
             sw_version=stale,
         )
+        heartbeat.beat(
+            conn,
+            "watchdog",
+            machine_owner="home",
+            home_ip="100.1.1.3",
+            role="watchdog",
+            state="idle",
+            sw_version=None,
+        )
 
     status = console_app.build_status()
 

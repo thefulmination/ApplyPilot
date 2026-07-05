@@ -182,8 +182,10 @@ def _versions(conn) -> dict:
         )
         cfg = cur.fetchone() or {}
         cur.execute(
-            "SELECT worker_id, machine_owner, sw_version "
-            "FROM worker_heartbeat ORDER BY worker_id"
+            "SELECT worker_id, machine_owner, role, sw_version "
+            "FROM worker_heartbeat "
+            "WHERE role IN ('apply', 'compute', 'discovery') "
+            "ORDER BY worker_id"
         )
         rows = cur.fetchall()
     conn.rollback()  # read-only
