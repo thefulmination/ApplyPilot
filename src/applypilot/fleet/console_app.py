@@ -1684,11 +1684,19 @@ _INDEX_HTML = r"""<!doctype html>
       <div class="card"><div class="label">Apply queue</div>
         <div class="val" id="cQueued">&mdash;</div><div class="hint">queued</div></div>
       <div class="card"><div class="label">Leasable now</div>
-        <div class="val" id="cLeasable">&mdash;</div><div class="hint">approved &amp; not deduped</div></div>
+        <div class="val" id="cLeasable">&mdash;</div><div class="hint" id="cLeasableHint">leaseable after pause/canary gates</div></div>
       <div class="card"><div class="label">Open challenges</div>
         <div class="val" id="cChallenges">&mdash;</div><div class="hint">need a human</div></div>
       <div class="card"><div class="label">Doctor</div>
         <div class="val" id="cDoctor">&mdash;</div><div class="hint" id="cDoctorHint">auto-fixes active</div></div>
+    </div>
+    <h2 style="margin-top:14px">Lane State</h2>
+    <div class="diagnosis-grid lane-state" id="laneStateGrid">
+      <div class="mini"><span>Shared pause</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>ATS pause</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>ATS leaseable</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>LinkedIn owner IP</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>LinkedIn canary</span><b>&mdash;</b><small>loading</small></div>
     </div>
   </section>
 
@@ -1998,6 +2006,42 @@ function renderWorkerComparison(rows){
   ).join("") : '<tr><td colspan="6" class="mut">no worker outcome data yet</td></tr>';
 }
 
+function renderLaneState(s){
+  const grid = document.getElementById("laneStateGrid");
+  if(!grid) return;
+  const diag = s.fleet_diagnosis || {};
+  const ats = diag.ats || {};
+  const linkedin = diag.linkedin || {};
+  const gate = s.gate || {};
+  const statusLinkedin = s.linkedin || {};
+  const doctor = s.doctor || {};
+  const sharedPaused = Boolean(gate.paused || ats.paused);
+  const atsPaused = Boolean(ats.ats_paused || doctor.ats_paused);
+  const ownerKnown = linkedin.owner_ip_context_known;
+  const ownerReady = linkedin.owner_ip_ready;
+  const linkedinCanaryEnabled = linkedin.canary_enabled != null
+    ? linkedin.canary_enabled : statusLinkedin.canary_enabled;
+  const linkedinCanaryRemaining = linkedin.canary_remaining;
+  const linkedinCanary = linkedinCanaryEnabled
+    ? (linkedinCanaryRemaining == null ? "armed" : linkedinCanaryRemaining)
+    : "off";
+  const cells = [
+    ["Shared pause", sharedPaused ? "on" : "off",
+      sharedPaused ? "apply lane halted; compute/discovery may continue" : "shared kill switch clear"],
+    ["ATS pause", atsPaused ? "on" : "off",
+      atsPaused ? "source " + (doctor.ats_pause_source || "unknown") : "ATS pause clear"],
+    ["ATS leaseable", ats.leaseable == null ? "—" : ats.leaseable,
+      "approved, canary-safe, not deduped"],
+    ["LinkedIn owner IP", ownerKnown ? (ownerReady ? "ready" : "blocked") : "unknown",
+      ownerKnown ? "owner-IP context checked" : "owner-IP context unavailable"],
+    ["LinkedIn canary", linkedinCanary,
+      linkedin.canary_exhausted ? "exhausted; re-arm before lease" : "catastrophe lane cap"],
+  ];
+  grid.innerHTML = cells.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
 function renderAudit(d){
   const body = document.getElementById("auditRows");
   const rows = (d && d.rows) || [];
@@ -2028,6 +2072,7 @@ function render(s){
   document.getElementById("conn").textContent = "connected";
   const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
   const dep = s.deployment || {};
+  const liveAts = ((s.fleet_diagnosis || {}).ats) || {};
   const consoleInfo = dep.console || {};
   const schema = dep.schema || {};
   const worker_versions = dep.worker_versions || [];
@@ -2087,8 +2132,12 @@ function render(s){
   document.getElementById("cSpendHint").textContent =
     g.spend_cap_usd>0 ? ("of $" + g.spend_cap_usd.toFixed(2) + " cap") : "no cap set";
   document.getElementById("cQueued").textContent = q.queued;
-  document.getElementById("cLeasable").textContent = g.leasable;
+  document.getElementById("cLeasable").textContent =
+    liveAts.leaseable == null ? g.leasable : liveAts.leaseable;
+  document.getElementById("cLeasableHint").textContent =
+    liveAts.leaseable == null ? "eligible if running" : "leaseable after pause/canary gates";
   document.getElementById("cChallenges").textContent = s.challenges;
+  renderLaneState(s);
 
   const wt = document.getElementById("workers");
   if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }

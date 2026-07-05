@@ -126,3 +126,25 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert "worker_versions" in html
     assert "browser.examples" in html
     assert "logs_url" in html
+
+
+def test_dashboard_has_explicit_lane_state_safety_rails(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert "Lane State" in html
+    assert 'id="laneStateGrid"' in html
+    assert "renderLaneState" in html
+    assert "Shared pause" in html
+    assert "ATS pause" in html
+    assert "ATS leaseable" in html
+    assert "LinkedIn owner IP" in html
+    assert "LinkedIn canary" in html
+
+
+def test_dashboard_uses_lane_gated_leaseable_count(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert "leaseable after pause/canary gates" in html
+    assert "liveAts.leaseable" in html
