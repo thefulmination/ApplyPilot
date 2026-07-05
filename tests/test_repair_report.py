@@ -101,8 +101,8 @@ def test_repair_report_summarizes_crashes_email_queue_and_recommendations(fleet_
         )
         cur.execute("INSERT INTO applied_set (dedup_key, company) VALUES ('dk-hiringcafe','HiringCafe')")
         cur.execute(
-            "INSERT INTO worker_heartbeat (worker_id, role, state, recent_log) "
-            "VALUES ('w-timeout','apply','idle','noise\nRESULT:FAILED:timeout\nmore')"
+            "INSERT INTO worker_heartbeat (worker_id, role, state, current_job, recent_log) "
+            "VALUES ('w-timeout','apply','idle','timeout-crash','noise\nRESULT:FAILED:timeout\nmore')"
         )
         conn.commit()
 
@@ -124,6 +124,23 @@ def test_repair_report_summarizes_crashes_email_queue_and_recommendations(fleet_
     assert any("--apply --confirmed-only --max-flips 1" in r["command"] for r in report["recommendations"])
     assert any("applypilot-fleet-dedup-repair" in r["command"] for r in report["recommendations"])
     assert repair_report.classify_crash_error("email_reconcile_review_required") == "email_review_required"
+
+
+def test_repair_report_ignores_stale_worker_heartbeat_result_lines(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="stale-crash", apply_error="email_reconcile_review_required", worker_id="w-stale")
+        cur.execute(
+            "INSERT INTO worker_heartbeat (worker_id, role, state, current_job, recent_log) "
+            "VALUES ('w-stale','apply','idle','different-job','noise\nRESULT:APPLIED\nmore')"
+        )
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        report = repair_report.build_report(conn, sample_limit=3)
+
+    sample = report["crash"]["buckets"]["email_review_required"]["samples"][0]
+    assert sample["worker_id"] == "w-stale"
+    assert sample["last_result_line"] is None
 
 
 class _Conn:

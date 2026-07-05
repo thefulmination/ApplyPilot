@@ -65,8 +65,8 @@ def _crash_summary(conn, *, sample_limit: int = 5) -> dict[str, Any]:
               q.updated_at,
               wh.machine_owner,
               wh.home_ip,
-              wh.recent_log,
-              wh.last_error
+              CASE WHEN wh.current_job = q.url THEN wh.recent_log ELSE NULL END AS recent_log,
+              CASE WHEN wh.current_job = q.url THEN wh.last_error ELSE NULL END AS last_error
             FROM apply_queue q
             LEFT JOIN worker_heartbeat wh ON wh.worker_id = q.worker_id
             WHERE q.status='crash_unconfirmed'

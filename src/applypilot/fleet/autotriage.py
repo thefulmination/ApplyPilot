@@ -35,11 +35,15 @@ ACTION_MENU = frozenset(
 )
 
 _USAGE_LIMIT_RE = re.compile(r"\busage[_ -]?limit\b|\bsession[_ -]?limit\b", re.I)
+_BUDGET_PRE_SUBMIT_RE = re.compile(
+    r"\bfailed:budget_exhausted_(?:before_(?:submit|submission)|incomplete_submission)\b",
+    re.I,
+)
 _WORKER_RESTART_RE = re.compile(
     r"browser_unavailable|worker_error|chrome|playwright|traceback|process|connection refused",
     re.I,
 )
-_AUTH_RE = re.compile(r"captcha|auth_required|login|verification|otp", re.I)
+_AUTH_RE = re.compile(r"captcha|auth_required|email_reconcile_review_required|login|verification|otp", re.I)
 
 
 @dataclass(frozen=True)
@@ -114,8 +118,8 @@ def load_contexts(conn, *, limit: int = 50, window_minutes: int = 1440) -> list[
             SELECT q.url, q.worker_id, q.status::text AS status, q.attempts,
                    q.apply_error, q.dedup_key, COALESCE(q.target_host, q.apply_domain) AS target_host,
                    q.company, q.title,
-                   COALESCE(h.recent_log, '') AS recent_log,
-                   COALESCE(h.last_error, '') AS last_error
+                   CASE WHEN h.current_job = q.url THEN COALESCE(h.recent_log, '') ELSE '' END AS recent_log,
+                   CASE WHEN h.current_job = q.url THEN COALESCE(h.last_error, '') ELSE '' END AS last_error
             FROM apply_queue q
             LEFT JOIN worker_heartbeat h ON h.worker_id = q.worker_id
             WHERE q.lane = 'ats'
@@ -230,11 +234,10 @@ def _llm_decision(ctx: TriageContext, *, client=None) -> TriageDecision:
 
 def decide(ctx: TriageContext, *, client=None, enable_llm: bool = False) -> TriageDecision:
     """Return a bounded decision. Deterministic provable cases outrank the LLM."""
-    text = ctx.text()
-    if ctx.status == "failed" and _USAGE_LIMIT_RE.search(text or "") and ctx.dedup_key:
+    if _is_requeueable_transient_limit(ctx):
         return TriageDecision(
             ACTION_REQUEUE_USAGE_LIMIT,
-            "failed+usage_limit is provably pre-submit; safe to requeue through remediation guards",
+            "failed+transient_limit is provably pre-submit; safe to requeue through remediation guards",
             confidence=1.0,
             source="rules",
         )
@@ -252,7 +255,7 @@ def validate_decision(ctx: TriageContext, decision: TriageDecision) -> TriageDec
         return decision
     text = ctx.text()
     if action == ACTION_REQUEUE_USAGE_LIMIT:
-        if ctx.status == "failed" and ctx.dedup_key and _USAGE_LIMIT_RE.search(text or ""):
+        if _is_requeueable_transient_limit(ctx):
             return decision
         return _reject(decision, "may_have_submitted_or_not_usage_limit")
     if action == ACTION_RESTART_WORKER:
@@ -268,6 +271,14 @@ def validate_decision(ctx: TriageContext, decision: TriageDecision) -> TriageDec
             return decision
         return _reject(decision, "manual_auth_requires_auth_or_captcha_evidence")
     return _reject(decision, "invalid_action")
+
+
+def _is_requeueable_transient_limit(ctx: TriageContext) -> bool:
+    """Return True only for failed rows whose own error proves no final submit happened."""
+    if ctx.status != "failed" or not ctx.dedup_key:
+        return False
+    text = ctx.text()
+    return bool(_USAGE_LIMIT_RE.search(text or "") or _BUDGET_PRE_SUBMIT_RE.search(text or ""))
 
 
 def _reject(decision: TriageDecision, reason: str) -> TriageDecision:
