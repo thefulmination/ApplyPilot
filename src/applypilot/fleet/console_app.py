@@ -1716,6 +1716,10 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="machineHealth">
     <h2>Machine Health</h2>
     <div id="machineMap" class="machine-grid"></div>
+    <div class="dgrp" style="margin-top:12px">
+      <div class="lbl">Stale Apply Workers</div>
+      <div id="staleWorkers" class="mut">loading stale worker details</div>
+    </div>
   </section>
 
   <section id="deploymentDrift">
@@ -2094,6 +2098,23 @@ function renderWorkerComparison(rows){
   ).join("") : '<tr><td colspan="6" class="mut">no worker outcome data yet</td></tr>';
 }
 
+function renderStaleWorkers(workers){
+  const el = document.getElementById("staleWorkers");
+  if(!el) return;
+  const stale = (workers || []).filter(w => !w.alive);
+  if(!stale.length){
+    el.innerHTML = '<div class="mut">no stale apply workers</div>';
+    return;
+  }
+  el.innerHTML = '<div class="table-scroll"><table><thead><tr>'+
+    '<th>Worker</th><th>Machine</th><th>Last beat</th><th>State</th><th>Version</th>'+
+    '</tr></thead><tbody>' + stale.map(w =>
+      '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_display_name||w.machine_owner||"")+
+      '</td><td>'+esc(w.last_beat ? rel(w.last_beat) : "never")+
+      '</td><td>'+esc(w.state||"")+'</td><td>'+esc(w.sw_version||"unknown")+'</td></tr>'
+    ).join("") + '</tbody></table></div>';
+}
+
 function classifyBuild(version){
   const v = String(version || "(unknown)");
   if(v === "(unknown)") return "unknown build";
@@ -2258,6 +2279,7 @@ function render(s){
     liveAts.leaseable == null ? "eligible if running" : "leaseable after pause/canary gates";
   document.getElementById("cChallenges").textContent = s.challenges;
   renderLaneState(s);
+  renderStaleWorkers(s.workers || []);
 
   const wt = document.getElementById("workers");
   if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }

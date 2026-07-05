@@ -132,6 +132,9 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert "renderDeploymentDrift" in html
     assert "dirty build" in html
     assert "unknown build" in html
+    assert 'id="staleWorkers"' in html
+    assert "renderStaleWorkers" in html
+    assert "Stale Apply Workers" in html
     assert "spend_24h" in html
     assert "Dynamic switching" in html
     assert "Model in use" in html
