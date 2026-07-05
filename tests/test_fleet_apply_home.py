@@ -16,7 +16,9 @@ def _home_sqlite(tmp_path):
     conn.row_factory = sqlite3.Row
     conn.executescript(
         "CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT, "
-        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, liveness_status TEXT, duplicate_of_url TEXT);"
+        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, full_description TEXT, "
+        "liveness_status TEXT, duplicate_of_url TEXT, decision_source TEXT, "
+        "fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT);"
         "CREATE TABLE applications (job_url TEXT, application_url TEXT, status TEXT);")
     return conn
 
@@ -71,6 +73,94 @@ def test_apply_home_canary_and_approve_gate(fleet_db):
         assert cur.fetchone()["approved_batch"] == token
 
 
+def test_two_consecutive_cycles_auto_approve(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('cycle1','http://x/1','9','queued','ats','x.com')")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        assert hm.arm_canary_if_safe(conn, 3) is True
+        token1 = hm.approve(conn, all_pushed=True)
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET canary_remaining=0, paused=TRUE WHERE id=1")
+            cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                        "VALUES ('cycle2','http://x/2','9','queued','ats','x.com')")
+        conn.commit()
+
+        assert hm.arm_canary_if_safe(conn, 3) is True
+        token2 = hm.approve(conn, all_pushed=True)
+        assert token2 != token1
+        with conn.cursor() as cur:
+            cur.execute("SELECT canary_enabled, canary_remaining, paused FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+            assert cfg["canary_enabled"] is True
+            assert cfg["canary_remaining"] == 3
+            assert cfg["paused"] is False
+            cur.execute("SELECT approved_batch FROM apply_queue WHERE url='cycle2'")
+            assert cur.fetchone()["approved_batch"] == token2
+
+
+def test_arm_canary_if_safe_refuses_ats_paused(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET canary_enabled=FALSE, canary_remaining=NULL, "
+                    "paused=TRUE, ats_paused=TRUE, ats_pause_source='doctor' WHERE id=1")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        assert hm.arm_canary_if_safe(conn, 3) is False
+        with conn.cursor() as cur:
+            cur.execute("SELECT canary_enabled, canary_remaining, paused, ats_paused, ats_pause_source "
+                        "FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+        assert cfg["canary_enabled"] is False
+        assert cfg["canary_remaining"] is None
+        assert cfg["paused"] is True
+        assert cfg["ats_paused"] is True
+        assert cfg["ats_pause_source"] == "doctor"
+        try:
+            hm.approve(conn, all_pushed=True)
+            assert False, "approve must still refuse when canary remains disarmed"
+        except SystemExit:
+            pass
+
+
+def test_arm_canary_if_safe_refuses_cost_cap(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET canary_enabled=FALSE, canary_remaining=NULL, "
+                    "paused=TRUE, ats_paused=FALSE, cost_cap_daily_usd=1 WHERE id=1")
+        cur.execute("INSERT INTO llm_usage (cost_usd, ts) VALUES (5, now())")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        assert hm.arm_canary_if_safe(conn, 3) is False
+        with conn.cursor() as cur:
+            cur.execute("SELECT canary_enabled, canary_remaining, paused FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+        assert cfg["canary_enabled"] is False
+        assert cfg["canary_remaining"] is None
+        assert cfg["paused"] is True
+
+
+def test_lift_canary_then_approve_still_refuses(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn:
+        hm.set_canary(conn, 3)
+        hm.lift_canary(conn)
+        try:
+            hm.approve(conn, all_pushed=True)
+            assert False, "approve must refuse after lift-canary disarms the gate"
+        except SystemExit:
+            pass
+
+
 def test_push_home_invokes_push_inbox_outcomes(fleet_db, tmp_path, monkeypatch):
     """Phase 2.3: the home push cadence must also push email_events outcome
     summaries into PG inbox_outcomes -- today push_inbox_outcomes has zero
@@ -92,7 +182,9 @@ def test_push_home_invokes_push_inbox_outcomes(fleet_db, tmp_path, monkeypatch):
     sq.row_factory = sqlite3.Row
     sq.executescript(
         "CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT, "
-        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, liveness_status TEXT, duplicate_of_url TEXT);"
+        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, full_description TEXT, "
+        "liveness_status TEXT, duplicate_of_url TEXT, decision_source TEXT, "
+        "fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT);"
         "CREATE TABLE email_events(message_id TEXT PRIMARY KEY, job_url TEXT, occurred_at TEXT, "
         "sender_domain TEXT, stage TEXT, outcome TEXT, title TEXT, company TEXT, confidence TEXT);"
     )
@@ -120,7 +212,9 @@ def test_push_home_survives_inbox_outcomes_failure(fleet_db, tmp_path, monkeypat
     sq.row_factory = sqlite3.Row
     sq.executescript(
         "CREATE TABLE jobs (url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT, "
-        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, liveness_status TEXT, duplicate_of_url TEXT);"
+        "apply_status TEXT, apply_error TEXT, audit_score REAL, fit_score REAL, full_description TEXT, "
+        "liveness_status TEXT, duplicate_of_url TEXT, decision_source TEXT, "
+        "fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT);"
     )
     sq.commit()
 

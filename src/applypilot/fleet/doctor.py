@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import sqlite3
 import logging
 import math as _math
 import os
+from pathlib import Path
 import time
 
 from applypilot.fleet import governor, heartbeat, queue
@@ -1281,6 +1283,73 @@ def _record_recommendation(conn, action: dict) -> bool:
     return True
 
 
+def parsing_drift_actions(brain_path: str | None = None) -> list[dict]:
+    """Read the latest parse-quality drift rows from the brain and return recommendations."""
+    try:
+        from applypilot import config
+    except Exception:
+        return []
+
+    path = Path(brain_path or config.DB_PATH).expanduser()
+    if not path.exists():
+        return []
+
+    uri = f"file:{path.as_posix()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT board, total, null_rate, short_rate, html_rate
+                FROM desc_quality_drift d
+                WHERE d.board <> '__all__'
+                  AND d.snapshot_at = (
+                      SELECT MAX(d2.snapshot_at)
+                        FROM desc_quality_drift d2
+                       WHERE d2.board = d.board
+                  )
+                """
+            ).fetchall()
+    except Exception:
+        return []
+
+    actions: list[dict] = []
+    for row in rows:
+        total = int(row["total"] or 0)
+        if total <= 0:
+            continue
+
+        board = str(row["board"] or "unknown")
+        for metric, rate, threshold, severity in (
+            ("null", row["null_rate"], 0.02, "warn"),
+            ("short", row["short_rate"], 0.05, "warn"),
+            ("html", row["html_rate"], 0.01, "warn"),
+        ):
+            if rate is None:
+                continue
+            if float(rate) <= threshold:
+                continue
+            actions.append({
+                "mode": "recommend",
+                "reason": "parsing_drift",
+                "host": board,
+                "machine": None,
+                "lane": None,
+                "sample_count": total,
+                "severity": severity,
+                "diagnosis": (
+                    f"Board '{board}' has elevated parse drift: {metric.replace('_', ' ')} "
+                    f"rate={float(rate):.2%}."
+                ),
+                "recommendation": (
+                    f"Review parsing for board '{board}' before continuing large-at-scale ATS pushes."
+                ),
+                "cluster_key": f"parsing_drift|{board}|{metric}",
+            })
+
+    return actions
+
+
 # ---------------------------------------------------------------------------
 # SWEEP -- TTL: deactivate expired knobs + expire stale diagnoses each run.
 # ---------------------------------------------------------------------------
@@ -1604,6 +1673,18 @@ def run_doctor(conn, *, window_minutes: int = 60) -> dict:
                     pass
             except Exception:  # pragma: no cover - logged, never fatal to the pass
                 logger.exception("doctor action failed; continuing")
+                summary["errors"] += 1
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        for action in parsing_drift_actions():
+            try:
+                if _record_recommendation(conn, action):
+                    summary["recommendations"] += 1
+            except Exception:  # pragma: no cover - logged, never fatal to the pass
+                logger.exception("parsing-drift recommendation failed; continuing")
                 summary["errors"] += 1
                 try:
                     conn.rollback()

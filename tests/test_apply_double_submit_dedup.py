@@ -150,10 +150,44 @@ def _seed_age(conn, url, days_old, *, live=None, company="Acme", title="Chief of
     conn.commit()
 
 
-def test_freshness_filter_off_by_default_keeps_stale(conn):
-    # No env set -> filter off -> a 60-day-old posting is still acquirable (unchanged behavior).
+def test_freshness_filter_default_45_skips_stale_unverified(conn):
+    # The default is now 45; a stale posting with no liveness confirmation is skipped.
     _seed_age(conn, "https://boards.greenhouse.io/a/jobs/1", 60)
+    assert L.acquire_job(min_score=7) is None
+
+
+def test_freshness_filter_disabled_allows_stale(conn, monkeypatch):
+    # Explicit zero disables the freshness filter for owner-operated runs.
+    monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "0")
+    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/5", 60)
     assert L.acquire_job(min_score=7) is not None
+
+
+def test_freshness_filter_uses_posted_at_tiebreaker(conn, monkeypatch):
+    # Posted-at is preferred over discovered_at only for same-score ordering; older
+    # postings can still be picked later when a fresher posting date exists.
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/6", 120, live=None, title="A")
+    conn.execute(
+        "UPDATE jobs SET posted_at = ? WHERE url = ?",
+        ((now - _dt.timedelta(days=2)).isoformat(), "https://boards.greenhouse.io/a/jobs/6"),
+    )
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, company, tailored_resume_path, fit_score, "
+        "audit_score, discovered_at, posted_at, liveness_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            "https://boards.greenhouse.io/a/jobs/7", "B", "X", "Acme", "x", 8, 9.0,
+            (now - _dt.timedelta(days=119)).isoformat(),
+            (now - _dt.timedelta(days=30)).isoformat(),
+            None,
+        ),
+    )
+    conn.commit()
+    monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
+    job = L.acquire_job(min_score=7)
+    assert job is not None
+    assert job["url"] == "https://boards.greenhouse.io/a/jobs/7"
 
 
 def test_freshness_filter_skips_stale_unverified(conn, monkeypatch):

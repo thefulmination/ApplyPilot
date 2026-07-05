@@ -26,6 +26,13 @@ blocked:
     - "%accenture%"
     - "%workopolis.com/out%"
 
+# ── Blocked companies — owner no-apply rules enforced at acquire/push/lease ──
+blocked_companies:
+  names:
+    - "openai"
+  url_patterns:
+    - "%openai%"
+
 # ── Unresolved aggregators — opaque apply targets, undedupable until resolved ──
 # Job-board aggregators that list a role but whose application_url is the
 # aggregator's OWN page (the real ATS + company are only revealed at runtime when

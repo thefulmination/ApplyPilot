@@ -48,7 +48,7 @@ $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 # Run exactly one worker (helper used by both the single-worker path and each spawned child).
 function Start-OneWorker([string]$wid) {
   Write-Host "[fleet-discovery] worker $wid  results/site=$ResultsPerSite  hours-old=$HoursOld  (pure scrape, no agent)"
-  & $exe --dsn $env:FLEET_PG_DSN --worker-id "$wid" --results-per-site $ResultsPerSite --hours-old $HoursOld
+  & $exe --worker-id "$wid" --results-per-site $ResultsPerSite --hours-old $HoursOld
 }
 
 # --- child invocation: run ONE worker with a distinct id in the foreground ---
@@ -69,11 +69,16 @@ if ($existing) {
 }
 
 $self = $MyInvocation.MyCommand.Path
+$logDir = Join-Path $ProjectRoot ".fleet-logs"
+New-Item -ItemType Directory -Force $logDir | Out-Null
 for ($i = 0; $i -lt $Workers; $i++) {
-  $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", $self,
+  $outLog = Join-Path $logDir ("discovery-{0}-disc-{1}.out.log" -f $Label, $i)
+  $errLog = Join-Path $logDir ("discovery-{0}-disc-{1}.err.log" -f $Label, $i)
+  $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$self`"",
                "-Index", $i, "-Label", $Label,
                "-ResultsPerSite", $ResultsPerSite, "-HoursOld", $HoursOld)
-  Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $ProjectRoot
+  Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $ProjectRoot `
+    -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
   Write-Host ("  launched {0}-disc-{1}" -f $Label, $i) -ForegroundColor Green
   Start-Sleep -Milliseconds 800
 }

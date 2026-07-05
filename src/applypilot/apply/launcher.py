@@ -112,6 +112,41 @@ def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
 
+
+def _load_blocked_companies():
+    from applypilot.config import load_blocked_companies
+    return load_blocked_companies()
+
+
+def _company_blocked(row, names: set[str], patterns: list[str]) -> bool:
+    company = (row["company"] or "").strip().lower()
+    if company and company in names:
+        return True
+    url = (row["url"] or "").lower()
+    application_url = (row["application_url"] or "").lower()
+    for pattern in patterns:
+        needle = pattern.strip("%").lower()
+        if needle and (needle in url or needle in application_url):
+            return True
+    return False
+
+
+def _company_blocklist_clause(names: set[str], patterns: list[str]) -> tuple[str, list]:
+    clauses: list[str] = []
+    params: list = []
+    if names:
+        placeholders = ",".join("?" * len(names))
+        clauses.append(f"LOWER(TRIM(COALESCE(company,''))) NOT IN ({placeholders})")
+        params.extend(sorted(names))
+    for pattern in patterns:
+        clauses.append("url NOT LIKE ?")
+        clauses.append("COALESCE(application_url,'') NOT LIKE ?")
+        params.extend([pattern, pattern])
+    if not clauses:
+        return "", []
+    return "AND " + "\n                      AND ".join(clauses), params
+
+
 # How often to poll the DB when the queue is empty (seconds). Tunable via
 # APPLYPILOT_POLL_INTERVAL / --poll-interval (lower = a worker idles less between
 # empty polls; only matters once the queue drains).
@@ -655,6 +690,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     tailored_clause = "" if config.base_resume_enabled() else "AND tailored_resume_path IS NOT NULL"
     blocked_sites: list = []
     blocked_patterns: list = []
+    blocked_company_names, blocked_company_patterns = _load_blocked_companies()
     if not target_url:
         blocked_sites, blocked_patterns = _load_blocked()
 
@@ -693,6 +729,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 if blocked_patterns:
                     url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                     params.extend(blocked_patterns)
+                company_block_clause, company_block_params = _company_blocklist_clause(
+                    blocked_company_names, blocked_company_patterns)
+                params.extend(company_block_params)
                 # LinkedIn lane gating: when the daily cap / same-day halt is in
                 # effect, skip Easy-Apply jobs so the run keeps flowing offsite.
                 li_clause = f"AND NOT {_LINKEDIN_LANE_SQL}" if exclude_linkedin else ""
@@ -719,17 +758,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     eff2 = "(CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END)"
                     tenant_clause = f"AND {eff2} LIKE ?"
                     params.append(f"%{tenant_scope}%")
-                # Optional freshness filter: skip very-stale postings (discovered_at older
-                # than APPLYPILOT_MAX_JOB_AGE_DAYS) that aren't liveness-confirmed -- they
-                # have a much higher expired-on-visit rate, so applying to them wastes a
-                # Chrome launch + agent run. 0 (default) = off, so normal runs are
-                # unaffected; liveness_status='live' rows are kept regardless of age, and
-                # rows with no discovered_at are kept (unknown age, don't penalize).
+                # Optional freshness filter: skip stale postings (posted/discovered timestamp)
+                # older than APPLYPILOT_MAX_JOB_AGE_DAYS that aren't liveness-confirmed.
+                # The value is now default-on for safety; 0 explicitly disables.
                 fresh_clause = ""
-                _max_age = int(os.environ.get("APPLYPILOT_MAX_JOB_AGE_DAYS") or 0)
+                _raw_age = os.environ.get("APPLYPILOT_MAX_JOB_AGE_DAYS")
+                _max_age = 45 if not _raw_age else int(_raw_age)
                 if _max_age > 0:
                     _cut = (datetime.now(timezone.utc) - timedelta(days=_max_age)).isoformat()
-                    fresh_clause = ("AND (discovered_at IS NULL OR discovered_at >= ? "
+                    fresh_clause = ("AND (COALESCE(posted_at, discovered_at) IS NULL OR "
+                                    "COALESCE(posted_at, discovered_at) >= ? "
                                     "OR COALESCE(liveness_status, '') = 'live')")
                     params.append(_cut)
                 # Lane filter (off-lane drift guard): the ORDER BY ranks on-lane roles
@@ -801,6 +839,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                       AND COALESCE(audit_score, fit_score) >= ?
                       {site_clause}
                       {url_clauses}
+                      {company_block_clause}
                       {li_clause}
                       {seen_clause}
                       {host_clause}
@@ -814,17 +853,52 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                                OR audit_flags LIKE '%"operations_leadership"%') DESC,
                              role_fit_score DESC,
                              (COALESCE(liveness_status, '') = 'live') DESC,
+                             COALESCE(discovered_at, posted_at) DESC,
+                             COALESCE(posted_at, discovered_at) DESC,
                              fit_score DESC, url
                     LIMIT 1
                 """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
             if not row:
+                if not target_url and (blocked_company_names or blocked_company_patterns):
+                    company_block_clause, company_block_params = _company_blocklist_clause(
+                        blocked_company_names, blocked_company_patterns)
+                    if company_block_clause:
+                        cur = conn.execute(
+                            f"""
+                            UPDATE jobs
+                            SET apply_status='blocked', apply_error='company_blocklist'
+                            WHERE url IN (
+                                SELECT url FROM jobs
+                                WHERE duplicate_of_url IS NULL
+                                  {tailored_clause}
+                                  AND COALESCE(liveness_status, '') != 'dead'
+                                  AND (apply_status IS NULL OR apply_status = 'failed')
+                                  AND COALESCE(audit_score, fit_score) >= ?
+                                  AND NOT ({company_block_clause[4:]})
+                            )
+                            """,
+                            [min_score] + company_block_params,
+                        )
+                        if cur.rowcount:
+                            conn.commit()
+                            return None
                 conn.rollback()
                 return None
 
             # Skip manual ATS sites (unsolvable CAPTCHAs): mark + continue to the
             # next candidate rather than returning None.
             apply_url = row["application_url"] or row["url"]
+            if _company_blocked(row, blocked_company_names, blocked_company_patterns):
+                conn.execute(
+                    "UPDATE jobs SET apply_status='blocked', apply_error='company_blocklist' WHERE url = ?",
+                    (row["url"],),
+                )
+                conn.commit()
+                logger.info("Skipping blocked company: %s", row["url"][:80])
+                if target_url:
+                    return None
+                continue
             if is_manual_ats(apply_url):
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
@@ -975,10 +1049,10 @@ def mark_result(url: str, status: str, error: str | None = None,
 
 def _preflight_liveness_enabled() -> bool:
     """Whether to HTTP-probe each candidate for closure before launching Chrome.
-    Off by default (adds a per-job request); the supervised/production run turns it
-    on via APPLYPILOT_PREFLIGHT_LIVENESS=1 to avoid burning launches on dead postings."""
-    return os.environ.get("APPLYPILOT_PREFLIGHT_LIVENESS", "").strip().lower() in (
-        "1", "true", "yes", "on")
+    On by default; callers can set APPLYPILOT_PREFLIGHT_LIVENESS to 0/false/no/off
+    to disable the additional network probe."""
+    return os.environ.get("APPLYPILOT_PREFLIGHT_LIVENESS", "").strip().lower() not in (
+        "0", "false", "no", "off")
 
 
 def _stamp_liveness_dead(url: str, reason: str) -> None:
@@ -1288,6 +1362,121 @@ def is_usage_limit_result(status: str | None) -> bool:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
+def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
+                            resume_text: str, resume_path) -> tuple[str, int] | None:
+    """Opt-in deterministic Greenhouse path. Returns (status, duration_ms) if it
+    OWNED the application, else None so the apply agent proceeds. Never raises.
+
+    Two independent gates:
+      * APPLYPILOT_GREENHOUSE_ADAPTER  -> SHADOW: deterministically fill the form
+        in a scratch tab in DRY-RUN, log the plan, then fall through (agent still
+        submits). Proves the adapter works on live forms.
+      * + APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT -> OWN: for a ready plan on a real
+        (non-dry) run, fill + submit + confirm, and return the resulting status;
+        the agent is skipped. An incomplete plan (agent_fallback) always defers.
+
+    This runs INSIDE _run_job_impl, so the job has already cleared the apply
+    loop's lease / canary / cost gates before we get here.
+    """
+    try:
+        from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
+        from applypilot.apply.greenhouse_submit import (
+            adapter_enabled,
+            apply_greenhouse,
+            submit_enabled,
+        )
+    except Exception:
+        return None
+    if not adapter_enabled():
+        return None
+    url = job.get("application_url") or job.get("url") or ""
+    if not parse_greenhouse_url(url):
+        return None
+
+    own = submit_enabled() and not dry_run  # may we actually submit and own the outcome?
+    t0 = time.time()
+    res = None
+    try:
+        from playwright.sync_api import sync_playwright
+        profile = config.load_profile()
+        pdf = str(Path(resume_path).with_suffix(".pdf")) if resume_path else None
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                res = apply_greenhouse(url, profile=profile, resume_text=resume_text,
+                                       resume_path=pdf, page=page, dry_run=not own)
+            finally:
+                page.close()
+    except Exception:
+        logger.debug("greenhouse adapter failed (non-fatal); agent proceeds", exc_info=True)
+        return None
+
+    if not res or res.get("route") != "deterministic":
+        logger.info("greenhouse adapter: deferring to agent (route=%s unmapped=%s)",
+                    (res or {}).get("route"), (res or {}).get("unmapped"))
+        return None
+    if not own:
+        plan = res.get("plan")
+        logger.info("greenhouse shadow OK: ready=%s free_text=%s",
+                    res.get("ready"), list(plan.free_text) if plan else [])
+        return None  # shadow: agent still owns the submission
+
+    status = res.get("status", "failed:no_confirmation")
+    duration_ms = int((time.time() - t0) * 1000)
+    logger.info("greenhouse adapter OWNED submit for %s -> %s", url, status)
+    return (status, duration_ms)
+
+
+def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) -> None:
+    """Opt-in SHADOW validation of the deterministic Lever adapter.
+
+    Lever's submit is hCaptcha-gated, so the adapter never owns submission: this
+    discovers + deterministically fills the form in a scratch tab (no submit
+    action is ever emitted), logs the plan, then closes the tab. The apply agent
+    still owns the real submission. Gated by APPLYPILOT_GREENHOUSE_ADAPTER (the
+    shared adapter flag). Never raises.
+    """
+    try:
+        from applypilot.apply.greenhouse_submit import adapter_enabled, execute_form
+        from applypilot.apply.lever_adapter import (
+            build_lever_plan,
+            discover_fields,
+            parse_lever_url,
+            plan_lever_form_actions,
+        )
+    except Exception:
+        return
+    if not adapter_enabled():
+        return
+    url = job.get("application_url") or job.get("url") or ""
+    if not parse_lever_url(url):
+        return
+    try:
+        from playwright.sync_api import sync_playwright
+        profile = config.load_profile()
+        pdf = str(Path(resume_path).with_suffix(".pdf")) if resume_path else None
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                fields = discover_fields(page)
+                plan = build_lever_plan(fields, profile=profile, resume_text=resume_text,
+                                        job={"site": job.get("site", "")})
+                execute_form(plan_lever_form_actions(plan, fields, resume_path=pdf),
+                             page, dry_run=True)
+                logger.info("lever shadow: fields=%d ready=%s free_text=%s unmapped=%s",
+                            len(fields), plan.ready, list(plan.free_text), plan.unmapped_required)
+            finally:
+                page.close()
+    except Exception:
+        logger.debug("lever shadow failed (non-fatal); agent proceeds", exc_info=True)
+
+
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str | None = "sonnet", dry_run: bool = False,
             agent: str = "claude", inbox_auth_hint: str | None = None,
@@ -1340,6 +1529,15 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     resume_text = ""
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
+
+    # Opt-in deterministic Greenhouse adapter (no-op unless
+    # APPLYPILOT_GREENHOUSE_ADAPTER is set). Owns the application only with the
+    # second submit gate on a ready plan; otherwise validates + falls through.
+    gh_result = _maybe_greenhouse_apply(job, port, dry_run=dry_run,
+                                        resume_text=resume_text, resume_path=resume_path)
+    if gh_result is not None:
+        return gh_result
+    _maybe_lever_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
 
     # Reset the worker's isolated working directory FIRST. build_prompt stages
     # upload files under worker-{id}/current and reset_worker_dir wipes

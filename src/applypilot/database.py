@@ -9,11 +9,24 @@ import re
 import sqlite3
 import threading
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from applypilot.config import DB_PATH
+
+MIN_GOOD_DESCRIPTION_CHARS = 200
+THIN_DESCRIPTION_CHARS = 500
+
+def _ensure_desc_quality(row: dict[str, Any]) -> tuple[str, int]:
+    """Compute deterministic description-quality telemetry for one job row."""
+    from applypilot.discovery import desc_quality
+
+    title = row.get("title")
+    full_description = row.get("full_description")
+    flags, score = desc_quality.assess_description(title, full_description)
+    return ",".join(flags), score
+
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -182,6 +195,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     ensure_inbox_auth_tables(conn)
     ensure_pipeline_tables(conn)
     ensure_research_tables(conn)
+    ensure_desc_quality_tables(conn)
     ensure_outcome_tables(conn)
     ensure_tenant_tables(conn)
 
@@ -286,6 +300,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "liveness_status": "TEXT",        # live | dead | uncertain (NULL = unchecked)
     "last_verified_live": "TEXT",     # ISO8601 timestamp of last liveness probe
     "liveness_reason": "TEXT",        # signal that produced the verdict
+    "posted_at": "TEXT",
+    "valid_through": "TEXT",
     # Research advisory scores (denormalized "current best research opinion" written by the
     # TS KG scorer; detail rows live in research_scores). ADVISORY ONLY -- NEVER folded into
     # COALESCE(audit_score, fit_score); reaches the apply gate only via owner promotion.
@@ -295,6 +311,9 @@ _ALL_COLUMNS: dict[str, str] = {
     "research_model": "TEXT",
     "research_scored_at": "TEXT",
     "research_opt_in": "INTEGER DEFAULT 0",
+    "desc_quality_flags": "TEXT",
+    "desc_quality_score": "INTEGER",
+    "desc_quality_at": "TEXT",
 }
 
 
@@ -773,6 +792,281 @@ def ensure_research_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.commit()
 
 
+def ensure_desc_quality_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create durable parse-quality drift/audit tables."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS desc_quality_drift (
+            snapshot_at        TEXT NOT NULL,
+            board              TEXT NOT NULL,
+            window_days        INTEGER NOT NULL,
+            total              INTEGER NOT NULL,
+            null_rate          REAL NOT NULL,
+            stub_rate          REAL NOT NULL,
+            short_rate         REAL NOT NULL,
+            html_rate          REAL NOT NULL,
+            junk_rate          REAL NOT NULL,
+            board_summary_rate  REAL NOT NULL,
+            title_echo_rate    REAL NOT NULL,
+            no_req_marker_rate REAL NOT NULL,
+            PRIMARY KEY(snapshot_at, board)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS parse_spot_audit (
+            audited_at  TEXT NOT NULL,
+            url         TEXT NOT NULL,
+            board       TEXT NOT NULL,
+            band        TEXT NOT NULL,
+            complete    INTEGER NOT NULL,
+            defects     TEXT,
+            model       TEXT,
+            PRIMARY KEY (audited_at, url)
+        )
+    """)
+    conn.commit()
+
+
+def refresh_desc_quality(conn: sqlite3.Connection | None = None, limit: int | None = None) -> dict[str, int]:
+    """Recompute desc_quality_* where stale or missing.
+
+    Returns counters in a stable shape for tests and diagnostics:
+    {"scanned": N, "updated": M}.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    where = (
+        "WHERE duplicate_of_url IS NULL "
+        "AND (desc_quality_at IS NULL OR desc_quality_at < COALESCE(detail_scraped_at, discovered_at))"
+    )
+    query = (
+        "SELECT url, title, full_description, COALESCE(detail_scraped_at, discovered_at) AS source_ts "
+        f"FROM jobs {where}"
+    )
+    if limit:
+        query += " LIMIT ?"
+    rows = conn.execute(query, () if not limit else (limit,)).fetchall()
+
+    updates = 0
+    for row in rows:
+        row_dict = {
+            "url": row[0],
+            "title": row[1],
+            "full_description": row[2],
+        }
+        desc_flags, desc_score = _ensure_desc_quality(row_dict)
+        source_ts = row["source_ts"] or datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE jobs
+               SET desc_quality_flags = ?,
+                   desc_quality_score = ?,
+                   desc_quality_at = ?
+             WHERE url = ?
+            """,
+            (desc_flags, int(desc_score), source_ts, row[0]),
+        )
+        updates += 1
+    conn.commit()
+    return {"scanned": len(rows), "updated": updates}
+
+
+def snapshot_desc_quality(conn: sqlite3.Connection | None = None, window_days: int = 7) -> dict[str, int | list[dict]]:
+    """Compute rolling-window parse quality rates per board and persist a snapshot."""
+    if conn is None:
+        conn = get_connection()
+
+    cutoff = datetime.now(timezone.utc).astimezone().isoformat()
+    if window_days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+
+    rows = conn.execute(
+        """
+        SELECT
+            COALESCE(source_board, strategy, site, 'unknown') AS board,
+            title,
+            full_description,
+            desc_quality_flags
+        FROM jobs
+        WHERE duplicate_of_url IS NULL
+          AND discovered_at IS NOT NULL
+          AND datetime(discovered_at) >= datetime(?)
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    by_board: dict[str, dict[str, float | int]] = {}
+    for board, title, full_description, flags in rows:
+        stats = by_board.setdefault(
+            board,
+            {"total": 0, "empty": 0, "stub": 0, "short": 0, "html": 0, "junk": 0,
+             "board_summary": 0, "title_echo": 0, "no_req_marker": 0},
+        )
+        flags_iter = _flag_set(title, full_description, flags)
+        stats["total"] += 1
+        if "empty" in flags_iter:
+            stats["empty"] += 1
+        if "stub_lt200" in flags_iter:
+            stats["stub"] += 1
+        if "short_lt500" in flags_iter:
+            stats["short"] += 1
+        if "html_residue" in flags_iter:
+            stats["html"] += 1
+        if "junk_boilerplate" in flags_iter:
+            stats["junk"] += 1
+        if "board_summary_stub" in flags_iter:
+            stats["board_summary"] += 1
+        if "title_echo" in flags_iter:
+            stats["title_echo"] += 1
+        if "no_requirements_marker" in flags_iter:
+            stats["no_req_marker"] += 1
+
+    snapshot_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    report_rows: list[dict] = []
+    for board, s in by_board.items():
+        total = int(s["total"])
+        if total <= 0:
+            continue
+        total_f = float(total)
+        rec = {
+            "board": board,
+            "total": total,
+            "null_rate": round((s["empty"] or 0) / total_f, 4),
+            "stub_rate": round((s["stub"] or 0) / total_f, 4),
+            "short_rate": round((s["short"] or 0) / total_f, 4),
+            "html_rate": round((s["html"] or 0) / total_f, 4),
+            "junk_rate": round((s["junk"] or 0) / total_f, 4),
+            "board_summary_rate": round((s["board_summary"] or 0) / total_f, 4),
+            "title_echo_rate": round((s["title_echo"] or 0) / total_f, 4),
+            "no_req_marker_rate": round((s["no_req_marker"] or 0) / total_f, 4),
+        }
+        conn.execute(
+            """
+            INSERT INTO desc_quality_drift (
+                snapshot_at, board, window_days, total,
+                null_rate, stub_rate, short_rate, html_rate, junk_rate,
+                board_summary_rate, title_echo_rate, no_req_marker_rate
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_at, board) DO UPDATE SET
+                total = excluded.total,
+                null_rate = excluded.null_rate,
+                stub_rate = excluded.stub_rate,
+                short_rate = excluded.short_rate,
+                html_rate = excluded.html_rate,
+                junk_rate = excluded.junk_rate,
+                board_summary_rate = excluded.board_summary_rate,
+                title_echo_rate = excluded.title_echo_rate,
+                no_req_marker_rate = excluded.no_req_marker_rate,
+                window_days = excluded.window_days
+            """,
+            (
+                snapshot_at,
+                board,
+                window_days,
+                total,
+                rec["null_rate"],
+                rec["stub_rate"],
+                rec["short_rate"],
+                rec["html_rate"],
+                rec["junk_rate"],
+                rec["board_summary_rate"],
+                rec["title_echo_rate"],
+                rec["no_req_marker_rate"],
+            ),
+        )
+        report_rows.append(rec)
+
+    total_all = 0
+    aggregate = {"empty": 0.0, "stub": 0.0, "short": 0.0, "html": 0.0, "junk": 0.0,
+                 "board_summary": 0.0, "title_echo": 0.0, "no_req_marker": 0.0}
+    for s in by_board.values():
+        board_total = int(s["total"])
+        if board_total <= 0:
+            continue
+        total_all += board_total
+        aggregate["empty"] += float(s["empty"] or 0)
+        aggregate["stub"] += float(s["stub"] or 0)
+        aggregate["short"] += float(s["short"] or 0)
+        aggregate["html"] += float(s["html"] or 0)
+        aggregate["junk"] += float(s["junk"] or 0)
+        aggregate["board_summary"] += float(s["board_summary"] or 0)
+        aggregate["title_echo"] += float(s["title_echo"] or 0)
+        aggregate["no_req_marker"] += float(s["no_req_marker"] or 0)
+    all_board = {
+        "board": "__all__",
+        "total": total_all,
+        "null_rate": 0.0,
+        "stub_rate": 0.0,
+        "short_rate": 0.0,
+        "html_rate": 0.0,
+        "junk_rate": 0.0,
+        "board_summary_rate": 0.0,
+        "title_echo_rate": 0.0,
+        "no_req_marker_rate": 0.0,
+    }
+    if total_all:
+        all_board["null_rate"] = round(aggregate["empty"] / total_all, 4)
+        all_board["stub_rate"] = round(aggregate["stub"] / total_all, 4)
+        all_board["short_rate"] = round(aggregate["short"] / total_all, 4)
+        all_board["html_rate"] = round(aggregate["html"] / total_all, 4)
+        all_board["junk_rate"] = round(aggregate["junk"] / total_all, 4)
+        all_board["board_summary_rate"] = round(aggregate["board_summary"] / total_all, 4)
+        all_board["title_echo_rate"] = round(aggregate["title_echo"] / total_all, 4)
+        all_board["no_req_marker_rate"] = round(aggregate["no_req_marker"] / total_all, 4)
+
+    conn.execute(
+        """
+        INSERT INTO desc_quality_drift (
+            snapshot_at, board, window_days, total,
+            null_rate, stub_rate, short_rate, html_rate, junk_rate,
+            board_summary_rate, title_echo_rate, no_req_marker_rate
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(snapshot_at, board) DO UPDATE SET
+            total = excluded.total,
+            null_rate = excluded.null_rate,
+            stub_rate = excluded.stub_rate,
+            short_rate = excluded.short_rate,
+            html_rate = excluded.html_rate,
+            junk_rate = excluded.junk_rate,
+            board_summary_rate = excluded.board_summary_rate,
+            title_echo_rate = excluded.title_echo_rate,
+            no_req_marker_rate = excluded.no_req_marker_rate,
+            window_days = excluded.window_days
+        """,
+        (
+            snapshot_at,
+            "__all__",
+            window_days,
+            all_board["total"],
+            all_board["null_rate"],
+            all_board["stub_rate"],
+            all_board["short_rate"],
+            all_board["html_rate"],
+            all_board["junk_rate"],
+            all_board["board_summary_rate"],
+            all_board["title_echo_rate"],
+            all_board["no_req_marker_rate"],
+        ),
+    )
+
+    report_rows.append(all_board)
+    conn.commit()
+    return {"snapshot_at": snapshot_at, "rows": report_rows}
+
+
+def _flag_set(title: str | None, full_description: str | None, raw_flags: str | None) -> set[str]:
+    """Return a deterministic set of quality flags, recomputing if needed."""
+    if raw_flags is not None:
+        return {f for f in str(raw_flags).split(",") if f}
+    flags, _ = _ensure_desc_quality({"title": title, "full_description": full_description})
+    return {f for f in flags.split(",") if f}
+
+
 def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
     """Create durable pipeline run/checkpoint tables."""
     if conn is None:
@@ -827,6 +1121,14 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
             created_at            TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scoring_context_events (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            event                 TEXT NOT NULL,
+            detail                TEXT,
+            created_at            TEXT NOT NULL
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started_at ON pipeline_runs(started_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pipeline_stage_runs_run_id ON pipeline_stage_runs(run_id)")
@@ -841,6 +1143,7 @@ def ensure_pipeline_tables(conn: sqlite3.Connection | None = None) -> None:
         conn.execute("ALTER TABLE llm_usage ADD COLUMN prompt_variant TEXT")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_variant ON llm_usage(prompt_variant)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scoring_context_events_event ON scoring_context_events(event)")
 
     conn.commit()
 
@@ -885,6 +1188,27 @@ def record_llm_usage(
         conn.commit()
     except Exception:
         pass  # usage logging must never break a real LLM call
+
+
+def record_scoring_context_event(
+    event: str,
+    detail: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Persist scorer context anomalies (best-effort; never raises)."""
+    try:
+        if conn is None:
+            conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO scoring_context_events (event, detail, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (event, detail, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 def get_llm_usage_summary(conn: sqlite3.Connection | None = None) -> dict:
@@ -1254,6 +1578,13 @@ def insert_discovered_job(
     duplicate_reason = _DUPLICATE_REASON if canonical else None
     duplicate_detected_at = now if canonical else None
 
+    desc_flags = None
+    desc_score = None
+    desc_quality_at = now
+    if job.get("full_description") is not None:
+        desc_flags, desc_score = _ensure_desc_quality(job)
+        desc_quality_at = job.get("detail_scraped_at") or now
+
     try:
         conn.execute(
             """
@@ -1261,9 +1592,11 @@ def insert_discovered_job(
                 url, title, salary, description, location, site,
                 company, source_board, strategy, discovered_at,
                 dedupe_key, duplicate_of_url, duplicate_reason, duplicate_detected_at,
-                full_description, application_url, detail_scraped_at, detail_error
+                full_description, application_url, detail_scraped_at, detail_error,
+                posted_at, valid_through,
+                desc_quality_flags, desc_quality_score, desc_quality_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 url,
@@ -1284,6 +1617,11 @@ def insert_discovered_job(
                 job.get("application_url"),
                 job.get("detail_scraped_at"),
                 job.get("detail_error"),
+                job.get("posted_at"),
+                job.get("valid_through"),
+                desc_flags,
+                desc_score,
+                desc_quality_at,
             ),
         )
     except sqlite3.IntegrityError:
@@ -1706,7 +2044,10 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL AND duplicate_of_url IS NULL",
         "enriched": "full_description IS NOT NULL AND duplicate_of_url IS NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of_url IS NULL",
+        "pending_score": (
+            f"full_description IS NOT NULL AND LENGTH(full_description) >= {MIN_GOOD_DESCRIPTION_CHARS} "
+            "AND fit_score IS NULL AND duplicate_of_url IS NULL"
+        ),
         "scored": "fit_score IS NOT NULL AND duplicate_of_url IS NULL",
         "pending_diagnosis": (
             "fit_score IS NOT NULL AND full_description IS NOT NULL "
@@ -1717,6 +2058,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         ),
         "pending_tailor": (
             "COALESCE(audit_score, fit_score) >= ? AND full_description IS NOT NULL "
+            f"AND LENGTH(COALESCE(full_description,'')) >= {THIN_DESCRIPTION_CHARS} "
             "AND duplicate_of_url IS NULL "
             "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
         ),
@@ -1725,6 +2067,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
             "AND duplicate_of_url IS NULL "
             "AND (apply_status IS NULL OR apply_status = 'failed') "
+            f"AND LENGTH(COALESCE(full_description,'')) >= {THIN_DESCRIPTION_CHARS} "
             "AND COALESCE(audit_score, fit_score, 0) >= 7"
         ),
         "applied": "applied_at IS NOT NULL AND duplicate_of_url IS NULL",

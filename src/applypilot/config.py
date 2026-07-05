@@ -423,6 +423,27 @@ def load_blocked_sites() -> tuple[set[str], list[str]]:
     return sites, patterns
 
 
+def load_blocked_companies() -> tuple[set[str], list[str]]:
+    """Load blocked company names and URL patterns from sites.yaml.
+
+    Company names are exact, case-insensitive matches. URL patterns are SQL LIKE
+    patterns matched against both url and application_url at apply chokepoints.
+    """
+    cfg = load_sites_config()
+    blocked = cfg.get("blocked_companies", {}) or {}
+    names = {
+        str(name).strip().lower()
+        for name in blocked.get("names", []) or []
+        if str(name).strip()
+    }
+    patterns = [
+        str(pattern).strip()
+        for pattern in blocked.get("url_patterns", []) or []
+        if str(pattern).strip()
+    ]
+    return names, patterns
+
+
 def load_blocked_sso() -> list[str]:
     """Load blocked SSO domains from sites.yaml."""
     cfg = load_sites_config()

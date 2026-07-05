@@ -6,6 +6,7 @@ profile and resume file.
 """
 
 import logging
+import json
 import os
 import re
 import time
@@ -13,7 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # antigravity: python-scorer-integration-v1
+from applypilot import database
 from applypilot.config import RESUME_PATH, load_preference_profile, KNOWLEDGE_GRAPH_PROMPT_PATH
+from applypilot.database import MIN_GOOD_DESCRIPTION_CHARS
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
@@ -50,11 +53,24 @@ REASONING: [2-3 sentences in plain English: what matches, what is missing, and w
 # Recommendation calibration is produced by an external engine ("brainstorm"),
 # so treat its content defensively: cap sizes and tolerate wrong-typed fields.
 _MAX_PREFERENCE_CHARS = 12000
-_MAX_KNOWLEDGE_GRAPH_CHARS = 16000
+# 32k covers the current compact KG pack; +~2.8k input tokens costs about
+# $0.0008/job at the DeepSeek input rate cited in the 2026-07-04 audit.
+_MAX_KNOWLEDGE_GRAPH_CHARS = 32000
+_MAX_DESCRIPTION_CHARS = int(os.getenv("APPLYPILOT_SCORE_DESC_CAP", "15000"))
+DESCRIPTION_TRUNCATION_MARKER = "\n[...TRUNCATED: description exceeded limit...]"
+DESCRIPTION_OMISSION_MARKER = "[...middle of description omitted...]"
+REQUIREMENTS_MARKER_RE = re.compile(
+    r"(?i)(requirements|qualifications|what you.ll need|what we.re looking for|who you are|must[- ]haves?)"
+)
 # Fields the scorer calibrates on; used to detect a present-but-empty profile
 # (a likely schema mismatch with the recommendation engine).
 _PREFERENCE_FIELDS = ("promptSummary", "summary", "positiveSignals",
                       "negativeSignals", "fitMapRules", "examples")
+_RESCORE_QUERY = (
+    "SELECT * FROM jobs WHERE full_description IS NOT NULL "
+    f"AND LENGTH(full_description) >= {MIN_GOOD_DESCRIPTION_CHARS} "
+    "AND duplicate_of_url IS NULL"
+)
 
 
 def _as_list(value) -> list:
@@ -93,6 +109,30 @@ def _preference_profile_prompt(preference_profile: dict | None) -> str:
     return text
 
 
+def select_description(full_description, cap=None) -> str:
+    desc = full_description or ""
+    cap = int(cap or _MAX_DESCRIPTION_CHARS)
+    if len(desc) <= cap:
+        return desc
+
+    match = REQUIREMENTS_MARKER_RE.search(desc)
+    if not match:
+        return desc[:cap] + DESCRIPTION_TRUNCATION_MARKER
+
+    joiner = f"\n{DESCRIPTION_OMISSION_MARKER}\n"
+    tail = desc[match.start():]
+    min_head = min(500, cap)
+    available = max(0, cap - len(joiner))
+    if len(tail) >= available - min_head:
+        head_budget = min_head
+        tail_budget = max(0, available - head_budget)
+        tail = tail[:tail_budget]
+    else:
+        head_budget = max(min_head, available - len(tail))
+    head = desc[:head_budget]
+    return f"{head}{joiner}{tail}{DESCRIPTION_TRUNCATION_MARKER}"
+
+
 def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge_graph_prompt=None) -> str:
     """The combined prompt text for a single-string backend (e.g. `codex exec`).
     Same instructions + context as score_job, flattened to one prompt."""
@@ -100,7 +140,7 @@ def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job.get('site', '')}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{select_description(job.get('full_description'))}"
     )
     parts = [SCORE_PROMPT, f"RESUME:\n{resume_text}"]
     pref = _preference_profile_prompt(preference_profile)
@@ -112,21 +152,40 @@ def build_score_prompt_text(resume_text, job, preference_profile=None, knowledge
     return "\n\n---\n\n".join(parts)
 
 
+def _load_knowledge_graph_prompt() -> str | None:
+    try:
+        if not KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
+            return None
+        kg_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
+        if kg_prompt and len(kg_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
+            log.error(
+                "Knowledge graph prompt is %d chars; truncating to %d to control "
+                "token cost (it is injected into every scoring call).",
+                len(kg_prompt), _MAX_KNOWLEDGE_GRAPH_CHARS,
+            )
+            database.record_scoring_context_event(
+                "kg_prompt_truncated",
+                json.dumps({
+                    "path": str(KNOWLEDGE_GRAPH_PROMPT_PATH),
+                    "original_chars": len(kg_prompt),
+                    "cap": _MAX_KNOWLEDGE_GRAPH_CHARS,
+                }),
+            )
+            kg_prompt = kg_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
+        if not (kg_prompt or "").strip():
+            return None
+        return kg_prompt
+    except Exception as e:
+        log.warning("Could not read knowledge graph prompt from %s: %s", KNOWLEDGE_GRAPH_PROMPT_PATH, e)
+        return None
+
+
 def load_score_context() -> dict:
     """Resume / preference profile / KG prompt from the same sources run_scoring reads.
     For the frontier pass + any standalone scorer caller."""
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     preference_profile = load_preference_profile()
-    kg_prompt = None
-    try:
-        if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
-            kg_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
-            if kg_prompt and len(kg_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
-                kg_prompt = kg_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
-            if not (kg_prompt or "").strip():
-                kg_prompt = None
-    except OSError:
-        kg_prompt = None
+    kg_prompt = _load_knowledge_graph_prompt()
     return {"resume_text": resume_text, "preference_profile": preference_profile, "kg_prompt": kg_prompt}
 
 
@@ -195,7 +254,7 @@ def score_job(
 
     Args:
         resume_text: The candidate's full resume text.
-        job: Job dict with keys: title, site, location, full_description.
+        job: Job dict with keys: title, company/site, location, full_description.
         preference_profile: Human preference calibration data.
         knowledge_graph_prompt: Factual knowledge graph prompt pack.
         provider: Optional LLM provider override.
@@ -205,9 +264,9 @@ def score_job(
     """
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"COMPANY: {job.get('company') or job.get('site') or 'Unknown'}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{select_description(job.get('full_description'))}"
     )
 
     preference_prompt = _preference_profile_prompt(preference_profile)
@@ -334,32 +393,15 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int | None = Non
             )
 
     # antigravity: python-scorer-integration-v1
-    knowledge_graph_prompt = None
-    if KNOWLEDGE_GRAPH_PROMPT_PATH.exists():
-        try:
-            knowledge_graph_prompt = KNOWLEDGE_GRAPH_PROMPT_PATH.read_text(encoding="utf-8")
-            if len(knowledge_graph_prompt) > _MAX_KNOWLEDGE_GRAPH_CHARS:
-                log.warning(
-                    "Knowledge graph prompt is %d chars; truncating to %d to control "
-                    "token cost (it is injected into every scoring call).",
-                    len(knowledge_graph_prompt), _MAX_KNOWLEDGE_GRAPH_CHARS,
-                )
-                knowledge_graph_prompt = (
-                    knowledge_graph_prompt[:_MAX_KNOWLEDGE_GRAPH_CHARS] + "\n...[truncated]"
-                )
-            if not knowledge_graph_prompt.strip():
-                knowledge_graph_prompt = None
-            else:
-                log.info("Loaded job knowledge graph prompt for scoring calibration (%d chars).",
-                         len(knowledge_graph_prompt))
-        except Exception as e:
-            log.warning("Could not read knowledge graph prompt from %s: %s", KNOWLEDGE_GRAPH_PROMPT_PATH, e)
-            knowledge_graph_prompt = None
+    knowledge_graph_prompt = _load_knowledge_graph_prompt()
+    if knowledge_graph_prompt:
+        log.info("Loaded job knowledge graph prompt for scoring calibration (%d chars).",
+                 len(knowledge_graph_prompt))
 
     conn = get_connection()
 
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL AND duplicate_of_url IS NULL"
+        query = _RESCORE_QUERY
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()

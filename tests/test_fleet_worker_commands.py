@@ -40,6 +40,24 @@ def test_restart_returns_stop_and_hard_acks(fleet_db):
     assert loop.run_once()["action"] == "idle"
 
 
+def test_stale_direct_restart_from_previous_process_is_acked_but_ignored(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        cmd_id = heartbeat.issue_command(conn, "m2-0", "restart")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE remote_commands SET issued_at = now() - interval '10 minutes' "
+                "WHERE id=%s",
+                (cmd_id,),
+            )
+        conn.commit()
+    loop = _mk_loop(fleet_db)
+    assert loop.run_once()["action"] == "idle"
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT acked_at FROM remote_commands WHERE id=%s", (cmd_id,))
+            assert cur.fetchone()["acked_at"] is not None
+
+
 def test_broadcast_drain_reaches_every_worker(fleet_db):
     w0, w1 = _mk_loop(fleet_db, "m2-0"), _mk_loop(fleet_db, "m2-1")
     with pgqueue.connect(fleet_db) as conn:

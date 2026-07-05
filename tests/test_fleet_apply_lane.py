@@ -98,12 +98,21 @@ def test_build_apply_loop_wires_apply_fn(fleet_db, monkeypatch):
     assert loop.role == "apply" and loop.apply_fn is not None
 
 
-def test_apply_env_sets_base_resume():
+def test_apply_env_sets_base_resume(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_LANE_FILTER", raising=False)
     from applypilot.fleet import apply_worker_main as am
     am._setup_apply_env()
     import os
     assert os.environ.get("APPLYPILOT_BASE_RESUME") == "1"
     assert os.environ.get("APPLYPILOT_LANE_FILTER") == "0"
+
+
+def test_apply_env_preserves_existing_lane_filter(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_LANE_FILTER", "1")
+    from applypilot.fleet import apply_worker_main as am
+    am._setup_apply_env()
+    import os
+    assert os.environ.get("APPLYPILOT_LANE_FILTER") == "1"
 
 
 def test_run_apply_idles_when_halted(fleet_db):

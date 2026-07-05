@@ -25,8 +25,9 @@ from urllib.parse import urlsplit
 
 import pandas as pd
 
-from applypilot import config
+from applypilot import config, database
 from applypilot.apply import pgqueue
+from applypilot.database import THIN_DESCRIPTION_CHARS
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import queue as _queue
 from applypilot.discovery.jobspy import store_jobspy_results
@@ -39,19 +40,22 @@ from applypilot.discovery.jobspy import store_jobspy_results
 # Eligibility mirrors fleet_sync._PUSH_SELECT (the offsite-apply predicate, S2/S9.3):
 #   not a dedup duplicate; score floor on COALESCE(audit_score, fit_score); not dead;
 #   not already applied/in-flight; a real http(s) offsite (non-LinkedIn) target.
+#   The research score lane stays opt-in for apply staging via ``include_research``.
 # crash_unconfirmed / no_confirmation are EXCLUDED (v1 parity): a posting that may
 # already have been submitted under the user's name must never be re-pushed/re-applied.
 _PUSH_APPLY_SELECT = """
 SELECT url, company, title, application_url,
-       CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
+       CAST({score_expr} AS REAL) AS score
 FROM jobs
 WHERE duplicate_of_url IS NULL
-  AND COALESCE(audit_score, fit_score) >= ?
+  AND {score_expr} >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
   AND application_url LIKE 'http%'
   AND application_url NOT LIKE '%linkedin.com%'
+  {company_blocklist}
 ORDER BY score DESC
 """
 
@@ -70,6 +74,55 @@ def _applications_table_exists(sqlite_conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'"
     ).fetchone()
     return row is not None
+
+
+def _company_blocklist_sql() -> tuple[str, list[str]]:
+    names, patterns = config.load_blocked_companies()
+    clauses: list[str] = []
+    params: list[str] = []
+    if names:
+        placeholders = ",".join("?" * len(names))
+        clauses.append(f"LOWER(TRIM(COALESCE(company,''))) NOT IN ({placeholders})")
+        params.extend(sorted(names))
+    for pattern in patterns:
+        clauses.append("url NOT LIKE ?")
+        clauses.append("COALESCE(application_url,'') NOT LIKE ?")
+        params.extend([pattern, pattern])
+    if not clauses:
+        return "", []
+    return "  AND " + "\n  AND ".join(clauses), params
+
+
+def _lane_filter_sql() -> tuple[str, list[str]]:
+    off_needles, on_tags = config.load_lane_filter()
+    params: list[str] = []
+    lane_parts = [
+        "COALESCE(fit_gap_category, '') != 'wrong_role_lane'",
+        "COALESCE(recommended_action, '') != 'ignore'",
+    ]
+    if off_needles:
+        tnorm = "LOWER(' ' || COALESCE(title, '') || ' ')"
+        title_or = " OR ".join(f"{tnorm} LIKE ?" for _ in off_needles)
+        params.extend(f"%{needle}%" for needle in off_needles)
+        flag_guard = ""
+        if on_tags:
+            flag_guard = " AND " + " AND ".join(
+                "COALESCE(audit_flags, '') NOT LIKE ?" for _ in on_tags
+            )
+            params.extend(f'%"{tag}"%' for tag in on_tags)
+        lane_parts.append(f"NOT (({title_or}){flag_guard})")
+    return (
+        "\n  AND (decision_source IS NOT NULL OR ("
+        + " AND ".join(lane_parts)
+        + "))",
+        params,
+    )
+
+
+def _inject_before_order_by(sql: str, clause: str) -> str:
+    if not clause:
+        return sql
+    return sql.replace("ORDER BY score DESC", clause + "\nORDER BY score DESC")
 
 
 def backfill_applied_set(sqlite_conn: sqlite3.Connection, pg_conn: Any) -> int:
@@ -120,6 +173,8 @@ def push_apply_eligible(
     score_floor: int = 7,
     approved_batch: str | None = None,
     limit: int | None = None,
+    include_research: bool = False,
+    lane_filter: bool = True,
 ) -> int:
     """Push approved offsite-eligible jobs from the brain into ``apply_queue`` (idempotent).
 
@@ -134,16 +189,30 @@ def push_apply_eligible(
         out: list[dict[str, Any]] = []
         # Build the eligibility SQL; append the ledger cross-check when the home brain
         # has an applications table (the check is a no-op on minimal test fixtures).
-        base_sql = _PUSH_APPLY_SELECT
+        company_blocklist, company_params = _company_blocklist_sql()
+        score_expr = (
+            "COALESCE(audit_score, fit_score, research_fit_score)"
+            if include_research
+            else "COALESCE(audit_score, fit_score)"
+        )
+        base_sql = _PUSH_APPLY_SELECT.format(
+            score_expr=score_expr,
+            company_blocklist=company_blocklist,
+            thin_description_chars=THIN_DESCRIPTION_CHARS,
+        )
         if _applications_table_exists(sq):
             # Inject the cross-check before the ORDER BY clause.
-            base_sql = base_sql.replace(
-                "ORDER BY score DESC",
-                _PUSH_APPLY_LEDGER_CROSS_CHECK + "ORDER BY score DESC",
+            base_sql = _inject_before_order_by(
+                base_sql,
+                _PUSH_APPLY_LEDGER_CROSS_CHECK.rstrip("\n"),
             )
+        lane_params: list[str] = []
+        if lane_filter:
+            lane_sql, lane_params = _lane_filter_sql()
+            base_sql = _inject_before_order_by(base_sql, lane_sql)
         # Push the limit into SQL so we fetch only the top-N (not the whole eligible
         # set on a 70k+ job brain); keep the Python break as belt-and-suspenders.
-        sql, params = base_sql, [score_floor]
+        sql, params = base_sql, [score_floor] + company_params + lane_params
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -292,11 +361,13 @@ FROM jobs
 WHERE duplicate_of_url IS NULL
   AND COALESCE(audit_score, fit_score) >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
   AND TRIM(COALESCE(company, '')) != ''
   AND TRIM(COALESCE(title, '')) != ''
   AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+  {company_blocklist}
   {recency}
 ORDER BY score DESC
 """
@@ -310,6 +381,7 @@ def push_linkedin_eligible(
     max_age_days: int | None = None,
     approved_batch=None,
     limit=None,
+    lane_filter: bool = True,
 ) -> int:
     """Push LinkedIn-eligible jobs from the brain into ``linkedin_queue`` (idempotent).
 
@@ -328,11 +400,24 @@ def push_linkedin_eligible(
     try:
         out = []
         params = [score_floor]
+        recency_params: list[str] = []
         recency = ""
         if max_age_days and int(max_age_days) > 0:
             recency = "AND discovered_at IS NOT NULL AND julianday(discovered_at) >= julianday('now', ?)"
-            params.append(f"-{int(max_age_days)} days")
-        sql = _PUSH_LINKEDIN_SELECT.format(recency=recency)
+            recency_params.append(f"-{int(max_age_days)} days")
+        company_blocklist, company_params = _company_blocklist_sql()
+        sql = _PUSH_LINKEDIN_SELECT.format(
+            company_blocklist=company_blocklist,
+            recency=recency,
+            thin_description_chars=THIN_DESCRIPTION_CHARS,
+        )
+        lane_params: list[str] = []
+        if lane_filter:
+            lane_sql, lane_params = _lane_filter_sql()
+            sql = _inject_before_order_by(sql, lane_sql)
+        params.extend(company_params)
+        params.extend(recency_params)
+        params.extend(lane_params)
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -398,6 +483,18 @@ WHERE duplicate_of_url IS NULL
 ORDER BY score DESC
 """
 
+_PUSH_COMPUTE_UNSCORED = """
+SELECT url, company, title, application_url, full_description,
+       CAST(NULL AS REAL) AS score
+FROM jobs
+WHERE duplicate_of_url IS NULL
+  AND audit_score IS NULL
+  AND fit_score IS NULL
+  AND research_fit_score IS NULL
+  AND TRIM(COALESCE(full_description, '')) != ''
+ORDER BY discovered_at DESC
+"""
+
 
 def push_compute_eligible(
     *,
@@ -406,6 +503,7 @@ def push_compute_eligible(
     task: str,
     score_floor: int = 0,
     limit: int | None = None,
+    unscored_only: bool = False,
 ) -> int:
     """Push brain jobs needing a compute ``task`` (score|audit|tailor|enrich) into
     ``compute_queue`` (S8). Each row carries the minimal ``payload`` the task needs
@@ -416,7 +514,7 @@ def push_compute_eligible(
     pg = pg_conn or pgqueue.connect()
     try:
         out: list[dict[str, Any]] = []
-        sql, params = _PUSH_COMPUTE_SELECT, [score_floor]
+        sql, params = (_PUSH_COMPUTE_UNSCORED, []) if unscored_only else (_PUSH_COMPUTE_SELECT, [score_floor])
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -458,6 +556,14 @@ WHERE status IN ('done', 'failed')
   AND synced_to_home_at IS NULL
 ORDER BY updated_at
 LIMIT %(limit)s
+"""
+
+_REOPEN_COMPUTE_RESULTS = """
+UPDATE compute_queue
+SET synced_to_home_at = NULL,
+    updated_at = now()
+WHERE status = ANY(%(statuses)s)
+  AND synced_to_home_at IS NOT NULL
 """
 
 
@@ -514,6 +620,21 @@ def pull_compute_results(
     finally:
         if own_sq:
             sq.close()
+        if own_pg:
+            pg.close()
+
+
+def reopen_compute_results(*, pg_conn: Any | None = None, statuses: tuple[str, ...] = ("done", "failed")) -> int:
+    """Re-serve completed compute results for a later home pull without touching the brain."""
+    own_pg = pg_conn is None
+    pg = pg_conn or pgqueue.connect()
+    try:
+        with pg.cursor() as cur:
+            cur.execute(_REOPEN_COMPUTE_RESULTS, {"statuses": list(statuses)})
+            n = cur.rowcount
+        pg.commit()
+        return n
+    finally:
         if own_pg:
             pg.close()
 
@@ -631,5 +752,9 @@ def _home_conn() -> sqlite3.Connection:
     """Open an isolated connection to the authoritative home SQLite (not the app's shared
     singleton, so the sync never contends with a live run's connection)."""
     conn = sqlite3.connect(str(config.DB_PATH), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.row_factory = sqlite3.Row
+    database.ensure_columns(conn)
+    database.ensure_job_indexes(conn)
     return conn

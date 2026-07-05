@@ -96,6 +96,7 @@ def upsert_email_event(conn, row: dict, *, reextract: bool = False) -> str:
             f"UPDATE email_events SET {assignments} WHERE message_id = ?",
             [row.get(c) for c in _COLUMNS if c != "message_id"] + [row["message_id"]],
         )
+        _mark_position_filled_liveness(conn, row)
         conn.commit()
         return "updated"
 
@@ -104,8 +105,50 @@ def upsert_email_event(conn, row: dict, *, reextract: bool = False) -> str:
         f"INSERT INTO email_events ({', '.join(_COLUMNS)}) VALUES ({placeholders})",
         values,
     )
+    _mark_position_filled_liveness(conn, row)
     conn.commit()
     return "inserted"
+
+
+def _mark_position_filled_liveness(conn, row: dict) -> None:
+    if row.get("stage") != "position_filled":
+        return
+    if row.get("match_status") == "needs_review":
+        return
+    job_url = _resolve_position_filled_job_url(conn, row)
+    if job_url is None:
+        return
+    conn.execute(
+        "UPDATE jobs SET liveness_status='dead', liveness_reason='email_position_filled' "
+        "WHERE url = ?",
+        (job_url,),
+    )
+
+
+def _resolve_position_filled_job_url(conn, row: dict) -> str | None:
+    """Best-effort exact-match fallback for position-filled outcomes.
+
+    Some position-closed emails contain no reliable sender/domain hints; when the
+    LLM provides title+company, we can still map to a single applied job safely.
+    """
+    if row.get("job_url"):
+        return row["job_url"]
+
+    title = (row.get("title") or "").strip().lower()
+    company = (row.get("company") or "").strip().lower()
+    if not title or not company:
+        return None
+
+    rows = conn.execute(
+        "SELECT url FROM jobs "
+        "WHERE LOWER(COALESCE(title,'')) = ? "
+        "AND (LOWER(COALESCE(company,'')) = ? OR LOWER(COALESCE(site,'')) = ?) "
+        "AND apply_status='applied'",
+        (title, company, company),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    return rows[0][0]
 
 
 def _gmail_fetch(

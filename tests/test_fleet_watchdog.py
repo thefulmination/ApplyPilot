@@ -117,6 +117,22 @@ def test_watchdog_restarts_stuck_worker(fleet_db):
             assert cur.fetchone()["command"] == "restart"
 
 
+def test_watchdog_dedupes_open_restart_for_stuck_worker(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_stuck_worker(conn, "wStuck")
+        watchdog.watchdog_tick(conn, cfg)
+        summary = watchdog.watchdog_tick(conn, cfg)
+        entries = [e for e in summary["stuck_handled"] if e["worker_id"] == "wStuck"]
+        assert entries and entries[0]["action"] == ["restart_pending"]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM remote_commands "
+                "WHERE worker_id='wStuck' AND command='restart' AND acked_at IS NULL"
+            )
+            assert cur.fetchone()["n"] == 1
+
+
 def test_watchdog_never_restarts_itself(fleet_db):
     cfg = watchdog.WatchdogConfig()
     with pgqueue.connect(fleet_db) as conn:

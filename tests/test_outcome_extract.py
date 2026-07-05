@@ -56,3 +56,24 @@ def test_extract_falls_back_on_unparseable_reply():
     r = extract_outcome("Thanks for applying", "We received your application.", client=Junk())
     assert r.stage == "acknowledged"
     assert r.extracted_by == "heuristic_fallback"
+
+
+def test_extract_handles_position_filled_stage():
+    reply = (
+        '{"stage":"position_filled","outcome":"position_filled","reason":"role already filled",'
+        '"title":"Quant Analyst","company":"Acme","confidence":"high"}'
+    )
+    r = extract_outcome("Update", "The position has been closed.", client=FakeClient(reply))
+    assert r.stage == "position_filled"
+    assert r.outcome == "position_filled"
+    assert r.extracted_by != "heuristic_fallback"
+
+
+def test_extract_heuristic_maps_position_filled():
+    r = extract_outcome(
+        "Update on your application",
+        "Hi, thank you for applying. This position has been closed.",
+        client=FakeClient("not-json"),
+    )
+    assert r.stage == "position_filled"
+    assert r.outcome == "position_filled"

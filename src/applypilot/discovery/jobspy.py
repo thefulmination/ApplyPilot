@@ -41,6 +41,15 @@ def _jobspy_worker_count(search_cfg: dict, requested_workers: int | None = None)
     return max(1, min(8, _cfg_int_value(workers, 1)))
 
 
+def _normalize_date_posted(raw) -> str | None:
+    if raw is None:
+        return None
+    v = str(raw).strip()
+    if not v or v.lower() in {"nan", "nat", "na", "none"}:
+        return None
+    return v
+
+
 # -- Proxy parsing -----------------------------------------------------------
 
 def parse_proxy(proxy_str: str) -> dict:
@@ -200,6 +209,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        posted_at = _normalize_date_posted(row.get("date_posted"))
 
         status = insert_discovered_job(
             conn,
@@ -213,6 +223,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
                 "full_description": full_description,
                 "application_url": apply_url,
                 "detail_scraped_at": detail_scraped_at,
+                "posted_at": posted_at,
             },
             site=site_label,
             strategy=strategy,

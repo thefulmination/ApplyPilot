@@ -35,6 +35,47 @@ def test_lease_requires_approval(fleet_db):
         assert leased and leased["url"] == "u1"
 
 
+def test_lease_apply_skips_company_blocklist_match(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "openai-direct", host="greenhouse.io", score=10,
+                    company="OpenAI", title="Strategy")
+        _seed_apply(conn, "openai-url", host="ashbyhq.com", score=9,
+                    company="HiringCafe", title="Ops")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET application_url='https://jobs.ashbyhq.com/openai/1' "
+                "WHERE url='openai-url'"
+            )
+        conn.commit()
+        _seed_apply(conn, "acme-ok", host="lever.co", score=8,
+                    company="Acme", title="Chief of Staff")
+
+        leased = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+
+        assert leased is not None
+        assert leased["url"] == "acme-ok"
+
+
+def test_lease_linkedin_skips_company_blocklist_match(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-openai', 'OpenAI', 'Role', 'https://linkedin.com/jobs/openai', 10, 'linkedin', 'b1')"
+            )
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-acme', 'Acme', 'Role', 'https://linkedin.com/jobs/acme', 9, 'linkedin', 'b1')"
+            )
+        conn.commit()
+
+        leased = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1")
+
+        assert leased is not None
+        assert leased["url"] == "li-acme"
+
+
 # ---- cross-board dedup (R9) ----------------------------------------------------
 
 def test_lease_dedup_guard_blocks_reapply(fleet_db):
@@ -104,6 +145,37 @@ def test_breaker_pauses_high_challenge_host(fleet_db):
         # a job on that host is not leasable while paused
         _seed_apply(conn, "p1", host="walls.io")
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
+
+
+def test_lease_ignores_expired_pause_but_keeps_demotion_sticky(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        sk = governor.host_scope("cooldown.io")
+        governor.ensure_scope(conn, sk, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rate_governor SET breaker_state='paused', "
+                "breaker_until=now() - interval '1 minute' WHERE scope_key=%s",
+                (sk,),
+            )
+        conn.commit()
+        _seed_apply(conn, "expired-pause", host="cooldown.io")
+
+        leased = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+        assert leased is not None
+        assert leased["url"] == "expired-pause"
+
+        sk = governor.host_scope("demoted.io")
+        governor.ensure_scope(conn, sk, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rate_governor SET breaker_state='demoted', "
+                "breaker_until=now() - interval '1 minute' WHERE scope_key=%s",
+                (sk,),
+            )
+        conn.commit()
+        _seed_apply(conn, "expired-demotion", host="demoted.io")
+
+        assert queue.lease_apply(conn, "w2", home_ip="1.1.1.1") is None
 
 
 def test_breaker_pauses_at_exact_threshold_boundary(fleet_db):

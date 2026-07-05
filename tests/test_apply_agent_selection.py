@@ -166,6 +166,7 @@ def test_worker_loop_passes_selected_agent_to_run_job(monkeypatch) -> None:
     monkeypatch.setattr(launcher, "mark_result", lambda *a, **k: None)
     monkeypatch.setattr(launcher, "_throttle_before_apply", lambda *a, **k: None)
     monkeypatch.setattr(launcher, "_throttle_after_apply", lambda *a, **k: None)
+    monkeypatch.setenv("APPLYPILOT_PREFLIGHT_LIVENESS", "0")
 
     def fake_run_job(*args, **kwargs):
         captured.update(kwargs)

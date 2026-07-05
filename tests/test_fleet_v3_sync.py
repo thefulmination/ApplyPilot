@@ -31,7 +31,9 @@ CREATE TABLE jobs (
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
     applied_at TEXT, agent_id TEXT, verification_confidence TEXT,
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0,
-    research_fit_score REAL, research_decision TEXT
+    research_fit_score REAL, research_decision TEXT,
+    discovered_at TEXT, decision_source TEXT, fit_gap_category TEXT,
+    recommended_action TEXT, audit_flags TEXT
 );
 """
 
@@ -44,7 +46,8 @@ def _home_sqlite(tmp_path):
 
 
 def _add_job(conn, url, **kw):
-    cols = {"url": url, "application_url": url, "audit_score": 8.0, "liveness_status": "live"}
+    cols = {"url": url, "application_url": url, "audit_score": 8.0,
+            "liveness_status": "live", "full_description": "x" * 600}
     cols.update(kw)
     conn.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                  list(cols.values()))
@@ -66,6 +69,8 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
              company="X", title="Analyst", apply_status="in_progress")        # in-flight -> skip
     _add_job(sq, "https://boards.greenhouse.io/y/jobs/4",
              company="Y", title="PM", audit_score=5.0)                        # below floor -> skip
+    _add_job(sq, "https://boards.greenhouse.io/thin/jobs/7",
+             company="Thin", title="PM", full_description="x" * 499)           # too thin -> skip
     _add_job(sq, "https://boards.greenhouse.io/z/jobs/5",
              company="Z", title="Eng", audit_score=9.0,
              liveness_status="dead")                                          # dead -> skip
@@ -94,6 +99,144 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"]
     from applypilot.fleet import dedup
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
+
+
+def test_push_apply_eligible_can_opt_into_research_scores(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/research/jobs/1",
+             company="Research Co", title="Strategy Lead",
+             audit_score=None, fit_score=None, research_fit_score=8.0)
+
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A"
+        ) == 0
+        assert sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A",
+            include_research=True,
+        ) == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url, score FROM apply_queue")
+            rows = cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["url"].endswith("/research/jobs/1")
+    assert float(rows[0]["score"]) == 8.0
+
+
+def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
+             company="Acme Inc", title="Chief of Staff")                       # eligible
+    _add_job(sq, "https://boards.greenhouse.io/openai/jobs/2",
+             company="OpenAI", title="Strategy")                               # blocked by company
+    _add_job(sq, "https://hiring.cafe/viewjob/openai-3",
+             company="HiringCafe", title="Ops",
+             application_url="https://jobs.ashbyhq.com/openai/3")              # blocked by app url
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_apply_eligible_filters_off_lane_by_default(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
+             company="Acme Inc", title="Chief of Staff")
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/2",
+             company="Sales Co", title="Enterprise Account Executive")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_apply_eligible_keeps_human_decision_off_lane_rows(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/1",
+             company="Sales Co", title="Enterprise Account Executive",
+             decision_source="human_review")
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/2",
+             company="Sales Co", title="Enterprise Account Executive",
+             decision_source="human_review", fit_gap_category="wrong_role_lane",
+             recommended_action="ignore")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 2
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {
+        "https://boards.greenhouse.io/sales/jobs/1",
+        "https://boards.greenhouse.io/sales/jobs/2",
+    }
+
+
+def test_push_apply_eligible_keeps_audit_flag_positive_override(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
+             company="Acme Inc", title="Enterprise Account Executive to CRO",
+             audit_flags='["chief_of_staff"]')
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+
+
+def test_push_apply_eligible_can_disable_lane_filter(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/sales/jobs/1",
+             company="Sales Co", title="Enterprise Account Executive")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
+                                     score_floor=7, approved_batch="batch-A",
+                                     limit=None, lane_filter=False)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://boards.greenhouse.io/sales/jobs/1"}
+
+
+def test_push_linkedin_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://www.linkedin.com/jobs/view/acme",
+             company="Acme", title="Chief of Staff", audit_score=9.0)
+    _add_job(sq, "https://www.linkedin.com/jobs/view/openai",
+             company="OpenAI", title="Strategy", audit_score=10.0)
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg,
+                                        score_floor=7, approved_batch="batch-L", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM linkedin_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+
+    assert urls == {"https://www.linkedin.com/jobs/view/acme"}
 
 
 def test_push_apply_eligible_excludes_crash_unconfirmed(fleet_db, tmp_path):
@@ -224,6 +367,70 @@ def test_push_compute_eligible_enqueues_with_payload(fleet_db, tmp_path):
     assert rows[0]["payload"]["company"] == "Co"
 
 
+def test_push_compute_eligible_default_floor_excludes_null_score_rows(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://co/jobs/scored", company="Co", title="Analyst", audit_score=8.0)
+    _add_job(sq, "https://co/jobs/unscored", company="Co", title="PM",
+             audit_score=None, fit_score=None, full_description="real JD")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score", score_floor=7)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM compute_queue ORDER BY url")
+            rows = cur.fetchall()
+
+    assert [r["url"] for r in rows] == ["https://co/jobs/scored"]
+
+
+def test_push_compute_eligible_unscored_only_selects_described_nondup_research_unscored(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://co/jobs/fresh", company="Co", title="Fresh",
+             audit_score=None, fit_score=None, full_description="fresh JD",
+             discovered_at="2026-07-04T09:00:00")
+    _add_job(sq, "https://co/jobs/older", company="Co", title="Older",
+             audit_score=None, fit_score=None, full_description="older JD",
+             discovered_at="2026-07-03T09:00:00")
+    _add_job(sq, "https://co/jobs/scored", company="Co", title="Scored",
+             audit_score=8.0, fit_score=None, full_description="scored JD")
+    _add_job(sq, "https://co/jobs/research", company="Co", title="Research",
+             audit_score=None, fit_score=None, research_fit_score=8.5,
+             full_description="already research scored")
+    _add_job(sq, "https://co/jobs/blank", company="Co", title="Blank",
+             audit_score=None, fit_score=None, full_description=" ")
+    _add_job(sq, "https://co/jobs/dup", company="Co", title="Dup",
+             audit_score=None, fit_score=None, full_description="dup JD",
+             duplicate_of_url="https://co/jobs/fresh")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score", unscored_only=True)
+        assert n == 2
+        with pg.cursor() as cur:
+            cur.execute("SELECT url, payload FROM compute_queue ORDER BY url")
+            rows = cur.fetchall()
+
+    assert [r["url"] for r in rows] == ["https://co/jobs/fresh", "https://co/jobs/older"]
+    assert {r["payload"]["full_description"] for r in rows} == {"fresh JD", "older JD"}
+
+
+def test_push_compute_eligible_unscored_only_respects_limit(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://co/jobs/first", company="Co", title="First",
+             audit_score=None, fit_score=None, full_description="first JD",
+             discovered_at="2026-07-04T10:00:00")
+    _add_job(sq, "https://co/jobs/second", company="Co", title="Second",
+             audit_score=None, fit_score=None, full_description="second JD",
+             discovered_at="2026-07-03T10:00:00")
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score",
+                                       unscored_only=True, limit=1)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM compute_queue")
+            rows = cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://co/jobs/first"
+
+
 def test_pull_compute_results_is_advisory_only_and_idempotent(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     url = "https://co/jobs/1"
@@ -249,6 +456,38 @@ def test_pull_compute_results_is_advisory_only_and_idempotent(fleet_db, tmp_path
 
         # re-pull is a no-op
         assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 0
+
+
+def test_reopen_compute_results_recovers_stranded_advisory_scores(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    url = "https://co/jobs/restore"
+    _add_job(sq, url, company="Co", title="Analyst", audit_score=8.0, fit_score=6)
+    with pgqueue.connect(fleet_db) as pg:
+        sync.push_compute_eligible(sqlite_conn=sq, pg_conn=pg, task="score")
+        job = fleet_queue.lease_compute(pg, "c1")
+        assert job is not None and job["url"] == url
+        fleet_queue.write_compute_result(
+            pg, "c1", url,
+            result={"research_fit_score": 9.5, "research_decision": "strong_qualified"},
+            status="done", cost_usd=0.01, model="deepseek-chat", task="score")
+
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 1
+        sq.execute(
+            "UPDATE jobs SET research_fit_score=NULL, research_decision=NULL WHERE url=?",
+            (url,),
+        )
+        sq.commit()
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 0
+
+        assert sync.reopen_compute_results(pg_conn=pg) == 1
+        assert sync.reopen_compute_results(pg_conn=pg) == 0
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg) == 1
+        row = sq.execute("SELECT research_fit_score, research_decision, fit_score, audit_score "
+                         "FROM jobs WHERE url=?", (url,)).fetchone()
+        assert row["research_fit_score"] == 9.5
+        assert row["research_decision"] == "strong_qualified"
+        assert row["fit_score"] == 6
+        assert row["audit_score"] == 8.0
 
 
 # ---------------------------------------------------------------------------

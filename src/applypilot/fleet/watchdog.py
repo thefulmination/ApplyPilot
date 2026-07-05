@@ -189,7 +189,19 @@ def _handle_stuck(conn, cfg: WatchdogConfig) -> list[dict]:
         if wid == WATCHDOG_ID:
             continue
         actions = ["restart"]
-        heartbeat.issue_command(conn, wid, "restart")
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM remote_commands "
+                "WHERE worker_id=%s AND command='restart' AND acked_at IS NULL "
+                "LIMIT 1",
+                (wid,),
+            )
+            restart_pending = cur.fetchone() is not None
+        conn.rollback()
+        if restart_pending:
+            actions = ["restart_pending"]
+        else:
+            heartbeat.issue_command(conn, wid, "restart")
         if s["reason"] == "job_over_max":
             # the worker's current job has been running too long -> quarantine it so a
             # restart doesn't immediately re-lease the same poison job.

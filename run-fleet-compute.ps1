@@ -69,7 +69,7 @@ if (-not $env:DEEPSEEK_API_KEY) {
 
 function Start-OneWorker([string]$wid) {
   Write-Host "[fleet-compute] worker $wid  providers=$Providers  (IP-free score/audit, cost-cap gated)"
-  & $exe --dsn $env:FLEET_PG_DSN --worker-id "$wid" --home-ip "0.0.0.0" --machine-owner $Label
+  & $exe --worker-id "$wid" --home-ip "0.0.0.0" --machine-owner $Label
 }
 
 # --- child invocation: run ONE worker with a distinct id in the foreground ---
@@ -102,10 +102,15 @@ if ($existing) {
 }
 
 $self = $MyInvocation.MyCommand.Path
+$logDir = Join-Path $ProjectRoot ".fleet-logs"
+New-Item -ItemType Directory -Force $logDir | Out-Null
 for ($i = 0; $i -lt $Workers; $i++) {
-  $argList = @("-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$self`"",
+  $outLog = Join-Path $logDir ("compute-{0}-score-{1}.out.log" -f $Label, $i)
+  $errLog = Join-Path $logDir ("compute-{0}-score-{1}.err.log" -f $Label, $i)
+  $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$self`"",
                "-Index", $i, "-Label", $Label, "-Providers", $Providers)
-  Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $ProjectRoot
+  Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $ProjectRoot `
+    -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
   Write-Host ("  launched {0}-score-{1}" -f $Label, $i) -ForegroundColor Green
   Start-Sleep -Milliseconds 800
 }

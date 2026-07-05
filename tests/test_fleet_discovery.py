@@ -1,5 +1,6 @@
 # tests/test_fleet_discovery.py
 import os
+import math
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import queue, governor
@@ -49,6 +50,27 @@ def test_push_discovered_stages_rows(fleet_db):
         assert [r["posting"]["job_url"] for r in rows] == ["u1", "u2"]
         assert rows[0]["task_id"] == "t1" and rows[0]["source_label"] == "chief of staff"
         assert rows[0]["synced_to_home_at"] is None
+
+
+def test_push_discovered_sanitizes_non_finite_numbers(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        n = queue.push_discovered(
+            conn,
+            task_id="t1",
+            source_label="chief of staff",
+            worker_id="w1",
+            postings=[{
+                "job_url": "u1",
+                "job_type": float("nan"),
+                "salary": [math.inf, -math.inf, 100],
+            }],
+        )
+        assert n == 1
+        with conn.cursor() as cur:
+            cur.execute("SELECT posting FROM discovered_postings WHERE task_id='t1'")
+            posting = cur.fetchone()["posting"]
+        assert posting["job_type"] is None
+        assert posting["salary"] == [None, None, 100]
 
 
 def test_worker_discovery_scrape_error_reschedules(fleet_db):

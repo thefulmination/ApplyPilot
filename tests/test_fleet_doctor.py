@@ -498,6 +498,70 @@ def test_agent_and_auth_clusters_become_recommendations_not_auto(fleet_db):
             assert cur.fetchone()["n"] == 0
 
 
+def test_parsing_drift_breach_becomes_recommendation_only(tmp_path, fleet_db, monkeypatch):
+    from datetime import datetime, timezone
+
+    from applypilot import config, database
+
+    brain_db = tmp_path / "brain.db"
+    bconn = database.init_db(brain_db)
+    bconn.execute(
+        "INSERT INTO desc_quality_drift "
+        "(snapshot_at, board, window_days, total, null_rate, stub_rate, short_rate, html_rate, "
+        "junk_rate, board_summary_rate, title_echo_rate, no_req_marker_rate) "
+        "VALUES (?, 'hiringcafe', 7, 100, 0.03, 0.10, 0.10, 0.03, 0.00, 0.01, 0.02, 0.01)"
+    , (datetime(2026, 7, 4, tzinfo=timezone.utc).isoformat(),))
+    bconn.commit()
+    monkeypatch.setattr(config, "DB_PATH", brain_db)
+
+    with pgqueue.connect(fleet_db) as conn:
+        summary = doctor.run_doctor(conn, window_minutes=60)
+
+    assert summary["recommendations"] >= 3
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM fleet_diagnoses "
+                "WHERE status='recommended' AND cluster_key LIKE 'parsing_drift|hiringcafe|%'"
+            )
+            assert cur.fetchone()["n"] >= 3
+            cur.execute("SELECT count(*) AS n FROM fleet_knobs")
+            assert cur.fetchone()["n"] == 0
+
+
+def test_parsing_drift_doctor_alerts_only_null_short_html(tmp_path):
+    from datetime import datetime, timezone
+
+    from applypilot import database
+
+    brain_db = tmp_path / "brain.db"
+    bconn = database.init_db(brain_db)
+    bconn.execute(
+        "INSERT INTO desc_quality_drift "
+        "(snapshot_at, board, window_days, total, null_rate, stub_rate, short_rate, html_rate, "
+        "junk_rate, board_summary_rate, title_echo_rate, no_req_marker_rate) "
+        "VALUES (?, 'hiringcafe', 7, 100, 0.00, 0.99, 0.00, 0.00, 0.00, 0.99, 0.00, 0.00)",
+        (datetime(2026, 7, 4, tzinfo=timezone.utc).isoformat(),),
+    )
+    bconn.commit()
+
+    assert doctor.parsing_drift_actions(str(brain_db)) == []
+
+
+def test_parsing_drift_missing_brain_db_is_silent_no_recommendations(fleet_db, monkeypatch, tmp_path):
+    from applypilot import config
+
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "missing.db")
+    with pgqueue.connect(fleet_db) as conn:
+        summary = doctor.run_doctor(conn, window_minutes=60)
+
+    assert summary["recommendations"] == 0
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM fleet_diagnoses WHERE status='recommended'")
+            assert cur.fetchone()["n"] == 0
+
+
 def test_recommendations_are_idempotent(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply_failure(conn, url="a1", host="x.com", apply_error="no_result_line")

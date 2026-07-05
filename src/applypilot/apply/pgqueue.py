@@ -25,6 +25,8 @@ from typing import Any, Iterable, Sequence
 import psycopg
 from psycopg.rows import dict_row
 
+from applypilot import config
+
 _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding="utf-8")
 
 
@@ -70,6 +72,11 @@ next_job AS (
     LEFT JOIN host_recent hr ON hr.apply_domain = q.apply_domain
     WHERE q.status = 'queued'
       AND q.approved_batch IS NOT NULL
+      AND NOT (
+          LOWER(TRIM(COALESCE(q.company,''))) = ANY(%(blocked_names)s)
+          OR q.url ILIKE ANY(%(blocked_pats)s)
+          OR COALESCE(q.application_url,'') ILIKE ANY(%(blocked_pats)s)
+      )
       AND (hr.last_at IS NULL
            OR hr.last_at < now() - make_interval(
                   secs => (%(politeness)s * (0.7 + random() * 0.7))::int))
@@ -105,10 +112,14 @@ def lease_one(
     row dict, or None if nothing is leasable.
 
     politeness_seconds=0 disables host throttling (used by tests for determinism)."""
+    blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         cur.execute(
             _LEASE_SQL,
-            {"worker": worker_id, "ttl": ttl_seconds, "politeness": politeness_seconds},
+            {
+                "worker": worker_id, "ttl": ttl_seconds, "politeness": politeness_seconds,
+                "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
+            },
         )
         row = cur.fetchone()
     conn.commit()

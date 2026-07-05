@@ -107,6 +107,11 @@ _OFFER_WEAK = [
     "excited to have you join", "offer letter is attached", "attached is your offer",
 ]
 
+_POSITION_FILLED = [
+    "position has been filled", "role has been filled", "role has been filled",
+    "position has been closed", "this position has been closed",
+]
+
 # --- Interview signals --------------------------------------------------------
 # STRONG SUBJECT = an explicit NEW interview/assessment invite -> short-circuits to
 # interview. Thread-title phrases ("your interview", "interview with") are NOT here: they
@@ -252,7 +257,7 @@ class EmailOutcome:
     date: str
     sender: str
     subject: str
-    outcome: str           # offer|interview|rejected|acknowledged|ambiguous
+    outcome: str           # offer|interview|rejected|position_filled|acknowledged|ambiguous
     confidence: str        # "high" | "medium" | "low"
     signals_found: list[str] = field(default_factory=list)
     matched_job_url: str | None = None
@@ -286,6 +291,7 @@ def _has_job_outcome_signal(subj: str, text: str) -> bool:
     return (
         any(p in text for p in _OFFER_STRONG)
         or any(p in subj for p in _OFFER_SUBJECT)
+        or any(p in text for p in _POSITION_FILLED)
         or any(p in text for p in _REJECTION_STRONG)
         or any(p in text for p in _REJECTION_DECISION)
         or any(p in subj for p in _INTERVIEW_SUBJECT_STRONG)
@@ -346,6 +352,7 @@ def classify_email_outcome(
     # OFFER -- a strong job-specific phrase OR an offer subject = weight 2; weak = 1 each.
     offer_w = (2 if hits(_OFFER_STRONG) else 0) + 2 * len(hits(_OFFER_SUBJECT, in_subj=True))
     offer_w += len(hits(_OFFER_WEAK))
+    filled = bool(hits(_POSITION_FILLED))
     # INTERVIEW -- explicit invite subject; concrete (strong) body CTA vs generic (weak).
     interview_subj = bool(hits(_INTERVIEW_SUBJECT_STRONG, in_subj=True))
     iv_strong = bool(hits(_INTERVIEW_STRONG))
@@ -366,6 +373,8 @@ def classify_email_outcome(
     # strong interview CTA) override a receipt; generic scheduling / "unfortunately" yield.
     if offer_w >= 2:
         return "offer", _confidence(offer_w), signals
+    if filled:
+        return "position_filled", "high", signals
     if reject_strong:
         return "rejected", "high", signals
     if interview_subj:

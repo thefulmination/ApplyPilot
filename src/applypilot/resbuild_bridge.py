@@ -27,8 +27,8 @@ the fleet is run, so staging is safe.
 from __future__ import annotations
 
 import json
-import os
 import tempfile
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -37,6 +37,7 @@ from urllib.parse import urlsplit
 from applypilot import config
 from applypilot import import_decisions as _imp
 from applypilot.database import get_connection, init_db
+from applypilot.apply import pgqueue
 
 DEFAULT_EXCLUDE_HOSTS = ("linkedin.com",)
 DEFAULT_SOURCE = "res_build"
@@ -92,7 +93,10 @@ def _existing(conn, urls: list[str]) -> dict:
     """url -> brain row (the columns we filter and snapshot on), chunked for SQLite's
     variable limit."""
     out: dict = {}
-    cols = ("url, applied_at, duplicate_of_url, fit_score, " + ", ".join(_SNAPSHOT_COLS))
+    cols = (
+        "url, applied_at, duplicate_of_url, fit_score, apply_status, apply_error, "
+        + ", ".join(_SNAPSHOT_COLS)
+    )
     CHUNK = 400
     for i in range(0, len(urls), CHUNK):
         chunk = urls[i:i + CHUNK]
@@ -107,17 +111,66 @@ def _eff(row) -> float | None:
     return row["audit_score"] if row["audit_score"] is not None else row["fit_score"]
 
 
-def _filter(conn, recs, *, exclude_hosts, only_applyable, limit):
+def _fleet_cross_checked_urls(pg_conn, urls: list[str]) -> set[str]:
+    if not urls:
+        return set()
+
+    urls = sorted(set(urls))
+    out: set[str] = set()
+    chunk = 300
+    with pg_conn.cursor() as cur:
+        for i in range(0, len(urls), chunk):
+            batch = urls[i:i + chunk]
+            cur.execute(
+                """
+                SELECT url
+                FROM apply_queue
+                WHERE status IN ('leased', 'applied', 'crash_unconfirmed')
+                  AND url = ANY(%s)
+                """,
+                (batch,),
+            )
+            out.update(r["url"] for r in cur.fetchall())
+            cur.execute(
+                """
+                SELECT url
+                FROM linkedin_queue
+                WHERE status IN ('leased', 'applied', 'crash_unconfirmed')
+                  AND url = ANY(%s)
+                """,
+                (batch,),
+            )
+            out.update(r["url"] for r in cur.fetchall())
+    return out
+
+
+def _filter(conn, recs, *, exclude_hosts, only_applyable, limit, fleet_applied_urls: set[str] | None = None):
     kept = [(u, r) for (u, r) in recs if not _excluded(u, exclude_hosts)]
+    excluded_fleet_applied = 0
     if only_applyable and kept:
         rows = _existing(conn, [u for (u, _) in kept])
-        applyable = {u for u, row in rows.items()
-                     if row["applied_at"] is None and row["duplicate_of_url"] is None}
-        kept = [(u, r) for (u, r) in kept if u in applyable]
+        applyable_urls: set[str] = set()
+        excluded = fleet_applied_urls or set()
+        for u, row in rows.items():
+            if row["applied_at"] is not None:
+                continue
+            if row["duplicate_of_url"] is not None:
+                continue
+            status = (row["apply_status"] or "").strip().lower()
+            if status in {"applied", "in_progress", "crash_unconfirmed"}:
+                continue
+            error = (row["apply_error"] or "").strip().lower()
+            if error in {"no_confirmation", "crash_unconfirmed"}:
+                continue
+            if u in excluded:
+                excluded_fleet_applied += 1
+                continue
+            applyable_urls.add(u)
+        kept = [(u, r) for (u, r) in kept if u in applyable_urls]
     kept.sort(key=lambda ur: _score_of(ur[1]), reverse=True)   # the user's own score, best first
     if limit is not None:
         kept = kept[:limit]
-    return kept
+    return kept, excluded_fleet_applied
 
 
 def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
@@ -134,8 +187,30 @@ def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
     conn = get_connection()
     path = Path(path)
     recs = _approved_url_records(path)
-    kept = _filter(conn, recs, exclude_hosts=exclude_hosts,
-                   only_applyable=only_applyable, limit=limit)
+    fleet_cross_check = "skipped_no_dsn"
+    fleet_applied_urls: set[str] = set()
+    if os.environ.get("FLEET_PG_DSN"):
+        try:
+            pg_conn = pgqueue.connect()
+            try:
+                kept_urls_hint = [u for (u, _r) in recs if not _excluded(u, exclude_hosts)]
+                existing_hint = _existing(conn, kept_urls_hint)
+                if existing_hint:
+                    fleet_applied_urls = _fleet_cross_checked_urls(pg_conn, list(existing_hint))
+            finally:
+                pg_conn.close()
+            fleet_cross_check = "ok"
+        except Exception:
+            raise
+
+    kept, excluded_fleet_applied = _filter(
+        conn,
+        recs,
+        exclude_hosts=exclude_hosts,
+        only_applyable=only_applyable,
+        limit=limit,
+        fleet_applied_urls=fleet_applied_urls,
+    )
     kept_urls = [u for (u, _) in kept]
     threshold = config.get_min_score()
 
@@ -152,6 +227,8 @@ def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
         "excluded_hosts": list(exclude_hosts),
         "apply_threshold": threshold,
         "would_raise": would_raise,
+        "excluded_fleet_applied": excluded_fleet_applied,
+        "fleet_cross_check": fleet_cross_check,
         "dry_run": dry_run,
     }
     if dry_run:

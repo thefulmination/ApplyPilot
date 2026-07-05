@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from pathlib import Path
 
 
@@ -17,12 +18,14 @@ def _setup(monkeypatch, tmp_path: Path):
 
 def _insert_job(conn, url, *, title="Engineer", site="Co", fit_score=5,
                 audit_score=None, audit_label=None, full_description="desc",
-                applied_at=None, duplicate_of_url=None):
+                applied_at=None, duplicate_of_url=None, apply_status=None,
+                apply_error=None):
     conn.execute(
         "INSERT INTO jobs (url, title, site, full_description, fit_score, audit_score, "
-        "audit_label, applied_at, duplicate_of_url) VALUES (?,?,?,?,?,?,?,?,?)",
+        "audit_label, applied_at, duplicate_of_url, apply_status, apply_error) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (url, title, site, full_description, fit_score, audit_score, audit_label,
-         applied_at, duplicate_of_url),
+         applied_at, duplicate_of_url, apply_status, apply_error),
     )
     conn.commit()
 
@@ -217,3 +220,104 @@ def test_revert_skips_rows_no_longer_ours(monkeypatch, tmp_path):
     conn.commit()
     assert mod.revert(snap) == 0   # not ours anymore -> leave it alone
     assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 6
+
+
+class _FakePgCursor:
+    def __init__(self, apply_queue_urls=(), linkedin_queue_urls=()):
+        self.apply_queue_urls = list(apply_queue_urls)
+        self.linkedin_queue_urls = list(linkedin_queue_urls)
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def execute(self, sql, params=()):
+        if "apply_queue" in sql:
+            self._rows = [{"url": u} for u in self.apply_queue_urls]
+        elif "linkedin_queue" in sql:
+            self._rows = [{"url": u} for u in self.linkedin_queue_urls]
+        else:
+            self._rows = []
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        return None
+
+
+class _FakePgConn:
+    def __init__(self, apply_queue_urls=(), linkedin_queue_urls=()):
+        self._cursor = _FakePgCursor(apply_queue_urls, linkedin_queue_urls)
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        return None
+
+
+def test_promote_excludes_fleet_applied_rows_and_counts(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    _insert_job(conn, "https://x.io/normal", fit_score=5)
+    _insert_job(conn, "https://x.io/fleet", fit_score=5)
+    path = _write(
+        tmp_path,
+        [
+            {"url": "https://x.io/normal", "verdict": "approve", "decision_score": 9},
+            {"url": "https://x.io/fleet", "verdict": "approve", "decision_score": 9},
+        ],
+    )
+
+    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://unit-test")
+    monkeypatch.setattr(
+        "applypilot.resbuild_bridge.pgqueue.connect",
+        lambda: _FakePgConn(apply_queue_urls=["https://x.io/fleet"]),
+    )
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+
+    assert r["fleet_cross_check"] == "ok"
+    assert r["excluded_fleet_applied"] == 1
+    assert r["promoted"] == 1
+    assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", ("https://x.io/normal",)).fetchone()["decision_source"] == "res_build"
+    assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", ("https://x.io/fleet",)).fetchone()["decision_source"] is None
+
+
+@pytest.mark.parametrize("field,value", [("apply_status", "applied"), ("apply_status", "in_progress"),
+                                        ("apply_status", "crash_unconfirmed"),
+                                        ("apply_error", "no_confirmation"),
+                                        ("apply_error", "crash_unconfirmed")])
+def test_promote_excludes_submit_markers(monkeypatch, tmp_path, field, value):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    url = f"https://x.io/{field}-{value}"
+    _insert_job(conn, url, fit_score=5, **{field: value})
+    path = _write(tmp_path, [{"url": url, "verdict": "approve", "decision_score": 9}])
+
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["promoted"] == 0
+    assert r["fleet_cross_check"] == "skipped_no_dsn"
+    assert r["excluded_fleet_applied"] == 0
+    assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", (url,)).fetchone()["decision_source"] is None
+
+
+def test_promote_without_dsn_skips_fleet_cross_check(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    _insert_job(conn, "https://x.io/normal", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/normal", "verdict": "approve", "decision_score": 9}])
+    monkeypatch.setattr(
+        "applypilot.resbuild_bridge.pgqueue.connect",
+        lambda: (_ for _ in ()).throw(RuntimeError("should not be called")),
+    )
+
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    assert r["fleet_cross_check"] == "skipped_no_dsn"
+    assert r["excluded_fleet_applied"] == 0
+    assert r["promoted"] == 1
+    assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", ("https://x.io/normal",)).fetchone()["decision_source"] == "res_build"

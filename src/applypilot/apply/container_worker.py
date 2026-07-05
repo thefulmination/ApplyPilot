@@ -46,7 +46,8 @@ def _setup_env() -> None:
     os.environ.setdefault("CLAUDE_PATH", "/usr/local/bin/claude")
     os.environ["PYTHONUTF8"] = "1"
     os.environ["APPLYPILOT_PREFLIGHT_LIVENESS"] = "1"   # ON: cheap read-only GET skips DEAD postings before launching the agent (jobs expire after queueing)
-    os.environ["APPLYPILOT_LANE_FILTER"] = "0"                           # offsite-only already
+    # Fleet row selection is lane-filtered at push time; keep worker-side acquire opt-in.
+    os.environ.setdefault("APPLYPILOT_LANE_FILTER", "0")
     os.environ.setdefault("APPLYPILOT_AGENT_TIMEOUT", "300")             # kill runaways (~5 min)
 
 

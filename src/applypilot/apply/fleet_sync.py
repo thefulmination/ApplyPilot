@@ -19,9 +19,11 @@ from typing import Any
 from applypilot import config
 from applypilot.apply import pgqueue
 from applypilot.apply.launcher import _apply_target, _throttle_host
+from applypilot.database import THIN_DESCRIPTION_CHARS
 
 # Blocked sites/patterns loaded once at import (mirrors acquire_job in launcher.py).
 _BLOCKED_SITES, _BLOCKED_PATTERNS = config.load_blocked_sites()
+_BLOCKED_COMPANY_NAMES, _BLOCKED_COMPANY_PATTERNS = config.load_blocked_companies()
 
 # --- PUSH -------------------------------------------------------------------
 
@@ -32,6 +34,7 @@ FROM jobs
 WHERE duplicate_of_url IS NULL
   AND COALESCE(audit_score, fit_score) >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress'))
   -- offsite ATS only: a real http(s) target, never LinkedIn (no cookies offsite)
   AND application_url LIKE 'http%'
@@ -65,6 +68,15 @@ def _eligible(row: sqlite3.Row) -> bool:
             needle = pat.strip("%").lower()
             if needle and needle in t_lower:
                 return False
+    company = (row["company"] or "").strip().lower()
+    if company and company in _BLOCKED_COMPANY_NAMES:
+        return False
+    url_lower = (row["url"] or "").lower()
+    app_lower = (row["application_url"] or "").lower()
+    for pat in _BLOCKED_COMPANY_PATTERNS:
+        needle = pat.strip("%").lower()
+        if needle and (needle in url_lower or needle in app_lower):
+            return False
     return True
 
 
@@ -81,7 +93,8 @@ def push_offsite_jobs(
     pg = pg_conn or pgqueue.connect()
     try:
         out: list[dict[str, Any]] = []
-        for r in sq.execute(_PUSH_SELECT, (score_floor,)).fetchall():
+        sql = _PUSH_SELECT.format(thin_description_chars=THIN_DESCRIPTION_CHARS)
+        for r in sq.execute(sql, (score_floor,)).fetchall():
             if not _eligible(r):
                 continue
             out.append({
