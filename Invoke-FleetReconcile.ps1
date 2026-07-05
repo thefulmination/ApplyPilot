@@ -148,8 +148,16 @@ if ($applyLiteral) {
       if (`$LASTEXITCODE -eq 0) { `$remoteRef = `$candidate; break }
     }
     if (`$remoteRef) {
-      Write-Output "APPLY: git checkout -B `$branch `$remoteRef"
-      git checkout -B `$branch `$remoteRef
+      git show-ref --verify --quiet "refs/heads/`$branch"
+      if (`$LASTEXITCODE -eq 0) {
+        Write-Output "APPLY: git checkout `$branch"
+        git checkout `$branch
+        Write-Output "APPLY: git merge --ff-only `$remoteRef"
+        git merge --ff-only `$remoteRef
+      } else {
+        Write-Output "APPLY: git checkout -b `$branch `$remoteRef"
+        git checkout -b `$branch `$remoteRef
+      }
     } else {
       Write-Output "APPLY: git checkout `$branch"
       git checkout `$branch
@@ -208,8 +216,15 @@ if [ "$applyLiteral" = "1" ]; then
       if git show-ref --verify --quiet "refs/remotes/$candidate"; then remote_ref="$candidate"; break; fi
     done
     if [ -n "$remote_ref" ]; then
-      echo "APPLY: git checkout -B $branch $remote_ref"
-      git checkout -B "$branch" "$remote_ref"
+      if git show-ref --verify --quiet "refs/heads/$branch"; then
+        echo "APPLY: git checkout $branch"
+        git checkout "$branch"
+        echo "APPLY: git merge --ff-only $remote_ref"
+        git merge --ff-only "$remote_ref"
+      else
+        echo "APPLY: git checkout -b $branch $remote_ref"
+        git checkout -b "$branch" "$remote_ref"
+      fi
     else
       echo "APPLY: git checkout $branch"
       git checkout "$branch"
