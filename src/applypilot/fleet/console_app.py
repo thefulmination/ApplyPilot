@@ -42,6 +42,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from psycopg import errors
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
@@ -1058,31 +1060,42 @@ def _try_audit_action(conn, **kwargs) -> None:
         _rollback_quietly(conn)
 
 
-def audit_rows(limit: int = _AUDIT_READ_LIMIT) -> list[dict[str, Any]]:
+def audit_rows(limit: int = _AUDIT_READ_LIMIT) -> dict[str, Any]:
     limit = max(1, min(int(limit), _AUDIT_READ_LIMIT))
     conn = pgqueue.connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, created_at, action, ok, message, lane, target "
-                "FROM fleet_console_audit "
-                "ORDER BY created_at DESC, id DESC "
-                "LIMIT %s",
-                (limit,),
-            )
-            rows = cur.fetchall()
-        return [
-            {
-                "time": _iso(r["created_at"]),
-                "action": _audit_text(r["action"], _AUDIT_ACTION_CAP),
-                "ok": bool(r["ok"]),
-                "result": "ok" if r["ok"] else "failed",
-                "message": _audit_text(r["message"] or "", _AUDIT_MESSAGE_CAP),
-                "lane": _audit_optional_text(r["lane"], _AUDIT_LANE_CAP),
-                "target": _audit_optional_text(r["target"], _AUDIT_TARGET_CAP),
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, created_at, action, ok, message, lane, target "
+                    "FROM fleet_console_audit "
+                    "ORDER BY created_at DESC, id DESC "
+                    "LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        except errors.UndefinedTable:
+            _rollback_quietly(conn)
+            return {
+                "rows": [],
+                "schema_missing": True,
+                "reason": "Console audit table is not installed; apply the fleet v3 schema migration.",
             }
-            for r in rows
-        ]
+        return {
+            "rows": [
+                {
+                    "time": _iso(r["created_at"]),
+                    "action": _audit_text(r["action"], _AUDIT_ACTION_CAP),
+                    "ok": bool(r["ok"]),
+                    "result": "ok" if r["ok"] else "failed",
+                    "message": _audit_text(r["message"] or "", _AUDIT_MESSAGE_CAP),
+                    "lane": _audit_optional_text(r["lane"], _AUDIT_LANE_CAP),
+                    "target": _audit_optional_text(r["target"], _AUDIT_TARGET_CAP),
+                }
+                for r in rows
+            ],
+            "schema_missing": False,
+        }
     finally:
         _rollback_quietly(conn)
         conn.close()
@@ -1332,7 +1345,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/audit":
             try:
-                self._send_json(200, {"rows": audit_rows()})
+                self._send_json(200, audit_rows())
             except Exception as e:
                 self._send_json(500, {"error": _scrub(str(e))[:500]})
             return

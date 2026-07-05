@@ -59,8 +59,10 @@ def test_console_audit_rows_are_read_only_bounded_and_scrubbed(fleet_db, monkeyp
                 target="https://example.test/apply?api_key=abc123&" + ("target" * 100),
             )
 
-    rows = console_app.audit_rows()
+    payload = console_app.audit_rows()
+    rows = payload["rows"]
 
+    assert payload["schema_missing"] is False
     assert len(rows) == 25
     assert rows[0]["action"].startswith("action-29")
     assert set(rows[0]) == {"time", "action", "ok", "result", "message", "lane", "target"}
@@ -212,3 +214,19 @@ def test_console_action_exception_audit_failure_reraises_original(fleet_db, monk
 
     with pytest.raises(ValueError, match="original failure"):
         console_app.run_action({"action": "fake_raises_no_audit"})
+
+
+def test_console_audit_rows_degrades_when_audit_table_missing(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE fleet_console_audit")
+        conn.commit()
+
+    result = console_app.audit_rows()
+
+    assert result == {
+        "rows": [],
+        "schema_missing": True,
+        "reason": "Console audit table is not installed; apply the fleet v3 schema migration.",
+    }
