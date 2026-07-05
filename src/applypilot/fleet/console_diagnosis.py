@@ -8,6 +8,10 @@ from __future__ import annotations
 from applypilot import config
 
 
+def _iso(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
 def _queue_counts(cur, table: str, *, lane: str | None = None) -> dict[str, int]:
     lane_sql, params = _lane_predicate(lane)
     cur.execute(
@@ -276,6 +280,94 @@ def browser_health(conn) -> dict:
     return summarize_worker_logs(rows)
 
 
+def operational_rollups(conn) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT worker_id, machine_owner, role, state, last_beat, current_agent, current_model "
+            "FROM worker_heartbeat ORDER BY machine_owner NULLS LAST, worker_id"
+        )
+        worker_rows = cur.fetchall()
+        cur.execute(
+            "SELECT COALESCE(target_host, apply_domain, '(unknown)') AS host, "
+            "COUNT(*) AS total, "
+            "COUNT(*) FILTER (WHERE status='applied') AS applied, "
+            "COUNT(*) FILTER (WHERE status='failed') AS failed, "
+            "COUNT(*) FILTER (WHERE apply_status='challenge_pending') AS challenges "
+            "FROM apply_queue GROUP BY 1 ORDER BY total DESC LIMIT 25"
+        )
+        host_rows = cur.fetchall()
+        cur.execute(
+            "SELECT COUNT(*) FILTER (WHERE status='applied' AND updated_at > now() - interval '1 hour') AS applied_1h, "
+            "COUNT(*) FILTER (WHERE status='applied' AND updated_at > now() - interval '24 hours') AS applied_24h, "
+            "MAX(updated_at) FILTER (WHERE status='applied') AS last_apply_at "
+            "FROM apply_queue"
+        )
+        throughput = cur.fetchone() or {}
+        cur.execute(
+            "SELECT worker_id, COUNT(*) AS total, "
+            "COUNT(*) FILTER (WHERE status='applied') AS applied, "
+            "COUNT(*) FILTER (WHERE status='failed') AS failed, "
+            "COUNT(*) FILTER (WHERE status='crash_unconfirmed') AS crash_unconfirmed, "
+            "COALESCE(SUM(est_cost_usd),0) AS cost_usd "
+            "FROM apply_queue WHERE worker_id IS NOT NULL "
+            "GROUP BY worker_id ORDER BY applied DESC, total DESC, worker_id LIMIT 50"
+        )
+        worker_cmp = cur.fetchall()
+    conn.rollback()
+
+    machines: dict[str, dict] = {}
+    for row in worker_rows:
+        machine = row["machine_owner"] or "(unknown)"
+        m = machines.setdefault(machine, {
+            "workers": 0,
+            "roles": {},
+            "last_beat": None,
+            "states": {},
+        })
+        m["workers"] += 1
+        m["roles"][row["role"]] = m["roles"].get(row["role"], 0) + 1
+        m["states"][row["state"]] = m["states"].get(row["state"], 0) + 1
+        if m["last_beat"] is None or row["last_beat"] > m["last_beat"]:
+            m["last_beat"] = row["last_beat"]
+    for machine in machines.values():
+        machine["last_beat"] = _iso(machine["last_beat"])
+
+    applied_1h = int(throughput.get("applied_1h") or 0)
+    applied_24h = int(throughput.get("applied_24h") or 0)
+    return {
+        "machines": machines,
+        "host_quality": [{
+            "host": r["host"],
+            "total": int(r["total"] or 0),
+            "applied": int(r["applied"] or 0),
+            "failed": int(r["failed"] or 0),
+            "challenges": int(r["challenges"] or 0),
+        } for r in host_rows],
+        "throughput": {
+            "applied_1h": applied_1h,
+            "applied_24h": applied_24h,
+            "estimated_applies_per_hour": applied_1h if applied_1h > 0 else round(applied_24h / 24, 2),
+        },
+        "daily_goal": {
+            "configured": False,
+            "target": None,
+            "applied_today": applied_24h,
+            "remaining": None,
+        },
+        "worker_comparison": [{
+            "worker_id": r["worker_id"],
+            "total": int(r["total"] or 0),
+            "applied": int(r["applied"] or 0),
+            "failed": int(r["failed"] or 0),
+            "crash_unconfirmed": int(r["crash_unconfirmed"] or 0),
+            "cost_usd": float(r["cost_usd"] or 0),
+        } for r in worker_cmp],
+        "freshness": {
+            "last_apply_at": _iso(throughput.get("last_apply_at")),
+        },
+    }
+
+
 def recommendations_from(queue: dict, browser: dict) -> list[dict]:
     recs: list[dict] = []
     ats = queue["ats"]
@@ -330,8 +422,10 @@ def recommendations_from(queue: dict, browser: dict) -> list[dict]:
 def full_diagnosis(conn) -> dict:
     queue = queue_diagnosis(conn)
     browser = browser_health(conn)
+    rollups = operational_rollups(conn)
     return {
         "queue": queue,
         "browser": browser,
+        "rollups": rollups,
         "recommendations": recommendations_from(queue, browser),
     }

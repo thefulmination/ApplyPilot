@@ -380,3 +380,39 @@ def test_recommendation_for_browser_server_unavailable():
     result = console_diagnosis.recommendations_from(queue, browser)
 
     assert [r["code"] for r in result] == ["restart_browser_backend"]
+
+
+def test_operational_rollups_include_machines_hosts_forecast_goals_and_workers(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, home_ip, role, state, last_beat, current_agent, current_model) "
+                "VALUES "
+                "('m4-0','m4','100.69.68.103','apply','idle',now(),'codex','sonnet'), "
+                "('m4-score-0','m4','0.0.0.0','compute','idle',now(),NULL,NULL), "
+                "('m2-disc-0','m2','100.77.65.8','discovery','idle',now(),NULL,NULL)"
+            )
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, company, title, application_url, score, lane, status, approved_batch, "
+                "dedup_key, target_host, apply_domain, worker_id, est_cost_usd, updated_at) "
+                "VALUES "
+                "('https://boards.greenhouse.io/acme/jobs/1','Acme','Engineer',"
+                "'https://boards.greenhouse.io/acme/jobs/1/apply',8,'ats','applied','b',"
+                "'acme::eng','boards.greenhouse.io','boards.greenhouse.io','m4-0',0.50,now()), "
+                "('https://jobs.ashbyhq.com/beta/1','Beta','Analyst',"
+                "'https://jobs.ashbyhq.com/beta/1/apply',8,'ats','failed','b',"
+                "'beta::analyst','jobs.ashbyhq.com','jobs.ashbyhq.com','m4-0',0.25,now())"
+            )
+        conn.commit()
+
+        result = console_diagnosis.operational_rollups(conn)
+
+    assert result["machines"]["m4"]["workers"] == 2
+    assert result["machines"]["m4"]["roles"]["apply"] == 1
+    assert result["host_quality"][0]["host"] in {"boards.greenhouse.io", "jobs.ashbyhq.com"}
+    assert result["throughput"]["applied_24h"] == 1
+    assert result["daily_goal"]["configured"] is False
+    assert result["worker_comparison"][0]["worker_id"] == "m4-0"
+    assert result["freshness"]["last_apply_at"] is not None
