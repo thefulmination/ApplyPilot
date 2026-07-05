@@ -16,7 +16,7 @@ if (-not $Dsn) {
   if ($env:FLEET_PG_DSN) {
     $Dsn = $env:FLEET_PG_DSN
   } else {
-    $Dsn = "host=100.90.104.99 port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+    $Dsn = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
   }
 }
 if (-not $KeyPath) {
