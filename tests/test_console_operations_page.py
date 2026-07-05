@@ -112,6 +112,18 @@ def test_favicon_does_not_emit_browser_404(live_server):
         assert resp.read() == b""
 
 
+def test_dashboard_surfaces_primary_blocker(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert 'id="primaryBlocker"' in html
+    assert "renderPrimaryBlocker" in html
+    assert "Primary blocker" in html
+    assert "Spend cap halt" in html
+    assert "spent over cap" in html
+    assert "No blocking gate" in html
+
+
 def test_dashboard_uses_friendly_machine_names(live_server):
     with urllib.request.urlopen(f"{live_server}/") as resp:
         html = resp.read().decode("utf-8")

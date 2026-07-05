@@ -1570,6 +1570,11 @@ _INDEX_HTML = r"""<!doctype html>
   .band.primary{border-left:4px solid var(--blue)}
   .headline{font-size:24px;font-weight:750;margin:6px 0}
   .actionline{margin-top:10px;color:var(--fg);font-weight:600}
+  .blockerline{border-left:3px solid var(--blue);background:rgba(56,139,253,.08);
+    border-radius:8px;padding:8px 10px;overflow-wrap:anywhere}
+  .blockerline.severe{border-left-color:var(--red2);background:rgba(218,54,51,.12)}
+  .blockerline.warn{border-left-color:var(--amber);background:rgba(210,153,34,.10)}
+  .blockerline.ok{border-left-color:var(--green2);background:rgba(46,160,67,.10)}
   .rec-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin-top:12px}
   .action-item{background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:8px;padding:9px 10px;min-width:0}
   .action-item.warn{border-left-color:var(--amber)}
@@ -1697,6 +1702,7 @@ _INDEX_HTML = r"""<!doctype html>
     <h2>Fleet State</h2>
     <div id="stateHeadline" class="headline">Loading</div>
     <div id="stateReason" class="sub"></div>
+    <div id="primaryBlocker" class="actionline blockerline">Primary blocker: loading</div>
     <div id="nextAction" class="actionline">Recommended Next Action: Loading</div>
     <h2 style="margin-top:14px">Action Queue</h2>
     <div id="recommendationList" class="rec-list"><div class="mut">loading recommendations</div></div>
@@ -2057,6 +2063,7 @@ function renderDiagnosis(d){
   document.getElementById("nextAction").textContent = recs.length
     ? "Recommended Next Action: " + recs[0].title + " — " + recs[0].reason
     : "Recommended Next Action: No recommendation";
+  renderPrimaryBlocker();
   renderRecommendationList(recs);
   document.getElementById("whyBody").innerHTML = [
     ["ATS queued", ats.queued],
@@ -2101,6 +2108,41 @@ function renderDiagnosis(d){
       ' alive / '+esc(machines[k].stale_workers||0)+' stale</small></div>').join("")
     : '<div class="mut">no machine heartbeats</div>';
   renderWorkerComparison(roll.worker_comparison || []);
+}
+
+function renderPrimaryBlocker(){
+  const el = document.getElementById("primaryBlocker");
+  if(!el) return;
+  const s = statusSnapshot || {};
+  const d = diagnosisSnapshot || {};
+  const gate = s.gate || {};
+  const q = d.queue || s.fleet_diagnosis || {};
+  const ats = q.ats || {};
+  const linkedin = q.linkedin || {};
+  const doctor = s.doctor || {};
+  let state = "ok";
+  let text = "Primary blocker: No blocking gate";
+  if(gate.should_halt){
+    state = "severe";
+    text = "Primary blocker: Spend cap halt — " +
+      money(gate.spent_usd || 0) + " spent over cap " + money(gate.spend_cap_usd || 0);
+  } else if(gate.paused || ats.paused){
+    state = "severe";
+    text = "Primary blocker: Fleet pause — shared pause is active";
+  } else if(ats.ats_paused || doctor.ats_paused){
+    state = "warn";
+    text = "Primary blocker: ATS pause — source " + (doctor.ats_pause_source || "unknown");
+  } else if(Number(ats.approved || 0) > 0 && Number(ats.leaseable || 0) === 0){
+    state = "warn";
+    text = "Primary blocker: ATS lease gate — " + ats.approved + " approved but 0 leaseable";
+  } else if(Number(linkedin.queued || 0) > 0 && Number(linkedin.leaseable || 0) === 0){
+    state = "warn";
+    text = "Primary blocker: LinkedIn lease gate — " +
+      (linkedin.canary_exhausted ? "canary exhausted" :
+        (linkedin.owner_ip_context_known && !linkedin.owner_ip_ready ? "owner IP blocked" : "queued but not leaseable"));
+  }
+  el.textContent = text;
+  el.className = "actionline blockerline " + state;
 }
 
 function renderAgents(d){
@@ -2639,6 +2681,7 @@ function render(s){
   document.getElementById("cLeasableHint").textContent =
     liveAts.leaseable == null ? "eligible if running" : "leaseable after pause/canary gates";
   document.getElementById("cChallenges").textContent = s.challenges;
+  renderPrimaryBlocker();
   renderLaneState(s);
   renderLaneActivity(s);
   renderStaleWorkers(s.workers || []);
