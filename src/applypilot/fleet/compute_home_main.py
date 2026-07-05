@@ -18,7 +18,11 @@ from applypilot.fleet import compute_context as cc
 from applypilot.fleet import sync
 
 _BAD_REASONING_RE = "(without a resume|no resume|resume contains no|resume provided|missing resume)"
-_RATE_LIMIT_RE = r"(\brate[- ]?limit(?:ed|ing)?\b|\btoo many requests\b|\bhttp\s*429\b|\b429\b|\bquota\b|\bthrottl(?:ed|ing|e)\b)"
+_RATE_LIMIT_RE = (
+    r"(^|[^A-Za-z0-9_])"
+    r"(rate[- ]?limit(ed|ing)?|too many requests|http\s*429|429|quota|throttl(ed|ing|e))"
+    r"([^A-Za-z0-9_]|$)"
+)
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_SCORE_WORKERS = 16
 MAX_SCORE_WORKERS = 16
