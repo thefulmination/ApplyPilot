@@ -195,6 +195,28 @@ def test_linkedin_canary_exhaustion_is_lane_specific(fleet_db):
     assert result["ats"]["canary_exhausted"] is False
 
 
+def test_queue_diagnosis_surfaces_linkedin_block_when_ats_empty(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, company, title, application_url, score, lane, status, approved_batch, dedup_key, updated_at) "
+                "VALUES ('https://www.linkedin.com/jobs/view/blocked','Beta','Analyst',"
+                "'https://www.linkedin.com/jobs/view/blocked',8,'ats','queued','batch-li','beta::blocked',now())"
+            )
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_canary_enabled=TRUE, "
+                "linkedin_canary_remaining=0, canary_enabled=FALSE, canary_remaining=NULL WHERE id=1"
+            )
+        conn.commit()
+
+        result = console_diagnosis.queue_diagnosis(conn)
+
+    assert result["ats"]["queued"] == 0
+    assert result["state"]["code"] == "linkedin_canary_exhausted"
+    assert "LinkedIn" in result["state"]["reason"]
+
+
 def test_linkedin_owner_ip_context_missing_prevents_leaseable_overreport(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
@@ -350,7 +372,9 @@ def test_browser_health_counts_apply_workers_and_skips_non_apply_and_unknown(fle
         "login_gate": {
             "worker_id": "apply-known",
             "machine_owner": "m4",
+            "machine_display_name": "GGGTower",
             "severity": "warn",
+            "logs_url": "/api/logs?worker=apply-known",
         }
     }
 
@@ -419,7 +443,10 @@ def test_operational_rollups_include_machines_hosts_forecast_goals_and_workers(f
                 "VALUES "
                 "('m4-0','m4','100.69.68.103','apply','idle',now(),'codex','sonnet'), "
                 "('m4-score-0','m4','0.0.0.0','compute','idle',now(),NULL,NULL), "
-                "('m2-disc-0','m2','100.77.65.8','discovery','idle',now(),NULL,NULL)"
+                "('m2-disc-0','m2','100.77.65.8','discovery','idle',now(),NULL,NULL), "
+                "('m2-disc',NULL,'100.77.65.8','discovery','idle',now(),NULL,NULL), "
+                "('home-linkedin-0',NULL,'100.90.104.99','linkedin','idle',now(),NULL,NULL), "
+                "('watchdog',NULL,'100.90.104.99','watchdog','idle',now() - interval '10 minutes',NULL,NULL)"
             )
             cur.execute(
                 "INSERT INTO apply_queue "
@@ -438,11 +465,21 @@ def test_operational_rollups_include_machines_hosts_forecast_goals_and_workers(f
         result = console_diagnosis.operational_rollups(conn)
 
     assert result["machines"]["m4"]["workers"] == 2
+    assert result["machines"]["m4"]["display_name"] == "GGGTower"
     assert result["machines"]["m4"]["roles"]["apply"] == 1
+    assert result["machines"]["m2"]["display_name"] == "TARPON"
+    assert result["machines"]["m2"]["workers"] == 2
+    assert result["machines"]["home"]["display_name"] == "Home"
+    assert result["machines"]["home"]["workers"] == 2
+    assert result["machines"]["home"]["stale_workers"] == 1
+    assert "(unknown)" not in result["machines"]
     assert result["host_quality"][0]["host"] in {"boards.greenhouse.io", "jobs.ashbyhq.com"}
     assert result["throughput"]["applied_24h"] == 1
     assert result["daily_goal"]["configured"] is False
     assert result["worker_comparison"][0]["worker_id"] == "m4-0"
+    assert result["worker_comparison"][0]["success_rate"] == 0.5
+    assert result["worker_comparison"][0]["crash_rate"] == 0.0
+    assert result["worker_comparison"][0]["cost_per_applied"] == 0.75
     assert result["freshness"]["last_apply_at"] is not None
 
 

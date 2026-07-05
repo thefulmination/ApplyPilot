@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import urllib.request
+import re
 from http.server import ThreadingHTTPServer
 
 import pytest
@@ -91,17 +92,34 @@ def test_agent_routing_table_is_responsively_contained(live_server):
 
     assert ".table-scroll" in html
     assert "overflow-x:auto" in html
+    assert "overflow-wrap:anywhere" in html
     assert 'id="agentRouting"' in html
     assert '<div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>' in html
+    assert html.count("<table") == len(re.findall(r'class="table-scroll"[^>]*><table', html))
+
+
+def test_favicon_does_not_emit_browser_404(live_server):
+    with urllib.request.urlopen(f"{live_server}/favicon.ico") as resp:
+        assert resp.status == 204
+        assert resp.read() == b""
 
 
 def test_dashboard_uses_friendly_machine_names(live_server):
     with urllib.request.urlopen(f"{live_server}/") as resp:
         html = resp.read().decode("utf-8")
 
-    assert '"m2":"TARPON"' in html
-    assert '"m4":"GGGTower"' in html
-    assert '"home":"Home"' in html
-    assert "function machineLabel(machine)" in html
-    assert "machineLabel(k)" in html
-    assert "machineLabel(w.machine_owner)" in html
+    assert "machine_display_name" in html
+    assert "w.machine_display_name" in html
+    assert "machines[k].display_name" in html
+
+
+def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert 'id="deploymentMeta"' in html
+    assert 'id="workerComparisonRows"' in html
+    assert "renderWorkerComparison" in html
+    assert "worker_versions" in html
+    assert "browser.examples" in html
+    assert "logs_url" in html

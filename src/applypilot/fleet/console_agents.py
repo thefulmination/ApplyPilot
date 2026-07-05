@@ -6,6 +6,8 @@ from typing import Any
 
 from psycopg import errors
 
+from applypilot.fleet import console_machines
+
 
 def _iso(v: Any) -> str | None:
     if v is None:
@@ -46,6 +48,13 @@ def _verdict(
 ) -> dict[str, str]:
     if not workers:
         return _make_verdict("unknown", "warn", "No apply workers have reported heartbeat state.")
+
+    if all(not _configured_agents(worker) and not worker.get("current_model") for worker in workers):
+        return _make_verdict(
+            "telemetry_missing",
+            "warn",
+            "Apply workers are heartbeating, but none has reported current agent/model telemetry yet.",
+        )
 
     blocked_agents = {agent for agent, row in availability.items() if row["blocked"]}
     chain_agents = {
@@ -135,9 +144,20 @@ def _read_workers(conn) -> tuple[list[dict[str, Any]], bool]:
     workers = []
     for row in rows:
         last_agent_switch_at = row.get("last_agent_switch_at") if telemetry_available else None
+        machine_owner = console_machines.infer_machine_owner(
+            row.get("worker_id"), row.get("machine_owner")
+        )
+        telemetry_status = (
+            "configured"
+            if telemetry_available and (
+                row.get("current_agent") or row.get("current_model") or row.get("agent_chain")
+            )
+            else "missing"
+        )
         worker = {
             "worker_id": row.get("worker_id"),
-            "machine_owner": row.get("machine_owner"),
+            "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
             "home_ip": row.get("home_ip"),
             "role": row.get("role"),
             "state": row.get("state"),
@@ -150,6 +170,7 @@ def _read_workers(conn) -> tuple[list[dict[str, Any]], bool]:
             "last_agent_switch_reason": (
                 row.get("last_agent_switch_reason") if telemetry_available else None
             ),
+            "telemetry_status": telemetry_status,
         }
         worker["chain_agents"] = _configured_agents(worker)
         workers.append(worker)

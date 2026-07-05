@@ -48,6 +48,7 @@ def test_agent_summary_reads_worker_heartbeat_blocks_and_spend(fleet_db):
         result = console_agents.agent_summary(conn)
 
     assert result["workers"][0]["worker_id"] == "m4-0"
+    assert result["workers"][0]["machine_display_name"] == "GGGTower"
     assert result["workers"][0]["current_agent"] == "codex"
     assert result["workers"][0]["current_model"] == "sonnet"
     assert result["availability"]["claude"]["blocked"] is True
@@ -58,6 +59,24 @@ def test_agent_summary_reads_worker_heartbeat_blocks_and_spend(fleet_db):
     assert result["verdict"]["code"] == "working"
     assert result["verdict"]["severity"] == "ok"
     assert result["verdict"]["reason"]
+
+
+def test_agent_summary_flags_workers_waiting_for_model_telemetry(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, role, state, last_beat, current_agent, current_model) "
+                "VALUES ('m2-0','m2','apply','idle',now(),NULL,NULL)"
+            )
+        conn.commit()
+
+        result = console_agents.agent_summary(conn)
+
+    assert result["verdict"]["code"] == "telemetry_missing"
+    assert result["verdict"]["severity"] == "warn"
+    assert result["workers"][0]["machine_display_name"] == "TARPON"
+    assert result["workers"][0]["telemetry_status"] == "missing"
 
 
 def test_agent_summary_detects_all_agents_blocked(fleet_db):

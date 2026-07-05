@@ -120,6 +120,8 @@ def test_summarize_worker_logs_counts_examples_and_skips_unknown():
         "browser_backend_crashed": {
             "worker_id": "w1",
             "machine_owner": "m4",
+            "machine_display_name": "GGGTower",
             "severity": "error",
+            "logs_url": "/api/logs?worker=w1",
         }
     }

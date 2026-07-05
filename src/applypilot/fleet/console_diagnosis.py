@@ -5,11 +5,24 @@ uses parameterized SQL, and rolls back its read transaction before returning.
 """
 from __future__ import annotations
 
+import datetime as _dt
+
 from applypilot import config
+from applypilot.fleet import console_machines
+
+_HB_ALIVE_SECONDS = 150
 
 
 def _iso(v):
     return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+def _seconds_since(ts) -> int | None:
+    if ts is None or not hasattr(ts, "tzinfo"):
+        return None
+    now = _dt.datetime.now(_dt.timezone.utc)
+    t = ts if ts.tzinfo is not None else ts.replace(tzinfo=_dt.timezone.utc)
+    return int((now - t).total_seconds())
 
 
 def _queue_counts(cur, table: str, *, lane: str | None = None) -> dict[str, int]:
@@ -255,6 +268,28 @@ def queue_diagnosis(conn) -> dict:
             "severity": "warn",
             "reason": "Approved queued ATS rows are already protected by applied_set dedup guards.",
         }
+    elif ats["approved"] == 0 and linkedin["leaseable"] > 0:
+        state = {
+            "code": "linkedin_ready_to_apply",
+            "severity": "ok",
+            "reason": "ATS has no leaseable jobs, but LinkedIn has leaseable approved jobs.",
+        }
+    elif ats["approved"] == 0 and linkedin["queued"] > 0 and linkedin["canary_exhausted"]:
+        state = {
+            "code": "linkedin_canary_exhausted",
+            "severity": "halted",
+            "reason": "ATS has no leaseable jobs; LinkedIn is queued but its canary is exhausted.",
+        }
+    elif (
+        ats["approved"] == 0
+        and linkedin["approved"] > 0
+        and linkedin["dedup_blocked"] == linkedin["approved"]
+    ):
+        state = {
+            "code": "linkedin_dedup_blocked",
+            "severity": "warn",
+            "reason": "ATS has no leaseable jobs; approved LinkedIn rows are already in applied_set.",
+        }
     else:
         state = {
             "code": "idle_no_leasable_jobs",
@@ -319,14 +354,23 @@ def operational_rollups(conn) -> dict:
 
     machines: dict[str, dict] = {}
     for row in worker_rows:
-        machine = row["machine_owner"] or "(unknown)"
+        machine = console_machines.infer_machine_owner(row["worker_id"], row["machine_owner"])
+        secs = _seconds_since(row["last_beat"])
+        alive = secs is not None and secs <= _HB_ALIVE_SECONDS
         m = machines.setdefault(machine, {
+            "display_name": console_machines.display_name(machine),
             "workers": 0,
+            "alive_workers": 0,
+            "stale_workers": 0,
             "roles": {},
             "last_beat": None,
             "states": {},
         })
         m["workers"] += 1
+        if alive:
+            m["alive_workers"] += 1
+        else:
+            m["stale_workers"] += 1
         m["roles"][row["role"]] = m["roles"].get(row["role"], 0) + 1
         m["states"][row["state"]] = m["states"].get(row["state"], 0) + 1
         if m["last_beat"] is None or row["last_beat"] > m["last_beat"]:
@@ -363,6 +407,16 @@ def operational_rollups(conn) -> dict:
             "failed": int(r["failed"] or 0),
             "crash_unconfirmed": int(r["crash_unconfirmed"] or 0),
             "cost_usd": float(r["cost_usd"] or 0),
+            "success_rate": round(
+                int(r["applied"] or 0) / int(r["total"] or 1), 4
+            ),
+            "crash_rate": round(
+                int(r["crash_unconfirmed"] or 0) / int(r["total"] or 1), 4
+            ),
+            "cost_per_applied": (
+                round(float(r["cost_usd"] or 0) / int(r["applied"] or 0), 4)
+                if int(r["applied"] or 0) > 0 else None
+            ),
         } for r in worker_cmp],
         "freshness": {
             "last_apply_at": _iso(throughput.get("last_apply_at")),

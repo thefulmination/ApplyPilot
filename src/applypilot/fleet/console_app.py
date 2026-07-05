@@ -38,6 +38,7 @@ import os
 import re
 import secrets
 import socket
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ from psycopg import errors
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
+from applypilot.fleet import console_machines
 from applypilot.fleet import queue as _queue
 from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor (S1: scrub on READ too)
 
@@ -74,6 +76,68 @@ def _seconds_since(ts: Any) -> int | None:
     now = _utcnow()
     t = ts if ts.tzinfo is not None else ts.replace(tzinfo=_dt.timezone.utc)
     return int((now - t).total_seconds())
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _git_text(args: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=_repo_root(),
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _deployment_info(conn) -> dict[str, Any]:
+    """Read-only console/schema/version facts for the top dashboard banner."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='worker_heartbeat' "
+            "AND column_name IN ('current_agent','current_model','agent_chain',"
+            "'last_agent_switch_at','last_agent_switch_reason')"
+        )
+        telemetry_cols = {r["column_name"] for r in cur.fetchall()}
+        cur.execute("SELECT to_regclass('public.fleet_console_audit') AS audit_table")
+        audit_table = cur.fetchone()["audit_table"]
+        cur.execute(
+            "SELECT COALESCE(sw_version, '(unknown)') AS version, COUNT(*) AS workers "
+            "FROM worker_heartbeat GROUP BY 1 ORDER BY 1"
+        )
+        worker_versions = [
+            {"version": r["version"], "workers": int(r["workers"] or 0)}
+            for r in cur.fetchall()
+        ]
+    conn.rollback()
+    return {
+        "console": {
+            "branch": _git_text(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown",
+            "commit": _git_text(["rev-parse", "--short", "HEAD"]) or "unknown",
+            "path": str(_repo_root()),
+        },
+        "schema": {
+            "agent_telemetry": {
+                "current_agent",
+                "current_model",
+                "agent_chain",
+                "last_agent_switch_at",
+                "last_agent_switch_reason",
+            }.issubset(telemetry_cols),
+            "audit_table": bool(audit_table),
+        },
+        "worker_versions": worker_versions,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +204,8 @@ def _workers(conn) -> list[dict]:
     out: list[dict] = []
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT wh.worker_id, wh.state, wh.role, wh.current_job, "
-            "       wh.last_beat, aq.company AS cur_company, aq.title AS cur_title, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.state, wh.role, wh.current_job, "
+            "       wh.sw_version, wh.last_beat, aq.company AS cur_company, aq.title AS cur_title, "
             "       (SELECT COUNT(*) FROM apply_queue done "
             "          WHERE done.worker_id = wh.worker_id "
             "            AND done.status = 'applied') AS applied_n "
@@ -158,12 +222,21 @@ def _workers(conn) -> list[dict]:
         current = None
         if r["current_job"] and r["state"] == "applying":
             current = {"company": r["cur_company"], "title": r["cur_title"]}
+        machine_owner = console_machines.infer_machine_owner(
+            r["worker_id"], r.get("machine_owner")
+        )
         out.append({
             "worker_id": r["worker_id"],
+            "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
             "alive": bool(alive),
+            "health": "alive" if alive else "stale",
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
+            "role": r["role"],
+            "state": r["state"],
             "lane": r["role"],
+            "sw_version": r.get("sw_version"),
             "applied": int(r["applied_n"] or 0),
             "current": current,
         })
@@ -501,6 +574,14 @@ def build_status() -> dict:
             except Exception:
                 pass
             discovery = None
+        try:
+            deployment = _deployment_info(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            deployment = None
     finally:
         try:
             conn.rollback()
@@ -517,6 +598,7 @@ def build_status() -> dict:
         "linkedin": linkedin,
         "doctor": doctor_sig,
         "discovery": discovery,
+        "deployment": deployment,
         "fleet_diagnosis": fleet_diagnosis,
         # H19: the DeadMan alert (fleet_config.deadman_alert/_at, written by
         # applypilot.fleet.deadman's run_deadman) surfaced top-level -- NOT nested
@@ -1060,6 +1142,23 @@ def _try_audit_action(conn, **kwargs) -> None:
         _rollback_quietly(conn)
 
 
+def audit_lifecycle_event(action: str, message: str) -> None:
+    """Best-effort audit for console process lifecycle events.
+
+    Lifecycle audit must never prevent the dashboard from starting or stopping.
+    """
+    conn = None
+    try:
+        conn = pgqueue.connect()
+        _audit_action(conn, action=action, ok=True, message=message, lane="console")
+    except Exception:
+        if conn is not None:
+            _rollback_quietly(conn)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def audit_rows(limit: int = _AUDIT_READ_LIMIT) -> dict[str, Any]:
     limit = max(1, min(int(limit), _AUDIT_READ_LIMIT))
     conn = pgqueue.connect()
@@ -1267,6 +1366,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path == "/favicon.ico":
+            self._send(204, b"", "image/x-icon")
+            return
         if path == "/":
             import urllib.parse as _up
             qs = _up.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
@@ -1454,6 +1556,8 @@ _INDEX_HTML = r"""<!doctype html>
   .mini{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
   .mini span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
   .mini b{display:block;font-size:20px;margin-top:4px}
+  .mini small{display:block;margin-top:5px;color:var(--muted)}
+  .mini a{color:var(--blue);text-decoration:none}
   .funnel{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
   .fstep{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px;min-height:70px}
   .fstep span{display:block;color:var(--muted);font-size:11px}
@@ -1504,14 +1608,17 @@ _INDEX_HTML = r"""<!doctype html>
   pre.log.err{border-color:rgba(218,54,51,.45)}
   .dgrp{margin-bottom:14px}
   .dgrp .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
-  .rec{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px}
-  .rec .rh{display:flex;gap:10px;align-items:center;margin-bottom:4px}
+  .rec{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px;overflow:hidden;overflow-wrap:anywhere}
+  .rec .rh{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:4px}
+  .rec .rh .mut{min-width:0;flex:1 1 180px;overflow-wrap:anywhere}
+  .rec .rh button.sm{flex:0 0 auto}
   .rec .sev{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:6px;
     border:1px solid var(--border);color:var(--muted)}
   .rec .sev.warn{color:var(--amber);border-color:rgba(210,153,34,.4)}
   .rec .sev.severe{color:var(--red2);border-color:rgba(218,54,51,.4)}
   .rec .body{font-size:13px}
   .rec .recm{color:var(--muted);font-size:12px;margin-top:4px}
+  @media(max-width:560px){.rec .rh button.sm{margin-left:0!important}}
   button.sm{padding:5px 10px;font-size:12px}
   #challenges .chgrp{margin-bottom:14px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
   #challenges .chgrp-h{display:flex;flex-wrap:wrap;align-items:center;gap:10px;
@@ -1541,6 +1648,7 @@ _INDEX_HTML = r"""<!doctype html>
   <div>
     <h1>ApplyPilot Fleet Console</h1>
     <div class="sub">LAN-only control panel &mdash; this operates a system that submits REAL applications</div>
+    <div class="sub" id="deploymentMeta">console version loading</div>
   </div>
   <div class="sub" id="conn">connecting&hellip;</div>
 </header>
@@ -1597,6 +1705,12 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="browserBody" class="diagnosis-grid"></div>
   </section>
 
+  <section id="workerComparison">
+    <h2>Worker Comparison</h2>
+    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Applied</th><th>Total</th><th>Success</th><th>Crash</th><th>Cost / Apply</th></tr></thead>
+      <tbody id="workerComparisonRows"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
+  </section>
+
   <section id="queueFunnel">
     <h2>Queue Funnel</h2>
     <div id="funnelBody" class="funnel"></div>
@@ -1604,8 +1718,8 @@ _INDEX_HTML = r"""<!doctype html>
 
   <section id="auditLog">
     <h2>Audit Log</h2>
-    <table><thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Message</th></tr></thead>
-      <tbody id="auditRows"><tr><td colspan="4" class="mut">audit endpoint not loaded</td></tr></tbody></table>
+    <div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Message</th></tr></thead>
+      <tbody id="auditRows"><tr><td colspan="4" class="mut">audit endpoint not loaded</td></tr></tbody></table></div>
   </section>
 
   <section>
@@ -1634,14 +1748,14 @@ _INDEX_HTML = r"""<!doctype html>
 
   <section>
     <h2>Workers (apply lane)</h2>
-    <table><thead><tr><th>Worker</th><th>Live</th><th>Last beat</th><th>Applied</th><th>Current job</th></tr></thead>
-      <tbody id="workers"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table>
+    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Live</th><th>Last beat</th><th>Applied</th><th>Current job</th></tr></thead>
+      <tbody id="workers"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table></div>
   </section>
 
   <section>
     <h2>Recent activity</h2>
-    <table><thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Company / Title</th></tr></thead>
-      <tbody id="recent"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+    <div class="table-scroll"><table><thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Company / Title</th></tr></thead>
+      <tbody id="recent"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table></div>
   </section>
 
   <section>
@@ -1672,16 +1786,16 @@ _INDEX_HTML = r"""<!doctype html>
       <button class="go" id="btnExpand">Expand searches (seed tasks)</button>
       <span class="mut" style="font-size:12px">Seeds <code>search_tasks</code> from searches.yaml &mdash; queues scrape work, submits nothing. Discovery workers run per-machine (<code>applypilot-fleet-discovery</code>).</span>
     </div>
-    <table><thead><tr><th>Discovery worker</th><th>Live</th><th>Last beat</th><th>Found 24h</th></tr></thead>
-      <tbody id="discWorkers"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
-    <table style="margin-top:10px"><thead><tr><th>Found</th><th>Source</th><th>Search</th></tr></thead>
-      <tbody id="discRecent"><tr><td colspan="3" class="mut">&hellip;</td></tr></tbody></table>
+    <div class="table-scroll"><table><thead><tr><th>Discovery worker</th><th>Live</th><th>Last beat</th><th>Found 24h</th></tr></thead>
+      <tbody id="discWorkers"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table></div>
+    <div class="table-scroll" style="margin-top:10px"><table><thead><tr><th>Found</th><th>Source</th><th>Search</th></tr></thead>
+      <tbody id="discRecent"><tr><td colspan="3" class="mut">&hellip;</td></tr></tbody></table></div>
   </section>
 
-  <section>
+<section>
   <h2>Recent outcomes (read-only)</h2>
-  <table><thead><tr><th>Time</th><th>Company / Title</th><th>Stage</th><th>Outcome</th></tr></thead>
-    <tbody id="outcomes"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+  <div class="table-scroll"><table><thead><tr><th>Time</th><th>Company / Title</th><th>Stage</th><th>Outcome</th></tr></thead>
+    <tbody id="outcomes"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table></div>
 </section>
 
   <section>
@@ -1693,12 +1807,12 @@ _INDEX_HTML = r"""<!doctype html>
       a recommendation for you.
     </div>
     <div class="dgrp"><div class="lbl">Live failure clusters (last 60m)</div>
-      <table><thead><tr><th>Reason</th><th>Host</th><th>Machine</th><th>Samples</th></tr></thead>
-        <tbody id="docClusters"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+      <div class="table-scroll"><table><thead><tr><th>Reason</th><th>Host</th><th>Machine</th><th>Samples</th></tr></thead>
+        <tbody id="docClusters"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table></div>
     </div>
     <div class="dgrp"><div class="lbl">Active auto-fixes</div>
-      <table><thead><tr><th>Type</th><th>Scope</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
-        <tbody id="docAuto"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table>
+      <div class="table-scroll"><table><thead><tr><th>Type</th><th>Scope</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
+        <tbody id="docAuto"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table></div>
     </div>
     <div class="dgrp"><div class="lbl">Recommendations (need a human)</div>
       <div id="docRecs" class="mut">&hellip;</div>
@@ -1721,14 +1835,31 @@ _INDEX_HTML = r"""<!doctype html>
 <script>
 "use strict";
 let lastUpdate = null;
-const MACHINE_LABELS = {"m2":"TARPON","m4":"GGGTower","home":"Home"};
 
 function esc(s){ return s==null ? "" : String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-function machineLabel(machine){
-  const raw = machine == null ? "" : String(machine);
-  return MACHINE_LABELS[raw.toLowerCase()] || raw;
+function pct(v){
+  if(v==null || isNaN(v)) return "—";
+  return Math.round(Number(v) * 100) + "%";
+}
+
+function money(v){
+  if(v==null || isNaN(v)) return "—";
+  return "$" + Number(v).toFixed(2);
+}
+
+function machineName(obj, fallback){
+  return (obj && obj.machine_display_name) || fallback || "(unknown)";
+}
+
+function openWorkerLogs(workerId){
+  const sel = document.getElementById("logWorker");
+  if(!sel) return false;
+  sel.value = workerId || "";
+  loadLogs();
+  document.getElementById("logArea").scrollIntoView({block:"center"});
+  return false;
 }
 
 function rel(iso){
@@ -1787,9 +1918,18 @@ function renderDiagnosis(d){
   ].map(([k,v]) => '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
   const browser = d.browser || {};
   const counts = browser.counts || {};
+  const examples = browser.examples || {};
   const keys = Object.keys(counts);
   document.getElementById("browserBody").innerHTML = keys.length
-    ? keys.map(k => '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(counts[k])+'</b></div>').join("")
+    ? keys.map(k => {
+        const ex = examples[k] || {};
+        const detail = ex.worker_id
+          ? '<small>'+esc(machineName(ex, ex.machine_owner))+' / '+esc(ex.worker_id)+
+            ' · <a href="'+esc(ex.logs_url||"#")+'" onclick="return openWorkerLogs('+
+            esc(JSON.stringify(String(ex.worker_id)))+')">logs</a></small>'
+          : "";
+        return '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(counts[k])+'</b>'+detail+'</div>';
+      }).join("")
     : '<div class="mut">no classified browser failures</div>';
   document.getElementById("funnelBody").innerHTML = [
     ["Queued", ats.queued],
@@ -1802,9 +1942,11 @@ function renderDiagnosis(d){
   ].map(([k,v]) => '<div class="fstep"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
   const machines = roll.machines || {};
   document.getElementById("machineMap").innerHTML = Object.keys(machines).length
-    ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(machineLabel(k))+'</span><b>'+
-      esc(machines[k].workers)+'</b><small class="mut"> workers</small></div>').join("")
+    ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(machines[k].display_name || k)+'</span><b>'+
+      esc(machines[k].workers)+'</b><small class="mut">'+esc(machines[k].alive_workers||0)+
+      ' alive / '+esc(machines[k].stale_workers||0)+' stale</small></div>').join("")
     : '<div class="mut">no machine heartbeats</div>';
+  renderWorkerComparison(roll.worker_comparison || []);
 }
 
 function renderAgents(d){
@@ -1813,10 +1955,20 @@ function renderAgents(d){
   const rows = d.workers || [];
   const body = document.getElementById("agentWorkers");
   body.innerHTML = rows.length ? rows.map(w =>
-    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(machineLabel(w.machine_owner))+'</td><td>'+
+    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_display_name||w.machine_owner||"")+'</td><td>'+
     esc(w.current_agent||"unknown")+'</td><td>'+esc(w.current_model||"unknown")+'</td><td>'+
     esc(w.agent_chain||"")+'</td><td>'+esc(w.last_agent_switch_reason||"")+'</td></tr>'
   ).join("") : '<tr><td colspan="6" class="mut">no apply worker agent telemetry</td></tr>';
+}
+
+function renderWorkerComparison(rows){
+  const body = document.getElementById("workerComparisonRows");
+  if(!body) return;
+  body.innerHTML = rows.length ? rows.map(w =>
+    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.applied||0)+'</td><td>'+esc(w.total||0)+
+    '</td><td>'+esc(pct(w.success_rate))+'</td><td>'+esc(pct(w.crash_rate))+
+    '</td><td>'+esc(money(w.cost_per_applied))+'</td></tr>'
+  ).join("") : '<tr><td colspan="6" class="mut">no worker outcome data yet</td></tr>';
 }
 
 function renderAudit(d){
@@ -1848,6 +2000,18 @@ function render(s){
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
   const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
+  const dep = s.deployment || {};
+  const consoleInfo = dep.console || {};
+  const schema = dep.schema || {};
+  const worker_versions = dep.worker_versions || [];
+  const versionText = worker_versions.length
+    ? worker_versions.map(v => (v.version || "(unknown)") + "×" + (v.workers || 0)).join(", ")
+    : "none";
+  document.getElementById("deploymentMeta").textContent =
+    "console " + (consoleInfo.branch || "unknown") + "@" + (consoleInfo.commit || "unknown") +
+    " · schema telemetry=" + (schema.agent_telemetry ? "ok" : "missing") +
+    " audit=" + (schema.audit_table ? "ok" : "missing") +
+    " · worker_versions " + versionText;
 
   // DeadMan: a RED fixed banner when fleet_config.deadman_alert is set (silent
   // fleet death / stall / running-hot) so the owner sees it even glancing at a phone.
@@ -2220,11 +2384,19 @@ def main(argv=None) -> int:
     print("Open this from a machine on your LAN. Do NOT port-forward it.")
     print(f"One-tap arm URL (sets the mutation-auth cookie): "
           f"http://{host}:{args.port}/?token={get_console_token()}")
+    audit_lifecycle_event(
+        "console_start",
+        f"started on http://{host}:{args.port} from {_repo_root()}",
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        audit_lifecycle_event(
+            "console_stop",
+            f"stopped on http://{host}:{args.port} from {_repo_root()}",
+        )
         server.server_close()
     return 0
 

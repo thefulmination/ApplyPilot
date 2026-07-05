@@ -1,6 +1,10 @@
 """Deterministic worker-log classification for fleet console health panels."""
 from __future__ import annotations
 
+from urllib.parse import quote
+
+from applypilot.fleet import console_machines
+
 
 _RULES = [
     ("browser_backend_crashed", "error", ("browser_backend_crashed",)),
@@ -52,9 +56,15 @@ def summarize_worker_logs(rows: list[dict]) -> dict:
         if kind == "unknown":
             continue
         counts[kind] = counts.get(kind, 0) + 1
+        machine_owner = console_machines.infer_machine_owner(
+            row.get("worker_id"), row.get("machine_owner")
+        )
+        worker_id = row.get("worker_id")
         examples.setdefault(kind, {
-            "worker_id": row.get("worker_id"),
-            "machine_owner": row.get("machine_owner"),
+            "worker_id": worker_id,
+            "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
             "severity": cls["severity"],
+            "logs_url": f"/api/logs?worker={quote(str(worker_id or ''))}",
         })
     return {"counts": counts, "examples": examples}

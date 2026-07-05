@@ -28,6 +28,11 @@ $env:PYTHONPATH = Join-Path $RepoRoot "src"
 
 Set-Location $RepoRoot
 
+$Branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
+if (-not $Branch) { $Branch = "unknown" }
+$Commit = (& git rev-parse --short HEAD 2>$null)
+if (-not $Commit) { $Commit = "unknown" }
+
 # Detect THIS box's private LAN IPv4 so the URL is reachable from other LAN machines.
 # Prefer 192.168.x, then 10.x, then 172.16-31.x; fall back to 127.0.0.1.
 function Get-PrivateIPv4 {
@@ -49,6 +54,7 @@ $BindIp = Get-PrivateIPv4
 
 Write-Host ""
 Write-Host "ApplyPilot Fleet Console (LAN-only)" -ForegroundColor Cyan
+Write-Host ("Source checkout: {0} ({1}@{2})" -f $RepoRoot, $Branch, $Commit) -ForegroundColor DarkCyan
 Write-Host "Open this URL on any machine on your LAN:" -ForegroundColor Cyan
 Write-Host ("    http://{0}:{1}" -f $BindIp, $Port) -ForegroundColor Green
 Write-Host "Do NOT port-forward this. It controls a system that submits REAL applications." -ForegroundColor Yellow

@@ -230,3 +230,14 @@ def test_console_audit_rows_degrades_when_audit_table_missing(fleet_db, monkeypa
         "schema_missing": True,
         "reason": "Console audit table is not installed; apply the fleet v3 schema migration.",
     }
+
+
+def test_console_lifecycle_audit_records_startup_without_secrets(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+
+    console_app.audit_lifecycle_event("console_start", "started on http://127.0.0.1:8787 token raw-token")
+
+    row = _latest_audit_row(fleet_db)
+    assert row["action"] == "console_start"
+    assert row["ok"] is True
+    assert "raw-token" not in row["message"]
