@@ -8,7 +8,7 @@
 #   Score floor 7 is deliberate: only jobs the cheap first-pass scorer already ranked >=7 are
 #   worth the paid LLM pass. Lower it to widen the net (e.g. -ScoreFloor 5), raise it to conserve.
 #
-#   The compute SCORE half runs on machine 4:  .\run-fleet-compute.ps1 -Workers 5
+#   The compute SCORE half runs on machine 4:  .\run-fleet-compute.ps1 -Workers 16
 param(
   [int]$ScoreFloor = 7,
   [string]$Task = "score",
