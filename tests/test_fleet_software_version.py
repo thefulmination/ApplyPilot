@@ -11,9 +11,10 @@ def test_build_sw_version_formats_clean_git_identity() -> None:
         commit="53a4fa9e6c2a1b0d",
         dirty=False,
         git_available=True,
+        tree="8e72467aabbccdde",
     )
 
-    assert build_sw_version(ident) == "0.3.0+git.codex-fleet-applier-hardening.53a4fa9"
+    assert build_sw_version(ident) == "0.3.0+git.tree.8e72467"
 
 
 def test_build_sw_version_marks_dirty_tree() -> None:
@@ -23,9 +24,10 @@ def test_build_sw_version_marks_dirty_tree() -> None:
         commit="abcdef0123456789",
         dirty=True,
         git_available=True,
+        tree="baddad0123456789",
     )
 
-    assert build_sw_version(ident) == "0.3.0+git.main.abcdef0.dirty"
+    assert build_sw_version(ident) == "0.3.0+git.tree.baddad0.dirty"
 
 
 def test_build_sw_version_falls_back_when_git_unavailable() -> None:
@@ -49,6 +51,8 @@ def test_git_identity_uses_git_commands_without_touching_live_repo() -> None:
             return "codex/fleet-applier-hardening\n"
         if args == ["git", "rev-parse", "HEAD"]:
             return "53a4fa9e6c2a1b0d\n"
+        if args == ["git", "rev-parse", "HEAD^{tree}"]:
+            return "8e72467aabbccdde\n"
         if args == ["git", "status", "--porcelain"]:
             return " M fleet-agent.ps1\n"
         raise AssertionError(f"unexpected git command: {args}")
@@ -61,10 +65,12 @@ def test_git_identity_uses_git_commands_without_touching_live_repo() -> None:
         commit="53a4fa9e6c2a1b0d",
         dirty=True,
         git_available=True,
+        tree="8e72467aabbccdde",
     )
     assert calls == [
         ("git", "rev-parse", "--abbrev-ref", "HEAD"),
         ("git", "rev-parse", "HEAD"),
+        ("git", "rev-parse", "HEAD^{tree}"),
         ("git", "status", "--porcelain"),
     ]
 
@@ -82,7 +88,7 @@ def test_git_identity_reports_unavailable_when_git_command_fails() -> None:
 def test_worker_loop_defaults_to_current_software_version(monkeypatch) -> None:
     from applypilot.fleet import software_version
 
-    monkeypatch.setattr(software_version, "current_sw_version", lambda: "0.3.0+git.main.abc1234")
+    monkeypatch.setattr(software_version, "current_sw_version", lambda: "0.3.0+git.tree.abc1234")
 
     loop = WorkerLoop(
         lambda: None,
@@ -92,4 +98,4 @@ def test_worker_loop_defaults_to_current_software_version(monkeypatch) -> None:
         score_fn=lambda job: ({}, 0),
     )
 
-    assert loop.sw_version == "0.3.0+git.main.abc1234"
+    assert loop.sw_version == "0.3.0+git.tree.abc1234"

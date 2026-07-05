@@ -24,6 +24,7 @@ class GitIdentity:
     commit: str | None
     dirty: bool
     git_available: bool
+    tree: str | None = None
 
 
 def _run(args: list[str], cwd: Path) -> str:
@@ -50,6 +51,7 @@ def git_identity(
     try:
         branch = runner(["git", "rev-parse", "--abbrev-ref", "HEAD"], root).strip()
         commit = runner(["git", "rev-parse", "HEAD"], root).strip()
+        tree = runner(["git", "rev-parse", "HEAD^{tree}"], root).strip()
         dirty = bool(runner(["git", "status", "--porcelain"], root).strip())
     except Exception:
         return GitIdentity(
@@ -65,6 +67,7 @@ def git_identity(
         commit=commit or None,
         dirty=dirty,
         git_available=True,
+        tree=tree or None,
     )
 
 
@@ -72,10 +75,9 @@ def build_sw_version(identity: GitIdentity | None = None) -> str:
     ident = identity or git_identity()
     if not ident.git_available:
         return f"{ident.package_version}+git.unavailable"
-    branch = _clean_part(ident.branch)
-    short = _clean_part((ident.commit or "")[:7])
+    short = _clean_part((ident.tree or ident.commit or "")[:7])
     suffix = ".dirty" if ident.dirty else ""
-    return f"{ident.package_version}+git.{branch}.{short}{suffix}"
+    return f"{ident.package_version}+git.tree.{short}{suffix}"
 
 
 def current_sw_version(*, repo: Path | None = None) -> str:
