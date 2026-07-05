@@ -178,6 +178,9 @@ def test_dashboard_summarizes_apply_readiness_gates(live_server):
     assert "Leaseable queue" in html
     assert "Worker versions" in html
     assert "Model telemetry" in html
+    assert "Agent failover" in html
+    assert "blocked provider" in html
+    assert "still available" in html
     assert "Browser walls" in html
     assert "Stale workers" in html
     assert "Daily goal" in html

@@ -2260,6 +2260,11 @@ function renderApplyReadiness(){
   const applyWorkers = (s.workers || []).filter(w => (w.role || "apply") === "apply");
   const staleApply = applyWorkers.filter(w => w.alive === false);
   const agentWorkers = agents.workers || [];
+  const availability = agents.availability || {};
+  const availabilityNames = Object.keys(availability);
+  const blockedAgents = availabilityNames.filter(name => availability[name] && availability[name].blocked);
+  const readyAgents = availabilityNames.filter(name => availability[name] && !availability[name].blocked);
+  const agentVerdict = (agents.verdict || {}).code || "";
   const telemetryMissing = (agents.verdict || {}).code === "telemetry_missing" ||
     (agentWorkers.length > 0 && !agentWorkers.some(w => w.current_agent || w.current_model));
   const dirtyOrUnknown = versions.some(row => {
@@ -2287,6 +2292,12 @@ function renderApplyReadiness(){
     ["Model telemetry", telemetryMissing ? "warn" : "ok",
       telemetryMissing ? "missing" : "reported",
       telemetryMissing ? "cannot prove Codex/Claude model switching yet" : "workers report agent/model fields"],
+    ["Agent failover",
+      blockedAgents.length && !readyAgents.length ? "blocked" : ((blockedAgents.length || agentVerdict === "partial") ? "warn" : "ok"),
+      blockedAgents.length ? blockedAgents.length + " blocked provider(s)" : (readyAgents.length ? readyAgents.join(", ") + " ready" : "loading"),
+      blockedAgents.length
+        ? (readyAgents.length ? readyAgents.join(", ") + " still available" : "no provider still available")
+        : (readyAgents.length ? "no blocked provider reported" : "waiting for provider availability")],
     ["Browser walls", wallCount ? "warn" : "ok", wallCount,
       wallCount ? "login/captcha walls need review" : "no browser wall samples"],
     ["Stale workers", staleApply.length ? "warn" : "ok", staleApply.length,
