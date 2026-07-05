@@ -231,7 +231,6 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
                       log_tail_fn=make_log_tail_fn(slot))
-    loop._agent_model = model
     loop.set_agent_telemetry(current_agent=agent, current_model=model, agent_chain=agent)
     return loop
 
@@ -343,7 +342,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                     if callable(setter):
                         setter(
                             current_agent=agent,
-                            current_model=getattr(loop, "_agent_model", None),
+                            current_model=getattr(loop, "_current_model", None),
                             agent_chain=">".join(getattr(switcher, "agents", [agent])),
                             last_agent_switch_reason=reason,
                         )

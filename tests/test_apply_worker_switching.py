@@ -38,6 +38,19 @@ def test_run_apply_switches_to_fallback_after_usage_limit(monkeypatch):
     actions = iter(["usage_limit", "applied"])
     loop = MagicMock()
     loop._log_tail_fn = None
+    loop._current_model = "sonnet"
+    agent_events = []
+
+    def set_agent_telemetry(*, current_agent, current_model, agent_chain,
+                            last_agent_switch_reason=None):
+        agent_events.append({
+            "current_agent": current_agent,
+            "current_model": current_model,
+            "agent_chain": agent_chain,
+            "last_agent_switch_reason": last_agent_switch_reason,
+        })
+
+    loop.set_agent_telemetry = set_agent_telemetry
 
     def run_once():
         return {"action": next(actions), "url": "u"}
@@ -52,6 +65,20 @@ def test_run_apply_switches_to_fallback_after_usage_limit(monkeypatch):
     assert "codex" in rebuilt                     # tick 2 switched after the wall
     assert sw.blocked_until("claude") == 1000.0 + 3600   # walled for the cooldown
     assert counts["applied"] == 1
+    assert agent_events == [
+        {
+            "current_agent": "claude",
+            "current_model": "sonnet",
+            "agent_chain": "claude>codex",
+            "last_agent_switch_reason": "startup",
+        },
+        {
+            "current_agent": "codex",
+            "current_model": "sonnet",
+            "agent_chain": "claude>codex",
+            "last_agent_switch_reason": "switch:claude->codex",
+        },
+    ]
     awm._STOP_REQUESTED.clear()
 
 
@@ -66,6 +93,7 @@ def test_run_apply_updates_loop_agent_telemetry_on_switch(monkeypatch):
     class Loop:
         def __init__(self):
             self.apply_fn = None
+            self._current_model = "sonnet"
             self.agent_events = []
             self.calls = 0
 
@@ -106,7 +134,7 @@ def test_run_apply_updates_loop_agent_telemetry_on_switch(monkeypatch):
     assert rebuilt == ["claude"]
     assert loop.agent_events == [{
         "current_agent": "claude",
-        "current_model": None,
+        "current_model": "sonnet",
         "agent_chain": "claude>codex",
         "last_agent_switch_reason": "startup",
     }]
