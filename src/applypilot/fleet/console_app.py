@@ -1397,6 +1397,17 @@ _INDEX_HTML = r"""<!doctype html>
   .card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
   .card .val{font-size:24px;font-weight:700;margin-top:6px}
   .card .hint{color:var(--muted);font-size:11px;margin-top:4px}
+  .band.primary{border-left:4px solid var(--blue)}
+  .headline{font-size:24px;font-weight:750;margin:6px 0}
+  .actionline{margin-top:10px;color:var(--fg);font-weight:600}
+  .metric-grid,.diagnosis-grid,.machine-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+  .mini{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
+  .mini span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  .mini b{display:block;font-size:20px;margin-top:4px}
+  .funnel{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+  .fstep{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px;min-height:70px}
+  .fstep span{display:block;color:var(--muted);font-size:11px}
+  .fstep b{font-size:22px}
   section{background:var(--panel);border:1px solid var(--border);border-radius:10px;
     padding:14px 16px;margin-bottom:16px}
   section h2{font-size:13px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
@@ -1487,20 +1498,63 @@ _INDEX_HTML = r"""<!doctype html>
     <small id="updated"></small>
   </div>
 
-  <div class="cards">
-    <div class="card"><div class="label">Canary</div>
-      <div class="val" id="cCanary">&mdash;</div><div class="hint" id="cCanaryHint"></div></div>
-    <div class="card"><div class="label">Spend</div>
-      <div class="val" id="cSpend">&mdash;</div><div class="hint" id="cSpendHint">of cap</div></div>
-    <div class="card"><div class="label">Apply queue</div>
-      <div class="val" id="cQueued">&mdash;</div><div class="hint">queued</div></div>
-    <div class="card"><div class="label">Leasable now</div>
-      <div class="val" id="cLeasable">&mdash;</div><div class="hint">approved &amp; not deduped</div></div>
-    <div class="card"><div class="label">Open challenges</div>
-      <div class="val" id="cChallenges">&mdash;</div><div class="hint">need a human</div></div>
-    <div class="card"><div class="label">Doctor</div>
-      <div class="val" id="cDoctor">&mdash;</div><div class="hint" id="cDoctorHint">auto-fixes active</div></div>
-  </div>
+  <section id="fleetState" class="band primary">
+    <h2>Fleet State</h2>
+    <div id="stateHeadline" class="headline">Loading</div>
+    <div id="stateReason" class="sub"></div>
+    <div id="nextAction" class="actionline">Recommended Next Action: Loading</div>
+  </section>
+
+  <section id="safetyRails">
+    <h2>Safety Rails</h2>
+    <div class="metric-grid" id="safetyGrid">
+      <div class="card"><div class="label">Canary</div>
+        <div class="val" id="cCanary">&mdash;</div><div class="hint" id="cCanaryHint"></div></div>
+      <div class="card"><div class="label">Spend</div>
+        <div class="val" id="cSpend">&mdash;</div><div class="hint" id="cSpendHint">of cap</div></div>
+      <div class="card"><div class="label">Apply queue</div>
+        <div class="val" id="cQueued">&mdash;</div><div class="hint">queued</div></div>
+      <div class="card"><div class="label">Leasable now</div>
+        <div class="val" id="cLeasable">&mdash;</div><div class="hint">approved &amp; not deduped</div></div>
+      <div class="card"><div class="label">Open challenges</div>
+        <div class="val" id="cChallenges">&mdash;</div><div class="hint">need a human</div></div>
+      <div class="card"><div class="label">Doctor</div>
+        <div class="val" id="cDoctor">&mdash;</div><div class="hint" id="cDoctorHint">auto-fixes active</div></div>
+    </div>
+  </section>
+
+  <section id="whyNotApplying">
+    <h2>Why Not Applying</h2>
+    <div id="whyBody" class="diagnosis-grid"></div>
+  </section>
+
+  <section id="agentRouting">
+    <h2>Agent Routing</h2>
+    <div id="agentVerdict" class="sub"></div>
+    <table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>
+      <tbody id="agentWorkers"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table>
+  </section>
+
+  <section id="machineHealth">
+    <h2>Machine Health</h2>
+    <div id="machineMap" class="machine-grid"></div>
+  </section>
+
+  <section id="browserHealth">
+    <h2>Browser Health</h2>
+    <div id="browserBody" class="diagnosis-grid"></div>
+  </section>
+
+  <section id="queueFunnel">
+    <h2>Queue Funnel</h2>
+    <div id="funnelBody" class="funnel"></div>
+  </section>
+
+  <section id="auditLog">
+    <h2>Audit Log</h2>
+    <table><thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Message</th></tr></thead>
+      <tbody id="auditRows"><tr><td colspan="4" class="mut">audit endpoint not loaded</td></tr></tbody></table>
+  </section>
 
   <section>
     <h2>Controls</h2>
@@ -1634,6 +1688,77 @@ function toast(msg, kind){
   el.className = "toast show " + (kind||"");
   clearTimeout(el._t);
   el._t = setTimeout(()=>{ el.className = "toast " + (kind||""); }, 5000);
+}
+
+async function loadDiagnosis(){
+  try{
+    const r = await fetch("/api/diagnosis", {cache:"no-store"});
+    if(!r.ok) return;
+    renderDiagnosis(await r.json());
+  }catch(e){}
+}
+
+async function loadAgents(){
+  try{
+    const r = await fetch("/api/agents", {cache:"no-store"});
+    if(!r.ok) return;
+    renderAgents(await r.json());
+  }catch(e){}
+}
+
+function renderDiagnosis(d){
+  const q = d.queue || {};
+  const ats = q.ats || {};
+  const li = q.linkedin || {};
+  const roll = d.rollups || {};
+  const state = q.state || {};
+  document.getElementById("stateHeadline").textContent = state.code || "unknown";
+  document.getElementById("stateReason").textContent = state.reason || "";
+  const recs = d.recommendations || [];
+  document.getElementById("nextAction").textContent = recs.length
+    ? "Recommended Next Action: " + recs[0].title + " — " + recs[0].reason
+    : "Recommended Next Action: No recommendation";
+  document.getElementById("whyBody").innerHTML = [
+    ["ATS queued", ats.queued],
+    ["ATS approved", ats.approved],
+    ["ATS leaseable", ats.leaseable],
+    ["ATS dedup-blocked", ats.dedup_blocked],
+    ["LinkedIn queued", li.queued],
+    ["LinkedIn leaseable", li.leaseable],
+    ["LinkedIn canary exhausted", li.canary_exhausted ? "yes" : "no"]
+  ].map(([k,v]) => '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
+  const browser = d.browser || {};
+  const counts = browser.counts || {};
+  const keys = Object.keys(counts);
+  document.getElementById("browserBody").innerHTML = keys.length
+    ? keys.map(k => '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(counts[k])+'</b></div>').join("")
+    : '<div class="mut">no classified browser failures</div>';
+  document.getElementById("funnelBody").innerHTML = [
+    ["Queued", ats.queued],
+    ["Approved", ats.approved],
+    ["Leaseable", ats.leaseable],
+    ["Leased", ats.leased],
+    ["Applied", ats.applied],
+    ["Failed", ats.failed],
+    ["Crash unconfirmed", ats.crash_unconfirmed]
+  ].map(([k,v]) => '<div class="fstep"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
+  const machines = roll.machines || {};
+  document.getElementById("machineMap").innerHTML = Object.keys(machines).length
+    ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(k)+'</span><b>'+
+      esc(machines[k].workers)+'</b><small class="mut"> workers</small></div>').join("")
+    : '<div class="mut">no machine heartbeats</div>';
+}
+
+function renderAgents(d){
+  const verdict = d.verdict || {};
+  document.getElementById("agentVerdict").textContent = (verdict.code || "unknown") + " — " + (verdict.reason || "");
+  const rows = d.workers || [];
+  const body = document.getElementById("agentWorkers");
+  body.innerHTML = rows.length ? rows.map(w =>
+    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_owner||"")+'</td><td>'+
+    esc(w.current_agent||"unknown")+'</td><td>'+esc(w.current_model||"unknown")+'</td><td>'+
+    esc(w.agent_chain||"")+'</td><td>'+esc(w.last_agent_switch_reason||"")+'</td></tr>'
+  ).join("") : '<tr><td colspan="6" class="mut">no apply worker agent telemetry</td></tr>';
 }
 
 function render(s){
@@ -1974,6 +2099,10 @@ async function loadChallenges(){
 loadChallenges();
 setInterval(loadChallenges, 4000);
 
+loadDiagnosis();
+setInterval(loadDiagnosis, 15000);
+loadAgents();
+setInterval(loadAgents, 15000);
 poll();
 setInterval(poll, 4000);
 loadDiagnostics();

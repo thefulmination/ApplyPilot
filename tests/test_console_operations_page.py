@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+import pytest
+
+from applypilot.fleet import console_app
+
+
+@pytest.fixture()
+def live_server(monkeypatch):
+    monkeypatch.setattr(console_app, "_CACHED_TOKEN", None, raising=False)
+    monkeypatch.setenv("APPLYPILOT_CONSOLE_TOKEN", "tok-ops")
+    monkeypatch.setattr(
+        console_app,
+        "build_status",
+        lambda: {
+            "now": "2026-07-05T00:00:00+00:00",
+            "gate": {
+                "paused": False,
+                "should_halt": False,
+                "leasable": 0,
+                "spent_usd": 0,
+                "spend_cap_usd": 0,
+            },
+            "queue": {"apply": {"queued": 0}},
+            "workers": [],
+            "recent": [],
+            "challenges": 0,
+            "linkedin": {
+                "queued": 0,
+                "applied": 0,
+                "canary_enabled": False,
+                "halted": False,
+            },
+            "doctor": None,
+            "discovery": None,
+            "deadman_alert": None,
+            "deadman_alert_at": None,
+            "fleet_diagnosis": {
+                "state": {
+                    "code": "idle_no_leasable_jobs",
+                    "reason": "No leaseable ATS jobs are available.",
+                }
+            },
+        },
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), console_app._Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
+
+
+def test_index_contains_operations_sections(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    for text in [
+        "Fleet State",
+        "Why Not Applying",
+        "Agent Routing",
+        "Machine Health",
+        "Browser Health",
+        "Queue Funnel",
+        "Safety Rails",
+        "Recommended Next Action",
+        "Audit Log",
+    ]:
+        assert text in html
+
+    assert "/api/diagnosis" in html
+    assert "/api/agents" in html
