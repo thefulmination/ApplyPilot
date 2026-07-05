@@ -250,6 +250,10 @@ class WorkerLoop:
         self._events: collections.deque = collections.deque(maxlen=40)
         self._log_tail_fn = log_tail_fn
         self._started_at = _dt.datetime.now(_dt.timezone.utc)
+        self._current_agent = None
+        self._current_model = None
+        self._agent_chain = None
+        self._last_agent_switch_reason = None
         # Remote-command state: a 'pause' flips this until 'resume'; consumed in
         # run_once BETWEEN jobs (never mid-apply). See _handle_commands.
         self._paused = False
@@ -269,6 +273,13 @@ class WorkerLoop:
     # -- connection -----------------------------------------------------------
     def _connect(self):
         return self.conn_factory()
+
+    def set_agent_telemetry(self, *, current_agent=None, current_model=None,
+                            agent_chain=None, last_agent_switch_reason=None) -> None:
+        self._current_agent = current_agent
+        self._current_model = current_model
+        self._agent_chain = agent_chain
+        self._last_agent_switch_reason = last_agent_switch_reason
 
     # -- event ring (crash/log visibility) ------------------------------------
     def _record_event(self, msg) -> None:
@@ -638,7 +649,11 @@ class WorkerLoop:
             conn, worker_id=self.worker_id, machine_owner=self.machine_owner,
             home_ip=self.home_ip, role=self.role, state=state, current_job=current_job,
             sw_version=self.sw_version, last_error=last_error, recent_log=recent_log,
+            current_agent=self._current_agent, current_model=self._current_model,
+            agent_chain=self._agent_chain,
+            last_agent_switch_reason=self._last_agent_switch_reason,
         )
+        self._last_agent_switch_reason = None
 
     # -- long-running driver (not exercised by unit tests) --------------------
     def run_forever(self, *, idle_sleep_seconds: float = 5.0, stop=None) -> None:  # pragma: no cover

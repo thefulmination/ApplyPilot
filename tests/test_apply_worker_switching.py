@@ -55,6 +55,63 @@ def test_run_apply_switches_to_fallback_after_usage_limit(monkeypatch):
     awm._STOP_REQUESTED.clear()
 
 
+def test_run_apply_updates_loop_agent_telemetry_on_switch(monkeypatch):
+    from applypilot.fleet.agent_switch import AgentSwitcher
+    from applypilot.fleet import apply_worker_main as M
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+    class Loop:
+        def __init__(self):
+            self.apply_fn = None
+            self.agent_events = []
+            self.calls = 0
+
+        def set_agent_telemetry(self, *, current_agent, current_model, agent_chain,
+                                last_agent_switch_reason=None):
+            self.agent_events.append({
+                "current_agent": current_agent,
+                "current_model": current_model,
+                "agent_chain": agent_chain,
+                "last_agent_switch_reason": last_agent_switch_reason,
+            })
+
+        def run_once(self):
+            self.calls += 1
+            return {"action": "idle"}
+
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
+    monkeypatch.setattr(M, "_apply_timeout_override", lambda conn=None, dsn=None: None)
+
+    loop = Loop()
+    switcher = AgentSwitcher(agents=["claude", "codex"])
+    rebuilt = []
+
+    def rebuild(agent):
+        rebuilt.append(agent)
+        return lambda job: {"run_status": "failed:no_result_line", "agent": agent}
+
+    M.run_apply(
+        lambda: Conn(),
+        loop,
+        max_iterations=1,
+        idle_sleep=0,
+        switcher=switcher,
+        rebuild_apply_fn=rebuild,
+        time_fn=lambda: 1000.0,
+    )
+
+    assert rebuilt == ["claude"]
+    assert loop.agent_events == [{
+        "current_agent": "claude",
+        "current_model": None,
+        "agent_chain": "claude>codex",
+        "last_agent_switch_reason": "startup",
+    }]
+
+
 def test_run_apply_pauses_when_all_agents_walled(monkeypatch):
     awm._STOP_REQUESTED.clear()
     monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)

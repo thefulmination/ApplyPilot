@@ -228,9 +228,12 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)
-    return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
+    loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
                       log_tail_fn=make_log_tail_fn(slot))
+    loop._agent_model = model
+    loop.set_agent_telemetry(current_agent=agent, current_model=model, agent_chain=agent)
+    return loop
 
 
 # When all agents are usage-limit-walled the worker pauses until the nearer reset. Cap a
@@ -334,7 +337,16 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                     continue
                 if agent != current_agent and rebuild_apply_fn is not None:
                     loop.apply_fn = rebuild_apply_fn(agent)
+                    reason = "startup" if current_agent is None else f"switch:{current_agent}->{agent}"
                     current_agent = agent
+                    setter = getattr(loop, "set_agent_telemetry", None)
+                    if callable(setter):
+                        setter(
+                            current_agent=agent,
+                            current_model=getattr(loop, "_agent_model", None),
+                            agent_chain=">".join(getattr(switcher, "agents", [agent])),
+                            last_agent_switch_reason=reason,
+                        )
             with conn_factory() as conn:
                 # Re-resolve the Doctor's agent_timeout_override on EVERY tick (not just at
                 # startup): the Doctor sets the override mid-flight while this worker is already
