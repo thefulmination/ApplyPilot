@@ -1708,6 +1708,7 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="agentRouting">
     <h2>Agent Routing</h2>
     <div id="agentVerdict" class="sub"></div>
+    <div id="agentSummary" class="diagnosis-grid" style="margin-top:10px;margin-bottom:12px"></div>
     <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Version</th><th>Switch</th></tr></thead>
       <tbody id="agentWorkers"><tr><td colspan="7" class="mut">loading</td></tr></tbody></table></div>
   </section>
@@ -1981,6 +1982,7 @@ function renderDiagnosis(d){
 function renderAgents(d){
   const verdict = d.verdict || {};
   document.getElementById("agentVerdict").textContent = (verdict.code || "unknown") + " — " + (verdict.reason || "");
+  renderAgentSummary(d);
   const rows = d.workers || [];
   const body = document.getElementById("agentWorkers");
   body.innerHTML = rows.length ? rows.map(w =>
@@ -1989,6 +1991,57 @@ function renderAgents(d){
     esc(w.agent_chain||"")+'</td><td>'+esc(w.sw_version||"unknown")+'</td><td>'+
     esc(w.last_agent_switch_reason||"")+'</td></tr>'
   ).join("") : '<tr><td colspan="7" class="mut">no apply worker agent telemetry</td></tr>';
+}
+
+function renderAgentSummary(d){
+  const el = document.getElementById("agentSummary");
+  if(!el) return;
+  const workers = d.workers || [];
+  const verdict = d.verdict || {};
+  const availability = d.availability || {};
+  const spend = d.spend_24h || [];
+  const modelCounts = {};
+  workers.forEach(w => {
+    if(w.current_agent || w.current_model){
+      const key = (w.current_agent || "unknown") + " / " + (w.current_model || "model unknown");
+      modelCounts[key] = (modelCounts[key] || 0) + 1;
+    }
+  });
+  const modelKeys = Object.keys(modelCounts);
+  const modelText = modelKeys.length
+    ? modelKeys.map(k => k + "×" + modelCounts[k]).join(", ")
+    : "unknown";
+  const switched = workers.filter(w =>
+    w.last_agent_switch_reason || String(w.agent_chain || "").indexOf(">") >= 0
+  ).length;
+  const telemetryMissing = verdict.code === "telemetry_missing" || !modelKeys.length;
+  const switchingText = telemetryMissing ? "not observable" : (switched ? "observed" : "not observed");
+  const cards = [
+    ["Model in use", modelText,
+      modelKeys.length ? "current worker heartbeat telemetry" : "workers have not reported agent/model telemetry"],
+    ["Dynamic switching", switchingText,
+      telemetryMissing ? "redeploy/restart workers before judging switching" : (switched ? switched+" worker(s) show switch evidence" : "no switch rows reported")],
+  ];
+  Object.keys(availability).sort().forEach(agent => {
+    const row = availability[agent] || {};
+    cards.push([
+      "Agent " + agent,
+      row.blocked ? "blocked" : "ready",
+      row.blocked ? ((row.reason || "blocked") + (row.blocked_until ? " until " + row.blocked_until : "")) : "not currently blocked",
+    ]);
+  });
+  if(spend.length){
+    spend.forEach(row => cards.push([
+      "24h spend " + (row.provider || "unknown"),
+      money(row.cost_usd || 0),
+      (row.count || 0) + " call(s)" + (row.model ? " / " + row.model : " / model unknown"),
+    ]));
+  } else {
+    cards.push(["24h spend", "$0.00", "no apply-agent usage recorded"]);
+  }
+  el.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
 }
 
 function renderRecommendationList(recs){

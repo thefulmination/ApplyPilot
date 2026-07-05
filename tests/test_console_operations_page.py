@@ -122,8 +122,13 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert 'id="workerComparisonRows"' in html
     assert "renderWorkerComparison" in html
     assert "renderRecommendationList" in html
+    assert "renderAgentSummary" in html
     assert 'id="recommendationList"' in html
+    assert 'id="agentSummary"' in html
     assert "worker_versions" in html
+    assert "spend_24h" in html
+    assert "Dynamic switching" in html
+    assert "Model in use" in html
     assert "browser.examples" in html
     assert "logs_url" in html
     assert 'id="browserWallQueue"' in html
