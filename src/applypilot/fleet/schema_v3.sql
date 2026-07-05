@@ -555,3 +555,17 @@ CREATE TABLE IF NOT EXISTS email_reconcile_actions (
     how_to_reverse  TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Console operator action audit. This records only action metadata and scrubbed
+-- result messages. It never stores DSNs, tokens, prompts, resumes, or raw logs.
+CREATE TABLE IF NOT EXISTS fleet_console_audit (
+    id BIGSERIAL PRIMARY KEY,
+    action TEXT NOT NULL,
+    actor TEXT,
+    lane TEXT,
+    target TEXT,
+    message TEXT,
+    ok BOOLEAN NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_console_audit_created ON fleet_console_audit (created_at DESC);

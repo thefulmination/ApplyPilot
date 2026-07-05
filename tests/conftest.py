@@ -28,7 +28,7 @@ _V3_TABLES = [
     "inbox_outcomes",
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "command_acks",
     "fleet_assets", "discovered_postings", "fleet_knobs", "fleet_diagnoses",
-    "agent_availability",
+    "fleet_console_audit", "agent_availability",
 ]
 
 

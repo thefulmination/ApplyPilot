@@ -1005,6 +1005,18 @@ _ACTIONS = {
 }
 
 
+def _audit_action(conn, *, action: str, ok: bool, message: str,
+                  lane: str | None = None, target: str | None = None) -> None:
+    safe_message = _scrub(message or "")[:500]
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_console_audit (action, ok, message, lane, target) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (_scrub(action or "unknown")[:120], bool(ok), safe_message, lane, target),
+        )
+    conn.commit()
+
+
 def run_action(body: dict) -> tuple[bool, str]:
     """Validate + dispatch a single allowed action against a short-lived connection.
     Returns (ok, message). Connection always closed.
@@ -1016,13 +1028,19 @@ def run_action(body: dict) -> tuple[bool, str]:
     action = body.get("action")
     fn = _ACTIONS.get(action) if isinstance(action, str) else None
     if fn is None:
+        conn = pgqueue.connect()
+        try:
+            _audit_action(conn, action=str(action), ok=False, message="unknown action")
+        finally:
+            conn.close()
         return False, "unknown action"
     conn = pgqueue.connect()
     try:
         result = fn(conn, body)
-        if isinstance(result, tuple):
-            return result
-        return True, result
+        ok, message = result if isinstance(result, tuple) else (True, result)
+        _audit_action(conn, action=action, ok=bool(ok), message=str(message),
+                      lane=body.get("lane"), target=body.get("url") or body.get("host"))
+        return ok, message
     finally:
         try:
             conn.rollback()
