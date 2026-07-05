@@ -79,6 +79,10 @@ def test_index_contains_operations_sections(live_server):
 
     assert "/api/diagnosis" in html
     assert "/api/agents" in html
+    assert "/api/audit" in html
+    assert "async function loadAudit()" in html
+    assert 'fetch("/api/audit", {cache:"no-store"})' in html
+    assert "renderAudit(await r.json())" in html
 
 
 def test_agent_routing_table_is_responsively_contained(live_server):

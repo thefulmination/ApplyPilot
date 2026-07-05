@@ -46,6 +46,41 @@ def test_console_action_audit_records_unknown_action(fleet_db, monkeypatch):
     assert row["ok"] is False
 
 
+def test_console_audit_rows_are_read_only_bounded_and_scrubbed(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        for i in range(30):
+            console_app._audit_action(
+                conn,
+                action=f"action-{i} token sk-test-{i}",
+                ok=(i % 2 == 0),
+                message="done password topsecret " + ("x" * 600),
+                lane="ats secret lane-secret",
+                target="https://example.test/apply?api_key=abc123&" + ("target" * 100),
+            )
+
+    rows = console_app.audit_rows()
+
+    assert len(rows) == 25
+    assert rows[0]["action"].startswith("action-29")
+    assert set(rows[0]) == {"time", "action", "ok", "result", "message", "lane", "target"}
+    assert rows[0]["result"] == "failed"
+    assert len(rows[0]["action"]) <= 120
+    assert len(rows[0]["message"]) <= 500
+    assert len(rows[0]["lane"]) <= 120
+    assert len(rows[0]["target"]) <= 300
+    combined = " ".join(
+        str(v).lower()
+        for row in rows
+        for v in row.values()
+        if v is not None
+    )
+    assert "topsecret" not in combined
+    assert "sk-test" not in combined
+    assert "lane-secret" not in combined
+    assert "abc123" not in combined
+
+
 def test_console_action_audit_scrubs_and_bounds_lane_and_target(fleet_db, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
 

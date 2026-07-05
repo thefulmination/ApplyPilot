@@ -1009,6 +1009,7 @@ _AUDIT_ACTION_CAP = 120
 _AUDIT_MESSAGE_CAP = 500
 _AUDIT_LANE_CAP = 120
 _AUDIT_TARGET_CAP = 300
+_AUDIT_READ_LIMIT = 25
 _AUDIT_SECRET_WORD_RE = re.compile(
     r"(?i)\b(token|password|passwd|pwd|secret|api[_-]?key)\s+[^\s,'\"}{]+"
 )
@@ -1055,6 +1056,36 @@ def _try_audit_action(conn, **kwargs) -> None:
         _audit_action(conn, **kwargs)
     except Exception:
         _rollback_quietly(conn)
+
+
+def audit_rows(limit: int = _AUDIT_READ_LIMIT) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), _AUDIT_READ_LIMIT))
+    conn = pgqueue.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, created_at, action, ok, message, lane, target "
+                "FROM fleet_console_audit "
+                "ORDER BY created_at DESC, id DESC "
+                "LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "time": _iso(r["created_at"]),
+                "action": _audit_text(r["action"], _AUDIT_ACTION_CAP),
+                "ok": bool(r["ok"]),
+                "result": "ok" if r["ok"] else "failed",
+                "message": _audit_text(r["message"] or "", _AUDIT_MESSAGE_CAP),
+                "lane": _audit_optional_text(r["lane"], _AUDIT_LANE_CAP),
+                "target": _audit_optional_text(r["target"], _AUDIT_TARGET_CAP),
+            }
+            for r in rows
+        ]
+    finally:
+        _rollback_quietly(conn)
+        conn.close()
 
 
 def run_action(body: dict) -> tuple[bool, str]:
@@ -1298,6 +1329,12 @@ class _Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                     conn.close()
+            return
+        if path == "/api/audit":
+            try:
+                self._send_json(200, {"rows": audit_rows()})
+            except Exception as e:
+                self._send_json(500, {"error": _scrub(str(e))[:500]})
             return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs
@@ -1763,6 +1800,31 @@ function renderAgents(d){
   ).join("") : '<tr><td colspan="6" class="mut">no apply worker agent telemetry</td></tr>';
 }
 
+function renderAudit(d){
+  const body = document.getElementById("auditRows");
+  const rows = (d && d.rows) || [];
+  if(!rows.length){
+    body.innerHTML = '<tr><td colspan="4" class="mut">no audit entries yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(r =>
+    '<tr><td class="mut">'+esc(rel(r.time))+'</td><td>'+esc(r.action||"—")+
+    '</td><td>'+esc(r.result || (r.ok ? "ok" : "failed"))+'</td><td>'+
+    esc(r.message||"—")+'</td></tr>'
+  ).join("");
+}
+
+async function loadAudit(){
+  const body = document.getElementById("auditRows");
+  try{
+    const r = await fetch("/api/audit", {cache:"no-store"});
+    if(!r.ok){ body.innerHTML = '<tr><td colspan="4" class="mut">audit unavailable</td></tr>'; return; }
+    renderAudit(await r.json());
+  }catch(e){
+    body.innerHTML = '<tr><td colspan="4" class="mut">audit unavailable</td></tr>';
+  }
+}
+
 function render(s){
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
@@ -2105,6 +2167,8 @@ loadDiagnosis();
 setInterval(loadDiagnosis, 15000);
 loadAgents();
 setInterval(loadAgents, 15000);
+loadAudit();
+setInterval(loadAudit, 15000);
 poll();
 setInterval(poll, 4000);
 loadDiagnostics();
