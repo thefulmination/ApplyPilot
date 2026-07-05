@@ -111,3 +111,69 @@ def test_console_action_audit_records_tuple_failure(fleet_db, monkeypatch):
     assert row["action"] == "fake_failure"
     assert row["ok"] is False
     assert row["message"] == "unknown lane"
+
+
+def test_console_action_audit_failure_does_not_mask_success(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+
+    def fake_success(conn, body):
+        return "done"
+
+    def audit_fails(conn, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setitem(console_app._ACTIONS, "fake_success_no_audit", fake_success)
+    monkeypatch.setattr(console_app, "_audit_action", audit_fails)
+
+    assert console_app.run_action({"action": "fake_success_no_audit"}) == (True, "done")
+
+
+def test_console_action_audit_failure_does_not_mask_tuple_failure(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+
+    def fake_failure(conn, body):
+        return False, "unknown lane"
+
+    def audit_fails(conn, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setitem(console_app._ACTIONS, "fake_failure_no_audit", fake_failure)
+    monkeypatch.setattr(console_app, "_audit_action", audit_fails)
+
+    assert console_app.run_action({"action": "fake_failure_no_audit"}) == (False, "unknown lane")
+
+
+def test_console_action_unknown_action_audit_failure_still_returns_unknown(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+
+    def audit_fails(conn, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(console_app, "_audit_action", audit_fails)
+
+    assert console_app.run_action({"action": "does_not_exist"}) == (False, "unknown action")
+
+
+def test_console_action_unknown_action_connect_failure_still_returns_unknown(monkeypatch):
+    def connect_fails(*args, **kwargs):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(console_app.pgqueue, "connect", connect_fails)
+
+    assert console_app.run_action({"action": "does_not_exist"}) == (False, "unknown action")
+
+
+def test_console_action_exception_audit_failure_reraises_original(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+
+    def fake_raises(conn, body):
+        raise ValueError("original failure")
+
+    def audit_fails(conn, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setitem(console_app._ACTIONS, "fake_raises_no_audit", fake_raises)
+    monkeypatch.setattr(console_app, "_audit_action", audit_fails)
+
+    with pytest.raises(ValueError, match="original failure"):
+        console_app.run_action({"action": "fake_raises_no_audit"})

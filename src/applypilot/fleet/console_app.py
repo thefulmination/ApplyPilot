@@ -1043,6 +1043,20 @@ def _audit_action(conn, *, action: str, ok: bool, message: str,
     conn.commit()
 
 
+def _rollback_quietly(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _try_audit_action(conn, **kwargs) -> None:
+    try:
+        _audit_action(conn, **kwargs)
+    except Exception:
+        _rollback_quietly(conn)
+
+
 def run_action(body: dict) -> tuple[bool, str]:
     """Validate + dispatch a single allowed action against a short-lived connection.
     Returns (ok, message). Connection always closed.
@@ -1054,39 +1068,35 @@ def run_action(body: dict) -> tuple[bool, str]:
     action = body.get("action")
     fn = _ACTIONS.get(action) if isinstance(action, str) else None
     if fn is None:
-        conn = pgqueue.connect()
+        conn = None
         try:
-            _audit_action(conn, action=str(action), ok=False, message="unknown action")
+            conn = pgqueue.connect()
+            _try_audit_action(conn, action=str(action), ok=False, message="unknown action")
+        except Exception:
+            if conn is not None:
+                _rollback_quietly(conn)
         finally:
-            conn.close()
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return False, "unknown action"
     conn = pgqueue.connect()
     try:
         try:
             result = fn(conn, body)
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                _audit_action(conn, action=action, ok=False, message=str(exc),
+            _rollback_quietly(conn)
+            _try_audit_action(conn, action=action, ok=False, message=str(exc),
                               lane=body.get("lane"), target=body.get("url") or body.get("host"))
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
             raise
         ok, message = result if isinstance(result, tuple) else (True, result)
-        _audit_action(conn, action=action, ok=bool(ok), message=str(message),
-                      lane=body.get("lane"), target=body.get("url") or body.get("host"))
+        _try_audit_action(conn, action=action, ok=bool(ok), message=str(message),
+                          lane=body.get("lane"), target=body.get("url") or body.get("host"))
         return ok, message
     finally:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        _rollback_quietly(conn)
         conn.close()
 
 
