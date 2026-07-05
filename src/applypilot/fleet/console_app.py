@@ -1185,6 +1185,21 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})   # match sibling GET routes
             return
+        if path == "/api/agents":
+            from applypilot.fleet import console_agents
+
+            conn = pgqueue.connect()
+            try:
+                self._send_json(200, console_agents.agent_summary(conn))
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            finally:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                conn.close()
+            return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs
             # never bloat the 4s poll. The `worker` param is validated against an
