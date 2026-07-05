@@ -19,6 +19,8 @@ def classify_crash_error(apply_error: str | None) -> str:
         return "no_result_line"
     if "timeout" in token:
         return "timeout"
+    if "email_reconcile_review_required" in token:
+        return "email_review_required"
     if token.startswith("failed:worker_error"):
         return "worker_error"
     if token == "crash_unconfirmed":
@@ -113,6 +115,7 @@ def _bucket_action(bucket: str) -> str:
     return {
         "no_result_line": "check email_reconcile before any requeue; the form may have submitted",
         "timeout": "inspect worker/model/host samples; do not auto-requeue without evidence",
+        "email_review_required": "review prior email reconcile match before marking applied",
         "watchdog_reclaim": "inspect worker heartbeat/logs; row was reclaimed after a lost lease",
         "worker_error": "diagnose worker exception before retrying",
         "unknown": "review manually",
@@ -148,7 +151,13 @@ def _email_summary(conn, *, home_db_path: str | None, min_score: float) -> dict[
         }
 
     jobs = email_reconcile.load_crash_jobs(conn)
-    result = email_reconcile.reconcile(emails, jobs, min_strong=min_score)
+    consumed_message_ids = email_reconcile.load_consumed_message_ids(conn)
+    result = email_reconcile.reconcile(
+        emails,
+        jobs,
+        min_strong=min_score,
+        consumed_message_ids=consumed_message_ids,
+    )
     confirmed_methods = Counter(r.method for r in result.confirmed)
     probable_methods = Counter(r.method for r in result.probable)
     return {
@@ -156,6 +165,7 @@ def _email_summary(conn, *, home_db_path: str | None, min_score: float) -> dict[
         "confirmed": len(result.confirmed),
         "probable": len(result.probable),
         "unmatched_emails": result.unmatched_emails,
+        "consumed_message_ids": len(consumed_message_ids),
         "confirmed_methods": dict(sorted(confirmed_methods.items())),
         "probable_methods": dict(sorted(probable_methods.items())),
         "confirmed_samples": [_resolution_dict(r) for r in result.confirmed[:10]],

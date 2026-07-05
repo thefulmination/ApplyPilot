@@ -69,7 +69,13 @@ def main(argv=None) -> int:
 
     with pgqueue.connect(args.dsn) as conn:
         jobs = er.load_crash_jobs(conn, limit=args.limit)
-        result = er.reconcile(emails, jobs, min_strong=args.min_score)
+        consumed_message_ids = er.load_consumed_message_ids(conn)
+        result = er.reconcile(
+            emails,
+            jobs,
+            min_strong=args.min_score,
+            consumed_message_ids=consumed_message_ids,
+        )
         counts = None
         if args.apply:
             counts = er.apply_resolutions(
@@ -85,6 +91,7 @@ def main(argv=None) -> int:
                 "confirmed": len(result.confirmed),
                 "probable": len(result.probable),
                 "unmatched_emails": result.unmatched_emails,
+                "consumed_message_ids": len(consumed_message_ids),
                 "dry_run": not args.apply,
                 "applied": counts,
             }

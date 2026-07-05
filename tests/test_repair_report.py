@@ -19,6 +19,7 @@ def _seed_apply_row(
     agent_model="sonnet",
     duration_ms=1234,
     approved=True,
+    application_url=None,
 ):
     cur.execute(
         "INSERT INTO apply_queue "
@@ -29,7 +30,7 @@ def _seed_apply_row(
         "'2026-06-30T00:00:00+00:00'::timestamptz)",
         (
             url,
-            f"https://{apply_domain}/jobs/{url}",
+            application_url or f"https://{apply_domain}/jobs/{url}",
             status,
             apply_domain,
             apply_domain,
@@ -58,7 +59,7 @@ def _mk_home_db(path):
             "m-stripe",
             "jobs@stripe.com",
             "Application received",
-            "Thanks for applying to Stripe.",
+            "Thanks for applying: https://job-boards.greenhouse.io/stripe/jobs/stripe-crash",
             "Stripe",
             "Analyst",
             None,
@@ -80,7 +81,8 @@ def test_repair_report_summarizes_crashes_email_queue_and_recommendations(fleet_
             company="Stripe",
             title="Analyst",
             dedup_key="dk-stripe",
-            apply_domain="stripe.com",
+            apply_domain="job-boards.greenhouse.io",
+            application_url="https://job-boards.greenhouse.io/stripe/jobs/stripe-crash",
             apply_error="failed:no_result_line",
             worker_id="w-stripe",
             agent_model="claude-sonnet-4",
@@ -121,6 +123,7 @@ def test_repair_report_summarizes_crashes_email_queue_and_recommendations(fleet_
     assert report["queue_diagnosis"]["queued"]["dedup_blocked"] == 1
     assert any("--apply --confirmed-only --max-flips 1" in r["command"] for r in report["recommendations"])
     assert any("applypilot-fleet-dedup-repair" in r["command"] for r in report["recommendations"])
+    assert repair_report.classify_crash_error("email_reconcile_review_required") == "email_review_required"
 
 
 class _Conn:

@@ -4,12 +4,14 @@ dry-run by default; writes only to the fleet Postgres. Reuses gmail_outcomes.mat
 from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
 
 from applypilot.gmail_outcomes import match_email_to_job
 
 CONFIRMING_STAGES = frozenset({"acknowledged", "screen", "assessment", "interview", "offer", "rejected"})
-# Exact/near-exact methods that confirm a match regardless of score.
-STRONG_METHODS = frozenset({"board_slug", "linkedin_job_id", "company_domain"})
+# Exact per-job methods that confirm a match regardless of score. Bare company_domain is
+# review-only: LinkedIn/Indeed/company career domains can hold many simultaneous crash rows.
+STRONG_METHODS = frozenset({"board_slug", "linkedin_job_id"})
 # Fuzzy methods strong ENOUGH to auto-confirm when they clear MIN_STRONG. Only `ats_domain`
 # qualifies: an ATS sender (Greenhouse/Lever/...) plus a matching extracted employer name is
 # materially stronger than a bare token overlap. `company_name` and `title` are NOT here — a
@@ -134,12 +136,55 @@ def load_crash_jobs(conn, *, limit: int | None = None) -> list[dict]:
     return out
 
 
-def reconcile(emails: list, jobs: list[dict], *, min_strong: float = MIN_STRONG) -> ReconcileResult:
+def load_consumed_message_ids(conn) -> set[str]:
+    """Return Gmail message IDs already used as proof for a reconcile flip.
+
+    A single confirmation email is one piece of evidence. Once consumed, it must not
+    be matched to the next same-domain crash row on a later run.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT message_id FROM email_reconcile_actions "
+                "WHERE message_id IS NOT NULL AND message_id <> ''"
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"}:
+            rollback = getattr(conn, "rollback", None)
+            if rollback is not None:
+                rollback()
+            return set()
+        raise
+    out: set[str] = set()
+    for row in rows:
+        value = row.get("message_id") if isinstance(row, Mapping) else row[0]
+        if value:
+            out.add(str(value))
+    return out
+
+
+def reconcile(
+    emails: list,
+    jobs: list[dict],
+    *,
+    min_strong: float = MIN_STRONG,
+    consumed_message_ids: Iterable[str] | None = None,
+) -> ReconcileResult:
     """Match each outcome email to a crash job via the existing fuzzy matcher and classify the hit.
-    A job is resolved at most once: the highest-scoring hit wins (a strong method scores 1.0)."""
+    A job is resolved at most once: the highest-scoring hit wins (a strong method scores 1.0).
+    A Gmail message_id is also resolved at most once across runs; otherwise repeated dry-runs can
+    walk the same confirmation email across many same-company crash rows."""
     best: dict[str, Resolution] = {}   # job_url -> best Resolution
+    consumed = {str(mid) for mid in (consumed_message_ids or set()) if mid}
+    seen_message_ids: set[str] = set()
     unmatched = 0
     for e in emails:
+        message_id = str(e.message_id or "")
+        if message_id:
+            if message_id in consumed or message_id in seen_message_ids:
+                continue
+            seen_message_ids.add(message_id)
         r = match_email_to_job(e.sender, e.subject, e.body, jobs, occurred_at=e.occurred_at)
         if r.status != "attributed":
             unmatched += 1
@@ -174,8 +219,14 @@ def apply_resolutions(
     targets = list(result.confirmed) + (list(result.probable) if include_probable else [])
     if max_flips is not None:
         targets = targets[: max(int(max_flips), 0)]
+    consumed_message_ids = load_consumed_message_ids(conn)
+    used_this_run: set[str] = set()
     flipped = skipped = 0
     for r in targets:
+        message_id = str(r.message_id or "")
+        if message_id and (message_id in consumed_message_ids or message_id in used_this_run):
+            skipped += 1
+            continue
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -203,6 +254,9 @@ def apply_resolutions(
                     (r.job_url,),
                 )
                 flipped += 1
+                if message_id:
+                    consumed_message_ids.add(message_id)
+                    used_this_run.add(message_id)
         except Exception:
             conn.rollback()
             raise

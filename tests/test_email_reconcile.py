@@ -92,14 +92,26 @@ def _email(**kw):
     return er.OutcomeEmail(**base)
 
 
-def test_reconcile_company_domain_is_confirmed():
+def test_reconcile_company_domain_is_probable():
     jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
              "title": "Analyst", "site": "stripe.com"}]
     emails = [_email(message_id="m1", sender="jobs@stripe.com", subject="Application received")]
     res = er.reconcile(emails, jobs)
+    assert res.confirmed == []
+    r = res.probable[0]
+    assert r.job_url == "https://stripe.com/jobs/1" and r.method == "company_domain" and r.classification == "probable"
+
+
+def test_reconcile_board_slug_is_confirmed():
+    jobs = [{"url": "https://job-boards.greenhouse.io/stripe/jobs/1",
+             "application_url": "https://job-boards.greenhouse.io/stripe/jobs/1",
+             "company": "Stripe", "title": "Analyst", "site": "job-boards.greenhouse.io"}]
+    emails = [_email(message_id="m1", sender="no-reply@greenhouse-mail.io",
+                     subject="Application received",
+                     body="Thanks for applying: https://job-boards.greenhouse.io/stripe/jobs/1")]
+    res = er.reconcile(emails, jobs)
     assert len(res.confirmed) == 1
-    r = res.confirmed[0]
-    assert r.job_url == "https://stripe.com/jobs/1" and r.method == "company_domain" and r.classification == "confirmed"
+    assert res.confirmed[0].method == "board_slug"
 
 
 def test_reconcile_no_overlap_is_unmatched():
@@ -121,15 +133,37 @@ def test_reconcile_resolves_each_job_once():
     res = er.reconcile(emails, jobs)
     all_urls = [r.job_url for r in res.confirmed + res.probable]
     assert all_urls.count("https://stripe.com/jobs/1") == 1   # deduped to one resolution
-    assert len(res.confirmed) == 1
+    assert len(res.probable) == 1
+
+
+def test_reconcile_skips_consumed_message_ids():
+    jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
+             "title": "Analyst", "site": "stripe.com"}]
+    emails = [_email(message_id="m-consumed", sender="jobs@stripe.com", subject="Application received")]
+    res = er.reconcile(emails, jobs, consumed_message_ids={"m-consumed"})
+    assert res.confirmed == []
+    assert res.probable == []
+    assert res.unmatched_emails == 0
+
+
+def test_reconcile_uses_message_id_once_within_run():
+    jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
+             "title": "Analyst", "site": "stripe.com"}]
+    emails = [
+        _email(message_id="m-dupe", sender="jobs@stripe.com", subject="Application received"),
+        _email(message_id="m-dupe", sender="jobs@stripe.com", subject="Application received"),
+    ]
+    res = er.reconcile(emails, jobs)
+    assert len(res.probable) == 1
 
 
 # ---------------------------------------------------------------------------
 # Task 5: apply_resolutions
 # ---------------------------------------------------------------------------
 class _ScriptCursor:
-    def __init__(self, rowcounts):
+    def __init__(self, rowcounts, rows=None):
         self._rc = list(rowcounts)
+        self._rows = list(rows or [])
         self.executed = []
         self.rowcount = 0
 
@@ -144,10 +178,13 @@ class _ScriptCursor:
         if sql.strip().upper().startswith("UPDATE"):
             self.rowcount = self._rc.pop(0) if self._rc else 0
 
+    def fetchall(self):
+        return self._rows
+
 
 class _ScriptConn:
-    def __init__(self, rowcounts):
-        self._cur = _ScriptCursor(rowcounts)
+    def __init__(self, rowcounts, rows=None):
+        self._cur = _ScriptCursor(rowcounts, rows=rows)
         self.commits = 0
 
     def cursor(self):
@@ -176,6 +213,14 @@ def test_apply_resolutions_flips_confirmed_and_audits():
     assert len(updates) == 1 and len(inserts) == 1
     assert "status='applied'" in updates[0][0].replace(" ", "") or "status = 'applied'" in updates[0][0]
     assert "status='crash_unconfirmed'" in updates[0][0].replace(" ", "")   # guarded
+
+
+def test_apply_resolutions_skips_consumed_message_id():
+    conn = _ScriptConn(rowcounts=[1], rows=[{"message_id": "m"}])
+    counts = er.apply_resolutions(conn, _res(confirmed=[_r("u1")]))
+    assert counts == {"flipped": 0, "skipped": 1}
+    assert not any(e[0].strip().upper().startswith("UPDATE APPLY_QUEUE") for e in conn._cur.executed)
+    assert conn.commits == 0
 
 
 def test_apply_resolutions_skips_when_row_already_moved():
@@ -339,9 +384,12 @@ def test_format_report_summarizes_counts():
 
 
 def test_classify_strong_method_is_confirmed_regardless_of_score():
-    assert er.classify_match("company_domain", 1.0) == "confirmed"
     assert er.classify_match("board_slug", 1.0) == "confirmed"
     assert er.classify_match("linkedin_job_id", 1.0) == "confirmed"
+
+
+def test_classify_company_domain_is_review_only():
+    assert er.classify_match("company_domain", 1.0) == "probable"
 
 
 def test_classify_ats_domain_at_or_above_threshold_is_confirmed():
