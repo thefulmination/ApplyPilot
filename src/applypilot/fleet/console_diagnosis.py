@@ -302,13 +302,15 @@ def recommendations_from(queue: dict, browser: dict) -> list[dict]:
         })
     if browser["counts"].get("browser_service_unavailable") or browser["counts"].get(
         "browser_backend_crashed"
+    ) or browser["counts"].get(
+        "browser_server_unavailable"
     ):
         recs.append({
             "code": "restart_browser_backend",
             "severity": "warn",
             "lane": "ats",
             "title": "Browser backend failures detected",
-            "reason": "Recent worker logs include browser backend crash or connection-refused failures.",
+            "reason": "Recent worker logs include browser backend crash or server unavailable failures.",
             "action_type": "manual_machine",
             "command": "Restart the affected machine's browser/apply worker stack, then verify heartbeat.",
         })

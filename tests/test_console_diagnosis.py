@@ -368,3 +368,15 @@ def test_recommendation_for_linkedin_canary_exhausted(fleet_db):
 
     codes = {r["code"] for r in result["recommendations"]}
     assert "rearm_linkedin_canary" in codes
+
+
+def test_recommendation_for_browser_server_unavailable():
+    queue = {
+        "ats": {"approved": 0, "leaseable": 0, "dedup_blocked": 0},
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {"browser_server_unavailable": 1}}
+
+    result = console_diagnosis.recommendations_from(queue, browser)
+
+    assert [r["code"] for r in result] == ["restart_browser_backend"]
