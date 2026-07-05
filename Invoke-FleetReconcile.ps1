@@ -287,7 +287,9 @@ if [ "$applyLiteral" = "1" ]; then
   echo 'APPLY: clean stale pip invalid distribution artifacts (~pplypilot*)'
   "`$py_cmd" -c 'import site; print("\n".join(p for p in set(site.getsitepackages() + [site.getusersitepackages()]) if p))' |
   while IFS= read -r site_dir; do
-    [ -d "`$site_dir" ] && (cd "`$site_dir" && find . -maxdepth 1 -name '~pplypilot*' -print -exec rm -rf {} +)
+    if [ -d "`$site_dir" ]; then
+      (cd "`$site_dir" && find . -maxdepth 1 -name '~pplypilot*' -print -exec rm -rf {} +)
+    fi
   done
   echo 'APPLY: pip install -e .'
   "`$py_cmd" -m pip install -e .

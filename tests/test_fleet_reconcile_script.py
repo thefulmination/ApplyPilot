@@ -39,6 +39,7 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "~pplypilot*",
         "Remove-Item -LiteralPath",
         "find . -maxdepth 1 -name '~pplypilot*'",
+        "if [ -d \"`$site_dir\" ]; then",
         "pip install -e .",
         "register-fleet-tasks.ps1",
         "start ApplyPilotFleet tasks",
