@@ -132,6 +132,11 @@ function New-WindowsBody([hashtable]$Target) {
 @"
 `$ErrorActionPreference = "Continue"
 `$ProgressPreference = "SilentlyContinue"
+function Invoke-CheckedNative([string]`$Label, [scriptblock]`$Command) {
+  Write-Output `$Label
+  & `$Command
+  if (`$LASTEXITCODE -ne 0) { throw "`$Label failed with exit `$LASTEXITCODE" }
+}
 Write-Output "mode: $mode"
 Set-Location '$repoLiteral'
 Write-Output "repo: `$PWD"
@@ -141,6 +146,12 @@ Write-Output "git rev-parse --short HEAD"
 git rev-parse --short HEAD
 if ($applyLiteral) {
   `$branch = '$branchLiteral'
+  `$trackedDirty = git status --porcelain --untracked-files=no
+  if (`$trackedDirty) {
+    Write-Output "APPLY: stashing tracked local changes before sync"
+    git stash push -m "applypilot-reconcile-`$(`$env:COMPUTERNAME)-`$(Get-Date -Format yyyyMMddTHHmmss)"
+    if (`$LASTEXITCODE -ne 0) { throw "git stash push failed with exit `$LASTEXITCODE" }
+  }
   if (`$branch) {
     `$remoteRef = `$null
     foreach (`$remoteName in @("myfork", "origin", "homebundle")) {
@@ -154,26 +165,19 @@ if ($applyLiteral) {
       git show-ref --verify --quiet "refs/remotes/`$candidate"
       if (`$LASTEXITCODE -eq 0) { `$remoteRef = `$candidate; break }
     }
-    if (`$remoteRef) {
-      git show-ref --verify --quiet "refs/heads/`$branch"
-      if (`$LASTEXITCODE -eq 0) {
-        Write-Output "APPLY: git checkout `$branch"
-        git checkout `$branch
-        Write-Output "APPLY: git merge --ff-only `$remoteRef"
-        git merge --ff-only `$remoteRef
-      } else {
-        Write-Output "APPLY: git checkout -b `$branch `$remoteRef"
-        git checkout -b `$branch `$remoteRef
-      }
+    if (-not `$remoteRef) {
+      throw "ERROR: could not fetch branch `$branch from myfork/origin/homebundle"
+    }
+    git show-ref --verify --quiet "refs/heads/`$branch"
+    if (`$LASTEXITCODE -eq 0) {
+      Invoke-CheckedNative "APPLY: git checkout `$branch" { git checkout `$branch }
+      Invoke-CheckedNative "APPLY: git merge --ff-only `$remoteRef" { git merge --ff-only `$remoteRef }
     } else {
-      Write-Output "APPLY: git checkout `$branch"
-      git checkout `$branch
+      Invoke-CheckedNative "APPLY: git checkout -b `$branch `$remoteRef" { git checkout -b `$branch `$remoteRef }
     }
   } else {
-    Write-Output "APPLY: git fetch"
-    git fetch
-    Write-Output "APPLY: git merge --ff-only"
-    git merge --ff-only
+    Invoke-CheckedNative "APPLY: git fetch" { git fetch }
+    Invoke-CheckedNative "APPLY: git merge --ff-only" { git merge --ff-only }
   }
   Write-Output "APPLY: stop ApplyPilotFleet tasks/processes before reinstall"
   Get-ScheduledTask -TaskName 'ApplyPilotFleet-*' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
@@ -213,8 +217,9 @@ if ($applyLiteral) {
     }
     Write-Output "APPLY: pip install -e ."
     & `$py -m pip install -e .
+    if (`$LASTEXITCODE -ne 0) { throw "pip install -e . failed with exit `$LASTEXITCODE" }
   } else {
-    Write-Output "ERROR: no repo Python found for pip install -e ."
+    throw "ERROR: no repo Python found for pip install -e ."
   }
   if (Test-Path .\register-fleet-tasks.ps1) {
     Write-Output "APPLY: register-fleet-tasks.ps1"
@@ -255,6 +260,10 @@ echo 'git rev-parse --short HEAD'
 git rev-parse --short HEAD
 if [ "$applyLiteral" = "1" ]; then
   branch='$branchLiteral'
+  if [ -n "`$(git status --porcelain --untracked-files=no)" ]; then
+    echo 'APPLY: stashing tracked local changes before sync'
+    git stash push -m "applypilot-reconcile-`$(hostname)-`$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
   if [ -n "`$branch" ]; then
     remote_ref=''
     for remote_name in myfork origin homebundle; do
