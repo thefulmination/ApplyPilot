@@ -153,6 +153,26 @@ def test_watchdog_does_not_restart_stale_idle_discovery_worker(fleet_db):
             assert cur.fetchone()["n"] == 0
 
 
+def test_watchdog_does_not_restart_unmanaged_linkedin_worker(fleet_db):
+    cfg = watchdog.WatchdogConfig()
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, role, state, last_beat) "
+                "VALUES ('home-linkedin-0','linkedin','idle', now() - interval '10 minutes')"
+            )
+        conn.commit()
+        summary = watchdog.watchdog_tick(conn, cfg)
+
+        assert all(e["worker_id"] != "home-linkedin-0" for e in summary["stuck_handled"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM remote_commands "
+                "WHERE worker_id='home-linkedin-0' AND command='restart' AND acked_at IS NULL"
+            )
+            assert cur.fetchone()["n"] == 0
+
+
 def test_watchdog_does_not_restart_stale_fleet_doctor_heartbeat(fleet_db):
     cfg = watchdog.WatchdogConfig()
     with pgqueue.connect(fleet_db) as conn:

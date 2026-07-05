@@ -106,12 +106,13 @@ SELECT worker_id, reason, machine_owner FROM (
     SELECT worker_id, 'no_heartbeat' AS reason, machine_owner
     FROM worker_heartbeat
     WHERE last_beat < now() - make_interval(secs => %(hb_timeout)s)
-      AND role IN ('apply', 'compute', 'discovery', 'linkedin')
+      AND role IN ('apply', 'compute', 'discovery')
       AND NOT (role = 'discovery' AND state = 'idle')
     UNION ALL
     SELECT worker_id, 'job_over_max' AS reason, machine_owner
     FROM worker_heartbeat
     WHERE state = 'applying'
+      AND role IN ('apply', 'compute', 'discovery')
       AND job_started_at IS NOT NULL
       AND job_started_at < now() - make_interval(secs => %(job_max)s)
 ) s
