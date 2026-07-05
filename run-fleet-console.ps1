@@ -7,8 +7,14 @@
 
 $ErrorActionPreference = "Stop"
 
-$RepoRoot  = "C:/Users/JStal/OneDrive/Documents/New project/ApplyPilot"
-$PyExe     = "C:/Users/JStal/OneDrive/Documents/New project/ApplyPilot/.conda-env/python.exe"
+$RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoPyExe = Join-Path $RepoRoot ".conda-env/python.exe"
+if (Test-Path $RepoPyExe) {
+    $PyExe = $RepoPyExe
+} else {
+    # Worktrees share the primary checkout's Python environment.
+    $PyExe = "C:/Users/JStal/OneDrive/Documents/New project/ApplyPilot/.conda-env/python.exe"
+}
 $FleetDsn  = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
 $Port      = 8787   # 8765 is used by an unrelated local app (radio_digest); 8787 is free
 
@@ -18,6 +24,7 @@ $env:APPLYPILOT_FLEET_DSN = $FleetDsn
 $env:FLEET_PG_DSN         = $FleetDsn
 # So the "Expand searches" button can find searches.yaml (PG-only seed; no brain access).
 $env:APPLYPILOT_DIR       = Join-Path $RepoRoot ".applypilot"
+$env:PYTHONPATH = Join-Path $RepoRoot "src"
 
 Set-Location $RepoRoot
 

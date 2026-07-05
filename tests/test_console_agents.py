@@ -182,6 +182,32 @@ def test_agent_summary_treats_current_agent_as_configured_when_chain_empty(fleet
     assert result["verdict"]["code"] == "all_agents_blocked"
 
 
+def test_agent_summary_degrades_when_heartbeat_telemetry_columns_missing(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE worker_heartbeat "
+                "DROP COLUMN current_agent, "
+                "DROP COLUMN current_model, "
+                "DROP COLUMN agent_chain, "
+                "DROP COLUMN last_agent_switch_at, "
+                "DROP COLUMN last_agent_switch_reason"
+            )
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, home_ip, role, state, last_beat) "
+                "VALUES ('w-legacy', 'home', '100.90.104.99', 'apply', 'idle', now())"
+            )
+        conn.commit()
+
+        result = console_agents.agent_summary(conn)
+
+    assert result["verdict"]["code"] == "schema_missing"
+    assert result["workers"][0]["worker_id"] == "w-legacy"
+    assert result["workers"][0]["current_agent"] is None
+    assert result["workers"][0]["current_model"] is None
+
+
 def test_agents_route_scrubs_connect_errors(monkeypatch):
     def boom():
         raise RuntimeError("connect failed password=super-secret token=raw-token")

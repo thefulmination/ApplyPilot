@@ -284,7 +284,7 @@ def operational_rollups(conn) -> dict:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT worker_id, machine_owner, role, state, last_beat, current_agent, current_model "
+                "SELECT worker_id, machine_owner, role, state, last_beat "
                 "FROM worker_heartbeat ORDER BY machine_owner NULLS LAST, worker_id"
             )
             worker_rows = cur.fetchall()

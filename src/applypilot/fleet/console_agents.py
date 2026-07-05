@@ -4,6 +4,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from psycopg import errors
+
 
 def _iso(v: Any) -> str | None:
     if v is None:
@@ -104,8 +106,7 @@ def _has_scoped_activity(worker: dict[str, Any], recent_usage: list[dict[str, An
     return False
 
 
-def agent_summary(conn) -> dict[str, Any]:
-    """Return current apply-agent routing, block state, and 24h apply spend."""
+def _read_workers(conn) -> tuple[list[dict[str, Any]], bool]:
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -116,27 +117,50 @@ def agent_summary(conn) -> dict[str, Any]:
                 "WHERE role = 'apply' "
                 "ORDER BY worker_id"
             )
-            workers = []
-            for row in cur.fetchall():
-                last_agent_switch_at = row.get("last_agent_switch_at")
-                workers.append(
-                    {
-                        "worker_id": row.get("worker_id"),
-                        "machine_owner": row.get("machine_owner"),
-                        "home_ip": row.get("home_ip"),
-                        "role": row.get("role"),
-                        "state": row.get("state"),
-                        "last_beat": _iso(row.get("last_beat")),
-                        "current_agent": row.get("current_agent"),
-                        "current_model": row.get("current_model"),
-                        "agent_chain": row.get("agent_chain"),
-                        "chain_agents": _configured_agents(row),
-                        "last_agent_switch_at": _iso(last_agent_switch_at),
-                        "_last_agent_switch_at": last_agent_switch_at,
-                        "last_agent_switch_reason": row.get("last_agent_switch_reason"),
-                    }
-                )
+            rows = cur.fetchall()
+    except errors.UndefinedColumn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id, machine_owner, home_ip, role, state, last_beat "
+                "FROM worker_heartbeat "
+                "WHERE role = 'apply' "
+                "ORDER BY worker_id"
+            )
+            rows = cur.fetchall()
+        telemetry_available = False
+    else:
+        telemetry_available = True
 
+    workers = []
+    for row in rows:
+        last_agent_switch_at = row.get("last_agent_switch_at") if telemetry_available else None
+        worker = {
+            "worker_id": row.get("worker_id"),
+            "machine_owner": row.get("machine_owner"),
+            "home_ip": row.get("home_ip"),
+            "role": row.get("role"),
+            "state": row.get("state"),
+            "last_beat": _iso(row.get("last_beat")),
+            "current_agent": row.get("current_agent") if telemetry_available else None,
+            "current_model": row.get("current_model") if telemetry_available else None,
+            "agent_chain": row.get("agent_chain") if telemetry_available else None,
+            "last_agent_switch_at": _iso(last_agent_switch_at),
+            "_last_agent_switch_at": last_agent_switch_at,
+            "last_agent_switch_reason": (
+                row.get("last_agent_switch_reason") if telemetry_available else None
+            ),
+        }
+        worker["chain_agents"] = _configured_agents(worker)
+        workers.append(worker)
+    return workers, telemetry_available
+
+
+def agent_summary(conn) -> dict[str, Any]:
+    """Return current apply-agent routing, block state, and 24h apply spend."""
+    try:
+        workers, telemetry_available = _read_workers(conn)
+        with conn.cursor() as cur:
             cur.execute(
                 "SELECT agent, blocked_until, reason, updated_at, "
                 "(blocked_until IS NOT NULL AND blocked_until > now()) AS blocked "
@@ -182,11 +206,20 @@ def agent_summary(conn) -> dict[str, Any]:
             {k: v for k, v in worker.items() if not k.startswith("_")}
             for worker in workers
         ]
+        verdict = (
+            _make_verdict(
+                "schema_missing",
+                "warn",
+                "Agent/model heartbeat columns are not installed; apply the fleet v3 schema migration.",
+            )
+            if not telemetry_available
+            else _verdict(workers, availability, recent_usage)
+        )
         return {
             "workers": public_workers,
             "availability": availability,
             "spend_24h": spend_24h,
-            "verdict": _verdict(workers, availability, recent_usage),
+            "verdict": verdict,
         }
     finally:
         try:

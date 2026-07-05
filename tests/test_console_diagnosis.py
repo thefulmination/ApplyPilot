@@ -444,3 +444,24 @@ def test_operational_rollups_include_machines_hosts_forecast_goals_and_workers(f
     assert result["daily_goal"]["configured"] is False
     assert result["worker_comparison"][0]["worker_id"] == "m4-0"
     assert result["freshness"]["last_apply_at"] is not None
+
+
+def test_operational_rollups_tolerate_missing_agent_heartbeat_columns(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE worker_heartbeat "
+                "DROP COLUMN current_agent, "
+                "DROP COLUMN current_model"
+            )
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, home_ip, role, state, last_beat) "
+                "VALUES ('m4-legacy','m4','100.69.68.103','apply','idle',now())"
+            )
+        conn.commit()
+
+        result = console_diagnosis.operational_rollups(conn)
+
+    assert result["machines"]["m4"]["workers"] == 1
+    assert result["machines"]["m4"]["roles"]["apply"] == 1
