@@ -33,6 +33,7 @@ logs/
 .conda-pkgs/
 .conda-temp/
 .codex-temp/
+.worktrees/
 .npm-cache/
 .playwright-browsers/
 .tools/
