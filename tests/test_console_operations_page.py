@@ -93,3 +93,15 @@ def test_agent_routing_table_is_responsively_contained(live_server):
     assert "overflow-x:auto" in html
     assert 'id="agentRouting"' in html
     assert '<div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Switch</th></tr></thead>' in html
+
+
+def test_dashboard_uses_friendly_machine_names(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert '"m2":"TARPON"' in html
+    assert '"m4":"GGGTower"' in html
+    assert '"home":"Home"' in html
+    assert "function machineLabel(machine)" in html
+    assert "machineLabel(k)" in html
+    assert "machineLabel(w.machine_owner)" in html

@@ -1721,9 +1721,15 @@ _INDEX_HTML = r"""<!doctype html>
 <script>
 "use strict";
 let lastUpdate = null;
+const MACHINE_LABELS = {"m2":"TARPON","m4":"GGGTower","home":"Home"};
 
 function esc(s){ return s==null ? "" : String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function machineLabel(machine){
+  const raw = machine == null ? "" : String(machine);
+  return MACHINE_LABELS[raw.toLowerCase()] || raw;
+}
 
 function rel(iso){
   if(!iso) return "never";
@@ -1796,7 +1802,7 @@ function renderDiagnosis(d){
   ].map(([k,v]) => '<div class="fstep"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
   const machines = roll.machines || {};
   document.getElementById("machineMap").innerHTML = Object.keys(machines).length
-    ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(k)+'</span><b>'+
+    ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(machineLabel(k))+'</span><b>'+
       esc(machines[k].workers)+'</b><small class="mut"> workers</small></div>').join("")
     : '<div class="mut">no machine heartbeats</div>';
 }
@@ -1807,7 +1813,7 @@ function renderAgents(d){
   const rows = d.workers || [];
   const body = document.getElementById("agentWorkers");
   body.innerHTML = rows.length ? rows.map(w =>
-    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_owner||"")+'</td><td>'+
+    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(machineLabel(w.machine_owner))+'</td><td>'+
     esc(w.current_agent||"unknown")+'</td><td>'+esc(w.current_model||"unknown")+'</td><td>'+
     esc(w.agent_chain||"")+'</td><td>'+esc(w.last_agent_switch_reason||"")+'</td></tr>'
   ).join("") : '<tr><td colspan="6" class="mut">no apply worker agent telemetry</td></tr>';
