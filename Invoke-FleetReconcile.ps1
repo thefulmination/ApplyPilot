@@ -26,7 +26,7 @@ if (-not $KeyPath) {
 $FleetTargets = @(
   @{ Name = "Tarpon"; Machine = "m2"; Kind = "windows"; Target = "rstal@tarpon"; RepoPath = "C:\ApplyPilot" },
   @{ Name = "GGGTower"; Machine = "m4"; Kind = "windows"; Target = "backoffice@gggtower"; RepoPath = "C:\ApplyPilot" },
-  @{ Name = "Paloma"; Machine = "mac"; Kind = "mac"; Target = "palomaperez@palomas-macbook-air"; RepoPath = '$HOME/ApplyPilot' }
+  @{ Name = "Paloma"; Machine = "mac"; Kind = "mac"; Target = "palomaperez@palomas-macbook-air"; RepoPath = '$HOME/applypilot-fleet' }
 )
 
 function Write-Section([string]$Title) {
@@ -240,7 +240,7 @@ function New-MacBody([hashtable]$Target) {
 @"
 set -u
 echo 'mode: $mode'
-cd "$($Target.RepoPath)" 2>/dev/null || cd "`$HOME/ApplyPilot"
+cd "$($Target.RepoPath)" 2>/dev/null || cd "`$HOME/applypilot-fleet"
 echo 'repo:' "`$PWD"
 echo 'git status --short --branch'
 git status --short --branch

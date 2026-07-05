@@ -18,6 +18,7 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "rstal@tarpon",
         "backoffice@gggtower",
         "palomaperez@palomas-macbook-air",
+        '$HOME/applypilot-fleet',
         "git status --short --branch",
         "git fetch `$remoteName `$branch",
         "git fetch \"$remote_name\"",
@@ -46,6 +47,7 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         assert text in script
 
     assert "192.168.1.187" not in script
+    assert '$HOME/ApplyPilot' not in script
     assert "checkout -B" not in script
     assert "git fetch --all" not in script
     assert "-like '*$repoLiteral*'" not in script
