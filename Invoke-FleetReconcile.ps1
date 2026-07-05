@@ -208,6 +208,8 @@ if ($applyLiteral) {
   if (Test-Path .\register-fleet-tasks.ps1) {
     Write-Output "APPLY: register-fleet-tasks.ps1"
     .\register-fleet-tasks.ps1 -Machine '$machineLiteral' -AllowZero
+    Write-Output "APPLY: start ApplyPilotFleet tasks"
+    Get-ScheduledTask -TaskName 'ApplyPilotFleet-*' -ErrorAction SilentlyContinue | Start-ScheduledTask -ErrorAction SilentlyContinue
   }
 } else {
   Write-Output "CHECK-ONLY: pass -Apply to change remote state"
@@ -269,6 +271,7 @@ if [ "$applyLiteral" = "1" ]; then
   echo 'APPLY: pip install -e .'
   if [ -x ./.venv/bin/python ]; then ./.venv/bin/python -m pip install -e .; else python3 -m pip install -e .; fi
   if [ -f ./setup-mac-worker.sh ]; then echo 'APPLY: setup-mac-worker.sh present; run manually if launchd needs re-registration'; fi
+  if command -v launchctl >/dev/null 2>&1; then echo 'APPLY: launchd restart remains manual on mac target'; fi
 else
   echo 'CHECK-ONLY: pass -Apply to change remote state'
 fi

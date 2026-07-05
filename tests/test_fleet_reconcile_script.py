@@ -34,6 +34,8 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
         "applypilot-fleet-*",
         "pip install -e .",
         "register-fleet-tasks.ps1",
+        "start ApplyPilotFleet tasks",
+        "Start-ScheduledTask",
         "fleet-health.ps1",
         "pass -RunHealth to include it",
         "EncodedCommand",
