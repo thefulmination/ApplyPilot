@@ -125,3 +125,43 @@ def test_summarize_worker_logs_counts_examples_and_skips_unknown():
             "logs_url": "/api/logs?worker=w1",
         }
     }
+
+
+def test_summarize_worker_logs_returns_actionable_wall_queue():
+    summary = B.summarize_worker_logs([
+        {
+            "worker_id": "m2-0",
+            "machine_owner": "m2",
+            "last_error": "RESULT:FAILED:login_issue",
+            "recent_log": "login page detected",
+        },
+        {
+            "worker_id": "m4-1",
+            "machine_owner": "m4",
+            "last_error": "CapSolver ERROR_INVALID_TASK_DATA",
+            "recent_log": "hCaptcha appeared",
+        },
+    ])
+
+    assert summary["wall_queue"] == [
+        {
+            "kind": "login_gate",
+            "severity": "warn",
+            "worker_id": "m2-0",
+            "machine_owner": "m2",
+            "machine_display_name": "TARPON",
+            "logs_url": "/api/logs?worker=m2-0",
+            "action": "Resolve login/session in the worker browser or quarantine the affected job.",
+            "sample": "RESULT:FAILED:login_issue",
+        },
+        {
+            "kind": "captcha",
+            "severity": "warn",
+            "worker_id": "m4-1",
+            "machine_owner": "m4",
+            "machine_display_name": "GGGTower",
+            "logs_url": "/api/logs?worker=m4-1",
+            "action": "Open logs, solve the challenge manually, or quarantine before scaling applies.",
+            "sample": "CapSolver ERROR_INVALID_TASK_DATA",
+        },
+    ]

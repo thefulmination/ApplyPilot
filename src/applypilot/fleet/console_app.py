@@ -1720,6 +1720,10 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="browserHealth">
     <h2>Browser Health</h2>
     <div id="browserBody" class="diagnosis-grid"></div>
+    <div class="dgrp" style="margin-top:12px">
+      <div class="lbl">Wall Queue</div>
+      <div id="browserWallQueue" class="mut">loading browser wall queue</div>
+    </div>
   </section>
 
   <section id="workerComparison">
@@ -1873,6 +1877,12 @@ function machineName(obj, fallback){
 function openWorkerLogs(workerId){
   const sel = document.getElementById("logWorker");
   if(!sel) return false;
+  if(workerId && !Array.from(sel.options).some(o => o.value === workerId)){
+    const opt = document.createElement("option");
+    opt.value = workerId;
+    opt.textContent = workerId;
+    sel.appendChild(opt);
+  }
   sel.value = workerId || "";
   loadLogs();
   document.getElementById("logArea").scrollIntoView({block:"center"});
@@ -1949,6 +1959,7 @@ function renderDiagnosis(d){
         return '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(counts[k])+'</b>'+detail+'</div>';
       }).join("")
     : '<div class="mut">no classified browser failures</div>';
+  renderBrowserWallQueue(browser.wall_queue || []);
   document.getElementById("funnelBody").innerHTML = [
     ["Queued", ats.queued],
     ["Approved", ats.approved],
@@ -1994,6 +2005,23 @@ function renderRecommendationList(recs){
       esc(r.title || r.code || "Recommendation")+'</div><div class="r">'+
       esc(r.reason || "")+'</div></div>';
   }).join("");
+}
+
+function renderBrowserWallQueue(rows){
+  const el = document.getElementById("browserWallQueue");
+  if(!el) return;
+  if(!rows.length){
+    el.innerHTML = '<div class="mut">no browser/login/captcha walls in worker logs</div>';
+    return;
+  }
+  el.innerHTML = '<div class="table-scroll"><table><thead><tr>'+
+    '<th>Kind</th><th>Machine</th><th>Worker</th><th>Sample</th><th>Action</th><th>Logs</th>'+
+    '</tr></thead><tbody>' + rows.map(r =>
+      '<tr><td>'+esc(r.kind||"unknown")+'</td><td>'+esc(r.machine_display_name||r.machine_owner||"")+
+      '</td><td>'+esc(r.worker_id||"")+'</td><td>'+esc(r.sample||"")+'</td><td>'+
+      esc(r.action||"Open logs and inspect before scaling applies.")+'</td><td><a href="'+
+      esc(r.logs_url||"#")+'" onclick="return openWorkerLogs('+esc(JSON.stringify(String(r.worker_id||"")))+')">logs</a></td></tr>'
+    ).join("") + '</tbody></table></div>';
 }
 
 function renderWorkerComparison(rows){

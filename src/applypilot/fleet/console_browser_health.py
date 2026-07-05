@@ -37,6 +37,19 @@ _RULES = [
     ("no_result_line", "warn", ("no_result_line",)),
 ]
 
+_ACTIONS = {
+    "login_gate": "Resolve login/session in the worker browser or quarantine the affected job.",
+    "captcha": "Open logs, solve the challenge manually, or quarantine before scaling applies.",
+    "email_otp": "Complete the OTP on the owner machine, then re-queue or quarantine.",
+    "browser_backend_crashed": "Restart the browser backend or the affected worker before scaling applies.",
+    "browser_service_unavailable": "Restart the browser service or the affected worker before scaling applies.",
+    "browser_server_unavailable": "Restart the browser server or the affected worker before scaling applies.",
+    "usage_limit": "Switch agent/model if available, or wait for the provider limit to reset.",
+    "timeout": "Open logs and quarantine repeated timeout hosts before scaling applies.",
+    "employer_application_cap": "Skip or quarantine the employer cap; retrying will not help.",
+    "no_result_line": "Inspect the worker log before trusting the attempted apply outcome.",
+}
+
 
 def classify_text(text: str | None) -> dict:
     lower = (text or "").lower()
@@ -46,9 +59,19 @@ def classify_text(text: str | None) -> dict:
     return {"kind": "unknown", "severity": "info"}
 
 
+def _sample(row: dict) -> str:
+    text = str(row.get("last_error") or row.get("recent_log") or "")
+    for line in text.splitlines():
+        line = " ".join(line.split())
+        if line:
+            return line[:180]
+    return ""
+
+
 def summarize_worker_logs(rows: list[dict]) -> dict:
     counts: dict[str, int] = {}
     examples: dict[str, dict] = {}
+    wall_queue: list[dict] = []
     for row in rows:
         text = "\n".join(str(row.get(k) or "") for k in ("last_error", "recent_log"))
         cls = classify_text(text)
@@ -67,4 +90,14 @@ def summarize_worker_logs(rows: list[dict]) -> dict:
             "severity": cls["severity"],
             "logs_url": f"/api/logs?worker={quote(str(worker_id or ''))}",
         })
-    return {"counts": counts, "examples": examples}
+        wall_queue.append({
+            "kind": kind,
+            "severity": cls["severity"],
+            "worker_id": worker_id,
+            "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
+            "logs_url": f"/api/logs?worker={quote(str(worker_id or ''))}",
+            "action": _ACTIONS.get(kind, "Open logs and inspect before scaling applies."),
+            "sample": _sample(row),
+        })
+    return {"counts": counts, "examples": examples, "wall_queue": wall_queue[:12]}
