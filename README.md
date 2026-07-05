@@ -114,6 +114,21 @@ For the home/Tarpon/GGGTower/Paloma fleet, run the read-only status report from 
 
 It prints local scheduled tasks/processes, Postgres fleet tables, and SSH probes for the remote workers.
 
+### Fleet Software Rollout
+
+Normal fleet consistency is git release plus `fleet-agent.ps1 -AutoUpdate`, not manual SSH patching. Worker boxes should be clean clones; the agent fast-forwards between jobs, reinstalls the editable package when needed, and restarts workers through its normal reconcile loop.
+
+Use SSH over Tailscale for bootstrap/repair only:
+
+```powershell
+.\Invoke-FleetReconcile.ps1              # CHECK-ONLY: inspect Tarpon, GGGTower, Paloma
+.\Invoke-FleetReconcile.ps1 -Only m4     # CHECK-ONLY: inspect one machine
+.\Invoke-FleetReconcile.ps1 -Only m4 -RunHealth
+.\Invoke-FleetReconcile.ps1 -Apply -Branch codex/fleet-applier-hardening
+```
+
+The default check is intentionally quick and bounded; add `-RunHealth` when you want the slower remote `fleet-health.ps1 -SkipRemote` probe. The apply mode runs the same idempotent repair path on each target: `git fetch`, optional branch checkout, `git merge --ff-only`, `pip install -e .`, scheduled-task registration, and `fleet-health.ps1 -SkipRemote`. Do not use SSH to hand-edit fleet files; fix the repo, publish the branch/tag, then let auto-update converge.
+
 ---
 
 ## Configuration

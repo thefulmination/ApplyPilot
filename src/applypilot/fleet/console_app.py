@@ -138,7 +138,7 @@ def _workers(conn) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT wh.worker_id, wh.state, wh.role, wh.current_job, "
-            "       wh.last_beat, aq.company AS cur_company, aq.title AS cur_title, "
+            "       wh.sw_version, wh.last_beat, aq.company AS cur_company, aq.title AS cur_title, "
             "       (SELECT COUNT(*) FROM apply_queue done "
             "          WHERE done.worker_id = wh.worker_id "
             "            AND done.status = 'applied') AS applied_n "
@@ -161,10 +161,55 @@ def _workers(conn) -> list[dict]:
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
             "lane": r["role"],
+            "sw_version": r.get("sw_version"),
             "applied": int(r["applied_n"] or 0),
             "current": current,
         })
     return out
+
+
+def _versions(conn) -> dict:
+    """Read-only software-version rollup for drift visibility.
+
+    A worker is drifted when a pinned version exists and its heartbeat version differs
+    from the expected pin. If a canary worker/version is configured, that worker is
+    compared against the canary version while the rest compare against the pin.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pinned_worker_version, canary_version, canary_worker_id "
+            "FROM fleet_config WHERE id=1"
+        )
+        cfg = cur.fetchone() or {}
+        cur.execute(
+            "SELECT worker_id, machine_owner, sw_version "
+            "FROM worker_heartbeat ORDER BY worker_id"
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+
+    pinned = cfg.get("pinned_worker_version")
+    canary_version = cfg.get("canary_version")
+    canary_worker_id = cfg.get("canary_worker_id")
+    counts: dict[str, int] = {}
+    drifted: list[dict] = []
+    for row in rows:
+        version = row.get("sw_version") or "(unreported)"
+        counts[version] = counts.get(version, 0) + 1
+        expected = canary_version if row.get("worker_id") == canary_worker_id and canary_version else pinned
+        if expected and version != expected:
+            drifted.append({
+                "worker_id": row.get("worker_id"),
+                "machine_owner": row.get("machine_owner"),
+                "sw_version": row.get("sw_version"),
+            })
+    return {
+        "pinned_worker_version": pinned,
+        "canary_version": canary_version,
+        "canary_worker_id": canary_worker_id,
+        "worker_versions": counts,
+        "drifted_workers": drifted,
+    }
 
 
 def _recent(conn, limit: int = 15) -> list[dict]:
@@ -468,6 +513,7 @@ def build_status() -> dict:
         except Exception:
             gate["should_halt"] = gate["paused"]
         workers = _workers(conn)
+        versions = _versions(conn)
         recent = _recent(conn, 15)
         ch = cb._challenges(conn)
         challenges = len(ch.get("challenges", []))
@@ -499,6 +545,7 @@ def build_status() -> dict:
         "gate": gate,
         "queue": queue,
         "workers": workers,
+        "versions": versions,
         "recent": recent,
         "challenges": challenges,
         "linkedin": linkedin,
@@ -1413,6 +1460,20 @@ _INDEX_HTML = r"""<!doctype html>
   </section>
 
   <section>
+    <h2>Software versions</h2>
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="label">Pinned</div>
+        <div class="val" id="versionPinned">&mdash;</div><div class="hint">expected worker version</div></div>
+      <div class="card"><div class="label">Canary</div>
+        <div class="val" id="versionCanary">&mdash;</div><div class="hint" id="versionCanaryHint">optional staged worker</div></div>
+      <div class="card"><div class="label">Drifted</div>
+        <div class="val" id="versionDrift">&mdash;</div><div class="hint">workers off expected version</div></div>
+    </div>
+    <table><thead><tr><th>Version</th><th>Workers</th></tr></thead>
+      <tbody id="versionRows"><tr><td colspan="2" class="mut">&hellip;</td></tr></tbody></table>
+  </section>
+
+  <section>
     <h2>Workers (apply lane)</h2>
     <table><thead><tr><th>Worker</th><th>Live</th><th>Last beat</th><th>Applied</th><th>Current job</th></tr></thead>
       <tbody id="workers"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table>
@@ -1576,6 +1637,19 @@ function render(s){
   document.getElementById("cQueued").textContent = q.queued;
   document.getElementById("cLeasable").textContent = g.leasable;
   document.getElementById("cChallenges").textContent = s.challenges;
+
+  const versions = s.versions || {};
+  document.getElementById("versionPinned").textContent = versions.pinned_worker_version || "not pinned";
+  document.getElementById("versionCanary").textContent = versions.canary_version || "off";
+  document.getElementById("versionCanaryHint").textContent =
+    versions.canary_worker_id ? ("worker " + versions.canary_worker_id) : "optional staged worker";
+  document.getElementById("versionDrift").textContent = (versions.drifted_workers || []).length;
+  const vt = document.getElementById("versionRows");
+  const versionRows = Object.entries(versions.worker_versions || {});
+  if(!versionRows.length){ vt.innerHTML = '<tr><td colspan="2" class="mut">no worker versions reported</td></tr>'; }
+  else vt.innerHTML = versionRows.map(([ver,n])=>{
+    return '<tr><td><code>'+esc(ver)+'</code></td><td>'+esc(n)+'</td></tr>';
+  }).join("");
 
   const wt = document.getElementById("workers");
   if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }

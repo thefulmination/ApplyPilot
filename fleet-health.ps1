@@ -80,6 +80,30 @@ function Show-CapSolverReadiness {
   }
 }
 
+function Show-LocalGitState {
+  Write-Host "Version drift"
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Host "ERROR: git is not available on this machine." -ForegroundColor Red
+    return
+  }
+  Write-Host "git status --short --branch"
+  & git status --short --branch
+  Write-Host "git rev-parse --short HEAD"
+  & git rev-parse --short HEAD
+  $branch = (& git branch --show-current 2>$null)
+  if ($branch) {
+    $remote = (& git config "branch.$branch.remote" 2>$null)
+    if (-not $remote) { $remote = "origin" }
+    $upstream = (& git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>$null)
+    if ($upstream) {
+      Write-Host "upstream: $upstream"
+      & git rev-list --left-right --count "HEAD...$upstream" 2>$null
+    } else {
+      Write-Host "upstream: (none)"
+    }
+  }
+}
+
 function Show-LocalScheduledTasks {
   $tasks = Get-ScheduledTask -TaskName "ApplyPilotFleet-*" -ErrorAction SilentlyContinue
   if (-not $tasks) {
@@ -156,8 +180,22 @@ try:
                 "worker_heartbeat",
                 cur,
                 "SELECT worker_id, role, state, current_job, "
-                "round(EXTRACT(EPOCH FROM (now() - last_beat)))::int AS age_s, last_beat "
+                "sw_version, round(EXTRACT(EPOCH FROM (now() - last_beat)))::int AS age_s, last_beat "
                 "FROM worker_heartbeat ORDER BY worker_id",
+            )
+            show_rows(
+                "fleet pinned version",
+                cur,
+                "SELECT pinned_worker_version, canary_version, canary_worker_id "
+                "FROM fleet_config WHERE id=1",
+            )
+            show_rows(
+                "Version drift",
+                cur,
+                "SELECT fc.pinned_worker_version, wh.sw_version, count(*) AS workers "
+                "FROM worker_heartbeat wh CROSS JOIN fleet_config fc "
+                "GROUP BY fc.pinned_worker_version, wh.sw_version "
+                "ORDER BY wh.sw_version",
             )
             show_rows(
                 "open remote_commands",
@@ -187,6 +225,19 @@ try:
                 "apply_queue",
                 cur,
                 "SELECT status, count(*) AS n FROM apply_queue GROUP BY status ORDER BY status",
+            )
+            show_rows(
+                "apply_queue lease blockers",
+                cur,
+                "SELECT "
+                "count(*) FILTER (WHERE status='queued') AS queued, "
+                "count(*) FILTER (WHERE status='queued' AND lane='ats' AND approved_batch IS NOT NULL) AS approved_ats, "
+                "count(*) FILTER (WHERE status='queued' AND lane='ats' AND approved_batch IS NOT NULL "
+                "  AND EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = apply_queue.dedup_key)) AS already_applied_dedup, "
+                "count(*) FILTER (WHERE status='queued' AND lane='ats' AND approved_batch IS NOT NULL "
+                "  AND NOT EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = apply_queue.dedup_key)) AS lease_candidate_before_governor, "
+                "count(*) FILTER (WHERE status='failed' AND apply_error='dedup:already_applied') AS dedup_suppressed_terminal "
+                "FROM apply_queue",
             )
             show_rows(
                 "compute_queue",
@@ -253,6 +304,7 @@ Invoke-QuietProbe "tailscale status" {
     Write-Host "(tailscale CLI not found)"
   }
 }
+Invoke-QuietProbe "local git state" { Show-LocalGitState }
 Invoke-QuietProbe "ApplyPilotFleet scheduled tasks" { Show-LocalScheduledTasks }
 Invoke-QuietProbe "ApplyPilot processes" { Show-ApplyPilotProcesses }
 Invoke-QuietProbe "CapSolver readiness" { Show-CapSolverReadiness }
@@ -262,6 +314,8 @@ Write-Section "Remote Fleet"
 $windowsTaskProbe = @"
 hostname
 Set-Location C:\ApplyPilot
+git status --short --branch
+git rev-parse --short HEAD
 Write-Output 'CapSolver readiness'
 `$cli = `$null
 foreach (`$candidate in @('.\.conda-env\Scripts\applypilot.exe', '.\.venv\Scripts\applypilot.exe')) { if (Test-Path `$candidate) { `$cli = (Resolve-Path `$candidate).Path; break } }
@@ -277,6 +331,8 @@ Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -like '*C:\ApplyP
 $gggProbe = @"
 hostname
 Set-Location C:\ApplyPilot
+git status --short --branch
+git rev-parse --short HEAD
 git branch --show-current
 git log --oneline -1
 Write-Output 'CapSolver readiness'
@@ -291,7 +347,7 @@ if (Test-Path .\.venv\Scripts\python.exe) { .\.venv\Scripts\python.exe -m pip ch
 Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -like '*C:\ApplyPilot*' } | Select-Object ProcessId,Name,CommandLine | Format-Table -Wrap
 "@
 
-$macProbe = "hostname; pwd; ps aux | grep -E 'applypilot|run-worker-mac' | grep -v grep || true"
+$macProbe = "hostname; pwd; if [ -d `$HOME/ApplyPilot/.git ]; then cd `$HOME/ApplyPilot && git status --short --branch && git rev-parse --short HEAD; fi; ps aux | grep -E 'applypilot|run-worker-mac' | grep -v grep || true"
 
 Invoke-SshProbe "Tarpon" "rstal@tarpon" $windowsTaskProbe
 Invoke-SshProbe "GGGTower" "backoffice@gggtower" $gggProbe

@@ -11,6 +11,44 @@ exactly K submissions before auto-pausing for review.
 
 ## Preconditions (must be true before proceeding)
 
+### P0 — Fleet code is published and pinned
+
+All worker boxes should run a clean git checkout of one published fleet version.  The
+normal rollout path is:
+
+```powershell
+git status --short --branch
+git push origin HEAD
+git tag fleet-20260705.1
+git push origin fleet-20260705.1
+```
+
+Then pin the fleet to the current software identity from the home box:
+
+```powershell
+.\.conda-env\python.exe -c "import os; from applypilot.apply import pgqueue; from applypilot.fleet.config import set_pinned_version; from applypilot.fleet.software_version import current_sw_version; conn=pgqueue.connect(os.environ['FLEET_PG_DSN']); set_pinned_version(conn, current_sw_version()); conn.close(); print(current_sw_version())"
+```
+
+Worker boxes should converge through `fleet-agent.ps1 -AutoUpdate` while between
+jobs.  Do not hand-edit remote files over SSH; fix the repo, push/tag, and let the
+agent fast-forward clean clones.
+
+Verify drift:
+
+```powershell
+.\fleet-health.ps1
+```
+
+If a box is stale, missing the updater, or cannot fast-forward, use Tailscale/SSH
+only for bootstrap/repair:
+
+```powershell
+.\Invoke-FleetReconcile.ps1              # check-only
+.\Invoke-FleetReconcile.ps1 -Only m4     # check one target
+.\Invoke-FleetReconcile.ps1 -Only m4 -RunHealth
+.\Invoke-FleetReconcile.ps1 -Apply -Branch codex/fleet-applier-hardening
+```
+
 ### P1 — v1 fleet is OFF
 
 The legacy v1 fleet apply process (`applypilot apply` / the keepalive task) **must

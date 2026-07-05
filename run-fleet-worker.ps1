@@ -49,6 +49,11 @@ if (-not $exe) { throw "applypilot-fleet-apply not found in .conda-env or .venv 
 $scriptsDir = Split-Path -Parent $exe
 $applypilotCli = Join-Path $scriptsDir "applypilot.exe"
 if (-not (Test-Path $applypilotCli)) { throw "applypilot.exe not found next to applypilot-fleet-apply.exe -- run pip install -e . first." }
+$py = $null
+foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
+  if (Test-Path $d) { $py = (Resolve-Path $d).Path; break }
+}
+if (-not $py) { throw "python not found (.conda-env or .venv) -- run the setup script first." }
 
 function Resolve-FleetHomeIp([string]$Candidate) {
   $ip = "$Candidate".Trim()
@@ -70,6 +75,14 @@ $env:FLEET_HOME_IP = $HomeIp
 $env:FLEET_MACHINE_OWNER = $Label
 
 $env:APPLYPILOT_DIR = Join-Path $ProjectRoot ".applypilot"
+if (-not $env:FLEET_PG_DSN) { throw "FLEET_PG_DSN is not set (the setup script persists it; open a fresh window)." }
+$env:APPLYPILOT_FLEET_DSN = $env:FLEET_PG_DSN
+Write-Host "[fleet-worker] checking fleet Postgres connectivity ..."
+$probeLines = @(& $py (Join-Path $ProjectRoot "fleet-agent-query.py") $Label 2>&1)
+$probe = "$($probeLines | Select-Object -Last 1)"
+if ($probe -notmatch '^\d+\|') {
+  throw "Cannot reach fleet Postgres over FLEET_PG_DSN before starting worker '$WorkerId' (probe='$($probeLines -join ' ')'). On m2/m4 set FLEET_PG_DSN to host=<home Tailscale IP> port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5."
+}
 Write-Host "[fleet-worker] checking CapSolver fleet readiness ..."
 $capProbe = & $applypilotCli fleet-capsolver-check --json 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -115,19 +128,14 @@ $env:APPLYPILOT_AGENT_TIMEOUT = "600"
 # fills+submits then walls at AUTH_REQUIRED. Hydrate once from the fleet_assets blob store (the
 # same PG the box already talks to) -- no manual credential copy. Skips if already present.
 if (-not (Test-Path (Join-Path $HOME ".gmail-mcp\credentials.json"))) {
-  $pyH = @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-  if ($pyH) {
-    Write-Host "[fleet-worker] hydrating Gmail MCP creds from fleet Postgres ..."
-    & $pyH (Join-Path $ProjectRoot "hydrate-gmail.py") 2>&1 | ForEach-Object { Write-Host "  $_" }
-  }
+  Write-Host "[fleet-worker] hydrating Gmail MCP creds from fleet Postgres ..."
+  & $py (Join-Path $ProjectRoot "hydrate-gmail.py") 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 # Cheap read-only liveness probe before each agent launch: ~15% of queued postings are dead
 # (expired/closed) and would otherwise burn a full agent launch. linkedin.com is guarded in
 # liveness.py (never probed). Container/supervisor lanes already run with this ON.
 $env:APPLYPILOT_PREFLIGHT_LIVENESS = "1"
 $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
-
-if (-not $env:FLEET_PG_DSN) { throw "FLEET_PG_DSN is not set (the setup script persists it; open a fresh window)." }
 
 $margs = @(); if ($Model) { $margs = @("--model", $Model) }
 $fargs = @(); if ($FallbackAgent) { $fargs = @("--fallback-agent", $FallbackAgent) }

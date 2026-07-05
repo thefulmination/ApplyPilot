@@ -101,6 +101,62 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
 
 
+def test_push_apply_eligible_skips_applied_set_dedup(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/applied",
+             company="Acme Inc", title="Chief of Staff", apply_status="applied")
+    _add_job(sq, "https://boards.greenhouse.io/other/jobs/1",
+             company="Acme Inc", title="Chief of Staff")
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A"
+        )
+        assert n == 0
+        with pg.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM apply_queue")
+            assert cur.fetchone()["n"] == 0
+            cur.execute("SELECT COUNT(*) AS n FROM applied_set")
+            assert cur.fetchone()["n"] == 1
+
+
+def test_push_apply_eligible_retires_existing_applied_set_duplicates(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/applied",
+             company="Acme Inc", title="Chief of Staff", apply_status="applied")
+    _add_job(sq, "https://boards.greenhouse.io/other/jobs/1",
+             company="Acme Inc", title="Chief of Staff")
+
+    from applypilot.fleet import dedup
+    dk = dedup.dedup_key("Acme Inc", "Chief of Staff")
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, company, title, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
+                "VALUES ('https://boards.greenhouse.io/other/jobs/1', 'Acme Inc', 'Chief of Staff', "
+                "'https://boards.greenhouse.io/other/jobs/1', 9, 'queued', 'ats', 'old-batch', %s, "
+                "'boards.greenhouse.io')",
+                (dk,),
+            )
+        pg.commit()
+
+        assert sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A"
+        ) == 0
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT status, apply_status, apply_error, approved_batch "
+                "FROM apply_queue WHERE url='https://boards.greenhouse.io/other/jobs/1'"
+            )
+            row = cur.fetchone()
+
+    assert row["status"] == "failed"
+    assert row["apply_status"] == "skipped"
+    assert row["apply_error"] == "dedup:already_applied"
+    assert row["approved_batch"] == "old-batch"
+
+
 def test_push_apply_eligible_can_opt_into_research_scores(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://boards.greenhouse.io/research/jobs/1",

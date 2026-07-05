@@ -23,9 +23,15 @@ if ($StartSlot -lt 0 -or ($StartSlot + $Count - 1) -gt 9) { throw "-StartSlot pl
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
-# DSN: inherit a persisted FLEET_PG_DSN (machine 2 sets it at User scope), else default to the
-# home box's local Postgres. Set it in THIS process so the child windows inherit it.
-if (-not $env:FLEET_PG_DSN) { $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
+# DSN: inherit a persisted FLEET_PG_DSN (worker boxes set it at User scope). Only the home
+# label may fall back to localhost. Remote worker label m2/m4 + missing DSN used to spawn
+# workers that looped forever on Postgres connection timeouts.
+if (-not $env:FLEET_PG_DSN) {
+  if ($Label -ne "home") {
+    throw "FLEET_PG_DSN is not set for Remote worker label '$Label'. Set it to host=<home Tailscale IP> port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5 before launching remote workers."
+  }
+  $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+}
 $env:APPLYPILOT_FLEET_DSN = $env:FLEET_PG_DSN
 
 # 1. Clean slate: stop any apply workers already running (they may be stacked on one slot).

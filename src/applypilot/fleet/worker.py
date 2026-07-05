@@ -225,6 +225,10 @@ class WorkerLoop:
         self.search_fn = search_fn
         self.classify_fn = classify_fn
         self.machine_owner = machine_owner
+        if sw_version is None:
+            from applypilot.fleet import software_version
+
+            sw_version = software_version.current_sw_version()
         self.sw_version = sw_version
         self.on_owner_machine = on_owner_machine
         self.public_ip = public_ip or home_ip

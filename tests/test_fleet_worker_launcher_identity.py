@@ -27,3 +27,29 @@ def test_multi_worker_launcher_supports_non_overlapping_slot_ranges():
     assert "$slotPattern" in script
     assert "$StartSlot..($StartSlot + $Count - 1)" in script
     assert "slots {1}..{2}" in script
+
+
+def test_remote_multi_worker_launcher_requires_explicit_fleet_dsn():
+    script = Path("run-fleet-workers.ps1").read_text(encoding="utf-8")
+
+    assert "Remote worker label" in script
+    assert "FLEET_PG_DSN is not set" in script
+    assert "$Label -ne \"home\"" in script
+    assert "host=<home Tailscale IP> port=5432" in script
+
+
+def test_remote_fleet_agent_requires_explicit_fleet_dsn():
+    script = Path("fleet-agent.ps1").read_text(encoding="utf-8")
+
+    assert "Remote fleet-agent label" in script
+    assert "FLEET_PG_DSN is not set" in script
+    assert "$Label -ne \"home\"" in script
+    assert "host=<home Tailscale IP> port=5432" in script
+
+
+def test_worker_launcher_probes_fleet_pg_before_starting_apply_loop():
+    script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
+
+    assert "fleet-agent-query.py" in script
+    assert "Cannot reach fleet Postgres over FLEET_PG_DSN" in script
+    assert "before starting worker" in script

@@ -46,7 +46,12 @@ foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
   $cand = Join-Path $d "applypilot.exe"
   if (Test-Path $cand) { $applypilotCli = (Resolve-Path $cand).Path; break }
 }
-if (-not $env:FLEET_PG_DSN) { $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5" }
+if (-not $env:FLEET_PG_DSN) {
+  if ($Label -ne "home") {
+    throw "FLEET_PG_DSN is not set for Remote fleet-agent label '$Label'. Set it to host=<home Tailscale IP> port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5 before starting this agent."
+  }
+  $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+}
 $worker = Join-Path $repo "run-fleet-worker.ps1"
 if (-not (Test-Path $worker)) { throw "run-fleet-worker.ps1 not found next to fleet-agent.ps1 ($worker)" }
 

@@ -186,6 +186,7 @@ def push_apply_eligible(
     pg = pg_conn or pgqueue.connect()
     try:
         backfill_applied_set(sq, pg)
+        _queue.suppress_applied_set_duplicates(pg)
         out: list[dict[str, Any]] = []
         # Build the eligibility SQL; append the ledger cross-check when the home brain
         # has an applications table (the check is a no-op on minimal test fixtures).

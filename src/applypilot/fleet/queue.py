@@ -204,15 +204,49 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
     return True
 
 
+def suppress_applied_set_duplicates(conn, *, commit=True) -> int:
+    """Retire queued apply rows whose dedup key is already in ``applied_set``.
+
+    ``lease_apply`` refuses these rows to prevent double-submits. Keeping them in
+    status='queued' makes the fleet look backlogged while every worker correctly
+    idles, so convert them to a terminal skipped failure with an explicit reason.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE apply_queue q "
+            "SET status='failed'::apply_queue_status, apply_status='skipped', "
+            "apply_error='dedup:already_applied', lease_owner=NULL, lease_expires_at=NULL, "
+            "updated_at=now() "
+            "WHERE q.status='queued' AND q.dedup_key IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)"
+        )
+        n = cur.rowcount
+    if commit:
+        conn.commit()
+    return n
+
+
 def push_apply_jobs(conn, rows, *, approved_batch=None, commit=True) -> int:
     """UPSERT apply_queue rows with the v3 columns (dedup_key, target_host, lane,
     approved_batch). Only refreshes ``queued`` rows. ``rows`` need url, company,
     title, application_url, score, and target_host (or apply_domain)."""
-    n = 0
+    prepared = []
+    for r in rows:
+        host = r.get("target_host") or r.get("apply_domain")
+        dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
+        prepared.append((r, host, dk))
+
+    applied_keys = set()
     with conn.cursor() as cur:
-        for r in rows:
-            host = r.get("target_host") or r.get("apply_domain")
-            dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
+        keys = [dk for _, _, dk in prepared if dk]
+        if keys:
+            cur.execute("SELECT dedup_key FROM applied_set WHERE dedup_key = ANY(%s)", (keys,))
+            applied_keys = {row["dedup_key"] for row in cur.fetchall()}
+
+        n = 0
+        for r, host, dk in prepared:
+            if dk in applied_keys:
+                continue
             cur.execute(
                 "INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, target_host, lane, dedup_key, approved_batch) "
                 "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,%(host)s,%(host)s,'ats',%(dk)s,%(batch)s) "

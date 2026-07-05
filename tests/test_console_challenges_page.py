@@ -58,6 +58,14 @@ def test_index_page_has_token_expired_banner_text(live_server):
     assert "?token=" in html
 
 
+def test_index_page_has_software_versions_section(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+    assert "Software versions" in html
+    assert 'id="versionPinned"' in html
+    assert 'id="versionRows"' in html
+
+
 def test_get_token_url_still_302_and_sets_cookie(live_server):
     """Regression: Task 1's ?token= arming must still work after the Task 4 HTML edits."""
     opener = urllib.request.build_opener(_NoRedirect())
