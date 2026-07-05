@@ -40,7 +40,7 @@ def _make_verdict(code: str, severity: str, reason: str) -> dict[str, str]:
 def _verdict(
     workers: list[dict[str, Any]],
     availability: dict[str, dict[str, Any]],
-    spend_24h: list[dict[str, Any]],
+    recent_usage: list[dict[str, Any]],
 ) -> dict[str, str]:
     if not workers:
         return _make_verdict("unknown", "warn", "No apply workers have reported heartbeat state.")
@@ -63,12 +63,7 @@ def _verdict(
         for worker in workers
         if (worker.get("last_agent_switch_reason") or "").startswith("switch:")
     ]
-    spend_providers = {
-        row.get("provider")
-        for row in spend_24h
-        if row.get("provider") and int(row.get("count") or 0) > 0
-    }
-    if switched_workers and any(worker.get("current_agent") in spend_providers for worker in switched_workers):
+    if switched_workers and any(_has_scoped_activity(worker, recent_usage) for worker in switched_workers):
         return _make_verdict(
             "working",
             "ok",
@@ -87,6 +82,27 @@ def _verdict(
     )
 
 
+def _has_scoped_activity(worker: dict[str, Any], recent_usage: list[dict[str, Any]]) -> bool:
+    worker_id = worker.get("worker_id")
+    current_agent = worker.get("current_agent")
+    current_model = worker.get("current_model")
+    switch_at = worker.get("_last_agent_switch_at")
+    if not worker_id or not current_agent:
+        return False
+
+    for row in recent_usage:
+        if row.get("worker_id") != worker_id:
+            continue
+        if row.get("provider") != current_agent:
+            continue
+        if current_model and row.get("model") != current_model:
+            continue
+        if switch_at is not None and row.get("last_usage_at") and row["last_usage_at"] < switch_at:
+            continue
+        return True
+    return False
+
+
 def agent_summary(conn) -> dict[str, Any]:
     """Return current apply-agent routing, block state, and 24h apply spend."""
     try:
@@ -101,6 +117,7 @@ def agent_summary(conn) -> dict[str, Any]:
             )
             workers = []
             for row in cur.fetchall():
+                last_agent_switch_at = row.get("last_agent_switch_at")
                 workers.append(
                     {
                         "worker_id": row.get("worker_id"),
@@ -113,7 +130,8 @@ def agent_summary(conn) -> dict[str, Any]:
                         "current_model": row.get("current_model"),
                         "agent_chain": row.get("agent_chain"),
                         "chain_agents": _configured_agents(row),
-                        "last_agent_switch_at": _iso(row.get("last_agent_switch_at")),
+                        "last_agent_switch_at": _iso(last_agent_switch_at),
+                        "_last_agent_switch_at": last_agent_switch_at,
                         "last_agent_switch_reason": row.get("last_agent_switch_reason"),
                     }
                 )
@@ -151,11 +169,23 @@ def agent_summary(conn) -> dict[str, Any]:
                 for row in cur.fetchall()
             ]
 
+            cur.execute(
+                "SELECT worker_id, provider, model, COUNT(*) AS count, MAX(ts) AS last_usage_at "
+                "FROM llm_usage "
+                "WHERE task = 'apply_agent' AND ts >= now() - interval '24 hours' "
+                "GROUP BY worker_id, provider, model"
+            )
+            recent_usage = [dict(row) for row in cur.fetchall()]
+
+        public_workers = [
+            {k: v for k, v in worker.items() if not k.startswith("_")}
+            for worker in workers
+        ]
         return {
-            "workers": workers,
+            "workers": public_workers,
             "availability": availability,
             "spend_24h": spend_24h,
-            "verdict": _verdict(workers, availability, spend_24h),
+            "verdict": _verdict(workers, availability, recent_usage),
         }
     finally:
         try:
