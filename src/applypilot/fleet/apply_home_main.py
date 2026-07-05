@@ -37,7 +37,15 @@ def push_home(conn, *, sqlite_conn=None, score_floor: int = 7, limit: int | None
 
 def set_canary(conn, k: int) -> None:
     with conn.cursor() as cur:
-        cur.execute("UPDATE fleet_config SET canary_enabled=TRUE, canary_remaining=%s, paused=FALSE WHERE id=1", (k,))
+        cur.execute(
+            "UPDATE fleet_config "
+            "SET canary_enabled=TRUE, canary_remaining=%s, paused=FALSE, updated_at=now() "
+            "WHERE id=1 AND ats_paused=FALSE",
+            (k,),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            raise RuntimeError("cannot arm canary while ATS pause is active")
     conn.commit()
 
 

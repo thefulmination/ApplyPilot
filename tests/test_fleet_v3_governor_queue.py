@@ -401,6 +401,28 @@ def test_compute_queue_tracks_distinct_tasks_for_same_url(fleet_db):
     assert by_task[second["task"]]["status"] == "leased"
 
 
+def test_repush_compute_job_preserves_existing_queue_position(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_compute_jobs(conn, [{"url": "c-priority", "task": "score", "payload": {"v": 1}}])
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE compute_queue SET updated_at = now() - interval '3 hours' "
+                "WHERE url='c-priority' AND task='score'"
+            )
+            cur.execute("SELECT updated_at FROM compute_queue WHERE url='c-priority' AND task='score'")
+            original_updated_at = cur.fetchone()["updated_at"]
+        conn.commit()
+
+        queue.push_compute_jobs(conn, [{"url": "c-priority", "task": "score", "payload": {"v": 2}}])
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload, updated_at FROM compute_queue WHERE url='c-priority' AND task='score'")
+            row = cur.fetchone()
+
+    assert row["payload"] == {"v": 2}
+    assert row["updated_at"] == original_updated_at
+
+
 # ---- recurring search scheduler (RF3) ------------------------------------------
 
 def test_search_recurs_after_completion(fleet_db):
