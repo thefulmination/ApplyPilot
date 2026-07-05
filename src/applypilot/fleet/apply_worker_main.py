@@ -341,6 +341,13 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 if agent is None:
                     # Every agent is walled -> pause until the nearer reset (capped).
                     counts["idle"] += 1
+                    beat = getattr(loop, "_beat", None)
+                    if callable(beat):
+                        try:
+                            with conn_factory() as pause_conn:
+                                beat(pause_conn, state="paused")
+                        except Exception:  # pragma: no cover - never fatal
+                            logger.debug("agent-wall heartbeat failed", exc_info=True)
                     if idle_sleep:
                         resume = switcher.resume_at(now)
                         nap = min(max(resume - now, 0.0), _PAUSE_CEILING) if resume is not None else idle_sleep
