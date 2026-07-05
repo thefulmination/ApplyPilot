@@ -632,6 +632,14 @@ def test_heartbeat_persists_agent_model_telemetry(fleet_db):
         )
         second = fetch_heartbeat(conn)
 
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat "
+                "SET last_agent_switch_at = '2000-01-01T00:00:00Z'::timestamptz "
+                "WHERE worker_id='m4-0'"
+            )
+        sentinel = fetch_heartbeat(conn)["last_agent_switch_at"]
+
         _heartbeat(
             conn,
             worker_id="m4-0",
@@ -663,4 +671,4 @@ def test_heartbeat_persists_agent_model_telemetry(fleet_db):
     assert third["agent_chain"] == "claude>codex"
     assert third["last_agent_switch_reason"] == "handoff"
     assert third["last_agent_switch_at"] is not None
-    assert third["last_agent_switch_at"] >= first["last_agent_switch_at"]
+    assert third["last_agent_switch_at"] > sentinel
