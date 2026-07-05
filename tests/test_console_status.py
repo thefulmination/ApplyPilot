@@ -68,9 +68,37 @@ def test_status_workers_include_machine_role_state_and_version_health(fleet_db):
     by_id = {row["worker_id"]: row for row in result}
     assert by_id["m4-0"]["machine_owner"] == "m4"
     assert by_id["m4-0"]["machine_display_name"] == "GGGTower"
+    assert by_id["m4-0"]["home_ip"] == "100.69.68.103"
     assert by_id["m4-0"]["role"] == "apply"
     assert by_id["m4-0"]["state"] == "idle"
     assert by_id["m4-0"]["sw_version"] == "abc1234"
     assert by_id["m4-0"]["health"] == "alive"
     assert by_id["m2-0"]["health"] == "stale"
     assert by_id["m2-0"]["machine_display_name"] == "TARPON"
+
+
+def test_discovery_workers_include_machine_names_and_home_ip(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat "
+                "(worker_id, machine_owner, home_ip, role, state, last_beat) "
+                "VALUES ('m2-disc', NULL, '100.77.65.8', 'discovery', 'idle', now())"
+            )
+        conn.commit()
+
+        result = console_app._discovery(conn)
+
+    assert result["workers"] == [
+        {
+            "worker_id": "m2-disc",
+            "machine_owner": "m2",
+            "machine_display_name": "TARPON",
+            "home_ip": "100.77.65.8",
+            "alive": True,
+            "last_beat": result["workers"][0]["last_beat"],
+            "seconds_since": result["workers"][0]["seconds_since"],
+            "state": "idle",
+            "found_24h": 0,
+        }
+    ]

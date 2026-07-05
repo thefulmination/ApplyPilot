@@ -215,7 +215,7 @@ def _workers(conn) -> list[dict]:
     out: list[dict] = []
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT wh.worker_id, wh.machine_owner, wh.state, wh.role, wh.current_job, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.home_ip, wh.state, wh.role, wh.current_job, "
             "       wh.sw_version, wh.last_beat, aq.company AS cur_company, aq.title AS cur_title, "
             "       (SELECT COUNT(*) FROM apply_queue done "
             "          WHERE done.worker_id = wh.worker_id "
@@ -240,6 +240,7 @@ def _workers(conn) -> list[dict]:
             "worker_id": r["worker_id"],
             "machine_owner": machine_owner,
             "machine_display_name": console_machines.display_name(machine_owner),
+            "home_ip": r.get("home_ip"),
             "alive": bool(alive),
             "health": "alive" if alive else "stale",
             "last_beat": _iso(r["last_beat"]),
@@ -319,7 +320,7 @@ def _discovery(conn) -> dict:
         )
         d = dict(cur.fetchone())
         cur.execute(
-            "SELECT wh.worker_id, wh.state, wh.last_beat, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.home_ip, wh.state, wh.last_beat, "
             "       (SELECT COUNT(*) FROM discovered_postings dp "
             "          WHERE dp.worker_id = wh.worker_id "
             "            AND dp.discovered_at > now() - interval '24 hours') AS found_24h "
@@ -336,8 +337,14 @@ def _discovery(conn) -> dict:
     workers = []
     for r in wrows:
         secs = _seconds_since(r["last_beat"])
+        machine_owner = console_machines.infer_machine_owner(
+            r["worker_id"], r.get("machine_owner")
+        )
         workers.append({
             "worker_id": r["worker_id"],
+            "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
+            "home_ip": r.get("home_ip"),
             "alive": bool(secs is not None and secs <= _HB_ALIVE_SECONDS),
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
@@ -1770,6 +1777,12 @@ _INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 
+  <section id="machineNetwork">
+    <h2>Machine Network</h2>
+    <div class="table-scroll"><table><thead><tr><th>Machine</th><th>Home IP</th><th>Roles</th><th>Live</th><th>Workers</th></tr></thead>
+      <tbody id="machineNetworkRows"><tr><td colspan="5" class="mut">loading machine network</td></tr></tbody></table></div>
+  </section>
+
   <section id="deploymentDrift">
     <h2>Deployment Drift</h2>
     <div id="deploymentDriftSummary" class="sub"></div>
@@ -1951,6 +1964,11 @@ function money(v){
 
 function machineName(obj, fallback){
   return (obj && obj.machine_display_name) || fallback || "(unknown)";
+}
+
+function isUsefulHomeIp(ip){
+  const value = String(ip || "").trim();
+  return Boolean(value && value !== "0.0.0.0" && value !== "::" && value.toLowerCase() !== "unknown");
 }
 
 function openWorkerLogs(workerId){
@@ -2304,6 +2322,44 @@ function renderDiscoveryBacklog(s){
   ).join("");
 }
 
+function renderMachineNetwork(s){
+  const body = document.getElementById("machineNetworkRows");
+  if(!body) return;
+  const machines = {};
+  function addWorker(w, fallbackRole){
+    if(!w) return;
+    const machine = w.machine_display_name || w.machine_owner || "(unknown)";
+    const row = machines[machine] || {
+      machine,
+      ips: [],
+      roles: {},
+      alive: 0,
+      stale: 0,
+      workers: [],
+    };
+    const ip = w.home_ip || "";
+    if(isUsefulHomeIp(ip) && row.ips.indexOf(ip) < 0) row.ips.push(ip);
+    const role = w.role || fallbackRole || "worker";
+    row.roles[role] = (row.roles[role] || 0) + 1;
+    if(w.alive) row.alive += 1; else row.stale += 1;
+    if(w.worker_id) row.workers.push(w.worker_id);
+    machines[machine] = row;
+  }
+  (s.workers || []).forEach(w => addWorker(w, "apply"));
+  (((s.discovery || {}).workers) || []).forEach(w => addWorker(w, "discovery"));
+  const rows = Object.keys(machines).sort().map(k => machines[k]);
+  if(!rows.length){
+    body.innerHTML = '<tr><td colspan="5" class="mut">no machine network heartbeats</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(row => {
+    const roles = Object.keys(row.roles).sort().map(role => role + "×" + row.roles[role]).join(", ");
+    return '<tr><td>'+esc(row.machine)+'</td><td>'+esc(row.ips.join(", ") || "unknown")+
+      '</td><td>'+esc(roles || "unknown")+'</td><td>'+esc(row.alive + " alive / " + row.stale + " stale")+
+      '</td><td>'+esc(row.workers.join(", "))+'</td></tr>';
+  }).join("");
+}
+
 function renderStaleWorkers(workers){
   const el = document.getElementById("staleWorkers");
   if(!el) return;
@@ -2527,6 +2583,7 @@ function render(s){
   renderStaleWorkers(s.workers || []);
   renderApplyReadiness();
   renderDiscoveryBacklog(s);
+  renderMachineNetwork(s);
 
   const wt = document.getElementById("workers");
   if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }

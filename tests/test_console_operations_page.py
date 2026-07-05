@@ -73,6 +73,7 @@ def test_index_contains_operations_sections(live_server):
         "Why Not Applying",
         "Agent Routing",
         "Machine Health",
+        "Machine Network",
         "Deployment Drift",
         "Browser Health",
         "Queue Funnel",
@@ -204,6 +205,21 @@ def test_dashboard_shows_deployment_drift_targets(live_server):
     assert "row.machines" in html
     assert "row.worker_ids" in html
     assert "reconcile these machines before comparing telemetry" in html
+
+
+def test_dashboard_shows_machine_network_summary(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert 'id="machineNetwork"' in html
+    assert 'id="machineNetworkRows"' in html
+    assert "renderMachineNetwork" in html
+    assert "Home IP" in html
+    assert "Roles" in html
+    assert "machine_display_name" in html
+    assert "home_ip" in html
+    assert "isUsefulHomeIp" in html
+    assert "0.0.0.0" in html
 
 
 def test_dashboard_has_explicit_lane_state_safety_rails(live_server):
