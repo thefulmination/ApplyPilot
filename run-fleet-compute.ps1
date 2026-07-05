@@ -1,4 +1,4 @@
-# run-fleet-compute.ps1 [-Label m4] [-Workers 5] [-Providers deepseek]
+# run-fleet-compute.ps1 [-Label m4] [-Workers 16] [-Providers deepseek]
 #   Run compute/scoring worker(s): lease jobs from compute_queue, run the LLM score/audit
 #   pass, write ADVISORY results back. IP-FREE (no browser, no site traffic) -- so it is safe
 #   on any owner machine and does NOT need the apply IP hygiene. Cost is gated by the fleet's
@@ -16,15 +16,16 @@
 #
 #   FULL LOOP:
 #     1. HOME seeds + pulls:   .\run-compute-home-loop.ps1        (fills compute_queue, pulls results)
-#     2. THIS script (m4):     .\run-fleet-compute.ps1 -Workers 5 (scores what's queued)
+#     2. THIS script (m4):     .\run-fleet-compute.ps1 -Workers 16 (scores what's queued)
 param(
   [string]$Label = "m4",
-  [int]$Workers = 5,
+  [int]$Workers = 16,
   [string]$Providers = "deepseek",
   [int]$Index = -1   # internal: set when the launcher self-spawns a child worker
 )
 $ErrorActionPreference = "Stop"
-if ($Workers -lt 1 -or $Workers -gt 16) { throw "-Workers must be 1..16 (each is a scorer leasing its own jobs)." }
+$WorkerCap = 16
+if ($Workers -lt 1 -or $Workers -gt $WorkerCap) { throw "-Workers must be 1..$WorkerCap (each is a scorer leasing its own jobs)." }
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
@@ -74,6 +75,8 @@ function Start-OneWorker([string]$wid) {
 
 # --- child invocation: run ONE worker with a distinct id in the foreground ---
 if ($Index -ge 0) { Start-OneWorker "$Label-score-$Index"; return }
+
+Write-Host ("[fleet-compute] target_workers={0} cap={1} providers={2} label={3}" -f $Workers, $WorkerCap, $Providers, $Label) -ForegroundColor Cyan
 
 # --- pre-flight (parent only): is a usable LLM tier present? ---
 $pyExe = @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1

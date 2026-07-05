@@ -1,5 +1,7 @@
 import json
 import sqlite3
+from pathlib import Path
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import compute_context as cc
 from applypilot.fleet import compute_home_main as chm
@@ -208,3 +210,106 @@ def test_status_report_includes_context_workers_queue_and_bad_reasoning(fleet_db
     assert report["queue"]["done"]["unsynced"] == 1
     assert report["active_workers"]["total"] == 1
     assert report["bad_reasoning_unsynced_done"] == 1
+
+
+def test_status_report_includes_intentional_worker_count_and_recent_error_rates(fleet_db):
+    with pgqueue.connect(fleet_db) as pg:
+        _publish_score_context(pg, version="ctx-status")
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO compute_queue (url, task, payload, status, result, est_cost_usd, updated_at) "
+                "VALUES (%s,'score',%s,'done',%s,0.01,now())",
+                ("u-ok", json.dumps({"url": "u-ok"}),
+                 json.dumps({"research_fit_score": 7, "ctx_version": "ctx-status"})),
+            )
+            cur.execute(
+                "INSERT INTO compute_queue (url, task, payload, status, result, est_cost_usd, updated_at) "
+                "VALUES (%s,'score',%s,'failed',%s,0.01,now())",
+                ("u-rate", json.dumps({"url": "u-rate"}),
+                 json.dumps({"error": "DeepSeek 429 rate limit", "ctx_version": "ctx-status"})),
+            )
+            for idx in range(2):
+                cur.execute(
+                    "INSERT INTO worker_heartbeat (worker_id, machine_owner, role, state, last_beat) "
+                    "VALUES (%s,'m4','compute','computing',now())",
+                    (f"m4-score-{idx}",),
+                )
+        pg.commit()
+
+        report = chm.status_report(pg_conn=pg, task="score", expected_score_workers=2)
+
+    assert report["score_workers"]["expected"] == 2
+    assert report["score_workers"]["active"] == 2
+    assert report["score_workers"]["within_expected"] is True
+    assert report["score_workers"]["by_owner"] == {"m4": 2}
+    assert report["score_workers"]["recent_failed_15m"] == 1
+    assert report["score_workers"]["recent_rate_limited_15m"] == 1
+    assert report["score_workers"]["failure_rate_15m"] == 0.5
+
+
+def test_score_delta_audit_compares_snapshot_to_current_results(fleet_db):
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            for url, score in [("u-up", 4), ("u-down", 8), ("u-same", 7), ("u-pending", 6)]:
+                cur.execute(
+                    "INSERT INTO compute_queue (url, task, payload, status, result, est_cost_usd) "
+                    "VALUES (%s,'score',%s,'done',%s,0.01)",
+                    (url, json.dumps({"url": url}),
+                     json.dumps({"research_fit_score": score, "ctx_version": "ctx-old"})),
+                )
+            cur.execute(
+                "CREATE TABLE compute_queue_delta_snapshot AS "
+                "SELECT *, now() AS snapshotted_at, 'ctx-new'::text AS target_ctx_version "
+                "FROM compute_queue"
+            )
+            updates = {
+                "u-up": (7, "done"),
+                "u-down": (5, "done"),
+                "u-same": (7, "done"),
+                "u-pending": (None, "queued"),
+            }
+            for url, (score, status) in updates.items():
+                result = None if score is None else {"research_fit_score": score, "ctx_version": "ctx-new"}
+                cur.execute(
+                    "UPDATE compute_queue SET status=%s, result=%s WHERE url=%s AND task='score'",
+                    (status, json.dumps(result) if result is not None else None, url),
+                )
+        pg.commit()
+
+        report = chm.score_delta_audit(
+            pg_conn=pg,
+            snapshot_name="compute_queue_delta_snapshot",
+            task="score",
+            material_change=2,
+            high_threshold=7,
+            top=5,
+        )
+
+    assert report["snapshot_rows"] == 4
+    assert report["compared_rows"] == 3
+    assert report["pending_rows"] == 1
+    assert report["changed_count"] == 2
+    assert report["improved_count"] == 1
+    assert report["worsened_count"] == 1
+    assert report["crossed_high_up"] == 1
+    assert report["crossed_high_down"] == 1
+    assert report["old_ctx_versions"] == {"ctx-old": 4}
+    assert report["new_ctx_versions"] == {"ctx-new": 3}
+    assert {row["url"] for row in report["top_changes"][:2]} == {"u-up", "u-down"}
+
+
+def test_main_delta_audit_prints_json(monkeypatch, capsys):
+    monkeypatch.setattr(chm, "score_delta_audit", lambda **kwargs: {"snapshot_rows": 2, "task": kwargs["task"]})
+
+    assert chm.main(["delta-audit", "--snapshot", "snap", "--task", "score", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {"snapshot_rows": 2, "task": "score"}
+
+
+def test_compute_launcher_defaults_to_intentional_16_worker_cap():
+    launcher = Path(__file__).resolve().parents[1] / "run-fleet-compute.ps1"
+    text = launcher.read_text(encoding="utf-8")
+
+    assert "[int]$Workers = 16" in text
+    assert "$WorkerCap = 16" in text
+    assert "target_workers" in text
