@@ -1552,6 +1552,13 @@ _INDEX_HTML = r"""<!doctype html>
   .band.primary{border-left:4px solid var(--blue)}
   .headline{font-size:24px;font-weight:750;margin:6px 0}
   .actionline{margin-top:10px;color:var(--fg);font-weight:600}
+  .rec-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin-top:12px}
+  .action-item{background:var(--panel2);border:1px solid var(--border);border-left:3px solid var(--blue);border-radius:8px;padding:9px 10px;min-width:0}
+  .action-item.warn{border-left-color:var(--amber)}
+  .action-item.halted,.action-item.severe{border-left-color:var(--red2)}
+  .action-item .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px;overflow-wrap:anywhere}
+  .action-item .t{font-weight:700;margin-top:3px;overflow-wrap:anywhere}
+  .action-item .r{color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}
   .metric-grid,.diagnosis-grid,.machine-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
   .mini{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
   .mini span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
@@ -1663,6 +1670,8 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="stateHeadline" class="headline">Loading</div>
     <div id="stateReason" class="sub"></div>
     <div id="nextAction" class="actionline">Recommended Next Action: Loading</div>
+    <h2 style="margin-top:14px">Action Queue</h2>
+    <div id="recommendationList" class="rec-list"><div class="mut">loading recommendations</div></div>
   </section>
 
   <section id="safetyRails">
@@ -1907,6 +1916,7 @@ function renderDiagnosis(d){
   document.getElementById("nextAction").textContent = recs.length
     ? "Recommended Next Action: " + recs[0].title + " — " + recs[0].reason
     : "Recommended Next Action: No recommendation";
+  renderRecommendationList(recs);
   document.getElementById("whyBody").innerHTML = [
     ["ATS queued", ats.queued],
     ["ATS approved", ats.approved],
@@ -1960,6 +1970,22 @@ function renderAgents(d){
     esc(w.agent_chain||"")+'</td><td>'+esc(w.sw_version||"unknown")+'</td><td>'+
     esc(w.last_agent_switch_reason||"")+'</td></tr>'
   ).join("") : '<tr><td colspan="7" class="mut">no apply worker agent telemetry</td></tr>';
+}
+
+function renderRecommendationList(recs){
+  const el = document.getElementById("recommendationList");
+  if(!el) return;
+  if(!recs.length){
+    el.innerHTML = '<div class="mut">no current recommendations</div>';
+    return;
+  }
+  el.innerHTML = recs.map(r => {
+    const sev = r.severity || "info";
+    return '<div class="action-item '+esc(sev)+'"><div class="k">'+
+      esc([sev, r.lane, r.action_type].filter(Boolean).join(" / "))+'</div><div class="t">'+
+      esc(r.title || r.code || "Recommendation")+'</div><div class="r">'+
+      esc(r.reason || "")+'</div></div>';
+  }).join("");
 }
 
 function renderWorkerComparison(rows){

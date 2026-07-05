@@ -424,7 +424,13 @@ def operational_rollups(conn) -> dict:
     }
 
 
-def recommendations_from(queue: dict, browser: dict, *, agents: dict | None = None) -> list[dict]:
+def recommendations_from(
+    queue: dict,
+    browser: dict,
+    *,
+    agents: dict | None = None,
+    rollups: dict | None = None,
+) -> list[dict]:
     recs: list[dict] = []
     ats = queue["ats"]
     linkedin = queue["linkedin"]
@@ -468,6 +474,39 @@ def recommendations_from(queue: dict, browser: dict, *, agents: dict | None = No
             "reason": "LinkedIn has queued rows but linkedin_canary_remaining is zero.",
             "action_type": "manual_operator",
             "command": "Use the LinkedIn lane runbook to re-arm a small canary if you want LinkedIn active.",
+        })
+    agent_workers = (agents or {}).get("workers") or []
+    versions = {
+        (worker.get("sw_version") or "(unknown)")
+        for worker in agent_workers
+    }
+    if len(versions) > 1 or any(v == "(unknown)" or v.endswith(".dirty") for v in versions):
+        recs.append({
+            "code": "reconcile_apply_worker_versions",
+            "severity": "warn",
+            "lane": "apply",
+            "title": "Apply worker versions are mixed",
+            "reason": (
+                f"{len(versions)} apply-worker version(s) are reporting; "
+                "reconcile dirty/old workers before comparing performance or telemetry."
+            ),
+            "action_type": "manual_deploy",
+            "command": "Deploy one current checkout to apply workers, restart between jobs, then verify worker_versions.",
+        })
+    stale = []
+    for machine in (rollups or {}).get("machines", {}).values():
+        stale_count = int(machine.get("stale_workers") or 0)
+        if stale_count:
+            stale.append(f"{machine.get('display_name') or '(unknown)'}:{stale_count}")
+    if stale:
+        recs.append({
+            "code": "inspect_stale_workers",
+            "severity": "warn",
+            "lane": "fleet",
+            "title": "Stale workers need inspection",
+            "reason": "Stale heartbeat rows remain on " + ", ".join(stale) + ".",
+            "action_type": "manual_machine",
+            "command": "Inspect the affected machine runbook and restart only the stale worker stack when safe.",
         })
     browser_wall_count = int(browser["counts"].get("login_gate") or 0) + int(
         browser["counts"].get("captcha") or 0
@@ -530,5 +569,5 @@ def full_diagnosis(conn) -> dict:
         "browser": browser,
         "rollups": rollups,
         "agents": agents,
-        "recommendations": recommendations_from(queue, browser, agents=agents),
+        "recommendations": recommendations_from(queue, browser, agents=agents, rollups=rollups),
     }

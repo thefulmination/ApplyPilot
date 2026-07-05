@@ -510,6 +510,52 @@ def test_recommendation_for_missing_agent_telemetry():
     assert "redeploy" in result[0]["reason"].lower()
 
 
+def test_recommendation_for_apply_worker_version_drift():
+    queue = {
+        "state": {"code": "ready_to_apply"},
+        "ats": {"approved": 12, "leaseable": 12, "dedup_blocked": 0},
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {}}
+    agents = {
+        "verdict": {"code": "not_triggered"},
+        "workers": [
+            {"worker_id": "m2-0", "sw_version": "0.3.0+git.old"},
+            {"worker_id": "m4-0", "sw_version": "0.3.0+git.new"},
+            {"worker_id": "m4-1", "sw_version": "0.3.0+git.new.dirty"},
+        ],
+    }
+
+    result = console_diagnosis.recommendations_from(queue, browser, agents=agents)
+
+    assert result[0]["code"] == "reconcile_apply_worker_versions"
+    assert result[0]["severity"] == "warn"
+    assert "3 apply-worker version" in result[0]["reason"]
+
+
+def test_recommendation_for_stale_machine_workers():
+    queue = {
+        "state": {"code": "ready_to_apply"},
+        "ats": {"approved": 12, "leaseable": 12, "dedup_blocked": 0},
+        "linkedin": {"queued": 0, "canary_exhausted": False},
+    }
+    browser = {"counts": {}}
+    rollups = {
+        "machines": {
+            "m4": {"display_name": "GGGTower", "workers": 20, "stale_workers": 0},
+            "mac-Mac": {"display_name": "Paloma Mac", "workers": 1, "stale_workers": 1},
+            "home": {"display_name": "Home", "workers": 3, "stale_workers": 1},
+        }
+    }
+
+    result = console_diagnosis.recommendations_from(queue, browser, rollups=rollups)
+
+    assert result[0]["code"] == "inspect_stale_workers"
+    assert result[0]["severity"] == "warn"
+    assert "Paloma Mac" in result[0]["reason"]
+    assert "Home" in result[0]["reason"]
+
+
 def test_operational_rollups_include_machines_hosts_forecast_goals_and_workers(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:

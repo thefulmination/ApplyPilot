@@ -74,6 +74,7 @@ def test_index_contains_operations_sections(live_server):
         "Queue Funnel",
         "Safety Rails",
         "Recommended Next Action",
+        "Action Queue",
         "Audit Log",
     ]:
         assert text in html
@@ -120,6 +121,8 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert 'id="deploymentMeta"' in html
     assert 'id="workerComparisonRows"' in html
     assert "renderWorkerComparison" in html
+    assert "renderRecommendationList" in html
+    assert 'id="recommendationList"' in html
     assert "worker_versions" in html
     assert "browser.examples" in html
     assert "logs_url" in html
