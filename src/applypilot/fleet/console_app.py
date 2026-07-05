@@ -35,6 +35,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1004,15 +1005,40 @@ _ACTIONS = {
     "challenge_skip_host": _do_challenge_skip_host,
 }
 
+_AUDIT_ACTION_CAP = 120
+_AUDIT_MESSAGE_CAP = 500
+_AUDIT_LANE_CAP = 120
+_AUDIT_TARGET_CAP = 300
+_AUDIT_SECRET_WORD_RE = re.compile(
+    r"(?i)\b(token|password|passwd|pwd|secret|api[_-]?key)\s+[^\s,'\"}{]+"
+)
+
+
+def _audit_text(value: Any, limit: int) -> str:
+    safe = _scrub("" if value is None else str(value))
+    safe = _AUDIT_SECRET_WORD_RE.sub(r"\1 [REDACTED]", safe)
+    return safe[:limit]
+
+
+def _audit_optional_text(value: Any, limit: int) -> str | None:
+    if value is None:
+        return None
+    return _audit_text(value, limit)
+
 
 def _audit_action(conn, *, action: str, ok: bool, message: str,
                   lane: str | None = None, target: str | None = None) -> None:
-    safe_message = _scrub(message or "")[:500]
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO fleet_console_audit (action, ok, message, lane, target) "
             "VALUES (%s,%s,%s,%s,%s)",
-            (_scrub(action or "unknown")[:120], bool(ok), safe_message, lane, target),
+            (
+                _audit_text(action or "unknown", _AUDIT_ACTION_CAP),
+                bool(ok),
+                _audit_text(message or "", _AUDIT_MESSAGE_CAP),
+                _audit_optional_text(lane, _AUDIT_LANE_CAP),
+                _audit_optional_text(target, _AUDIT_TARGET_CAP),
+            ),
         )
     conn.commit()
 
@@ -1036,7 +1062,22 @@ def run_action(body: dict) -> tuple[bool, str]:
         return False, "unknown action"
     conn = pgqueue.connect()
     try:
-        result = fn(conn, body)
+        try:
+            result = fn(conn, body)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                _audit_action(conn, action=action, ok=False, message=str(exc),
+                              lane=body.get("lane"), target=body.get("url") or body.get("host"))
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise
         ok, message = result if isinstance(result, tuple) else (True, result)
         _audit_action(conn, action=action, ok=bool(ok), message=str(message),
                       lane=body.get("lane"), target=body.get("url") or body.get("host"))
