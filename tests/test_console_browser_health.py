@@ -1,3 +1,5 @@
+import pytest
+
 from applypilot.fleet import console_browser_health as B
 
 
@@ -30,3 +32,61 @@ def test_classify_employer_application_cap():
 def test_classify_usage_limit():
     c = B.classify_text("You've hit your session limit, resets 12:40pm")
     assert c["kind"] == "usage_limit"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've hit your usage limit. Try again later.",
+        "Usage limit reached for this account",
+    ],
+)
+def test_classify_usage_limit_aliases(text):
+    c = B.classify_text(text)
+    assert c["kind"] == "usage_limit"
+    assert c["severity"] == "warn"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "browser_backend_crashed while launching worker browser",
+        "RESULT:browser_crashed after navigation",
+    ],
+)
+def test_classify_browser_backend_crash_aliases(text):
+    c = B.classify_text(text)
+    assert c["kind"] == "browser_backend_crashed"
+    assert c["severity"] == "error"
+
+
+def test_classify_browser_server_unavailable_spaced_alias():
+    c = B.classify_text("browser server unavailable for worker m4-2")
+    assert c["kind"] == "browser_server_unavailable"
+    assert c["severity"] == "error"
+
+
+def test_summarize_worker_logs_counts_examples_and_skips_unknown():
+    summary = B.summarize_worker_logs([
+        {
+            "worker_id": "w1",
+            "machine_owner": "m4",
+            "last_error": "browser_backend_crashed",
+            "recent_log": "",
+        },
+        {
+            "worker_id": "w2",
+            "machine_owner": "home",
+            "last_error": "",
+            "recent_log": "ordinary heartbeat",
+        },
+    ])
+
+    assert summary["counts"] == {"browser_backend_crashed": 1}
+    assert summary["examples"] == {
+        "browser_backend_crashed": {
+            "worker_id": "w1",
+            "machine_owner": "m4",
+            "severity": "error",
+        }
+    }

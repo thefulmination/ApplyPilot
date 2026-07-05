@@ -264,11 +264,13 @@ def queue_diagnosis(conn) -> dict:
 def browser_health(conn) -> dict:
     from applypilot.fleet.console_browser_health import summarize_worker_logs
 
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT worker_id, machine_owner, last_error, recent_log "
-            "FROM worker_heartbeat WHERE role='apply' ORDER BY worker_id"
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    conn.rollback()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id, machine_owner, last_error, recent_log "
+                "FROM worker_heartbeat WHERE role='apply' ORDER BY worker_id"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.rollback()
     return summarize_worker_logs(rows)

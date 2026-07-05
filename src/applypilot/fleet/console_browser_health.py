@@ -3,11 +3,14 @@ from __future__ import annotations
 
 
 _RULES = [
+    ("browser_backend_crashed", "error", ("browser_backend_crashed",)),
+    ("browser_backend_crashed", "error", ("browser_crashed",)),
     ("browser_backend_crashed", "error", ("browser backend", "crashed")),
     ("browser_service_unavailable", "error", ("econnrefused",)),
     ("browser_service_unavailable", "error", ("browser_unavailable",)),
     ("browser_service_unavailable", "error", ("browser service", "not responding")),
     ("browser_server_unavailable", "error", ("browser_server_unavailable",)),
+    ("browser_server_unavailable", "error", ("browser server unavailable",)),
     ("captcha", "warn", ("captcha",)),
     ("captcha", "warn", ("hcaptcha",)),
     ("login_gate", "warn", ("auth_required",)),
@@ -16,6 +19,8 @@ _RULES = [
     ("employer_application_cap", "info", ("limit the number of applications",)),
     ("usage_limit", "warn", ("session limit",)),
     ("usage_limit", "warn", ("usage_limit",)),
+    ("usage_limit", "warn", ("hit your usage limit",)),
+    ("usage_limit", "warn", ("usage limit reached",)),
     ("timeout", "warn", ("timeout",)),
     ("no_result_line", "warn", ("no_result_line",)),
 ]

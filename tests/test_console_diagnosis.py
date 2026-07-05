@@ -265,3 +265,38 @@ def test_queue_diagnosis_rolls_back_when_query_raises():
         console_diagnosis.queue_diagnosis(conn)
 
     assert conn.rolled_back is True
+
+
+@pytest.mark.parametrize("failure", ["execute", "fetchall"])
+def test_browser_health_rolls_back_when_query_raises(failure):
+    class RaisingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            if failure == "execute":
+                raise RuntimeError("execute boom")
+
+        def fetchall(self):
+            if failure == "fetchall":
+                raise RuntimeError("fetchall boom")
+            return []
+
+    class Conn:
+        def __init__(self):
+            self.rolled_back = False
+
+        def cursor(self):
+            return RaisingCursor()
+
+        def rollback(self):
+            self.rolled_back = True
+
+    conn = Conn()
+    with pytest.raises(RuntimeError, match=f"{failure} boom"):
+        console_diagnosis.browser_health(conn)
+
+    assert conn.rolled_back is True
