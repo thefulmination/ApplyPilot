@@ -69,6 +69,7 @@ def test_index_contains_operations_sections(live_server):
         "Fleet State",
         "Lane Activity",
         "Apply Readiness",
+        "Discovery Backlog",
         "Why Not Applying",
         "Agent Routing",
         "Machine Health",
@@ -179,6 +180,19 @@ def test_dashboard_summarizes_apply_readiness_gates(live_server):
     assert "Browser walls" in html
     assert "Stale workers" in html
     assert "Daily goal" in html
+
+
+def test_dashboard_promotes_discovery_backlog_visibility(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert 'id="discoveryBacklog"' in html
+    assert 'id="discoveryBacklogGrid"' in html
+    assert "renderDiscoveryBacklog" in html
+    assert "Pending ingest" in html
+    assert "Ingest pressure" in html
+    assert "Discovery workers" in html
+    assert "Found 24h" in html
 
 
 def test_dashboard_has_explicit_lane_state_safety_rails(live_server):

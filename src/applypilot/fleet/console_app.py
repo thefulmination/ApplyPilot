@@ -1732,6 +1732,16 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="applyReadinessChecks" class="readiness-checks"></div>
   </section>
 
+  <section id="discoveryBacklog">
+    <h2>Discovery Backlog</h2>
+    <div class="diagnosis-grid" id="discoveryBacklogGrid">
+      <div class="mini"><span>Pending ingest</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Ingest pressure</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Discovery workers</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Found 24h</span><b>&mdash;</b><small>loading</small></div>
+    </div>
+  </section>
+
   <section id="agentRouting">
     <h2>Agent Routing</h2>
     <div id="agentVerdict" class="sub"></div>
@@ -2255,6 +2265,34 @@ function renderApplyReadiness(){
   ).join("");
 }
 
+function renderDiscoveryBacklog(s){
+  const grid = document.getElementById("discoveryBacklogGrid");
+  if(!grid) return;
+  const d = (s && s.discovery) || null;
+  if(!d){
+    grid.innerHTML = '<div class="mut">no discovery telemetry reported</div>';
+    return;
+  }
+  const tasks = d.tasks || {};
+  const postings = d.postings || {};
+  const workers = d.workers || [];
+  const pending = Number(postings.pending_ingest || 0);
+  const last24 = Number(postings.last24h || 0);
+  const due = Number(tasks.due_now || 0);
+  const alive = workers.filter(w => w.alive).length;
+  const latest = (d.recent && d.recent.length && d.recent[0].time) ? rel(d.recent[0].time) : "none";
+  const pressure = pending >= 500 ? "high" : (pending >= 100 ? "watch" : (pending > 0 ? "low" : "clear"));
+  const cards = [
+    ["Pending ingest", pending, pending ? "postings staged but not imported" : "no ingest backlog"],
+    ["Ingest pressure", pressure, due ? due + " search task(s) due now" : "no search tasks due now"],
+    ["Discovery workers", alive + " / " + workers.length, alive ? "heartbeat active" : "no live discovery worker"],
+    ["Found 24h", last24, "latest find " + latest],
+  ];
+  grid.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
 function renderStaleWorkers(workers){
   const el = document.getElementById("staleWorkers");
   if(!el) return;
@@ -2476,6 +2514,7 @@ function render(s){
   renderLaneActivity(s);
   renderStaleWorkers(s.workers || []);
   renderApplyReadiness();
+  renderDiscoveryBacklog(s);
 
   const wt = document.getElementById("workers");
   if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }
