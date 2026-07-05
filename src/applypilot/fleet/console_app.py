@@ -1176,10 +1176,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
             return
         if path == "/api/diagnosis":
-            from applypilot.fleet import console_diagnosis
-
             conn = None
             try:
+                from applypilot.fleet import console_diagnosis
+
                 conn = pgqueue.connect()
                 self._send_json(200, console_diagnosis.full_diagnosis(conn))
             except Exception as e:

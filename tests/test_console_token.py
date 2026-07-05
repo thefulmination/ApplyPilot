@@ -3,6 +3,7 @@ gated on APPLYPILOT_CONSOLE_TOKEN, and GET / can arm a cookie via ?token=.
 """
 from __future__ import annotations
 
+import builtins
 import json
 import threading
 import types
@@ -166,3 +167,40 @@ def test_get_arm_url_wrong_token_does_not_set_cookie(live_server):
     with urllib.request.urlopen(req) as resp:
         set_cookie = resp.headers.get("Set-Cookie")
     assert set_cookie is None
+
+
+def test_diagnosis_route_scrubs_lazy_import_errors(monkeypatch):
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "applypilot.fleet" and "console_diagnosis" in (fromlist or ()):
+            raise RuntimeError("password=topsecret token=sk-test")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), console_app._Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    body = {}
+    status = None
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/diagnosis", method="GET")
+        try:
+            urllib.request.urlopen(req)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            body = json.loads(exc.read())
+        except Exception:
+            body = {}
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert status == 500
+    assert "error" in body
+    assert len(body["error"]) <= 500
+    assert "topsecret" not in body["error"]
+    assert "sk-test" not in body["error"]
+    assert "[REDACTED]" in body["error"]
