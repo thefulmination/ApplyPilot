@@ -53,7 +53,7 @@ def test_git_identity_uses_git_commands_without_touching_live_repo() -> None:
             return "53a4fa9e6c2a1b0d\n"
         if args == ["git", "rev-parse", "HEAD^{tree}"]:
             return "8e72467aabbccdde\n"
-        if args == ["git", "status", "--porcelain"]:
+        if args == ["git", "status", "--porcelain", "--untracked-files=no"]:
             return " M fleet-agent.ps1\n"
         raise AssertionError(f"unexpected git command: {args}")
 
@@ -71,8 +71,26 @@ def test_git_identity_uses_git_commands_without_touching_live_repo() -> None:
         ("git", "rev-parse", "--abbrev-ref", "HEAD"),
         ("git", "rev-parse", "HEAD"),
         ("git", "rev-parse", "HEAD^{tree}"),
-        ("git", "status", "--porcelain"),
+        ("git", "status", "--porcelain", "--untracked-files=no"),
     ]
+
+
+def test_git_identity_ignores_untracked_files_for_dirty_marker() -> None:
+    def fake_runner(args: list[str], cwd: Path) -> str:
+        if args == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return "codex/fleet-applier-hardening\n"
+        if args == ["git", "rev-parse", "HEAD"]:
+            return "53a4fa9e6c2a1b0d\n"
+        if args == ["git", "rev-parse", "HEAD^{tree}"]:
+            return "8e72467aabbccdde\n"
+        if args == ["git", "status", "--porcelain", "--untracked-files=no"]:
+            return ""
+        raise AssertionError(f"unexpected git command: {args}")
+
+    ident = git_identity(repo=Path("C:/ApplyPilot"), package_version="0.3.0", runner=fake_runner)
+
+    assert ident.dirty is False
+    assert build_sw_version(ident) == "0.3.0+git.tree.8e72467"
 
 
 def test_git_identity_reports_unavailable_when_git_command_fails() -> None:
