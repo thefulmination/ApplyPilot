@@ -473,6 +473,41 @@ def score_delta_audit(*, pg_conn=None, snapshot_name: str, task="score",
             pg.close()
 
 
+def prioritize_snapshot(*, pg_conn=None, snapshot_name: str, task="score", minutes_ahead: int = 60) -> int:
+    if not snapshot_name:
+        raise ValueError("snapshot_name is required")
+    table = _safe_identifier(snapshot_name)
+    own_pg = pg_conn is None
+    pg = pg_conn or pgqueue.connect()
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH front AS (
+                    SELECT COALESCE(min(updated_at), now()) - make_interval(mins => %(minutes)s) AS priority_at
+                    FROM compute_queue
+                    WHERE task = %(task)s AND status = 'queued'
+                )
+                UPDATE compute_queue cq
+                   SET updated_at = front.priority_at
+                FROM front
+                WHERE cq.task = %(task)s
+                  AND cq.status = 'queued'
+                  AND EXISTS (
+                      SELECT 1 FROM {table} s
+                      WHERE s.url = cq.url AND s.task = cq.task
+                  )
+                """,
+                {"task": task, "minutes": minutes_ahead},
+            )
+            n = cur.rowcount
+        pg.commit()
+        return n
+    finally:
+        if own_pg:
+            pg.close()
+
+
 def _print_delta_audit(report: dict) -> None:
     print(f"task {report['task']} snapshot={report['snapshot']}")
     print(
@@ -499,7 +534,11 @@ def _print_delta_audit(report: dict) -> None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="applypilot-fleet-compute-home")
-    p.add_argument("cmd", choices=["push", "pull", "reopen", "publish-context", "requeue", "status", "delta-audit"])
+    p.add_argument(
+        "cmd",
+        choices=["push", "pull", "reopen", "publish-context", "requeue", "status", "delta-audit",
+                 "prioritize-snapshot"],
+    )
     p.add_argument("--task", default="score")
     p.add_argument("--score-floor", type=int, default=7)
     p.add_argument("--limit", type=int, default=None)
@@ -513,6 +552,7 @@ def main(argv=None) -> int:
     p.add_argument("--material-change", type=float, default=2.0)
     p.add_argument("--high-threshold", type=float, default=7.0)
     p.add_argument("--top", type=int, default=20)
+    p.add_argument("--minutes-ahead", type=int, default=60)
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     if args.cmd == "push":
@@ -533,7 +573,7 @@ def main(argv=None) -> int:
             print(json.dumps(report, sort_keys=True))
         else:
             _print_status(report)
-    else:
+    elif args.cmd == "delta-audit":
         report = score_delta_audit(
             snapshot_name=args.snapshot or args.snapshot_name,
             task=args.task,
@@ -545,4 +585,13 @@ def main(argv=None) -> int:
             print(json.dumps(report, sort_keys=True))
         else:
             _print_delta_audit(report)
+    else:
+        print(
+            "prioritized",
+            prioritize_snapshot(
+                snapshot_name=args.snapshot or args.snapshot_name,
+                task=args.task,
+                minutes_ahead=args.minutes_ahead,
+            ),
+        )
     return 0

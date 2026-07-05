@@ -306,6 +306,54 @@ def test_main_delta_audit_prints_json(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out) == {"snapshot_rows": 2, "task": "score"}
 
 
+def test_prioritize_snapshot_moves_only_queued_snapshot_rows_ahead(fleet_db):
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO compute_queue (url, task, payload, status, updated_at) "
+                "VALUES (%s,'score',%s,'queued',now())",
+                ("u-snapshot-queued", json.dumps({"url": "u-snapshot-queued"})),
+            )
+            cur.execute(
+                "INSERT INTO compute_queue (url, task, payload, status, updated_at) "
+                "VALUES (%s,'score',%s,'done',now())",
+                ("u-snapshot-done", json.dumps({"url": "u-snapshot-done"})),
+            )
+            cur.execute(
+                "INSERT INTO compute_queue (url, task, payload, status, updated_at) "
+                "VALUES (%s,'score',%s,'queued',now())",
+                ("u-other", json.dumps({"url": "u-other"})),
+            )
+            cur.execute(
+                "CREATE TABLE compute_queue_priority_snapshot AS "
+                "SELECT *, now() AS snapshotted_at, 'ctx-new'::text AS target_ctx_version "
+                "FROM compute_queue WHERE url LIKE 'u-snapshot-%'"
+            )
+        pg.commit()
+
+        moved = chm.prioritize_snapshot(pg_conn=pg, snapshot_name="compute_queue_priority_snapshot", task="score")
+
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT url, status, updated_at FROM compute_queue "
+                "WHERE task='score' ORDER BY updated_at, url"
+            )
+            rows = cur.fetchall()
+
+    assert moved == 1
+    assert rows[0]["url"] == "u-snapshot-queued"
+    assert [r["url"] for r in rows if r["status"] == "queued"] == ["u-snapshot-queued", "u-other"]
+    assert next(r for r in rows if r["url"] == "u-snapshot-done")["status"] == "done"
+
+
+def test_main_prioritize_snapshot_prints_count(monkeypatch, capsys):
+    monkeypatch.setattr(chm, "prioritize_snapshot", lambda **kwargs: 9)
+
+    assert chm.main(["prioritize-snapshot", "--snapshot", "snap", "--task", "score"]) == 0
+
+    assert capsys.readouterr().out == "prioritized 9\n"
+
+
 def test_compute_launcher_defaults_to_intentional_16_worker_cap():
     launcher = Path(__file__).resolve().parents[1] / "run-fleet-compute.ps1"
     text = launcher.read_text(encoding="utf-8")
