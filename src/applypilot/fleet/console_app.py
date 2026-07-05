@@ -1561,6 +1561,14 @@ _INDEX_HTML = r"""<!doctype html>
   .action-item .r{color:var(--muted);font-size:12px;margin-top:3px;overflow-wrap:anywhere}
   .action-item .cmd{font-size:12px;margin-top:7px;padding-top:7px;border-top:1px solid var(--border);overflow-wrap:anywhere}
   .action-item .cmd b{color:var(--muted);font-weight:600}
+  .readiness-checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:12px}
+  .ready-check{background:var(--panel2);border:1px solid var(--border);border-left:4px solid var(--blue);border-radius:8px;padding:10px;min-width:0}
+  .ready-check.ok{border-left-color:var(--green2)}
+  .ready-check.warn{border-left-color:var(--amber)}
+  .ready-check.blocked{border-left-color:var(--red2)}
+  .ready-check .name{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  .ready-check .value{font-size:18px;font-weight:700;margin-top:4px;overflow-wrap:anywhere}
+  .ready-check .hint{color:var(--muted);font-size:12px;margin-top:5px;overflow-wrap:anywhere}
   .metric-grid,.diagnosis-grid,.machine-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
   .mini{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
   .mini span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
@@ -1715,6 +1723,13 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="whyNotApplying">
     <h2>Why Not Applying</h2>
     <div id="whyBody" class="diagnosis-grid"></div>
+  </section>
+
+  <section id="applyReadiness">
+    <h2>Apply Readiness</h2>
+    <div id="applyReadinessVerdict" class="headline">loading</div>
+    <div id="applyReadinessSummary" class="sub">waiting for fleet status, diagnosis, and agent telemetry</div>
+    <div id="applyReadinessChecks" class="readiness-checks"></div>
   </section>
 
   <section id="agentRouting">
@@ -1896,6 +1911,9 @@ _INDEX_HTML = r"""<!doctype html>
 <script>
 "use strict";
 let lastUpdate = null;
+let statusSnapshot = null;
+let diagnosisSnapshot = null;
+let agentsSnapshot = null;
 
 function esc(s){ return s==null ? "" : String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -1950,7 +1968,9 @@ async function loadDiagnosis(){
   try{
     const r = await fetch("/api/diagnosis", {cache:"no-store"});
     if(!r.ok) return;
-    renderDiagnosis(await r.json());
+    diagnosisSnapshot = await r.json();
+    renderDiagnosis(diagnosisSnapshot);
+    renderApplyReadiness();
   }catch(e){}
 }
 
@@ -1958,7 +1978,9 @@ async function loadAgents(){
   try{
     const r = await fetch("/api/agents", {cache:"no-store"});
     if(!r.ok) return;
-    renderAgents(await r.json());
+    agentsSnapshot = await r.json();
+    renderAgents(agentsSnapshot);
+    renderApplyReadiness();
   }catch(e){}
 }
 
@@ -2168,6 +2190,71 @@ function renderThroughput(throughput, freshness, dailyGoal){
   ).join("");
 }
 
+function renderApplyReadiness(){
+  const checksEl = document.getElementById("applyReadinessChecks");
+  const verdictEl = document.getElementById("applyReadinessVerdict");
+  const summaryEl = document.getElementById("applyReadinessSummary");
+  if(!checksEl || !verdictEl || !summaryEl) return;
+  const s = statusSnapshot || {};
+  const d = diagnosisSnapshot || {};
+  const agents = agentsSnapshot || {};
+  const q = d.queue || s.fleet_diagnosis || {};
+  const ats = q.ats || {};
+  const gate = s.gate || {};
+  const doctor = s.doctor || {};
+  const deployment = s.deployment || {};
+  const browser = d.browser || {};
+  const browserCounts = browser.counts || {};
+  const wallRows = browser.wall_queue || [];
+  const rollups = d.rollups || {};
+  const dailyGoal = rollups.daily_goal || {};
+  const versions = deployment.worker_versions || [];
+  const applyWorkers = (s.workers || []).filter(w => (w.role || "apply") === "apply");
+  const staleApply = applyWorkers.filter(w => w.alive === false);
+  const agentWorkers = agents.workers || [];
+  const telemetryMissing = (agents.verdict || {}).code === "telemetry_missing" ||
+    (agentWorkers.length > 0 && !agentWorkers.some(w => w.current_agent || w.current_model));
+  const dirtyOrUnknown = versions.some(row => {
+    const v = String(row.version || "(unknown)");
+    return v === "(unknown)" || v.indexOf(".dirty") >= 0 || v.indexOf("-dirty") >= 0;
+  });
+  const mixedVersions = versions.length > 1;
+  const paused = Boolean(gate.paused || gate.should_halt || ats.paused || ats.ats_paused || doctor.ats_paused);
+  const leaseable = Number(ats.leaseable || 0);
+  const approved = Number(ats.approved || 0);
+  const wallCount = wallRows.length || Number(browserCounts.login_gate || 0) + Number(browserCounts.captcha || 0);
+  const goalConfigured = Boolean(dailyGoal.configured);
+  const checks = [
+    ["Pause gates", paused ? "blocked" : "ok", paused ? "blocked" : "clear",
+      paused ? "shared or ATS pause is active" : "no pause gate reported"],
+    ["Leaseable queue", leaseable > 0 ? "ok" : "blocked", leaseable,
+      approved > 0 ? approved + " approved but not leaseable" : "no approved ATS queue ready"],
+    ["Worker versions", (mixedVersions || dirtyOrUnknown) ? "warn" : "ok",
+      versions.length ? versions.length + " group(s)" : "unknown",
+      (mixedVersions || dirtyOrUnknown) ? "reconcile dirty/unknown workers before scale" : "one reported worker build"],
+    ["Model telemetry", telemetryMissing ? "warn" : "ok",
+      telemetryMissing ? "missing" : "reported",
+      telemetryMissing ? "cannot prove Codex/Claude model switching yet" : "workers report agent/model fields"],
+    ["Browser walls", wallCount ? "warn" : "ok", wallCount,
+      wallCount ? "login/captcha walls need review" : "no browser wall samples"],
+    ["Stale workers", staleApply.length ? "warn" : "ok", staleApply.length,
+      staleApply.length ? staleApply.map(w => machineName(w, w.machine_owner)).join(", ") : "all apply heartbeats fresh"],
+    ["Daily goal", goalConfigured ? "ok" : "warn",
+      goalConfigured ? String(dailyGoal.applied_today || 0) + " / " + String(dailyGoal.target || 0) : "not set",
+      goalConfigured ? String(dailyGoal.remaining == null ? "unknown" : dailyGoal.remaining) + " remaining today" : "set a daily target before unattended scale"],
+  ];
+  const blockers = checks.filter(c => c[1] === "blocked").length;
+  const warnings = checks.filter(c => c[1] === "warn").length;
+  verdictEl.textContent = blockers ? "Not ready to apply" : (warnings ? "Ready with warnings" : "Ready to apply");
+  summaryEl.textContent = blockers
+    ? blockers + " blocking gate(s), " + warnings + " warning(s)"
+    : (warnings ? warnings + " warning(s) before scaling" : "all readiness checks clear");
+  checksEl.innerHTML = checks.map(([label, state, value, hint]) =>
+    '<div class="ready-check '+esc(state)+'"><div class="name">'+esc(label)+
+    '</div><div class="value">'+esc(value)+'</div><div class="hint">'+esc(hint)+'</div></div>'
+  ).join("");
+}
+
 function renderStaleWorkers(workers){
   const el = document.getElementById("staleWorkers");
   if(!el) return;
@@ -2314,6 +2401,7 @@ async function loadAudit(){
 }
 
 function render(s){
+  statusSnapshot = s;
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
   const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
@@ -2387,6 +2475,7 @@ function render(s){
   renderLaneState(s);
   renderLaneActivity(s);
   renderStaleWorkers(s.workers || []);
+  renderApplyReadiness();
 
   const wt = document.getElementById("workers");
   if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }

@@ -68,6 +68,7 @@ def test_index_contains_operations_sections(live_server):
     for text in [
         "Fleet State",
         "Lane Activity",
+        "Apply Readiness",
         "Why Not Applying",
         "Agent Routing",
         "Machine Health",
@@ -161,6 +162,23 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert 'id="browserWallQueue"' in html
     assert "renderBrowserWallQueue" in html
     assert "wall_queue" in html
+
+
+def test_dashboard_summarizes_apply_readiness_gates(live_server):
+    with urllib.request.urlopen(f"{live_server}/") as resp:
+        html = resp.read().decode("utf-8")
+
+    assert 'id="applyReadiness"' in html
+    assert 'id="applyReadinessVerdict"' in html
+    assert 'id="applyReadinessChecks"' in html
+    assert "renderApplyReadiness" in html
+    assert "Pause gates" in html
+    assert "Leaseable queue" in html
+    assert "Worker versions" in html
+    assert "Model telemetry" in html
+    assert "Browser walls" in html
+    assert "Stale workers" in html
+    assert "Daily goal" in html
 
 
 def test_dashboard_has_explicit_lane_state_safety_rails(live_server):
