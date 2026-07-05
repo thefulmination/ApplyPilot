@@ -110,7 +110,48 @@ def test_ats_queue_diagnosis_spend_cap_reached_is_not_leaseable(fleet_db):
     assert result["state"]["code"] != "ready_to_apply"
 
 
-def test_ats_queue_diagnosis_ignores_non_ats_lane_for_approval_and_lease(fleet_db):
+def test_ats_queue_diagnosis_global_cap_reached_is_not_leaseable(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply_job(
+            conn,
+            url="https://boards.greenhouse.io/acme/jobs/5",
+            dedup_key="acme::qa",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rate_governor (scope_key, count_24h, daily_cap) "
+                "VALUES ('global', 3, 3)"
+            )
+        conn.commit()
+
+        result = console_diagnosis.queue_diagnosis(conn)
+
+    assert result["ats"]["leaseable"] == 0
+    assert result["state"]["code"] != "ready_to_apply"
+
+
+def test_ats_queue_diagnosis_host_doctor_skip_is_not_leaseable(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply_job(
+            conn,
+            url="https://boards.greenhouse.io/acme/jobs/6",
+            dedup_key="acme::support",
+            target_host="boards.greenhouse.io",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rate_governor (scope_key, doctor_skip_until) "
+                "VALUES ('host:boards.greenhouse.io', now() + interval '1 hour')"
+            )
+        conn.commit()
+
+        result = console_diagnosis.queue_diagnosis(conn)
+
+    assert result["ats"]["leaseable"] == 0
+    assert result["state"]["code"] != "ready_to_apply"
+
+
+def test_ats_queue_diagnosis_non_ats_lane_not_counted_in_depth(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply_job(
             conn,
@@ -123,7 +164,7 @@ def test_ats_queue_diagnosis_ignores_non_ats_lane_for_approval_and_lease(fleet_d
         result = console_diagnosis.queue_diagnosis(conn)
 
     ats = result["ats"]
-    assert ats["queued"] == 1
+    assert ats["queued"] == 0
     assert ats["approved"] == 0
     assert ats["dedup_blocked"] == 0
     assert ats["leaseable"] == 0
@@ -152,3 +193,75 @@ def test_linkedin_canary_exhaustion_is_lane_specific(fleet_db):
     assert result["linkedin"]["leaseable"] == 0
     assert result["linkedin"]["canary_exhausted"] is True
     assert result["ats"]["canary_exhausted"] is False
+
+
+def test_linkedin_owner_ip_context_missing_prevents_leaseable_overreport(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, company, title, application_url, score, lane, status, approved_batch, dedup_key, updated_at) "
+                "VALUES ('https://www.linkedin.com/jobs/view/2','Beta','Manager',"
+                "'https://www.linkedin.com/jobs/view/2',8,'ats','queued','batch-li','beta::manager',now())"
+            )
+        conn.commit()
+
+        result = console_diagnosis.queue_diagnosis(conn)
+
+    assert result["linkedin"]["approved"] == 1
+    assert result["linkedin"]["leaseable"] == 0
+    assert result["linkedin"]["owner_ip_context_known"] is False
+
+
+def test_linkedin_owner_ip_mismatch_prevents_leaseable_overreport(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, company, title, application_url, score, lane, status, approved_batch, dedup_key, updated_at) "
+                "VALUES ('https://www.linkedin.com/jobs/view/3','Beta','Director',"
+                "'https://www.linkedin.com/jobs/view/3',8,'ats','queued','batch-li','beta::director',now())"
+            )
+            cur.execute(
+                "INSERT INTO workers (worker_id, public_ip, capabilities) "
+                "VALUES ('li-worker', '203.0.113.10', '{\"can_linkedin\": true}'::jsonb)"
+            )
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, home_ip, role, state, last_beat) "
+                "VALUES ('li-worker', '203.0.113.11', 'linkedin', 'idle', now())"
+            )
+        conn.commit()
+
+        result = console_diagnosis.queue_diagnosis(conn)
+
+    assert result["linkedin"]["leaseable"] == 0
+    assert result["linkedin"]["owner_ip_context_known"] is True
+    assert result["linkedin"]["owner_ip_ready"] is False
+
+
+def test_queue_diagnosis_rolls_back_when_query_raises():
+    class RaisingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    class Conn:
+        def __init__(self):
+            self.rolled_back = False
+
+        def cursor(self):
+            return RaisingCursor()
+
+        def rollback(self):
+            self.rolled_back = True
+
+    conn = Conn()
+    with pytest.raises(RuntimeError, match="boom"):
+        console_diagnosis.queue_diagnosis(conn)
+
+    assert conn.rolled_back is True
