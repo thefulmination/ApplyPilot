@@ -129,6 +129,30 @@ def test_run_apply_idles_when_halted(fleet_db):
     assert ticks["halted"] >= 1 and ticks["applied"] == 0
 
 
+def test_run_apply_acks_restart_even_when_halted(fleet_db):
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import apply_worker_main as am
+    from applypilot.fleet import heartbeat
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1")
+        cmd_id = heartbeat.issue_command(conn, "w1", "restart", commit=False)
+        conn.commit()
+
+    loop = am.build_apply_loop(
+        dsn=fleet_db,
+        worker_id="w1",
+        home_ip="1.1.1.1",
+        model="sonnet",
+        agent="claude",
+    )
+    am.run_apply(lambda: pgqueue.connect(fleet_db), loop, max_iterations=1, idle_sleep=0)
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT acked_at FROM remote_commands WHERE id=%s", (cmd_id,))
+        assert cur.fetchone()["acked_at"] is not None
+
+
 def test_run_apply_reresolves_timeout_override_mid_flight(fleet_db, monkeypatch):
     """The Doctor sets agent_timeout_override WHILE a worker is already running. A startup-only
     read would never see it; the per-tick re-resolve must pick up a bump on the next tick and
