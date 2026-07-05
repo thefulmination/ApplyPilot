@@ -1761,6 +1761,16 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="funnelBody" class="funnel"></div>
   </section>
 
+  <section id="throughputSummary">
+    <h2>Throughput</h2>
+    <div class="diagnosis-grid" id="throughputGrid">
+      <div class="mini"><span>Last apply</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Applied 1h</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Applied 24h</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Daily goal</span><b>&mdash;</b><small>loading</small></div>
+    </div>
+  </section>
+
   <section id="hostQuality">
     <h2>Host Quality</h2>
     <div class="table-scroll"><table><thead><tr><th>Host</th><th>Total</th><th>Applied</th><th>Failed</th><th>Challenges</th><th>Bad Rate</th></tr></thead>
@@ -1999,6 +2009,7 @@ function renderDiagnosis(d){
     ["Failed", ats.failed],
     ["Crash unconfirmed", ats.crash_unconfirmed]
   ].map(([k,v]) => '<div class="fstep"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
+  renderThroughput(roll.throughput || {}, roll.freshness || {}, roll.daily_goal || {});
   renderHostQuality(roll.host_quality || []);
   const machines = roll.machines || {};
   document.getElementById("machineMap").innerHTML = Object.keys(machines).length
@@ -2133,6 +2144,28 @@ function renderHostQuality(rows){
       esc(h.applied || 0)+'</td><td>'+esc(h.failed || 0)+'</td><td>'+
       esc(h.challenges || 0)+'</td><td>'+esc(pct(badRate))+'</td></tr>';
   }).join("");
+}
+
+function renderThroughput(throughput, freshness, dailyGoal){
+  const grid = document.getElementById("throughputGrid");
+  if(!grid) return;
+  const configured = Boolean(dailyGoal && dailyGoal.configured);
+  const goalValue = configured ? String(dailyGoal.applied_today || 0) + " / " + String(dailyGoal.target || 0) : "not set";
+  const goalHint = configured
+    ? String(dailyGoal.remaining == null ? "unknown" : dailyGoal.remaining) + " remaining today"
+    : "daily apply target not configured";
+  const cards = [
+    ["Last apply", freshness.last_apply_at ? rel(freshness.last_apply_at) : "never",
+      freshness.last_apply_at || "no applied timestamp recorded"],
+    ["Applied 1h", throughput.applied_1h == null ? "—" : throughput.applied_1h,
+      "recent confirmed applies"],
+    ["Applied 24h", throughput.applied_24h == null ? "—" : throughput.applied_24h,
+      "confirmed applies in the last day"],
+    ["Daily goal", goalValue, goalHint],
+  ];
+  grid.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
 }
 
 function renderStaleWorkers(workers){

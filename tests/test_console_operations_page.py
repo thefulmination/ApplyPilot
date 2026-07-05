@@ -74,6 +74,7 @@ def test_index_contains_operations_sections(live_server):
         "Deployment Drift",
         "Browser Health",
         "Queue Funnel",
+        "Throughput",
         "Host Quality",
         "Safety Rails",
         "Recommended Next Action",
@@ -142,6 +143,11 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert "renderDeploymentDrift" in html
     assert 'id="hostQualityRows"' in html
     assert "renderHostQuality" in html
+    assert 'id="throughputSummary"' in html
+    assert "renderThroughput" in html
+    assert "Last apply" in html
+    assert "Applied 1h" in html
+    assert "Applied 24h" in html
     assert "dirty build" in html
     assert "unknown build" in html
     assert 'id="staleWorkers"' in html
