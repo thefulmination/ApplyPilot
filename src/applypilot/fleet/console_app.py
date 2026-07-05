@@ -1971,6 +1971,15 @@ function isUsefulHomeIp(ip){
   return Boolean(value && value !== "0.0.0.0" && value !== "::" && value.toLowerCase() !== "unknown");
 }
 
+function formatMachineCounts(items){
+  const counts = {};
+  (items || []).forEach(item => {
+    const name = machineName(item, item && item.machine_owner);
+    counts[name] = (counts[name] || 0) + 1;
+  });
+  return Object.keys(counts).sort().map(name => counts[name] > 1 ? name + "×" + counts[name] : name).join(", ");
+}
+
 function openWorkerLogs(workerId){
   const sel = document.getElementById("logWorker");
   if(!sel) return false;
@@ -2263,11 +2272,15 @@ function renderApplyReadiness(){
   const approved = Number(ats.approved || 0);
   const wallCount = wallRows.length || Number(browserCounts.login_gate || 0) + Number(browserCounts.captcha || 0);
   const goalConfigured = Boolean(dailyGoal.configured);
+  const leaseableHint = leaseable > 0
+    ? approved + " approved and leaseable"
+    : (approved > 0 ? approved + " approved but not leaseable" : "no approved ATS queue ready");
+  const staleMachineSummary = formatMachineCounts(staleApply);
   const checks = [
     ["Pause gates", paused ? "blocked" : "ok", paused ? "blocked" : "clear",
       paused ? "shared or ATS pause is active" : "no pause gate reported"],
     ["Leaseable queue", leaseable > 0 ? "ok" : "blocked", leaseable,
-      approved > 0 ? approved + " approved but not leaseable" : "no approved ATS queue ready"],
+      leaseableHint],
     ["Worker versions", (mixedVersions || dirtyOrUnknown) ? "warn" : "ok",
       versions.length ? versions.length + " group(s)" : "unknown",
       (mixedVersions || dirtyOrUnknown) ? "reconcile dirty/unknown workers before scale" : "one reported worker build"],
@@ -2277,17 +2290,21 @@ function renderApplyReadiness(){
     ["Browser walls", wallCount ? "warn" : "ok", wallCount,
       wallCount ? "login/captcha walls need review" : "no browser wall samples"],
     ["Stale workers", staleApply.length ? "warn" : "ok", staleApply.length,
-      staleApply.length ? staleApply.map(w => machineName(w, w.machine_owner)).join(", ") : "all apply heartbeats fresh"],
+      staleApply.length ? staleMachineSummary : "all apply heartbeats fresh"],
     ["Daily goal", goalConfigured ? "ok" : "warn",
       goalConfigured ? String(dailyGoal.applied_today || 0) + " / " + String(dailyGoal.target || 0) : "not set",
       goalConfigured ? String(dailyGoal.remaining == null ? "unknown" : dailyGoal.remaining) + " remaining today" : "set a daily target before unattended scale"],
   ];
   const blockers = checks.filter(c => c[1] === "blocked").length;
   const warnings = checks.filter(c => c[1] === "warn").length;
-  verdictEl.textContent = blockers ? "Not ready to apply" : (warnings ? "Ready with warnings" : "Ready to apply");
+  verdictEl.textContent = blockers
+    ? "Not ready to apply"
+    : (warnings ? "Unsafe to scale" : "Ready to apply carefully");
   summaryEl.textContent = blockers
-    ? blockers + " blocking gate(s), " + warnings + " warning(s)"
-    : (warnings ? warnings + " warning(s) before scaling" : "all readiness checks clear");
+    ? blockers + " blocking gate(s), " + warnings + " scale risk(s)"
+    : (warnings
+      ? "apply lane has queue, but " + warnings + " scale risk(s) remain"
+      : "all readiness checks clear; keep canary and daily caps in place");
   checksEl.innerHTML = checks.map(([label, state, value, hint]) =>
     '<div class="ready-check '+esc(state)+'"><div class="name">'+esc(label)+
     '</div><div class="value">'+esc(value)+'</div><div class="hint">'+esc(hint)+'</div></div>'

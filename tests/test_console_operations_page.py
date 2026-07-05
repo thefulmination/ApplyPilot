@@ -181,6 +181,10 @@ def test_dashboard_summarizes_apply_readiness_gates(live_server):
     assert "Browser walls" in html
     assert "Stale workers" in html
     assert "Daily goal" in html
+    assert "Unsafe to scale" in html
+    assert "Ready to apply carefully" in html
+    assert "approved and leaseable" in html
+    assert "formatMachineCounts" in html
 
 
 def test_dashboard_promotes_discovery_backlog_visibility(live_server):
