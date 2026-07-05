@@ -14,6 +14,15 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import console_agents, console_app
 
 
+def test_agent_summary_no_workers_returns_warn_unknown(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        result = console_agents.agent_summary(conn)
+
+    assert result["verdict"]["code"] == "unknown"
+    assert result["verdict"]["severity"] == "warn"
+    assert result["verdict"]["reason"]
+
+
 def test_agent_summary_reads_worker_heartbeat_blocks_and_spend(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
@@ -69,7 +78,7 @@ def test_agent_summary_detects_all_agents_blocked(fleet_db):
         result = console_agents.agent_summary(conn)
 
     assert result["verdict"]["code"] == "all_agents_blocked"
-    assert result["verdict"]["severity"] == "critical"
+    assert result["verdict"]["severity"] == "halted"
     assert result["verdict"]["reason"]
 
 

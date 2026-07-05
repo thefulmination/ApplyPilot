@@ -43,7 +43,7 @@ def _verdict(
     spend_24h: list[dict[str, Any]],
 ) -> dict[str, str]:
     if not workers:
-        return _make_verdict("unknown", "unknown", "No apply workers have reported heartbeat state.")
+        return _make_verdict("unknown", "warn", "No apply workers have reported heartbeat state.")
 
     blocked_agents = {agent for agent, row in availability.items() if row["blocked"]}
     chain_agents = {
@@ -54,7 +54,7 @@ def _verdict(
     if chain_agents and chain_agents.issubset(blocked_agents):
         return _make_verdict(
             "all_agents_blocked",
-            "critical",
+            "halted",
             "Every configured apply agent is currently blocked.",
         )
 
