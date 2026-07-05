@@ -51,3 +51,10 @@ def test_compute_ingest_wrapper_includes_unscored_push():
     script = Path("register-fleet-tasks.ps1").read_text(encoding="utf-8")
 
     assert "& '$computeIngestPs1' -Once -IncludeUnscored" in script
+
+
+def test_m4_compute_score_defaults_to_max_parallelism():
+    script = Path("register-fleet-tasks.ps1").read_text(encoding="utf-8")
+
+    assert "[ValidateRange(1,16)][int]$ComputeWorkers = 16" in script
+    assert "& '$computeScorePs1' -Label $Machine -Workers $ComputeWorkers" in script

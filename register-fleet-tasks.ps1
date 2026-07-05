@@ -1,4 +1,4 @@
-# register-fleet-tasks.ps1 -Machine home|m2|m4 [-Dsn <override>] [-SetDesired "home=1,m2=6,m4=2"] [-AllowZero] [-Unregister]
+# register-fleet-tasks.ps1 -Machine home|m2|m4 [-Dsn <override>] [-SetDesired "home=1,m2=6,m4=2"] [-ComputeWorkers 16] [-AllowZero] [-Unregister]
 #
 #   ONE-COMMAND path to wire ApplyPilot's control loop as Windows Scheduled Tasks. Run ONCE PER
 #   MACHINE, ELEVATED (right-click PowerShell -> Run as Administrator). Implements roadmap Phase 1
@@ -51,6 +51,7 @@ param(
   [Parameter(Mandatory = $true)][ValidateSet("home", "m2", "m4")][string]$Machine,
   [string]$Dsn,
   [string]$SetDesired,
+  [ValidateRange(1,16)][int]$ComputeWorkers = 16,
   [switch]$AllowZero,
   [switch]$Unregister
 )
@@ -476,7 +477,7 @@ if ($Machine -eq "m4") {
   # Persistent scorers (run-fleet-compute spawns N forever-workers + exits). Re-run hourly via
   # the repetition trigger self-heals any that died (it kills+respawns a clean slate of N).
   # IP-free + cost-cap gated: no apply-IP hygiene needed, and it is NOT halted by the apply pause.
-  Write-Host "`n[register-fleet-tasks] registering ComputeScore (5 scorers, self-heal hourly, IP-free)..." -ForegroundColor Cyan
+  Write-Host "`n[register-fleet-tasks] registering ComputeScore ($ComputeWorkers scorers, self-heal hourly, IP-free)..." -ForegroundColor Cyan
   $computeScorePs1 = Join-Path $repo "run-fleet-compute.ps1"
   if (-not (Test-Path $computeScorePs1)) { throw "run-fleet-compute.ps1 not found at $computeScorePs1" }
   $computeScoreLog = Join-Path $logDir "compute-score.log"
@@ -486,14 +487,14 @@ if ($Machine -eq "m4") {
 `$ErrorActionPreference = 'Continue'
 `$env:FLEET_PG_DSN = '$effectiveDsn'
 Set-Location '$repo'
-& '$computeScorePs1' -Label $Machine -Workers 5 *>> '$computeScoreLog'
+& '$computeScorePs1' -Label $Machine -Workers $ComputeWorkers *>> '$computeScoreLog'
 "@
   $computeScoreWrapper = Write-Wrapper "compute-score-task" $computeScoreWrapperContent
   $computeScoreTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
   $computeScoreSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
   Register-FleetTask -Name "${TaskPrefix}ComputeScore" -WrapperPath $computeScoreWrapper -Trigger $computeScoreTrigger -Settings $computeScoreSettings `
-    -Description "ApplyPilot compute score: 5 IP-free LLM scorers leasing compute_queue. Cost-cap gated (not apply spend_cap, not apply pause). Advisory results only."
+    -Description "ApplyPilot compute score: $ComputeWorkers IP-free LLM scorers leasing compute_queue. Cost-cap gated (not apply spend_cap, not apply pause). Advisory results only."
 }
 
 # ---------------------------------------------------------------------------------------------
