@@ -1718,6 +1718,13 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="machineMap" class="machine-grid"></div>
   </section>
 
+  <section id="deploymentDrift">
+    <h2>Deployment Drift</h2>
+    <div id="deploymentDriftSummary" class="sub"></div>
+    <div class="table-scroll"><table><thead><tr><th>Version</th><th>Workers</th><th>Status</th></tr></thead>
+      <tbody id="deploymentDriftRows"><tr><td colspan="3" class="mut">loading</td></tr></tbody></table></div>
+  </section>
+
   <section id="browserHealth">
     <h2>Browser Health</h2>
     <div id="browserBody" class="diagnosis-grid"></div>
@@ -2087,6 +2094,37 @@ function renderWorkerComparison(rows){
   ).join("") : '<tr><td colspan="6" class="mut">no worker outcome data yet</td></tr>';
 }
 
+function classifyBuild(version){
+  const v = String(version || "(unknown)");
+  if(v === "(unknown)") return "unknown build";
+  if(v.indexOf(".dirty") >= 0 || v.indexOf("-dirty") >= 0) return "dirty build";
+  return "reported build";
+}
+
+function renderDeploymentDrift(dep){
+  const rowsEl = document.getElementById("deploymentDriftRows");
+  const summaryEl = document.getElementById("deploymentDriftSummary");
+  if(!rowsEl || !summaryEl) return;
+  const versions = (dep && dep.worker_versions) || [];
+  if(!versions.length){
+    summaryEl.textContent = "No worker versions reported.";
+    rowsEl.innerHTML = '<tr><td colspan="3" class="mut">no worker version telemetry</td></tr>';
+    return;
+  }
+  const total = versions.reduce((n, row) => n + Number(row.workers || 0), 0);
+  const dirty = versions.filter(row => classifyBuild(row.version) === "dirty build")
+    .reduce((n, row) => n + Number(row.workers || 0), 0);
+  const unknown = versions.filter(row => classifyBuild(row.version) === "unknown build")
+    .reduce((n, row) => n + Number(row.workers || 0), 0);
+  summaryEl.textContent = total + " worker heartbeat(s) across " + versions.length +
+    " version group(s)" + (dirty || unknown ? " — reconcile dirty/unknown builds before comparing telemetry." : ".");
+  rowsEl.innerHTML = versions.map(row => {
+    const status = classifyBuild(row.version);
+    return '<tr><td>'+esc(row.version || "(unknown)")+'</td><td>'+esc(row.workers || 0)+
+      '</td><td>'+esc(status)+'</td></tr>';
+  }).join("");
+}
+
 function renderLaneState(s){
   const grid = document.getElementById("laneStateGrid");
   if(!grid) return;
@@ -2165,6 +2203,7 @@ function render(s){
     " · schema telemetry=" + (schema.agent_telemetry ? "ok" : "missing") +
     " audit=" + (schema.audit_table ? "ok" : "missing") +
     " · worker_versions " + versionText;
+  renderDeploymentDrift(dep);
 
   // DeadMan: a RED fixed banner when fleet_config.deadman_alert is set (silent
   // fleet death / stall / running-hot) so the owner sees it even glancing at a phone.

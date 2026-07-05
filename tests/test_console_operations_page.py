@@ -70,6 +70,7 @@ def test_index_contains_operations_sections(live_server):
         "Why Not Applying",
         "Agent Routing",
         "Machine Health",
+        "Deployment Drift",
         "Browser Health",
         "Queue Funnel",
         "Safety Rails",
@@ -126,6 +127,11 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert 'id="recommendationList"' in html
     assert 'id="agentSummary"' in html
     assert "worker_versions" in html
+    assert 'id="deploymentDrift"' in html
+    assert 'id="deploymentDriftRows"' in html
+    assert "renderDeploymentDrift" in html
+    assert "dirty build" in html
+    assert "unknown build" in html
     assert "spend_24h" in html
     assert "Dynamic switching" in html
     assert "Model in use" in html
