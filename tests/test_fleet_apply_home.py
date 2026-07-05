@@ -129,6 +129,31 @@ def test_arm_canary_if_safe_refuses_ats_paused(fleet_db):
             pass
 
 
+def test_manual_canary_refuses_ats_paused(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET canary_enabled=FALSE, canary_remaining=NULL, "
+                    "paused=TRUE, ats_paused=TRUE, ats_pause_source='operator' WHERE id=1")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        try:
+            hm.set_canary(conn, 3)
+            assert False, "manual canary must not bypass an ATS pause"
+        except RuntimeError as exc:
+            assert "ATS pause" in str(exc)
+        with conn.cursor() as cur:
+            cur.execute("SELECT canary_enabled, canary_remaining, paused, ats_paused, ats_pause_source "
+                        "FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+        assert cfg["canary_enabled"] is False
+        assert cfg["canary_remaining"] is None
+        assert cfg["paused"] is True
+        assert cfg["ats_paused"] is True
+        assert cfg["ats_pause_source"] == "operator"
+
+
 def test_arm_canary_if_safe_refuses_cost_cap(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     from applypilot.apply import pgqueue

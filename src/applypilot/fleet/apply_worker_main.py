@@ -307,6 +307,21 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
     while not _STOP_REQUESTED.is_set() and (max_iterations is None or it < max_iterations):
         it += 1
         try:
+            command_handler = (
+                getattr(loop, "_handle_commands", None)
+                if hasattr(type(loop), "_handle_commands")
+                else None
+            )
+            if callable(command_handler):
+                with conn_factory() as cmd_conn:
+                    stop = command_handler(cmd_conn)
+                    if stop is not None:
+                        logger.info(
+                            "remote %s command: exiting between jobs before lease gates "
+                            "(supervisor respawns)",
+                            stop,
+                        )
+                        break
             # Fleet-wide + predictive layer (optional): pull the shared agent_availability
             # blocks (another worker's reactive wall, or the predictive spend monitor) and
             # feed them into THIS worker's switcher, and run the throttled spend evaluator.
@@ -326,6 +341,13 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 if agent is None:
                     # Every agent is walled -> pause until the nearer reset (capped).
                     counts["idle"] += 1
+                    beat = getattr(loop, "_beat", None)
+                    if callable(beat):
+                        try:
+                            with conn_factory() as pause_conn:
+                                beat(pause_conn, state="paused")
+                        except Exception:  # pragma: no cover - never fatal
+                            logger.debug("agent-wall heartbeat failed", exc_info=True)
                     if idle_sleep:
                         resume = switcher.resume_at(now)
                         nap = min(max(resume - now, 0.0), _PAUSE_CEILING) if resume is not None else idle_sleep
@@ -345,20 +367,6 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 # H1: the APPLY lane honors the Doctor's ATS-only pause (ats_paused) in addition
                 # to the shared kill switch; ats_should_halt OR-s it in. The LinkedIn worker keeps
                 # plain should_halt(), so a Doctor ATS pause never halts the LinkedIn lane.
-                command_handler = (
-                    getattr(loop, "_handle_commands", None)
-                    if hasattr(type(loop), "_handle_commands")
-                    else None
-                )
-                if callable(command_handler):
-                    stop = command_handler(conn)
-                    if stop is not None:
-                        logger.info(
-                            "remote %s command: exiting between jobs while halted "
-                            "(supervisor respawns)",
-                            stop,
-                        )
-                        break
                 if pgqueue.ats_should_halt(conn):
                     counts["halted"] += 1
                     # Beat while halted: a paused worker that stops beating is indistinguishable

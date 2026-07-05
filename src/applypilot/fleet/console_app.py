@@ -79,12 +79,13 @@ def _seconds_since(ts: Any) -> int | None:
 def _gate_and_queue(conn) -> tuple[dict, dict]:
     """fleet_config gate + apply_queue depth + leasable + spend, in one read txn.
 
-    leasable mirrors queue.lease_apply's eligibility EXACTLY: status=queued AND
-    approved_batch IS NOT NULL AND NOT EXISTS(applied_set with same dedup_key).
+    base_leasable is the approved queued pool before global stop gates.
+    leasable is the operator-facing effective count after pause, ATS pause,
+    spend cap, and canary exhaustion are applied.
     spent_usd = SUM(est_cost_usd) over apply_queue (same SUM the cap halt uses)."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT paused, canary_enabled, canary_remaining, spend_cap_usd "
+            "SELECT paused, ats_paused, ats_pause_source, canary_enabled, canary_remaining, spend_cap_usd "
             "FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone() or {}
@@ -97,20 +98,43 @@ def _gate_and_queue(conn) -> tuple[dict, dict]:
 
         cur.execute(
             "SELECT COUNT(*) AS n FROM apply_queue q "
-            "WHERE q.status='queued' AND q.approved_batch IS NOT NULL "
+            "WHERE q.status='queued' AND q.lane='ats' AND q.approved_batch IS NOT NULL "
             "  AND NOT EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)"
         )
-        leasable = int(cur.fetchone()["n"])
+        base_leasable = int(cur.fetchone()["n"])
     conn.rollback()  # read-only
 
+    paused = bool(cfg.get("paused"))
+    ats_paused = bool(cfg.get("ats_paused"))
+    canary_enabled = bool(cfg.get("canary_enabled"))
+    canary_remaining = (int(cfg["canary_remaining"])
+                        if cfg.get("canary_remaining") is not None else None)
+    spend_cap = float(cfg.get("spend_cap_usd") or 0)
+    canary_exhausted = canary_enabled and not (canary_remaining is not None and canary_remaining > 0)
+    spend_halted = spend_cap > 0 and spent >= spend_cap
+    lease_gate_open = not (paused or ats_paused or canary_exhausted or spend_halted)
+    halt_reasons = []
+    if paused:
+        halt_reasons.append("paused")
+    if ats_paused:
+        halt_reasons.append("ats_paused")
+    if canary_exhausted:
+        halt_reasons.append("canary_exhausted")
+    if spend_halted:
+        halt_reasons.append("spend_cap")
+
     gate = {
-        "paused": bool(cfg.get("paused")),
-        "canary_enabled": bool(cfg.get("canary_enabled")),
-        "canary_remaining": (int(cfg["canary_remaining"])
-                             if cfg.get("canary_remaining") is not None else None),
-        "spend_cap_usd": float(cfg.get("spend_cap_usd") or 0),
+        "paused": paused,
+        "ats_paused": ats_paused,
+        "ats_pause_source": cfg.get("ats_pause_source"),
+        "canary_enabled": canary_enabled,
+        "canary_remaining": canary_remaining,
+        "spend_cap_usd": spend_cap,
         "spent_usd": spent,
-        "leasable": leasable,
+        "base_leasable": base_leasable,
+        "leasable": base_leasable if lease_gate_open else 0,
+        "lease_gate_open": lease_gate_open,
+        "halt_reasons": halt_reasons,
     }
     queue = {
         "apply": {
@@ -692,7 +716,8 @@ def _do_arm_canary(conn, body: dict) -> str:
     k = body.get("k")
     if not isinstance(k, int) or isinstance(k, bool) or k < 1 or k > 200:
         raise ValueError("arm_canary requires integer k in [1,200]")
-    H.set_canary(conn, k)
+    if not H.arm_canary_if_safe(conn, k):
+        return (False, "Canary not armed: ATS pause or cost cap is active.")
     return f"Canary armed: up to {k} real applications will be submitted, then auto-pause."
 
 
@@ -1605,16 +1630,17 @@ function render(s){
   // H8: an ATS-only Doctor pause (ats_paused, source='doctor') is a distinct, milder state than a
   // full operator/cost halt -- label it so the operator knows the LinkedIn lane is untouched and
   // that it auto-reverts. The shared paused/spend-cap halt still shows as the hard PAUSE/HALTED.
-  const doctorAtsPause = doc.ats_paused && doc.ats_pause_source === "doctor";
+  const atsPause = !!(doc.ats_paused || g.ats_paused);
+  const atsPauseSource = doc.ats_pause_source || g.ats_pause_source || "operator";
   const paused = g.paused || g.should_halt;
   const banner = document.getElementById("banner");
-  banner.className = "banner " + ((paused || doctorAtsPause) ? "pause" : "run");
+  banner.className = "banner " + ((paused || atsPause) ? "pause" : "run");
   document.getElementById("bannerText").textContent =
     paused ? (g.should_halt && !g.paused ? "HALTED (spend cap)" : "PAUSED")
-           : (doctorAtsPause ? "ATS PAUSED by Fleet Doctor (auto)" : "RUNNING");
+           : (atsPause ? ("ATS PAUSED (" + atsPauseSource + ")") : "RUNNING");
   document.getElementById("updated").textContent =
     "updated " + rel(s.now) + (g.should_halt ? " • halt active"
-      : doctorAtsPause ? " • LinkedIn lane UNAFFECTED" : "");
+      : atsPause ? " • LinkedIn lane UNAFFECTED" : "");
 
   // H18: above-the-fold Doctor card + a toast when a NEW auto-fix appears between polls.
   const dc = document.getElementById("cDoctor");

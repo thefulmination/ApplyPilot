@@ -1,0 +1,51 @@
+from applypilot.apply import pgqueue
+from applypilot.fleet import console_app, queue
+
+
+def test_gate_leasable_is_zero_when_ats_paused(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_apply_jobs(conn, [{
+            "url": "https://boards.greenhouse.io/acme/jobs/1",
+            "company": "Acme",
+            "title": "Chief of Staff",
+            "application_url": "https://boards.greenhouse.io/acme/jobs/1/apply",
+            "score": 9,
+            "target_host": "boards.greenhouse.io",
+        }], approved_batch="batch-1")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET paused=FALSE, ats_paused=TRUE, "
+                "ats_pause_source='operator', canary_enabled=TRUE, canary_remaining=5 WHERE id=1"
+            )
+        conn.commit()
+
+        gate, _ = console_app._gate_and_queue(conn)
+
+    assert gate["base_leasable"] == 1
+    assert gate["leasable"] == 0
+    assert gate["lease_gate_open"] is False
+    assert gate["ats_paused"] is True
+    assert gate["ats_pause_source"] == "operator"
+    assert "ats_paused" in gate["halt_reasons"]
+
+
+def test_console_arm_canary_refuses_ats_paused(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, "
+            "ats_pause_source='operator', canary_enabled=FALSE, canary_remaining=NULL WHERE id=1"
+        )
+        conn.commit()
+
+    ok, msg = console_app.run_action({"action": "arm_canary", "k": 5})
+
+    assert ok is False
+    assert "ATS pause" in msg
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT paused, ats_paused, canary_enabled, canary_remaining FROM fleet_config WHERE id=1")
+        cfg = cur.fetchone()
+    assert cfg["paused"] is True
+    assert cfg["ats_paused"] is True
+    assert cfg["canary_enabled"] is False
+    assert cfg["canary_remaining"] is None

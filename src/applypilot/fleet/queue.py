@@ -441,7 +441,7 @@ def push_compute_jobs(conn, rows, *, commit=True) -> int:
         for r in rows:
             cur.execute(
                 "INSERT INTO compute_queue (url, task, payload, est_cost_usd) VALUES (%s,%s,%s,%s) "
-                "ON CONFLICT (url, task) DO UPDATE SET payload=EXCLUDED.payload, updated_at=now() "
+                "ON CONFLICT (url, task) DO UPDATE SET payload=EXCLUDED.payload, est_cost_usd=EXCLUDED.est_cost_usd "
                 "WHERE compute_queue.status='queued'",
                 (r["url"], r["task"], json.dumps(r.get("payload")) if r.get("payload") is not None else None,
                  r.get("est_cost_usd", 0)),

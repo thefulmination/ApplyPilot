@@ -75,6 +75,75 @@ def test_run_apply_pauses_when_all_agents_walled(monkeypatch):
     awm._STOP_REQUESTED.clear()
 
 
+def test_run_apply_beats_while_all_agents_walled(monkeypatch):
+    awm._STOP_REQUESTED.clear()
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
+
+    sw = AgentSwitcher("claude", "codex", cooldown_seconds=3600)
+    sw.note_wall("claude", now=1000.0)
+    sw.note_wall("codex", now=1000.0)
+
+    class LoopWithBeat:
+        _log_tail_fn = None
+
+        def __init__(self):
+            self.beats = []
+            self.ran = 0
+
+        def _beat(self, conn, state):
+            self.beats.append(state)
+
+        def run_once(self):
+            self.ran += 1
+            return {"action": "applied"}
+
+    loop = LoopWithBeat()
+
+    counts = awm.run_apply(_conn_factory, loop, max_iterations=2, idle_sleep=0,
+                           switcher=sw, rebuild_apply_fn=lambda a: (lambda job: {}),
+                           time_fn=lambda: 1000.0)
+
+    assert loop.beats == ["paused", "paused"]
+    assert loop.ran == 0
+    assert counts["idle"] == 2
+    awm._STOP_REQUESTED.clear()
+
+
+def test_run_apply_handles_remote_command_before_all_agents_walled(monkeypatch):
+    awm._STOP_REQUESTED.clear()
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
+
+    sw = AgentSwitcher("claude", "codex", cooldown_seconds=3600)
+    sw.note_wall("claude", now=1000.0)
+    sw.note_wall("codex", now=1000.0)
+
+    class LoopWithCommand:
+        _log_tail_fn = None
+
+        def __init__(self):
+            self.handled = 0
+            self.ran = 0
+
+        def _handle_commands(self, conn):
+            self.handled += 1
+            return "restart"
+
+        def run_once(self):
+            self.ran += 1
+            return {"action": "applied"}
+
+    loop = LoopWithCommand()
+
+    counts = awm.run_apply(_conn_factory, loop, max_iterations=1, idle_sleep=0,
+                           switcher=sw, rebuild_apply_fn=lambda a: (lambda job: {}),
+                           time_fn=lambda: 1000.0)
+
+    assert loop.handled == 1
+    assert loop.ran == 0
+    assert counts == {"applied": 0, "halted": 0, "idle": 0, "error": 0}
+    awm._STOP_REQUESTED.clear()
+
+
 def test_run_apply_uses_parsed_reset_time_over_cooldown(monkeypatch):
     awm._STOP_REQUESTED.clear()
     monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
@@ -162,9 +231,14 @@ def test_pg_agent_budget_throttles_evaluate(monkeypatch):
     clock = {"t": 0.0}
     b = awm.PgAgentBudget(soft_caps={"claude": 5.0}, eval_interval_seconds=100,
                           time_fn=lambda: clock["t"])
-    b.maybe_evaluate(object()); assert calls["n"] == 1        # first call runs
-    clock["t"] = 50; b.maybe_evaluate(object()); assert calls["n"] == 1   # throttled
-    clock["t"] = 101; b.maybe_evaluate(object()); assert calls["n"] == 2  # due again
+    b.maybe_evaluate(object())
+    assert calls["n"] == 1        # first call runs
+    clock["t"] = 50
+    b.maybe_evaluate(object())
+    assert calls["n"] == 1        # throttled
+    clock["t"] = 101
+    b.maybe_evaluate(object())
+    assert calls["n"] == 2        # due again
 
 
 def test_pg_agent_budget_no_caps_skips_evaluate(monkeypatch):
@@ -172,7 +246,8 @@ def test_pg_agent_budget_no_caps_skips_evaluate(monkeypatch):
     monkeypatch.setattr("applypilot.fleet.agent_budget.evaluate_soft_blocks",
                         lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), [])[1])
     b = awm.PgAgentBudget(soft_caps={}, time_fn=lambda: 0.0)   # no caps -> predictive off
-    b.maybe_evaluate(object()); assert calls["n"] == 0
+    b.maybe_evaluate(object())
+    assert calls["n"] == 0
 
 
 def test_run_apply_without_switcher_is_unchanged(monkeypatch):
