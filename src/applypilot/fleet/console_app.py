@@ -464,6 +464,16 @@ def build_status() -> dict:
     try:
         gate, queue = _gate_and_queue(conn)
         try:
+            from applypilot.fleet import console_diagnosis
+
+            fleet_diagnosis = console_diagnosis.queue_diagnosis(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            fleet_diagnosis = None
+        try:
             gate["should_halt"] = bool(pgqueue.should_halt(conn))
         except Exception:
             gate["should_halt"] = gate["paused"]
@@ -504,6 +514,7 @@ def build_status() -> dict:
         "linkedin": linkedin,
         "doctor": doctor_sig,
         "discovery": discovery,
+        "fleet_diagnosis": fleet_diagnosis,
         # H19: the DeadMan alert (fleet_config.deadman_alert/_at, written by
         # applypilot.fleet.deadman's run_deadman) surfaced top-level -- NOT nested
         # under "doctor" -- so a silent fleet death/stall/running-hot is visible
@@ -1163,6 +1174,23 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, build_status())
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
+            return
+        if path == "/api/diagnosis":
+            from applypilot.fleet import console_diagnosis
+
+            conn = None
+            try:
+                conn = pgqueue.connect()
+                self._send_json(200, console_diagnosis.full_diagnosis(conn))
+            except Exception as e:
+                self._send_json(500, {"error": _scrub(str(e))[:500]})
+            finally:
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    conn.close()
             return
         if path == "/api/diagnostics":
             # Dedicated endpoint (NOT folded into the 4s /api/status poll): the Doctor blob

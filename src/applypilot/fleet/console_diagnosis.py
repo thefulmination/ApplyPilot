@@ -274,3 +274,62 @@ def browser_health(conn) -> dict:
     finally:
         conn.rollback()
     return summarize_worker_logs(rows)
+
+
+def recommendations_from(queue: dict, browser: dict) -> list[dict]:
+    recs: list[dict] = []
+    ats = queue["ats"]
+    linkedin = queue["linkedin"]
+    if ats["approved"] > 0 and ats["leaseable"] == 0 and ats["dedup_blocked"] == ats["approved"]:
+        recs.append({
+            "code": "reconcile_dedup_blocked_queue",
+            "severity": "warn",
+            "lane": "ats",
+            "title": "Queued ATS rows are dedup-blocked",
+            "reason": f"{ats['dedup_blocked']} approved queued ATS rows are already in applied_set.",
+            "action_type": "manual_runbook",
+            "command": "Run a read-only queue reconcile report before mutating any rows.",
+        })
+    if linkedin["queued"] > 0 and linkedin["canary_exhausted"]:
+        recs.append({
+            "code": "rearm_linkedin_canary",
+            "severity": "info",
+            "lane": "linkedin",
+            "title": "LinkedIn canary is exhausted",
+            "reason": "LinkedIn has queued rows but linkedin_canary_remaining is zero.",
+            "action_type": "manual_operator",
+            "command": "Use the LinkedIn lane runbook to re-arm a small canary if you want LinkedIn active.",
+        })
+    if browser["counts"].get("browser_service_unavailable") or browser["counts"].get(
+        "browser_backend_crashed"
+    ):
+        recs.append({
+            "code": "restart_browser_backend",
+            "severity": "warn",
+            "lane": "ats",
+            "title": "Browser backend failures detected",
+            "reason": "Recent worker logs include browser backend crash or connection-refused failures.",
+            "action_type": "manual_machine",
+            "command": "Restart the affected machine's browser/apply worker stack, then verify heartbeat.",
+        })
+    if not recs:
+        recs.append({
+            "code": "no_immediate_action",
+            "severity": "ok",
+            "lane": "fleet",
+            "title": "No immediate action required",
+            "reason": "No high-priority console diagnosis fired.",
+            "action_type": "none",
+            "command": "",
+        })
+    return recs
+
+
+def full_diagnosis(conn) -> dict:
+    queue = queue_diagnosis(conn)
+    browser = browser_health(conn)
+    return {
+        "queue": queue,
+        "browser": browser,
+        "recommendations": recommendations_from(queue, browser),
+    }

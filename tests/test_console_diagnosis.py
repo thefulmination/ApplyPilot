@@ -325,3 +325,46 @@ def test_browser_health_counts_apply_workers_and_skips_non_apply_and_unknown(fle
             "severity": "warn",
         }
     }
+
+
+def test_recommendation_for_dedup_blocked_queue(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply_job(
+            conn,
+            url="https://boards.greenhouse.io/acme/jobs/3",
+            dedup_key="acme::pm",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO applied_set (dedup_key, company, applied_url) "
+                "VALUES ('acme::pm', 'Acme', 'https://already/applied')"
+            )
+        conn.commit()
+
+        result = console_diagnosis.full_diagnosis(conn)
+
+    rec = result["recommendations"][0]
+    assert rec["code"] == "reconcile_dedup_blocked_queue"
+    assert rec["action_type"] == "manual_runbook"
+    assert "remediator" in rec["command"].lower() or "reconcile" in rec["command"].lower()
+
+
+def test_recommendation_for_linkedin_canary_exhausted(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, company, title, application_url, score, lane, status, approved_batch, dedup_key) "
+                "VALUES ('https://www.linkedin.com/jobs/view/4','Acme','Lead',"
+                "'https://www.linkedin.com/jobs/view/4',8,'ats','queued','li-batch','acme::lead')"
+            )
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_canary_enabled=TRUE, "
+                "linkedin_canary_remaining=0 WHERE id=1"
+            )
+        conn.commit()
+
+        result = console_diagnosis.full_diagnosis(conn)
+
+    codes = {r["code"] for r in result["recommendations"]}
+    assert "rearm_linkedin_canary" in codes
