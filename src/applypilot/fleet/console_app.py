@@ -1674,6 +1674,16 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="recommendationList" class="rec-list"><div class="mut">loading recommendations</div></div>
   </section>
 
+  <section id="laneActivity">
+    <h2>Lane Activity</h2>
+    <div id="laneActivityGrid" class="diagnosis-grid">
+      <div class="mini"><span>Apply lane</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Compute lane</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>Discovery lane</span><b>&mdash;</b><small>loading</small></div>
+      <div class="mini"><span>LinkedIn lane</span><b>&mdash;</b><small>loading</small></div>
+    </div>
+  </section>
+
   <section id="safetyRails">
     <h2>Safety Rails</h2>
     <div class="metric-grid" id="safetyGrid">
@@ -2206,6 +2216,42 @@ function renderLaneState(s){
   ).join("");
 }
 
+function renderLaneActivity(s){
+  const grid = document.getElementById("laneActivityGrid");
+  if(!grid) return;
+  const diag = s.fleet_diagnosis || {};
+  const ats = diag.ats || {};
+  const liDiag = diag.linkedin || {};
+  const gate = s.gate || {};
+  const q = (s.queue && s.queue.apply) || {};
+  const recent = s.recent || [];
+  const discovery = s.discovery || {};
+  const discoveryWorkers = discovery.workers || [];
+  const linkedin = s.linkedin || {};
+  const computeRecent = recent.filter(r => r.lane === "compute").length;
+  const applyStatus = (gate.paused || ats.paused || ats.ats_paused || gate.should_halt)
+    ? "halted" : (Number(ats.leaseable || 0) > 0 ? "ready" : "idle");
+  const computeStatus = computeRecent ? "active" : "idle";
+  const discoveryAlive = discoveryWorkers.filter(w => w.alive).length;
+  const discoveryStatus = discoveryAlive ? "active" : "idle";
+  const linkedinStatus = linkedin.halted ? "halted" : (Number(liDiag.leaseable || 0) > 0 ? "ready" : "limited");
+  const cards = [
+    ["Apply lane", applyStatus,
+      (ats.leaseable == null ? "leaseable unknown" : ats.leaseable + " leaseable") +
+      " / " + (q.queued || 0) + " queued"],
+    ["Compute lane", computeStatus,
+      computeRecent + " recent compute result(s)"],
+    ["Discovery lane", discoveryStatus,
+      discoveryAlive + " worker(s) alive / " + (((discovery.tasks || {}).due_now) || 0) + " due search task(s)"],
+    ["LinkedIn lane", linkedinStatus,
+      (liDiag.leaseable == null ? "leaseable unknown" : liDiag.leaseable + " leaseable") +
+      " / " + (linkedin.queued || liDiag.queued || 0) + " queued"],
+  ];
+  grid.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
 function renderAudit(d){
   const body = document.getElementById("auditRows");
   const rows = (d && d.rows) || [];
@@ -2303,6 +2349,7 @@ function render(s){
     liveAts.leaseable == null ? "eligible if running" : "leaseable after pause/canary gates";
   document.getElementById("cChallenges").textContent = s.challenges;
   renderLaneState(s);
+  renderLaneActivity(s);
   renderStaleWorkers(s.workers || []);
 
   const wt = document.getElementById("workers");

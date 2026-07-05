@@ -67,6 +67,7 @@ def test_index_contains_operations_sections(live_server):
 
     for text in [
         "Fleet State",
+        "Lane Activity",
         "Why Not Applying",
         "Agent Routing",
         "Machine Health",
@@ -125,8 +126,14 @@ def test_dashboard_surfaces_versions_browser_examples_and_worker_comparison(live
     assert "renderWorkerComparison" in html
     assert "renderRecommendationList" in html
     assert "renderAgentSummary" in html
+    assert "renderLaneActivity" in html
     assert 'id="recommendationList"' in html
+    assert 'id="laneActivity"' in html
     assert 'id="agentSummary"' in html
+    assert "Apply lane" in html
+    assert "Compute lane" in html
+    assert "Discovery lane" in html
+    assert "LinkedIn lane" in html
     assert "worker_versions" in html
     assert 'id="deploymentDrift"' in html
     assert 'id="deploymentDriftRows"' in html
