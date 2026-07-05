@@ -1749,6 +1749,12 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="funnelBody" class="funnel"></div>
   </section>
 
+  <section id="hostQuality">
+    <h2>Host Quality</h2>
+    <div class="table-scroll"><table><thead><tr><th>Host</th><th>Total</th><th>Applied</th><th>Failed</th><th>Challenges</th><th>Bad Rate</th></tr></thead>
+      <tbody id="hostQualityRows"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
+  </section>
+
   <section id="auditLog">
     <h2>Audit Log</h2>
     <div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Message</th></tr></thead>
@@ -1981,6 +1987,7 @@ function renderDiagnosis(d){
     ["Failed", ats.failed],
     ["Crash unconfirmed", ats.crash_unconfirmed]
   ].map(([k,v]) => '<div class="fstep"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
+  renderHostQuality(roll.host_quality || []);
   const machines = roll.machines || {};
   document.getElementById("machineMap").innerHTML = Object.keys(machines).length
     ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(machines[k].display_name || k)+'</span><b>'+
@@ -2096,6 +2103,23 @@ function renderWorkerComparison(rows){
     '</td><td>'+esc(pct(w.success_rate))+'</td><td>'+esc(pct(w.crash_rate))+
     '</td><td>'+esc(money(w.cost_per_applied))+'</td></tr>'
   ).join("") : '<tr><td colspan="6" class="mut">no worker outcome data yet</td></tr>';
+}
+
+function renderHostQuality(rows){
+  const body = document.getElementById("hostQualityRows");
+  if(!body) return;
+  if(!rows.length){
+    body.innerHTML = '<tr><td colspan="6" class="mut">no host outcome data yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(h => {
+    const total = Number(h.total || 0);
+    const bad = Number(h.failed || 0) + Number(h.challenges || 0);
+    const badRate = total ? (bad / total) : null;
+    return '<tr><td>'+esc(h.host || "(unknown)")+'</td><td>'+esc(total)+'</td><td>'+
+      esc(h.applied || 0)+'</td><td>'+esc(h.failed || 0)+'</td><td>'+
+      esc(h.challenges || 0)+'</td><td>'+esc(pct(badRate))+'</td></tr>';
+  }).join("");
 }
 
 function renderStaleWorkers(workers){
