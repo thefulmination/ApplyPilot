@@ -596,6 +596,15 @@ def test_heartbeat_persists_agent_model_telemetry(fleet_db):
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import _heartbeat
 
+    def fetch_heartbeat(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT current_agent, current_model, agent_chain, last_agent_switch_reason, "
+                "last_agent_switch_at, state, last_error, recent_log "
+                "FROM worker_heartbeat WHERE worker_id='m4-0'"
+            )
+            return cur.fetchone()
+
     with pgqueue.connect(fleet_db) as conn:
         _heartbeat(
             conn,
@@ -609,14 +618,49 @@ def test_heartbeat_persists_agent_model_telemetry(fleet_db):
             agent_chain="claude>codex",
             last_agent_switch_reason="startup",
         )
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT current_agent, current_model, agent_chain, last_agent_switch_reason "
-                "FROM worker_heartbeat WHERE worker_id='m4-0'"
-            )
-            row = cur.fetchone()
+        first = fetch_heartbeat(conn)
 
-    assert row["current_agent"] == "claude"
-    assert row["current_model"] == "sonnet"
-    assert row["agent_chain"] == "claude>codex"
-    assert row["last_agent_switch_reason"] == "startup"
+        _heartbeat(
+            conn,
+            worker_id="m4-0",
+            machine_owner="m4",
+            home_ip="100.69.68.103",
+            role="apply",
+            state="applying",
+            last_error="second",
+            recent_log="freshtail",
+        )
+        second = fetch_heartbeat(conn)
+
+        _heartbeat(
+            conn,
+            worker_id="m4-0",
+            machine_owner="m4",
+            home_ip="100.69.68.103",
+            role="apply",
+            state="idle",
+            last_agent_switch_reason="handoff",
+        )
+        third = fetch_heartbeat(conn)
+
+    assert first["current_agent"] == "claude"
+    assert first["current_model"] == "sonnet"
+    assert first["agent_chain"] == "claude>codex"
+    assert first["last_agent_switch_reason"] == "startup"
+    assert first["last_agent_switch_at"] is not None
+
+    assert second["current_agent"] == "claude"
+    assert second["current_model"] == "sonnet"
+    assert second["agent_chain"] == "claude>codex"
+    assert second["last_agent_switch_reason"] == "startup"
+    assert second["last_agent_switch_at"] == first["last_agent_switch_at"]
+    assert second["state"] == "applying"
+    assert second["last_error"] == "second"
+    assert second["recent_log"] == "freshtail"
+
+    assert third["current_agent"] == "claude"
+    assert third["current_model"] == "sonnet"
+    assert third["agent_chain"] == "claude>codex"
+    assert third["last_agent_switch_reason"] == "handoff"
+    assert third["last_agent_switch_at"] is not None
+    assert third["last_agent_switch_at"] >= first["last_agent_switch_at"]
