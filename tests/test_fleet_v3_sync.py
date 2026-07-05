@@ -546,6 +546,33 @@ def test_reopen_compute_results_recovers_stranded_advisory_scores(fleet_db, tmp_
         assert row["audit_score"] == 8.0
 
 
+def test_pull_compute_results_marks_each_task_independently(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    url = "https://co/jobs/multi-compute"
+    _add_job(sq, url, company="Co", title="Analyst", audit_score=8.0, fit_score=6)
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO compute_queue (url, task, status, result) VALUES "
+                "(%s, 'score', 'done', %s), (%s, 'audit', 'done', %s)",
+                (
+                    url,
+                    '{"research_fit_score": 9.5}',
+                    url,
+                    '{"research_decision": "qualified"}',
+                ),
+            )
+        pg.commit()
+
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg, batch=1) == 1
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg, batch=1) == 1
+        assert sync.pull_compute_results(sqlite_conn=sq, pg_conn=pg, batch=1) == 0
+
+        row = sq.execute("SELECT research_fit_score, research_decision FROM jobs WHERE url=?", (url,)).fetchone()
+        assert row["research_fit_score"] == 9.5
+        assert row["research_decision"] == "qualified"
+
+
 # ---------------------------------------------------------------------------
 # LINKEDIN pull (regression: pull was a report-only stub -- LinkedIn applies
 # never reached the brain, so brain-driven paths saw them as never-applied)

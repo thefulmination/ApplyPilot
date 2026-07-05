@@ -515,10 +515,20 @@ def test_tick_apply_status_passthrough(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed(conn, "jc", "acme-c.com")
     loop2 = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w2", home_ip="2.2.2.2", role="apply",
-                       apply_fn=lambda job: {"run_status": "failed:no_result_line", "est_cost_usd": 0.0})
+                       apply_fn=lambda job: {
+                           "run_status": "failed:no_result_line",
+                           "est_cost_usd": 0.0,
+                           "agent": "claude",
+                           "agent_model": "claude-sonnet-4",
+                           "duration_ms": 3210,
+                       })
     assert loop2.run_once()["action"] == "crash_unconfirmed"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT status FROM apply_queue WHERE url='jc'"); assert cur.fetchone()["status"] == "crash_unconfirmed"
+        cur.execute("SELECT status, agent_model, apply_duration_ms FROM apply_queue WHERE url='jc'")
+        row = cur.fetchone()
+        assert row["status"] == "crash_unconfirmed"
+        assert row["agent_model"] == "claude-sonnet-4"
+        assert row["apply_duration_ms"] == 3210
 
     # captcha -> parked (auth_challenge raised, lease frozen)
     with pgqueue.connect(fleet_db) as conn:

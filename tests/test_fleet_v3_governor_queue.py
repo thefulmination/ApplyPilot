@@ -265,6 +265,32 @@ def test_write_apply_result_records_llm_usage_cost(fleet_db):
         assert float(row["cost_usd"]) == 0.42
 
 
+def test_write_apply_result_records_model_and_duration(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "evidence1", host="ashbyhq.com", company="Epsilon", title="Staff Engineer")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        ok = queue.write_apply_result(
+            conn,
+            "w1",
+            a["url"],
+            status="crash_unconfirmed",
+            apply_status="crash_unconfirmed",
+            apply_error="failed:no_result_line",
+            target_host="ashbyhq.com",
+            home_ip="1.2.3.4",
+            est_cost_usd=0.03,
+            agent="claude",
+            agent_model="claude-sonnet-4",
+            apply_duration_ms=4567,
+        )
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute("SELECT agent_model, apply_duration_ms FROM apply_queue WHERE url='evidence1'")
+            row = cur.fetchone()
+        assert row["agent_model"] == "claude-sonnet-4"
+        assert row["apply_duration_ms"] == 4567
+
+
 def test_write_apply_result_no_llm_usage_row_when_cost_zero_or_none(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "cost2", host="greenhouse.io", company="Delta", title="Engineer")
@@ -301,6 +327,41 @@ def test_compute_lease_and_cost_cap(fleet_db):
         fcfg.set_cost_caps(conn, daily_usd=0.05)
         queue.push_compute_jobs(conn, [{"url": "c2", "task": "audit"}])
         assert queue.lease_compute(conn, "w1") is None
+
+
+def test_compute_queue_tracks_distinct_tasks_for_same_url(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        pushed = queue.push_compute_jobs(conn, [
+            {"url": "same-url", "task": "score", "payload": {"x": "score"}},
+            {"url": "same-url", "task": "audit", "payload": {"x": "audit"}},
+        ])
+        assert pushed == 2
+
+        first = queue.lease_compute(conn, "w1")
+        assert first and first["url"] == "same-url"
+        assert first["task"] in {"score", "audit"}
+
+        assert queue.write_compute_result(
+            conn, "w1", "same-url",
+            result={"task": first["task"], "research_fit_score": 8},
+            cost_usd=0.01, task=first["task"],
+        )
+
+        second = queue.lease_compute(conn, "w2")
+        assert second and second["url"] == "same-url"
+        assert {first["task"], second["task"]} == {"score", "audit"}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT task, status, lease_owner, result FROM compute_queue "
+                "WHERE url='same-url' ORDER BY task"
+            )
+            rows = cur.fetchall()
+
+    by_task = {r["task"]: r for r in rows}
+    assert by_task[first["task"]]["status"] == "done"
+    assert by_task[first["task"]]["result"]["research_fit_score"] == 8
+    assert by_task[second["task"]]["status"] == "leased"
 
 
 # ---- recurring search scheduler (RF3) ------------------------------------------

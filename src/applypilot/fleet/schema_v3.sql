@@ -58,7 +58,7 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 -- compute_queue: score / audit / tailor / enrich -- IP-free, cost-governed (§8, R14).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS compute_queue (
-    url               TEXT PRIMARY KEY,
+    url               TEXT NOT NULL,
     task              TEXT NOT NULL,                 -- 'score'|'audit'|'tailor'|'enrich'
     payload           JSONB,                         -- minimal context for the task
     status            fleet_task_status NOT NULL DEFAULT 'queued',
@@ -68,8 +68,29 @@ CREATE TABLE IF NOT EXISTS compute_queue (
     result            JSONB,                         -- advisory score/audit/tailored-resume ref
     est_cost_usd      NUMERIC(10,4) NOT NULL DEFAULT 0,
     synced_to_home_at TIMESTAMPTZ,
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (url, task)
 );
+
+DO $$
+DECLARE
+    pk_cols TEXT[];
+BEGIN
+    SELECT array_agg(a.attname ORDER BY u.ordinality)
+      INTO pk_cols
+    FROM pg_constraint c
+    JOIN unnest(c.conkey) WITH ORDINALITY u(attnum, ordinality) ON true
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
+    WHERE c.conrelid = 'compute_queue'::regclass
+      AND c.contype = 'p';
+
+    IF pk_cols = ARRAY['url'] THEN
+        ALTER TABLE compute_queue DROP CONSTRAINT compute_queue_pkey;
+        ALTER TABLE compute_queue ADD CONSTRAINT compute_queue_pkey PRIMARY KEY (url, task);
+    ELSIF pk_cols IS NULL THEN
+        ALTER TABLE compute_queue ADD CONSTRAINT compute_queue_pkey PRIMARY KEY (url, task);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_compute_lease ON compute_queue (status) WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS idx_compute_reclaim ON compute_queue (lease_expires_at) WHERE status = 'leased';
 CREATE INDEX IF NOT EXISTS idx_compute_unsynced ON compute_queue (updated_at)
@@ -215,6 +236,17 @@ CREATE TABLE IF NOT EXISTS applied_set (
 -- Phase 2.3: belt-and-suspenders for a live DB whose applied_set predates got_response
 -- (CREATE TABLE IF NOT EXISTS above is a no-op on an already-existing table).
 ALTER TABLE applied_set ADD COLUMN IF NOT EXISTS got_response BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS dedup_repair_actions (
+    id             BIGSERIAL PRIMARY KEY,
+    url            TEXT NOT NULL,
+    old_dedup_key  TEXT NOT NULL,
+    new_dedup_key  TEXT NOT NULL,
+    reason         TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_dedup_repair_actions_old_key
+    ON dedup_repair_actions (old_dedup_key, created_at);
 
 -- ---------------------------------------------------------------------------
 -- answer_bank: screening-question answers, broker-served, defer-on-unknown (R10).
@@ -545,6 +577,18 @@ CREATE TABLE IF NOT EXISTS email_reconcile_actions (
     match_score     REAL,
     stage           TEXT,
     prior_status    TEXT,
+    how_to_reverse  TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- dedup_repair_actions: audit + reversibility for source-specific rewrites of
+-- overbroad queued dedup keys (for example aggregator/missing-company keys).
+CREATE TABLE IF NOT EXISTS dedup_repair_actions (
+    id              BIGSERIAL PRIMARY KEY,
+    url             TEXT,
+    old_dedup_key   TEXT,
+    new_dedup_key   TEXT,
+    reason          TEXT,
     how_to_reverse  TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

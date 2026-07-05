@@ -200,6 +200,15 @@ if ($applyLiteral) {
     if (Test-Path `$candidate) { `$py = (Resolve-Path `$candidate).Path; break }
   }
   if (`$py) {
+    Write-Output "APPLY: clean stale pip invalid distribution artifacts (~pplypilot*)"
+    `$siteDirs = & `$py -c "import site; print('\n'.join(p for p in set(site.getsitepackages() + [site.getusersitepackages()]) if p))"
+    foreach (`$siteDir in `$siteDirs) {
+      if (-not (Test-Path `$siteDir)) { continue }
+      Get-ChildItem -LiteralPath `$siteDir -Force -Filter '~pplypilot*' -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Output "APPLY: remove stale pip artifact `$(`$_.FullName)"
+        Remove-Item -LiteralPath `$_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    }
     Write-Output "APPLY: pip install -e ."
     & `$py -m pip install -e .
   } else {
@@ -268,8 +277,14 @@ if [ "$applyLiteral" = "1" ]; then
     echo 'APPLY: git merge --ff-only'
     git merge --ff-only
   fi
+  if [ -x ./.venv/bin/python ]; then py_cmd=./.venv/bin/python; else py_cmd=python3; fi
+  echo 'APPLY: clean stale pip invalid distribution artifacts (~pplypilot*)'
+  "$py_cmd" -c 'import site; print("\n".join(p for p in set(site.getsitepackages() + [site.getusersitepackages()]) if p))' |
+  while IFS= read -r site_dir; do
+    [ -d "$site_dir" ] && (cd "$site_dir" && find . -maxdepth 1 -name '~pplypilot*' -print -exec rm -rf {} +)
+  done
   echo 'APPLY: pip install -e .'
-  if [ -x ./.venv/bin/python ]; then ./.venv/bin/python -m pip install -e .; else python3 -m pip install -e .; fi
+  "$py_cmd" -m pip install -e .
   if [ -f ./setup-mac-worker.sh ]; then echo 'APPLY: setup-mac-worker.sh present; run manually if launchd needs re-registration'; fi
   if command -v launchctl >/dev/null 2>&1; then echo 'APPLY: launchd restart remains manual on mac target'; fi
 else

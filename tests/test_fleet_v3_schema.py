@@ -34,6 +34,53 @@ def test_v3_schema_idempotent(fleet_db):
     assert {"rate_governor", "search_tasks", "compute_queue"} <= got
 
 
+def test_v3_schema_migrates_compute_queue_url_primary_key(fleet_pg):
+    with pgqueue.connect(fleet_pg) as conn:
+        pgqueue.ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS compute_queue")
+            cur.execute(
+                """
+                CREATE TABLE compute_queue (
+                    url TEXT PRIMARY KEY,
+                    task TEXT NOT NULL,
+                    payload JSONB,
+                    status fleet_task_status NOT NULL DEFAULT 'queued',
+                    lease_owner TEXT,
+                    lease_expires_at TIMESTAMPTZ,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    result JSONB,
+                    est_cost_usd NUMERIC(10,4) NOT NULL DEFAULT 0,
+                    synced_to_home_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        conn.commit()
+
+        fleet_schema.ensure_schema_v3(conn)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO compute_queue (url, task) VALUES "
+                "('same-url', 'score'), ('same-url', 'audit')"
+            )
+            cur.execute(
+                """
+                SELECT a.attname
+                FROM pg_constraint c
+                JOIN unnest(c.conkey) WITH ORDINALITY u(attnum, ordinality) ON true
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
+                WHERE c.conrelid = 'compute_queue'::regclass AND c.contype = 'p'
+                ORDER BY u.ordinality
+                """
+            )
+            pk_cols = [r["attname"] for r in cur.fetchall()]
+        conn.commit()
+
+    assert pk_cols == ["url", "task"]
+
+
 def test_apply_queue_v3_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='apply_queue'")

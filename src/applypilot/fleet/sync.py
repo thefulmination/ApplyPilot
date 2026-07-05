@@ -551,7 +551,7 @@ WHERE url = :url
 """
 
 _PULL_COMPUTE_PENDING = """
-SELECT url, result
+SELECT url, task, result
 FROM compute_queue
 WHERE status IN ('done', 'failed')
   AND synced_to_home_at IS NULL
@@ -608,7 +608,7 @@ def pull_compute_results(
             pending = cur.fetchall()
         pg.rollback()  # read-only fetch
         for res in pending:
-            url, result = res["url"], res["result"]
+            url, task, result = res["url"], res["task"], res["result"]
             if sq.execute("SELECT 1 FROM jobs WHERE url = ?", (url,)).fetchone():
                 score, decision = _advisory_fields(result)
                 sq.execute(_PULL_COMPUTE_ADVISORY, {
@@ -616,7 +616,7 @@ def pull_compute_results(
                 })
                 sq.commit()
                 n += 1
-            _mark_compute_synced(pg, url)
+            _mark_compute_synced(pg, url, task)
         return n
     finally:
         if own_sq:
@@ -640,10 +640,13 @@ def reopen_compute_results(*, pg_conn: Any | None = None, statuses: tuple[str, .
             pg.close()
 
 
-def _mark_compute_synced(pg_conn: Any, url: str) -> None:
+def _mark_compute_synced(pg_conn: Any, url: str, task: str) -> None:
     """Stamp a compute_queue row ingested-home so the compute PULL is idempotent."""
     with pg_conn.cursor() as cur:
-        cur.execute("UPDATE compute_queue SET synced_to_home_at = now() WHERE url = %s", (url,))
+        cur.execute(
+            "UPDATE compute_queue SET synced_to_home_at = now() WHERE url = %s AND task = %s",
+            (url, task),
+        )
     pg_conn.commit()
 
 

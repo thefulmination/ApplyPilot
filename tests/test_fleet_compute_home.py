@@ -38,6 +38,23 @@ def test_push_backlog_can_include_unscored_described_rows(fleet_db, tmp_path):
             assert cur.fetchone()["payload"]["full_description"] == "the full JD"
 
 
+def test_push_backlog_can_add_audit_task_after_score_task_exists(fleet_db, tmp_path):
+    sq = sqlite3.connect(str(tmp_path / "b.db")); sq.row_factory = sqlite3.Row
+    sq.executescript(_DDL)
+    sq.execute("INSERT INTO jobs (url, company, title, application_url, audit_score, full_description) "
+               "VALUES ('u1','Acme','COS','https://x',8.0,'the full JD')")
+    sq.commit()
+    with pgqueue.connect(fleet_db) as pg:
+        assert chm.push_backlog(sqlite_conn=sq, pg_conn=pg, task="score", score_floor=7) == 1
+        assert chm.push_backlog(sqlite_conn=sq, pg_conn=pg, task="audit", score_floor=7) == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT task, payload FROM compute_queue WHERE url='u1' ORDER BY task")
+            rows = cur.fetchall()
+
+    assert [r["task"] for r in rows] == ["audit", "score"]
+    assert {r["payload"]["full_description"] for r in rows} == {"the full JD"}
+
+
 def test_main_push_threads_unscored_only_and_limit(monkeypatch, capsys):
     called: dict[str, object] = {}
 

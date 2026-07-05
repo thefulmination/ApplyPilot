@@ -144,8 +144,8 @@ def requeue_apply(conn, worker_id, url, *, apply_error=None) -> bool:
 
 
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
-                       apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
-                       agent=None):
+                        apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
+                        agent=None, agent_model=None, apply_duration_ms=None):
     """Close the apply (lease-owner guarded), record the governor outcome on
     global+host+home_ip (bump cap on a confirmed apply), and UPSERT applied_set
     so the posting can never be applied to again. One transaction.
@@ -166,9 +166,14 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "agent_model=%s, apply_duration_ms=%s, "
             "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
             "WHERE url=%s AND lease_owner=%s",
-            (status, apply_status, apply_error, est_cost_usd, status, worker_id, url, worker_id),
+            (
+                status, apply_status, apply_error, est_cost_usd,
+                agent_model, apply_duration_ms,
+                status, worker_id, url, worker_id,
+            ),
         )
         if cur.rowcount == 0:
             conn.rollback()
@@ -348,12 +353,12 @@ def _cost_cap_exceeded(conn) -> bool:
 
 _LEASE_COMPUTE = """
 WITH next AS (
-  SELECT url FROM compute_queue WHERE status='queued'
-  ORDER BY updated_at LIMIT 1 FOR UPDATE SKIP LOCKED
+  SELECT url, task FROM compute_queue WHERE status='queued'
+  ORDER BY updated_at, url, task LIMIT 1 FOR UPDATE SKIP LOCKED
 )
 UPDATE compute_queue c SET status='leased', lease_owner=%(worker)s,
   lease_expires_at = now() + make_interval(secs => %(ttl)s), attempts = c.attempts + 1, updated_at = now()
-FROM next WHERE c.url = next.url
+FROM next WHERE c.url = next.url AND c.task = next.task
 RETURNING c.url, c.task, c.payload, c.attempts;
 """
 
@@ -371,11 +376,22 @@ def lease_compute(conn, worker_id, *, ttl_seconds=1200):
 def write_compute_result(conn, worker_id, url, *, result, status="done", cost_usd=0,
                          model=None, provider=None, task=None, machine_owner=None,
                          tokens_in=None, tokens_out=None):
+    effective_task = task
+    if effective_task is None and isinstance(result, dict):
+        effective_task = result.get("task")
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE compute_queue SET status=%s, result=%s, est_cost_usd=COALESCE(%s,0), updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s",
-            (status, json.dumps(result) if result is not None else None, cost_usd, url, worker_id),
+            "WHERE url=%s AND lease_owner=%s AND (%s::text IS NULL OR task=%s)",
+            (
+                status,
+                json.dumps(result) if result is not None else None,
+                cost_usd,
+                url,
+                worker_id,
+                effective_task,
+                effective_task,
+            ),
         )
         if cur.rowcount == 0:
             conn.rollback()
@@ -396,7 +412,7 @@ def push_compute_jobs(conn, rows, *, commit=True) -> int:
         for r in rows:
             cur.execute(
                 "INSERT INTO compute_queue (url, task, payload, est_cost_usd) VALUES (%s,%s,%s,%s) "
-                "ON CONFLICT (url) DO UPDATE SET task=EXCLUDED.task, payload=EXCLUDED.payload, updated_at=now() "
+                "ON CONFLICT (url, task) DO UPDATE SET payload=EXCLUDED.payload, updated_at=now() "
                 "WHERE compute_queue.status='queued'",
                 (r["url"], r["task"], json.dumps(r.get("payload")) if r.get("payload") is not None else None,
                  r.get("est_cost_usd", 0)),
