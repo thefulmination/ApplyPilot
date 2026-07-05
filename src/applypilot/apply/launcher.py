@@ -1794,11 +1794,14 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         result_source = final_text if "RESULT:" in final_text else output
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
-        _last_run_stats[worker_id] = dict(stats) if stats else {}
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
+        run_stats = dict(stats) if stats else {}
+        run_stats["transcript"] = output[-20000:]
+        run_stats["job_log"] = str(job_log)
+        _last_run_stats[worker_id] = run_stats
 
         if stats:
             cost = stats.get("cost_usd", 0)

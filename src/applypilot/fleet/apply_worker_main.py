@@ -90,6 +90,68 @@ def classify_apply_channel(tab_urls) -> dict:
     return {"apply_channel": "easy_apply", "apply_external_host": None}
 
 
+_KNOWN_EXTERNAL_APPLY_SUFFIXES = (
+    "amazon.jobs",
+    "ashbyhq.com",
+    "greenhouse.io",
+    "lever.co",
+    "myworkdayjobs.com",
+    "myworkdaysite.com",
+    "workdayjobs.com",
+    "jobvite.com",
+    "smartrecruiters.com",
+    "icims.com",
+    "workable.com",
+    "bamboohr.com",
+    "paylocity.com",
+    "paycomonline.net",
+    "ultipro.com",
+    "eightfold.ai",
+)
+
+_EXTERNAL_TEXT_MARKERS = (
+    ("workday", "workday"),
+    ("greenhouse", "greenhouse.io"),
+    ("ashby", "ashbyhq.com"),
+    ("lever", "lever.co"),
+)
+
+_HOST_IN_TEXT_RE = re.compile(
+    r"(?i)(?<!@)\b((?:[a-z0-9-]+\.)+(?:com|io|co|net|org|jobs|careers|ai))\b"
+)
+
+
+def _known_external_apply_host(host: str | None) -> str | None:
+    host = (host or "").strip().lower().strip(".")
+    if not host or host.endswith("linkedin.com"):
+        return None
+    for suffix in _KNOWN_EXTERNAL_APPLY_SUFFIXES:
+        if host == suffix or host.endswith(f".{suffix}"):
+            return suffix
+    return None
+
+
+def classify_apply_channel_from_text(text: str | None) -> dict:
+    """Fallback channel recorder for auth walls after the browser context is gone.
+
+    CDP tab capture is the primary source. Some external ATS auth flows close the
+    browser service before we can read `/json`, so use the current agent transcript
+    only for known application-host evidence. Generic identity providers such as
+    Google SSO are intentionally ignored; those can be true LinkedIn auth walls.
+    """
+    value = text or ""
+    for match in _HOST_IN_TEXT_RE.finditer(value):
+        host = _known_external_apply_host(match.group(1))
+        if host:
+            return {"apply_channel": "external", "apply_external_host": host}
+
+    lowered = value.lower()
+    for marker, host in _EXTERNAL_TEXT_MARKERS:
+        if marker in lowered:
+            return {"apply_channel": "external", "apply_external_host": host}
+    return {"apply_channel": None, "apply_external_host": None}
+
+
 def _cdp_page_urls(port: int) -> list[str]:
     """Best-effort read-only list of open page-tab URLs from Chrome's CDP /json endpoint."""
     import json
@@ -130,7 +192,11 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
             # Chrome). This is needed for non-applied terminal statuses too: an
             # auth_required result on an external ATS is a job-level wall, not a
             # LinkedIn account wall.
-            out.update(classify_apply_channel(_cdp_page_urls(port)))
+            channel = classify_apply_channel(_cdp_page_urls(port))
+            transcript_channel = classify_apply_channel_from_text(stats.get("transcript"))
+            if status != "applied" and transcript_channel.get("apply_channel") == "external":
+                channel = transcript_channel
+            out.update(channel)
             return out
         finally:
             try:
