@@ -126,10 +126,11 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
             # agent flows to write_apply_result -> llm_usage.provider for per-agent spend.
             out = {"run_status": status, "est_cost_usd": _real_cost(stats, model), "agent": agent}
-            if status == "applied":
-                # Record the apply channel from the STILL-OPEN tabs (the finally below kills
-                # Chrome). Best-effort: never let recording break a confirmed apply.
-                out.update(classify_apply_channel(_cdp_page_urls(port)))
+            # Record the apply channel from the STILL-OPEN tabs (the finally below kills
+            # Chrome). This is needed for non-applied terminal statuses too: an
+            # auth_required result on an external ATS is a job-level wall, not a
+            # LinkedIn account wall.
+            out.update(classify_apply_channel(_cdp_page_urls(port)))
             return out
         finally:
             try:
