@@ -289,12 +289,16 @@ class WorkerLoop:
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT state FROM worker_heartbeat WHERE worker_id=%s",
+                        "SELECT state, last_agent_switch_reason FROM worker_heartbeat WHERE worker_id=%s",
                         (self.worker_id,),
                     )
                     row = cur.fetchone()
                 conn.rollback()
-            return bool(row is not None and row.get("state") == "paused")
+            if row is None or row.get("state") != "paused":
+                return False
+            if row.get("last_agent_switch_reason") == "all_agents_walled":
+                return False
+            return True
         except Exception:
             return False
 

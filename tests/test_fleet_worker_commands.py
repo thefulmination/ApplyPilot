@@ -108,6 +108,33 @@ def test_restart_inherits_paused_heartbeat_state(fleet_db):
     assert loop.run_once()["action"] == "idle"
 
 
+def test_restart_does_not_inherit_agent_wall_pause(fleet_db):
+    # A quota wall heartbeat is a temporary scheduler state, not a manual remote
+    # pause. Restarting the worker must let it retry agent selection when quotas reset.
+    wid = "tarpon-linkedin-0"
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, "
+                "current_job, last_agent_switch_reason, last_beat) "
+                "VALUES (%s, %s, %s, %s, %s, NULL, %s, now())",
+                (wid, "m2", "100.77.65.8", "linkedin", "paused", "all_agents_walled"),
+            )
+        conn.commit()
+    loop = WorkerLoop(
+        lambda: pgqueue.connect(fleet_db),
+        wid,
+        home_ip="100.77.65.8",
+        role="linkedin",
+        apply_fn=lambda job: "",
+        machine_owner="m2",
+        public_ip="100.77.65.8",
+        owner_ip="100.77.65.8",
+        on_owner_machine=True,
+    )
+    assert loop.run_once()["action"] == "idle"
+
+
 def test_self_update_is_acked_noop(fleet_db):
     loop = _mk_loop(fleet_db)
     with pgqueue.connect(fleet_db) as conn:
