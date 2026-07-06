@@ -410,6 +410,28 @@ CREATE TABLE IF NOT EXISTS remote_commands (
 );
 CREATE INDEX IF NOT EXISTS idx_commands_open ON remote_commands (worker_id) WHERE acked_at IS NULL;
 
+
+-- ---------------------------------------------------------------------------
+-- fleet_machine_blackout: central, expiring operator control for all fleet work
+-- on selected machine labels. Launchers/agents read this before starting apply,
+-- discovery, or compute work. Expired rows remain as audit history.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_machine_blackout (
+    id             BIGSERIAL PRIMARY KEY,
+    name           TEXT NOT NULL,
+    active         BOOLEAN NOT NULL DEFAULT TRUE,
+    starts_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at     TIMESTAMPTZ NOT NULL,
+    allow_patterns TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    block_patterns TEXT[] NOT NULL DEFAULT ARRAY['*']::TEXT[],
+    reason         TEXT,
+    created_by     TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cleared_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_machine_blackout_active
+    ON fleet_machine_blackout (active, starts_at, expires_at);
+
 -- command_acks: per-worker ack of a command, so a fleet-wide ('*') broadcast is
 -- delivered to EVERY worker -- not consumed by whoever acks first (R7). poll_commands
 -- excludes a command this worker has already acked here; a DIRECT command also closes

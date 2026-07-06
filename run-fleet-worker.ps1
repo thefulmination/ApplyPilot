@@ -55,6 +55,11 @@ foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
 }
 if (-not $py) { throw "python not found (.conda-env or .venv) -- run the setup script first." }
 
+$machinePolicy = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label "apply" 2>$null | Select-Object -Last 1)
+if ("$machinePolicy" -match '^BLOCKED\|') {
+  throw "Refusing to start apply worker '$WorkerId': machine blackout active. $machinePolicy"
+}
+
 function Resolve-FleetHomeIp([string]$Candidate) {
   $ip = "$Candidate".Trim()
   if ($ip -and $ip -ne "0.0.0.0" -and $ip -ne "::") { return $ip }

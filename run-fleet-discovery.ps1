@@ -45,8 +45,22 @@ if (-not $env:FLEET_PG_DSN) { $env:FLEET_PG_DSN = "host=localhost port=5432 dbna
 $env:APPLYPILOT_FLEET_DSN = $env:FLEET_PG_DSN
 $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 
+$py = $null
+foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
+  if (Test-Path $d) { $py = (Resolve-Path $d).Path; break }
+}
+if (-not $py) { $py = "python" }
+
+function Test-MachineBlackout([string]$Role) {
+  $line = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null | Select-Object -Last 1)
+  if ("$line" -match '^BLOCKED\|') { return $line }
+  return $null
+}
+
 # Run exactly one worker (helper used by both the single-worker path and each spawned child).
 function Start-OneWorker([string]$wid) {
+  $blocked = Test-MachineBlackout "discovery"
+  if ($blocked) { throw "Refusing to start discovery workers for '$Label': machine blackout active. $blocked" }
   Write-Host "[fleet-discovery] worker $wid  results/site=$ResultsPerSite  hours-old=$HoursOld  (pure scrape, no agent)"
   & $exe --worker-id "$wid" --results-per-site $ResultsPerSite --hours-old $HoursOld
 }
@@ -58,6 +72,8 @@ if ($Index -ge 0) { Start-OneWorker "$Label-disc-$Index"; return }
 if ($Workers -le 1) { Start-OneWorker "$Label-disc"; return }
 
 # --- multi-worker: clean slate, then one window per worker on a DISTINCT id ---
+$blocked = Test-MachineBlackout "discovery"
+if ($blocked) { throw "Refusing to start discovery workers for '$Label': machine blackout active. $blocked" }
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
   $_.Name -eq 'applypilot-fleet-discovery.exe' -or
   ($_.Name -eq 'python.exe' -and $_.CommandLine -match 'fleet-discovery' -and $_.CommandLine -notmatch 'discovery-home')

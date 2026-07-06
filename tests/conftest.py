@@ -29,6 +29,7 @@ _V3_TABLES = [
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "command_acks",
     "fleet_assets", "discovered_postings", "fleet_knobs", "fleet_diagnoses",
     "agent_availability", "autotriage_actions", "apply_result_events",
+    "fleet_machine_blackout",
 ]
 
 

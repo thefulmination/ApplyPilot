@@ -177,6 +177,14 @@ try:
                 "FROM fleet_desired_state ORDER BY machine_owner",
             )
             show_rows(
+                "fleet_machine_blackout active",
+                cur,
+                "SELECT name, expires_at, allow_patterns, block_patterns, reason "
+                "FROM fleet_machine_blackout "
+                "WHERE active = TRUE AND cleared_at IS NULL AND starts_at <= now() AND expires_at > now() "
+                "ORDER BY expires_at, name",
+            )
+            show_rows(
                 "worker_heartbeat",
                 cur,
                 "SELECT worker_id, role, state, current_job, "

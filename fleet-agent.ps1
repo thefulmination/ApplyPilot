@@ -228,6 +228,16 @@ while ($true) {
   if ($f.Count -lt 4 -or $f[0] -eq 'KEEP') { Start-Sleep -Seconds $PollSec; continue }  # DB blip -> leave as-is
   $want = [int]$f[0]; $agent = $f[1]; $model = $f[2]; $gen = [int]$f[3]
   $desiredWant = $want
+  $machinePolicy = (& $py "fleet-blackout-query.py" $Label "all" 2>$null | Select-Object -Last 1)
+  if ("$machinePolicy" -match '^BLOCKED\|') {
+    $parts = "$machinePolicy" -split '\|', 6
+    $policyName = if ($parts.Count -ge 4) { $parts[3] } else { "machine blackout" }
+    $expiresAt = if ($parts.Count -ge 5) { $parts[4] } else { "" }
+    if ($want -gt 0) {
+      Write-Host "[fleet-agent:$Label] machine blackout active; effective desired_workers 0 (configured $want). policy=$policyName until=$expiresAt" -ForegroundColor Yellow
+    }
+    $want = 0
+  }
   $blackout = (& $py -m applypilot.fleet.work_hours $Label 2>$null | Select-Object -Last 1)
   if ("$blackout" -match '^BLACKOUT\|') {
     if ($want -gt 0) {
