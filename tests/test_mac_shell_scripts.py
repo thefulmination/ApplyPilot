@@ -45,3 +45,14 @@ def test_mac_worker_wrapper_prevents_idle_sleep_by_default():
     assert "APPLYPILOT_MAC_CAFFEINATE" in script
     assert "caffeinate -dims -w" in script
     assert "APPLYPILOT_MAC_CAFFEINATE='1'" in setup
+
+
+def test_mac_worker_wrapper_defaults_claude_to_codex_fallback():
+    script = (REPO / "run-worker-mac.sh").read_text(encoding="utf-8")
+    setup = (REPO / "setup-mac-worker.sh").read_text(encoding="utf-8")
+
+    assert 'fallback_args=(--fallback-agent "codex")' in script
+    assert '"${fallback_args[@]}" &' in script
+    assert "npm install -g @openai/codex" in setup
+    assert "CODEX_PATH='$CODEX_BIN'" in setup
+    assert "WORKER_FALLBACK_AGENT='codex'" in setup

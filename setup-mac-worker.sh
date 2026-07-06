@@ -24,7 +24,7 @@ if ! /Applications/Tailscale.app/Contents/MacOS/Tailscale status >/dev/null 2>&1
   exit 1
 fi
 
-# --- 1. toolchain (Homebrew, python, node/npx, git, claude CLI) --------------
+# --- 1. toolchain (Homebrew, python, node/npx, git, agent CLIs) --------------
 if ! command -v brew >/dev/null 2>&1; then
   say "Installing Homebrew (you may be prompted for the Mac's password)..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -34,6 +34,8 @@ say "Installing python, node, git via Homebrew..."
 brew install python@3.12 node git >/dev/null
 say "Installing Claude Code CLI..."
 npm install -g @anthropic-ai/claude-code >/dev/null
+say "Installing Codex CLI..."
+npm install -g @openai/codex >/dev/null
 
 # --- 2. read-only deploy key + clone ------------------------------------------
 if [ ! -f "$KEY" ]; then
@@ -78,9 +80,15 @@ unset PG_PW
 mkdir -p "$INSTALL_DIR/.applypilot" "$INSTALL_DIR/logs"
 ENV_FILE="$INSTALL_DIR/.applypilot/fleet-worker.env"
 CLAUDE_BIN="$(command -v claude || true)"
+CODEX_BIN="$(command -v codex || true)"
 if [ -z "$CLAUDE_BIN" ]; then
   say "WARNING: 'claude' CLI not found on PATH after npm install -g."
   say "  The worker falls back to a PATH lookup at runtime, but if that also fails, applies will not run."
+  say "  Check 'npm bin -g' is on PATH, then re-run this script (safe to re-run)."
+fi
+if [ -z "$CODEX_BIN" ]; then
+  say "WARNING: 'codex' CLI not found on PATH after npm install -g."
+  say "  Claude-primary workers need Codex available for quota fallback."
   say "  Check 'npm bin -g' is on PATH, then re-run this script (safe to re-run)."
 fi
 # Values are LITERAL-QUOTED (single quotes in the WRITTEN file): this file is sourced
@@ -98,10 +106,12 @@ APPLYPILOT_AGENT_TIMEOUT='600'
 ANTHROPIC_API_KEY='$ANTHROPIC_KEY'
 DEEPSEEK_API_KEY='$DEEPSEEK_KEY'
 CLAUDE_PATH='$CLAUDE_BIN'
+CODEX_PATH='$CODEX_BIN'
 WORKER_LABEL='mac'
 WORKER_SLOT='0'
 WORKER_AGENT='claude'
 WORKER_MODEL='sonnet'
+WORKER_FALLBACK_AGENT='codex'
 FLEET_MACHINE_OWNER='mac-$(hostname -s)'
 APPLYPILOT_BRANCH='$BRANCH'
 UPDATE_CHECK_SECONDS='21600'
