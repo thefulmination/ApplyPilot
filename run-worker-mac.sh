@@ -78,15 +78,11 @@ main() {
   export FLEET_HOME_IP
   log "egress=$FLEET_HOME_IP chrome=$CHROME_PATH branch=$APPLYPILOT_BRANCH"
 
-  # Gmail MCP for ATS email-verification codes: force the flag ON (older env files ship it
-  # '0') and hydrate ~/.gmail-mcp/{gcp-oauth.keys,credentials}.json from the fleet Postgres --
-  # the same PG this box already talks to, no manual credential copy (mirrors Windows
-  # run-fleet-worker.ps1). Without this the worker fills+submits then walls at AUTH_REQUIRED.
-  export APPLYPILOT_ENABLE_GMAIL_MCP=1
-  if [ ! -f "$HOME/.gmail-mcp/credentials.json" ]; then
-    log "hydrating Gmail MCP creds from fleet Postgres ..."
-    "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/hydrate-gmail.py" 2>&1 | sed 's/^/  /' || log "WARN: gmail hydrate failed"
-  fi
+  # Verification codes must go through the owner-side relay. Direct Gmail MCP
+  # access from apply workers can trigger codes without creating otp_request rows.
+  export APPLYPILOT_INBOX_AUTH=1
+  export APPLYPILOT_INBOX_AUTH_MODE=relay
+  export APPLYPILOT_ENABLE_GMAIL_MCP=0
 
   child=0
   trap 'log "SIGTERM: draining worker"; [ "$child" -gt 0 ] && kill -TERM "$child" 2>/dev/null; [ "$caffeinate_pid" -gt 0 ] && kill "$caffeinate_pid" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT

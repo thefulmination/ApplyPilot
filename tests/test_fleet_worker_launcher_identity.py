@@ -62,3 +62,12 @@ def test_worker_launcher_probes_fleet_pg_before_starting_apply_loop():
     assert "fleet-agent-query.py" in script
     assert "Cannot reach fleet Postgres over FLEET_PG_DSN" in script
     assert "before starting worker" in script
+
+
+def test_windows_apply_worker_forces_inbox_relay_not_direct_gmail():
+    script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
+
+    assert 'APPLYPILOT_INBOX_AUTH = "1"' in script
+    assert 'APPLYPILOT_INBOX_AUTH_MODE = "relay"' in script
+    assert 'APPLYPILOT_ENABLE_GMAIL_MCP = "0"' in script
+    assert "hydrate-gmail.py" not in script

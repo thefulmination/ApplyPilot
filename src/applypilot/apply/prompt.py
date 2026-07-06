@@ -629,10 +629,13 @@ def build_prompt(job: dict, tailored_resume: str,
             f'send_email with subject "Application for {job["title"]} -- {display_name}", '
             f'body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]'
         )
-        email_verification_instruction = "Need email verification? Use search_emails + read_email to get the code."
     else:
         email_only_instruction = "Output RESULT:FAILED:email_application_requires_gmail_mcp. Gmail MCP is not enabled."
-        email_verification_instruction = "Need email verification? Output RESULT:FAILED:email_verification_required. Gmail MCP is not enabled."
+    email_verification_instruction = (
+        "Output RESULT:AUTH_REQUIRED:email_verification_required and stop. "
+        "The launcher will request the code through the inbox relay and retry with an INBOX AUTH HINT. "
+        "Do not search or read Gmail for verification codes directly."
+    )
 
     if inbox_auth_hint:
         inbox_hint_section = f"""
@@ -721,7 +724,7 @@ This is the owner's REAL LinkedIn account -- protect it above all else:
    5c. Regular login form (employer's own site)? Use browser-stored credentials/session if available. If a password is required, output RESULT:AUTH_REQUIRED and stop for manual login. Do not expose, guess, or create passwords.
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
    5e. Sign in failed? Try account creation with {personal['email']} only if the site does not require setting or entering a password. Otherwise stop with RESULT:AUTH_REQUIRED.
-   5f. If the page asks for email verification, authenticator app, SMS code, magic link, or two-step authentication -> RESULT:AUTH_REQUIRED. {email_verification_instruction}
+   5f. If the page asks for email verification, login code, passwordless sign-in code, authenticator app, SMS code, magic link, or two-step authentication -> {email_verification_instruction}
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:AUTH_REQUIRED. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. (EXCEPTION: on LinkedIn Easy Apply do NOT delete -- see the LINKEDIN section.) This is the resume for THIS job. Non-negotiable.

@@ -112,7 +112,7 @@ foreach ($fa in ($FallbackAgent -split ',' | ForEach-Object { $_.Trim() } | Wher
   elseif ($fa -eq "codex") { $c = Join-Path $env:APPDATA "npm\codex.cmd"; if (Test-Path $c) { $env:CODEX_PATH = $c } }
 }
 
-# Per-LAUNCH throwaway cost-DB (never the real brain), Gmail verification, 10-min timeout.
+# Per-LAUNCH throwaway cost-DB (never the real brain), relay-based inbox auth, 10-min timeout.
 # Unique per launch (slot+PID): a corrupt leftover husk from a crashed run (seen live 7/03:
 # a 4KB unopenable fleet_apply_throwaway_0.db from 6/28 flash-killed every home-0 spawn at
 # startup, before the worker log existed) must never block the next launch. Best-effort
@@ -121,16 +121,10 @@ Get-ChildItem (Join-Path $env:TEMP "fleet_apply_throwaway_*.db*") -ErrorAction S
   Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
   ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {} }
 $env:APPLYPILOT_DB_PATH = Join-Path $env:TEMP "fleet_apply_throwaway_${Slot}_$PID.db"
-$env:APPLYPILOT_ENABLE_GMAIL_MCP = "1"
+$env:APPLYPILOT_INBOX_AUTH = "1"
+$env:APPLYPILOT_INBOX_AUTH_MODE = "relay"
+$env:APPLYPILOT_ENABLE_GMAIL_MCP = "0"
 $env:APPLYPILOT_AGENT_TIMEOUT = "600"
-# Self-heal the Gmail MCP creds: the @gongrzhe MCP server reads ~/.gmail-mcp/{gcp-oauth.keys,
-# credentials}.json to fetch ATS email-verification codes. A worker box (m4) that lacks them
-# fills+submits then walls at AUTH_REQUIRED. Hydrate once from the fleet_assets blob store (the
-# same PG the box already talks to) -- no manual credential copy. Skips if already present.
-if (-not (Test-Path (Join-Path $HOME ".gmail-mcp\credentials.json"))) {
-  Write-Host "[fleet-worker] hydrating Gmail MCP creds from fleet Postgres ..."
-  & $py (Join-Path $ProjectRoot "hydrate-gmail.py") 2>&1 | ForEach-Object { Write-Host "  $_" }
-}
 # Cheap read-only liveness probe before each agent launch: ~15% of queued postings are dead
 # (expired/closed) and would otherwise burn a full agent launch. linkedin.com is guarded in
 # liveness.py (never probed). Container/supervisor lanes already run with this ON.

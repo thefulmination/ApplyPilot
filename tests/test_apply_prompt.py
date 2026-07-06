@@ -187,6 +187,28 @@ def test_build_prompt_dry_run_emits_dry_run_code(tmp_path: Path, monkeypatch) ->
     assert "Do NOT output RESULT:APPLIED" in text
 
 
+def test_email_verification_uses_relay_result_not_direct_gmail(tmp_path: Path, monkeypatch) -> None:
+    tailored_txt = tmp_path / "tailored.txt"
+    tailored_txt.write_text("Tailored resume text", encoding="utf-8")
+    tailored_txt.with_suffix(".pdf").write_bytes(b"%PDF-1.4\n")
+
+    _patch_prompt_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("APPLYPILOT_ENABLE_GMAIL_MCP", "1")
+    job = {
+        "url": "https://example.com/job",
+        "title": "Chief of Staff",
+        "site": "ExampleCo",
+        "fit_score": 9,
+        "tailored_resume_path": str(tailored_txt),
+    }
+
+    text = prompt.build_prompt(job, "Tailored resume text")
+
+    assert "search_emails + read_email" not in text
+    assert "RESULT:AUTH_REQUIRED:email_verification_required" in text
+    assert "relay" in text.lower()
+
+
 def test_captcha_prompt_exits_fast_on_unsupported_capsolver_errors(monkeypatch) -> None:
     monkeypatch.setenv("CAPSOLVER_API_KEY", "CAI-test-key")
     monkeypatch.setattr(prompt.config, "load_env", lambda: None)

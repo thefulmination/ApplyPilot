@@ -8,6 +8,7 @@ def test_auth_required_result_detection() -> None:
     assert _is_auth_required_result("auth_required")
     assert _is_auth_required_result("failed:sso_required")
     assert _is_auth_required_result("email_verification_required")
+    assert _is_auth_required_result("RESULT:AUTH_REQUIRED:email_verification_required")
     assert not _is_auth_required_result("failed:page_error")
 
 

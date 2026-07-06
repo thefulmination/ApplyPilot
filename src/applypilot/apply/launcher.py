@@ -1940,9 +1940,9 @@ def _is_auth_required_result(result: str | None) -> bool:
     """Return True when a result should be routed to assisted/manual login."""
     if not result:
         return False
-    reason = result.split(":", 1)[-1] if ":" in result else result
-    normalized = reason.strip().lower()
-    return normalized in AUTH_REQUIRED_REASONS
+    normalized = result.strip().lower()
+    parts = [part.strip() for part in normalized.split(":") if part.strip()]
+    return normalized in AUTH_REQUIRED_REASONS or any(part in AUTH_REQUIRED_REASONS for part in parts)
 
 
 def _is_permanent_failure(result: str) -> bool:
