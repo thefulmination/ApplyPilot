@@ -53,6 +53,15 @@ def test_compute_ingest_wrapper_includes_unscored_push():
     assert "& '$computeIngestPs1' -Once -IncludeUnscored" in script
 
 
+def test_home_task_registration_includes_otp_responder():
+    script = Path("register-fleet-tasks.ps1").read_text(encoding="utf-8")
+
+    assert "${TaskPrefix}OtpResponder" in script
+    assert "applypilot-fleet-otp-home.exe" in script
+    assert "Stop-StaleOtpResponderProcesses" in script
+    assert "& '$otpExe' --dsn `$env:FLEET_PG_DSN" in script
+
+
 def test_m4_compute_score_defaults_to_max_parallelism():
     script = Path("register-fleet-tasks.ps1").read_text(encoding="utf-8")
 
