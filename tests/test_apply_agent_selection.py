@@ -5,6 +5,12 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_codex_apply_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("APPLYPILOT_CODEX_MODEL", raising=False)
+    monkeypatch.delenv("APPLYPILOT_CODEX_REASONING_EFFORT", raising=False)
+
+
 def test_tier3_accepts_codex_when_claude_is_missing(monkeypatch) -> None:
     from applypilot import config
 
@@ -123,6 +129,45 @@ def test_build_apply_agent_command_drops_claude_tier_model_for_codex(monkeypatch
     # The canary path shares the same guard.
     canary = launcher.build_agent_canary_command("codex", "sonnet")
     assert "--model" not in canary
+
+
+def test_codex_model_override_keeps_claude_model_separate(monkeypatch, tmp_path: Path) -> None:
+    from applypilot.apply import launcher
+
+    monkeypatch.setattr(launcher.config, "get_codex_path", lambda: "codex.exe")
+    monkeypatch.setenv("APPLYPILOT_CODEX_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("APPLYPILOT_CODEX_REASONING_EFFORT", "medium")
+
+    cmd = launcher.build_apply_agent_command(
+        agent="codex",
+        model="sonnet",
+        mcp_config_path=tmp_path / ".mcp-apply-0.json",
+        cdp_port=9333,
+    )
+
+    assert cmd[:4] == ["codex.exe", "exec", "--model", "gpt-5.4-mini"]
+    assert "-c" in cmd
+    assert 'model_reasoning_effort="medium"' in cmd
+    assert "sonnet" not in cmd
+
+    canary = launcher.build_agent_canary_command("codex", "sonnet")
+    assert canary[:4] == ["codex.exe", "exec", "--model", "gpt-5.4-mini"]
+    assert 'model_reasoning_effort="medium"' in canary
+
+
+def test_codex_reasoning_effort_rejects_invalid_value(monkeypatch, tmp_path: Path) -> None:
+    from applypilot.apply import launcher
+
+    monkeypatch.setattr(launcher.config, "get_codex_path", lambda: "codex.exe")
+    monkeypatch.setenv("APPLYPILOT_CODEX_REASONING_EFFORT", "hot")
+
+    with pytest.raises(ValueError, match="APPLYPILOT_CODEX_REASONING_EFFORT"):
+        launcher.build_apply_agent_command(
+            agent="codex",
+            model="gpt-5.4-mini",
+            mcp_config_path=tmp_path / ".mcp-apply-0.json",
+            cdp_port=9333,
+        )
 
 
 def test_build_apply_agent_canary_command_uses_selected_agent(monkeypatch) -> None:

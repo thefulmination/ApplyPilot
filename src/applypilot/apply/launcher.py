@@ -231,13 +231,36 @@ def _normalize_agent(agent: str | None) -> str:
 # Strip them so Codex uses its own default model (the documented intent: "codex uses
 # its own default"). A genuine Codex model (e.g. "gpt-5-codex") is still passed through.
 _CLAUDE_MODEL_TIERS = {"sonnet", "opus", "haiku"}
+_CODEX_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+
+
+def _codex_effective_model(model: str | None) -> str | None:
+    override = (os.environ.get("APPLYPILOT_CODEX_MODEL") or "").strip()
+    if override:
+        return override
+    if model and model.strip().lower() not in _CLAUDE_MODEL_TIERS:
+        return model
+    return None
 
 
 def _codex_model_args(model: str | None) -> list[str]:
     """--model args for Codex, dropping Claude tier names so Codex uses its default."""
-    if model and model.strip().lower() not in _CLAUDE_MODEL_TIERS:
-        return ["--model", model]
+    effective = _codex_effective_model(model)
+    if effective:
+        return ["--model", effective]
     return []
+
+
+def _codex_reasoning_args() -> list[str]:
+    effort = (os.environ.get("APPLYPILOT_CODEX_REASONING_EFFORT") or "").strip().lower()
+    if not effort:
+        return []
+    if effort not in _CODEX_REASONING_EFFORTS:
+        raise ValueError(
+            "APPLYPILOT_CODEX_REASONING_EFFORT must be one of "
+            f"{', '.join(sorted(_CODEX_REASONING_EFFORTS))}"
+        )
+    return ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
 
 
 def _codex_mcp_config_args(cdp_port: int) -> list[str]:
@@ -342,6 +365,7 @@ def build_apply_agent_command(
         config.get_codex_path(),
         "exec",
         *model_args,
+        *_codex_reasoning_args(),
         "--json",
         *_codex_isolation_args(),
         "--sandbox", "read-only",
@@ -369,6 +393,7 @@ def build_agent_canary_command(agent: str, model: str | None) -> list[str]:
         config.get_codex_path(),
         "exec",
         *model_args,
+        *_codex_reasoning_args(),
         *_codex_isolation_args(),
         "--ephemeral",
         "--sandbox", "read-only",
