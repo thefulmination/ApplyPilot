@@ -47,6 +47,15 @@ def test_remote_fleet_agent_requires_explicit_fleet_dsn():
     assert "host=<home Tailscale IP> port=5432" in script
 
 
+def test_fleet_agent_applies_m4_work_hours_blackout_before_reconcile():
+    script = Path("fleet-agent.ps1").read_text(encoding="utf-8")
+
+    assert "applypilot.fleet.work_hours" in script
+    assert "APPLYPILOT_ALLOW_WORK_HOURS_APPLY" in script
+    assert "$want = 0" in script
+    assert "work-hours blackout" in script
+
+
 def test_worker_launcher_probes_fleet_pg_before_starting_apply_loop():
     script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
 

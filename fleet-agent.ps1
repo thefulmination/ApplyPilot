@@ -227,6 +227,14 @@ while ($true) {
   $f = "$line" -split '\|'
   if ($f.Count -lt 4 -or $f[0] -eq 'KEEP') { Start-Sleep -Seconds $PollSec; continue }  # DB blip -> leave as-is
   $want = [int]$f[0]; $agent = $f[1]; $model = $f[2]; $gen = [int]$f[3]
+  $desiredWant = $want
+  $blackout = (& $py -m applypilot.fleet.work_hours $Label 2>$null | Select-Object -Last 1)
+  if ("$blackout" -match '^BLACKOUT\|') {
+    if ($want -gt 0) {
+      Write-Host "[fleet-agent:$Label] work-hours blackout active; effective desired_workers 0 (configured $want). Set APPLYPILOT_ALLOW_WORK_HOURS_APPLY=1 to override." -ForegroundColor Yellow
+    }
+    $want = 0
+  }
 
   $procs = Get-LocalWorkers
   # A worker is TWO OS processes (the pip .exe wrapper + its python.exe child), both carrying the
@@ -237,10 +245,12 @@ while ($true) {
   $have = $slotGroups.Count
 
   # generation bump -> the home box asked for a clean restart: kill all local, then re-spawn to $want
-  if ($null -ne $lastGen -and $gen -ne $lastGen) {
+  if ($null -ne $lastGen -and $gen -ne $lastGen -and $want -gt 0) {
     Write-Host "[fleet-agent:$Label] generation $lastGen->$gen : restarting all local workers" -ForegroundColor Yellow
     $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2; $procs = @(); $have = 0
+  } elseif ($null -ne $lastGen -and $gen -ne $lastGen -and $desiredWant -gt 0 -and $want -eq 0) {
+    Write-Host "[fleet-agent:$Label] generation $lastGen->$gen observed during work-hours blackout; deferring restart until blackout clears" -ForegroundColor Yellow
   }
   $lastGen = $gen
 
