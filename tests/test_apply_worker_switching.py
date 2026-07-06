@@ -109,6 +109,41 @@ def test_run_apply_beats_while_all_agents_walled(monkeypatch):
     awm._STOP_REQUESTED.clear()
 
 
+def test_run_apply_resumes_when_fleet_blocks_clear(monkeypatch):
+    awm._STOP_REQUESTED.clear()
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
+
+    sw = AgentSwitcher("claude", "codex", cooldown_seconds=3600)
+    sw.note_wall("claude", now=1000.0)
+    sw.note_wall("codex", now=1000.0)
+
+    class Loop:
+        _log_tail_fn = None
+
+        def __init__(self):
+            self.beats = []
+            self.ran = 0
+
+        def _beat(self, conn, state):
+            self.beats.append(state)
+
+        def run_once(self):
+            self.ran += 1
+            return {"action": "applied"}
+
+    loop = Loop()
+    budget = _FakeBudget()  # no blocks in DB -> should clear local stale walls
+    counts = awm.run_apply(_conn_factory, loop, max_iterations=1, idle_sleep=0,
+                           switcher=sw, rebuild_apply_fn=lambda a: (lambda j: {}),
+                           time_fn=lambda: 10_000.0, budget=budget)
+
+    assert loop.ran == 1
+    assert sw.blocked_until("claude") == 0.0
+    assert sw.blocked_until("codex") == 0.0
+    assert counts["applied"] == 1
+    awm._STOP_REQUESTED.clear()
+
+
 def test_run_apply_handles_remote_command_before_all_agents_walled(monkeypatch):
     awm._STOP_REQUESTED.clear()
     monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
@@ -163,6 +198,32 @@ def test_run_apply_uses_parsed_reset_time_over_cooldown(monkeypatch):
 
     # blocked until the PARSED 12:40pm reset, not now+3600 (which would be ~12:23)
     assert sw.blocked_until("claude") == reset_dt.timestamp()
+    awm._STOP_REQUESTED.clear()
+
+
+def test_run_apply_records_short_block_for_just_passed_try_again(monkeypatch):
+    awm._STOP_REQUESTED.clear()
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
+
+    sw = AgentSwitcher("codex", "claude", cooldown_seconds=3600)
+    now_dt = datetime(2026, 7, 5, 17, 10, 26, tzinfo=timezone.utc)
+    expected = datetime(2026, 7, 5, 17, 12, 26, tzinfo=timezone.utc).timestamp()
+    budget = _FakeBudget()
+
+    loop = MagicMock()
+    loop._log_tail_fn = lambda: (
+        "You've hit your usage limit. Visit [REDACTED] to purchase more credits "
+        "or try again at 5:10 PM."
+    )
+    loop.run_once = lambda: {"action": "usage_limit", "url": "u"}
+
+    awm.run_apply(_conn_factory, loop, max_iterations=1, idle_sleep=0,
+                  switcher=sw, rebuild_apply_fn=lambda a: (lambda job: {}),
+                  time_fn=lambda: now_dt.timestamp(), budget=budget,
+                  now_local_fn=lambda: now_dt)
+
+    assert sw.blocked_until("codex") == expected
+    assert budget.recorded == [("codex", expected)]
     awm._STOP_REQUESTED.clear()
 
 

@@ -20,6 +20,8 @@ import time
 
 logger = logging.getLogger("applypilot.fleet.linkedin_worker_main")
 
+_PAUSE_CEILING = 300.0
+
 
 def _setup_apply_env() -> None:
     """Mirror apply_worker_main._setup_apply_env (home-box flavored)."""
@@ -97,7 +99,7 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
-    from applypilot.fleet.apply_worker_main import make_apply_fn
+    from applypilot.fleet.apply_worker_main import make_apply_fn, make_log_tail_fn
 
     return WorkerLoop(
         lambda: pgqueue.connect(dsn),
@@ -109,10 +111,13 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
         public_ip=owner_ip,
         owner_ip=owner_ip,
         on_owner_machine=True,
+        log_tail_fn=make_log_tail_fn(0),
     )
 
 
-def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> dict:
+def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
+                 switcher=None, rebuild_apply_fn=None, time_fn=None, now_local_fn=None,
+                 budget=None) -> dict:
     """Drive the LinkedIn apply loop (mirrors run_apply from apply_worker_main).
 
     Before each iteration check the LinkedIn-specific shared kill switch and idle when
@@ -121,14 +126,69 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> 
     (testable). Production calls with max_iterations=None (forever).
     """
     from applypilot.apply import pgqueue
+    from applypilot.fleet.agent_switch import parse_reset_at
+    from datetime import datetime
+    _time = time_fn or time.time
+    _now_local = now_local_fn or (lambda: datetime.now().astimezone())
     counts = {"applied": 0, "halted": 0, "idle": 0, "error": 0}
+    current_agent = None
     it = 0
+    if switcher is not None:
+        try:
+            loop.agent_chain = ",".join(switcher.agents)
+        except Exception:
+            pass
     while max_iterations is None or it < max_iterations:
         it += 1
         try:
+            if budget is not None and switcher is not None:
+                now0 = _time()
+                with conn_factory() as bconn:
+                    try:
+                        budget.maybe_evaluate(bconn)
+                        switcher.sync_blocks(now0, budget.blocks(bconn))
+                    except Exception:  # pragma: no cover - best-effort; never block the worker
+                        logger.debug("agent budget sync failed", exc_info=True)
+            if switcher is not None:
+                now = _time()
+                agent = switcher.effective_agent(now)
+                if agent is None:
+                    try:
+                        loop.current_agent = None
+                        loop.last_agent_switch_reason = "all_agents_walled"
+                    except Exception:
+                        pass
+                    counts["idle"] += 1
+                    beat = getattr(loop, "_beat", None)
+                    if callable(beat):
+                        try:
+                            with conn_factory() as pause_conn:
+                                beat(pause_conn, state="paused")
+                        except Exception:  # pragma: no cover - never fatal
+                            logger.debug("agent-wall heartbeat failed", exc_info=True)
+                    if idle_sleep:
+                        resume = switcher.resume_at(now)
+                        nap = min(max(resume - now, 0.0), _PAUSE_CEILING) if resume is not None else idle_sleep
+                        if nap:
+                            time.sleep(nap)
+                    continue
+                if agent != current_agent and rebuild_apply_fn is not None:
+                    loop.apply_fn = rebuild_apply_fn(agent)
+                    try:
+                        loop.current_agent = agent
+                        loop.current_model = None if agent == "codex" else getattr(loop, "current_model", None)
+                        loop.last_agent_switch_at = _now_local()
+                        loop.last_agent_switch_reason = "agent_available"
+                    except Exception:
+                        pass
+                    current_agent = agent
             with conn_factory() as conn:
                 if pgqueue.linkedin_should_halt(conn):
                     counts["halted"] += 1
+                    try:
+                        loop._beat(conn, state="paused")
+                    except Exception:  # pragma: no cover - never fatal
+                        logger.debug("halted heartbeat failed", exc_info=True)
                     if idle_sleep:
                         time.sleep(idle_sleep)
                     continue
@@ -136,11 +196,30 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0) -> 
             action = res.get("action")
             if action == "applied":
                 counts["applied"] += 1
+            elif action == "usage_limit":
+                counts["idle"] += 1
+                if switcher is not None and current_agent is not None:
+                    reset_at = None
+                    tail_fn = getattr(loop, "_log_tail_fn", None)
+                    tail = tail_fn() if callable(tail_fn) else None
+                    dt = parse_reset_at(tail, now_local=_now_local()) if tail else None
+                    if dt is not None:
+                        reset_at = dt.timestamp()
+                    switcher.note_wall(current_agent, _time(), reset_at=reset_at)
+                    if budget is not None:
+                        blocked_epoch = reset_at if reset_at is not None else _time() + switcher.cooldown_seconds
+                        try:
+                            with conn_factory() as wconn:
+                                budget.record_wall(wconn, current_agent, blocked_epoch)
+                        except Exception:  # pragma: no cover - best-effort; never block the worker
+                            logger.debug("recording fleet wall failed", exc_info=True)
+                if idle_sleep:
+                    time.sleep(idle_sleep)
             elif action == "stop":
                 logger.info("remote %s command: exiting between jobs (supervisor respawns)",
                             res.get("command"))
                 break
-            elif action in ("idle", "paused", "usage_limit"):
+            elif action in ("idle", "paused"):
                 counts["idle"] += 1
                 if idle_sleep:
                     time.sleep(idle_sleep)
@@ -161,6 +240,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     # Match the apply-lane default: Codex uses the ChatGPT quota pool and avoids
     # burning the Claude Max subscription unless the operator explicitly opts in.
     p.add_argument("--agent", default="codex")
+    p.add_argument("--fallback-agent", default=os.environ.get("APPLYPILOT_LINKEDIN_FALLBACK_AGENT")
+                   or os.environ.get("APPLYPILOT_FALLBACK_AGENT"),
+                   help="Comma-separated ordered fallback agents to switch to when --agent "
+                        "hits its usage/session limit. Omit for none: the worker then pauses "
+                        "until the primary agent's window resets.")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
     args = p.parse_args(argv)
     if not args.dsn:
@@ -186,8 +270,41 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
         agent=args.agent,
         machine_owner=args.machine_owner,
     )
+    from applypilot.fleet.agent_switch import AgentSwitcher
+    from applypilot.fleet.apply_worker_main import PgAgentBudget, make_apply_fn
+
     try:
-        run_linkedin(lambda: pgqueue.connect(args.dsn), loop)
+        cooldown = float(os.environ.get("APPLYPILOT_USAGE_LIMIT_COOLDOWN_SECONDS") or 3600)
+    except (TypeError, ValueError):
+        cooldown = 3600.0
+    fallbacks = [a.strip() for a in (args.fallback_agent or "").split(",") if a.strip()]
+    switcher = AgentSwitcher(agents=[args.agent, *fallbacks], cooldown_seconds=cooldown)
+
+    def _envf(name, default):
+        try:
+            return float(os.environ.get(name) or default)
+        except (TypeError, ValueError):
+            return default
+
+    soft_caps = {}
+    for a in ("claude", "codex"):
+        cap = _envf(f"APPLYPILOT_{a.upper()}_SOFT_CAP_USD", 0.0)
+        if cap > 0:
+            soft_caps[a] = cap
+    budget = PgAgentBudget(
+        soft_caps=soft_caps,
+        window_seconds=_envf("APPLYPILOT_AGENT_WINDOW_SECONDS", 18000.0),
+        cooldown_seconds=_envf("APPLYPILOT_AGENT_SOFT_BLOCK_COOLDOWN_SECONDS", 1800.0),
+        eval_interval_seconds=_envf("APPLYPILOT_AGENT_EVAL_INTERVAL_SECONDS", 120.0),
+    )
+    try:
+        run_linkedin(
+            lambda: pgqueue.connect(args.dsn),
+            loop,
+            switcher=switcher,
+            rebuild_apply_fn=lambda agent: make_apply_fn(args.model, agent),
+            budget=budget,
+        )
     finally:
         try:
             interlock_conn.close()  # releases the advisory lock

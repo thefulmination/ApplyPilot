@@ -21,10 +21,12 @@ from typing import Optional
 # "resets 12:40pm" (Claude session-limit wording, 2026-07-03+) or "try again at 3:15 PM"
 # (older usage-limit wording). Case-insensitive; the two capture groups are alternatives.
 _RESET_RE = re.compile(
-    r"try again at\s+(\d{1,2}:\d{2}\s*[ap]m)"
-    r"|resets\s+(\d{1,2}:\d{2}\s*[ap]m)",
+    r"(?P<kind>try again at|resets)\s+(?P<time>\d{1,2}(?::\d{2})?\s*[ap]m)",
     re.IGNORECASE,
 )
+
+_RESET_PAST_GRACE = timedelta(minutes=15)
+_RESET_JUST_PASSED_DELAY = timedelta(minutes=2)
 
 
 class AgentSwitcher:
@@ -55,6 +57,21 @@ class AgentSwitcher:
     def blocked_until(self, agent: str) -> float:
         """Epoch until which `agent` is walled (0.0 if never walled)."""
         return self._blocked_until.get(agent, 0.0)
+
+    def sync_blocks(self, now: float, blocks: dict[str, float]) -> None:
+        """Reconcile switcher state with active fleet blocks from Postgres.
+
+        `blocks` should include only currently active blocks (`agent -> blocked_until`
+        where `blocked_until > now`). Any configured agent absent from `blocks` is treated
+        as unblocked. This lets a long-running worker recover from stale in-memory walls
+        when the controlling agent table has been reset upstream.
+        """
+        active = {str(agent): float(ts) for agent, ts in blocks.items()}
+        for agent in self.agents:
+            if active.get(agent, 0.0) > now:
+                self._blocked_until[agent] = active[agent]
+            else:
+                self._blocked_until[agent] = 0.0
 
     def _available(self, agent: Optional[str], now: float) -> bool:
         return agent is not None and now >= self._blocked_until.get(agent, 0.0)
@@ -88,13 +105,23 @@ def parse_reset_at(text: Optional[str], *, now_local: datetime) -> Optional[date
     now_local carries the tz; the result inherits it. None if no reset time is present."""
     if not text:
         return None
-    m = _RESET_RE.search(text)
-    if not m:
+    matches = list(_RESET_RE.finditer(text))
+    if not matches:
         return None
-    raw = (m.group(1) or m.group(2)).strip()
-    parsed = datetime.strptime(raw.upper().replace(" ", ""), "%I:%M%p").time()
+    match = matches[-1]
+    kind = match.group("kind").lower()
+    raw = match.group("time").strip()
+    normalized = raw.upper().replace(" ", "")
+    parsed = datetime.strptime(
+        normalized,
+        "%I:%M%p" if ":" in normalized else "%I%p",
+    ).time()
     candidate = now_local.replace(hour=parsed.hour, minute=parsed.minute,
                                   second=0, microsecond=0)
     if candidate < now_local:
+        if now_local - candidate <= _RESET_PAST_GRACE:
+            return now_local + _RESET_JUST_PASSED_DELAY
+        if kind == "try again at":
+            return None
         candidate = candidate + timedelta(days=1)
     return candidate

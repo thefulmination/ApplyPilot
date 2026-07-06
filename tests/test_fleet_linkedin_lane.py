@@ -202,6 +202,96 @@ def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
     assert sleeps == [7]
 
 
+def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
+    from applypilot.fleet import linkedin_worker_main as lm
+    from applypilot.fleet.agent_switch import AgentSwitcher
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    actions = iter(["usage_limit", "applied"])
+
+    class _Loop:
+        _log_tail_fn = None
+
+        def run_once(self):
+            return {"action": next(actions), "url": "li-wall"}
+
+    rebuilt = []
+
+    def rebuild(agent):
+        rebuilt.append(agent)
+        return lambda job: {}
+
+    monkeypatch.setattr(pgqueue, "linkedin_should_halt", lambda conn: False)
+    sw = AgentSwitcher(agents=["codex", "claude"], cooldown_seconds=3600)
+
+    counts = lm.run_linkedin(
+        lambda: _Conn(),
+        _Loop(),
+        max_iterations=2,
+        idle_sleep=0,
+        switcher=sw,
+        rebuild_apply_fn=rebuild,
+        time_fn=lambda: 1000.0,
+    )
+
+    assert rebuilt[0] == "codex"
+    assert "claude" in rebuilt
+    assert sw.blocked_until("codex") == 4600.0
+    assert counts["applied"] == 1
+
+
+def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
+    from applypilot.fleet import linkedin_worker_main as lm
+    from applypilot.fleet.agent_switch import AgentSwitcher
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Loop:
+        _log_tail_fn = None
+
+        def __init__(self):
+            self.ran = 0
+            self.beats = []
+
+        def _beat(self, _conn, state):
+            self.beats.append(state)
+
+        def run_once(self):
+            self.ran += 1
+            return {"action": "applied", "url": "li"}
+
+    monkeypatch.setattr(pgqueue, "linkedin_should_halt", lambda conn: False)
+    sw = AgentSwitcher(agents=["codex", "claude"], cooldown_seconds=3600)
+    sw.note_wall("codex", now=1000.0)
+    sw.note_wall("claude", now=1000.0)
+
+    loop = _Loop()
+    counts = lm.run_linkedin(
+        lambda: _Conn(),
+        loop,
+        max_iterations=2,
+        idle_sleep=0,
+        switcher=sw,
+        rebuild_apply_fn=lambda agent: (lambda job: {}),
+        time_fn=lambda: 1000.0,
+    )
+
+    assert loop.ran == 0
+    assert loop.beats == ["paused", "paused"]
+    assert counts["idle"] == 2
+
+
 def test_linkedin_setup_env_prefers_repo_local_profile(monkeypatch, tmp_path):
     from applypilot.fleet import linkedin_worker_main as lm
 

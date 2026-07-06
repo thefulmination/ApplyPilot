@@ -257,7 +257,9 @@ class WorkerLoop:
         self.last_agent_switch_reason: Optional[str] = None
         # Remote-command state: a 'pause' flips this until 'resume'; consumed in
         # run_once BETWEEN jobs (never mid-apply). See _handle_commands.
-        self._paused = False
+        # Rehydrate from a preexisting heartbeat row so process restarts after a
+        # pause command stay paused until a resume is observed again.
+        self._paused = self._hydrate_paused_state()
         if compute_fns is not None:
             self.compute_fns = compute_fns
             self._legacy_score_fn = None
@@ -274,6 +276,27 @@ class WorkerLoop:
     # -- connection -----------------------------------------------------------
     def _connect(self):
         return self.conn_factory()
+
+    def _hydrate_paused_state(self) -> bool:
+        """If this worker had a lingering paused heartbeat, resume in paused mode.
+
+        This avoids a hard failure mode where a remote pause is not reapplied after
+        restart, because the pause bit only lived in-memory. If no heartbeat exists
+        (or DB read fails), default to ``False`` and let normal command processing
+        continue.
+        """
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT state FROM worker_heartbeat WHERE worker_id=%s",
+                        (self.worker_id,),
+                    )
+                    row = cur.fetchone()
+                conn.rollback()
+            return bool(row is not None and row.get("state") == "paused")
+        except Exception:
+            return False
 
     # -- event ring (crash/log visibility) ------------------------------------
     def _record_event(self, msg) -> None:

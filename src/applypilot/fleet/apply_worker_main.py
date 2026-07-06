@@ -403,8 +403,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 with conn_factory() as bconn:
                     try:
                         budget.maybe_evaluate(bconn)
-                        for blk_agent, blk_until in budget.blocks(bconn).items():
-                            switcher.note_wall(blk_agent, now0, reset_at=blk_until)
+                        switcher.sync_blocks(now0, budget.blocks(bconn))
                     except Exception:  # pragma: no cover - best-effort; never block the worker
                         logger.debug("agent budget sync failed", exc_info=True)
             if switcher is not None:

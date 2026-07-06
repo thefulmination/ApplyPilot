@@ -85,6 +85,29 @@ def test_pause_idles_without_leasing_then_resume(fleet_db):
     assert loop.run_once()["action"] == "idle"
 
 
+def test_restart_inherits_paused_heartbeat_state(fleet_db):
+    # Simulate a process restart while a previous loop had already been heartbeating
+    # as paused; new process starts paused until an explicit resume command arrives.
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, last_beat) "
+                "VALUES (%s, %s, %s, %s, %s, NULL, now())",
+                ("m2-0", "m2", "1.2.3.4", "discovery", "paused"),
+            )
+        conn.commit()
+    loop = _mk_loop(fleet_db)
+    assert loop.run_once()["action"] == "paused"
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT state FROM worker_heartbeat WHERE worker_id='m2-0'")
+            assert cur.fetchone()["state"] == "paused"
+
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.issue_command(conn, "m2-0", "resume")
+    assert loop.run_once()["action"] == "idle"
+
+
 def test_self_update_is_acked_noop(fleet_db):
     loop = _mk_loop(fleet_db)
     with pgqueue.connect(fleet_db) as conn:

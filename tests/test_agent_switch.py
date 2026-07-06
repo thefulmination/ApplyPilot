@@ -55,6 +55,17 @@ def test_explicit_reset_time_overrides_cooldown():
     assert sw.effective_agent(now=4601.0) == "codex"   # cooldown would have freed it; reset has not
 
 
+def test_sync_blocks_clears_stale_in_memory_wall():
+    sw = AgentSwitcher("claude", "codex", cooldown_seconds=3600)
+    sw.note_wall("claude", now=1000.0)
+    sw.note_wall("codex", now=1000.0)
+    sw.sync_blocks(10_000.0, {})  # no active blocks in DB anymore
+
+    assert sw.effective_agent(now=10_000.0) == "claude"  # both cleared by sync
+    assert sw.blocked_until("claude") == 0.0
+    assert sw.blocked_until("codex") == 0.0
+
+
 def test_past_reset_time_falls_back_to_cooldown():
     sw = AgentSwitcher("claude", "codex", cooldown_seconds=3600)
     sw.note_wall("claude", now=1000.0, reset_at=500.0)  # reset already in the past -> ignore
@@ -113,16 +124,38 @@ def test_parse_reset_at_returns_same_day_when_still_ahead():
     assert got == datetime(2026, 7, 3, 12, 40, tzinfo=timezone.utc)
 
 
-def test_parse_reset_at_rolls_to_next_day_when_time_already_passed():
-    now = datetime(2026, 7, 3, 15, 0, tzinfo=timezone.utc)  # 3pm, reset says 12:40pm
-    got = parse_reset_at("resets 12:40pm", now_local=now)
-    assert got == datetime(2026, 7, 4, 12, 40, tzinfo=timezone.utc)
+def test_parse_reset_at_shortens_just_passed_time():
+    now = datetime(2026, 7, 3, 17, 10, 5, tzinfo=timezone.utc)
+    got = parse_reset_at("try again at 5:10 PM", now_local=now)
+    assert got == datetime(2026, 7, 3, 17, 12, 5, tzinfo=timezone.utc)
+
+
+def test_parse_reset_at_does_not_roll_stale_try_again_time_to_tomorrow():
+    now = datetime(2026, 7, 3, 18, 0, tzinfo=timezone.utc)
+    got = parse_reset_at("try again at 5:10 PM", now_local=now)
+    assert got is None
 
 
 def test_parse_reset_at_handles_try_again_at_wording():
     now = datetime(2026, 7, 3, 11, 0, tzinfo=timezone.utc)
     got = parse_reset_at("Try again at 3:15 PM", now_local=now)
     assert got == datetime(2026, 7, 3, 15, 15, tzinfo=timezone.utc)
+
+
+def test_parse_reset_at_handles_hour_only_reset():
+    now = datetime(2026, 7, 5, 23, 30, tzinfo=timezone.utc)
+    got = parse_reset_at("You've hit your weekly limit · resets 3am (America/New_York)", now_local=now)
+    assert got == datetime(2026, 7, 6, 3, 0, tzinfo=timezone.utc)
+
+
+def test_parse_reset_at_uses_latest_reset_mention():
+    now = datetime(2026, 7, 5, 23, 30, tzinfo=timezone.utc)
+    text = (
+        "try again at 5:10 PM\n"
+        "You've hit your weekly limit · resets 3am (America/New_York)"
+    )
+    got = parse_reset_at(text, now_local=now)
+    assert got == datetime(2026, 7, 6, 3, 0, tzinfo=timezone.utc)
 
 
 def test_parse_reset_at_none_when_absent():
