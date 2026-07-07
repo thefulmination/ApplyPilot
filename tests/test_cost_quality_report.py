@@ -14,6 +14,9 @@ def test_classify_ats_from_application_url():
     assert classify_ats("https://grnh.se/abcd1234") == "greenhouse"
     assert classify_ats("https://jobs.lever.co/example/abc") == "lever"
     assert classify_ats("https://adobe.wd5.myworkdayjobs.com/external/job/1") == "workday"
+    assert classify_ats("https://company.workdayjobs.com/external/job/1") == "workday"
+    assert classify_ats("https://jobs.smartrecruiters.com/example/123") == "smartrecruiters"
+    assert classify_ats("https://apply.workable.com/example/j/123") == "workable"
     assert classify_ats("https://example.com/apply") == "other"
 
 
@@ -35,7 +38,14 @@ def test_classify_failure_bucket_is_stable():
         classify_failure_bucket("failed", "failed:email_verification_required")
         == "email_auth_related"
     )
+    assert classify_failure_bucket("failed", "otp_required") == "email_auth_related"
+    assert classify_failure_bucket("failed", "auth_required") == "email_auth_related"
+    assert classify_failure_bucket("failed", "login_required") == "email_auth_related"
     assert classify_failure_bucket("blocked", "challenge_pending") == "challenge_related"
+    assert classify_failure_bucket("blocked", "captcha_required") == "challenge_related"
+    assert classify_failure_bucket("failed", "failed:timeout") == "agent_browser_runtime"
+    assert classify_failure_bucket("failed", "already_applied") == "preflight_or_policy"
+    assert classify_failure_bucket("failed", "excluded_company") == "preflight_or_policy"
     assert classify_failure_bucket("failed", "failed:no_confirmation") == "other"
 
 
@@ -74,6 +84,7 @@ def test_summarize_fleet_queue_computes_all_in_cost_per_apply():
 
     assert summary.applied == 2
     assert summary.terminal_attempts == 4
+    assert summary.queued_or_leased == 1
     assert summary.total_cost_usd == 2.5
     assert summary.cost_per_applied_all_in == 1.25
     assert summary.by_ats["greenhouse"].applied == 1
