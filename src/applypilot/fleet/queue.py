@@ -152,7 +152,9 @@ def _result_line(status, apply_status=None, apply_error=None) -> str:
 
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                         apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
-                        agent=None, agent_model=None, apply_duration_ms=None):
+                        agent=None, agent_model=None, apply_duration_ms=None,
+                        application_tool_calls=None, job_log_path=None, transcript_digest=None,
+                        final_result_source=None):
     """Close the apply (lease-owner guarded), record the governor outcome on
     global+host+home_ip (bump cap on a confirmed apply), and UPSERT applied_set
     so the posting can never be applied to again. One transaction.
@@ -203,8 +205,9 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         cur.execute(
             "INSERT INTO apply_result_events ("
             "queue_name, url, worker_id, status, apply_status, apply_error, target_host, home_ip, "
-            "agent, agent_model, est_cost_usd, apply_duration_ms, result_line, source"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s)",
+            "agent, agent_model, est_cost_usd, apply_duration_ms, application_tool_calls, "
+            "job_log_path, transcript_digest, final_result_source, result_line, source"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s)",
             (
                 "apply_queue",
                 url,
@@ -218,6 +221,10 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 agent_model,
                 est_cost_usd,
                 apply_duration_ms,
+                application_tool_calls,
+                job_log_path,
+                transcript_digest,
+                final_result_source,
                 _result_line(status, apply_status=apply_status, apply_error=apply_error),
                 "worker",
             ),

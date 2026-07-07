@@ -6,6 +6,7 @@ result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -1826,6 +1827,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         run_stats = dict(stats) if stats else {}
         run_stats["transcript"] = output[-20000:]
         run_stats["job_log"] = str(job_log)
+        run_stats["job_log_path"] = str(job_log)
+        run_stats["application_tool_calls"] = application_tool_calls[0]
+        run_stats["transcript_digest"] = (
+            "sha256:" + hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
+        )
+        run_stats["final_result_source"] = "final_message" if final_text and "RESULT:" in final_text else "transcript"
         _last_run_stats[worker_id] = run_stats
 
         if stats:
