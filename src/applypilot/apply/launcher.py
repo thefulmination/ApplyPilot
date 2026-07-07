@@ -1610,10 +1610,6 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         if job_log is not None:
             run_stats["job_log"] = str(job_log)
 
-        if not last_tool:
-            ws = get_state(worker_id)
-            last_tool = ws.last_action if ws else ""
-
         run_stats["application_tool_calls"] = int(application_tool_calls_count or 0)
         run_stats["tool_calls_total"] = int(tool_calls_total_count or 0)
         run_stats["last_tool"] = last_tool
@@ -1926,8 +1922,6 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         job_log = _write_job_log(output, label=agent)
 
         def _finish(status: str, duration_ms: int) -> tuple[str, int]:
-            ws = get_state(worker_id)
-            last_tool = last_tool_seen[0] or (ws.last_action if ws else "")
             return _record_run_metadata(
                 status,
                 duration_ms,
@@ -1935,7 +1929,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 stats_data=stats,
                 application_tool_calls_count=application_tool_calls[0],
                 tool_calls_total_count=tool_calls_total[0],
-                last_tool=last_tool,
+                last_tool=last_tool_seen[0],
                 route="agent",
                 job_log=job_log,
             )

@@ -181,6 +181,27 @@ def test_launcher_metadata_counts_total_tool_calls_separately(monkeypatch, tmp_p
     assert stats["last_tool"] == "browser_click"
 
 
+def test_launcher_zero_tool_terminal_failure_keeps_last_tool_empty(monkeypatch, tmp_path):
+    stdout_text = _stream_line(
+        {
+            "type": "result",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "num_turns": 1,
+            "total_cost_usd": 0,
+            "result": "RESULT:FAILED:no_result_line",
+        }
+    )
+    _patch_launcher_agent_io(monkeypatch, tmp_path, stdout_text=stdout_text)
+
+    status, _duration_ms = launcher._run_job_impl(_job(), port=9225, worker_id=47)
+
+    stats = launcher._last_run_stats[47]
+    assert status == "failed:no_result_line"
+    assert stats["tool_calls_total"] == 0
+    assert stats["application_tool_calls"] == 0
+    assert stats["last_tool"] == ""
+
+
 def test_launcher_exception_path_overwrites_stale_metadata(monkeypatch, tmp_path):
     _patch_launcher_agent_io(monkeypatch, tmp_path, popen_error="agent launch exploded")
     launcher._last_run_stats[45] = {
