@@ -382,6 +382,53 @@ def test_worker_role_validation():
         WorkerLoop(_factory("x"), "w", home_ip="1.1.1.1", role="bogus")
 
 
+def test_greenhouse_adapter_no_confirmation_is_crash_unconfirmed(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_apply_jobs(
+            conn,
+            [{
+                "url": "gh-no-confirm",
+                "company": "Acme",
+                "title": "Staff Engineer",
+                "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+                "score": 9.0,
+                "target_host": "greenhouse.io",
+                "dedup_key": "dk-gh-no-confirm",
+            }],
+            approved_batch="batchA",
+        )
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-gh-adapter",
+        home_ip="4.4.4.4",
+        role="apply",
+        apply_fn=lambda job: {
+            "run_status": "failed:no_confirmation",
+            "est_cost_usd": 0.0,
+            "route": "adapter_submit:greenhouse",
+            "failure_class": "adapter_no_confirmation",
+            "last_tool": "greenhouse_adapter",
+        },
+    )
+
+    assert loop.run_once()["action"] == "crash_unconfirmed"
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, apply_status, apply_error FROM apply_queue WHERE url='gh-no-confirm'")
+        q = cur.fetchone()
+        assert q["status"] == "crash_unconfirmed"
+        assert q["apply_status"] == "crash_unconfirmed"
+        assert q["apply_error"] == "failed:no_confirmation"
+        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-gh-no-confirm'")
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT route, failure_class, last_tool FROM apply_result_events WHERE url='gh-no-confirm'")
+        event = cur.fetchone()
+        assert event["route"] == "adapter_submit:greenhouse"
+        assert event["failure_class"] == "adapter_no_confirmation"
+        assert event["last_tool"] == "greenhouse_adapter"
+
+
 # ===========================================================================
 # 4b. Crash + log visibility: _scrub redacts secrets; _heartbeat persists
 #     last_error / recent_log (scrubbed) to worker_heartbeat.

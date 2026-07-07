@@ -589,7 +589,13 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     enforce_host_identity(args.machine_owner)
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
     from applypilot.fleet.agent_switch import AgentSwitcher
+    with pgqueue.connect(args.dsn) as conn:
+        try:
+            fleet_schema.require_apply_result_event_schema(conn)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
                             model=args.model, agent=args.agent, machine_owner=args.machine_owner,
                             slot=slot)

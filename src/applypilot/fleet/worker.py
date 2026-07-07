@@ -521,6 +521,13 @@ class WorkerLoop:
     _WALL_STATUSES = ("captcha", "login_issue", "auth_required")
     _CRASH_STATUSES = ("failed:no_result_line", "failed:timeout")
 
+    @staticmethod
+    def _adapter_may_have_submitted(run_status: str, res: dict) -> bool:
+        return (
+            run_status == "failed:no_confirmation"
+            and str((res or {}).get("route") or "").startswith("adapter_submit:")
+        )
+
     def _linkedin_halt_seconds(self) -> int:
         import os
         return int(os.environ.get("APPLYPILOT_LINKEDIN_HALT_COOLDOWN") or 21600)
@@ -629,7 +636,11 @@ class WorkerLoop:
             wall_outcome = None if kind == "login_gate" else "captcha"
             self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome, target_host=target_host)
             return {"action": "parked_challenge", "url": url}
-        if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
+        if (
+            run_status in self._CRASH_STATUSES
+            or run_status.startswith("failed:worker_error")
+            or self._adapter_may_have_submitted(run_status, res)
+        ):
             queue.write_apply_result(conn, self.worker_id, url, status="crash_unconfirmed",
                                      apply_status="crash_unconfirmed", apply_error=run_status[:200],
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
