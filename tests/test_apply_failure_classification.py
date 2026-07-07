@@ -101,6 +101,29 @@ def test_weekly_limit_before_application_tools_is_safe_requeue():
     assert result.safe_requeue is True
 
 
+def test_quota_signatures_before_application_tools_are_safe_requeue():
+    transcripts = (
+        "switch to a different model",
+        "exceeded your quota",
+        "insufficient quota",
+        "out of credits",
+        "upgrade to continue",
+    )
+
+    for transcript in transcripts:
+        evidence = FailureEvidence(
+            status="failed:no_result_line",
+            transcript=transcript,
+            application_tool_calls=0,
+            tool_calls_total=0,
+        )
+
+        result = classify_apply_failure(evidence)
+
+        assert result.failure_class == "usage_or_session_limit"
+        assert result.safe_requeue is True
+
+
 def test_auth_message_after_browser_tool_is_not_safe_requeue():
     evidence = FailureEvidence(
         status="failed:no_result_line",

@@ -31,9 +31,14 @@ _USAGE_OR_SESSION_LIMIT_NEEDLES = (
     "usage limit exceeded",
     "session limit exceeded",
     "exceeded your usage limit",
+    "exceeded your quota",
+    "insufficient quota",
+    "out of credits",
     "quota exceeded",
     "switch to another model",
+    "switch to a different model",
     "try again at",
+    "upgrade to continue",
 )
 
 _AGENT_AUTH_NEEDLES = (
@@ -45,8 +50,8 @@ _AGENT_AUTH_NEEDLES = (
 
 @dataclass(frozen=True)
 class FailureEvidence:
-    status: str
-    transcript: str = ""
+    status: str | None
+    transcript: str | None = ""
     application_tool_calls: int = 0
     tool_calls_total: int = 0
     last_tool: str = ""
