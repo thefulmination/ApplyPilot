@@ -4,6 +4,8 @@ from applypilot.fleet.host_policy import HostPolicyDecision, decide_host_policy,
 def test_host_from_url_normalizes_host():
     assert host_from_url("https://Boards.Greenhouse.io/acme/jobs/1") == "boards.greenhouse.io"
     assert host_from_url("not a url") == ""
+    assert host_from_url("https://not a url") == ""
+    assert host_from_url("http://exa mple.com/path") == ""
 
 
 def test_greenhouse_and_ashby_are_allowed_by_default():

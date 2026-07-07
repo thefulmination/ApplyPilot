@@ -34,7 +34,10 @@ def host_from_url(url: str | None) -> str:
         parsed = urlparse(url or "")
     except Exception:
         return ""
-    return (parsed.hostname or "").lower()
+    host = parsed.hostname or ""
+    if not host or any(char.isspace() for char in host):
+        return ""
+    return host.lower()
 
 
 def decide_host_policy(
