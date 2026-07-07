@@ -6,6 +6,7 @@ result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -1617,6 +1618,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         last_tool: str = "",
         route: str | None = "agent",
         job_log: Path | str | None = None,
+        final_result_source: str | None = None,
         worker_level_failure: bool | None = None,
     ) -> tuple[str, int]:
         run_stats = dict(stats_data or {})
@@ -1629,6 +1631,16 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         run_stats["transcript"] = transcript_text[-20000:]
         if job_log is not None:
             run_stats["job_log"] = str(job_log)
+            run_stats["job_log_path"] = str(job_log)
+        if transcript_text:
+            run_stats["transcript_digest"] = (
+                "sha256:"
+                + hashlib.sha256(
+                    transcript_text.encode("utf-8", errors="replace")
+                ).hexdigest()
+            )
+        if final_result_source:
+            run_stats["final_result_source"] = final_result_source
 
         run_stats["application_tool_calls"] = int(application_tool_calls_count or 0)
         run_stats["tool_calls_total"] = int(tool_calls_total_count or 0)
@@ -1965,6 +1977,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 last_tool=last_tool_seen[0],
                 route="agent",
                 job_log=job_log,
+                final_result_source=(
+                    "final_message"
+                    if final_text and "RESULT:" in final_text
+                    else "transcript"
+                ),
             )
 
         if stats:

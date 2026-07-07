@@ -30,8 +30,10 @@ def _seed_apply(conn, url, *, host, score=5.0, company="Co", title="Role", appro
 def _seed_li(conn, url, *, score=9.0, company="Co", title="Role", batch="b1"):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO linkedin_queue (url, company, title, application_url, score, status, lane, approved_batch, dedup_key) "
-            "VALUES (%s,%s,%s,%s,%s,'queued','ats',%s,%s)",
+            "INSERT INTO linkedin_queue "
+            "(url, company, title, application_url, score, status, lane, approved_batch, dedup_key, "
+            "linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES (%s,%s,%s,%s,%s,'queued','ats',%s,%s,'easy_apply',now())",
             (url, company, title, url, score, batch, f"dk-{url}"),
         )
     conn.commit()
@@ -210,7 +212,7 @@ def test_unknown_lane_returns_false_not_exception(fleet_db, monkeypatch):
         "action": "challenge_requeue", "url": "https://x.example.com/1", "lane": "bogus",
     })
     assert ok is False
-    assert msg == "unknown lane"
+    assert msg == "lane must be one of: apply, linkedin; got bogus"
 
 
 # ---- (4) skip_host caps at 200 and only hits that host ---------------------

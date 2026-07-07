@@ -124,6 +124,9 @@ def test_apply_result_events_include_cost_router_metadata(fleet_db):
     assert "last_tool" in cols
     assert "host_policy" in cols
     assert "result_metadata" in cols
+    assert "job_log_path" in cols
+    assert "transcript_digest" in cols
+    assert "final_result_source" in cols
 
 
 def test_apply_worker_schema_check_passes_with_current_schema(fleet_db):
@@ -156,12 +159,23 @@ def test_apply_worker_schema_check_reports_missing_columns():
         fleet_schema.require_apply_result_event_schema(_Conn())
 
 
+def test_linkedin_queue_freshness_columns(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='linkedin_queue'")
+        cols = {r["column_name"] for r in cur.fetchall()}
+    for c in ("linkedin_resolve_status", "linkedin_resolved_at", "linkedin_resolve_error"):
+        assert c in cols, f"linkedin_queue missing {c}"
+
+
 def test_fleet_config_v3_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='fleet_config'")
         cols = {r["column_name"] for r in cur.fetchall()}
     for c in ("approval_threshold", "approval_policy", "approval_sampling_rate",
-              "cost_cap_daily_usd", "cost_cap_total_usd", "pinned_worker_version"):
+              "cost_cap_daily_usd", "cost_cap_total_usd", "pinned_worker_version",
+              "canary_enabled", "canary_remaining", "ats_apply_mode",
+              "linkedin_canary_enabled", "linkedin_canary_remaining",
+              "linkedin_apply_mode", "daily_apply_target"):
         assert c in cols, f"fleet_config missing {c}"
 
 
@@ -175,6 +189,14 @@ def test_autotriage_actions_schema(fleet_db):
         "how_to_reverse",
     ):
         assert c in cols, f"autotriage_actions missing {c}"
+
+
+def test_fleet_console_audit_schema(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='fleet_console_audit'")
+        cols = {r["column_name"] for r in cur.fetchall()}
+    for c in ("id", "action", "actor", "lane", "target", "message", "ok", "created_at"):
+        assert c in cols, f"fleet_console_audit missing {c}"
 
 
 def test_challenge_rate_is_generated(fleet_db):

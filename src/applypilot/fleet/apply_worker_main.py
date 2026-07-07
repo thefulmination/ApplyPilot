@@ -187,13 +187,19 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
             # agent flows to write_apply_result -> llm_usage.provider for per-agent spend.
-            out = {"run_status": status, "est_cost_usd": _real_cost(stats, model), "agent": agent}
-            out.update({
+            out = {
+                "run_status": status,
+                "est_cost_usd": _real_cost(stats, model),
+                "agent": agent,
+                "agent_model": model,
                 "route": stats.get("route") or "agent",
                 "failure_class": stats.get("failure_class"),
                 "tool_calls_total": stats.get("tool_calls_total"),
                 "application_tool_calls": stats.get("application_tool_calls"),
                 "last_tool": stats.get("last_tool"),
+                "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
+                "transcript_digest": stats.get("transcript_digest"),
+                "final_result_source": stats.get("final_result_source"),
                 "result_metadata": {
                     "job_log": stats.get("job_log"),
                     "safe_requeue": stats.get("safe_requeue"),
@@ -201,7 +207,7 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
                     "adapter_name": stats.get("adapter_name"),
                     "adapter_plan_ready": stats.get("adapter_plan_ready"),
                 },
-            })
+            }
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
             # Chrome). This is needed for non-applied terminal statuses too: an
             # auth_required result on an external ATS is a job-level wall, not a

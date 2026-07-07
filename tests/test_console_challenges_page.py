@@ -120,9 +120,10 @@ def test_challenges_api_payload_has_fields_the_page_js_expects(fleet_db, monkeyp
     result = console_app.build_challenges()
     assert result["groups"], "expected at least one group"
     group = result["groups"][0]
-    assert set(group.keys()) == {"kind", "host", "rows"}
+    assert {"kind", "host", "rows"}.issubset(set(group.keys()))
     row = group["rows"][0]
     for field in ("url", "lane", "company", "title", "score", "kind", "machine",
                   "screenshot_url", "age_hours"):
         assert field in row
     assert row["lane"] == "apply"  # verbatim lane value the page's fetch buttons must send
+    assert "triage" in result

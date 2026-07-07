@@ -293,7 +293,7 @@ def test_write_apply_result_records_model_and_duration(fleet_db):
 
 def test_write_apply_result_records_durable_result_event(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
-        _seed_apply(conn, "event1", host="ashbyhq.com", company="Epsilon", title="Staff Engineer")
+        _seed_apply(conn, "event1", host="ashbyhq.com", score=9, company="Epsilon", title="Staff Engineer")
         a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
         ok = queue.write_apply_result(
             conn,
@@ -375,6 +375,41 @@ def test_write_apply_result_persists_router_metadata(fleet_db):
         assert row["last_tool"] == ""
         assert row["host_policy"] == "allow:greenhouse"
         assert row["job_log"] == "worker.log"
+
+
+def test_write_apply_result_records_submit_risk_evidence(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "event-risk", host="ashbyhq.com", score=9, company="Epsilon", title="Staff Engineer")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        ok = queue.write_apply_result(
+            conn,
+            "w1",
+            a["url"],
+            status="crash_unconfirmed",
+            apply_status="crash_unconfirmed",
+            apply_error="failed:no_result_line",
+            target_host="ashbyhq.com",
+            home_ip="1.2.3.4",
+            est_cost_usd=0.03,
+            agent="claude",
+            agent_model="claude-sonnet-4",
+            apply_duration_ms=4567,
+            application_tool_calls=0,
+            job_log_path="C:/logs/job.txt",
+            transcript_digest="sha256:abc123",
+            final_result_source="transcript",
+        )
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT application_tool_calls, job_log_path, transcript_digest, final_result_source "
+                "FROM apply_result_events WHERE url='event-risk'"
+            )
+            row = cur.fetchone()
+        assert row["application_tool_calls"] == 0
+        assert row["job_log_path"] == "C:/logs/job.txt"
+        assert row["transcript_digest"] == "sha256:abc123"
+        assert row["final_result_source"] == "transcript"
 
 
 def test_write_apply_result_no_llm_usage_row_when_cost_zero_or_none(fleet_db):

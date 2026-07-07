@@ -139,7 +139,7 @@ def select_backfill_candidates(conn, *, max_per_job: int = 2,
                 for r in cur.fetchall()]
 
 
-def requeue_job(conn, c: Candidate) -> bool:
+def requeue_job(conn, c: Candidate, *, apply_error_tag: str = REQUEUE_TAG) -> bool:
     """Reverse the reclaim park for ONE proven-never-submitted job: status -> 'queued', attempts
     -> 0, lease cleared, apply_error tagged. Race-guarded on the prior status. Writes a reversal
     audit row. Caller MUST have passed all 3 guards before calling this. Returns True if updated.
@@ -161,7 +161,7 @@ def requeue_job(conn, c: Candidate) -> bool:
             "SET status='queued'::apply_queue_status, attempts=0, lease_owner=NULL, "
             "    lease_expires_at=NULL, apply_error=%(tag)s, updated_at=now() "
             "WHERE url=%(url)s AND status=%(prior)s::apply_queue_status",
-            {"tag": REQUEUE_TAG, "url": c.url, "prior": c.status})
+            {"tag": apply_error_tag, "url": c.url, "prior": c.status})
         if cur.rowcount != 1:
             return False  # status changed since selection (race) -> do nothing
         if c.dedup_key:

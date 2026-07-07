@@ -604,13 +604,16 @@ class WorkerLoop:
         agent = res.get("agent")   # which apply agent ran -> attributes the spend (agent_budget)
         agent_model = res.get("agent_model") or res.get("model")
         duration_ms = res.get("apply_duration_ms") or res.get("duration_ms")
-        result_metadata = {
+        result_evidence = {
             "route": res.get("route"),
             "failure_class": res.get("failure_class"),
             "tool_calls_total": res.get("tool_calls_total"),
             "application_tool_calls": res.get("application_tool_calls"),
             "last_tool": res.get("last_tool"),
             "result_metadata": res.get("result_metadata"),
+            "job_log_path": res.get("job_log_path"),
+            "transcript_digest": res.get("transcript_digest"),
+            "final_result_source": res.get("final_result_source"),
         }
         # Agent usage/session-limit wall (turn-1, page never touched -> launcher returns
         # failed:usage_limit): RE-QUEUE, never park. This lease provably did nothing, so
@@ -626,7 +629,7 @@ class WorkerLoop:
             queue.write_apply_result(conn, self.worker_id, url, status="applied", apply_status="applied",
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
                                      outcome="success", agent=agent, agent_model=agent_model,
-                                     apply_duration_ms=duration_ms, **result_metadata)
+                                     apply_duration_ms=duration_ms, **result_evidence)
             self._record_event(f"wrote apply applied {url}")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
@@ -645,7 +648,7 @@ class WorkerLoop:
                                      apply_status="crash_unconfirmed", apply_error=run_status[:200],
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
                                      agent=agent, agent_model=agent_model,
-                                     apply_duration_ms=duration_ms, **result_metadata)
+                                     apply_duration_ms=duration_ms, **result_evidence)
             self._record_event(f"wrote apply crash_unconfirmed {url} ({run_status})")
             self._beat(conn, state="idle")
             return {"action": "crash_unconfirmed", "url": url}
@@ -653,7 +656,7 @@ class WorkerLoop:
                                  apply_error=(run_status or "unknown")[:200],
                                  target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
                                  agent=agent, agent_model=agent_model,
-                                 apply_duration_ms=duration_ms, **result_metadata)
+                                 apply_duration_ms=duration_ms, **result_evidence)
         self._record_event(f"wrote apply failed {url} ({run_status or 'unknown'})")
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}

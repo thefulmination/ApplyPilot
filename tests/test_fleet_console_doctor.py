@@ -178,3 +178,105 @@ def test_diagnostics_read_shapes(fleet_db):
     assert "clusters" in d and "auto_fixes" in d and "recommendations" in d
     assert any(a["knob_type"] == "host_skip" for a in d["auto_fixes"])
     assert any(r["reason"] == "agent" for r in d["recommendations"])
+
+
+def test_diagnostics_recommendation_machine_is_human_named(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fleet_diagnoses (reason, host, machine, lane, diagnosis, recommendation, status) "
+                "VALUES ('agent','m2.com','m2','ats','d','r','recommended')")
+        conn.commit()
+        d = console_app._diagnostics(conn)
+    assert len(d["recommendations"]) == 1
+    assert d["recommendations"][0]["machine"] == "tarpon"
+
+
+def test_diagnostics_omits_expired_recommendations(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fleet_diagnoses "
+                "(reason, host, machine, lane, diagnosis, recommendation, status, expires_at) "
+                "VALUES ('agent','stale.com','m2','ats','stale','stale rec','recommended', "
+                "        now() - interval '1 hour')")
+            cur.execute(
+                "INSERT INTO fleet_diagnoses "
+                "(reason, host, machine, lane, diagnosis, recommendation, status, expires_at) "
+                "VALUES ('agent','live.com','m2','ats','live','live rec','recommended', "
+                "        now() + interval '1 hour')")
+        conn.commit()
+        d = console_app._diagnostics(conn)
+    hosts = {r["host"] for r in d["recommendations"]}
+    assert "live.com" in hosts
+    assert "stale.com" not in hosts
+
+
+def test_diagnostics_filters_dead_recommendations_and_aggregates_unclassified_hosts(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fleet_diagnoses "
+                "(reason, host, machine, lane, sample_count, severity, diagnosis, recommendation, status, expires_at) "
+                "VALUES "
+                "('dead','dead.example','m2','ats',1,'info','dead row','dead rec','recommended', now() + interval '1 hour'), "
+                "('other','other.example','m2','ats',2,'info','other row 1','other rec','recommended', now() + interval '1 hour'), "
+                "('other','other.example','m4','ats',3,'info','other row 2','other rec','recommended', now() + interval '1 hour')"
+            )
+        conn.commit()
+        d = console_app._diagnostics(conn)
+    assert all(r["reason"] != "dead" for r in d["recommendations"])
+    other = [r for r in d["recommendations"] if r["host"] == "other.example"]
+    assert len(other) == 1
+    assert other[0]["sample_count"] == 5
+    summary = d["recommendations_summary"]
+    assert summary["total"] == 1
+    assert summary["other_hosts"] == 1
+    assert summary["other_samples"] == 5
+
+
+def test_diagnostics_single_unclassified_recommendation_gets_bucket_hint(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fleet_diagnoses "
+                "(reason, host, machine, lane, sample_count, severity, diagnosis, recommendation, status, expires_at) "
+                "VALUES "
+                "('other','expired.example','m2','ats',4,'info',"
+                "'posting removed / no longer available','review manually','recommended', now() + interval '1 hour')"
+            )
+        conn.commit()
+        d = console_app._diagnostics(conn)
+    rec = next(r for r in d["recommendations"] if r["host"] == "expired.example")
+    assert rec["diagnosis"] == "4 unclassified failure(s) on expired.example."
+    assert "Likely expired posting pattern" in rec["recommendation"]
+    assert "Run availability re-check" in rec["recommendation"]
+
+
+def test_challenge_actions_report_valid_lanes_for_bad_lane(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    ok, message = console_app.run_action({
+        "action": "challenge_skip",
+        "lane": "ats",
+        "url": "https://example.com/job",
+    })
+    assert ok is False
+    assert "lane must be one of: apply, linkedin" in message
+    assert "got ats" in message
+
+
+def test_unknown_deadman_alert_keeps_raw_kind_and_detail(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET deadman_alert=%s, deadman_alert_at=now() WHERE id=1",
+                ("new_watchdog: model reset unclear at 3am",),
+            )
+        conn.commit()
+
+    body = console_app.diagnosis()
+    assert body["deadman"]["code"] == "new_watchdog"
+    assert body["deadman"]["title"] == "Unknown DeadMan alert: new_watchdog"
+    assert "Unhandled watchdog alert" in body["deadman"]["reason"]
+    assert "model reset unclear at 3am" in body["deadman"]["reason"]

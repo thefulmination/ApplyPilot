@@ -29,6 +29,9 @@ _APPLY_RESULT_EVENT_REQUIRED_COLUMNS = frozenset({
     "last_tool",
     "host_policy",
     "result_metadata",
+    "job_log_path",
+    "transcript_digest",
+    "final_result_source",
 })
 
 
