@@ -5,6 +5,42 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+_MCP_START_FAILURE_NEEDLES = (
+    "mcp startup failed",
+    "handshaking with mcp server failed",
+    "mcp server failed",
+)
+
+_CDP_LOST_NEEDLES = (
+    "cdp",
+    "browser connection lost",
+)
+
+_USAGE_OR_SESSION_LIMIT_NEEDLES = (
+    "hit your usage limit",
+    "hit your session limit",
+    "hit your weekly limit",
+    "usage limit reached",
+    "session limit reached",
+    "weekly limit reached",
+    "5-hour limit reached",
+    "reached your usage limit",
+    "reached your session limit",
+    "usage limit exceeded",
+    "session limit exceeded",
+    "exceeded your usage limit",
+    "quota exceeded",
+    "switch to another model",
+    "try again at",
+)
+
+_AGENT_AUTH_NEEDLES = (
+    "auth required",
+    "invalid api key",
+    "no access token",
+)
+
+
 @dataclass(frozen=True)
 class FailureEvidence:
     status: str
@@ -27,41 +63,35 @@ class FailureClassification:
 
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
-    haystack = text.lower()
+    haystack = (text or "").lower()
     return any(needle.lower() in haystack for needle in needles)
 
 
 def classify_apply_failure(evidence: FailureEvidence) -> FailureClassification:
-    transcript = evidence.transcript.lower()
-    status = evidence.status.lower()
+    transcript = evidence.transcript or ""
+    status = (evidence.status or "").lower()
     touched_application = evidence.application_tool_calls > 0
 
-    if _has_any(
-        transcript,
-        (
-            "mcp startup failed",
-            "handshaking with mcp server failed",
-            "mcp server failed",
-        ),
-    ):
+    if evidence.mcp_started_ok is False:
+        return FailureClassification("mcp_start_failure", worker_level=True)
+
+    if _has_any(transcript, _MCP_START_FAILURE_NEEDLES):
         return FailureClassification("mcp_start_failure", worker_level=True)
 
     if evidence.chrome_launch_ok is False:
         return FailureClassification("browser_launch_failure", worker_level=True)
 
-    if evidence.cdp_connect_ok is False or _has_any(
-        transcript, ("cdp", "browser connection lost")
-    ):
+    if evidence.cdp_connect_ok is False or _has_any(transcript, _CDP_LOST_NEEDLES):
         return FailureClassification("cdp_lost", worker_level=True)
 
     if (
-        _has_any(transcript, ("usage limit", "session limit", "switch to another model"))
+        _has_any(transcript, _USAGE_OR_SESSION_LIMIT_NEEDLES)
         and evidence.application_tool_calls == 0
     ):
         return FailureClassification("usage_or_session_limit", safe_requeue=True)
 
     if (
-        _has_any(transcript, ("auth required", "invalid api key", "no access token"))
+        _has_any(transcript, _AGENT_AUTH_NEEDLES)
         and evidence.application_tool_calls == 0
     ):
         return FailureClassification(
