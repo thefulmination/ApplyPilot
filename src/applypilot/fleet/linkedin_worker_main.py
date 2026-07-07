@@ -106,7 +106,7 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
         worker_id,
         home_ip=owner_ip,
         role="linkedin",
-        apply_fn=make_apply_fn(model, agent),
+        apply_fn=make_apply_fn(model, agent, fleet_worker_id=worker_id),
         machine_owner=machine_owner,
         public_ip=owner_ip,
         owner_ip=owner_ip,
@@ -302,7 +302,8 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
             lambda: pgqueue.connect(args.dsn),
             loop,
             switcher=switcher,
-            rebuild_apply_fn=lambda agent: make_apply_fn(args.model, agent),
+            rebuild_apply_fn=lambda agent: make_apply_fn(
+                args.model, agent, fleet_worker_id=args.worker_id),
             budget=budget,
         )
     finally:

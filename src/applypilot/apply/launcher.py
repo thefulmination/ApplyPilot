@@ -2029,8 +2029,27 @@ def _inbox_auth_mode() -> str:
     return "relay" if _auto_relay() else "local"
 
 
-def _relay_inbox_auth_hint(job: dict) -> str | None:
-    """Remote-worker path: get the verification code from the fleet OTP relay."""
+def _should_prearm_inbox_auth(job: dict) -> bool:
+    """Whether to file an OTP relay request before the browser reaches the wall."""
+    if os.environ.get("APPLYPILOT_INBOX_AUTH_PREARM", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+    if not _inbox_auth_enabled() or _inbox_auth_mode() != "relay":
+        return False
+    try:
+        apply_target = job.get("application_url") or job.get("url")
+        return bool(config.is_auth_gated_application(apply_target))
+    except Exception:
+        logger.debug("Could not evaluate inbox auth pre-arm eligibility", exc_info=True)
+        return False
+
+
+def _prearm_inbox_auth_request(job: dict) -> int | None:
+    """Create a pending relay request without waiting for the code."""
     try:
         from applypilot.apply import pgqueue
         from applypilot.fleet import otp_relay
@@ -2040,17 +2059,74 @@ def _relay_inbox_auth_hint(job: dict) -> str | None:
             return None
         worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
         timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
-        poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
         apply_target = job.get("application_url") or job["url"]
         with pgqueue.connect(dsn) as conn:
-            rid = otp_relay.request_code(conn, worker_id=worker_id, job_url=job["url"],
-                                         application_url=apply_target, ttl_seconds=timeout)
-            code = otp_relay.poll_for_code(conn, rid, timeout_seconds=timeout, poll_seconds=poll)
+            return otp_relay.request_code(
+                conn,
+                worker_id=worker_id,
+                job_url=job["url"],
+                application_url=apply_target,
+                ttl_seconds=timeout,
+            )
+    except Exception:
+        logger.debug("Relay inbox auth pre-arm failed", exc_info=True)
+        return None
+
+
+def _format_relay_code_hint(code) -> str:
+    if code.kind == "magic_link":
+        return f"magic_link={code.value}\nsource=fleet_relay"
+    return f"code={code.value}\nsource=fleet_relay"
+
+
+def _consume_prearmed_inbox_auth_hint(
+    request_id: int | None,
+    *,
+    timeout_seconds: int | None = None,
+    poll_seconds: float | None = None,
+) -> str | None:
+    """Wait briefly for a pre-filed relay request and return the prompt hint."""
+    if request_id is None:
+        return None
+    try:
+        from applypilot.apply import pgqueue
+        from applypilot.fleet import otp_relay
+
+        dsn = os.environ.get("FLEET_PG_DSN")
+        if not dsn:
+            return None
+        if timeout_seconds is None:
+            timeout_seconds = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or "45")
+        if poll_seconds is None:
+            poll_seconds = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        with pgqueue.connect(dsn) as conn:
+            code = otp_relay.poll_for_code(
+                conn,
+                request_id,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
         if code is None:
             return None
-        if code.kind == "magic_link":
-            return f"magic_link={code.value}\nsource=fleet_relay"
-        return f"code={code.value}\nsource=fleet_relay"
+        return _format_relay_code_hint(code)
+    except Exception:
+        logger.debug("Relay inbox auth consume failed", exc_info=True)
+        return None
+
+
+def _relay_inbox_auth_hint(job: dict) -> str | None:
+    """Remote-worker path: get the verification code from the fleet OTP relay."""
+    try:
+        request_id = _prearm_inbox_auth_request(job)
+        if request_id is None:
+            return None
+        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
+        poll = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        return _consume_prearmed_inbox_auth_hint(
+            request_id,
+            timeout_seconds=timeout,
+            poll_seconds=poll,
+        )
     except Exception:
         logger.debug("Relay inbox auth failed", exc_info=True)
         return None

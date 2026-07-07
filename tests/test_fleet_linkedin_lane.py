@@ -167,9 +167,10 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
 
     captured = {}
 
-    def _fake_make_apply_fn(model, agent):
+    def _fake_make_apply_fn(model, agent, *args, **kwargs):
         captured["model"] = model
         captured["agent"] = agent
+        captured["fleet_worker_id"] = kwargs.get("fleet_worker_id")
         return lambda job: {"run_status": "failed:usage_limit", "est_cost_usd": 0.0}
 
     monkeypatch.setattr(awm, "make_apply_fn", _fake_make_apply_fn)
@@ -177,6 +178,7 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
     lm.build_linkedin_loop(dsn="postgresql://example.invalid/db", worker_id="w", owner_ip="1.1.1.1")
 
     assert captured["agent"] == "codex"
+    assert captured["fleet_worker_id"] == "w"
 
 
 def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
