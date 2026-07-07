@@ -39,3 +39,27 @@ def test_fleet_health_script_covers_current_fleet_topology() -> None:
         "git rev-parse --short HEAD",
     ):
         assert text in script
+
+
+def test_check_fleet_ready_script_fails_closed_on_apply_blockers() -> None:
+    script = (REPO / "check-fleet-ready.ps1").read_text(encoding="utf-8")
+
+    for text in (
+        "VerifyLive",
+        "verify-live exit=",
+        "fleet_config",
+        "agent_availability",
+        "blocked_until > now()",
+        "remote_commands",
+        "acked_at IS NULL",
+        "fleet_desired_state",
+        "desired_workers",
+        "fresh LinkedIn worker heartbeat",
+        'r["role"] == "linkedin"',
+        "linkedin_queue",
+        "apply_queue",
+        "approved_batch IS NOT NULL",
+        "sys.exit(2 if blockers else 0)",
+        "AllowPaused",
+    ):
+        assert text in script
