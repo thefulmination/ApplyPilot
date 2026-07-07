@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import re
 import signal
 import threading
@@ -101,6 +102,10 @@ def _cdp_page_urls(port: int) -> list[str]:
         return []
 
 
+def _should_launch_chrome_headless() -> bool:
+    return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
+
+
 def make_apply_fn(model: str, agent: str, slot: int = 0):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
@@ -119,7 +124,10 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
         # workers on ONE machine (distinct slots) never collide in a shared browser.
         worker_id = slot
         port = BASE_CDP_PORT + worker_id
-        proc = chrome.launch_chrome(worker_id)  # returns Popen; port is implicit BASE_CDP_PORT+slot
+        proc = chrome.launch_chrome(
+            worker_id,
+            headless=_should_launch_chrome_headless(),
+        )  # returns Popen; port is implicit BASE_CDP_PORT+slot
         try:
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})

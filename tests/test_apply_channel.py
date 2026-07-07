@@ -37,3 +37,31 @@ def test_no_informative_tabs_is_unknown():
     assert classify_apply_channel(["about:blank", "chrome://newtab/"]) == {
         "apply_channel": None, "apply_external_host": None}
     assert classify_apply_channel([]) == {"apply_channel": None, "apply_external_host": None}
+
+
+def test_make_apply_fn_launches_headless_on_linux_without_display(monkeypatch):
+    import platform
+
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    launch_kwargs = []
+
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+    def fake_launch(worker_id, **kwargs):
+        launch_kwargs.append(kwargs)
+        return proc
+
+    monkeypatch.setattr(chrome, "launch_chrome", fake_launch)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(launcher, "run_job", lambda job, port, worker_id, model, agent: ("expired", 1.0))
+    monkeypatch.setattr(launcher, "_last_run_stats", {3: {}}, raising=False)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=3)({"url": "https://example.test/job"})
+
+    assert out["run_status"] == "expired"
+    assert launch_kwargs == [{"headless": True}]
