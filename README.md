@@ -114,6 +114,35 @@ For the home/Tarpon/GGGTower/Paloma fleet, run the read-only status report from 
 
 It prints local scheduled tasks/processes, Postgres fleet tables, and SSH probes for the remote workers.
 
+### Fleet SSH Access
+
+Fleet repair scripts use one operator key at `~\.ssh\codex_fleet_ed25519` and connect over Tailscale names. Generate or print that public key from the home box:
+
+```powershell
+.\setup-fleet-ssh-access.ps1 -GenerateKey
+```
+
+On each Windows worker, run the printed command from an elevated PowerShell in `C:\ApplyPilot`. For example:
+
+```powershell
+.\setup-fleet-ssh-access.ps1 -InstallPublicKey -TargetUser rstal -PublicKey '<public key printed on home>'
+.\setup-fleet-ssh-access.ps1 -InstallPublicKey -TargetUser backoffice -PublicKey '<public key printed on home>'
+```
+
+On Paloma, run the Mac bootstrap from the ApplyPilot checkout:
+
+```bash
+APPLYPILOT_FLEET_SSH_PUBLIC_KEY='<public key printed on home>' bash ./setup-fleet-ssh-access-mac.sh
+```
+
+Then verify all machines from home:
+
+```powershell
+.\setup-fleet-ssh-access.ps1 -Check
+```
+
+The Windows bootstrap starts `sshd`, sets it to automatic, and creates a Windows Firewall rule limited to the Tailscale range (`100.64.0.0/10`).
+
 ### Fleet Software Rollout
 
 Normal fleet consistency is git release plus `fleet-agent.ps1 -AutoUpdate`, not manual SSH patching. Worker boxes should be clean clones; the agent fast-forwards between jobs, reinstalls the editable package when needed, and restarts workers through its normal reconcile loop.
