@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import base64
+import html
 import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -27,6 +28,14 @@ KNOWN_ATS_DOMAINS = {
     "workable.com",
     "taleo.net",
     "oraclecloud.com",
+    "oracle.com",
+    "workday.com",
+    "greenhouse-mail.io",
+    "adp.com",
+    "workforcenow.adp.com",
+    "amazon.jobs",
+    "jobs.amazon.com",
+    "eightfold.ai",
 }
 
 VERIFY_WORDS = {
@@ -35,6 +44,7 @@ VERIFY_WORDS = {
     "verify",
     "verify your email",
     "confirm your email",
+    "confirm your identity",
     "security code",
     "authentication code",
     "one-time",
@@ -51,9 +61,13 @@ VERIFY_WORDS = {
 }
 
 _CODE_RE = re.compile(r"(?<![A-Za-z0-9-])\d{4,8}(?![A-Za-z0-9-])")
+_ALNUM_CODE_RE = re.compile(
+    r"(?<![A-Za-z0-9-])(?=[A-Za-z0-9]{6,12}(?![A-Za-z0-9-]))"
+    r"(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,12}(?![A-Za-z0-9-])"
+)
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _STRONG_AUTH_URL_PATH_RE = re.compile(
-    r"(^|[/?&_.=-])(?:verify|verification|magic|magic-link|continue)([/?&_.=-]|$)",
+    r"(^|[/?&_.=-])(?:verify|verification|magic|magic-link|continue|activate)([/?&_.=-]|$)",
     re.IGNORECASE,
 )
 _GENERIC_AUTH_URL_PATH_RE = re.compile(
@@ -71,20 +85,26 @@ _REJECTED_MAGIC_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _AUTH_CODE_BEFORE_RE = re.compile(
-    r"\b(?:verification|security|authentication|one[- ]time)\s+(?:code|passcode)\s*(?:is\s*:?|:)?\s*$"
-    r"|\b(?:otp|passcode)\s*(?:is\s*:?|:)?\s*$"
+    r"\b(?:verification|security|authentication|one[- ]time)\s+(?:code|pass\s*code)\s*(?:is\s*:?|:)?\s*$"
+    r"|\b(?:otp|pass\s*code)\s*(?:is\s*:?|:)?\s*$"
     r"|\b(?:to\s+)?(?:verify|confirm)\s+your\s+email,?\s*(?:please\s+)?(?:enter|use)\s*$",
     re.IGNORECASE,
 )
 _CODE_COMMAND_BEFORE_RE = re.compile(r"\b(?:enter|use)\s*$", re.IGNORECASE)
 _PLAIN_CODE_BEFORE_RE = re.compile(r"\b(?:your\s+)?code\s*(?:is\s*:?|:)?\s*$", re.IGNORECASE)
+_CODE_FIELD_BEFORE_RE = re.compile(
+    r"\b(?:copy\s+and\s+paste|enter|use)\s+(?:this\s+)?code\b"
+    r"|\bsecurity\s+code\s+field\b",
+    re.IGNORECASE,
+)
 _AUTH_CODE_AFTER_RE = re.compile(
     r"^\s*(?:to\s+)?(?:verify|confirm)\s+your\s+email\b"
+    r"|^\s*(?:to\s+)?confirm\s+your\s+identity\b"
     r"|^\s*(?:to\s+)?(?:sign\s+in|continue\s+your\s+application)\b",
     re.IGNORECASE,
 )
 _AUTH_CODE_FIRST_AFTER_RE = re.compile(
-    r"^\s*is\s+your\s+(?:verification|security|authentication|one[- ]time)\s+(?:code|passcode)\b",
+    r"^\s*is\s+your\s+(?:verification|security|authentication|one[- ]time)\s+(?:code|pass\s*code)\b",
     re.IGNORECASE,
 )
 _NEGATIVE_CODE_PREFIX_RE = re.compile(
@@ -217,15 +237,18 @@ def _extract_code_drafts(
     url_spans: list[tuple[int, int]],
 ) -> list[_CandidateDraft]:
     drafts: list[_CandidateDraft] = []
-    for match in _CODE_RE.finditer(text):
+    for match in list(_CODE_RE.finditer(text)) + list(_ALNUM_CODE_RE.finditer(text)):
         value = match.group(0)
         if _span_inside(match.start(), match.end(), url_spans):
             continue
         if _looks_like_year(value):
             continue
 
-        prefix = text[max(0, match.start() - 40) : match.start()]
-        if _NEGATIVE_CODE_PREFIX_RE.search(prefix):
+        short_prefix = text[max(0, match.start() - 40) : match.start()]
+        context_prefix = text[max(0, match.start() - 120) : match.start()]
+        if _NEGATIVE_CODE_PREFIX_RE.search(short_prefix):
+            continue
+        if not value.isdigit() and not _CODE_FIELD_BEFORE_RE.search(context_prefix):
             continue
         if not _has_auth_code_context(
             text,
@@ -236,7 +259,11 @@ def _extract_code_drafts(
         ):
             continue
 
-        reasons = ["numeric_code", "nearby_verification_language", "auth_code_context"]
+        reasons = [
+            "numeric_code" if value.isdigit() else "alphanumeric_code",
+            "nearby_verification_language",
+            "auth_code_context",
+        ]
         if sender_is_known_ats:
             reasons.append("known_ats_sender")
         if has_verification_language:
@@ -255,14 +282,15 @@ def _extract_magic_link_drafts(
         value = _clean_url(match.group(0))
         domain = url_domain(value)
         known_ats_link = is_known_ats_domain(domain)
-        if _is_tracking_or_click_wrapper(value, domain):
+        window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
+        strong_auth_path = _has_strong_auth_url_path(value)
+        strong_auth_link = _has_strong_auth_url_signal(value)
+        generic_auth_link = _has_generic_auth_url_path(value)
+        if _is_tracking_or_click_wrapper(value, domain) and not strong_auth_path:
             continue
         if _is_rejected_magic_link_path(value):
             continue
 
-        window = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
-        strong_auth_link = _has_strong_auth_url_signal(value)
-        generic_auth_link = _has_generic_auth_url_path(value)
         has_context = _has_magic_link_context(window)
         if not (strong_auth_link or has_context):
             continue
@@ -283,7 +311,7 @@ def _extract_magic_link_drafts(
 
 
 def _combined_text(subject: str, body: str) -> str:
-    return f"{subject or ''}\n{body or ''}"
+    return re.sub(r"\s+", " ", html.unescape(f"{subject or ''}\n{body or ''}"))
 
 
 def _normalize_domain(domain: str) -> str:
@@ -310,6 +338,8 @@ def _has_auth_code_context(
         return True
     if _PLAIN_CODE_BEFORE_RE.search(prefix):
         return sender_is_known_ats and has_verification_language
+    if _CODE_FIELD_BEFORE_RE.search(prefix):
+        return sender_is_known_ats or has_verification_language
     if _AUTH_CODE_FIRST_AFTER_RE.search(suffix):
         return True
     return bool(_CODE_COMMAND_BEFORE_RE.search(prefix) and _AUTH_CODE_AFTER_RE.search(suffix))
@@ -485,6 +515,18 @@ def _high_confidence_matches(
     return matches
 
 
+def _received_at_dt(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def scan_gmail_for_auth_codes(
     *,
     service=None,
@@ -500,13 +542,16 @@ def scan_gmail_for_auth_codes(
     - `service`: legacy Gmail-API service object -- back-compat path.
     """
     if messages is not None:
+        window_minutes = max(1, int(minutes))
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
         matches: list[AuthEmailMatch] = []
-        seen_threads: set[str] = set()
-        for m in messages:
-            thread_id = m.thread_id or m.id
-            if thread_id in seen_threads:
+        filtered = []
+        for m in messages[: max(0, int(max_messages or 0)) or None]:
+            received = _received_at_dt(m.date)
+            if received is not None and received < cutoff:
                 continue
-            seen_threads.add(thread_id)
+            filtered.append(m)
+        for m in filtered:
             matches.extend(
                 _high_confidence_matches(
                     message_id=m.id,
@@ -534,13 +579,7 @@ def scan_gmail_for_auth_codes(
     )
 
     matches = []
-    seen_threads = set()
     for ref in gmail_messages:
-        thread_id = ref.get("threadId", ref["id"])
-        if thread_id in seen_threads:
-            continue
-        seen_threads.add(thread_id)
-
         msg = (
             service.users()
             .messages()
@@ -597,6 +636,11 @@ def watch_gmail_for_auth_code(
                     minutes=minutes,
                     max_messages=max_messages,
                 )
+            matches.sort(
+                key=lambda match: _received_at_dt(match.received_at)
+                or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
             if matches:
                 return matches[0]
             errors = 0

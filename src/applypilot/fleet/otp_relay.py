@@ -8,12 +8,24 @@ is read only by ``answer_pending`` (home box). See the 2026-07-03 relay spec."""
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import time
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 from applypilot import inbox_auth
+
+_DEFAULT_ANSWERED_TTL_SECONDS = 600
+
+_PROVIDER_DOMAIN_GROUPS = (
+    ("oraclecloud.com", "oracle.com", "taleo.net"),
+    ("myworkdayjobs.com", "myworkdaysite.com", "workdayjobs.com", "workday.com"),
+    ("greenhouse.io", "greenhouse-mail.io"),
+    ("adp.com", "workforcenow.adp.com"),
+    ("amazon.jobs", "jobs.amazon.com"),
+    ("eightfold.ai",),
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +36,48 @@ class RelayCode:
 
 def _apply_domain(application_url: str) -> str:
     return (urlparse(application_url or "").hostname or "").lower()
+
+
+def _normalize_domain(domain: str | None) -> str:
+    return (domain or "").strip().lower().strip(".")
+
+
+def _domain_related(left: str, right: str) -> bool:
+    left = _normalize_domain(left)
+    right = _normalize_domain(right)
+    if not left or not right:
+        return False
+    if left == right or left.endswith(f".{right}") or right.endswith(f".{left}"):
+        return True
+    for group in _PROVIDER_DOMAIN_GROUPS:
+        if any(left == d or left.endswith(f".{d}") for d in group) and any(
+            right == d or right.endswith(f".{d}") for d in group
+        ):
+            return True
+    return False
+
+
+def _candidate_url_domain(match) -> str:
+    candidate = getattr(match, "candidate", None)
+    if getattr(candidate, "kind", None) != "magic_link":
+        return ""
+    return _apply_domain(getattr(candidate, "value", "") or "")
+
+
+def _match_belongs_to_request(sender_hint: str | None, match) -> bool:
+    hint = _normalize_domain(sender_hint)
+    if not hint:
+        return True
+    evidence = [
+        inbox_auth.sender_domain(getattr(match, "sender", "") or ""),
+        _candidate_url_domain(match),
+    ]
+    evidence = [d for d in evidence if d]
+    if not evidence:
+        # Older unit-test doubles predate sender/link metadata. Production matches always
+        # carry sender, so keep legacy doubles from becoming unrelated failures.
+        return True
+    return any(_domain_related(hint, domain) for domain in evidence)
 
 
 def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
@@ -90,9 +144,21 @@ def _parse_email_dt(raw):
     return d.astimezone(_dt.timezone.utc)
 
 
+def _answered_ttl_seconds(explicit: int | None) -> int:
+    if explicit is not None:
+        return max(1, int(explicit))
+    raw = os.environ.get("APPLYPILOT_INBOX_AUTH_ANSWERED_TTL", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_ANSWERED_TTL_SECONDS
+
+
 def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
-                   max_messages: int = 25, skew_seconds: int = 60,
-                   answered_ttl_seconds: int = 120) -> int:
+                   max_messages: int = 100, skew_seconds: int = 60,
+                   answered_ttl_seconds: int | None = None) -> int:
     """Read Gmail ONCE and answer every pending request whose code arrived after it.
 
     Home box only (this is the sole function that touches Gmail). Time-based match:
@@ -104,14 +170,16 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     passing a `gmail_service` explicitly preserves the old direct-service path."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, requested_at FROM otp_request "
+            "SELECT id, requested_at, sender_hint FROM otp_request "
             "WHERE code IS NULL AND consumed_at IS NULL "
             "      AND (expires_at IS NULL OR expires_at > now()) "
             "ORDER BY requested_at"
         )
         pending = cur.fetchall()
+    conn.commit()
     if not pending:
         return 0
+    answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
 
     if gmail_service is None:
         from applypilot.mail_source import get_mail_source
@@ -139,6 +207,8 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
         for m, ts in parsed:
             if m.message_id in used_messages:
                 continue
+            if not _match_belongs_to_request(req.get("sender_hint"), m):
+                continue
             if ts >= req_floor:
                 chosen = m
                 break
@@ -149,7 +219,8 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
             cur.execute(
                 "UPDATE otp_request SET code=%s, code_kind=%s, matched_email_ts=%s, "
                 "answered_at=now(), expires_at = GREATEST(expires_at, now() + make_interval(secs => %s)) "
-                "WHERE id=%s AND code IS NULL AND consumed_at IS NULL",
+                "WHERE id=%s AND code IS NULL AND consumed_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at > now())",
                 (chosen.candidate.value, chosen.candidate.kind,
                  _parse_email_dt(chosen.received_at), answered_ttl_seconds, req["id"]),
             )

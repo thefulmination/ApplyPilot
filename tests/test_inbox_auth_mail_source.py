@@ -10,13 +10,20 @@ from applypilot.fleet import otp_relay
 from applypilot.mail_source import MailMessage
 
 
+def _rfc(when: dt.datetime) -> str:
+    from email.utils import format_datetime
+
+    return format_datetime(when)
+
+
 def test_scan_gmail_for_auth_codes_messages_path_extracts_code():
+    now = dt.datetime.now(dt.timezone.utc)
     msg = MailMessage(
         id="m1",
         thread_id="t1",
         subject="Your Greenhouse verification code",
         sender="no-reply@greenhouse.io",
-        date="Mon, 01 Jan 2024 12:00:00 +0000",
+        date=_rfc(now),
         body="Use verification code 123456 to continue your application.",
     )
 
@@ -36,10 +43,11 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
     subject = "Verify your email"
     sender = "no-reply@greenhouse.io"
     body = "Use verification code 839214 to continue your application."
+    now = dt.datetime.now(dt.timezone.utc)
 
     msg = MailMessage(
         id="m2", thread_id="t2", subject=subject, sender=sender,
-        date="Mon, 01 Jan 2024 12:00:00 +0000", body=body,
+        date=_rfc(now), body=body,
     )
     via_messages = inbox_auth.scan_gmail_for_auth_codes(messages=[msg])
 
@@ -62,7 +70,7 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
                 "headers": [
                     {"name": "Subject", "value": subject},
                     {"name": "From", "value": sender},
-                    {"name": "Date", "value": "Mon, 01 Jan 2024 12:00:00 +0000"},
+                    {"name": "Date", "value": _rfc(now)},
                 ],
                 "mimeType": "text/plain",
                 "body": {"data": encoded},
@@ -85,22 +93,83 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
     assert via_messages[0].candidate.confidence == via_service[0].candidate.confidence
 
 
-def test_scan_gmail_for_auth_codes_messages_path_dedupes_by_thread():
+def test_scan_gmail_for_auth_codes_messages_path_keeps_distinct_same_thread_codes():
+    now = dt.datetime.now(dt.timezone.utc)
     common = dict(
         subject="Verify your email",
         sender="no-reply@greenhouse.io",
-        date="Mon, 01 Jan 2024 12:00:00 +0000",
-        body="Use verification code 111222 to continue.",
+        thread_id="dup",
     )
     msgs = [
-        MailMessage(id="a", thread_id="dup", **common),
-        MailMessage(id="b", thread_id="dup", **common),
+        MailMessage(
+            id="a",
+            date=_rfc(now - dt.timedelta(minutes=2)),
+            body="Use verification code 111222 to continue.",
+            **common,
+        ),
+        MailMessage(
+            id="b",
+            date=_rfc(now - dt.timedelta(minutes=1)),
+            body="Use verification code 333444 to continue.",
+            **common,
+        ),
     ]
 
     matches = inbox_auth.scan_gmail_for_auth_codes(messages=msgs)
 
-    assert len(matches) == 1
-    assert matches[0].message_id == "a"
+    assert [m.message_id for m in matches] == ["a", "b"]
+    assert [m.candidate.value for m in matches] == ["111222", "333444"]
+
+
+def test_scan_gmail_for_auth_codes_messages_path_drops_codes_outside_minutes_window():
+    now = dt.datetime.now(dt.timezone.utc)
+    stale = MailMessage(
+        id="old",
+        thread_id="old",
+        subject="Your Greenhouse verification code",
+        sender="no-reply@greenhouse.io",
+        date=_rfc(now - dt.timedelta(hours=23)),
+        body="Use verification code 123456 to continue your application.",
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        messages=[stale],
+        minutes=10,
+        max_messages=25,
+    )
+
+    assert matches == []
+
+
+def test_watch_gmail_for_auth_code_picks_newest_recent_match(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages):
+            return [
+                MailMessage(
+                    id="older", thread_id="t-old", subject="Verify your email",
+                    sender="no-reply@greenhouse.io", date=_rfc(now - dt.timedelta(minutes=8)),
+                    body="Use verification code 111111 to continue.",
+                ),
+                MailMessage(
+                    id="newer", thread_id="t-new", subject="Verify your email",
+                    sender="no-reply@greenhouse.io", date=_rfc(now - dt.timedelta(minutes=1)),
+                    body="Use verification code 222222 to continue.",
+                ),
+            ]
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _FakeSource()
+    )
+
+    match = inbox_auth.watch_gmail_for_auth_code(
+        timeout_seconds=1, poll_seconds=0, max_errors=1, minutes=10, max_messages=25,
+    )
+
+    assert match is not None
+    assert match.message_id == "newer"
+    assert match.candidate.value == "222222"
 
 
 def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
@@ -114,7 +183,7 @@ def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
             return [
                 MailMessage(
                     id="m3", thread_id="t3", subject="Verify your email",
-                    sender="no-reply@greenhouse.io", date="Mon, 01 Jan 2024 12:00:00 +0000",
+                    sender="no-reply@greenhouse.io", date=_rfc(dt.datetime.now(dt.timezone.utc)),
                     body="Use verification code 654321 to continue.",
                 )
             ]
@@ -227,9 +296,3 @@ def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):
 
     assert got is not None
     assert got.value == "998877"
-
-
-def _rfc(when: dt.datetime) -> str:
-    from email.utils import format_datetime
-
-    return format_datetime(when)

@@ -307,3 +307,110 @@ def test_accepts_plain_code_phrasing_with_strong_ats_verification_context() -> N
         assert candidates
         assert candidates[0].kind == "code"
         assert candidates[0].value == "123456"
+
+
+def test_accepts_oracle_confirm_identity_pass_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Confirm your identity",
+        body=(
+            "Hello Jonathan, Just one more step before you get started. "
+            "You must confirm your identity using the one-time pass code : 123456. "
+            "This code will expire in 10 minutes."
+        ),
+        sender="no-reply@oracle.com",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_oracle_identity_code_without_picking_job_number() -> None:
+    candidates = extract_verification_candidates(
+        subject="Confirm your identity for job Lead, MAST Project Portfolio - 13248",
+        body=(
+            "We need you to confirm your identity so that your job application is considered "
+            "for the job Lead, MAST Project Portfolio - 13248. "
+            "Confirm your identity using this code: 654321. The code expires in 10 minutes."
+        ),
+        sender="no-reply@oracle.com",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "654321"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_workday_candidate_account_activate_link() -> None:
+    candidates = extract_verification_candidates(
+        subject="Verify your candidate account",
+        body=(
+            "Click this link to confirm your email address and complete setup for your "
+            "candidate account: "
+            "https://motorolasolutions.wd5.myworkdayjobs.com/Careers/activate/"
+            "abc123def456/?redirect=%2FCareers"
+        ),
+        sender="Motorola Solutions - Workday <motorolasolutions@otp.workday.com>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "magic_link"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_greenhouse_alphanumeric_security_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Security code for your application to Neo4j",
+        body=(
+            "Copy and paste this code into the security code field on your application:\n\n"
+            "2NxdKLd2\n\n"
+            "After you enter the code, resubmit your application."
+        ),
+        sender="Greenhouse <no-reply@us.greenhouse-mail.io>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "2NxdKLd2"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_adp_verification_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Here's your verification code from ADP",
+        body="&nbsp;Verification code&nbsp;" + (" " * 180) + "123456&nbsp;This code expires in 15 minutes.",
+        sender="<SecurityServices_NoReply@adp.com>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_amazon_jobs_verification_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Your Amazon Jobs verification code",
+        body="Use verification code 123456 to continue your application.",
+        sender="Amazon Jobs <no-reply@jobs.amazon.com>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_eightfold_verification_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Your verification code",
+        body="Use verification code 123456 to continue your application.",
+        sender="Morgan Stanley Careers <no-reply@eightfold.ai>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"

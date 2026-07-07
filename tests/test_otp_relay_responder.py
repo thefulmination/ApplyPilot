@@ -1,6 +1,8 @@
 """Home responder: match Gmail codes to pending requests (time-based, single-assign)."""
 import datetime as dt
 
+from psycopg.pq import TransactionStatus
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import otp_relay, schema as fleet_schema
 
@@ -120,6 +122,43 @@ def test_answer_does_not_shorten_request_window(fleet_db, monkeypatch):
     assert row["still_long"] is True  # window preserved near the original 300s, not cut to 120s
 
 
+def test_answer_pending_does_not_revive_request_that_expires_during_mail_scan(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("m1", _rfc(now + dt.timedelta(seconds=10)), "334455")]
+
+    with _fresh(fleet_db) as conn:
+        rid = otp_relay.request_code(
+            conn,
+            worker_id="mac-0",
+            job_url="j",
+            application_url="https://greenhouse.io/a",
+            ttl_seconds=300,
+        )
+
+        def fake_scan(**_kw):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE otp_request SET expires_at=now() - interval '1 second' WHERE id=%s",
+                    (rid,),
+                )
+            conn.commit()
+            return matches
+
+        monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes", fake_scan)
+
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, answered_at, consumed_at FROM otp_request WHERE id=%s",
+                (rid,),
+            )
+            row = cur.fetchone()
+
+    assert row["code"] is None
+    assert row["answered_at"] is None
+    assert row["consumed_at"] is None
+
+
 def test_unparseable_email_date_is_skipped(fleet_db, monkeypatch):
     matches = [_Match("mBad", "not-a-real-date", "000000")]
     monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
@@ -129,6 +168,22 @@ def test_unparseable_email_date_is_skipped(fleet_db, monkeypatch):
         assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
         got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
     assert got is None
+
+
+def test_answer_pending_releases_select_transaction_before_mail_scan(fleet_db, monkeypatch):
+    observed_statuses = []
+
+    with _fresh(fleet_db) as conn:
+        _pending(conn)
+
+        def fake_scan(**_kw):
+            observed_statuses.append(conn.info.transaction_status)
+            return []
+
+        monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes", fake_scan)
+        assert otp_relay.answer_pending(conn, _FakeGmail([])) == 0
+
+    assert observed_statuses == [TransactionStatus.IDLE]
 
 
 def test_purge_expired_nulls_code_keeps_row(fleet_db, monkeypatch):
