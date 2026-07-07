@@ -7,16 +7,26 @@ Design: `docs/superpowers/specs/2026-07-03-fleet-otp-relay-design.md`.
 ## Home box (one-time + keep running)
 
 The responder must run on the box that has Gmail (`~/.applypilot/gmail_credentials.json`).
-Run it alongside your other fleet processes:
+Register it once on the home box:
 
 ```powershell
 cd "C:\Users\JStal\OneDrive\Documents\New project\ApplyPilot"
-$env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
-.\.conda-env\Scripts\applypilot-fleet-otp-home.exe
+.\register-otp-responder-startup.ps1
 ```
 
-Leave it running (or register it as a scheduled task the same way as the other fleet
-loops). It scans Gmail only when a request is actually pending, so it is cheap when idle.
+The script first tries to create `ApplyPilotFleet-OtpResponder` in Task Scheduler. If
+Windows denies that registration, it installs a current-user Startup shortcut named
+`ApplyPilotFleet-OtpResponder.lnk` instead. Both paths run `run-otp-responder.ps1
+-Supervise`, so the hidden launcher restarts the responder if the child process exits.
+
+For an immediate manual start without registering persistence:
+
+```powershell
+cd "C:\Users\JStal\OneDrive\Documents\New project\ApplyPilot"
+.\run-otp-responder.ps1
+```
+
+It scans Gmail only when a request is actually pending, so it is cheap when idle.
 
 ## Remote workers
 

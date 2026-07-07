@@ -14,7 +14,7 @@
 #     ApplyPilot ApplyCycle  -- every 4h.  Wrapper chain, each step logged, wrapper exits non-zero
 #                                if ANY step fails (Task Scheduler Last-Result visibility):
 #                                  1. run-applypilot.ps1 verify-live --limit 300   (fresh pre-push check)
-#                                  2. applypilot-fleet-apply-home push --score-floor 7 --include-research
+#                                  2. applypilot-fleet-apply-home push --score-floor 7
 #                                  3. applypilot-fleet-apply-home arm-canary-if-safe <K>
 #                                  4. applypilot-fleet-apply-home approve --all-pushed
 #                                  5. applypilot-fleet-apply-home resume-if-safe
@@ -243,7 +243,7 @@ Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle
 `$fail = 0
 `$rc = Step 'verify-live' { Invoke-VerifyLive { & '$runApplyPilotPs1' verify-live --max-age-days 3 --limit 300 } }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: verify-live FAILED (continuing best-effort)' }
-`$rc = Step 'push' { & '$applyHomeExe' push --score-floor 7 --include-research }
+`$rc = Step 'push' { & '$applyHomeExe' push --score-floor 7 }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: push FAILED (continuing best-effort)' }
 `$rc = Step 'arm-canary' { & '$applyHomeExe' arm-canary-if-safe $CanaryK }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: arm-canary FAILED (continuing best-effort)' }

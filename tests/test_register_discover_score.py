@@ -57,9 +57,14 @@ def test_home_task_registration_includes_otp_responder():
     script = Path("register-fleet-tasks.ps1").read_text(encoding="utf-8")
 
     assert "${TaskPrefix}OtpResponder" in script
-    assert "applypilot-fleet-otp-home.exe" in script
-    assert "Stop-StaleOtpResponderProcesses" in script
-    assert "& '$otpExe' --dsn `$env:FLEET_PG_DSN" in script
+    assert "run-otp-responder.ps1" in script
+    assert "& '$otpLauncher' -Dsn `$env:FLEET_PG_DSN -Supervise" in script
+
+
+def test_apply_cycle_does_not_stage_advisory_research_scores():
+    script = Path("register-apply-cycle.ps1").read_text(encoding="utf-8")
+
+    assert "--include-research" not in script
 
 
 def test_m4_compute_score_defaults_to_max_parallelism():
