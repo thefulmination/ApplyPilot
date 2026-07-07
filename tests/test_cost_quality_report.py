@@ -119,3 +119,20 @@ def test_summarize_local_jobs_computes_historical_success_rate():
     assert summary.applied == 2
     assert summary.by_ats["ashby"].success_pct == 50.0
     assert summary.by_ats["workday"].success_pct == 0.0
+
+
+def test_summarize_local_jobs_counts_non_terminal_touched_rows_in_success_rate():
+    rows = [
+        {
+            "url": "https://jobs.ashbyhq.com/example",
+            "apply_status": "applied",
+        },
+        {
+            "url": "https://jobs.ashbyhq.com/manual-review",
+            "apply_status": "manual",
+        },
+    ]
+
+    summary = summarize_local_jobs(rows)
+
+    assert summary.by_ats["ashby"].success_pct == 50.0

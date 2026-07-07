@@ -22,9 +22,9 @@ class CountCost:
 
     @property
     def success_pct(self) -> float:
-        if not self.terminal:
+        if not self.count:
             return 0.0
-        return (self.applied / self.terminal) * 100.0
+        return (self.applied / self.count) * 100.0
 
     @property
     def cost_per_applied(self) -> float:
