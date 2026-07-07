@@ -13,6 +13,8 @@ import math
 import numbers
 import urllib.parse as _urlparse
 
+from psycopg.types.json import Jsonb
+
 from applypilot import config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
@@ -152,7 +154,10 @@ def _result_line(status, apply_status=None, apply_error=None) -> str:
 
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                         apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
-                        agent=None, agent_model=None, apply_duration_ms=None):
+                        agent=None, agent_model=None, apply_duration_ms=None,
+                        route=None, failure_class=None, tool_calls_total=None,
+                        application_tool_calls=None, last_tool=None, host_policy=None,
+                        result_metadata=None):
     """Close the apply (lease-owner guarded), record the governor outcome on
     global+host+home_ip (bump cap on a confirmed apply), and UPSERT applied_set
     so the posting can never be applied to again. One transaction.
@@ -203,8 +208,9 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         cur.execute(
             "INSERT INTO apply_result_events ("
             "queue_name, url, worker_id, status, apply_status, apply_error, target_host, home_ip, "
-            "agent, agent_model, est_cost_usd, apply_duration_ms, result_line, source"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s)",
+            "agent, agent_model, est_cost_usd, apply_duration_ms, result_line, source, "
+            "route, failure_class, tool_calls_total, application_tool_calls, last_tool, host_policy, result_metadata"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 "apply_queue",
                 url,
@@ -220,6 +226,13 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 apply_duration_ms,
                 _result_line(status, apply_status=apply_status, apply_error=apply_error),
                 "worker",
+                route,
+                failure_class,
+                tool_calls_total,
+                application_tool_calls,
+                last_tool,
+                host_policy,
+                Jsonb(result_metadata or {}) if result_metadata is not None else None,
             ),
         )
         # Phase 2.1: the apply lane spends real agent money but never recorded it to

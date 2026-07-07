@@ -107,6 +107,23 @@ def test_apply_queue_v3_columns(fleet_db):
         assert c in cols, f"apply_queue missing {c}"
 
 
+def test_apply_result_events_include_cost_router_metadata(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='apply_result_events'"
+        )
+        cols = {r["column_name"] for r in cur.fetchall()}
+
+    assert "route" in cols
+    assert "failure_class" in cols
+    assert "tool_calls_total" in cols
+    assert "application_tool_calls" in cols
+    assert "last_tool" in cols
+    assert "host_policy" in cols
+    assert "result_metadata" in cols
+
+
 def test_fleet_config_v3_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='fleet_config'")
