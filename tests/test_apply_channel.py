@@ -2,6 +2,8 @@
 linkedin.com) vs external (redirected to an off-LinkedIn ATS) from the browser tabs
 the agent ended on. Zero LinkedIn scraping -- it reads tabs the apply already opened.
 """
+import datetime as dt
+
 from applypilot.fleet.apply_worker_main import classify_apply_channel, classify_apply_channel_from_text
 
 
@@ -183,3 +185,121 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
     assert calls == [None, "code=246810\nsource=fleet_relay"]
     assert out["run_status"] == "applied"
     assert cleaned == [(3, proc)]
+
+
+def test_make_apply_fn_retries_generic_failure_when_prearmed_otp_arrived(monkeypatch):
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    calls = []
+
+    monkeypatch.delenv("FLEET_WORKER_ID", raising=False)
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+    monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
+    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 99)
+    monkeypatch.setattr(
+        launcher,
+        "_consume_prearmed_inbox_auth_hint",
+        lambda request_id: "magic_link=https://oracle.test/verify?t=abc\nsource=fleet_relay",
+    )
+
+    def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
+        calls.append(inbox_auth_hint)
+        monkeypatch.setattr(launcher, "_last_run_stats", {2: {}}, raising=False)
+        if len(calls) == 1:
+            return "failed:no_result_line", 1.0
+        return "applied", 1.0
+
+    monkeypatch.setattr(launcher, "run_job", fake_run_job)
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=2, fleet_worker_id="m4-2")(
+        {
+            "url": "https://www.indeed.com/viewjob?jk=oracle",
+            "application_url": "https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions/preview/83866",
+        }
+    )
+
+    assert calls == [
+        None,
+        "magic_link=https://oracle.test/verify?t=abc\nsource=fleet_relay",
+    ]
+    assert out["run_status"] == "applied"
+
+
+def test_make_apply_fn_oracle_relay_retry_is_db_backed(fleet_db, monkeypatch):
+    from applypilot.apply import chrome, launcher, pgqueue
+    from applypilot.fleet import apply_worker_main as awm, otp_relay, schema as fleet_schema
+    from applypilot.mail_source import MailMessage
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages):
+            when = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)
+            return [
+                MailMessage(
+                    id="oracle-message-1",
+                    thread_id="oracle-thread-1",
+                    subject="Confirm your identity",
+                    sender="Oracle <no-reply@oracle.com>",
+                    date=_rfc(when),
+                    body=(
+                        "You must confirm your identity using the one-time pass code : "
+                        "246810. This code will expire in 10 minutes."
+                    ),
+                )
+            ]
+
+    proc = object()
+    calls = []
+
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "relay")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT", "2")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "0.01")
+    monkeypatch.setattr("applypilot.mail_source.get_mail_source", lambda: _FakeSource())
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+
+    def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
+        calls.append(inbox_auth_hint)
+        monkeypatch.setattr(launcher, "_last_run_stats", {1: {}}, raising=False)
+        if len(calls) == 1:
+            with pgqueue.connect(fleet_db) as conn:
+                fleet_schema.ensure_schema_v3(conn)
+                assert otp_relay.answer_pending(conn) == 1
+            return "failed:no_result_line", 1.0
+        return "applied", 1.0
+
+    monkeypatch.setattr(launcher, "run_job", fake_run_job)
+    job = {
+        "url": "https://www.indeed.com/viewjob?jk=oracle",
+        "application_url": "https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions/preview/83866",
+    }
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=1, fleet_worker_id="m4-1")(job)
+
+    assert calls == [None, "code=246810\nsource=fleet_relay"]
+    assert out["run_status"] == "applied"
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id, sender_hint, matched_email_ts, answered_at, consumed_at, "
+                "code IS NULL AS code_cleared "
+                "FROM otp_request WHERE worker_id='m4-1'"
+            )
+            row = cur.fetchone()
+    assert row["sender_hint"].endswith("oraclecloud.com")
+    assert row["matched_email_ts"] is not None
+    assert row["answered_at"] is not None
+    assert row["consumed_at"] is not None
+    assert row["code_cleared"] is True
+
+
+def _rfc(when: dt.datetime) -> str:
+    from email.utils import format_datetime
+
+    return format_datetime(when)

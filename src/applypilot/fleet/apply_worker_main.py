@@ -177,6 +177,18 @@ def _browser_tool_retryable(status: str | None) -> bool:
     return reason in _BROWSER_TOOL_RETRY_REASONS
 
 
+def _prearmed_auth_retryable(status: str | None) -> bool:
+    normalized = (status or "").strip().lower()
+    return (
+        normalized == "expired"
+        or normalized == "timeout"
+        or normalized.startswith("failed:no_result")
+        or normalized.startswith("failed:timeout")
+        or normalized.startswith("failed:browser_")
+        or normalized.startswith("crash_unconfirmed")
+    )
+
+
 def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | None = None):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
@@ -207,7 +219,9 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
             )
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
             if prearmed_request_id is not None and (
-                launcher._is_auth_required_result(status) or _browser_tool_retryable(status)
+                launcher._is_auth_required_result(status)
+                or _browser_tool_retryable(status)
+                or _prearmed_auth_retryable(status)
             ):
                 inbox_hint = launcher._consume_prearmed_inbox_auth_hint(prearmed_request_id)
                 if not inbox_hint and launcher._is_auth_required_result(status):

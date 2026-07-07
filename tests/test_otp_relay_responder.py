@@ -11,9 +11,10 @@ class _Cand:
 
 
 class _Match:
-    def __init__(self, message_id, received_at, value, kind="code"):
+    def __init__(self, message_id, received_at, value, kind="code", sender=""):
         self.message_id = message_id
         self.received_at = received_at  # RFC2822 string
+        self.sender = sender
         self.candidate = _Cand(value, kind)
 
 
@@ -64,6 +65,81 @@ def test_stale_email_before_request_is_not_matched(fleet_db, monkeypatch):
         assert n == 0
         got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
     assert got is None
+
+
+def test_email_inside_clock_skew_before_request_is_matched(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match(
+            "m_skew",
+            _rfc(now - dt.timedelta(seconds=30)),
+            "123456",
+            sender="Oracle <no-reply@oracle.com>",
+        )
+    ]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        rid = otp_relay.request_code(
+            conn,
+            worker_id="m4-0",
+            job_url="j",
+            application_url="https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience",
+        )
+        n = otp_relay.answer_pending(conn, _FakeGmail(matches), skew_seconds=60)
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+    assert n == 1
+    assert got is not None and got.value == "123456"
+
+
+def test_answer_does_not_cross_match_different_auth_provider(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match(
+            "greenhouse_message",
+            _rfc(now + dt.timedelta(seconds=10)),
+            "998877",
+            sender="Greenhouse <no-reply@greenhouse-mail.io>",
+        )
+    ]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        rid = otp_relay.request_code(
+            conn,
+            worker_id="m4-0",
+            job_url="j",
+            application_url="https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience",
+        )
+        n = otp_relay.answer_pending(conn, _FakeGmail(matches))
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+    assert n == 0
+    assert got is None
+
+
+def test_oracle_identity_email_answers_oracle_request(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match(
+            "oracle_message",
+            _rfc(now + dt.timedelta(seconds=10)),
+            "654321",
+            sender="Oracle <no-reply@oracle.com>",
+        )
+    ]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        rid = otp_relay.request_code(
+            conn,
+            worker_id="m4-0",
+            job_url="j",
+            application_url="https://eofe.fa.us2.oraclecloud.com/hcmUI/CandidateExperience",
+        )
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 1
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+    assert got is not None
+    assert got.value == "654321"
 
 
 def test_two_requests_get_distinct_codes_one_message_each(fleet_db, monkeypatch):
@@ -118,6 +194,25 @@ def test_answer_does_not_shorten_request_window(fleet_db, monkeypatch):
                         "FROM otp_request WHERE id=%s", (rid,))
             row = cur.fetchone()
     assert row["still_long"] is True  # window preserved near the original 300s, not cut to 120s
+
+
+def test_answer_default_keeps_code_available_for_worker_retry(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("m1", _rfc(now + dt.timedelta(seconds=10)), "334455")]
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes",
+                        lambda **kw: matches)
+    with _fresh(fleet_db) as conn:
+        rid = otp_relay.request_code(conn, worker_id="mac-0", job_url="j",
+                                     application_url="https://greenhouse.io/a", ttl_seconds=300)
+        otp_relay.answer_pending(conn, _FakeGmail(matches))
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT (expires_at > now() + interval '8 minutes') AS long_enough "
+                "FROM otp_request WHERE id=%s",
+                (rid,),
+            )
+            row = cur.fetchone()
+    assert row["long_enough"] is True
 
 
 def test_unparseable_email_date_is_skipped(fleet_db, monkeypatch):
