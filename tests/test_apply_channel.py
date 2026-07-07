@@ -72,7 +72,7 @@ def test_make_apply_fn_records_external_channel_on_auth_required(monkeypatch):
     proc = object()
     cleaned = []
 
-    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id: proc)
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: cleaned.append((worker_id, process)))
     monkeypatch.setattr(
         launcher,
@@ -103,7 +103,7 @@ def test_make_apply_fn_falls_back_to_transcript_channel_on_auth_required(monkeyp
 
     proc = object()
 
-    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id: proc)
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
     monkeypatch.setattr(
         launcher,
@@ -130,3 +130,85 @@ def test_make_apply_fn_falls_back_to_transcript_channel_on_auth_required(monkeyp
     assert out["run_status"] == "auth_required"
     assert out["apply_channel"] == "external"
     assert out["apply_external_host"] == "amazon.jobs"
+
+
+def test_make_apply_fn_launches_headless_on_linux_without_display(monkeypatch):
+    import platform
+
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    launch_kwargs = []
+
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+    def fake_launch(worker_id, **kwargs):
+        launch_kwargs.append(kwargs)
+        return proc
+
+    monkeypatch.setattr(chrome, "launch_chrome", fake_launch)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(launcher, "run_job", lambda job, port, worker_id, model, agent: ("expired", 1.0))
+    monkeypatch.setattr(launcher, "_last_run_stats", {3: {}}, raising=False)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+    monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: False)
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=3)({"url": "https://example.test/job"})
+
+    assert out["run_status"] == "expired"
+    assert launch_kwargs == [{"headless": True}]
+
+
+def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monkeypatch):
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    cleaned = []
+    calls = []
+    prearm_worker_ids = []
+
+    monkeypatch.delenv("FLEET_WORKER_ID", raising=False)
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: cleaned.append((worker_id, process)))
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+    monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
+
+    def fake_prearm(job):
+        prearm_worker_ids.append(__import__("os").environ.get("FLEET_WORKER_ID"))
+        return 42
+
+    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", fake_prearm)
+    monkeypatch.setattr(
+        launcher,
+        "_consume_prearmed_inbox_auth_hint",
+        lambda request_id: "code=246810\nsource=fleet_relay" if request_id == 42 else None,
+    )
+
+    def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
+        calls.append(inbox_auth_hint)
+        monkeypatch.setattr(
+            launcher,
+            "_last_run_stats",
+            {3: {"application_tool_calls": 1}},
+            raising=False,
+        )
+        if len(calls) == 1:
+            return "failed:browser_tool_unavailable", 1.0
+        return "applied", 1.0
+
+    monkeypatch.setattr(launcher, "run_job", fake_run_job)
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=3, fleet_worker_id="mint-0")(
+        {
+            "url": "https://www.indeed.com/viewjob?jk=933e088d7448c68e",
+            "application_url": "https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions/preview/83866",
+        }
+    )
+
+    assert prearm_worker_ids == ["mint-0"]
+    assert calls == [None, "code=246810\nsource=fleet_relay"]
+    assert out["run_status"] == "applied"
+    assert cleaned == [(3, proc)]

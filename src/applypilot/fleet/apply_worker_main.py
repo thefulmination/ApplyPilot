@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import re
 import signal
 import threading
@@ -164,7 +165,36 @@ def _cdp_page_urls(port: int) -> list[str]:
         return []
 
 
-def make_apply_fn(model: str, agent: str, slot: int = 0):
+_BROWSER_TOOL_RETRY_REASONS = {
+    "browser_tool_unavailable",
+    "browser_unavailable",
+    "browser_service_unavailable",
+    "browser_connection_lost",
+}
+
+
+def _browser_tool_retryable(status: str | None) -> bool:
+    reason = (status or "").split(":", 1)[-1].strip().lower()
+    return reason in _BROWSER_TOOL_RETRY_REASONS
+
+
+def _prearmed_auth_retryable(status: str | None) -> bool:
+    normalized = (status or "").strip().lower()
+    return (
+        normalized == "expired"
+        or normalized == "timeout"
+        or normalized.startswith("failed:no_result")
+        or normalized.startswith("failed:timeout")
+        or normalized.startswith("failed:browser_")
+        or normalized.startswith("crash_unconfirmed")
+    )
+
+
+def _should_launch_chrome_headless() -> bool:
+    return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
+
+
+def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | None = None):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
 
@@ -182,12 +212,49 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
         # workers on ONE machine (distinct slots) never collide in a shared browser.
         worker_id = slot
         port = BASE_CDP_PORT + worker_id
-        proc = chrome.launch_chrome(worker_id)  # returns Popen; port is implicit BASE_CDP_PORT+slot
+        previous_fleet_worker_id = os.environ.get("FLEET_WORKER_ID")
+        if fleet_worker_id:
+            os.environ["FLEET_WORKER_ID"] = str(fleet_worker_id)
+        proc = chrome.launch_chrome(
+            worker_id,
+            headless=_should_launch_chrome_headless(),
+        )  # returns Popen; port is implicit BASE_CDP_PORT+slot
         try:
+            prearmed_request_id = (
+                launcher._prearm_inbox_auth_request(job)
+                if launcher._should_prearm_inbox_auth(job)
+                else None
+            )
             status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
+            if prearmed_request_id is not None and (
+                launcher._is_auth_required_result(status)
+                or _browser_tool_retryable(status)
+                or _prearmed_auth_retryable(status)
+            ):
+                inbox_hint = launcher._consume_prearmed_inbox_auth_hint(prearmed_request_id)
+                if not inbox_hint and launcher._is_auth_required_result(status):
+                    inbox_hint = launcher._poll_inbox_auth_hint(job)
+                if inbox_hint:
+                    status, _dur = launcher.run_job(
+                        job,
+                        port,
+                        worker_id,
+                        model=model,
+                        agent=agent,
+                        inbox_auth_hint=inbox_hint,
+                    )
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
             # agent flows to write_apply_result -> llm_usage.provider for per-agent spend.
-            out = {"run_status": status, "est_cost_usd": _real_cost(stats, model), "agent": agent}
+            out = {
+                "run_status": status,
+                "est_cost_usd": _real_cost(stats, model),
+                "agent": agent,
+                "agent_model": model,
+                "application_tool_calls": stats.get("application_tool_calls"),
+                "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
+                "transcript_digest": stats.get("transcript_digest"),
+                "final_result_source": stats.get("final_result_source"),
+            }
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
             # Chrome). This is needed for non-applied terminal statuses too: an
             # auth_required result on an external ATS is a job-level wall, not a
@@ -199,6 +266,11 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
             out.update(channel)
             return out
         finally:
+            if fleet_worker_id:
+                if previous_fleet_worker_id is None:
+                    os.environ.pop("FLEET_WORKER_ID", None)
+                else:
+                    os.environ["FLEET_WORKER_ID"] = previous_fleet_worker_id
             try:
                 chrome.cleanup_worker(worker_id, proc)
             except Exception:
@@ -296,7 +368,8 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)
     return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
-                      apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
+                      apply_fn=make_apply_fn(model, agent, slot, fleet_worker_id=worker_id),
+                      machine_owner=machine_owner,
                       log_tail_fn=make_log_tail_fn(slot))
 
 
@@ -563,6 +636,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Browser slot (Chrome profile + CDP port + logs). Auto-derived from "
                         "--worker-id's trailing digits; set explicitly (0,1,2,...) to run "
                         "multiple workers on ONE machine without browser collisions.")
+    p.add_argument("--max-iterations", type=int, default=None,
+                   help="Stop after this many worker loop ticks. Intended for bounded canaries.")
+    p.add_argument("--once", action="store_true",
+                   help="Run one worker loop tick, then exit.")
     return p
 
 
@@ -612,8 +689,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
         cooldown_seconds=_envf("APPLYPILOT_AGENT_SOFT_BLOCK_COOLDOWN_SECONDS", 1800.0),
         eval_interval_seconds=_envf("APPLYPILOT_AGENT_EVAL_INTERVAL_SECONDS", 120.0),
     )
+    max_iterations = 1 if args.once else args.max_iterations
     run_apply(lambda: pgqueue.connect(args.dsn), loop,
               switcher=switcher,
-              rebuild_apply_fn=lambda agent: make_apply_fn(args.model, agent, slot),
-              budget=budget)
+              rebuild_apply_fn=lambda agent: make_apply_fn(
+                  args.model, agent, slot, fleet_worker_id=args.worker_id),
+              budget=budget,
+              max_iterations=max_iterations)
     return 0

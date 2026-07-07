@@ -35,6 +35,10 @@ CLAUDE_WALL = (
 CLAUDE_SESSION_WALL = (
     "You've hit your session limit · resets 12:40pm (America/New_York)"
 )
+CODEX_UNAUTH_WALL = (
+    "unexpected status 401 Unauthorized: Missing bearer or basic authentication "
+    "in header, url: https://api.openai.com/v1/responses"
+)
 
 
 def test_usage_limit_transcript_with_no_tool_calls_is_retryable():
@@ -51,6 +55,12 @@ def test_session_limit_wording_with_no_tool_calls_is_retryable():
     limit', so this wall went unclassified and a worker hung silently for 4 hours."""
     assert launcher._no_result_status(CLAUDE_SESSION_WALL, tool_calls=0) == launcher.USAGE_LIMIT_STATUS
     assert launcher._no_result_status(CLAUDE_SESSION_WALL, tool_calls=0) != "failed:no_result_line"
+
+
+def test_codex_unauthorized_with_no_tool_calls_is_retryable_agent_wall():
+    """An unauthenticated Codex fallback never touched the page; do not poison jobs."""
+    assert launcher._no_result_status(CODEX_UNAUTH_WALL, tool_calls=0) == launcher.USAGE_LIMIT_STATUS
+    assert launcher._no_result_status(CODEX_UNAUTH_WALL, tool_calls=0) != "failed:no_result_line"
 
 
 def test_usage_limit_signature_WITH_tool_calls_stays_no_result_line():

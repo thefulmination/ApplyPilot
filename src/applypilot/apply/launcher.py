@@ -6,6 +6,7 @@ result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -1351,6 +1352,8 @@ _USAGE_LIMIT_SIGNATURES = (
     "insufficient quota",
     "out of credits",
     "upgrade to continue",
+    "401 unauthorized",
+    "missing bearer or basic authentication",
 )
 
 
@@ -1656,10 +1659,15 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         text_parts: list[str] = []
         final_result_text: list[str] = []  # text from the final 'result' message
         stats_holder: dict = {}
+        terminal_result_seen = threading.Event()
         # Count only application-touching tool calls. ZERO app tool calls + a usage-limit
         # signature == the agent hit a wall before touching the page -> safely re-queuable
         # (see _no_result_status). A list so the daemon-thread closure can mutate it.
         application_tool_calls = [0]
+
+        def _note_terminal_result(text: str | None) -> None:
+            if text and "RESULT:" in text:
+                terminal_result_seen.set()
 
         def _consume_stream() -> None:
             """Read the agent's stream-json stdout to EOF.
@@ -1682,6 +1690,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                 bt = block.get("type")
                                 if bt == "text":
                                     text_parts.append(block["text"])
+                                    _note_terminal_result(block["text"])
                                     lf.write(block["text"] + "\n")
                                 elif bt == "tool_use":
                                     name = (
@@ -1722,6 +1731,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             text_parts.append(rt)
                             final_result_text.clear()
                             final_result_text.append(rt)
+                            _note_terminal_result(rt)
                         elif msg_type == "item.completed":
                             item = msg.get("item", {})
                             item_type = item.get("type")
@@ -1729,6 +1739,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                 text = item.get("text") or item.get("message") or ""
                                 if text:
                                     text_parts.append(text)
+                                    _note_terminal_result(text)
                                     final_result_text.clear()
                                     final_result_text.append(text)
                                     lf.write(text + "\n")
@@ -1763,6 +1774,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             lf.write(str(err) + "\n")
                     except json.JSONDecodeError:
                         text_parts.append(line)
+                        _note_terminal_result(line)
                         lf.write(line + "\n")
 
         # Start reading BEFORE writing the prompt so a large prompt can't deadlock
@@ -1783,10 +1795,21 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             except Exception:
                 pass
 
-        # Bound the whole run by a wall-clock timeout. The old code only timed out
-        # the post-EOF wait(), so a session that stopped emitting output but never
-        # exited would hang the worker forever.
-        reader.join(timeout=AGENT_TIMEOUT_SECONDS)
+        # Bound the whole run by a wall-clock timeout. Also stop waiting once the
+        # agent emits a terminal RESULT line: Codex can leave its session stream
+        # open after the final answer, and the fleet worker must still commit the
+        # captured result promptly.
+        deadline = time.monotonic() + AGENT_TIMEOUT_SECONDS
+        while reader.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if terminal_result_seen.wait(timeout=min(1.0, remaining)):
+                reader.join(timeout=float(os.environ.get("APPLYPILOT_TERMINAL_RESULT_GRACE_SECONDS") or 5))
+                if reader.is_alive():
+                    _kill_process_tree(proc.pid)
+                    reader.join(timeout=15)
+                break
         if reader.is_alive():
             _kill_process_tree(proc.pid)
             reader.join(timeout=15)
@@ -1807,9 +1830,6 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         stats = stats_holder
         proc = None
 
-        if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
-
         output = "\n".join(text_parts)
         # Prefer the agent's FINAL result message for the RESULT code; only fall
         # back to scanning the full transcript when the final message has none.
@@ -1820,12 +1840,21 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
+        if returncode and returncode < 0 and "RESULT:" not in result_source:
+            return "skipped", duration_ms
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
         run_stats = dict(stats) if stats else {}
         run_stats["transcript"] = output[-20000:]
         run_stats["job_log"] = str(job_log)
+        run_stats["job_log_path"] = str(job_log)
+        run_stats["application_tool_calls"] = application_tool_calls[0]
+        run_stats["transcript_digest"] = (
+            "sha256:" + hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
+        )
+        run_stats["final_result_source"] = "final_message" if final_text and "RESULT:" in final_text else "transcript"
         _last_run_stats[worker_id] = run_stats
 
         if stats:
@@ -2022,8 +2051,35 @@ def _inbox_auth_mode() -> str:
     return "relay" if _auto_relay() else "local"
 
 
-def _relay_inbox_auth_hint(job: dict) -> str | None:
-    """Remote-worker path: get the verification code from the fleet OTP relay."""
+def _should_prearm_inbox_auth(job: dict) -> bool:
+    """Whether to file an OTP relay request before the browser reaches the wall."""
+    if os.environ.get("APPLYPILOT_INBOX_AUTH_PREARM", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+    if not _inbox_auth_enabled() or _inbox_auth_mode() != "relay":
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        apply_target = job.get("application_url") or job.get("url")
+        url_lower = (apply_target or "").lower()
+        host = (urlparse(apply_target or "").hostname or "").lower()
+        sites_cfg = config.load_sites_config()
+        auth_cfg = sites_cfg.get("auth_gated", {}) or {}
+        domains = [str(d).lower() for d in (auth_cfg.get("domains", []) or [])]
+        domains.extend(str(d).lower() for d in config.load_blocked_sso())
+        return any(d and (d in host or d in url_lower) for d in domains)
+    except Exception:
+        logger.debug("Could not evaluate inbox auth pre-arm eligibility", exc_info=True)
+        return False
+
+
+def _prearm_inbox_auth_request(job: dict) -> int | None:
+    """Create a pending relay request without waiting for the code."""
     try:
         from applypilot.apply import pgqueue
         from applypilot.fleet import otp_relay
@@ -2033,17 +2089,80 @@ def _relay_inbox_auth_hint(job: dict) -> str | None:
             return None
         worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
         timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
-        poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        agent_timeout = int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT", str(AGENT_TIMEOUT_SECONDS)))
+        postrun_timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or "45")
+        ttl_seconds = max(timeout, agent_timeout + postrun_timeout)
         apply_target = job.get("application_url") or job["url"]
         with pgqueue.connect(dsn) as conn:
-            rid = otp_relay.request_code(conn, worker_id=worker_id, job_url=job["url"],
-                                         application_url=apply_target, ttl_seconds=timeout)
-            code = otp_relay.poll_for_code(conn, rid, timeout_seconds=timeout, poll_seconds=poll)
+            return otp_relay.request_code(
+                conn,
+                worker_id=worker_id,
+                job_url=job["url"],
+                application_url=apply_target,
+                ttl_seconds=ttl_seconds,
+            )
+    except Exception:
+        logger.debug("Relay inbox auth pre-arm failed", exc_info=True)
+        return None
+
+
+def _format_relay_code_hint(code) -> str:
+    if code.kind == "magic_link":
+        return f"magic_link={code.value}\nsource=fleet_relay"
+    return f"code={code.value}\nsource=fleet_relay"
+
+
+def _consume_prearmed_inbox_auth_hint(
+    request_id: int | None,
+    *,
+    timeout_seconds: int | None = None,
+    poll_seconds: float | None = None,
+) -> str | None:
+    """Wait briefly for a pre-filed relay request and return the prompt hint."""
+    if request_id is None:
+        return None
+    try:
+        from applypilot.apply import pgqueue
+        from applypilot.fleet import otp_relay
+
+        dsn = os.environ.get("FLEET_PG_DSN")
+        if not dsn:
+            return None
+        if timeout_seconds is None:
+            timeout_seconds = int(
+                os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT")
+                or "45"
+            )
+        if poll_seconds is None:
+            poll_seconds = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        with pgqueue.connect(dsn) as conn:
+            code = otp_relay.poll_for_code(
+                conn,
+                request_id,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
         if code is None:
             return None
-        if code.kind == "magic_link":
-            return f"magic_link={code.value}\nsource=fleet_relay"
-        return f"code={code.value}\nsource=fleet_relay"
+        return _format_relay_code_hint(code)
+    except Exception:
+        logger.debug("Relay inbox auth consume failed", exc_info=True)
+        return None
+
+
+def _relay_inbox_auth_hint(job: dict) -> str | None:
+    """Remote-worker path: get the verification code from the fleet OTP relay."""
+    try:
+        request_id = _prearm_inbox_auth_request(job)
+        if request_id is None:
+            return None
+        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
+        poll = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+        return _consume_prearmed_inbox_auth_hint(
+            request_id,
+            timeout_seconds=timeout,
+            poll_seconds=poll,
+        )
     except Exception:
         logger.debug("Relay inbox auth failed", exc_info=True)
         return None
