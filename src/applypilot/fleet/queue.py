@@ -787,14 +787,16 @@ def push_linkedin_jobs(conn, rows, *, approved_batch=None, commit=True) -> int:
         for r in rows:
             dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
             cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, dedup_key, approved_batch) "
-                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,'ats',%(dk)s,%(batch)s) "
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, dedup_key, approved_batch, linkedin_unresolved_kind, linkedin_next_action) "
+                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,'ats',%(dk)s,%(batch)s,%(linkedin_unresolved_kind)s,%(linkedin_next_action)s) "
                 "ON CONFLICT (url) DO UPDATE SET company=EXCLUDED.company, title=EXCLUDED.title, "
                 "application_url=EXCLUDED.application_url, score=EXCLUDED.score, "
                 "dedup_key=EXCLUDED.dedup_key, "
+                "linkedin_unresolved_kind=EXCLUDED.linkedin_unresolved_kind, "
+                "linkedin_next_action=EXCLUDED.linkedin_next_action, "
                 "approved_batch=COALESCE(EXCLUDED.approved_batch, linkedin_queue.approved_batch), updated_at=now() "
                 "WHERE linkedin_queue.status='queued'",
-                {**r, "dk": dk, "batch": approved_batch},
+                {**r, "dk": dk, "batch": approved_batch, "linkedin_unresolved_kind": r.get("linkedin_unresolved_kind"), "linkedin_next_action": r.get("linkedin_next_action")},
             )
             n += cur.rowcount
     if commit:

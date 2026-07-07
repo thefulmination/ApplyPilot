@@ -21,7 +21,7 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import sync
+from applypilot.fleet import queue, sync
 
 
 _JOBS_DDL = """
@@ -30,7 +30,8 @@ CREATE TABLE jobs (
     audit_score REAL, fit_score INTEGER, full_description TEXT, liveness_status TEXT,
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
     applied_at TEXT, discovered_at TEXT, decision_source TEXT,
-    fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT
+    fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT,
+    linkedin_unresolved_kind TEXT, linkedin_next_action TEXT
 );
 """
 
@@ -190,6 +191,35 @@ def test_push_linkedin_uses_url_when_application_url_null(fleet_db, tmp_path):
 
 
 # --- Issue 3: unscored backlog is countable, not silently lost --------------
+
+def test_push_linkedin_jobs_carries_unresolved_metadata(fleet_db):
+    with pgqueue.connect(fleet_db) as pg:
+        n = queue.push_linkedin_jobs(
+            pg,
+            [{
+                "url": "https://linkedin.com/jobs/unresolved",
+                "company": "Acme",
+                "title": "Role",
+                "application_url": "https://linkedin.com/jobs/unresolved",
+                "score": 9.0,
+                "linkedin_resolve_status": "unresolved",
+                "linkedin_resolved_at": "2026-07-07T12:00:00",
+                "linkedin_resolve_error": "no_primary_apply_button",
+                "linkedin_unresolved_kind": "apply_button_missing",
+                "linkedin_next_action": "run_ats_reconstruction",
+            }],
+        )
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("""
+                SELECT linkedin_unresolved_kind, linkedin_next_action
+                  FROM linkedin_queue
+                 WHERE url = 'https://linkedin.com/jobs/unresolved'
+            """)
+            row = cur.fetchone()
+    assert row["linkedin_unresolved_kind"] == "apply_button_missing"
+    assert row["linkedin_next_action"] == "run_ats_reconstruction"
+
 
 def test_count_linkedin_unscored(tmp_path):
     sq = _home_sqlite(tmp_path)

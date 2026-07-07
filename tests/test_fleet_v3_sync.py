@@ -33,7 +33,8 @@ CREATE TABLE jobs (
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0,
     research_fit_score REAL, research_decision TEXT,
     discovered_at TEXT, decision_source TEXT, fit_gap_category TEXT,
-    recommended_action TEXT, audit_flags TEXT
+    recommended_action TEXT, audit_flags TEXT,
+    linkedin_unresolved_kind TEXT, linkedin_next_action TEXT
 );
 """
 
@@ -293,6 +294,34 @@ def test_push_linkedin_eligible_skips_company_blocklist_matches(fleet_db, tmp_pa
             urls = {r["url"] for r in cur.fetchall()}
 
     assert urls == {"https://www.linkedin.com/jobs/view/acme"}
+
+
+def test_push_linkedin_eligible_carries_resolver_metadata(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(
+        sq,
+        "https://www.linkedin.com/jobs/view/metadata",
+        company="Acme",
+        title="Chief of Staff",
+        audit_score=9.0,
+        linkedin_unresolved_kind="apply_button_missing",
+        linkedin_next_action="run_ats_reconstruction",
+    )
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg,
+                                        score_floor=7, approved_batch="batch-L", limit=None)
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("""
+                SELECT linkedin_unresolved_kind, linkedin_next_action
+                  FROM linkedin_queue
+                 WHERE url = 'https://www.linkedin.com/jobs/view/metadata'
+            """)
+            row = cur.fetchone()
+
+    assert row["linkedin_unresolved_kind"] == "apply_button_missing"
+    assert row["linkedin_next_action"] == "run_ats_reconstruction"
 
 
 def test_push_apply_eligible_excludes_crash_unconfirmed(fleet_db, tmp_path):

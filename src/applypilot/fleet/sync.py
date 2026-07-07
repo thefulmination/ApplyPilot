@@ -357,7 +357,8 @@ def _pull_results(
 _PUSH_LINKEDIN_SELECT = """
 SELECT url, company, title,
        CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END AS application_url,
-       CAST(COALESCE(audit_score, fit_score) AS REAL) AS score
+       CAST(COALESCE(audit_score, fit_score) AS REAL) AS score,
+       linkedin_unresolved_kind, linkedin_next_action
 FROM jobs
 WHERE duplicate_of_url IS NULL
   AND COALESCE(audit_score, fit_score) >= ?
@@ -427,6 +428,8 @@ def push_linkedin_eligible(
                 "url": r["url"], "company": r["company"], "title": r["title"],
                 "application_url": r["application_url"], "score": r["score"],
                 "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
+                "linkedin_unresolved_kind": r["linkedin_unresolved_kind"],
+                "linkedin_next_action": r["linkedin_next_action"],
             })
             if limit and len(out) >= limit:
                 break
