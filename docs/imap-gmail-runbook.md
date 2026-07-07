@@ -25,7 +25,7 @@ OAuth path unchanged.
 5. **Verify it reads:**
    ```powershell
    cd "C:\Users\JStal\OneDrive\Documents\New project\ApplyPilot"
-   .\run-applypilot.ps1 scan-gmail --days 1
+   .\.conda-env\python.exe -c "from applypilot.mail_source import get_mail_source; src=get_mail_source(); print(type(src).__name__); print(len(src.fetch(since_days=1, max_messages=1)))"
    ```
    It now reads over IMAP (no browser consent). This doubles as your first-run canary against
    real Gmail.

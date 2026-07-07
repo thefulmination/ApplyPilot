@@ -6,7 +6,8 @@ Design: `docs/superpowers/specs/2026-07-03-fleet-otp-relay-design.md`.
 
 ## Home box (one-time + keep running)
 
-The responder must run on the box that has Gmail (`~/.applypilot/gmail_credentials.json`).
+The responder must run on the box that has the IMAP app-password secret
+(`~/.applypilot/gmail_app_password.json`).
 Register it once on the home box:
 
 ```powershell
