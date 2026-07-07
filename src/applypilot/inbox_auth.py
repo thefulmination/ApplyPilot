@@ -579,6 +579,7 @@ def scan_gmail_for_auth_codes(
     )
 
     matches = []
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     for ref in gmail_messages:
         msg = (
             service.users()
@@ -591,6 +592,9 @@ def scan_gmail_for_auth_codes(
         subject = hdrs.get("subject", "")
         sender = hdrs.get("from", "")
         received_at = hdrs.get("date")
+        received = _received_at_dt(received_at)
+        if received is not None and received < cutoff:
+            continue
         body = _payload_text(payload)
 
         matches.extend(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 
 from applypilot import inbox_auth
 
@@ -48,12 +49,18 @@ def _encoded_body(value: str) -> str:
     return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def _make_payload(subject: str, sender: str, body: str) -> dict:
+def _rfc(when: dt.datetime) -> str:
+    from email.utils import format_datetime
+
+    return format_datetime(when)
+
+
+def _make_payload(subject: str, sender: str, body: str, *, date: str | None = None) -> dict:
     return {
         "headers": [
             {"name": "Subject", "value": subject},
             {"name": "From", "value": sender},
-            {"name": "Date", "value": "Mon, 01 Jan 2024 12:00:00 +0000"},
+            {"name": "Date", "value": date or _rfc(dt.datetime.now(dt.timezone.utc))},
         ],
         "mimeType": "text/plain",
         "body": {"data": _encoded_body(body)},
@@ -86,6 +93,28 @@ def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():
     assert matches[0].message_id == "m1"
     assert matches[0].candidate.kind == "code"
     assert matches[0].candidate.value == "839214"
+
+
+def test_scan_gmail_for_auth_codes_service_path_drops_codes_outside_minutes_window():
+    old_date = _rfc(dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=23))
+    payload = _make_payload(
+        subject="Your Greenhouse verification code",
+        sender="no-reply@greenhouse.io",
+        body="Use verification code 839214 to continue your application.",
+        date=old_date,
+    )
+    service = _build_service(
+        [{"id": "m-old", "threadId": "t-old"}],
+        {"m-old": {"payload": payload}},
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        minutes=10,
+        max_messages=25,
+    )
+
+    assert matches == []
 
 
 def test_watch_gmail_for_auth_code_polls_until_match(monkeypatch):

@@ -215,6 +215,45 @@ def test_fetch_login_failure_raises_mail_source_error():
     assert fake.logged_out is True
 
 
+def test_fetch_select_failure_raises_mail_source_error():
+    class SelectFailsImap(FakeImap):
+        def select(self, mailbox, readonly=False):
+            self.selected = (mailbox, readonly)
+            return "NO", [b"imap disabled"]
+
+    fake = SelectFailsImap(search_ids=[], messages_by_id={})
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    with pytest.raises(MailSourceError, match="select"):
+        source.fetch(since_days=7, max_messages=5)
+
+    assert fake.logged_out is True
+
+
+def test_fetch_search_failure_raises_mail_source_error():
+    class SearchFailsImap(FakeImap):
+        def search(self, charset, criterion, date):
+            return "NO", [b"search failed"]
+
+    fake = SearchFailsImap(search_ids=[], messages_by_id={})
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    with pytest.raises(MailSourceError, match="search"):
+        source.fetch(since_days=7, max_messages=5)
+
+    assert fake.logged_out is True
+
+
+def test_fetch_message_failure_raises_mail_source_error():
+    fake = FakeImap(search_ids=[b"1"], messages_by_id={})
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    with pytest.raises(MailSourceError, match="fetch"):
+        source.fetch(since_days=7, max_messages=5)
+
+    assert fake.logged_out is True
+
+
 # ---------------------------------------------------------------------------
 # config.load_gmail_app_password tests
 # ---------------------------------------------------------------------------

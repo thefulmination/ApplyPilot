@@ -138,12 +138,18 @@ class ImapMailSource:
                     "is enabled in Gmail settings"
                 ) from exc
 
-            imap.select("INBOX", readonly=True)
+            status, data = imap.select("INBOX", readonly=True)
+            if status != "OK":
+                detail = data[0].decode(errors="replace") if data else status
+                raise MailSourceError(f"IMAP select failed: {detail}")
 
             since_date = (
                 datetime.date.today() - datetime.timedelta(days=since_days)
             ).strftime("%d-%b-%Y")
             status, data = imap.search(None, "SINCE", since_date)
+            if status != "OK":
+                detail = data[0].decode(errors="replace") if data else status
+                raise MailSourceError(f"IMAP search failed: {detail}")
 
             ids: list[bytes | str] = []
             if data and data[0]:
@@ -159,9 +165,11 @@ class ImapMailSource:
             for msg_id in newest_ids:
                 uid = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
                 status, fetch_data = imap.fetch(uid, "(RFC822)")
+                if status != "OK":
+                    raise MailSourceError(f"IMAP fetch failed for message {uid}")
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
-                    continue
+                    raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")
                 messages.append(_normalize(uid, raw))
 
             return messages
