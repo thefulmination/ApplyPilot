@@ -134,7 +134,7 @@ def test_indeed_resolve_apply_urls_rejects_negative_limit(monkeypatch):
 
 
 def test_boost_output_resolves_urls_and_generates_until_ready_target(monkeypatch):
-    calls = {"pipeline": 0, "liveness": 0, "company": 0}
+    calls = {"pipeline": 0, "liveness": 0, "company": 0, "indeed": 0}
     ready_values = [10, 80, 120, 150]
 
     def fake_get_stats():
@@ -149,6 +149,15 @@ def test_boost_output_resolves_urls_and_generates_until_ready_target(monkeypatch
         return company_resolver.CompanyResolverSummary(
             considered=50,
             counts={"resolved_company_match": 2},
+        )
+
+    def fake_indeed(options):
+        calls["indeed"] += 1
+        assert isinstance(options, indeed_resolver.IndeedResolverOptions)
+        assert options.limit == 2000
+        return indeed_resolver.IndeedResolverSummary(
+            considered=40,
+            counts={"resolved_offsite": 5, "hosted_apply": 3, "unresolved": 2},
         )
 
     def fake_verify_jobs(*args, **kwargs):
@@ -169,6 +178,7 @@ def test_boost_output_resolves_urls_and_generates_until_ready_target(monkeypatch
 
     monkeypatch.setattr(cli, "_bootstrap", lambda: None)
     monkeypatch.setattr("applypilot.company_resolver.run_resolver", fake_company)
+    monkeypatch.setattr("applypilot.indeed_resolver.run_resolver", fake_indeed)
     monkeypatch.setattr("applypilot.database.get_connection", lambda: object())
     monkeypatch.setattr("applypilot.database.get_stats", fake_get_stats)
     monkeypatch.setattr("applypilot.apply.liveness.verify_jobs", fake_verify_jobs)
@@ -192,5 +202,6 @@ def test_boost_output_resolves_urls_and_generates_until_ready_target(monkeypatch
     )
 
     assert result.exit_code == 0
-    assert calls == {"pipeline": 2, "liveness": 1, "company": 1}
+    assert calls == {"pipeline": 2, "liveness": 1, "company": 1, "indeed": 1}
+    assert "Indeed URL pass" in result.output
     assert "ApplyPilot output boost complete" in result.output

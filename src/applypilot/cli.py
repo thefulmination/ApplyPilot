@@ -605,6 +605,7 @@ def resolve_company_apply_urls_command(
 def boost_output_command(
     target_ready: int = typer.Option(300, "--target-ready", help="Build ready-to-apply queue to at least this size."),
     company_limit: int = typer.Option(2000, "--company-limit", help="LinkedIn rows to try resolving via company/ATS matches."),
+    indeed_limit: int = typer.Option(2000, "--indeed-limit", help="Indeed rows to classify with the deterministic resolver. 0 disables."),
     verify_limit: int = typer.Option(500, "--verify-limit", help="Ready/high-priority jobs to liveness-check before generation. 0 disables."),
     verify_workers: int = typer.Option(16, "--verify-workers", help="Concurrent liveness probes."),
     batch_size: int = typer.Option(500, "--batch-size", help="Tailor/cover/pdf batch size per pass."),
@@ -627,7 +628,7 @@ def boost_output_command(
     """Increase application throughput by filling the ready queue before apply."""
     _bootstrap()
 
-    from applypilot import company_resolver, config
+    from applypilot import company_resolver, config, indeed_resolver
     from applypilot.apply import liveness
     from applypilot.database import get_connection, get_stats
     from applypilot.pipeline import run_pipeline
@@ -637,7 +638,7 @@ def boost_output_command(
     if target_ready < 0:
         console.print("[red]--target-ready must be 0 or a positive number.[/red]")
         raise typer.Exit(code=1)
-    if company_limit < 0 or verify_limit < 0 or batch_size < 0 or max_passes < 0:
+    if company_limit < 0 or indeed_limit < 0 or verify_limit < 0 or batch_size < 0 or max_passes < 0:
         console.print("[red]Limits, batch size, and max passes must be 0 or positive numbers.[/red]")
         raise typer.Exit(code=1)
     if validation not in {"strict", "normal", "lenient"}:
@@ -666,6 +667,21 @@ def boost_output_command(
         )
         resolved = (res.counts or {}).get("resolved_company_match", 0)
         console.print(f"  Company URL matches: {resolved} / {res.considered}")
+
+    if indeed_limit:
+        res = indeed_resolver.run_resolver(
+            indeed_resolver.IndeedResolverOptions(
+                limit=indeed_limit,
+                tiers=("priority", "recommended"),
+            )
+        )
+        resolved = (res.counts or {}).get("resolved_offsite", 0)
+        hosted = (res.counts or {}).get("hosted_apply", 0)
+        unresolved = (res.counts or {}).get("unresolved", 0)
+        console.print(
+            "  Indeed URL pass:     "
+            f"offsite={resolved}, hosted={hosted}, unresolved={unresolved} / {res.considered}"
+        )
 
     if verify_limit:
         conn = get_connection()
