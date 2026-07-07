@@ -67,6 +67,33 @@ def test_url_classification_distinguishes_linkedin_and_offsite():
     assert linkedin_resolver.is_external_apply_url(None) is False
 
 
+def test_unresolved_taxonomy_maps_to_next_actions():
+    assert linkedin_resolver.next_action_for_unresolved_kind("auth_required") == "refresh_session"
+    assert linkedin_resolver.next_action_for_unresolved_kind("checkpoint_or_captcha") == "pause_resolver"
+    assert linkedin_resolver.next_action_for_unresolved_kind("rate_limited") == "retry_later"
+    assert linkedin_resolver.next_action_for_unresolved_kind("page_unreachable") == "retry_later"
+    assert linkedin_resolver.next_action_for_unresolved_kind("dom_unreadable") == "retry_fresh_context"
+    assert linkedin_resolver.next_action_for_unresolved_kind("apply_button_missing") == "run_ats_reconstruction"
+    assert linkedin_resolver.next_action_for_unresolved_kind("conflicting_signals") == "run_conservative_dom_parser"
+    assert linkedin_resolver.next_action_for_unresolved_kind("outbound_not_observed") == "retry_with_network_capture"
+    assert linkedin_resolver.next_action_for_unresolved_kind("outbound_still_source_platform") == "run_url_unwrapper"
+    assert linkedin_resolver.next_action_for_unresolved_kind("malformed_outbound_url") == "extract_from_serialized_page_data"
+    assert linkedin_resolver.next_action_for_unresolved_kind("ats_reconstruction_needed") == "run_ats_reconstruction"
+    assert linkedin_resolver.next_action_for_unresolved_kind("low_confidence_match") == "manual_review"
+
+
+def test_page_decision_unresolved_helper_sets_action():
+    decision = linkedin_resolver.unresolved_decision(
+        "apply_button_missing",
+        error="no_primary_apply_button",
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "apply_button_missing"
+    assert decision.next_action == "run_ats_reconstruction"
+    assert decision.error == "no_primary_apply_button"
+
+
 def test_classify_snapshot_stops_on_linkedin_challenge():
     snapshot = linkedin_resolver.PageSnapshot(
         url="https://www.linkedin.com/checkpoint/challenge",
@@ -76,8 +103,10 @@ def test_classify_snapshot_stops_on_linkedin_challenge():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "challenge_required"
+    assert decision.status == "unresolved"
     assert decision.stop_run is True
+    assert decision.unresolved_kind == "checkpoint_or_captcha"
+    assert decision.next_action == "pause_resolver"
     assert decision.final_url is None
 
 
@@ -90,8 +119,10 @@ def test_classify_snapshot_stops_on_login_wall():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "login_required"
+    assert decision.status == "unresolved"
     assert decision.stop_run is True
+    assert decision.unresolved_kind == "auth_required"
+    assert decision.next_action == "refresh_session"
 
 
 def test_classify_snapshot_stops_on_restricted_account_text():
@@ -103,8 +134,10 @@ def test_classify_snapshot_stops_on_restricted_account_text():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "challenge_required"
+    assert decision.status == "unresolved"
     assert decision.stop_run is True
+    assert decision.unresolved_kind == "checkpoint_or_captcha"
+    assert decision.next_action == "pause_resolver"
 
 
 def test_classify_snapshot_stops_for_email_or_phone_login_prompt():
@@ -116,8 +149,10 @@ def test_classify_snapshot_stops_for_email_or_phone_login_prompt():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "login_required"
+    assert decision.status == "unresolved"
     assert decision.stop_run is True
+    assert decision.unresolved_kind == "auth_required"
+    assert decision.next_action == "refresh_session"
 
 
 def test_classify_snapshot_detects_unavailable_job():
@@ -212,7 +247,9 @@ def test_classify_snapshot_reports_missing_apply_control():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "no_apply_button"
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "apply_button_missing"
+    assert decision.next_action == "run_ats_reconstruction"
 
 
 def test_classify_snapshot_handles_missing_url_and_controls():
@@ -224,7 +261,9 @@ def test_classify_snapshot_handles_missing_url_and_controls():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "no_apply_button"
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "apply_button_missing"
+    assert decision.next_action == "run_ats_reconstruction"
 
 
 def test_classify_snapshot_handles_control_without_text():
@@ -242,7 +281,9 @@ def test_classify_snapshot_handles_control_without_text():
 
     decision = linkedin_resolver.classify_snapshot(snapshot)
 
-    assert decision.status == "no_apply_button"
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "apply_button_missing"
+    assert decision.next_action == "run_ats_reconstruction"
 
 
 def test_classify_snapshot_does_not_treat_generic_sign_in_text_as_login_wall():
@@ -350,6 +391,11 @@ def test_fetch_candidates_can_include_low_and_refresh_completed_statuses(tmp_pat
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
     _insert_job(conn, url="https://www.linkedin.com/jobs/view/low", audit_label="low")
     _insert_job(conn, url="https://www.linkedin.com/jobs/view/easy", linkedin_resolve_status="easy_apply")
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/unresolved-refresh",
+        linkedin_resolve_status="unresolved",
+    )
 
     rows = linkedin_resolver.fetch_candidates(
         limit=10,
@@ -361,7 +407,24 @@ def test_fetch_candidates_can_include_low_and_refresh_completed_statuses(tmp_pat
     assert {row.url for row in rows} == {
         "https://www.linkedin.com/jobs/view/low",
         "https://www.linkedin.com/jobs/view/easy",
+        "https://www.linkedin.com/jobs/view/unresolved-refresh",
     }
+
+
+def test_fetch_candidates_skips_unresolved_without_refresh(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/unresolved",
+        audit_label="priority",
+        linkedin_resolve_status="unresolved",
+    )
+
+    rows = linkedin_resolver.fetch_candidates(limit=5, tiers=("priority",))
+
+    assert rows == []
 
 
 def test_fetch_candidates_filters_external_application_urls_host_aware(tmp_path, monkeypatch):
@@ -591,6 +654,63 @@ def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp
     assert row["linkedin_resolved_at"]
 
 
+def test_record_resolution_unresolved_defaults_taxonomy_metadata(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/unresolved-default")
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/unresolved-default",
+        status="unresolved",
+        error="dom_snapshot_failed",
+    )
+
+    row = conn.execute(
+        """
+        SELECT linkedin_resolve_status, linkedin_resolve_error,
+               linkedin_unresolved_kind, linkedin_next_action
+        FROM jobs WHERE url = ?
+        """,
+        ("https://www.linkedin.com/jobs/view/unresolved-default",),
+    ).fetchone()
+    assert row["linkedin_resolve_status"] == "unresolved"
+    assert row["linkedin_resolve_error"] == "dom_snapshot_failed"
+    assert row["linkedin_unresolved_kind"] == "dom_unreadable"
+    assert row["linkedin_next_action"] == "retry_fresh_context"
+
+
+def test_record_resolution_resolved_clears_stale_unresolved_metadata(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/clears-unresolved")
+    conn.execute(
+        """
+        UPDATE jobs
+           SET linkedin_unresolved_kind = 'auth_required',
+               linkedin_next_action = 'refresh_session'
+         WHERE url = ?
+        """,
+        ("https://www.linkedin.com/jobs/view/clears-unresolved",),
+    )
+    conn.commit()
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/clears-unresolved",
+        status="easy_apply",
+    )
+
+    row = conn.execute(
+        """
+        SELECT linkedin_resolve_status, linkedin_unresolved_kind, linkedin_next_action
+        FROM jobs WHERE url = ?
+        """,
+        ("https://www.linkedin.com/jobs/view/clears-unresolved",),
+    ).fetchone()
+    assert row["linkedin_resolve_status"] == "easy_apply"
+    assert row["linkedin_unresolved_kind"] is None
+    assert row["linkedin_next_action"] is None
+
+
 def test_record_resolution_does_not_overwrite_existing_offsite_without_refresh(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
@@ -654,10 +774,13 @@ def test_record_resolution_does_not_overwrite_with_invalid_or_internal_final_url
     assert row["linkedin_resolve_error"] == "bad final URL"
 
 
-def test_should_stop_run_respects_stop_statuses():
-    assert linkedin_resolver.should_stop_run("login_required") is True
-    assert linkedin_resolver.should_stop_run("challenge_required") is True
-    assert linkedin_resolver.should_stop_run("easy_apply") is False
+def test_should_stop_run_respects_unresolved_stop_kinds():
+    assert linkedin_resolver.should_stop_run("unresolved", "auth_required") is True
+    assert linkedin_resolver.should_stop_run("unresolved", "checkpoint_or_captcha") is True
+    assert linkedin_resolver.should_stop_run("unresolved", "rate_limited") is True
+    assert linkedin_resolver.should_stop_run("unresolved", "apply_button_missing") is False
+    assert linkedin_resolver.should_stop_run("easy_apply", "auth_required") is False
+    assert linkedin_resolver.should_stop_run("unresolved", None) is False
 
 
 def test_run_resolver_dry_run_does_not_record_status_or_launch_browser(tmp_path, monkeypatch):
@@ -688,7 +811,7 @@ def test_run_resolver_dry_run_does_not_record_status_or_launch_browser(tmp_path,
     ).fetchone()[0] is None
 
 
-def test_run_resolver_stops_after_login_required_result(tmp_path, monkeypatch):
+def test_run_resolver_stops_after_auth_required_result(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
     _insert_job(conn, url="https://www.linkedin.com/jobs/view/first", audit_label="recommended")
@@ -699,9 +822,11 @@ def test_run_resolver_stops_after_login_required_result(tmp_path, monkeypatch):
     def fake_resolve(candidate, options):
         calls.append(candidate.url)
         return linkedin_resolver.PageDecision(
-            status="login_required",
+            status="unresolved",
             stop_run=True,
             error="linkedin_login",
+            unresolved_kind="auth_required",
+            next_action="refresh_session",
         )
 
     monkeypatch.setattr(
@@ -717,14 +842,20 @@ def test_run_resolver_stops_after_login_required_result(tmp_path, monkeypatch):
     summary = linkedin_resolver.run_resolver(linkedin_resolver.ResolverOptions(limit=10))
 
     assert calls == ["https://www.linkedin.com/jobs/view/first"]
-    assert summary.stopped_reason == "login_required"
-    assert summary.counts == {"login_required": 1}
+    assert summary.stopped_reason == "auth_required"
+    assert summary.counts == {"unresolved": 1}
     row = conn.execute(
-        "SELECT linkedin_resolve_status, linkedin_resolve_error FROM jobs WHERE url = ?",
+        """
+        SELECT linkedin_resolve_status, linkedin_resolve_error,
+               linkedin_unresolved_kind, linkedin_next_action
+        FROM jobs WHERE url = ?
+        """,
         ("https://www.linkedin.com/jobs/view/first",),
     ).fetchone()
-    assert row["linkedin_resolve_status"] == "login_required"
+    assert row["linkedin_resolve_status"] == "unresolved"
     assert row["linkedin_resolve_error"] == "linkedin_login"
+    assert row["linkedin_unresolved_kind"] == "auth_required"
+    assert row["linkedin_next_action"] == "refresh_session"
     assert conn.execute(
         "SELECT linkedin_resolve_status FROM jobs WHERE url = ?",
         ("https://www.linkedin.com/jobs/view/second",),

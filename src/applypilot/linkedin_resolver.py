@@ -22,7 +22,6 @@ from playwright.sync_api import sync_playwright
 
 from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_worker, launch_chrome
 from applypilot.aggregator_resolver import (
-    UNRESOLVED_NEXT_ACTIONS,
     is_external_apply_url,
     next_action_for_unresolved_kind,
     source_platform_from_url,
@@ -35,9 +34,10 @@ COMPLETED_STATUSES = {
     "login_required",
     "challenge_required",
     "unavailable",
+    "unresolved",
 }
 
-STOP_STATUSES = {"login_required", "challenge_required"}
+STOP_UNRESOLVED_KINDS = {"auth_required", "checkpoint_or_captcha", "rate_limited"}
 
 CHALLENGE_TEXTS = (
     "security check",
@@ -100,6 +100,8 @@ class PageDecision:
     final_url: str | None = None
     error: str | None = None
     control: ApplyControl | None = None
+    unresolved_kind: str | None = None
+    next_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,23 @@ def is_linkedin_url(url: str | None) -> bool:
     return source_platform_from_url(url) == "linkedin"
 
 
+def unresolved_decision(
+    kind: str,
+    *,
+    error: str | None = None,
+    stop_run: bool = False,
+    control: ApplyControl | None = None,
+) -> PageDecision:
+    return PageDecision(
+        status="unresolved",
+        stop_run=stop_run,
+        error=error,
+        control=control,
+        unresolved_kind=kind,
+        next_action=next_action_for_unresolved_kind(kind),
+    )
+
+
 def _snapshot_text_lower(snapshot: PageSnapshot) -> str:
     return (snapshot.text or "").lower()
 
@@ -147,13 +166,32 @@ def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
     controls = tuple(snapshot.controls or ())
 
     if "/checkpoint/" in url or "/uas/" in url:
-        return PageDecision(status="challenge_required", stop_run=True, error="linkedin_checkpoint")
+        return unresolved_decision(
+            "checkpoint_or_captcha",
+            stop_run=True,
+            error="linkedin_checkpoint",
+        )
+
+    if "too many requests" in text or "rate limit" in text or "temporarily restricted" in text:
+        return unresolved_decision(
+            "rate_limited",
+            stop_run=True,
+            error="linkedin_rate_limited",
+        )
 
     if any(token in text for token in CHALLENGE_TEXTS):
-        return PageDecision(status="challenge_required", stop_run=True, error="linkedin_challenge")
+        return unresolved_decision(
+            "checkpoint_or_captcha",
+            stop_run=True,
+            error="linkedin_challenge",
+        )
 
     if "linkedin.com/login" in url or any(token in text for token in LOGIN_TEXTS):
-        return PageDecision(status="login_required", stop_run=True, error="linkedin_login")
+        return unresolved_decision(
+            "auth_required",
+            stop_run=True,
+            error="linkedin_login",
+        )
 
     if any(token in text for token in UNAVAILABLE_TEXTS):
         return PageDecision(status="unavailable")
@@ -170,7 +208,7 @@ def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
         None,
     )
     if apply_control is None:
-        return PageDecision(status="no_apply_button")
+        return unresolved_decision("apply_button_missing", error="no_primary_apply_button")
 
     if is_external_apply_url(apply_control.href):
         return PageDecision(
@@ -321,11 +359,20 @@ def record_resolution(
     status: str,
     final_url: str | None = None,
     error: str | None = None,
+    unresolved_kind: str | None = None,
+    next_action: str | None = None,
     refresh: bool = False,
     conn: sqlite3.Connection | None = None,
 ) -> None:
     if conn is None:
         conn = get_connection()
+
+    if status == "unresolved":
+        unresolved_kind = unresolved_kind or "dom_unreadable"
+        next_action = next_action or next_action_for_unresolved_kind(unresolved_kind)
+    else:
+        unresolved_kind = None
+        next_action = None
 
     now = datetime.now(timezone.utc).isoformat()
     existing = conn.execute(
@@ -350,11 +397,13 @@ def record_resolution(
                    linkedin_resolve_final_url = ?,
                    linkedin_resolve_status = ?,
                    linkedin_resolve_error = ?,
+                   linkedin_unresolved_kind = ?,
+                   linkedin_next_action = ?,
                    linkedin_resolved_at = ?,
                    linkedin_resolve_attempts = COALESCE(linkedin_resolve_attempts, 0) + 1
              WHERE url = ?
             """,
-            (final_url, final_url, status, error, now, url),
+            (final_url, final_url, status, error, unresolved_kind, next_action, now, url),
         )
     else:
         conn.execute(
@@ -363,17 +412,19 @@ def record_resolution(
                SET linkedin_resolve_final_url = ?,
                    linkedin_resolve_status = ?,
                    linkedin_resolve_error = ?,
+                   linkedin_unresolved_kind = ?,
+                   linkedin_next_action = ?,
                    linkedin_resolved_at = ?,
                    linkedin_resolve_attempts = COALESCE(linkedin_resolve_attempts, 0) + 1
              WHERE url = ?
             """,
-            (final_url, status, error, now, url),
+            (final_url, status, error, unresolved_kind, next_action, now, url),
         )
     conn.commit()
 
 
-def should_stop_run(status: str) -> bool:
-    return status in STOP_STATUSES
+def should_stop_run(status: str, unresolved_kind: str | None = None) -> bool:
+    return status == "unresolved" and unresolved_kind in STOP_UNRESOLVED_KINDS
 
 
 def _summary_url(candidate: Candidate, decision: PageDecision) -> str:
@@ -406,13 +457,15 @@ def _run_candidates(
             status=decision.status,
             final_url=decision.final_url,
             error=decision.error,
+            unresolved_kind=decision.unresolved_kind,
+            next_action=decision.next_action,
             refresh=options.refresh,
         )
         counts[decision.status] += 1
         if len(sample_urls) < 10:
             sample_urls.append(_summary_url(candidate, decision))
-        if decision.stop_run or should_stop_run(decision.status):
-            stopped_reason = decision.status
+        if decision.stop_run or should_stop_run(decision.status, decision.unresolved_kind):
+            stopped_reason = decision.unresolved_kind or decision.status
             break
         _sleep_between(options)
 
@@ -589,9 +642,13 @@ def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
         return PageDecision(status="resolved_offsite", final_url=page.url, control=control)
 
     decision = classify_snapshot(_snapshot_page(page))
-    if decision.status in {"login_required", "challenge_required", "easy_apply", "unavailable"}:
+    if decision.status in {"unresolved", "easy_apply", "unavailable"}:
         return decision
-    return PageDecision(status="no_apply_button", error=f"same_tab_stayed_on_linkedin:{page.url}", control=control)
+    return unresolved_decision(
+        "outbound_still_source_platform",
+        error=f"same_tab_stayed_on_linkedin:{page.url}",
+        control=control,
+    )
 
 
 def _click_and_capture_external(page, control: ApplyControl, options: ResolverOptions) -> PageDecision:
@@ -609,9 +666,13 @@ def _click_and_capture_external(page, control: ApplyControl, options: ResolverOp
             if is_external_apply_url(popup.url):
                 return PageDecision(status="resolved_offsite", final_url=popup.url, control=control)
             popup_decision = classify_snapshot(_snapshot_page(popup))
-            if popup_decision.status in {"login_required", "challenge_required", "easy_apply", "unavailable"}:
+            if popup_decision.status in {"unresolved", "easy_apply", "unavailable"}:
                 return popup_decision
-            return PageDecision(status="no_apply_button", error=f"popup_stayed_on_linkedin:{popup.url}", control=control)
+            return unresolved_decision(
+                "outbound_still_source_platform",
+                error=f"popup_stayed_on_linkedin:{popup.url}",
+                control=control,
+            )
         finally:
             try:
                 popup.close()
