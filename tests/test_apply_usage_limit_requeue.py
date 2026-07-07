@@ -239,7 +239,7 @@ def test_greenhouse_owned_result_updates_launcher_metadata(monkeypatch):
     assert stats["last_tool"] == "greenhouse_adapter"
     assert stats["tool_calls_total"] == 0
     assert stats["application_tool_calls"] == 0
-    assert stats["failure_class"] == "malformed_result"
+    assert stats["failure_class"] == "adapter_no_confirmation"
 
 
 def test_session_limit_wording_with_no_tool_calls_is_retryable():
