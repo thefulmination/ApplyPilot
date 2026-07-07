@@ -101,6 +101,98 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
 
 
+def test_push_apply_rows_parks_untrusted_workday_hosts(fleet_db):
+    rows = [
+        {
+            "url": "job-workday",
+            "application_url": "https://adobe.wd5.myworkdayjobs.com/external/job/1",
+            "company": "Adobe",
+            "title": "Analyst",
+            "score": 8.5,
+            "apply_domain": "adobe.wd5.myworkdayjobs.com",
+            "target_host": "adobe.wd5.myworkdayjobs.com",
+            "dedup_key": "dedup-workday",
+        },
+        {
+            "url": "job-greenhouse",
+            "application_url": "https://boards.greenhouse.io/acme/jobs/1",
+            "company": "Acme",
+            "title": "Analyst",
+            "score": 8.5,
+            "apply_domain": "boards.greenhouse.io",
+            "target_host": "boards.greenhouse.io",
+            "dedup_key": "dedup-greenhouse",
+        },
+    ]
+
+    with pgqueue.connect(fleet_db) as pg:
+        result = sync.push_apply_rows(
+            pg, rows, approved_batch="b1", enforce_host_policy=True
+        )
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT url, status, apply_status, apply_error, approved_batch, "
+                "lane, target_host FROM apply_queue ORDER BY url"
+            )
+            queued = {row["url"]: row for row in cur.fetchall()}
+
+    assert result == {"pushed": 1, "parked": 1}
+    assert queued["job-greenhouse"]["status"] == "queued"
+    assert queued["job-greenhouse"]["apply_error"] is None
+    assert queued["job-greenhouse"]["approved_batch"] == "b1"
+    assert queued["job-greenhouse"]["lane"] == "ats"
+    assert queued["job-greenhouse"]["target_host"] == "boards.greenhouse.io"
+
+    assert queued["job-workday"]["status"] == "failed"
+    assert queued["job-workday"]["apply_status"] == "skipped"
+    assert queued["job-workday"]["apply_error"] == "host_policy:workday_tenant_requires_trust"
+    assert queued["job-workday"]["approved_batch"] == "b1"
+    assert queued["job-workday"]["target_host"] == "adobe.wd5.myworkdayjobs.com"
+
+
+def test_push_apply_eligible_parks_untrusted_workday_by_default(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(
+        sq,
+        "job-workday",
+        application_url="https://adobe.wd5.myworkdayjobs.com/external/job/1",
+        company="Adobe",
+        title="Analyst",
+        audit_score=8.5,
+    )
+    _add_job(
+        sq,
+        "job-greenhouse",
+        application_url="https://boards.greenhouse.io/acme/jobs/1",
+        company="Acme",
+        title="Analyst",
+        audit_score=8.5,
+    )
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="b1"
+        )
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT url, status, apply_status, apply_error, approved_batch, "
+                "lane, target_host FROM apply_queue ORDER BY url"
+            )
+            queued = {row["url"]: row for row in cur.fetchall()}
+
+    assert n == 1
+    assert queued["job-greenhouse"]["status"] == "queued"
+    assert queued["job-greenhouse"]["apply_error"] is None
+    assert queued["job-greenhouse"]["approved_batch"] == "b1"
+    assert queued["job-greenhouse"]["lane"] == "ats"
+    assert queued["job-greenhouse"]["target_host"] == "boards.greenhouse.io"
+    assert queued["job-workday"]["status"] == "failed"
+    assert queued["job-workday"]["apply_status"] == "skipped"
+    assert queued["job-workday"]["apply_error"] == "host_policy:workday_tenant_requires_trust"
+    assert queued["job-workday"]["approved_batch"] == "b1"
+    assert queued["job-workday"]["target_host"] == "adobe.wd5.myworkdayjobs.com"
+
+
 def test_push_apply_eligible_skips_applied_set_dedup(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://boards.greenhouse.io/acme/jobs/applied",
