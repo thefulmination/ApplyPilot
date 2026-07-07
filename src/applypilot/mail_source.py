@@ -37,6 +37,26 @@ class MailSourceError(Exception):
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
+def _status_text(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("ascii", errors="replace")
+    return str(value)
+
+
+def _imap_detail(data, fallback) -> str:
+    if data:
+        first = data[0]
+        if isinstance(first, bytes):
+            return first.decode(errors="replace")
+        return str(first)
+    return _status_text(fallback)
+
+
+def _ensure_ok(status, operation: str, data=None) -> None:
+    if _status_text(status).upper() != "OK":
+        raise MailSourceError(f"IMAP {operation} failed: {_imap_detail(data, status)}")
+
+
 def _decode_header_value(raw_value: str | None) -> str:
     """Decode an RFC 2047 encoded-word header (Subject/From) into plain text."""
     if not raw_value:
@@ -139,17 +159,13 @@ class ImapMailSource:
                 ) from exc
 
             status, data = imap.select("INBOX", readonly=True)
-            if status != "OK":
-                detail = data[0].decode(errors="replace") if data else status
-                raise MailSourceError(f"IMAP select failed: {detail}")
+            _ensure_ok(status, "select", data)
 
             since_date = (
                 datetime.date.today() - datetime.timedelta(days=since_days)
             ).strftime("%d-%b-%Y")
             status, data = imap.search(None, "SINCE", since_date)
-            if status != "OK":
-                detail = data[0].decode(errors="replace") if data else status
-                raise MailSourceError(f"IMAP search failed: {detail}")
+            _ensure_ok(status, "search", data)
 
             ids: list[bytes | str] = []
             if data and data[0]:
@@ -165,8 +181,7 @@ class ImapMailSource:
             for msg_id in newest_ids:
                 uid = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
                 status, fetch_data = imap.fetch(uid, "(RFC822)")
-                if status != "OK":
-                    raise MailSourceError(f"IMAP fetch failed for message {uid}")
+                _ensure_ok(status, f"fetch for message {uid}", fetch_data)
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
                     raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")

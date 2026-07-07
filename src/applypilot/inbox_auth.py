@@ -527,6 +527,13 @@ def _received_at_dt(raw: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _received_at_in_window(raw: str | None, *, cutoff: datetime) -> bool:
+    received = _received_at_dt(raw)
+    if received is None:
+        return False
+    return received >= cutoff
+
+
 def scan_gmail_for_auth_codes(
     *,
     service=None,
@@ -547,8 +554,7 @@ def scan_gmail_for_auth_codes(
         matches: list[AuthEmailMatch] = []
         filtered = []
         for m in messages[: max(0, int(max_messages or 0)) or None]:
-            received = _received_at_dt(m.date)
-            if received is not None and received < cutoff:
+            if not _received_at_in_window(m.date, cutoff=cutoff):
                 continue
             filtered.append(m)
         for m in filtered:
@@ -592,8 +598,7 @@ def scan_gmail_for_auth_codes(
         subject = hdrs.get("subject", "")
         sender = hdrs.get("from", "")
         received_at = hdrs.get("date")
-        received = _received_at_dt(received_at)
-        if received is not None and received < cutoff:
+        if not _received_at_in_window(received_at, cutoff=cutoff):
             continue
         body = _payload_text(payload)
 
