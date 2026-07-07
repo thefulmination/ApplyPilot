@@ -558,6 +558,20 @@ def _snapshot_page(page) -> PageSnapshot:
     return PageSnapshot(url=page.url, text=text, controls=controls)
 
 
+def _is_browser_closed_error(message: str) -> bool:
+    text = message.lower()
+    return any(
+        token in text
+        for token in (
+            "target page, context or browser has been closed",
+            "context or browser has been closed",
+            "browser has been closed",
+            "context closed",
+            "browser closed",
+        )
+    )
+
+
 def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOptions) -> PageDecision:
     page = None
     try:
@@ -576,12 +590,12 @@ def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOp
             return _click_and_capture_external(page, decision.control, options)
         return decision
     except PlaywrightTimeoutError:
-        return PageDecision(status="timeout", error="page_timeout")
+        return unresolved_decision("page_unreachable", error="page_timeout")
     except Exception as exc:
         message = str(exc)
-        if "context or browser has been closed" in message or "target page" in message.lower():
-            return PageDecision(status="browser_error", error="browser_context_closed")
-        return PageDecision(status="error", error=str(exc)[:200])
+        if _is_browser_closed_error(message):
+            return unresolved_decision("page_unreachable", error="browser_context_closed")
+        return unresolved_decision("dom_unreadable", error=str(exc)[:200])
     finally:
         if page is not None:
             try:
@@ -629,7 +643,12 @@ def _locator_for_control(page, control: ApplyControl):
     raise ValueError(f"ambiguous_apply_control:{control_text}")
 
 
-def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
+def _same_tab_decision_after_click(
+    page,
+    control: ApplyControl,
+    *,
+    before_click_url: str | None = None,
+) -> PageDecision:
     try:
         page.wait_for_load_state("domcontentloaded", timeout=3000)
     except Exception:
@@ -640,6 +659,18 @@ def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
         pass
     if is_external_apply_url(page.url):
         return PageDecision(status="resolved_offsite", final_url=page.url, control=control)
+    if is_linkedin_url(page.url) and page.url != before_click_url:
+        return unresolved_decision(
+            "outbound_still_source_platform",
+            error=f"same_tab_stayed_on_linkedin:{page.url}",
+            control=control,
+        )
+    if page.url == before_click_url:
+        return unresolved_decision(
+            "outbound_not_observed",
+            error=f"same_tab_no_navigation:{page.url}",
+            control=control,
+        )
 
     decision = classify_snapshot(_snapshot_page(page))
     if decision.status in {"unresolved", "easy_apply", "unavailable"}:
@@ -652,6 +683,7 @@ def _same_tab_decision_after_click(page, control: ApplyControl) -> PageDecision:
 
 
 def _click_and_capture_external(page, control: ApplyControl, options: ResolverOptions) -> PageDecision:
+    before_click_url = getattr(page, "url", None)
     try:
         locator = _locator_for_control(page, control)
         with page.expect_popup(timeout=options.click_timeout_ms) as popup_info:
@@ -665,6 +697,12 @@ def _click_and_capture_external(page, control: ApplyControl, options: ResolverOp
                 pass
             if is_external_apply_url(popup.url):
                 return PageDecision(status="resolved_offsite", final_url=popup.url, control=control)
+            if is_linkedin_url(popup.url):
+                return unresolved_decision(
+                    "outbound_still_source_platform",
+                    error=f"popup_stayed_on_linkedin:{popup.url}",
+                    control=control,
+                )
             popup_decision = classify_snapshot(_snapshot_page(popup))
             if popup_decision.status in {"unresolved", "easy_apply", "unavailable"}:
                 return popup_decision
@@ -679,9 +717,12 @@ def _click_and_capture_external(page, control: ApplyControl, options: ResolverOp
             except Exception:
                 pass
     except PlaywrightTimeoutError:
-        return _same_tab_decision_after_click(page, control)
+        return _same_tab_decision_after_click(page, control, before_click_url=before_click_url)
     except Exception as exc:
-        return PageDecision(status="error", error=str(exc)[:200], control=control)
+        message = str(exc)
+        if _is_browser_closed_error(message):
+            return unresolved_decision("page_unreachable", error="browser_context_closed", control=control)
+        return unresolved_decision("dom_unreadable", error=message[:200], control=control)
 
 
 def _merge_summaries(summaries: Sequence[ResolverSummary]) -> ResolverSummary:

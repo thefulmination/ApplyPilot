@@ -971,14 +971,263 @@ def test_click_and_capture_external_fails_closed_on_ambiguous_control():
         linkedin_resolver.ResolverOptions(click_timeout_ms=1),
     )
 
-    assert decision.status == "error"
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "dom_unreadable"
+    assert decision.next_action == "retry_fresh_context"
     assert decision.error is not None
     assert "ambiguous_apply_control" in decision.error
     assert page.selector_locator.clicked is False
     assert page.text_locator.clicked is False
 
 
-def test_resolve_one_returns_error_when_browser_context_is_closed_before_page_creation():
+class _TimeoutPopup:
+    value = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc is None:
+            raise linkedin_resolver.PlaywrightTimeoutError("no popup observed")
+        return False
+
+
+class _NoPopupPage(_FakeLocatorPage):
+    def __init__(self, *, url: str, after_click_url: str | None = None):
+        super().__init__(selector_count=1, text_count=1)
+        self.url = url
+        self._after_click_url = after_click_url
+
+    def expect_popup(self, **kwargs):
+        return _TimeoutPopup()
+
+    def wait_for_load_state(self, *args, **kwargs):
+        if self._after_click_url:
+            self.url = self._after_click_url
+
+
+def test_click_timeout_records_outbound_not_observed():
+    page = _NoPopupPage(url="https://www.linkedin.com/jobs/view/no-popup")
+
+    decision = linkedin_resolver._click_and_capture_external(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        linkedin_resolver.ResolverOptions(click_timeout_ms=1),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "outbound_not_observed"
+    assert decision.next_action == "retry_with_network_capture"
+    assert decision.error == "same_tab_no_navigation:https://www.linkedin.com/jobs/view/no-popup"
+
+
+def test_same_tab_stays_source_platform_records_outbound_still_source_platform():
+    page = _NoPopupPage(
+        url="https://www.linkedin.com/jobs/view/start",
+        after_click_url="https://www.linkedin.com/jobs/view/start?trk=public_jobs_apply-link-offsite",
+    )
+
+    decision = linkedin_resolver._click_and_capture_external(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        linkedin_resolver.ResolverOptions(click_timeout_ms=1),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "outbound_still_source_platform"
+    assert decision.next_action == "run_url_unwrapper"
+    assert decision.error == (
+        "same_tab_stayed_on_linkedin:"
+        "https://www.linkedin.com/jobs/view/start?trk=public_jobs_apply-link-offsite"
+    )
+
+
+class _PopupContext:
+    def __init__(self, popup):
+        self.value = popup
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _LinkedInEasyApplyPopup:
+    url = "https://www.linkedin.com/jobs/view/456"
+
+    def __init__(self):
+        self.closed = False
+
+    def wait_for_load_state(self, *args, **kwargs):
+        pass
+
+    def locator(self, selector):
+        return _FakeLocator(count=1, text="Easy Apply", href=None)
+
+    def evaluate(self, *args, **kwargs):
+        return [{"text": "Easy Apply", "href": "", "selector": "button.easy-apply"}]
+
+    def close(self):
+        self.closed = True
+
+
+class _PopupPage(_FakeLocatorPage):
+    url = "https://www.linkedin.com/jobs/view/start"
+
+    def __init__(self, popup):
+        super().__init__(selector_count=1, text_count=1)
+        self.popup = popup
+
+    def expect_popup(self, **kwargs):
+        return _PopupContext(self.popup)
+
+
+def test_popup_stays_source_platform_before_easy_apply_dom_classification():
+    popup = _LinkedInEasyApplyPopup()
+    page = _PopupPage(popup)
+
+    decision = linkedin_resolver._click_and_capture_external(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        linkedin_resolver.ResolverOptions(click_timeout_ms=1),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "outbound_still_source_platform"
+    assert decision.next_action == "run_url_unwrapper"
+    assert decision.error == "popup_stayed_on_linkedin:https://www.linkedin.com/jobs/view/456"
+    assert decision.control is not None
+    assert popup.closed is True
+
+
+def test_resolve_one_timeout_is_page_unreachable():
+    class TimeoutPage:
+        def goto(self, *args, **kwargs):
+            raise linkedin_resolver.PlaywrightTimeoutError("navigation timeout")
+
+        def close(self):
+            pass
+
+    class TimeoutContext:
+        def new_page(self):
+            return TimeoutPage()
+
+    decision = linkedin_resolver._resolve_one_with_context(
+        TimeoutContext(),
+        linkedin_resolver.Candidate(
+            url="https://www.linkedin.com/jobs/view/page-timeout",
+            title=None,
+            company=None,
+            application_url=None,
+            audit_label="recommended",
+            audit_score=None,
+            fit_score=None,
+        ),
+        linkedin_resolver.ResolverOptions(),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "page_unreachable"
+    assert decision.next_action == "retry_later"
+    assert decision.error == "page_timeout"
+
+
+def test_resolve_one_snapshot_failure_is_dom_unreadable():
+    class BodyLocator:
+        def inner_text(self, *args, **kwargs):
+            return "Chief of Staff"
+
+    class SnapshotFailurePage:
+        url = "https://www.linkedin.com/jobs/view/snapshot-failure"
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def wait_for_load_state(self, *args, **kwargs):
+            pass
+
+        def locator(self, selector):
+            return BodyLocator()
+
+        def evaluate(self, *args, **kwargs):
+            raise RuntimeError("dom evaluate failed")
+
+        def close(self):
+            pass
+
+    class SnapshotFailureContext:
+        def new_page(self):
+            return SnapshotFailurePage()
+
+    decision = linkedin_resolver._resolve_one_with_context(
+        SnapshotFailureContext(),
+        linkedin_resolver.Candidate(
+            url="https://www.linkedin.com/jobs/view/snapshot-failure",
+            title=None,
+            company=None,
+            application_url=None,
+            audit_label="recommended",
+            audit_score=None,
+            fit_score=None,
+        ),
+        linkedin_resolver.ResolverOptions(),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "dom_unreadable"
+    assert decision.next_action == "retry_fresh_context"
+    assert decision.error == "dom evaluate failed"
+
+
+def test_resolve_one_generic_target_page_snapshot_failure_is_dom_unreadable():
+    class BodyLocator:
+        def inner_text(self, *args, **kwargs):
+            return "Chief of Staff"
+
+    class SnapshotFailurePage:
+        url = "https://www.linkedin.com/jobs/view/generic-target-page-snapshot-failure"
+
+        def goto(self, *args, **kwargs):
+            pass
+
+        def wait_for_load_state(self, *args, **kwargs):
+            pass
+
+        def locator(self, selector):
+            return BodyLocator()
+
+        def evaluate(self, *args, **kwargs):
+            raise RuntimeError("target page selector failed")
+
+        def close(self):
+            pass
+
+    class SnapshotFailureContext:
+        def new_page(self):
+            return SnapshotFailurePage()
+
+    decision = linkedin_resolver._resolve_one_with_context(
+        SnapshotFailureContext(),
+        linkedin_resolver.Candidate(
+            url="https://www.linkedin.com/jobs/view/generic-target-page-snapshot-failure",
+            title=None,
+            company=None,
+            application_url=None,
+            audit_label="recommended",
+            audit_score=None,
+            fit_score=None,
+        ),
+        linkedin_resolver.ResolverOptions(),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "dom_unreadable"
+    assert decision.next_action == "retry_fresh_context"
+    assert decision.error == "target page selector failed"
+
+
+def test_resolve_one_returns_page_unreachable_when_browser_context_is_closed_before_page_creation():
     class ClosedContext:
         def new_page(self):
             raise RuntimeError("Target page, context or browser has been closed")
@@ -997,7 +1246,74 @@ def test_resolve_one_returns_error_when_browser_context_is_closed_before_page_cr
         linkedin_resolver.ResolverOptions(),
     )
 
-    assert decision.status == "browser_error"
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "page_unreachable"
+    assert decision.next_action == "retry_later"
+    assert decision.error == "browser_context_closed"
+
+
+def test_resolve_one_browser_has_been_closed_is_page_unreachable():
+    class ClosedContext:
+        def new_page(self):
+            raise RuntimeError("Browser has been closed")
+
+    decision = linkedin_resolver._resolve_one_with_context(
+        ClosedContext(),
+        linkedin_resolver.Candidate(
+            url="https://www.linkedin.com/jobs/view/browser-closed",
+            title=None,
+            company=None,
+            application_url=None,
+            audit_label="recommended",
+            audit_score=None,
+            fit_score=None,
+        ),
+        linkedin_resolver.ResolverOptions(),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "page_unreachable"
+    assert decision.next_action == "retry_later"
+    assert decision.error == "browser_context_closed"
+
+
+def test_click_and_capture_generic_target_page_error_is_dom_unreadable():
+    class ClickSelectorFailurePage(_FakeLocatorPage):
+        def expect_popup(self, **kwargs):
+            return _PopupContext(None)
+
+    page = ClickSelectorFailurePage(selector_count=1, text_count=1)
+    page.selector_locator._click_error = RuntimeError("target page selector failed")
+
+    decision = linkedin_resolver._click_and_capture_external(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        linkedin_resolver.ResolverOptions(click_timeout_ms=1),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "dom_unreadable"
+    assert decision.next_action == "retry_fresh_context"
+    assert decision.error == "target page selector failed"
+
+
+def test_click_and_capture_context_closed_is_page_unreachable():
+    class ClickClosedPage(_FakeLocatorPage):
+        def expect_popup(self, **kwargs):
+            return _PopupContext(None)
+
+    page = ClickClosedPage(selector_count=1, text_count=1)
+    page.selector_locator._click_error = RuntimeError("Context closed")
+
+    decision = linkedin_resolver._click_and_capture_external(
+        page,
+        linkedin_resolver.ApplyControl(text="Apply", href=None, selector="button.apply"),
+        linkedin_resolver.ResolverOptions(click_timeout_ms=1),
+    )
+
+    assert decision.status == "unresolved"
+    assert decision.unresolved_kind == "page_unreachable"
+    assert decision.next_action == "retry_later"
     assert decision.error == "browser_context_closed"
 
 
