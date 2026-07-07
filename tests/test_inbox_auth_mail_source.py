@@ -85,22 +85,31 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
     assert via_messages[0].candidate.confidence == via_service[0].candidate.confidence
 
 
-def test_scan_gmail_for_auth_codes_messages_path_dedupes_by_thread():
+def test_scan_gmail_for_auth_codes_messages_path_keeps_distinct_same_thread_codes():
     common = dict(
         subject="Verify your email",
         sender="no-reply@greenhouse.io",
-        date="Mon, 01 Jan 2024 12:00:00 +0000",
-        body="Use verification code 111222 to continue.",
+        thread_id="dup",
     )
     msgs = [
-        MailMessage(id="a", thread_id="dup", **common),
-        MailMessage(id="b", thread_id="dup", **common),
+        MailMessage(
+            id="a",
+            date="Mon, 01 Jan 2024 12:00:00 +0000",
+            body="Use verification code 111222 to continue.",
+            **common,
+        ),
+        MailMessage(
+            id="b",
+            date="Mon, 01 Jan 2024 12:02:00 +0000",
+            body="Use verification code 333444 to continue.",
+            **common,
+        ),
     ]
 
     matches = inbox_auth.scan_gmail_for_auth_codes(messages=msgs)
 
-    assert len(matches) == 1
-    assert matches[0].message_id == "a"
+    assert [m.message_id for m in matches] == ["a", "b"]
+    assert [m.candidate.value for m in matches] == ["111222", "333444"]
 
 
 def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):

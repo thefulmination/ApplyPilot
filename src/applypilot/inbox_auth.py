@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import re
 import sqlite3
 import time
@@ -30,6 +31,11 @@ KNOWN_ATS_DOMAINS = {
     "oracle.com",
     "workday.com",
     "greenhouse-mail.io",
+    "adp.com",
+    "workforcenow.adp.com",
+    "amazon.jobs",
+    "jobs.amazon.com",
+    "eightfold.ai",
 }
 
 VERIFY_WORDS = {
@@ -305,7 +311,7 @@ def _extract_magic_link_drafts(
 
 
 def _combined_text(subject: str, body: str) -> str:
-    return f"{subject or ''}\n{body or ''}"
+    return re.sub(r"\s+", " ", html.unescape(f"{subject or ''}\n{body or ''}"))
 
 
 def _normalize_domain(domain: str) -> str:
@@ -525,12 +531,7 @@ def scan_gmail_for_auth_codes(
     """
     if messages is not None:
         matches: list[AuthEmailMatch] = []
-        seen_threads: set[str] = set()
         for m in messages:
-            thread_id = m.thread_id or m.id
-            if thread_id in seen_threads:
-                continue
-            seen_threads.add(thread_id)
             matches.extend(
                 _high_confidence_matches(
                     message_id=m.id,
@@ -558,13 +559,7 @@ def scan_gmail_for_auth_codes(
     )
 
     matches = []
-    seen_threads = set()
     for ref in gmail_messages:
-        thread_id = ref.get("threadId", ref["id"])
-        if thread_id in seen_threads:
-            continue
-        seen_threads.add(thread_id)
-
         msg = (
             service.users()
             .messages()

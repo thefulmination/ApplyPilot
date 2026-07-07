@@ -375,3 +375,42 @@ def test_accepts_greenhouse_alphanumeric_security_code() -> None:
     assert candidates[0].kind == "code"
     assert candidates[0].value == "2NxdKLd2"
     assert candidates[0].confidence == "high"
+
+
+def test_accepts_adp_verification_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Here's your verification code from ADP",
+        body="&nbsp;Verification code&nbsp;" + (" " * 180) + "123456&nbsp;This code expires in 15 minutes.",
+        sender="<SecurityServices_NoReply@adp.com>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_amazon_jobs_verification_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Your Amazon Jobs verification code",
+        body="Use verification code 123456 to continue your application.",
+        sender="Amazon Jobs <no-reply@jobs.amazon.com>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"
+
+
+def test_accepts_eightfold_verification_code() -> None:
+    candidates = extract_verification_candidates(
+        subject="Your verification code",
+        body="Use verification code 123456 to continue your application.",
+        sender="Morgan Stanley Careers <no-reply@eightfold.ai>",
+    )
+
+    assert candidates
+    assert candidates[0].kind == "code"
+    assert candidates[0].value == "123456"
+    assert candidates[0].confidence == "high"
