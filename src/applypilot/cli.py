@@ -703,8 +703,9 @@ def apply_cost_report_command(
     sqlite_path: Optional[str] = typer.Option(None, "--sqlite", help="Local ApplyPilot SQLite brain path."),
 ) -> None:
     """Print quality-adjusted apply cost and success metrics."""
-    _bootstrap()
+    from applypilot.config import load_env
 
+    load_env()
     from applypilot.fleet.cost_quality_report import build_report, render_report_markdown
 
     report = build_report(pg_dsn=pg_dsn, sqlite_path=sqlite_path)

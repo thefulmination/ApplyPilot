@@ -203,7 +203,8 @@ def fetch_fleet_queue_rows(pg_dsn: str) -> list[dict]:
 
 
 def fetch_local_job_rows(sqlite_path: str | Path) -> list[dict]:
-    conn = sqlite3.connect(sqlite_path)
+    uri = Path(sqlite_path).expanduser().resolve(strict=False).as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
@@ -219,6 +220,8 @@ def fetch_local_job_rows(sqlite_path: str | Path) -> list[dict]:
 
 
 def default_sqlite_path() -> Path:
+    if os.environ.get("APPLYPILOT_DB_PATH"):
+        return Path(os.environ["APPLYPILOT_DB_PATH"])
     return Path(os.environ.get("LOCALAPPDATA", "")) / "ApplyPilot" / "applypilot.db"
 
 
@@ -248,8 +251,8 @@ def render_report_markdown(report: CostQualityReport) -> str:
     local = report.local
     ats_keys = sorted(set(local.by_ats) | set(fleet.by_ats))
     failure_keys = sorted(
-        fleet.by_failure_bucket,
-        key=lambda key: (-fleet.by_failure_bucket[key].cost, key),
+        set(fleet.by_failure_bucket) | set(local.by_failure_bucket),
+        key=lambda key: (-(fleet.by_failure_bucket.get(key) or FailureBucket()).cost, key),
     )
 
     lines = [
@@ -304,11 +307,12 @@ def render_report_markdown(report: CostQualityReport) -> str:
 
     if failure_keys:
         for bucket in failure_keys:
-            fleet_item = fleet.by_failure_bucket[bucket]
+            fleet_item = fleet.by_failure_bucket.get(bucket)
             local_item = local.by_failure_bucket.get(bucket, FailureBucket())
+            fleet_count = fleet_item.count if fleet_item else 0
+            fleet_cost = _fmt_money(fleet_item.cost) if fleet_item else "n/a"
             lines.append(
-                f"| {bucket} | {fleet_item.count} | {_fmt_money(fleet_item.cost)} | "
-                f"{local_item.count} |"
+                f"| {bucket} | {fleet_count} | {fleet_cost} | {local_item.count} |"
             )
     else:
         lines.append("| n/a | 0 | n/a | 0 |")

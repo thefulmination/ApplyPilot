@@ -1,8 +1,16 @@
 from decimal import Decimal
+import sqlite3
 
 from applypilot.fleet.cost_quality_report import (
+    CostQualityReport,
+    FailureBucket,
+    FleetQueueSummary,
+    LocalJobsSummary,
     classify_ats,
     classify_failure_bucket,
+    default_sqlite_path,
+    fetch_local_job_rows,
+    render_report_markdown,
     summarize_fleet_queue,
     summarize_local_jobs,
 )
@@ -136,3 +144,37 @@ def test_summarize_local_jobs_counts_non_terminal_touched_rows_in_success_rate()
     summary = summarize_local_jobs(rows)
 
     assert summary.by_ats["ashby"].success_pct == 50.0
+
+
+def test_default_sqlite_path_prefers_applypilot_db_path(monkeypatch, tmp_path):
+    db_path = tmp_path / "custom.db"
+
+    monkeypatch.setenv("APPLYPILOT_DB_PATH", str(db_path))
+
+    assert default_sqlite_path() == db_path
+
+
+def test_fetch_local_job_rows_opens_missing_database_read_only(tmp_path):
+    missing_db = tmp_path / "missing.db"
+
+    try:
+        fetch_local_job_rows(missing_db)
+    except sqlite3.OperationalError:
+        pass
+    else:
+        raise AssertionError("missing read-only SQLite database should fail")
+
+    assert not missing_db.exists()
+
+
+def test_render_report_markdown_includes_local_only_failure_bucket():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(
+            by_failure_bucket={"email_auth_related": FailureBucket(count=3)}
+        ),
+    )
+
+    rendered = render_report_markdown(report)
+
+    assert "| email_auth_related | 0 | n/a | 3 |" in rendered
