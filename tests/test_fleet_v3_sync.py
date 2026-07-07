@@ -150,6 +150,133 @@ def test_push_apply_rows_parks_untrusted_workday_hosts(fleet_db):
     assert queued["job-workday"]["target_host"] == "adobe.wd5.myworkdayjobs.com"
 
 
+def test_push_apply_rows_leaves_active_and_terminal_workday_conflicts_untouched(fleet_db):
+    rows = [
+        {
+            "url": "job-workday-leased",
+            "application_url": "https://adobe.wd5.myworkdayjobs.com/external/job/1",
+            "company": "Adobe",
+            "title": "Analyst",
+            "score": 8.5,
+            "apply_domain": "adobe.wd5.myworkdayjobs.com",
+            "target_host": "adobe.wd5.myworkdayjobs.com",
+            "dedup_key": "dedup-workday-leased",
+        },
+        {
+            "url": "job-workday-applied",
+            "application_url": "https://adobe.wd5.myworkdayjobs.com/external/job/2",
+            "company": "Adobe",
+            "title": "Senior Analyst",
+            "score": 8.5,
+            "apply_domain": "adobe.wd5.myworkdayjobs.com",
+            "target_host": "adobe.wd5.myworkdayjobs.com",
+            "dedup_key": "dedup-workday-applied",
+        },
+    ]
+
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, company, title, application_url, score, apply_domain, target_host, "
+                "lane, dedup_key, approved_batch, status, lease_owner, lease_expires_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,'ats',%s,%s,'leased',%s,now() + interval '30 minutes')",
+                (
+                    "job-workday-leased",
+                    "Adobe",
+                    "Analyst",
+                    "https://adobe.wd5.myworkdayjobs.com/external/job/1",
+                    8.5,
+                    "adobe.wd5.myworkdayjobs.com",
+                    "adobe.wd5.myworkdayjobs.com",
+                    "dedup-workday-leased",
+                    "old-batch",
+                    "w-active",
+                ),
+            )
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, company, title, application_url, score, apply_domain, target_host, "
+                "lane, dedup_key, approved_batch, status, apply_status, applied_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,'ats',%s,%s,'applied','applied',now())",
+                (
+                    "job-workday-applied",
+                    "Adobe",
+                    "Senior Analyst",
+                    "https://adobe.wd5.myworkdayjobs.com/external/job/2",
+                    8.5,
+                    "adobe.wd5.myworkdayjobs.com",
+                    "adobe.wd5.myworkdayjobs.com",
+                    "dedup-workday-applied",
+                    "old-batch",
+                ),
+            )
+        pg.commit()
+
+        result = sync.push_apply_rows(
+            pg, rows, approved_batch="b1", enforce_host_policy=True
+        )
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT url, status, apply_status, apply_error, lease_owner, "
+                "lease_expires_at, approved_batch FROM apply_queue ORDER BY url"
+            )
+            queued = {row["url"]: row for row in cur.fetchall()}
+
+    assert result == {"pushed": 0, "parked": 0}
+    leased = queued["job-workday-leased"]
+    assert leased["status"] == "leased"
+    assert leased["lease_owner"] == "w-active"
+    assert leased["lease_expires_at"] is not None
+    assert leased["apply_status"] is None
+    assert leased["apply_error"] is None
+    assert leased["approved_batch"] == "old-batch"
+
+    applied = queued["job-workday-applied"]
+    assert applied["status"] == "applied"
+    assert applied["apply_status"] == "applied"
+    assert applied["apply_error"] is None
+    assert applied["approved_batch"] == "old-batch"
+
+
+def test_push_apply_rows_allows_trusted_workday_hosts(fleet_db):
+    rows = [
+        {
+            "url": "job-workday",
+            "application_url": "https://adobe.wd5.myworkdayjobs.com/external/job/1",
+            "company": "Adobe",
+            "title": "Analyst",
+            "score": 8.5,
+            "apply_domain": "adobe.wd5.myworkdayjobs.com",
+            "target_host": "adobe.wd5.myworkdayjobs.com",
+            "dedup_key": "dedup-workday",
+        },
+    ]
+
+    with pgqueue.connect(fleet_db) as pg:
+        result = sync.push_apply_rows(
+            pg,
+            rows,
+            approved_batch="b1",
+            enforce_host_policy=True,
+            trusted_hosts={"adobe.wd5.myworkdayjobs.com": "canary"},
+        )
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT status, apply_status, apply_error, approved_batch, lane, target_host "
+                "FROM apply_queue WHERE url='job-workday'"
+            )
+            queued = cur.fetchone()
+
+    assert result == {"pushed": 1, "parked": 0}
+    assert queued["status"] == "queued"
+    assert queued["apply_status"] is None
+    assert queued["apply_error"] is None
+    assert queued["approved_batch"] == "b1"
+    assert queued["lane"] == "ats"
+    assert queued["target_host"] == "adobe.wd5.myworkdayjobs.com"
+
+
 def test_push_apply_eligible_parks_untrusted_workday_by_default(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(

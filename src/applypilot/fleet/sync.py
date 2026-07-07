@@ -172,6 +172,7 @@ def push_apply_rows(
     *,
     approved_batch: str | None = None,
     enforce_host_policy: bool = False,
+    trusted_hosts: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Push prepared ATS rows, parking rows that are not safe for unattended apply."""
     from applypilot.fleet.host_policy import decide_host_policy
@@ -179,7 +180,7 @@ def push_apply_rows(
     allowed: list[dict[str, Any]] = []
     parked = []
     for row in rows:
-        decision = decide_host_policy(row.get("application_url"))
+        decision = decide_host_policy(row.get("application_url"), trusted_hosts=trusted_hosts)
         if enforce_host_policy and not decision.unattended_allowed:
             parked.append((row, decision))
         else:
@@ -213,7 +214,7 @@ def push_apply_rows(
                 "approved_batch=COALESCE(EXCLUDED.approved_batch, apply_queue.approved_batch), "
                 "status=EXCLUDED.status, apply_status=EXCLUDED.apply_status, "
                 "apply_error=EXCLUDED.apply_error, updated_at=now() "
-                "WHERE apply_queue.status IN ('queued','leased')",
+                "WHERE apply_queue.status='queued'",
                 {
                     "url": row.get("url"),
                     "company": row.get("company"),
@@ -293,6 +294,8 @@ def push_apply_eligible(
             })
             if limit and len(out) >= limit:
                 break
+        # Phase 1 keeps tenant trust loading out of the SQLite push path; untrusted
+        # Workday rows stay supervised until a trusted-host source is wired here.
         result = push_apply_rows(pg, out, approved_batch=approved_batch, enforce_host_policy=True)
         return result["pushed"]
     finally:
