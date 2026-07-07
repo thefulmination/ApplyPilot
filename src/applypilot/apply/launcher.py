@@ -1674,6 +1674,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 "failure_class": (
                     None if status == "applied" else "adapter_no_confirmation"
                 ),
+                "safe_requeue": False,
+                "worker_level_failure": False,
                 "application_tool_calls": 0,
                 "tool_calls_total": 0,
                 "last_tool": "greenhouse_adapter",

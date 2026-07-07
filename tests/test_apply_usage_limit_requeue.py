@@ -240,6 +240,55 @@ def test_greenhouse_owned_result_updates_launcher_metadata(monkeypatch):
     assert stats["tool_calls_total"] == 0
     assert stats["application_tool_calls"] == 0
     assert stats["failure_class"] == "adapter_no_confirmation"
+    assert stats["safe_requeue"] is False
+    assert stats["worker_level_failure"] is False
+    assert stats["adapter_name"] == "greenhouse"
+    assert stats["adapter_plan_ready"] is True
+
+
+def test_apply_fn_forwards_adapter_metadata_from_launcher_stats(monkeypatch):
+    from applypilot.apply import chrome
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(
+        launcher,
+        "run_job",
+        lambda job, port, worker_id, model, agent: ("failed:no_confirmation", 42),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_last_run_stats",
+        {
+            5: {
+                "route": "adapter_submit:greenhouse",
+                "failure_class": "adapter_no_confirmation",
+                "tool_calls_total": 0,
+                "application_tool_calls": 0,
+                "last_tool": "greenhouse_adapter",
+                "safe_requeue": False,
+                "worker_level_failure": False,
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": True,
+                "cost_usd": 0,
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+
+    out = awm.make_apply_fn("sonnet", "claude", slot=5)(_job())
+
+    assert out["route"] == "adapter_submit:greenhouse"
+    assert out["failure_class"] == "adapter_no_confirmation"
+    assert out["last_tool"] == "greenhouse_adapter"
+    assert out["result_metadata"]["safe_requeue"] is False
+    assert out["result_metadata"]["worker_level_failure"] is False
+    assert out["result_metadata"]["adapter_name"] == "greenhouse"
+    assert out["result_metadata"]["adapter_plan_ready"] is True
 
 
 def test_session_limit_wording_with_no_tool_calls_is_retryable():

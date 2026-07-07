@@ -198,6 +198,8 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
                     "job_log": stats.get("job_log"),
                     "safe_requeue": stats.get("safe_requeue"),
                     "worker_level_failure": stats.get("worker_level_failure"),
+                    "adapter_name": stats.get("adapter_name"),
+                    "adapter_plan_ready": stats.get("adapter_plan_ready"),
                 },
             })
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
