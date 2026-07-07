@@ -58,6 +58,20 @@ def test_relay_mode_timeout_returns_none(monkeypatch):
     assert launcher._poll_inbox_auth_hint({"url": "j", "application_url": "https://greenhouse.io/a"}) is None
 
 
+def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "relay")
+
+    assert launcher._should_prearm_inbox_auth({
+        "url": "https://indeed.com/viewjob?jk=1",
+        "application_url": "https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions/preview/83866",
+    })
+    assert not launcher._should_prearm_inbox_auth({
+        "url": "https://remotejobs.org/remote-jobs/account-manager-readymode",
+        "application_url": "https://remotejobs.org/remote-jobs/account-manager-readymode",
+    })
+
+
 def test_local_mode_unchanged_when_disabled(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_INBOX_AUTH", raising=False)  # disabled entirely
     assert launcher._poll_inbox_auth_hint({"url": "j", "application_url": "https://greenhouse.io/a"}) is None

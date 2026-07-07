@@ -2041,8 +2041,16 @@ def _should_prearm_inbox_auth(job: dict) -> bool:
     if not _inbox_auth_enabled() or _inbox_auth_mode() != "relay":
         return False
     try:
+        from urllib.parse import urlparse
+
         apply_target = job.get("application_url") or job.get("url")
-        return bool(config.is_auth_gated_application(apply_target))
+        url_lower = (apply_target or "").lower()
+        host = (urlparse(apply_target or "").hostname or "").lower()
+        sites_cfg = config.load_sites_config()
+        auth_cfg = sites_cfg.get("auth_gated", {}) or {}
+        domains = [str(d).lower() for d in (auth_cfg.get("domains", []) or [])]
+        domains.extend(str(d).lower() for d in config.load_blocked_sso())
+        return any(d and (d in host or d in url_lower) for d in domains)
     except Exception:
         logger.debug("Could not evaluate inbox auth pre-arm eligibility", exc_info=True)
         return False
