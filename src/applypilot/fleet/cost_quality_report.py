@@ -1,12 +1,15 @@
-"""Pure cost-quality aggregation for fleet apply reporting.
+"""Cost-quality aggregation and reporting for fleet apply metrics.
 
-This module intentionally accepts already-loaded row dictionaries and performs
-no database reads or writes. Callers decide where rows come from.
+The summarize_* helpers intentionally accept already-loaded row dictionaries so
+their behavior stays independent from the live database fetch helpers below.
 """
 from __future__ import annotations
 
+import os
+import sqlite3
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
@@ -179,6 +182,138 @@ def summarize_local_jobs(rows: Iterable[dict]) -> LocalJobsSummary:
         by_ats=dict(sorted(by_ats.items())),
         by_failure_bucket=dict(sorted(by_failure_bucket.items())),
     )
+
+
+def fetch_fleet_queue_rows(pg_dsn: str) -> list[dict]:
+    from psycopg.rows import dict_row
+    import psycopg
+
+    with psycopg.connect(pg_dsn, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                status::text AS status,
+                apply_error,
+                application_url,
+                COALESCE(est_cost_usd, 0) AS est_cost_usd
+            FROM apply_queue
+            """
+        ).fetchall()
+    return list(rows)
+
+
+def fetch_local_job_rows(sqlite_path: str | Path) -> list[dict]:
+    conn = sqlite3.connect(sqlite_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT apply_status, apply_error, application_url
+            FROM jobs
+            WHERE apply_status IS NOT NULL
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def default_sqlite_path() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA", "")) / "ApplyPilot" / "applypilot.db"
+
+
+def build_report(
+    *,
+    pg_dsn: str | None = None,
+    sqlite_path: str | Path | None = None,
+) -> CostQualityReport:
+    pg_dsn = pg_dsn or os.environ.get("FLEET_PG_DSN") or (
+        "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+    )
+    local_path = sqlite_path if sqlite_path is not None else default_sqlite_path()
+    return CostQualityReport(
+        fleet=summarize_fleet_queue(fetch_fleet_queue_rows(pg_dsn)),
+        local=summarize_local_jobs(fetch_local_job_rows(local_path)),
+    )
+
+
+def _fmt_money(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"${value:.4f}"
+
+
+def render_report_markdown(report: CostQualityReport) -> str:
+    fleet = report.fleet
+    local = report.local
+    ats_keys = sorted(set(local.by_ats) | set(fleet.by_ats))
+    failure_keys = sorted(
+        fleet.by_failure_bucket,
+        key=lambda key: (-fleet.by_failure_bucket[key].cost, key),
+    )
+
+    lines = [
+        "# Apply Cost Quality Report",
+        "",
+        "## Fleet Cost",
+        "",
+        f"- Applied: {fleet.applied}",
+        f"- Terminal attempts: {fleet.terminal_attempts}",
+        f"- Queued or leased: {fleet.queued_or_leased}",
+        f"- Total recorded cost: {_fmt_money(fleet.total_cost_usd)}",
+        "- All-in cost per successful apply: "
+        f"{_fmt_money(fleet.cost_per_applied_all_in if fleet.applied else None)}",
+        "- Cost per terminal attempt: "
+        f"{_fmt_money(fleet.cost_per_terminal_attempt if fleet.terminal_attempts else None)}",
+        "",
+        "## Local History",
+        "",
+        f"- Touched: {local.touched}",
+        f"- Applied: {local.applied}",
+        "",
+        "## ATS History",
+        "",
+        "| ATS | Local touched | Local applied | Local success | Fleet attempts | Fleet applied | Fleet cost/apply |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    if ats_keys:
+        for ats in ats_keys:
+            local_item = local.by_ats.get(ats, CountCost())
+            fleet_item = fleet.by_ats.get(ats, CountCost())
+            fleet_cost_per_apply = (
+                fleet_item.cost_per_applied if fleet_item.applied else None
+            )
+            lines.append(
+                f"| {ats} | {local_item.count} | {local_item.applied} | "
+                f"{local_item.success_pct:.1f}% | {fleet_item.terminal} | "
+                f"{fleet_item.applied} | {_fmt_money(fleet_cost_per_apply)} |"
+            )
+    else:
+        lines.append("| n/a | 0 | 0 | 0.0% | 0 | 0 | n/a |")
+
+    lines.extend(
+        [
+            "",
+            "## Failure Buckets",
+            "",
+            "| Bucket | Fleet failures | Fleet cost | Local failures |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+
+    if failure_keys:
+        for bucket in failure_keys:
+            fleet_item = fleet.by_failure_bucket[bucket]
+            local_item = local.by_failure_bucket.get(bucket, FailureBucket())
+            lines.append(
+                f"| {bucket} | {fleet_item.count} | {_fmt_money(fleet_item.cost)} | "
+                f"{local_item.count} |"
+            )
+    else:
+        lines.append("| n/a | 0 | n/a | 0 |")
+
+    return "\n".join(lines) + "\n"
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
