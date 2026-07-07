@@ -15,6 +15,34 @@ def test_usage_limit_before_application_tools_is_safe_requeue():
     assert result.safe_requeue is True
 
 
+def test_short_usage_limit_before_application_tools_is_safe_requeue():
+    evidence = FailureEvidence(
+        status="failed:no_result_line",
+        transcript="usage limit",
+        application_tool_calls=0,
+        tool_calls_total=0,
+    )
+
+    result = classify_apply_failure(evidence)
+
+    assert result.failure_class == "usage_or_session_limit"
+    assert result.safe_requeue is True
+
+
+def test_short_session_limit_before_application_tools_is_safe_requeue():
+    evidence = FailureEvidence(
+        status="failed:no_result_line",
+        transcript="session limit",
+        application_tool_calls=0,
+        tool_calls_total=0,
+    )
+
+    result = classify_apply_failure(evidence)
+
+    assert result.failure_class == "usage_or_session_limit"
+    assert result.safe_requeue is True
+
+
 def test_usage_limit_after_browser_tool_is_not_safe_requeue():
     evidence = FailureEvidence(
         status="failed:no_result_line",

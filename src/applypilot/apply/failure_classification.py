@@ -17,6 +17,8 @@ _CDP_LOST_NEEDLES = (
 )
 
 _USAGE_OR_SESSION_LIMIT_NEEDLES = (
+    "usage limit",
+    "session limit",
     "hit your usage limit",
     "hit your session limit",
     "hit your weekly limit",
