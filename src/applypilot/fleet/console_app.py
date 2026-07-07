@@ -44,6 +44,7 @@ from typing import Any
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
+from applypilot.fleet import compute_home_main as compute_home
 from applypilot.fleet import queue as _queue
 from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor (S1: scrub on READ too)
 
@@ -52,6 +53,415 @@ _HB_ALIVE_SECONDS = 150          # apply workers beat ~every tick; >150s stale =
 _INFERRED_WINDOW_SECONDS = 300   # fallback only (unused: apply workers DO beat)
 _LOG_LAST_ERROR_CAP = 4000       # mirror the worker write caps on read (S3)
 _LOG_RECENT_CAP = 8000
+_MACHINE_NAME_FALLBACK = {"home": "home", "m2": "tarpon", "m4": "gggtower"}
+_BROWSER_ISSUE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("browser backend crashed", ("browser backend crashed", "browser process crashed", "backend crashed")),
+    ("browser service unavailable", ("browser service unavailable", "service unavailable", "browser down")),
+    ("playwright/mcp disconnected", ("playwright", "mcp", "disconnected", "browser disconnected")),
+    ("file chooser crash", ("file chooser", "filechooser",)),
+    ("connection refused", ("connection refused", "[errno 111]", "could not connect")),
+    ("timeout after browser action", ("timeout after", "browser timeout", "timed out waiting for")),
+    ("captcha solver unsupported", ("captcha solver unsupported", "unsupported captcha", "captcha-solver")),
+    ("CAPTCHA present", ("captcha", "visible_captcha", "hcaptcha")),
+    ("login gate", ("login required", "login gate", "sign-in required", "please sign in")),
+    ("email/OTP verification", ("otp", "verification code", "email verification", "2fa", "two-factor")),
+    ("employer application cap", ("application cap", "employer application cap", "application limit reached")),
+    ("usage limit", ("usage limit", "usage-limit", "account limit")),
+    ("no result line", ("no result line", "could not extract", "no result")),
+]
+_BROWSER_BACKEND_ISSUES = {
+    "browser backend crashed",
+    "browser service unavailable",
+    "playwright/mcp disconnected",
+    "file chooser crash",
+    "connection refused",
+    "timeout after browser action",
+}
+_BROWSER_MANUAL_ISSUES = {
+    "CAPTCHA present",
+    "login gate",
+    "email/OTP verification",
+}
+_BROWSER_OPERATOR_LIMIT_ISSUES = {
+    "captcha solver unsupported",
+    "employer application cap",
+    "usage limit",
+    "no result line",
+}
+_BROWSER_ISSUE_GUIDANCE = {
+    "browser backend crashed": "Restart that worker's browser subsystem (worker restart usually recovers).",
+    "browser service unavailable": "Check Playwright/browser backend service health on that host; restart if unavailable.",
+    "playwright/mcp disconnected": "Verify backend process and transport channel between worker and browser; recycle worker profile.",
+    "file chooser crash": "Pause and restart the worker; resume when the environment can open file dialogs.",
+    "connection refused": "Check whether the browser backend host/port is reachable and restart affected automation stack.",
+    "timeout after browser action": "Browser action is stalling; inspect the worker's recent log tail for the failing page.",
+    "CAPTCHA present": "Resolve captcha/login in worker session and reopen lane once solved.",
+    "login gate": "Manually resolve login gate or rotate auth profile for that worker.",
+    "email/OTP verification": "Open challenge triage and complete OTP/email verification for affected rows.",
+    "captcha solver unsupported": "Skip or manually solve this host; the automated browser cannot handle this captcha path.",
+    "employer application cap": "Skip this job or host group; the employer or board is refusing more applications.",
+    "usage limit": "Switch the worker model/account or wait for the reset time before re-queueing affected rows.",
+    "no result line": "Inspect the worker log and adapter path; the apply agent ended without a terminal RESULT line.",
+}
+_FROZEN_LEASE_THRESHOLD = "300 days"
+_HISTORICAL_MACHINE_LABEL = "historical/no owner recorded"
+_APPLY_LLM_TASKS = ("apply", "apply_agent")
+_DEADMAN_SEVERITY = {
+    "critical": 0,
+    "warning": 1,
+    "warn": 1,
+    "info": 2,
+}
+_DEADMAN_KIND_DETAILS: dict[str, tuple[str, str, str]] = {
+    "silent_death": (
+        "No apply worker heartbeat",
+        "No apply worker heartbeat has been recorded recently; the apply lane may be down or disconnected.",
+        "severe",
+    ),
+    "stalled_queue": (
+        "Queued backlog is stalled",
+        "Approved backlog is not converting into applied rows; workers may be blocked, parked, or no longer making forward progress.",
+        "severe",
+    ),
+    "selfheal_dead": (
+        "Fleet self-healer is unavailable",
+        "Watchdog/Doctor recovery loop is not healthy; stalled queues will not auto-heal.",
+        "severe",
+    ),
+    "otp_relay_down": (
+        "OTP relay is unavailable",
+        "Email-2FA relay is not healthy; jobs waiting on email verification will stall.",
+        "severe",
+    ),
+    "running_hot": (
+        "Daily spend is running hot",
+        "24h spend has been near or above cap threshold; continue cautiously and watch the cap.",
+        "warn",
+    ),
+}
+
+
+def _parse_deadman_alert(raw: Any) -> list[tuple[str, str]]:
+    """Parse ``deadman_alert`` string into (code, detail) tuples."""
+    if not raw:
+        return []
+    if not isinstance(raw, str):
+        return []
+    items: list[tuple[str, str]] = []
+    for part in raw.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            kind, detail = part.split(":", 1)
+            kind = kind.strip()
+            detail = detail.strip()
+        else:
+            kind = part.strip()
+            detail = part.strip()
+        if kind:
+            items.append((kind, detail))
+    # Keep one row per kind, preferring first-seen details where duplicates appear.
+    unique: dict[str, str] = {}
+    for kind, detail in items:
+        unique.setdefault(kind, detail)
+    return [(kind, detail) for kind, detail in unique.items()]
+
+
+def _classify_deadman(kind: str, detail: str) -> dict[str, str]:
+    known = kind in _DEADMAN_KIND_DETAILS
+    title, reason, severity = _DEADMAN_KIND_DETAILS.get(kind, (
+        f"Unknown DeadMan alert: {kind}",
+        (
+            f"Unhandled watchdog alert '{kind}' was raised"
+            + (f" with detail: {detail}" if detail else ".")
+        ),
+        "warn",
+    ))
+    if detail:
+        detail_text = detail.strip()
+        if known and detail_text and detail_text.lower() not in reason.lower():
+            reason = f"{reason} ({detail_text})"
+    return {"kind": kind, "title": title, "reason": reason, "detail": detail, "severity": severity}
+
+
+def _model_family(model: str | None) -> str:
+    if not model:
+        return "unknown"
+    m = str(model).lower()
+    if "claude" in m or "sonnet" in m or "haiku" in m or "opus" in m:
+        return "claude"
+    if "gpt" in m or "codex" in m or "deepseek" in m or "gemini" in m or "qwen" in m or "llama" in m or "mixtral" in m:
+        return "codex-like"
+    return "other"
+
+
+def _model_vendor(model: str | None) -> str:
+    if not model:
+        return "unknown"
+    m = str(model).lower()
+    if "claude" in m or "sonnet" in m or "haiku" in m or "opus" in m:
+        return "claude"
+    if "gpt" in m or "o1" in m or "o3" in m or "gpt-4" in m or "gpt-5" in m:
+        return "codex"
+    if "gemini" in m:
+        return "gemini"
+    if "deepseek" in m or "qwen" in m or "llama" in m or "mixtral" in m:
+        return "other"
+    return "other"
+
+
+def _machine_name_map() -> dict[str, str]:
+    raw = os.environ.get("APPLYPILOT_MACHINE_NAMES")
+    if not raw:
+        return dict(_MACHINE_NAME_FALLBACK)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return dict(_MACHINE_NAME_FALLBACK)
+    if not isinstance(parsed, dict):
+        return dict(_MACHINE_NAME_FALLBACK)
+    out: dict[str, str] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key.strip():
+            out[key.strip().lower()] = value.strip()
+    if out:
+        return out
+    return dict(_MACHINE_NAME_FALLBACK)
+
+
+def _machine_display_name(machine_owner: str | None) -> str:
+    if not machine_owner:
+        return "unknown"
+    m = str(machine_owner).strip()
+    if not m:
+        return "unknown"
+    name = _machine_name_map().get(m.lower())
+    if name:
+        return name
+    owner_prefix = m.split("-", 1)[0]
+    return _machine_name_map().get(owner_prefix.lower(), m)
+
+
+def _historical_machine_label(machine_owner: str | None) -> str:
+    if machine_owner:
+        return _machine_display_name(machine_owner)
+    return _HISTORICAL_MACHINE_LABEL
+
+
+def _latest_worker_llm_usage(conn, *, tasks: tuple[str, ...] = _APPLY_LLM_TASKS) -> dict[str, dict[str, Any]]:
+    """Latest per-worker LLM usage row for backfilling worker/model attribution."""
+    placeholders = ", ".join(["%s"] * len(tasks))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (worker_id)
+                worker_id,
+                machine_owner,
+                provider,
+                model,
+                ts
+            FROM llm_usage
+            WHERE worker_id IS NOT NULL
+              AND task IN (""" + placeholders + """)
+            ORDER BY worker_id, ts DESC, id DESC
+            """,
+            tuple(tasks),
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        wid = row.get("worker_id")
+        if not wid:
+            continue
+        out[str(wid)] = {
+            "machine_owner": row.get("machine_owner"),
+            "current_agent": row.get("provider"),
+            "current_model": row.get("model"),
+            "ts": row.get("ts"),
+        }
+    return out
+
+
+def _agent_parts(value: Any) -> list[str]:
+    if not value:
+        return []
+    if not isinstance(value, str):
+        return []
+    out = []
+    for token in value.split(","):
+        token = token.strip()
+        if token:
+            out.append(token)
+    return out
+
+
+def _agents_state() -> dict[str, Any]:
+    conn = pgqueue.connect()  # reads APPLYPILOT_FLEET_DSN / DATABASE_URL
+    try:
+        apply_placeholders = ", ".join(["%s"] * len(_APPLY_LLM_TASKS))
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT wh.worker_id, wh.machine_owner, wh.current_agent, wh.current_model, "
+                "wh.agent_chain, wh.last_agent_switch_at, wh.last_agent_switch_reason, "
+                "wh.state, wh.last_beat "
+                "FROM worker_heartbeat wh WHERE wh.role='apply'"
+            )
+            rows = [dict(r) if hasattr(r, "keys") else r for r in cur.fetchall()]
+
+            cur.execute(
+                "SELECT agent, blocked_until, reason, updated_at FROM agent_availability"
+            )
+            blocks_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT provider, model, COALESCE(COUNT(*),0) AS apply_calls, "
+                "COALESCE(SUM(cost_usd),0) AS spend_usd "
+                "FROM llm_usage "
+                f"WHERE ts >= now() - interval '24 hours' AND task IN ({apply_placeholders}) "
+                "GROUP BY provider, model"
+            , tuple(_APPLY_LLM_TASKS))
+            usage_rows = cur.fetchall()
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+    active_blocks: dict[str, dict[str, Any]] = {}
+    for row in blocks_rows:
+        if not row:
+            continue
+        agent = row["agent"] if hasattr(row, "keys") or isinstance(row, dict) else row[0]
+        blocked_until = row["blocked_until"] if hasattr(row, "keys") or isinstance(row, dict) else row[1]
+        reason = row["reason"] if hasattr(row, "keys") or isinstance(row, dict) else row[2]
+        updated_at = row["updated_at"] if hasattr(row, "keys") or isinstance(row, dict) else row[3]
+        if blocked_until is not None and blocked_until > _utcnow():
+            active_blocks[agent] = {
+                "blocked_until": _iso(blocked_until),
+                "reason": reason,
+                "updated_at": _iso(updated_at),
+            }
+
+    usage_by_agent: dict[str, dict[str, Any]] = {}
+    for row in usage_rows:
+        if not row:
+            continue
+        agent = row["provider"] if hasattr(row, "keys") or isinstance(row, dict) else row[0]
+        model = row["model"] if hasattr(row, "keys") or isinstance(row, dict) else row[1]
+        if not agent:
+            continue
+        stat = usage_by_agent.setdefault(agent, {"apply_calls": 0, "spend_usd": 0.0, "models": {}})
+        stat["apply_calls"] += int((row["apply_calls"] if hasattr(row, "keys") or isinstance(row, dict) else row[2]) or 0)
+        stat["spend_usd"] += float((row["spend_usd"] if hasattr(row, "keys") or isinstance(row, dict) else row[3]) or 0)
+        if model:
+            stat["models"][model] = stat["models"].get(model, 0) + int((row["apply_calls"] if hasattr(row, "keys") or isinstance(row, dict) else row[2]) or 0)
+
+    workers: list[dict[str, Any]] = []
+    model_usage: dict[str, int] = {}
+    family_usage: dict[str, int] = {}
+    chain_workers = 0
+    switched_workers = 0
+    partial_workers = 0
+    blocked_workers = 0
+    model_missing_workers = 0
+    for r in rows:
+        row = dict(r) if hasattr(r, "keys") or isinstance(r, dict) else {
+            "worker_id": r[0], "machine_owner": r[1], "current_agent": r[2], "current_model": r[3],
+            "agent_chain": r[4], "last_agent_switch_at": r[5], "last_agent_switch_reason": r[6],
+            "state": r[7], "last_beat": r[8],
+        }
+        chain = _agent_parts(row.get("agent_chain"))
+        current_agent = row.get("current_agent")
+        verdict = "unknown"
+        if chain:
+            if len(chain) == 1:
+                if current_agent == chain[0]:
+                    verdict = "not triggered"
+                else:
+                    verdict = "misconfigured"
+            elif current_agent in chain:
+                blocked = [a for a in chain if a in active_blocks]
+                if blocked:
+                    if len(blocked) == len(chain):
+                        verdict = "blocked"
+                    elif current_agent == chain[0]:
+                        verdict = "partial"
+                    else:
+                        verdict = "working"
+                else:
+                    verdict = "not triggered" if current_agent == chain[0] else "working"
+            else:
+                verdict = "misconfigured"
+        blocks = []
+        if current_agent and current_agent in active_blocks:
+            block = active_blocks[current_agent].copy()
+            block["agent"] = current_agent
+            blocks.append(block)
+        if chain and len(chain) > 1:
+            chain_workers += 1
+        if current_agent and chain and current_agent != chain[0]:
+            switched_workers += 1
+        if verdict == "partial":
+            partial_workers += 1
+        if verdict == "blocked":
+            blocked_workers += 1
+        current_model = str(row.get("current_model") or "").strip()
+        if current_model:
+            model_usage[current_model] = model_usage.get(current_model, 0) + 1
+            fam = _model_family(current_model)
+            family_usage[fam] = family_usage.get(fam, 0) + 1
+        elif current_agent:
+            model_missing_workers += 1
+        workers.append({
+            "worker_id": row.get("worker_id"),
+            "machine": _machine_display_name(row.get("machine_owner")),
+            "machine_owner": row.get("machine_owner"),
+            "current_agent": current_agent,
+            "current_model": row.get("current_model"),
+            "current_model_family": _model_family(current_model),
+            "current_model_vendor": _model_vendor(current_model),
+            "agent_chain": chain,
+            "last_agent_switch_at": _iso(row.get("last_agent_switch_at")),
+            "last_switch_reason": row.get("last_agent_switch_reason"),
+            "switch_verdict": verdict,
+            "last_beat": _iso(row.get("last_beat")),
+            "state": row.get("state"),
+            "active_blocked_agents": [k for k in chain if k in active_blocks],
+            "agent_blocks": blocks,
+            "current_agent_stats": usage_by_agent.get(current_agent) if current_agent else None,
+        })
+
+    return {
+        "workers": workers,
+        "agent_blocks": {
+            k: {"blocked_until": v["blocked_until"], "reason": v["reason"], "updated_at": v["updated_at"]}
+            for k, v in active_blocks.items()
+        },
+        "agent_spend": {
+            k: {"apply_calls": int(v["apply_calls"]), "spend_usd": round(float(v["spend_usd"]), 6),
+                "models": dict(v["models"])}
+            for k, v in usage_by_agent.items()
+        },
+        "summary": {
+            "dynamic_workers": chain_workers,
+            "switched_workers": switched_workers,
+            "partial_workers": partial_workers,
+            "blocked_workers": blocked_workers,
+            "model_usage": dict(sorted(
+                model_usage.items(), key=lambda kv: kv[1], reverse=True
+            )),
+            "model_family_usage": dict(sorted(
+                family_usage.items(), key=lambda kv: kv[1], reverse=True
+            )),
+            "model_count": sum(model_usage.values()),
+            "model_missing_workers": model_missing_workers,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -73,10 +483,191 @@ def _seconds_since(ts: Any) -> int | None:
     return int((now - t).total_seconds())
 
 
+def _classify_browser_issue(text: Any) -> str | None:
+    if not text:
+        return None
+    if not isinstance(text, str):
+        return None
+    normalized = text.lower()
+    for issue, triggers in _BROWSER_ISSUE_PATTERNS:
+        if issue == "playwright/mcp disconnected":
+            if (
+                "browser disconnected" in normalized
+                or "playwright disconnected" in normalized
+                or "mcp disconnected" in normalized
+                or ("playwright" in normalized and "disconnected" in normalized)
+                or ("mcp" in normalized and "disconnected" in normalized)
+            ):
+                return issue
+            continue
+        for trigger in triggers:
+            if trigger in normalized:
+                return issue
+        # continue trying other issues if no trigger matches this one
+    return None
+
+
+def _summarize_browser_issue_rows(
+    issues: list[dict[str, Any]], tracked: set[str]
+) -> list[str]:
+    """Build compact ``issue (machines/models)`` summaries for status recommendations."""
+    by_issue: dict[str, list[str]] = {}
+    for issue in issues:
+        issue_name = issue.get("issue")
+        if issue_name not in tracked:
+            continue
+        model = issue.get("current_model") or "unknown model"
+        machine = issue.get("machine") or "unknown"
+        worker = issue.get("worker_id") or "worker"
+        age = issue.get("age")
+        age_text = f"{age}s ago" if isinstance(age, int) else "age unknown"
+        issue_key = f"{issue_name} on {machine}"
+        bucket = by_issue.setdefault(issue_key, [])
+        summary = f"{worker} ({model}, {age_text})"
+        if summary not in bucket:
+            bucket.append(summary)
+    return [f"{issue} [{'; '.join(details)}]" for issue, details in sorted(by_issue.items())]
+
+
+def _browser_issue_guidance(issues: list[dict[str, Any]], tracked: set[str]) -> list[str]:
+    guidance: list[str] = []
+    for issue in issues:
+        issue_name = issue.get("issue")
+        if issue_name not in tracked:
+            continue
+        hint = _BROWSER_ISSUE_GUIDANCE.get(str(issue_name))
+        if hint and hint not in guidance:
+            guidance.append(hint)
+    return guidance
+
+
+def _browser_health(conn) -> dict[str, Any]:
+    """Read-only browser/backend health from heartbeats.
+
+    We keep this lightweight (metadata, not full log dump) and only return the newest
+    issue signal per worker. The endpoint stays on /api/diagnostics, so no 4-second
+    status polling penalty.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT worker_id, machine_owner, role, state, last_beat, last_error, recent_log, "
+            "       current_agent, current_model "
+            "FROM worker_heartbeat ORDER BY worker_id"
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+
+    total = len(rows)
+    issues: list[dict[str, Any]] = []
+    by_issue: dict[str, int] = {}
+    for r in rows:
+        worker_issue = _classify_browser_issue(_scrub(r.get("last_error"))) or _classify_browser_issue(_scrub(r.get("recent_log")))
+        if worker_issue is None:
+            continue
+        by_issue[worker_issue] = by_issue.get(worker_issue, 0) + 1
+        issues.append({
+            "worker_id": r.get("worker_id"),
+            "machine": _machine_display_name(r.get("machine_owner")),
+            "role": r.get("role"),
+            "state": r.get("state"),
+            "issue": worker_issue,
+            "last_beat": _iso(r.get("last_beat")),
+            "age": _seconds_since(r.get("last_beat")),
+            "current_agent": r.get("current_agent"),
+            "current_model": r.get("current_model"),
+            "current_model_family": _model_family(r.get("current_model")),
+            "current_model_vendor": _model_vendor(r.get("current_model")),
+            "evidence": _scrub((r.get("last_error") or r.get("recent_log")) or "")[:250],
+        })
+    return {
+        "issues": issues,
+        "summary": {
+            "workers": total,
+            "problem_workers": len(issues),
+            "by_issue": by_issue,
+        },
+    }
+
+
+def _desired_machine_workers(conn) -> dict[str, int]:
+    """Optional desired worker counts by human-readable machine name.
+
+    Some installs have fleet_desired_state; older/test installs do not. Treat the table
+    as advisory telemetry only and keep /api/diagnosis available when it is absent.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('fleet_desired_state') AS rel")
+        if cur.fetchone()["rel"] is None:
+            conn.rollback()
+            return {}
+        cur.execute(
+            "SELECT machine_owner, desired_workers "
+            "FROM fleet_desired_state WHERE desired_workers > 0"
+        )
+        rows = cur.fetchall()
+    conn.rollback()
+
+    desired: dict[str, int] = {}
+    for row in rows:
+        name = _machine_display_name(row.get("machine_owner"))
+        desired[name] = desired.get(name, 0) + int(row.get("desired_workers") or 0)
+    return desired
+
+
+def _network_rollup(conn) -> dict[str, Any]:
+    """All-role worker_heartbeat rollup for fleet-network visibility."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT worker_id, machine_owner, role, state, last_beat "
+            "FROM worker_heartbeat ORDER BY worker_id"
+        )
+        rows = cur.fetchall()
+    conn.rollback()
+
+    machines: dict[str, dict[str, Any]] = {}
+    by_role: dict[str, int] = {}
+    alive_total = 0
+    stale_total = 0
+    for row in rows:
+        machine = _machine_display_name(row.get("machine_owner"))
+        role = row.get("role") or "unknown"
+        secs = _seconds_since(row.get("last_beat"))
+        alive = secs is not None and secs <= _HB_ALIVE_SECONDS
+        item = machines.setdefault(
+            machine,
+            {"workers": 0, "alive": 0, "stale": 0, "by_role": {}},
+        )
+        item["workers"] += 1
+        item["by_role"][role] = item["by_role"].get(role, 0) + 1
+        by_role[role] = by_role.get(role, 0) + 1
+        if alive:
+            item["alive"] += 1
+            alive_total += 1
+        else:
+            item["stale"] += 1
+            stale_total += 1
+
+    return {
+        "workers": len(rows),
+        "alive": alive_total,
+        "stale": stale_total,
+        "by_role": dict(sorted(by_role.items())),
+        "machines": {
+            name: {
+                "workers": int(data["workers"]),
+                "alive": int(data["alive"]),
+                "stale": int(data["stale"]),
+                "by_role": dict(sorted(data["by_role"].items())),
+            }
+            for name, data in sorted(machines.items())
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # READ: status snapshot (all queries via short-lived connection)
 # ---------------------------------------------------------------------------
-def _gate_and_queue(conn) -> tuple[dict, dict]:
+def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
     """fleet_config gate + apply_queue depth + leasable + spend, in one read txn.
 
     base_leasable is the approved queued pool before global stop gates.
@@ -85,7 +676,8 @@ def _gate_and_queue(conn) -> tuple[dict, dict]:
     spent_usd = SUM(est_cost_usd) over apply_queue (same SUM the cap halt uses)."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT paused, ats_paused, ats_pause_source, canary_enabled, canary_remaining, spend_cap_usd "
+            "SELECT paused, ats_paused, ats_pause_source, ats_apply_mode, "
+            "canary_enabled, canary_remaining, spend_cap_usd "
             "FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone() or {}
@@ -95,6 +687,36 @@ def _gate_and_queue(conn) -> tuple[dict, dict]:
 
         cur.execute("SELECT status, COUNT(*) AS n FROM apply_queue GROUP BY status")
         depth = {r["status"]: int(r["n"]) for r in cur.fetchall()}
+        cur.execute(
+            "SELECT COALESCE(lane, 'unknown') AS lane, status, COALESCE(COUNT(*),0) AS n "
+            "FROM apply_queue GROUP BY lane, status"
+        )
+        depth_by_lane: dict[str, dict[str, int]] = {}
+        for row in cur.fetchall():
+            lane = row["lane"]
+            status = row["status"]
+            if not lane:
+                lane = "unknown"
+            if lane not in depth_by_lane:
+                depth_by_lane[lane] = {}
+            depth_by_lane[lane][status] = int(row["n"])
+        cur.execute(
+            "SELECT COALESCE(lane, 'unknown') AS lane, "
+            "       COUNT(*) FILTER (WHERE status='leased') AS leased, "
+            "       COUNT(*) FILTER (WHERE status='leased' AND lease_expires_at IS NOT NULL "
+            f"                        AND lease_expires_at > now() + interval '{_FROZEN_LEASE_THRESHOLD}') AS parked_frozen, "
+            "       COUNT(*) FILTER (WHERE status='leased' AND (lease_expires_at IS NULL "
+            f"                        OR lease_expires_at <= now() + interval '{_FROZEN_LEASE_THRESHOLD}')) AS active_leased "
+            "FROM apply_queue GROUP BY lane"
+        )
+        lease_by_lane: dict[str, dict[str, int]] = {}
+        for row in cur.fetchall():
+            lane = row["lane"] or "unknown"
+            lease_by_lane[lane] = {
+                "leased": int(row.get("leased") or 0),
+                "parked_frozen": int(row.get("parked_frozen") or 0),
+                "active_leased": int(row.get("active_leased") or 0),
+            }
 
         cur.execute(
             "SELECT COUNT(*) AS n FROM apply_queue q "
@@ -102,22 +724,40 @@ def _gate_and_queue(conn) -> tuple[dict, dict]:
             "  AND NOT EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)"
         )
         base_leasable = int(cur.fetchone()["n"])
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM apply_queue q "
+            "WHERE q.status='queued' AND q.approved_batch IS NOT NULL "
+            "  AND EXISTS (SELECT 1 FROM applied_set a WHERE a.dedup_key = q.dedup_key)"
+        )
+        dedup_blocked = int(cur.fetchone()["n"])
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM apply_queue "
+            "WHERE status='queued' AND approved_batch IS NOT NULL"
+        )
+        approved = int(cur.fetchone()["n"])
     conn.rollback()  # read-only
 
     paused = bool(cfg.get("paused"))
     ats_paused = bool(cfg.get("ats_paused"))
+    ats_apply_mode = cfg.get("ats_apply_mode") or "stopped"
     canary_enabled = bool(cfg.get("canary_enabled"))
     canary_remaining = (int(cfg["canary_remaining"])
                         if cfg.get("canary_remaining") is not None else None)
     spend_cap = float(cfg.get("spend_cap_usd") or 0)
-    canary_exhausted = canary_enabled and not (canary_remaining is not None and canary_remaining > 0)
+    lane_stopped = ats_apply_mode == "stopped"
+    canary_exhausted = (
+        ats_apply_mode == "canary"
+        and (not canary_enabled or not (canary_remaining is not None and canary_remaining > 0))
+    )
     spend_halted = spend_cap > 0 and spent >= spend_cap
-    lease_gate_open = not (paused or ats_paused or canary_exhausted or spend_halted)
+    lease_gate_open = not (paused or ats_paused or lane_stopped or canary_exhausted or spend_halted)
     halt_reasons = []
     if paused:
         halt_reasons.append("paused")
     if ats_paused:
         halt_reasons.append("ats_paused")
+    if lane_stopped:
+        halt_reasons.append("ats_stopped")
     if canary_exhausted:
         halt_reasons.append("canary_exhausted")
     if spend_halted:
@@ -127,6 +767,7 @@ def _gate_and_queue(conn) -> tuple[dict, dict]:
         "paused": paused,
         "ats_paused": ats_paused,
         "ats_pause_source": cfg.get("ats_pause_source"),
+        "ats_apply_mode": ats_apply_mode,
         "canary_enabled": canary_enabled,
         "canary_remaining": canary_remaining,
         "spend_cap_usd": spend_cap,
@@ -140,12 +781,86 @@ def _gate_and_queue(conn) -> tuple[dict, dict]:
         "apply": {
             "queued": depth.get("queued", 0),
             "leased": depth.get("leased", 0),
+            "active_leased": lease_by_lane.get("ats", {}).get("active_leased", 0)
+            + lease_by_lane.get("unknown", {}).get("active_leased", 0)
+            + lease_by_lane.get("compute", {}).get("active_leased", 0),
+            "parked_frozen": lease_by_lane.get("ats", {}).get("parked_frozen", 0)
+            + lease_by_lane.get("unknown", {}).get("parked_frozen", 0)
+            + lease_by_lane.get("compute", {}).get("parked_frozen", 0),
             "applied": depth.get("applied", 0),
             "failed": depth.get("failed", 0) + depth.get("blocked", 0),
             "crash_unconfirmed": depth.get("crash_unconfirmed", 0),
+        "approved": approved,
+        "dedup_blocked": dedup_blocked,
+        "base_leasable": base_leasable,
+        "by_lane": {
+            "ats": {
+                "queued": depth_by_lane.get("ats", {}).get("queued", 0),
+                "leased": depth_by_lane.get("ats", {}).get("leased", 0),
+                "active_leased": lease_by_lane.get("ats", {}).get("active_leased", 0),
+                "parked_frozen": lease_by_lane.get("ats", {}).get("parked_frozen", 0),
+                "applied": depth_by_lane.get("ats", {}).get("applied", 0),
+            },
+            "compute": {
+                "queued": depth_by_lane.get("compute", {}).get("queued", 0),
+                "leased": depth_by_lane.get("compute", {}).get("leased", 0),
+                "active_leased": lease_by_lane.get("compute", {}).get("active_leased", 0),
+                "parked_frozen": lease_by_lane.get("compute", {}).get("parked_frozen", 0),
+                "applied": depth_by_lane.get("compute", {}).get("applied", 0),
+            },
+            "other": {
+                "queued": depth_by_lane.get("unknown", {}).get("queued", 0),
+                "leased": depth_by_lane.get("unknown", {}).get("leased", 0),
+                "active_leased": lease_by_lane.get("unknown", {}).get("active_leased", 0),
+                "parked_frozen": lease_by_lane.get("unknown", {}).get("parked_frozen", 0),
+                "applied": depth_by_lane.get("unknown", {}).get("applied", 0),
+            },
         }
     }
-    return gate, queue
+    }
+    if paused:
+        apply_state = {
+            "code": "paused",
+            "severity": "halted",
+            "reason": "Fleet is paused by the shared kill switch.",
+        }
+    elif ats_paused:
+        apply_state = {
+            "code": "ats_paused",
+            "severity": "halted",
+            "reason": "ATS lane is paused.",
+        }
+    elif canary_exhausted:
+        apply_state = {
+            "code": "ats_canary_exhausted",
+            "severity": "halted",
+            "reason": "ATS canary is exhausted.",
+        }
+    elif spend_halted:
+        apply_state = {
+            "code": "spend_cap_reached",
+            "severity": "halted",
+            "reason": "Spend cap reached; leasing is temporarily halted.",
+        }
+    elif gate["leasable"] > 0:
+        apply_state = {
+            "code": "ready_to_apply",
+            "severity": "ok",
+            "reason": "Leaseable ATS jobs are available.",
+        }
+    elif approved > 0 and dedup_blocked >= approved:
+        apply_state = {
+            "code": "ready_jobs_not_leaseable",
+            "severity": "warn",
+            "reason": "Queued approved ATS rows are blocked by dedup; no new leaseable jobs.",
+        }
+    else:
+        apply_state = {
+            "code": "no_leaseable_jobs",
+            "severity": "warn",
+            "reason": "No leaseable ATS jobs are available.",
+        }
+    return gate, queue, apply_state
 
 
 def _workers(conn) -> list[dict]:
@@ -159,10 +874,13 @@ def _workers(conn) -> list[dict]:
     so it would be a misleading permanent 0. apply_queue.worker_id is set on every
     terminal write by pgqueue.write_result, so this count is real."""
     out: list[dict] = []
+    latest_usage = _latest_worker_llm_usage(conn)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT wh.worker_id, wh.state, wh.role, wh.current_job, "
-            "       wh.sw_version, wh.last_beat, aq.company AS cur_company, aq.title AS cur_title, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.state, wh.role, wh.current_job, "
+            "       wh.sw_version, wh.last_beat, wh.current_agent, wh.current_model, "
+            "       wh.agent_chain, wh.last_agent_switch_at, wh.last_agent_switch_reason, "
+            "       aq.company AS cur_company, aq.title AS cur_title, "
             "       (SELECT COUNT(*) FROM apply_queue done "
             "          WHERE done.worker_id = wh.worker_id "
             "            AND done.status = 'applied') AS applied_n "
@@ -176,17 +894,31 @@ def _workers(conn) -> list[dict]:
     for r in rows:
         secs = _seconds_since(r["last_beat"])
         alive = secs is not None and secs <= _HB_ALIVE_SECONDS
+        usage = latest_usage.get(str(r.get("worker_id") or ""))
+        machine_owner = r.get("machine_owner") or (usage or {}).get("machine_owner")
+        current_agent = r.get("current_agent") or (usage or {}).get("current_agent")
+        current_model = r.get("current_model") or (usage or {}).get("current_model")
         current = None
         if r["current_job"] and r["state"] == "applying":
             current = {"company": r["cur_company"], "title": r["cur_title"]}
         out.append({
             "worker_id": r["worker_id"],
+            "machine": _machine_display_name(machine_owner),
+            "machine_owner": machine_owner,
             "alive": bool(alive),
+            "state": r.get("state"),
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
             "lane": r["role"],
             "sw_version": r.get("sw_version"),
             "applied": int(r["applied_n"] or 0),
+            "current_agent": current_agent,
+            "current_model": current_model,
+            "current_model_family": _model_family(current_model),
+            "current_model_vendor": _model_vendor(current_model),
+            "agent_chain": r.get("agent_chain"),
+            "last_agent_switch_at": _iso(r["last_agent_switch_at"]),
+            "last_agent_switch_reason": r.get("last_agent_switch_reason"),
             "current": current,
         })
     return out
@@ -263,7 +995,8 @@ def _linkedin_summary(conn) -> dict:
         cur.execute("SELECT status, COUNT(*) AS n FROM linkedin_queue GROUP BY status")
         depth = {r["status"]: int(r["n"]) for r in cur.fetchall()}
         cur.execute(
-            "SELECT linkedin_canary_enabled FROM fleet_config WHERE id=1"
+            "SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canary_remaining "
+            "FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone() or {}
         cur.execute(
@@ -278,8 +1011,619 @@ def _linkedin_summary(conn) -> dict:
     return {
         "queued": depth.get("queued", 0),
         "applied": depth.get("applied", 0),
+        "apply_mode": cfg.get("linkedin_apply_mode") or "stopped",
         "canary_enabled": bool(cfg.get("linkedin_canary_enabled")),
+        "canary_remaining": cfg.get("linkedin_canary_remaining"),
         "halted": bool(halted),
+    }
+
+
+def _deadman_status(conn) -> dict:
+    """READ-ONLY watchdog summary for the operator-facing diagnosis surface."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT deadman_alert, deadman_alert_at FROM fleet_config WHERE id=1")
+        cfg = cur.fetchone() or {}
+    conn.rollback()  # read-only
+    alert = cfg.get("deadman_alert")
+    code = None
+    title = None
+    reason = None
+    alerts = []
+    top: dict[str, str] | None = None
+    deadman_items = _parse_deadman_alert(alert)
+    if deadman_items:
+        for kind, detail in deadman_items:
+            classified = _classify_deadman(kind, detail)
+            alerts.append(classified)
+            if top is None:
+                top = classified
+            elif _DEADMAN_SEVERITY.get(classified["severity"], 9) < _DEADMAN_SEVERITY.get(top.get("severity", "warn"), 9):
+                top = classified
+    if alert:
+        code = top.get("kind") if top is not None else deadman_items[0][0]
+        title = top.get("title") if top is not None else f"Deadman alert: {code}"
+        reason = top.get("reason") if top is not None else (deadman_items[0][1] if deadman_items else str(alert))
+    return {
+        "active": bool(alert),
+        "code": code,
+        "title": title,
+        "reason": reason,
+        "alerts": alerts,
+        "alert": _scrub(alert)[:300] if alert else None,
+        "alert_at": _iso(cfg.get("deadman_alert_at")),
+    }
+
+
+def _agent_routing_summary(conn, workers: list[dict]) -> dict:
+    """READ-ONLY model/agent summary for the top diagnosis surface."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT agent, blocked_until FROM agent_availability")
+        block_rows = cur.fetchall()
+    conn.rollback()  # read-only
+
+    active_blocks = {
+        r["agent"]
+        for r in block_rows
+        if r.get("agent") and r.get("blocked_until") is not None and r["blocked_until"] > _utcnow()
+    }
+    model_usage: dict[str, int] = {}
+    family_usage: dict[str, int] = {}
+    dynamic_workers = 0
+    switched_workers = 0
+    partial_workers = 0
+    blocked_workers = 0
+    model_missing_workers = 0
+    for worker in workers:
+        chain = _agent_parts(worker.get("agent_chain"))
+        current_agent = worker.get("current_agent")
+        if len(chain) > 1:
+            dynamic_workers += 1
+        if current_agent and chain and current_agent != chain[0]:
+            switched_workers += 1
+        if chain:
+            blocked = [agent for agent in chain if agent in active_blocks]
+            if blocked:
+                if len(blocked) == len(chain):
+                    blocked_workers += 1
+                elif current_agent == chain[0]:
+                    partial_workers += 1
+        current_model = str(worker.get("current_model") or "").strip()
+        if current_model:
+            model_usage[current_model] = model_usage.get(current_model, 0) + 1
+            family = _model_family(current_model)
+            family_usage[family] = family_usage.get(family, 0) + 1
+        elif current_agent:
+            model_missing_workers += 1
+
+    return {
+        "workers": len(workers),
+        "dynamic_workers": dynamic_workers,
+        "switched_workers": switched_workers,
+        "partial_workers": partial_workers,
+        "blocked_workers": blocked_workers,
+        "active_agent_blocks": sorted(active_blocks),
+        "model_usage": dict(sorted(model_usage.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "model_family_usage": dict(sorted(family_usage.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "model_count": sum(model_usage.values()),
+        "model_missing_workers": model_missing_workers,
+    }
+
+
+def _compute_summary(conn) -> dict:
+    """READ-ONLY compute/scoring health for the operator diagnosis surface."""
+    try:
+        return compute_home.status_report(pg_conn=conn, task="score")
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {
+            "task": "score",
+            "unavailable": True,
+            "error": _scrub(str(exc))[:200],
+            "context": {"version": "", "resume_chars": 0, "kg_chars": 0},
+            "queue": {},
+            "active_workers": {"total": 0, "by_state": {}},
+            "score_workers": {
+                "expected": None,
+                "cap": None,
+                "active": 0,
+                "within_expected": None,
+                "by_owner": {},
+                "recent_done_15m": 0,
+                "recent_failed_15m": 0,
+                "recent_rate_limited_15m": 0,
+                "failure_rate_15m": None,
+            },
+            "bad_reasoning_unsynced_done": 0,
+            "eta_seconds": None,
+            "recent_done_15m": 0,
+        }
+
+
+def _throughput_forecast(conn, gate: dict, workers: list[dict]) -> dict:
+    """READ-ONLY lightweight apply-throughput forecast for the diagnosis surface."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT "
+            "COUNT(*) FILTER (WHERE status='applied' AND applied_at >= now() - interval '1 hour') AS applied_1h, "
+            "COUNT(*) FILTER (WHERE status='applied' AND applied_at >= now() - interval '24 hours') AS applied_24h, "
+            "MAX(applied_at) FILTER (WHERE status='applied') AS last_applied "
+            "FROM apply_queue"
+        )
+        apply_stats = cur.fetchone() or {}
+        cur.execute("SELECT COUNT(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
+        challenge_stats = cur.fetchone() or {}
+    conn.rollback()  # read-only
+
+    applied_1h = int(apply_stats.get("applied_1h") or 0)
+    applied_24h = int(apply_stats.get("applied_24h") or 0)
+    live_apply_workers = sum(1 for row in workers if row.get("alive"))
+    leaseable = int(gate.get("leasable") or 0)
+    estimated_per_hour = float(applied_1h)
+    eta_hours = None
+    if estimated_per_hour > 0 and leaseable > 0:
+        eta_hours = round(leaseable / estimated_per_hour, 2)
+    return {
+        "applies_last_1h": applied_1h,
+        "applies_last_24h": applied_24h,
+        "live_apply_workers": live_apply_workers,
+        "leaseable_jobs": leaseable,
+        "open_challenges": int(challenge_stats.get("n") or 0),
+        "estimated_applies_per_hour": estimated_per_hour,
+        "eta_hours_to_exhaust_leaseable": eta_hours,
+        "last_successful_apply_at": _iso(apply_stats.get("last_applied")),
+        "assumption": "Estimated rate uses confirmed applies in the last hour; ETA is blank until at least one recent apply exists.",
+    }
+
+
+def _daily_goals(conn, gate: dict) -> dict:
+    """READ-ONLY optional daily target strip for the diagnosis surface."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM information_schema.columns "
+            "  WHERE table_name='fleet_config' AND column_name='daily_apply_target'"
+            ") AS has_target"
+        )
+        has_target = bool((cur.fetchone() or {}).get("has_target"))
+        if has_target:
+            cur.execute("SELECT daily_apply_target FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone() or {}
+            target = cfg.get("daily_apply_target")
+        else:
+            target = None
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM apply_queue "
+            "WHERE status='applied' "
+            "AND applied_at >= (date_trunc('day', now() AT TIME ZONE 'America/New_York') "
+            "                   AT TIME ZONE 'America/New_York')"
+        )
+        applied_today = int((cur.fetchone() or {}).get("n") or 0)
+    conn.rollback()  # read-only
+
+    target_today = int(target) if target is not None else None
+    remaining = max(target_today - applied_today, 0) if target_today is not None else None
+    return {
+        "configured": target_today is not None,
+        "message": "Daily target active" if target_today is not None else "No daily target configured",
+        "applied_today": applied_today,
+        "target_today": target_today,
+        "remaining_target": remaining,
+        "canary_remaining": gate.get("canary_remaining"),
+        "projected_shortfall": remaining,
+    }
+
+
+def _data_freshness(conn, *, endpoint: str = "diagnosis") -> dict:
+    """READ-ONLY freshness rollup for the diagnosis endpoint and major dashboard panels."""
+    generated_at = _utcnow()
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(last_beat) AS ts FROM worker_heartbeat")
+        worker_ts = (cur.fetchone() or {}).get("ts")
+        cur.execute("SELECT MAX(applied_at) AS ts FROM apply_queue WHERE status='applied'")
+        apply_ts = (cur.fetchone() or {}).get("ts")
+        cur.execute("SELECT MAX(discovered_at) AS ts FROM discovered_postings")
+        discovery_ts = (cur.fetchone() or {}).get("ts")
+        cur.execute("SELECT MAX(updated_at) AS ts FROM compute_queue")
+        compute_ts = (cur.fetchone() or {}).get("ts")
+        cur.execute("SELECT updated_at AS ts FROM fleet_config WHERE id=1")
+        config_ts = (cur.fetchone() or {}).get("ts")
+    conn.rollback()  # read-only
+
+    return {
+        "endpoint": endpoint,
+        "generated_at": _iso(generated_at),
+        "last_worker_beat_at": _iso(worker_ts),
+        "last_apply_at": _iso(apply_ts),
+        "last_discovery_at": _iso(discovery_ts),
+        "last_compute_at": _iso(compute_ts),
+        "config_updated_at": _iso(config_ts),
+        "ages": {
+            "last_worker_beat_seconds": _seconds_since(worker_ts),
+            "last_apply_seconds": _seconds_since(apply_ts),
+            "last_discovery_seconds": _seconds_since(discovery_ts),
+            "last_compute_seconds": _seconds_since(compute_ts),
+            "config_updated_seconds": _seconds_since(config_ts),
+        },
+    }
+
+
+def _status_recommendation(
+    *,
+    gate: dict,
+    queue_apply: dict,
+    apply_state: dict,
+    workers: list[dict],
+    linkedin: dict,
+    discovery: dict | None,
+    doctor_sig: dict | None,
+    agents: dict,
+    browser: dict,
+) -> dict[str, str]:
+    """Small next-action summary for the fast /api/status poll."""
+    deadman_alert = (doctor_sig or {}).get("deadman_alert")
+    if deadman_alert:
+        deadman_entries = _parse_deadman_alert(deadman_alert)
+        summary_parts = []
+        deadman_reason = "Fleet deadman is signaling an alert."
+        for kind, detail in deadman_entries:
+            classified = _classify_deadman(kind, detail or "")
+            summary_parts.append(f"{classified['title']}: {classified['reason']}")
+            if not deadman_reason and classified.get("reason"):
+                deadman_reason = classified["reason"]
+        if summary_parts:
+            deadman_reason = summary_parts[0]
+        if summary_parts:
+            if len(summary_parts) > 1:
+                deadman_reason += " (+ multiple alerts)"
+                deadman_reason += f" (+ {len(summary_parts)-1} additional)"
+        return {
+            "title": "Investigate DeadMan alert",
+            "severity": "severe",
+            "reason": deadman_reason,
+        }
+
+    backend_issue_count = sum(
+        1 for issue in browser.get("issues", []) if issue.get("issue") in _BROWSER_BACKEND_ISSUES
+    )
+    manual_issue_count = sum(
+        1 for issue in browser.get("issues", []) if issue.get("issue") in _BROWSER_MANUAL_ISSUES
+    )
+    operator_limit_count = sum(
+        1 for issue in browser.get("issues", []) if issue.get("issue") in _BROWSER_OPERATOR_LIMIT_ISSUES
+    )
+    if backend_issue_count > 0:
+        details = _summarize_browser_issue_rows(browser.get("issues", []), _BROWSER_BACKEND_ISSUES)
+        guidance = []
+        for issue in browser.get("issues", []):
+            issue_name = issue.get("issue")
+            if issue_name in _BROWSER_BACKEND_ISSUES:
+                hint = _BROWSER_ISSUE_GUIDANCE.get(issue_name)
+                if hint and hint not in guidance:
+                    guidance.append(hint)
+        detail_text = "; ".join(details) if details else "multiple browser/backend faults"
+        guidance_text = "; ".join(guidance) if guidance else "inspect browser health details"
+        return {
+            "title": "Fix browser/backend",
+            "severity": "warn",
+            "reason": (
+                f"{backend_issue_count} worker(s) report browser/backend failures: {detail_text}. "
+                f"Suggested actions: {guidance_text}."
+            ),
+        }
+    if manual_issue_count > 0:
+        details = _summarize_browser_issue_rows(browser.get("issues", []), _BROWSER_MANUAL_ISSUES)
+        guidance = []
+        for issue in browser.get("issues", []):
+            issue_name = issue.get("issue")
+            if issue_name in _BROWSER_MANUAL_ISSUES:
+                hint = _BROWSER_ISSUE_GUIDANCE.get(issue_name)
+                if hint and hint not in guidance:
+                    guidance.append(hint)
+        guidance_text = "; ".join(guidance) if guidance else "manual resolution workflow"
+        detail_text = "; ".join(details) if details else "captcha/login/verification required"
+        return {
+            "title": "Resolve browser challenges",
+            "severity": "warn",
+            "reason": (
+                f"{manual_issue_count} worker(s) report manual browser challenges: {detail_text}. "
+                f"Suggested actions: {guidance_text}."
+            ),
+        }
+    if operator_limit_count > 0:
+        details = _summarize_browser_issue_rows(browser.get("issues", []), _BROWSER_OPERATOR_LIMIT_ISSUES)
+        guidance = _browser_issue_guidance(browser.get("issues", []), _BROWSER_OPERATOR_LIMIT_ISSUES)
+        detail_text = "; ".join(details) if details else "browser/model limit or missing terminal result"
+        guidance_text = "; ".join(guidance) if guidance else "inspect worker log and route manually"
+        return {
+            "title": "Resolve browser/model limit",
+            "severity": "warn",
+            "reason": (
+                f"{operator_limit_count} worker(s) report browser/model limits: {detail_text}. "
+                f"Suggested actions: {guidance_text}."
+            ),
+        }
+
+    if gate.get("paused"):
+        return {
+            "title": "Resume fleet",
+            "severity": "severe",
+            "reason": "Fleet is globally paused.",
+        }
+    if gate.get("ats_paused"):
+        return {
+            "title": "Resume ATS lane",
+            "severity": "warn",
+            "reason": "ATS lane paused; review ATS controls and resume when ready.",
+        }
+    if gate.get("canary_enabled") and (gate.get("canary_remaining") or 0) <= 0:
+        return {
+            "title": "Arm lift",
+            "severity": "warn",
+            "reason": "ATS canary exhausted; lift canary to continue bounded applying.",
+        }
+    if linkedin.get("halted") and linkedin.get("queued", 0) > 0:
+        return {
+            "title": "Clear LinkedIn halt",
+            "severity": "warn",
+            "reason": "LinkedIn lane has queued work but the account governor is halted.",
+        }
+    discovery_due = 0
+    discovery_workers_alive = 0
+    if discovery:
+        discovery_due = int(discovery.get("tasks", {}).get("due_now") or 0)
+        discovery_workers_alive = sum(1 for row in discovery.get("workers", []) if row.get("alive"))
+    if discovery_due > 0 and discovery_workers_alive == 0 and queue_apply.get("queued", 0) == 0:
+        return {
+            "title": "Start discovery workers",
+            "severity": "warn",
+            "reason": f"{discovery_due} discovery task(s) are due, but no discovery worker is alive.",
+        }
+    if queue_apply.get("queued", 0) == 0 and apply_state.get("code") == "ready_to_apply":
+        return {
+            "title": "Inspect upstream queues",
+            "severity": "warn",
+            "reason": "Ready state is reporting no queued ATS jobs currently.",
+        }
+    if queue_apply.get("approved", 0) == 0:
+        return {
+            "title": "Seed approvals",
+            "severity": "info",
+            "reason": "No approved ATS jobs are queued yet.",
+        }
+    alive_workers = sum(1 for row in workers if row.get("alive"))
+    if apply_state.get("code") == "ready_to_apply" and alive_workers == 0:
+        return {
+            "title": "Start apply workers",
+            "severity": "severe",
+            "reason": "Leaseable jobs exist, but no apply workers are heartbeating alive.",
+        }
+    if apply_state.get("code") == "ready_to_apply" and agents.get("blocked_workers", 0) > 0:
+        return {
+            "title": "Unblock agent routing",
+            "severity": "warn",
+            "reason": f"{agents.get('blocked_workers', 0)} dynamic worker(s) have all configured agents blocked.",
+        }
+    return {
+        "title": "Monitor throughput",
+        "severity": "info",
+        "reason": "Fleet is eligible and should be applying if workers are healthy.",
+    }
+
+
+def _console_audit_summary(conn, limit: int = 10) -> dict:
+    """READ-ONLY operator console action audit rows."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('fleet_console_audit') AS rel")
+        if cur.fetchone()["rel"] is None:
+            conn.rollback()
+            return {"available": False, "rows": [], "summary": {"rows": 0}}
+        cur.execute(
+            "SELECT action, actor, lane, target, message, ok, created_at "
+            "FROM fleet_console_audit ORDER BY created_at DESC, id DESC LIMIT %s",
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+    out = []
+    for row in rows:
+        out.append({
+            "action": _scrub(row.get("action") or "")[:80],
+            "actor": _scrub(row.get("actor") or "")[:80],
+            "lane": _scrub(row.get("lane") or "")[:40],
+            "target": _scrub(row.get("target") or "")[:160],
+            "message": _scrub(row.get("message") or "")[:300],
+            "ok": bool(row.get("ok")),
+            "created_at": _iso(row.get("created_at")),
+        })
+    return {
+        "available": True,
+        "rows": out,
+        "summary": {
+            "rows": len(out),
+            "failed": sum(1 for row in out if not row["ok"]),
+        },
+    }
+
+
+def _host_source_quality(conn, limit: int = 8) -> dict:
+    """READ-ONLY host/source quality rollup for tuning noisy boards and sources."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH open_challenges AS (
+                SELECT DISTINCT url FROM auth_challenge WHERE resolved_at IS NULL
+            )
+            SELECT
+                COALESCE(NULLIF(q.target_host, ''), NULLIF(q.apply_domain, ''), 'unknown') AS host,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE q.status='applied') AS applied,
+                COUNT(*) FILTER (WHERE q.status IN ('failed','blocked','crash_unconfirmed')) AS failed,
+                COUNT(*) FILTER (
+                    WHERE q.apply_status='challenge_pending' OR oc.url IS NOT NULL
+                ) AS challenges,
+                COUNT(*) FILTER (WHERE q.status='queued') AS queued,
+                COUNT(*) FILTER (
+                    WHERE q.status='queued'
+                      AND q.approved_batch IS NOT NULL
+                      AND (q.dedup_key IS NULL OR a.dedup_key IS NULL)
+                ) AS leaseable
+            FROM apply_queue q
+            LEFT JOIN applied_set a ON a.dedup_key = q.dedup_key
+            LEFT JOIN open_challenges oc ON oc.url = q.url
+            GROUP BY host
+            ORDER BY challenges DESC, failed DESC, queued DESC, applied DESC, host ASC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+
+    hosts: list[dict[str, Any]] = []
+    for row in rows:
+        total = int(row.get("total") or 0)
+        failed = int(row.get("failed") or 0)
+        challenges = int(row.get("challenges") or 0)
+        hosts.append({
+            "host": row.get("host") or "unknown",
+            "total": total,
+            "applied": int(row.get("applied") or 0),
+            "failed": failed,
+            "challenges": challenges,
+            "queued": int(row.get("queued") or 0),
+            "leaseable": int(row.get("leaseable") or 0),
+            "failure_rate": round(failed / total, 4) if total else 0.0,
+            "challenge_rate": round(challenges / total, 4) if total else 0.0,
+        })
+    return {
+        "hosts": hosts,
+        "summary": {
+            "hosts": len(hosts),
+            "challenge_hosts": sum(1 for row in hosts if row["challenges"] > 0),
+            "failed": sum(row["failed"] for row in hosts),
+            "challenges": sum(row["challenges"] for row in hosts),
+            "queued": sum(row["queued"] for row in hosts),
+            "leaseable": sum(row["leaseable"] for row in hosts),
+        },
+    }
+
+
+def _worker_comparison(conn, workers: list[dict], limit: int = 12) -> dict:
+    """READ-ONLY per-worker comparison for spotting bad workers or machines."""
+    latest_usage = _latest_worker_llm_usage(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                worker_id,
+                COUNT(*) FILTER (WHERE status='applied') AS applied,
+                COUNT(*) FILTER (WHERE status IN ('failed','blocked','crash_unconfirmed')) AS failed,
+                COALESCE(SUM(est_cost_usd), 0) AS cost_usd,
+                AVG(apply_duration_ms) FILTER (WHERE apply_duration_ms IS NOT NULL) AS avg_duration_ms,
+                MAX(updated_at) AS last_terminal_at
+            FROM apply_queue
+            WHERE worker_id IS NOT NULL
+            GROUP BY worker_id
+            """
+        )
+        result_rows = cur.fetchall()
+        cur.execute(
+            """
+            SELECT worker_id, COUNT(*) AS n
+            FROM auth_challenge
+            WHERE resolved_at IS NULL AND worker_id IS NOT NULL
+            GROUP BY worker_id
+            """
+        )
+        challenge_rows = cur.fetchall()
+    conn.rollback()  # read-only
+
+    metrics: dict[str, dict[str, Any]] = {}
+    for row in result_rows:
+        wid = row.get("worker_id")
+        if not wid:
+            continue
+        avg_duration = row.get("avg_duration_ms")
+        metrics[wid] = {
+            "applied": int(row.get("applied") or 0),
+            "failed": int(row.get("failed") or 0),
+            "challenges": 0,
+            "cost_usd": round(float(row.get("cost_usd") or 0), 4),
+            "avg_duration_ms": int(round(float(avg_duration))) if avg_duration is not None else None,
+            "last_terminal_at": _iso(row.get("last_terminal_at")),
+        }
+    for row in challenge_rows:
+        wid = row.get("worker_id")
+        if not wid:
+            continue
+        item = metrics.setdefault(
+            wid,
+            {
+                "applied": 0,
+                "failed": 0,
+                "challenges": 0,
+                "cost_usd": 0.0,
+                "avg_duration_ms": None,
+                "last_terminal_at": None,
+            },
+        )
+        item["challenges"] = int(row.get("n") or 0)
+
+    by_worker = {row.get("worker_id"): row for row in workers if row.get("worker_id")}
+    worker_ids = set(by_worker) | set(metrics)
+    rows: list[dict[str, Any]] = []
+    for wid in worker_ids:
+        heartbeat = by_worker.get(wid, {})
+        usage = latest_usage.get(str(wid or ""))
+        machine_owner = heartbeat.get("machine_owner") or (usage or {}).get("machine_owner")
+        current_agent = heartbeat.get("current_agent") or (usage or {}).get("current_agent")
+        current_model = heartbeat.get("current_model") or (usage or {}).get("current_model")
+        stat = metrics.get(
+            wid,
+            {
+                "applied": 0,
+                "failed": 0,
+                "challenges": 0,
+                "cost_usd": 0.0,
+                "avg_duration_ms": None,
+                "last_terminal_at": None,
+            },
+        )
+        rows.append({
+            "worker_id": wid,
+            "machine": (
+                heartbeat.get("machine")
+                or _historical_machine_label(machine_owner)
+            ),
+            "machine_owner": machine_owner,
+            "alive": bool(heartbeat.get("alive")),
+            "state": heartbeat.get("state"),
+            "last_beat": heartbeat.get("last_beat"),
+            "current_agent": current_agent,
+            "current_model": current_model,
+            **stat,
+        })
+    rows.sort(
+        key=lambda row: (
+            -int(row.get("failed") or 0),
+            -int(row.get("challenges") or 0),
+            -int(row.get("applied") or 0),
+            str(row.get("worker_id") or ""),
+        )
+    )
+    rows = rows[: int(limit)]
+    return {
+        "workers": rows,
+        "summary": {
+            "workers": len(rows),
+            "applied": sum(int(row.get("applied") or 0) for row in rows),
+            "failed": sum(int(row.get("failed") or 0) for row in rows),
+            "challenges": sum(int(row.get("challenges") or 0) for row in rows),
+            "cost_usd": round(sum(float(row.get("cost_usd") or 0) for row in rows), 4),
+        },
     }
 
 
@@ -303,7 +1647,7 @@ def _discovery(conn) -> dict:
         )
         d = dict(cur.fetchone())
         cur.execute(
-            "SELECT wh.worker_id, wh.state, wh.last_beat, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.state, wh.last_beat, "
             "       (SELECT COUNT(*) FROM discovered_postings dp "
             "          WHERE dp.worker_id = wh.worker_id "
             "            AND dp.discovered_at > now() - interval '24 hours') AS found_24h "
@@ -322,18 +1666,31 @@ def _discovery(conn) -> dict:
         secs = _seconds_since(r["last_beat"])
         workers.append({
             "worker_id": r["worker_id"],
+            "machine": _machine_display_name(r.get("machine_owner")),
+            "machine_owner": r.get("machine_owner"),
             "alive": bool(secs is not None and secs <= _HB_ALIVE_SECONDS),
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
             "state": r["state"],
             "found_24h": int(r["found_24h"] or 0),
         })
-    recent = [{
-        "time": _iso(r["discovered_at"]),
-        "source": r["source_label"],
-        "query": r["query"],
-        "board": r["board"],
-    } for r in rrows]
+    recent: list[dict[str, Any]] = []
+    recent_by_key: dict[tuple[str | None, str | None, str | None, str | None], dict[str, Any]] = {}
+    for r in rrows:
+        item = {
+            "time": _iso(r["discovered_at"]),
+            "source": r["source_label"],
+            "query": r["query"],
+            "board": r["board"],
+            "count": 1,
+        }
+        key = (item["time"], item["source"], item["query"], item["board"])
+        existing = recent_by_key.get(key)
+        if existing is not None:
+            existing["count"] += 1
+            continue
+        recent_by_key[key] = item
+        recent.append(item)
     return {
         "tasks": {"total": int(t["total"] or 0), "enabled": int(t["enabled"] or 0),
                   "due_now": int(t["due_now"] or 0)},
@@ -342,6 +1699,397 @@ def _discovery(conn) -> dict:
         "workers": workers,
         "recent": recent,
     }
+
+
+def _challenge_backlog_summary(conn) -> dict:
+    """READ-ONLY rollup that separates the open auth backlog from live browser worker symptoms."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, kind, raised_at FROM auth_challenge WHERE resolved_at IS NULL ORDER BY raised_at DESC"
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+    _, parked_by_url = _queue._challenge_rows(conn, None)
+    by_kind: dict[str, int] = {}
+    fresh_open = 0
+    stale_open = 0
+    missing_metadata_rows = 0
+    park_only_rows = 0
+    now = _utcnow()
+    for row in rows:
+        kind = str(row.get("kind") or "(unknown)")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        raised_at = row.get("raised_at")
+        age_hours = _age_hours(raised_at, now)
+        if age_hours is not None and age_hours > 24:
+            stale_open += 1
+        else:
+            fresh_open += 1
+    for _, parked in parked_by_url.values():
+        if not ((parked or {}).get("company") and (parked or {}).get("title")):
+            missing_metadata_rows += 1
+    park_only_rows = sum(1 for url in parked_by_url if url not in {str(r.get("url") or "") for r in rows})
+    return {
+        "open_auth": len(rows),
+        "parked_urls": len(parked_by_url),
+        "fresh_open": fresh_open,
+        "stale_open": stale_open,
+        "missing_metadata_rows": missing_metadata_rows,
+        "park_only_rows": park_only_rows,
+        "by_kind": dict(sorted(by_kind.items())),
+    }
+
+
+def _diagnostics_backlog_summary(conn) -> dict:
+    """READ-ONLY summary of active recommended diagnosis backlog for operator prioritization."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, host, sample_count, diagnosis, recommendation "
+            "FROM fleet_diagnoses "
+            "WHERE status='recommended' AND (expires_at IS NULL OR expires_at > now())"
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # read-only
+    recommendations = _diagnostic_recommendations([{
+        "diagnosis_id": None,
+        "reason": r.get("reason"),
+        "host": _scrub(r.get("host"))[:200],
+        "machine": None,
+        "lane": None,
+        "sample_count": int(r.get("sample_count") or 0),
+        "severity": "info",
+        "diagnosis": _scrub(r.get("diagnosis"))[:300],
+        "recommendation": _scrub(r.get("recommendation"))[:300],
+        "created_at": None,
+    } for r in rows])
+    other_hosts: dict[str, int] = {}
+    other_buckets: dict[str, int] = {}
+    other_bucket_hosts: dict[str, dict[str, int]] = {}
+    for r in rows:
+        if r.get("reason") != "other":
+            continue
+        host = str(_scrub(r.get("host"))[:200] or "unknown")
+        samples = int(r.get("sample_count") or 0)
+        other_hosts[host] = other_hosts.get(host, 0) + samples
+        bucket = _classify_unclassified_failure({
+            "diagnosis": _scrub(r.get("diagnosis"))[:300],
+            "recommendation": _scrub(r.get("recommendation"))[:300],
+            "host": host,
+        })
+        other_buckets[bucket] = other_buckets.get(bucket, 0) + samples
+        bucket_hosts = other_bucket_hosts.setdefault(bucket, {})
+        bucket_hosts[host] = bucket_hosts.get(host, 0) + samples
+    top_other_hosts = [
+        {"host": host, "samples": samples}
+        for host, samples in sorted(other_hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    ]
+    top_other_buckets = [
+        {"bucket": bucket, "samples": samples}
+        for bucket, samples in sorted(other_buckets.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    ]
+    top_other_bucket_hosts = {
+        bucket: [
+            {"host": host, "samples": samples}
+            for host, samples in sorted(hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        ]
+        for bucket, hosts in sorted(other_bucket_hosts.items())
+    }
+    return {
+        "total": len(recommendations),
+        "other_hosts": len({r["host"] for r in recommendations if r.get("reason") == "other"}),
+        "other_samples": sum(int(r.get("sample_count") or 0) for r in recommendations if r.get("reason") == "other"),
+        "dead_rows": sum(1 for r in recommendations if r.get("reason") == "dead"),
+        "top_other_hosts": top_other_hosts,
+        "other_buckets": dict(sorted(other_buckets.items())),
+        "top_other_buckets": top_other_buckets,
+        "top_other_bucket_hosts": top_other_bucket_hosts,
+    }
+
+
+def _host_risk_summary(source_quality: dict[str, Any]) -> dict[str, Any]:
+    """Summarize leaseable ATS hosts that are burning attempts through high failure/challenge rates."""
+    risky_hosts: list[dict[str, Any]] = []
+    for row in source_quality.get("hosts", []):
+        total = int(row.get("total") or 0)
+        failed = int(row.get("failed") or 0)
+        challenges = int(row.get("challenges") or 0)
+        leaseable = int(row.get("leaseable") or 0)
+        queued = int(row.get("queued") or 0)
+        backlog = max(leaseable, queued)
+        failure_rate = float(row.get("failure_rate") or 0.0)
+        challenge_rate = float(row.get("challenge_rate") or 0.0)
+        if backlog <= 0:
+            continue
+        if failed >= 3 and failure_rate >= 0.5:
+            risky_hosts.append(dict(row))
+            continue
+        if challenges >= 3 and challenge_rate >= 0.1:
+            risky_hosts.append(dict(row))
+    risky_hosts.sort(
+        key=lambda row: (
+            -max(float(row.get("failure_rate") or 0.0), float(row.get("challenge_rate") or 0.0)),
+            -int(row.get("leaseable") or 0),
+            str(row.get("host") or ""),
+        )
+    )
+    actions: list[dict[str, Any]] = []
+    for row in risky_hosts[:5]:
+        failure_rate = float(row.get("failure_rate") or 0.0)
+        challenge_rate = float(row.get("challenge_rate") or 0.0)
+        failed = int(row.get("failed") or 0)
+        challenges = int(row.get("challenges") or 0)
+        queued = int(row.get("queued") or 0)
+        if failure_rate >= 0.5 and challenge_rate >= 0.1:
+            action = "adapter_fix"
+        elif failure_rate >= 0.5 and failed >= 3:
+            action = "adapter_fix"
+        elif challenge_rate >= 0.1 and challenges >= 3:
+            action = "deprioritize"
+        else:
+            action = "watch"
+        actions.append({
+            "host": row.get("host") or "unknown",
+            "action": action,
+            "failure_rate": round(failure_rate, 4),
+            "challenge_rate": round(challenge_rate, 4),
+            "queued": queued,
+            "leaseable": int(row.get("leaseable") or 0),
+            "failed": failed,
+            "challenges": challenges,
+        })
+    top = risky_hosts[0] if risky_hosts else None
+    return {
+        "hosts": len(risky_hosts),
+        "top_host": top.get("host") if top else None,
+        "top_failure_rate": float(top.get("failure_rate") or 0.0) if top else 0.0,
+        "top_challenge_rate": float(top.get("challenge_rate") or 0.0) if top else 0.0,
+        "top_leaseable": int(top.get("leaseable") or 0) if top else 0,
+        "top_actions": actions,
+    }
+
+_UNCLASSIFIED_BUCKET_HINTS: dict[str, str] = {
+    "expired_posting": "Run availability re-check for these rows and skip dead postings.",
+    "access_denied": "Investigate anti-bot/auth barrier on the host; likely needs manual verification.",
+    "broken_redirect": "Verify navigation/host-specific selectors; page target may have changed.",
+    "parse_failure": "Inspect adapter parsing assumptions for this host and update selectors/workflow mapping.",
+    "adapter_gap": "Host workflow drift detected; this likely needs ATS-specific adapter or target mapping update.",
+    "unknown_other": "Still unclassified; open fresh worker logs and keep manual.",
+}
+
+
+def _classify_unclassified_failure(row: dict[str, Any]) -> str:
+    text = " ".join(
+        str(row.get(key) or "")
+        for key in ("diagnosis", "recommendation", "host")
+    ).lower()
+    if any(token in text for token in ("expired", "no longer available", "job closed", "posting removed", "404", "not found")):
+        return "expired_posting"
+    if any(token in text for token in ("access denied", "forbidden", "blocked", "captcha", "login required", "sign in", "unauthorized", "429", "rate limit")):
+        return "access_denied"
+    if any(token in text for token in ("redirect", "broken target", "target missing", "landed on search", "apply target missing", "wrong page")):
+        return "broken_redirect"
+    if any(token in text for token in ("parse", "extract", "selector", "dom", "field missing", "no result line", "could not read")):
+        return "parse_failure"
+    if any(token in text for token in ("adapter", "unsupported", "not implemented", "site-specific", "workflow mismatch", "integration gap")):
+        return "adapter_gap"
+    return "unknown_other"
+
+
+def _unclassified_bucket_text(bucket: str) -> str:
+    hint = _UNCLASSIFIED_BUCKET_HINTS.get(bucket)
+    if hint:
+        return f"Likely {bucket.replace('_', ' ')} pattern. {hint}"
+    return (
+        "Unrecognized failure token. Human review only -- the Doctor never auto-acts on an unclassified cluster."
+    )
+
+
+def _apply_unclassified_bucket(row: dict[str, Any], evidence: dict[str, Any] | None = None) -> None:
+    host = str(row.get("host") or "unknown")
+    n = int(row.get("sample_count") or 0)
+    if n <= 0:
+        n = 1
+    source = evidence or row
+    bucket = _classify_unclassified_failure({
+        "diagnosis": str(source.get("diagnosis") or ""),
+        "recommendation": str(source.get("recommendation") or ""),
+        "host": host,
+    })
+    row["diagnosis"] = f"{n} unclassified failure(s) on {host}."
+    row["recommendation"] = _unclassified_bucket_text(bucket)
+    row["bucket"] = bucket
+
+
+def _apply_state_blockers(
+    apply_state: dict[str, Any],
+    queue_apply: dict[str, Any],
+    challenge_backlog: dict[str, Any],
+    host_risk: dict[str, Any],
+) -> dict[str, Any]:
+    state = dict(apply_state)
+    blockers: list[dict[str, Any]] = []
+
+    if state.get("code") == "ready_jobs_not_leaseable":
+        dedup_blocked = int(queue_apply.get("dedup_blocked") or 0)
+        blockers.append({
+            "code": "dedup_blocked",
+            "title": "Approved rows are dedup-blocked",
+            "count": dedup_blocked,
+            "severity": "warn",
+            "reason": (
+                f"{dedup_blocked} approved ATS row(s) are blocked by dedup, so the queue looks ready "
+                "but no new rows can be leased."
+            ),
+            "next_action": "Review dedup groups before expecting new leases.",
+        })
+    elif state.get("code") == "no_leaseable_jobs":
+        stale_open = int(challenge_backlog.get("stale_open") or 0)
+        fresh_open = int(challenge_backlog.get("fresh_open") or 0)
+        open_auth = int(challenge_backlog.get("open_auth") or 0)
+        missing_metadata_rows = int(challenge_backlog.get("missing_metadata_rows") or 0)
+        parked_frozen = int(queue_apply.get("parked_frozen") or 0)
+        approved = int(queue_apply.get("approved") or 0)
+        queued = int(queue_apply.get("queued") or 0)
+        risky_hosts = int(host_risk.get("hosts") or 0)
+        top_host = host_risk.get("top_host") or "unknown"
+
+        if stale_open > 0:
+            blockers.append({
+                "code": "stale_challenges",
+                "title": "Stale challenges are blocking backlog",
+                "count": stale_open,
+                "severity": "warn",
+                "reason": (
+                    f"{stale_open} open auth challenge(s) are older than 24 hours and should be "
+                    "cleared or dropped before the queue is trusted."
+                ),
+                "next_action": "Clear stale challenge backlog first.",
+            })
+        if parked_frozen > 0:
+            blockers.append({
+                "code": "frozen_leases",
+                "title": "Parked leases are still frozen",
+                "count": parked_frozen,
+                "severity": "warn",
+                "reason": (
+                    f"{parked_frozen} ATS row(s) are still leased/frozen, which keeps queue inventory "
+                    "out of circulation."
+                ),
+                "next_action": "Release or reclaim parked leases.",
+            })
+        if approved <= 0 and queued > 0:
+            blockers.append({
+                "code": "approval_gap",
+                "title": "Queued backlog has no approved ATS rows",
+                "count": queued,
+                "severity": "info",
+                "reason": (
+                    f"{queued} ATS row(s) are queued, but none are approved, so zero rows are eligible "
+                    "for leasing."
+                ),
+                "next_action": "Approve ATS backlog before expecting new leases.",
+            })
+        if risky_hosts > 0:
+            blockers.append({
+                "code": "host_risk",
+                "title": "Queued backlog is concentrated on hostile ATS hosts",
+                "count": risky_hosts,
+                "severity": "warn",
+                "reason": (
+                    f"{risky_hosts} queued host group(s) show elevated failure/challenge rates; top host "
+                    f"{top_host} is a likely adapter/deprioritization candidate."
+                ),
+                "next_action": "Review hostile ATS hosts before spending more attempts there.",
+            })
+        if fresh_open > 0 and stale_open == 0:
+            blockers.append({
+                "code": "fresh_challenges",
+                "title": "Fresh auth challenges are holding rows",
+                "count": fresh_open,
+                "severity": "warn",
+                "reason": (
+                    f"{fresh_open} fresh auth challenge(s) remain open; those rows need manual resolution "
+                    "before they can flow again."
+                ),
+                "next_action": "Resolve fresh challenges worth saving.",
+            })
+        elif open_auth > 0 and stale_open > 0:
+            blockers.append({
+                "code": "open_challenges",
+                "title": "Open auth challenges still dominate the queue",
+                "count": open_auth,
+                "severity": "warn",
+                "reason": (
+                    f"{open_auth} total auth challenge(s) are open; even after stale cleanup, fresh rows "
+                    "will still need manual intervention."
+                ),
+                "next_action": "Work through fresh challenges after stale cleanup.",
+            })
+        if missing_metadata_rows > 0:
+            blockers.append({
+                "code": "challenge_metadata_gap",
+                "title": "Challenge metadata is missing on parked rows",
+                "count": missing_metadata_rows,
+                "severity": "info",
+                "reason": (
+                    f"{missing_metadata_rows} parked challenge row(s) are missing company/title metadata, "
+                    "which slows operator triage."
+                ),
+                "next_action": "Backfill challenge metadata to speed manual triage.",
+            })
+
+    if blockers:
+        severity_rank = {"severe": 0, "warn": 1, "info": 2}
+        blocker_rank = {
+            "stale_challenges": 0,
+            "frozen_leases": 1,
+            "approval_gap": 2,
+            "host_risk": 3,
+            "fresh_challenges": 4,
+            "open_challenges": 5,
+            "challenge_metadata_gap": 6,
+            "dedup_blocked": 7,
+        }
+        blockers.sort(
+            key=lambda item: (
+                severity_rank.get(str(item.get("severity") or "info"), 9),
+                blocker_rank.get(str(item.get("code") or ""), 99),
+                -int(item.get("count") or 0),
+                str(item.get("code") or ""),
+            )
+        )
+        top = blockers[0]
+        state["reason"] = str(top.get("reason") or state.get("reason") or "")
+        state["next_action"] = str(top.get("next_action") or "")
+    state["blockers"] = blockers
+    return state
+
+
+def _diagnostic_recommendations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    filtered = [dict(r) for r in rows if (r.get("reason") or "") != "dead"]
+    aggregated: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    ordered: list[tuple[str, str, str | None]] = []
+    for row in filtered:
+        reason = str(row.get("reason") or "")
+        if reason != "other":
+            key = (str(row.get("diagnosis_id") or row.get("diagnosis") or ""), reason, row.get("lane"))
+            aggregated[key] = row
+            ordered.append(key)
+            continue
+        key = (reason, str(row.get("host") or ""), row.get("lane"))
+        existing = aggregated.get(key)
+        if existing is None:
+            aggregated[key] = row
+            _apply_unclassified_bucket(aggregated[key])
+            ordered.append(key)
+            continue
+        existing["sample_count"] = int(existing.get("sample_count") or 0) + int(row.get("sample_count") or 0)
+        if str(row.get("created_at") or "") > str(existing.get("created_at") or ""):
+            existing["diagnosis_id"] = row.get("diagnosis_id")
+            existing["created_at"] = row.get("created_at")
+        existing["machine"] = None
+        _apply_unclassified_bucket(existing, row)
+    return [aggregated[key] for key in ordered]
 
 
 def _diagnostics(conn) -> dict:
@@ -368,7 +2116,7 @@ def _diagnostics(conn) -> dict:
         clusters.append({
             "reason": c.get("reason"),
             "host": _scrub(c.get("host"))[:200],
-            "machine": _scrub(c.get("machine"))[:120],
+            "machine": _machine_display_name(_scrub(c.get("machine"))[:120]),
             "lane": c.get("lane"),
             "sample_count": int(c.get("sample_count") or 0),
         })
@@ -407,7 +2155,8 @@ def _diagnostics(conn) -> dict:
             "SELECT id, cluster_key, reason, host, machine, lane, sample_count, severity, "
             "       diagnosis, recommendation, created_at "
             "FROM fleet_diagnoses WHERE status='recommended' "
-            "ORDER BY created_at DESC LIMIT 100"
+            "AND (expires_at IS NULL OR expires_at > now()) "
+            "ORDER BY created_at DESC LIMIT 200"
         )
         rrows = cur.fetchall()
         # H11/H15: quarantined URLs surfaced INDEPENDENT of fleet_knobs, so a still-quarantined url
@@ -420,6 +2169,7 @@ def _diagnostics(conn) -> dict:
         )
         qrows = cur.fetchall()
     conn.rollback()  # read-only
+    browser_health = _browser_health(conn)
     auto_fixes = [{
         "knob_id": r["knob_id"],
         "diagnosis_id": r["diagnosis_id"],
@@ -435,7 +2185,7 @@ def _diagnostics(conn) -> dict:
         "diagnosis_id": r["id"],
         "reason": r.get("reason"),
         "host": _scrub(r.get("host"))[:200],
-        "machine": _scrub(r.get("machine"))[:120],
+        "machine": _machine_display_name(_scrub(r.get("machine"))[:120]),
         "lane": r.get("lane"),
         "sample_count": int(r.get("sample_count") or 0),
         "severity": r.get("severity"),
@@ -443,13 +2193,21 @@ def _diagnostics(conn) -> dict:
         "recommendation": _scrub(r.get("recommendation"))[:600],
         "created_at": _iso(r.get("created_at")),
     } for r in rrows]
+    recommendations = _diagnostic_recommendations(recommendations)
+    recommendations_summary = {
+        "total": len(recommendations),
+        "other_hosts": len({r["host"] for r in recommendations if r.get("reason") == "other"}),
+        "other_samples": sum(int(r.get("sample_count") or 0) for r in recommendations if r.get("reason") == "other"),
+    }
     quarantined = [{
         "url": _scrub(r.get("url"))[:300],
         "reason": _scrub(r.get("reason"))[:200],
         "quarantined_at": _iso(r.get("quarantined_at")),
     } for r in qrows]
     return {"clusters": clusters, "auto_fixes": auto_fixes,
-            "recommendations": recommendations, "quarantined": quarantined}
+            "recommendations": recommendations, "recommendations_summary": recommendations_summary,
+            "quarantined": quarantined,
+            "browser_health": browser_health}
 
 
 def _doctor_signal(conn) -> dict:
@@ -484,6 +2242,341 @@ def diagnostics() -> dict:
     conn = pgqueue.connect()
     try:
         return _diagnostics(conn)
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+
+def diagnosis() -> dict:
+    """Build an operator-facing /api/diagnosis payload (why-not-applying + safety rails +
+    machine rollups + browser summary + lightweight recommendations)."""
+    conn = pgqueue.connect()
+    try:
+        gate, queue, apply_state = _gate_and_queue(conn)
+        workers = _workers(conn)
+        queue_apply = queue.get("apply", {})
+        browser = _browser_health(conn)
+        desired_workers_by_machine = _desired_machine_workers(conn)
+        network = _network_rollup(conn)
+        linkedin = _linkedin_summary(conn)
+        deadman = _deadman_status(conn)
+        compute = _compute_summary(conn)
+        forecast = _throughput_forecast(conn, gate, workers)
+        daily_goals = _daily_goals(conn, gate)
+        freshness = _data_freshness(conn)
+        audit = _console_audit_summary(conn)
+        challenge_backlog = _challenge_backlog_summary(conn)
+        diagnostics_summary = _diagnostics_backlog_summary(conn)
+        source_quality = _host_source_quality(conn)
+        host_risk = _host_risk_summary(source_quality)
+        apply_state = _apply_state_blockers(apply_state, queue_apply, challenge_backlog, host_risk)
+        worker_comparison = _worker_comparison(conn, workers)
+        try:
+            agents = _agent_routing_summary(conn, workers)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            agents = {
+                "workers": len(workers),
+                "dynamic_workers": 0,
+                "switched_workers": 0,
+                "partial_workers": 0,
+                "blocked_workers": 0,
+                "active_agent_blocks": [],
+                "model_usage": {},
+                "model_family_usage": {},
+                "model_count": 0,
+            }
+        try:
+            discovery = _discovery(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            discovery = None
+
+        machines: dict[str, dict[str, int]] = {}
+        for row in workers:
+            m = row.get("machine", "unknown")
+            item = machines.setdefault(m, {"workers": 0, "alive": 0, "idle": 0, "working": 0})
+            item["workers"] += 1
+            if row.get("alive"):
+                item["alive"] += 1
+            if row.get("alive") and row.get("state") == "applying":
+                item["working"] += 1
+            elif row.get("alive"):
+                item["idle"] += 1
+            if row.get("applied", 0) > 0:
+                item["applied_workers"] = item.get("applied_workers", 0) + 1
+        for name, desired_count in desired_workers_by_machine.items():
+            item = machines.setdefault(name, {"workers": 0, "alive": 0, "idle": 0, "working": 0})
+            item["desired"] = desired_count
+            item["missing"] = max(desired_count - int(item.get("alive", 0)), 0)
+        for name, data in network.get("machines", {}).items():
+            item = machines.setdefault(name, {"workers": 0, "alive": 0, "idle": 0, "working": 0})
+            item["fleet_workers"] = int(data.get("workers", 0))
+            item["fleet_alive"] = int(data.get("alive", 0))
+            item["fleet_stale"] = int(data.get("stale", 0))
+        if desired_workers_by_machine:
+            for name, item in machines.items():
+                item.setdefault("desired", desired_workers_by_machine.get(name, 0))
+                item.setdefault("missing", max(int(item.get("desired", 0)) - int(item.get("alive", 0)), 0))
+        desired_total = sum(desired_workers_by_machine.values())
+        alive_total = sum(int(item.get("alive", 0)) for item in machines.values())
+        missing_total = sum(int(item.get("missing", 0)) for item in machines.values())
+        queue_funnel = {
+            "ats": queue_apply.get("by_lane", {}).get("ats", {}),
+            "compute": queue_apply.get("by_lane", {}).get("compute", {}),
+            "other": queue_apply.get("by_lane", {}).get("other", {}),
+        }
+
+        recommendations: list[dict[str, str]] = []
+        recommendation_titles: set[str] = set()
+        def add_recommendation(title: str, severity: str, reason: str) -> None:
+            key = f"{title}|{reason}"
+            if key in recommendation_titles:
+                return
+            recommendation_titles.add(key)
+            recommendations.append({
+                "title": title,
+                "severity": severity,
+                "reason": reason,
+            })
+        alive_workers = sum(1 for row in workers if row.get("alive"))
+        problem_workers = int(browser.get("summary", {}).get("problem_workers") or 0)
+        browser_issues = browser.get("issues") or []
+        backend_problem_workers = sum(
+            1 for issue in browser_issues
+            if issue.get("issue") in _BROWSER_BACKEND_ISSUES
+        )
+        manual_problem_workers = sum(
+            1 for issue in browser_issues
+            if issue.get("issue") in _BROWSER_MANUAL_ISSUES
+        )
+        operator_limit_workers = sum(
+            1 for issue in browser_issues
+            if issue.get("issue") in _BROWSER_OPERATOR_LIMIT_ISSUES
+        )
+        discovery_workers_alive = 0
+        discovery_due = 0
+        if discovery:
+            discovery_due = int(discovery.get("tasks", {}).get("due_now") or 0)
+            discovery_workers_alive = sum(1 for row in discovery.get("workers", []) if row.get("alive"))
+        compute_queue = compute.get("queue", {}) if compute else {}
+        compute_queued = int(compute_queue.get("queued", {}).get("count") or 0)
+        compute_leased = int(compute_queue.get("leased", {}).get("count") or 0)
+        compute_workers_alive = int(compute.get("score_workers", {}).get("active") or 0) if compute else 0
+        compute_recent_failed = int(compute.get("score_workers", {}).get("recent_failed_15m") or 0) if compute else 0
+        if deadman.get("active"):
+            for deadman_alert in deadman.get("alerts") or []:
+                add_recommendation(
+                    "Investigate DeadMan alert",
+                    deadman_alert.get("severity", "severe"),
+                    (
+                        deadman_alert.get("reason")
+                        or deadman.get("reason")
+                        or deadman.get("alert")
+                        or "Fleet watchdog has raised an alert."
+                    ),
+                )
+        if gate.get("paused"):
+            add_recommendation("Resume fleet", "severe", "Fleet is globally paused.")
+        if gate.get("ats_paused"):
+            add_recommendation("Resume ATS lane", "warn", "ATS lane paused; review ATS controls and resume when ready.")
+        if gate.get("canary_enabled") and (gate.get("canary_remaining") or 0) <= 0:
+            add_recommendation("Arm lift", "warn", "ATS canary exhausted; lift canary to continue bounded applying.")
+        if linkedin.get("halted") and linkedin.get("queued", 0) > 0:
+            add_recommendation("Clear LinkedIn halt", "warn", "LinkedIn lane has queued work but the account governor is halted.")
+        if discovery_due > 0 and discovery_workers_alive == 0 and queue_apply.get("queued", 0) == 0:
+            add_recommendation("Start discovery workers", "warn", f"{discovery_due} discovery task(s) are due, but no discovery worker is alive.")
+        if compute_queued > 0 and compute_workers_alive == 0:
+            add_recommendation("Start compute workers", "warn", f"{compute_queued} score task(s) are queued, but no compute worker is alive.")
+        if compute_recent_failed > 0:
+            add_recommendation("Review compute failures", "warn", f"{compute_recent_failed} score task(s) failed in the last 15 minutes.")
+        if queue_apply.get("queued", 0) == 0 and apply_state.get("code") == "ready_to_apply":
+            add_recommendation("Inspect upstream queues", "warn", "Ready state is reporting no queued ATS jobs currently.")
+        if apply_state.get("code") == "no_leaseable_jobs" and (apply_state.get("blockers") or []):
+            for blocker in apply_state.get("blockers") or []:
+                blocker_code = str((blocker or {}).get("code") or "")
+                blocker_reason = str((blocker or {}).get("reason") or apply_state.get("reason") or "No leaseable ATS jobs are available.")
+                if blocker_code == "stale_challenges":
+                    add_recommendation("Clear stale challenge backlog", "warn", blocker_reason)
+                elif blocker_code == "frozen_leases":
+                    add_recommendation("Release parked leases", "warn", blocker_reason)
+                elif blocker_code == "approval_gap":
+                    add_recommendation("Approve ATS backlog", "info", blocker_reason)
+                elif blocker_code == "host_risk":
+                    add_recommendation("Review hostile ATS hosts", "warn", blocker_reason)
+                elif blocker_code in {"fresh_challenges", "open_challenges"}:
+                    add_recommendation("Resolve browser challenges", "warn", blocker_reason)
+                elif blocker_code == "challenge_metadata_gap":
+                    add_recommendation("Backfill challenge metadata", "info", blocker_reason)
+        if queue_apply.get("approved", 0) == 0:
+            add_recommendation("Seed approvals", "info", "No approved ATS jobs are queued yet.")
+        if apply_state.get("code") == "ready_to_apply" and alive_workers == 0:
+            add_recommendation("Start apply workers", "severe", "Leaseable jobs exist, but no apply workers are heartbeating alive.")
+        if apply_state.get("code") == "ready_to_apply" and backend_problem_workers > 0:
+            browser_issues = browser.get("issues") or []
+            details = _summarize_browser_issue_rows(browser_issues, _BROWSER_BACKEND_ISSUES)
+            guidance = _browser_issue_guidance(browser_issues, _BROWSER_BACKEND_ISSUES)
+            detail_suffix = f" {', '.join(details)}" if details else ""
+            guidance_text = "; ".join(guidance) if guidance else "inspect browser health details"
+            add_recommendation(
+                "Fix browser/backend",
+                "warn",
+                f"{backend_problem_workers} worker(s) report browser/backend failures; {detail_suffix or 'inspect browser logs'}."
+                f" Suggested actions: {guidance_text}.",
+            )
+            if (
+                apply_state.get("code") == "ready_to_apply"
+                and int(queue_apply.get("parked_frozen") or 0) > 0
+                and int(queue_apply.get("active_leased") or 0) == 0
+            ):
+                add_recommendation(
+                    "Release parked leases",
+                    "warn",
+                    f"{int(queue_apply.get('parked_frozen') or 0)} leased ATS row(s) are frozen while zero leased rows look actively in progress.",
+                )
+        if apply_state.get("code") == "ready_to_apply" and manual_problem_workers > 0:
+            browser_issues = browser.get("issues") or []
+            details = _summarize_browser_issue_rows(browser_issues, _BROWSER_MANUAL_ISSUES)
+            guidance = _browser_issue_guidance(browser_issues, _BROWSER_MANUAL_ISSUES)
+            detail_suffix = f" {', '.join(details)}" if details else ""
+            guidance_text = "; ".join(guidance) if guidance else "manual challenge triage"
+            add_recommendation(
+                "Resolve browser challenges",
+                "warn",
+                f"{manual_problem_workers} worker(s) report CAPTCHA/login/verification; "
+                f"{detail_suffix or 'manual intervention is required'}."
+                f" Suggested actions: {guidance_text}.",
+            )
+            if apply_state.get("code") == "ready_to_apply" and agents.get("blocked_workers", 0) > 0:
+                add_recommendation("Unblock agent routing", "warn", f"{agents.get('blocked_workers', 0)} dynamic worker(s) have all configured agents blocked.")
+
+        if apply_state.get("code") == "ready_to_apply" and operator_limit_workers > 0:
+            browser_issues = browser.get("issues") or []
+            details = _summarize_browser_issue_rows(browser_issues, _BROWSER_OPERATOR_LIMIT_ISSUES)
+            guidance = _browser_issue_guidance(browser_issues, _BROWSER_OPERATOR_LIMIT_ISSUES)
+            detail_suffix = f" {', '.join(details)}" if details else ""
+            guidance_text = "; ".join(guidance) if guidance else "inspect worker log and route manually"
+            add_recommendation(
+                "Resolve browser/model limit",
+                "warn",
+                f"{operator_limit_workers} worker(s) report browser/model limits; "
+                f"{detail_suffix or 'quota/cap/no-result intervention is required'}."
+                f" Suggested actions: {guidance_text}.",
+            )
+
+        if int(queue_apply.get("parked_frozen") or 0) > 0 and int(queue_apply.get("active_leased") or 0) == 0:
+            add_recommendation(
+                "Release parked leases",
+                "warn",
+                f"{int(queue_apply.get('parked_frozen') or 0)} leased ATS row(s) are frozen while zero leased rows look actively in progress.",
+            )
+        if apply_state.get("code") == "ready_to_apply" and missing_total > 0:
+            add_recommendation("Restore missing workers", "warn", f"{missing_total} desired apply worker(s) are not heartbeating alive.")
+        if not recommendations:
+            add_recommendation("Monitor throughput", "info", "Fleet is eligible and should be applying if workers are healthy.")
+        if challenge_backlog.get("stale_open", 0) > 0:
+            add_recommendation(
+                "Triage stale challenges",
+                "warn",
+                f"{int(challenge_backlog.get('stale_open') or 0)} open auth challenge(s) are older than 24 hours; review or clear backlog rows that are no longer actionable.",
+            )
+        if challenge_backlog.get("missing_metadata_rows", 0) > 0:
+            add_recommendation(
+                "Backfill challenge metadata",
+                "info",
+                f"{int(challenge_backlog.get('missing_metadata_rows') or 0)} parked challenge row(s) are missing company/title metadata; triage will be slower until those rows can be identified.",
+            )
+        if agents.get("model_missing_workers", 0) > 0:
+            add_recommendation(
+                "Backfill apply model telemetry",
+                "info",
+                f"{int(agents.get('model_missing_workers') or 0)} apply worker(s) report an agent but no model name; operator comparisons and model-level spend views are incomplete until that telemetry is filled.",
+            )
+        if diagnostics_summary.get("other_hosts", 0) > 0:
+            top_hosts = diagnostics_summary.get("top_other_hosts") or []
+            top_buckets = diagnostics_summary.get("top_other_buckets") or []
+            top_hosts_text = ", ".join(
+                f"{str(item.get('host') or 'unknown')} ({int(item.get('samples') or 0)})"
+                for item in top_hosts[:3]
+            )
+            top_buckets_text = ", ".join(
+                f"{str(item.get('bucket') or 'unknown')} ({int(item.get('samples') or 0)})"
+                for item in top_buckets[:3]
+            )
+            add_recommendation(
+                "Review unclassified ATS failures",
+                "info",
+                f"{int(diagnostics_summary.get('other_hosts') or 0)} host group(s) and {int(diagnostics_summary.get('other_samples') or 0)} sample(s) remain unclassified."
+                + (f" Likely buckets: {top_buckets_text}." if top_buckets_text else "")
+                + (f" Top hosts: {top_hosts_text}." if top_hosts_text else ""),
+            )
+        if host_risk.get("hosts", 0) > 0:
+            top_actions = host_risk.get("top_actions") or []
+            top_actions_text = ", ".join(
+                f"{str(item.get('host') or 'unknown')} ({str(item.get('action') or 'watch')})"
+                for item in top_actions[:3]
+            )
+            add_recommendation(
+                "Review hostile ATS hosts",
+                "warn",
+                f"{int(host_risk.get('hosts') or 0)} host(s) with queued backlog show elevated failure/challenge rates; "
+                f"top offender {host_risk.get('top_host') or 'unknown'} "
+                f"(failure {float(host_risk.get('top_failure_rate') or 0.0):.0%}, "
+                f"challenge {float(host_risk.get('top_challenge_rate') or 0.0):.0%}, "
+                f"leaseable {int(host_risk.get('top_leaseable') or 0)})."
+                + (f" Suggested actions: {top_actions_text}." if top_actions_text else ""),
+            )
+
+        return {
+            "apply_state": apply_state,
+            "queue": {"apply": queue_apply},
+            "safety": {
+                "paused": bool(gate.get("paused")),
+                "ats_paused": bool(gate.get("ats_paused")),
+                "spend_cap_usd": gate.get("spend_cap_usd"),
+                "spent_usd": gate.get("spent_usd"),
+                "canary_enabled": bool(gate.get("canary_enabled")),
+                "canary_remaining": gate.get("canary_remaining"),
+            },
+            "browser": {
+                "summary": browser.get("summary", {}),
+                "counts": browser.get("summary", {}).get("by_issue", {}),
+            },
+            "linkedin": linkedin,
+            "discovery": discovery,
+            "compute": compute,
+            "forecast": forecast,
+            "challenges": challenge_backlog,
+            "diagnostics_summary": diagnostics_summary,
+            "daily_goals": daily_goals,
+            "freshness": freshness,
+            "audit": audit,
+            "source_quality": source_quality,
+            "worker_comparison": worker_comparison,
+            "deadman": deadman,
+            "agents": agents,
+            "rollups": {
+                "machines": {k: dict(v) for k, v in machines.items()},
+                "fleet": {
+                    "desired_configured": bool(desired_workers_by_machine),
+                    "desired_workers": desired_total,
+                    "alive_workers": alive_total,
+                    "missing_workers": missing_total,
+                },
+                "network": network,
+                "funnel": queue_funnel,
+            },
+            "recommendations": recommendations,
+        }
     finally:
         try:
             conn.rollback()
@@ -528,17 +2621,49 @@ def outcomes() -> dict:
         conn.close()
 
 
+def agents() -> dict:
+    """Build /api/agents payload."""
+    try:
+        return _agents_state()
+    except Exception as e:
+        raise RuntimeError(f"agent telemetry read failed: {e}") from e
+
+
 def build_status() -> dict:
     """Assemble the full /api/status object. Opens its OWN short-lived connections
     (each helper rolls back and we always close) so no connection is ever leaked."""
     conn = pgqueue.connect()  # reads APPLYPILOT_FLEET_DSN / DATABASE_URL
     try:
-        gate, queue = _gate_and_queue(conn)
+        gate, queue, apply_state = _gate_and_queue(conn)
         try:
             gate["should_halt"] = bool(pgqueue.should_halt(conn))
         except Exception:
             gate["should_halt"] = gate["paused"]
         workers = _workers(conn)
+        try:
+            deadman = _deadman_status(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            deadman = {
+                "active": False,
+                "alerts": [],
+                "code": None,
+                "title": None,
+                "reason": None,
+                "alert": None,
+                "alert_at": None,
+            }
+        try:
+            browser = _browser_health(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            browser = {"summary": {}, "issues": []}
         versions = _versions(conn)
         recent = _recent(conn, 15)
         ch = cb._challenges(conn)
@@ -560,6 +2685,43 @@ def build_status() -> dict:
             except Exception:
                 pass
             discovery = None
+        try:
+            agents_summary = _agent_routing_summary(conn, workers)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            agents_summary = {
+                "workers": len(workers),
+                "dynamic_workers": 0,
+                "switched_workers": 0,
+                "partial_workers": 0,
+                "blocked_workers": 0,
+                "active_agent_blocks": [],
+                "model_usage": {},
+                "model_family_usage": {},
+                "model_count": 0,
+            }
+        try:
+            freshness = _data_freshness(conn, endpoint="status")
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            freshness = {"endpoint": "status", "generated_at": _utcnow().isoformat(), "ages": {}}
+        recommendation = _status_recommendation(
+            gate=gate,
+            queue_apply=queue.get("apply", {}),
+            apply_state=apply_state,
+            workers=workers,
+            linkedin=linkedin,
+            discovery=discovery,
+            doctor_sig=doctor_sig,
+            agents=agents_summary,
+            browser=browser,
+        )
     finally:
         try:
             conn.rollback()
@@ -575,8 +2737,13 @@ def build_status() -> dict:
         "recent": recent,
         "challenges": challenges,
         "linkedin": linkedin,
+        "apply_state": apply_state,
+        "agents": agents_summary,
+        "freshness": freshness,
+        "recommendation": recommendation,
         "doctor": doctor_sig,
         "discovery": discovery,
+        "deadman": deadman,
         # H19: the DeadMan alert (fleet_config.deadman_alert/_at, written by
         # applypilot.fleet.deadman's run_deadman) surfaced top-level -- NOT nested
         # under "doctor" -- so a silent fleet death/stall/running-hot is visible
@@ -620,6 +2787,13 @@ def _challenges_data(conn) -> dict:
 
     urls = set(challenge_by_url) | set(parked_by_url)
     groups: dict[tuple[str, str], list[dict]] = {}
+    by_kind: dict[str, int] = {}
+    by_staleness: dict[str, int] = {}
+    stale_by_host: dict[str, int] = {}
+    missing_metadata_by_host: dict[str, int] = {}
+    stale_rows = 0
+    fresh_rows = 0
+    missing_metadata_rows = 0
     for url in urls:
         ch = challenge_by_url.get(url)
         lane, park = parked_by_url.get(url, (None, None))
@@ -627,6 +2801,9 @@ def _challenges_data(conn) -> dict:
         host = _host_of(url)
         raised_at = ch["raised_at"] if ch else None
         updated_at = park["updated_at"] if park else None
+        age_hours = _age_hours(raised_at if ch else updated_at, now)
+        staleness = "stale" if age_hours is not None and age_hours > 24 else "fresh"
+        has_metadata = bool((park or {}).get("company") and (park or {}).get("title"))
         row = {
             "url": url,
             "lane": lane,
@@ -634,20 +2811,109 @@ def _challenges_data(conn) -> dict:
             "title": park["title"] if park else None,
             "score": park["score"] if park else None,
             "kind": kind,
-            "machine": ch["machine_owner"] if ch else None,
+            "machine": _machine_display_name(ch["machine_owner"]) if ch else None,
             "screenshot_url": ch["screenshot_url"] if ch else None,
-            "age_hours": _age_hours(raised_at if ch else updated_at, now),
+            "age_hours": age_hours,
+            "staleness": staleness,
+            "has_metadata": has_metadata,
         }
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        by_staleness[staleness] = by_staleness.get(staleness, 0) + 1
+        if staleness == "stale":
+            stale_rows += 1
+            stale_by_host[host] = stale_by_host.get(host, 0) + 1
+        else:
+            fresh_rows += 1
+        if not has_metadata:
+            missing_metadata_rows += 1
+            missing_metadata_by_host[host] = missing_metadata_by_host.get(host, 0) + 1
         groups.setdefault((kind, host), []).append(row)
 
+    group_payloads = []
+    clear_first = []
+    resolve_first = []
+    for (kind, host), rows in groups.items():
+        stale_count = sum(1 for row in rows if row["staleness"] == "stale")
+        fresh_count = len(rows) - stale_count
+        missing_metadata_count = sum(1 for row in rows if not row["has_metadata"])
+        park_only_count = sum(1 for row in rows if row["kind"] == "(no challenge row)")
+        ages = [float(row["age_hours"]) for row in rows if row["age_hours"] is not None]
+        oldest_age_hours = round(max(ages), 1) if ages else None
+        machines = sorted({str(row["machine"]) for row in rows if row.get("machine")})
+        lanes = [row.get("lane") for row in rows if row.get("lane")]
+        lane = max(sorted(set(lanes)), key=lanes.count) if lanes else None
+        group_summary = {
+            "host": host,
+            "kind": kind,
+            "rows": len(rows),
+            "stale_rows": stale_count,
+            "fresh_rows": fresh_count,
+            "missing_metadata_rows": missing_metadata_count,
+            "park_only_rows": park_only_count,
+            "oldest_age_hours": oldest_age_hours,
+            "lane": lane,
+            "machines": machines,
+        }
+        group_payloads.append({
+            "kind": kind,
+            "host": host,
+            "rows": rows,
+            "summary": group_summary,
+        })
+        if stale_count > 0 or missing_metadata_count > 0:
+            clear_first.append(group_summary)
+        else:
+            resolve_first.append(group_summary)
+
+    group_payloads.sort(
+        key=lambda group: (
+            -int(group["summary"]["stale_rows"]),
+            -int(group["summary"]["missing_metadata_rows"]),
+            -int(group["summary"]["rows"]),
+            -float(group["summary"]["oldest_age_hours"] or 0.0),
+            str(group["host"]),
+            str(group["kind"]),
+        )
+    )
+    clear_first.sort(
+        key=lambda group: (
+            -int(group["stale_rows"]),
+            -int(group["missing_metadata_rows"]),
+            -int(group["rows"]),
+            -float(group["oldest_age_hours"] or 0.0),
+            str(group["host"]),
+            str(group["kind"]),
+        )
+    )
+    resolve_first.sort(
+        key=lambda group: (
+            -int(group["fresh_rows"]),
+            -int(group["rows"]),
+            float(group["oldest_age_hours"] or 0.0),
+            str(group["host"]),
+            str(group["kind"]),
+        )
+    )
+
     return {
-        "groups": [
-            {"kind": kind, "host": host, "rows": rows}
-            for (kind, host), rows in groups.items()
-        ],
+        "groups": group_payloads,
         "counts": {
             "open_challenges": len(open_challenges),
             "parked": len(parked_by_url),
+        },
+        "summary": {
+            "rows": sum(len(rows) for rows in groups.values()),
+            "fresh_rows": fresh_rows,
+            "stale_rows": stale_rows,
+            "missing_metadata_rows": missing_metadata_rows,
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_staleness": dict(sorted(by_staleness.items())),
+        },
+        "triage": {
+            "clear_first": clear_first,
+            "resolve_first": resolve_first,
+            "stale_by_host": dict(sorted(stale_by_host.items())),
+            "missing_metadata_by_host": dict(sorted(missing_metadata_by_host.items())),
         },
     }
 
@@ -722,11 +2988,16 @@ def _do_arm_canary(conn, body: dict) -> str:
 
 
 def _do_lift_canary(conn, body: dict) -> str:
-    # "Lift canary" must mean RUN UNBOUNDED: lift_canary alone does NOT unpause, so we
-    # also clear the pause here (per the task contract).
+    # Disarming a canary must not also resume the fleet. Resume is an explicit
+    # operator action with a separate confirmation path.
     H.lift_canary(conn)
-    pgqueue.set_paused(conn, False)
-    return "Canary lifted: the fleet will now apply UNBOUNDED (no cap on count)."
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET ats_apply_mode='stopped', "
+            "canary_enabled=FALSE, canary_remaining=NULL WHERE id=1"
+        )
+    conn.commit()
+    return "Canary disarmed: no new applications will be leased until a positive canary is armed."
 
 
 def _do_pause(conn, body: dict) -> str:
@@ -988,6 +3259,12 @@ _LANE_RESOLVERS = {
 }
 
 
+def _invalid_lane_message(lane: Any) -> str:
+    valid = ", ".join(sorted(_LANE_RESOLVERS))
+    got = "missing" if lane is None else str(lane)
+    return f"lane must be one of: {valid}; got {got}"
+
+
 def _do_challenge_resolve(conn, body: dict, *, requeue: bool):
     """Shared body for challenge_requeue (requeue=True) / challenge_skip (requeue=False).
     Idempotent: a url with no parked row is a success no-op (queue_rows: 0), never an
@@ -998,7 +3275,7 @@ def _do_challenge_resolve(conn, body: dict, *, requeue: bool):
         raise ValueError("url is required")
     resolver = _LANE_RESOLVERS.get(lane)
     if resolver is None:
-        return False, "unknown lane"
+        return False, _invalid_lane_message(lane)
     found = resolver(conn, url, requeue=requeue, commit=True)
     n = 1 if found else 0
     verb = "requeued" if requeue else "skipped"
@@ -1025,7 +3302,7 @@ def _do_challenge_skip_host(conn, body: dict):
         raise ValueError("host is required")
     resolver = _LANE_RESOLVERS.get(lane)
     if resolver is None:
-        return False, "unknown lane"
+        return False, _invalid_lane_message(lane)
     table = "apply_queue" if lane == "apply" else "linkedin_queue"
     with conn.cursor() as cur:
         cur.execute(
@@ -1068,6 +3345,66 @@ _ACTIONS = {
 }
 
 
+def _audit_lane(action: str, body: dict) -> str | None:
+    lane = body.get("lane")
+    if isinstance(lane, str) and lane:
+        return lane[:40]
+    if action in {"arm_canary", "lift_canary", "doctor_revert", "doctor_dismiss"}:
+        return "ats"
+    return None
+
+
+def _audit_target(action: str, body: dict) -> str | None:
+    if action in {"pause", "resume", "reclaim"}:
+        return "fleet"
+    if action in {"arm_canary", "lift_canary"}:
+        return "ats"
+    if action == "set_cap":
+        return "spend_cap"
+    if action == "expand_searches":
+        return "search_tasks"
+    if action == "doctor_revert":
+        if _is_pos_int(body.get("knob_id")):
+            return f"knob:{int(body['knob_id'])}"
+        if _is_pos_int(body.get("diagnosis_id")):
+            return f"diagnosis:{int(body['diagnosis_id'])}"
+    if action == "doctor_dismiss" and _is_pos_int(body.get("diagnosis_id")):
+        return f"diagnosis:{int(body['diagnosis_id'])}"
+    if action == "challenge_skip_host" and isinstance(body.get("host"), str):
+        return "host:" + _scrub(body["host"])[:120]
+    if action in {"challenge_requeue", "challenge_skip"} and isinstance(body.get("url"), str):
+        return "host:" + _scrub(_host_of(body["url"]))[:120]
+    return action[:120]
+
+
+def _record_console_audit(conn, action: str, body: dict, *, ok: bool, message: str) -> None:
+    """Append a minimal, secret-free audit row for an existing allow-listed console action."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('fleet_console_audit') AS rel")
+            if cur.fetchone()["rel"] is None:
+                conn.rollback()
+                return
+            cur.execute(
+                "INSERT INTO fleet_console_audit (action, actor, lane, target, message, ok) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    _scrub(action)[:80],
+                    "console",
+                    _audit_lane(action, body),
+                    _audit_target(action, body),
+                    _scrub(message)[:300],
+                    bool(ok),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def run_action(body: dict) -> tuple[bool, str]:
     """Validate + dispatch a single allowed action against a short-lived connection.
     Returns (ok, message). Connection always closed.
@@ -1082,9 +3419,19 @@ def run_action(body: dict) -> tuple[bool, str]:
         return False, "unknown action"
     conn = pgqueue.connect()
     try:
-        result = fn(conn, body)
+        try:
+            result = fn(conn, body)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _record_console_audit(conn, action, body, ok=False, message=str(exc))
+            raise
         if isinstance(result, tuple):
+            _record_console_audit(conn, action, body, ok=bool(result[0]), message=str(result[1]))
             return result
+        _record_console_audit(conn, action, body, ok=True, message=str(result))
         return True, result
     finally:
         try:
@@ -1238,6 +3585,18 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
+        if path == "/api/agents":
+            try:
+                self._send_json(200, agents())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if path == "/api/diagnosis":
+            try:
+                self._send_json(200, diagnosis())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
         if path == "/api/diagnostics":
             # Dedicated endpoint (NOT folded into the 4s /api/status poll): the Doctor blob
             # (clusters + auto-fixes + recommendations) can be large, so it is fetched on its
@@ -1351,19 +3710,69 @@ _INDEX_HTML = r"""<!doctype html>
   .banner.run .dot{background:var(--green2);box-shadow:0 0 10px var(--green2)}
   .banner.pause{background:rgba(218,54,51,.12);color:var(--red2);border-color:rgba(218,54,51,.4)}
   .banner.pause .dot{background:var(--red2);box-shadow:0 0 10px var(--red2)}
+  .banner.warn{background:rgba(210,153,34,.12);color:var(--amber);border-color:rgba(210,153,34,.4)}
+  .banner.warn .dot{background:var(--amber);box-shadow:0 0 10px var(--amber)}
   .banner small{margin-left:auto;font-size:12px;font-weight:400;color:var(--muted)}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;margin-bottom:18px}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px}
   .card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
   .card .val{font-size:24px;font-weight:700;margin-top:6px}
   .card .hint{color:var(--muted);font-size:11px;margin-top:4px}
+  .band.primary{border-left:4px solid var(--blue)}
+  .headline{font-size:24px;font-weight:750;margin:6px 0}
+  .actionline{margin-top:10px;color:var(--fg);font-weight:600}
+  .metric-grid,.diagnosis-grid,.machine-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+  .mini{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px}
+  .mini span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  .mini b{display:block;font-size:20px;margin-top:4px}
+  .funnel{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+  .fstep{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px;min-height:70px}
+  .fstep span{display:block;color:var(--muted);font-size:11px}
+  .fstep b{font-size:22px}
+  .apply-state{border-color:var(--border)}
+  .apply-state.ok{border-color:rgba(86,211,100,.65)}
+  .apply-state.warn{border-color:rgba(210,153,34,.65)}
+  .apply-state.halted{border-color:rgba(248,81,73,.65)}
+  .apply-state .val{color:var(--fg)}
+  .apply-state.ok .val{color:#56d364}
+  .apply-state.warn .val{color:#d29922}
+  .apply-state.halted .val{color:#f85149}
   section{background:var(--panel);border:1px solid var(--border);border-radius:10px;
     padding:14px 16px;margin-bottom:16px}
   section h2{font-size:13px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .table-wrap{width:100%;overflow:auto}
   table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
   th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
   tr:last-child td{border-bottom:none}
+  .family-chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;line-height:1.1;border:1px solid var(--border)}
+  .family-chip.claude{color:#b18cff;border-color:rgba(177,140,255,.5);background:rgba(177,140,255,.12)}
+  .family-chip.codex-like{color:#58a6ff;border-color:rgba(88,166,255,.45);background:rgba(88,166,255,.12)}
+  .family-chip.other{color:#8b949e;border-color:rgba(139,148,158,.35);background:rgba(139,148,158,.12)}
+  .family-chip.unknown{color:#f8eec7;border-color:rgba(248,238,199,.45);background:rgba(248,238,199,.1)}
+  .vendor-chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;line-height:1.1;border:1px solid var(--border)}
+  .vendor-chip.claude{color:#c9a4ff;border-color:rgba(201,164,255,.45);background:rgba(201,164,255,.12)}
+  .vendor-chip.codex{color:#58a6ff;border-color:rgba(88,166,255,.45);background:rgba(88,166,255,.12)}
+  .vendor-chip.gemini{color:#ffbe6a;border-color:rgba(255,190,106,.45);background:rgba(255,190,106,.12)}
+  .vendor-chip.other{color:#8b949e;border-color:rgba(139,148,158,.35);background:rgba(139,148,158,.12)}
+  .vendor-chip.unknown{color:#f8eec7;border-color:rgba(248,238,199,.45);background:rgba(248,238,199,.1)}
+  .verdict-chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;line-height:1.1;font-weight:600;border:1px solid var(--border)}
+  .v-working{color:#56d364;border-color:rgba(86,211,100,.45);background:rgba(86,211,100,.1)}
+  .v-blocked{color:#f85149;border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.1)}
+  .v-partial{color:#d29922;border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.1)}
+  .v-not-triggered{color:#8b949e;border-color:rgba(139,148,158,.45);background:rgba(139,148,158,.08)}
+  .v-misconfigured{color:#d2a8ff;border-color:rgba(210,168,255,.45);background:rgba(210,168,255,.1)}
+  .v-unknown{color:#b0b7c3;border-color:rgba(176,183,195,.45);background:rgba(176,183,195,.08)}
+  tr.v-working td{background-color:rgba(86,211,100,.04)}
+  tr.v-blocked td{background-color:rgba(248,81,73,.05)}
+  tr.v-partial td{background-color:rgba(210,153,34,.05)}
+  tr.v-not-triggered td{background-color:rgba(139,148,158,.04)}
+  tr.v-misconfigured td{background-color:rgba(210,168,255,.05)}
+  tr.v-unknown td{background-color:rgba(176,183,195,.03)}
+  .family-legend{display:flex;flex-wrap:wrap;gap:8px;color:var(--muted);font-size:11px;margin:0 0 10px}
+  .family-legend .tag{display:inline-flex;align-items:center;gap:6px}
+  .verdict-legend{display:flex;flex-wrap:wrap;gap:8px;color:var(--muted);font-size:11px;margin:8px 0 0}
+  .verdict-legend .tag{display:inline-flex;align-items:center;gap:6px}
   .ldot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}
   .ldot.on{background:var(--green2);box-shadow:0 0 6px var(--green2)}
   .ldot.off{background:var(--grey)}
@@ -1448,19 +3857,123 @@ _INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="cards">
+    <div class="card apply-state" id="applyStateCard">
+      <div class="label">Apply state</div>
+      <div class="val" id="applyState">&mdash;</div><div class="hint" id="applyStateHint">&nbsp;</div></div>
     <div class="card"><div class="label">Canary</div>
       <div class="val" id="cCanary">&mdash;</div><div class="hint" id="cCanaryHint"></div></div>
     <div class="card"><div class="label">Spend</div>
       <div class="val" id="cSpend">&mdash;</div><div class="hint" id="cSpendHint">of cap</div></div>
+    <div class="card"><div class="label">ATS queued</div>
+      <div class="val" id="cQueuedAts">&mdash;</div><div class="hint">queued / leased / applied</div></div>
     <div class="card"><div class="label">Apply queue</div>
       <div class="val" id="cQueued">&mdash;</div><div class="hint">queued</div></div>
     <div class="card"><div class="label">Leasable now</div>
       <div class="val" id="cLeasable">&mdash;</div><div class="hint">approved &amp; not deduped</div></div>
+    <div class="card"><div class="label">Compute queued</div>
+      <div class="val" id="cQueuedCompute">&mdash;</div><div class="hint">queued / leased / applied</div></div>
+    <div class="card"><div class="label">Other queued</div>
+      <div class="val" id="cQueuedOther">&mdash;</div><div class="hint">queued / leased / applied</div></div>
+    <div class="card"><div class="label">Flow (10m)</div>
+      <div class="val" id="cQueueFlow">&mdash;</div><div class="hint" id="cQueueFlowHint">leases/applied per minute</div></div>
+    <div class="card"><div class="label">ATS lane flow</div>
+      <div class="val" id="cLaneFlowAts">&mdash;</div><div class="hint" id="cLaneFlowAtsHint">leases/applied per minute</div></div>
+    <div class="card"><div class="label">Compute lane flow</div>
+      <div class="val" id="cLaneFlowCompute">&mdash;</div><div class="hint" id="cLaneFlowComputeHint">leases/applied per minute</div></div>
+    <div class="card"><div class="label">Other lane flow</div>
+      <div class="val" id="cLaneFlowOther">&mdash;</div><div class="hint" id="cLaneFlowOtherHint">leases/applied per minute</div></div>
     <div class="card"><div class="label">Open challenges</div>
       <div class="val" id="cChallenges">&mdash;</div><div class="hint">need a human</div></div>
     <div class="card"><div class="label">Doctor</div>
       <div class="val" id="cDoctor">&mdash;</div><div class="hint" id="cDoctorHint">auto-fixes active</div></div>
   </div>
+
+  <section id="fleetState" class="band primary">
+    <h2>Fleet State</h2>
+    <div id="stateHeadline" class="headline">Loading</div>
+    <div id="stateReason" class="sub"></div>
+    <div id="stateAction" class="actionline">—</div>
+  </section>
+
+  <section id="safetyRails">
+    <h2>Safety Rails</h2>
+    <div class="metric-grid" id="safetyGrid"></div>
+  </section>
+
+  <section id="whyNotApplying">
+    <h2>Why Not Applying</h2>
+    <div class="diagnosis-grid" id="whyBody"></div>
+  </section>
+
+  <section id="machineHealth">
+    <h2>Machine Health</h2>
+    <div class="machine-grid" id="machineMap"></div>
+  </section>
+
+  <section id="agentRouting">
+    <h2>Agent Routing</h2>
+    <div class="funnel" id="agentBody"></div>
+  </section>
+
+  <section id="workerComparison">
+    <h2>Worker Comparison</h2>
+    <div class="funnel" id="workerComparisonBody"></div>
+  </section>
+
+  <section id="queueFunnel">
+    <h2>Queue Funnel</h2>
+    <div class="funnel" id="funnelBody"></div>
+  </section>
+
+  <section id="throughputForecast">
+    <h2>Throughput Forecast</h2>
+    <div class="funnel" id="forecastBody"></div>
+  </section>
+
+  <section id="dailyGoals">
+    <h2>Daily Goals</h2>
+    <div class="funnel" id="dailyGoalsBody"></div>
+  </section>
+
+  <section id="dataFreshness">
+    <h2>Data Freshness</h2>
+    <div class="funnel" id="freshnessBody"></div>
+  </section>
+
+  <section id="operatorAudit">
+    <h2>Operator Audit</h2>
+    <div class="funnel" id="operatorAuditBody"></div>
+  </section>
+
+  <section id="hostSourceQuality">
+    <h2>Host / Source Quality</h2>
+    <div class="funnel" id="hostQualityBody"></div>
+  </section>
+
+  <section id="linkedinLane">
+    <h2>LinkedIn Lane</h2>
+    <div class="funnel" id="linkedinBody"></div>
+  </section>
+
+  <section id="discoveryPipeline">
+    <h2>Discovery Pipeline</h2>
+    <div class="funnel" id="discoveryBody"></div>
+  </section>
+
+  <section id="computeHealth">
+    <h2>Compute Health</h2>
+    <div class="funnel" id="computeBody"></div>
+  </section>
+
+  <section id="deadmanWatchdog">
+    <h2>Fleet Watchdog</h2>
+    <div class="funnel" id="deadmanBody"></div>
+  </section>
+
+  <section id="queueRecommendations">
+    <h2>Recommended Next Action</h2>
+    <div class="mut" id="stateRecommendation">—</div>
+  </section>
 
   <section>
     <h2>Controls</h2>
@@ -1496,20 +4009,83 @@ _INDEX_HTML = r"""<!doctype html>
       <div class="card"><div class="label">Drifted</div>
         <div class="val" id="versionDrift">&mdash;</div><div class="hint">workers off expected version</div></div>
     </div>
-    <table><thead><tr><th>Version</th><th>Workers</th></tr></thead>
-      <tbody id="versionRows"><tr><td colspan="2" class="mut">&hellip;</td></tr></tbody></table>
+    <div class="table-wrap">
+      <table><thead><tr><th>Version</th><th>Workers</th></tr></thead>
+        <tbody id="versionRows"><tr><td colspan="2" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
   </section>
 
   <section>
     <h2>Workers (apply lane)</h2>
-    <table><thead><tr><th>Worker</th><th>Live</th><th>Last beat</th><th>Applied</th><th>Current job</th></tr></thead>
-      <tbody id="workers"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table>
+    <div class="table-wrap">
+      <table><thead><tr><th>Machine</th><th>Worker</th><th>Live</th><th>Last beat</th><th>Applied</th><th>Agent</th><th>Model</th><th>Model vendor</th><th>Model family</th><th>Last switch</th><th>Current job</th></tr></thead>
+        <tbody id="workers"><tr><td colspan="11" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+    <section>
+    <h2>Agents and models</h2>
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="label">Active blocks</div>
+        <div class="val" id="aBlocks">&mdash;</div><div class="hint">agents currently blocked</div></div>
+      <div class="card"><div class="label">Spending telemetry</div>
+        <div class="val" id="aSpendRows">&mdash;</div><div class="hint">agents with apply spend in last 24h</div></div>
+      <div class="card"><div class="label">Dynamic switching (live)</div>
+        <div class="val" id="aSwitch">&mdash;</div><div class="hint">working / blocked / partial / misconfigured</div></div>
+      <div class="card"><div class="label">Dynamic switching</div>
+        <div class="val" id="aDynamicWorked">&mdash;</div><div class="hint">whether alternate agent is currently active</div></div>
+      <div class="card"><div class="label">Model in use</div>
+        <div class="val" id="aPrimaryModel">&mdash;</div><div class="hint" id="aPrimaryModelHint">top current model by worker count</div></div>
+      <div class="card"><div class="label">Dynamic switching summary</div>
+        <div class="val" id="aSwitchStatus">&mdash;</div><div class="hint" id="aSwitchStatusHint">workers on alternate agent now</div></div>
+      <div class="card"><div class="label">Model family</div>
+        <div class="val" id="aModelFamily">&mdash;</div><div class="hint" id="aModelFamilyHint">model family mix</div></div>
+      <div class="card"><div class="label">Model trend (9m)</div>
+        <div class="val" id="aModelTrend">&mdash;</div><div class="hint" id="aModelTrendHint">rolling snapshot trend</div></div>
+      <div class="card"><div class="label">Latest switch</div>
+        <div class="val" id="aLatestSwitch">&mdash;</div><div class="hint">most recent model/agent switch</div></div>
+    </div>
+    <div class="family-legend" aria-label="model family legend">
+      <span class="tag"><span class="family-chip claude">claude</span> Claude family</span>
+      <span class="tag"><span class="family-chip codex-like">codex-like</span> Codex-like</span>
+      <span class="tag"><span class="family-chip other">other</span> Other</span>
+      <span class="tag"><span class="family-chip unknown">unknown</span> Unknown</span>
+    </div>
+    <div class="family-legend" aria-label="model vendor legend">
+      <span class="tag"><span class="vendor-chip codex">codex</span> Codex</span>
+      <span class="tag"><span class="vendor-chip claude">claude</span> Claude</span>
+      <span class="tag"><span class="vendor-chip gemini">gemini</span> Gemini</span>
+      <span class="tag"><span class="vendor-chip other">other</span> Other</span>
+    </div>
+    <div class="verdict-legend" aria-label="agent switching verdict legend">
+      <span class="tag"><span class="verdict-chip v-working">working</span> Working</span>
+      <span class="tag"><span class="verdict-chip v-blocked">blocked</span> Blocked</span>
+      <span class="tag"><span class="verdict-chip v-partial">partial</span> Partial</span>
+      <span class="tag"><span class="verdict-chip v-misconfigured">misconfigured</span> Misconfigured</span>
+      <span class="tag"><span class="verdict-chip v-not-triggered">not triggered</span> Not triggered</span>
+      <span class="tag"><span class="verdict-chip v-unknown">unknown</span> Unknown</span>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th>Machine</th><th>Worker</th><th>Current agent</th><th>Model</th><th>Model vendor</th><th>Model family</th><th>Configured chain</th><th>Verdict</th><th>Blocked agents</th><th>Last switch</th></tr></thead>
+        <tbody id="agents"><tr><td colspan="10" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th>Machine</th><th>Workers</th><th>Codex</th><th>Claude</th><th>Gemini</th><th>Other</th><th>Unknown</th></tr></thead>
+        <tbody id="aModelByMachine"><tr><td colspan="7" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
   </section>
 
   <section>
     <h2>Recent activity</h2>
-    <table><thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Company / Title</th></tr></thead>
-      <tbody id="recent"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+   <div class="table-wrap">
+     <table><thead><tr><th>Time</th><th>Worker</th><th>Status</th><th>Company / Title</th></tr></thead>
+       <tbody id="recent"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody>
+     </table>
+   </div>
   </section>
 
   <section>
@@ -1522,6 +4098,23 @@ _INDEX_HTML = r"""<!doctype html>
       <span class="mut" style="font-size:12px">Last crash traceback + recent log tail, shipped via the heartbeat (secrets scrubbed). Read-only.</span>
     </div>
     <div id="logArea" class="mut" style="font-size:12px">Select a worker to view its logs.</div>
+  </section>
+
+  <section>
+    <h2>Browser and backend health</h2>
+    <div class="cards" style="margin-bottom:12px">
+      <div class="card"><div class="label">Workers</div>
+        <div class="val" id="bWorkers">&mdash;</div><div class="hint">heartbeat rows scanned</div></div>
+      <div class="card"><div class="label">Problem workers</div>
+        <div class="val" id="bProblem">&mdash;</div><div class="hint" id="bProblemHint">workers with browser/backend symptoms</div></div>
+      <div class="card"><div class="label">Healthy workers</div>
+        <div class="val" id="bHealthy">&mdash;</div><div class="hint">currently no browser/backend symptom</div></div>
+    </div>
+    <div class="table-wrap">
+      <table><thead><tr><th>Worker</th><th>Machine</th><th>Lane</th><th>State</th><th>Issue</th><th>Age</th><th>Evidence</th><th>Last beat</th></tr></thead>
+        <tbody id="browserHealth"><tr><td colspan="8" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -1540,16 +4133,25 @@ _INDEX_HTML = r"""<!doctype html>
       <button class="go" id="btnExpand">Expand searches (seed tasks)</button>
       <span class="mut" style="font-size:12px">Seeds <code>search_tasks</code> from searches.yaml &mdash; queues scrape work, submits nothing. Discovery workers run per-machine (<code>applypilot-fleet-discovery</code>).</span>
     </div>
-    <table><thead><tr><th>Discovery worker</th><th>Live</th><th>Last beat</th><th>Found 24h</th></tr></thead>
-      <tbody id="discWorkers"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
-    <table style="margin-top:10px"><thead><tr><th>Found</th><th>Source</th><th>Search</th></tr></thead>
-      <tbody id="discRecent"><tr><td colspan="3" class="mut">&hellip;</td></tr></tbody></table>
+    <div class="table-wrap">
+      <table><thead><tr><th>Discovery worker</th><th>Machine</th><th>Live</th><th>Last beat</th><th>Found 24h</th></tr></thead>
+        <tbody id="discWorkers"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table><thead><tr><th>Found</th><th>Source</th><th>Search</th></tr></thead>
+        <tbody id="discRecent"><tr><td colspan="3" class="mut">&hellip;</td></tr></tbody>
+      </table>
+    </div>
   </section>
 
   <section>
   <h2>Recent outcomes (read-only)</h2>
-  <table><thead><tr><th>Time</th><th>Company / Title</th><th>Stage</th><th>Outcome</th></tr></thead>
-    <tbody id="outcomes"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+   <div class="table-wrap">
+     <table><thead><tr><th>Time</th><th>Company / Title</th><th>Stage</th><th>Outcome</th></tr></thead>
+       <tbody id="outcomes"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody>
+     </table>
+   </div>
 </section>
 
   <section>
@@ -1561,12 +4163,18 @@ _INDEX_HTML = r"""<!doctype html>
       a recommendation for you.
     </div>
     <div class="dgrp"><div class="lbl">Live failure clusters (last 60m)</div>
-      <table><thead><tr><th>Reason</th><th>Host</th><th>Machine</th><th>Samples</th></tr></thead>
-        <tbody id="docClusters"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody></table>
+      <div class="table-wrap">
+        <table><thead><tr><th>Reason</th><th>Host</th><th>Machine</th><th>Samples</th></tr></thead>
+          <tbody id="docClusters"><tr><td colspan="4" class="mut">&hellip;</td></tr></tbody>
+        </table>
+      </div>
     </div>
     <div class="dgrp"><div class="lbl">Active auto-fixes</div>
-      <table><thead><tr><th>Type</th><th>Scope</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
-        <tbody id="docAuto"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody></table>
+      <div class="table-wrap">
+        <table><thead><tr><th>Type</th><th>Scope</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
+          <tbody id="docAuto"><tr><td colspan="5" class="mut">&hellip;</td></tr></tbody>
+        </table>
+      </div>
     </div>
     <div class="dgrp"><div class="lbl">Recommendations (need a human)</div>
       <div id="docRecs" class="mut">&hellip;</div>
@@ -1589,6 +4197,10 @@ _INDEX_HTML = r"""<!doctype html>
 <script>
 "use strict";
 let lastUpdate = null;
+let queueFlowSnapshots = [];
+let laneFlowSnapshots = {ats: [], compute: [], other: []};
+const QUEUE_FLOW_MAX_SAMPLES = 16;
+const QUEUE_FLOW_WINDOW_SECONDS = 600;
 
 function esc(s){ return s==null ? "" : String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -1600,6 +4212,148 @@ function rel(iso){
   if(d<60) return d+"s ago";
   if(d<3600) return Math.round(d/60)+"m ago";
   return Math.round(d/3600)+"h ago";
+}
+
+let modelTrendSnapshots = [];
+const MODEL_TREND_MAX_SAMPLES = 12;
+const MODEL_TREND_WINDOW_SECONDS = 900;
+
+function familyChipHtml(f){
+  const fam = esc(f || "unknown");
+  const cls = (f || "unknown").toLowerCase().replace(/[^a-z0-9-]+/g, "");
+  return '<span class="family-chip ' + esc(cls) + '">' + fam + '</span>';
+}
+
+function updateQueueFlowMetrics(queue){
+  if(!queue) return {text: "—", hint: "no queue telemetry"};
+  const now = Date.now();
+  queueFlowSnapshots.push({
+    at: now,
+    queued: Number(queue.queued || 0),
+    leased: Number(queue.leased || 0),
+    applied: Number(queue.applied || 0),
+    failed: Number(queue.failed || 0),
+  });
+  const cutoff = now - (QUEUE_FLOW_WINDOW_SECONDS * 1000);
+  while(queueFlowSnapshots.length && queueFlowSnapshots[0].at < cutoff){
+    queueFlowSnapshots.shift();
+  }
+  while(queueFlowSnapshots.length > QUEUE_FLOW_MAX_SAMPLES){
+    queueFlowSnapshots.shift();
+  }
+  if(queueFlowSnapshots.length < 2){
+    return {text: "bootstrapping", hint: "collecting queue samples"};
+  }
+  const first = queueFlowSnapshots[0];
+  const last = queueFlowSnapshots[queueFlowSnapshots.length - 1];
+  const elapsedMs = Math.max(1, last.at - first.at);
+  const elapsedMin = elapsedMs / 60000.0;
+  const leasedDelta = Math.max(0, last.leased - first.leased);
+  const appliedDelta = Math.max(0, last.applied - first.applied);
+  const queuedDelta = last.queued - first.queued;
+  const leasedRate = leasedDelta / elapsedMin;
+  const appliedRate = appliedDelta / elapsedMin;
+  const queuedBacklog = last.queued;
+  const queueSlope = queuedDelta === 0 ? "steady" : (queuedDelta < 0 ? "improving" : "growing");
+  const qSuffix = queuedBacklog > 0 ? (" · backlog " + queuedBacklog) : "";
+  const leasedFmt = Math.round(leasedRate * 10) / 10;
+  const appliedFmt = Math.round(appliedRate * 10) / 10;
+  return {
+    text: "leases " + leasedFmt + "/m · applied " + appliedFmt + "/m",
+    hint: queueSlope + " queue · " + (new Date(first.at).toISOString() + " to " + new Date(last.at).toISOString()) + qSuffix,
+  };
+}
+
+function updateModelTrend(modelUsageEntries, modelText){
+  const now = Date.now();
+  modelTrendSnapshots.push({
+    at: now,
+    top: (modelText && modelText !== "—") ? modelText : null,
+    items: modelUsageEntries.slice(0, 3),
+  });
+  const cutoff = now - (MODEL_TREND_WINDOW_SECONDS * 1000);
+  while(modelTrendSnapshots.length && modelTrendSnapshots[0].at < cutoff){
+    modelTrendSnapshots.shift();
+  }
+  while(modelTrendSnapshots.length > MODEL_TREND_MAX_SAMPLES){
+    modelTrendSnapshots.shift();
+  }
+  if(!modelTrendSnapshots.length || modelTrendSnapshots.length === 1){
+    return {
+      text: modelText || "—",
+      trend: "steady",
+      window: "capturing",
+    };
+  }
+  const first = modelTrendSnapshots[0].top || "";
+  const last = modelTrendSnapshots[modelTrendSnapshots.length - 1].top || "";
+  return {
+    text: modelText || "—",
+    trend: first && last && first !== last ? "trend: " + first.split(" ")[0] + " → " + last.split(" ")[0] : "steady",
+    window: rel(new Date(modelTrendSnapshots[0].at).toISOString()) + " – now",
+  };
+}
+
+function _queueFlowForLane(flowSamples, laneData, laneText){
+  const queue = laneData || {};
+  const now = Date.now();
+  flowSamples.push({
+    at: now,
+    queued: Number(queue.queued || 0),
+    leased: Number(queue.leased || 0),
+    applied: Number(queue.applied || 0),
+  });
+  const cutoff = now - (QUEUE_FLOW_WINDOW_SECONDS * 1000);
+  while(flowSamples.length && flowSamples[0].at < cutoff){
+    flowSamples.shift();
+  }
+  while(flowSamples.length > QUEUE_FLOW_MAX_SAMPLES){
+    flowSamples.shift();
+  }
+  if(flowSamples.length < 2){
+    return {
+      text: laneText ? (laneText + " — bootstrapping") : "bootstrapping",
+      hint: "collecting queue samples",
+    };
+  }
+  const first = flowSamples[0];
+  const last = flowSamples[flowSamples.length - 1];
+  const elapsedMin = Math.max(1, (last.at - first.at) / 60000.0);
+  const leasedRate = Math.max(0, last.leased - first.leased) / elapsedMin;
+  const appliedRate = Math.max(0, last.applied - first.applied) / elapsedMin;
+  const queuedBacklog = last.queued;
+  const qSuffix = queuedBacklog > 0 ? (" · backlog " + queuedBacklog) : "";
+  const leasedFmt = Math.round(leasedRate * 10) / 10;
+  const appliedFmt = Math.round(appliedRate * 10) / 10;
+  return {
+    text: "leases " + leasedFmt + "/m · applied " + appliedFmt + "/m",
+    hint: (laneText ? laneText : "lane") + " " + qSuffix + " (" +
+      (new Date(first.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + " to " +
+      new Date(last.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })) + ")",
+  };
+}
+
+function updateLaneFlowMetrics(key, laneData){
+  if(!key) return {text: "—", hint: "no lane telemetry"};
+  if(!laneFlowSnapshots[key]){
+    laneFlowSnapshots[key] = [];
+  }
+  return _queueFlowForLane(laneFlowSnapshots[key], laneData, key.toUpperCase());
+}
+
+function laneRateText(d){
+  const lane = d || {};
+  const queued = Number(lane.queued || 0);
+  const leased = Number(lane.leased || 0);
+  const applied = Number(lane.applied || 0);
+  const conversion = queued > 0 ? Math.round((leased / queued) * 100) + "%" : "—";
+  return `${queued}/${leased}/${applied} · lease ${conversion}`;
+}
+
+function vendorChipHtml(v){
+  const vendor = esc(v || "unknown");
+  const cls = (v || "unknown").toLowerCase().replace(/[^a-z0-9-]+/g, "");
+  return '<span class="vendor-chip ' + esc(cls) + '">' + vendor + '</span>';
 }
 
 function toast(msg, kind){
@@ -1614,13 +4368,17 @@ function render(s){
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
   const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
+  const state = s.apply_state || {};
 
   // DeadMan: a RED fixed banner when fleet_config.deadman_alert is set (silent
   // fleet death / stall / running-hot) so the owner sees it even glancing at a phone.
   const dmBanner = document.getElementById("deadmanBanner");
   if(dmBanner){
-    if(s.deadman_alert){
-      dmBanner.textContent = "DEADMAN ALERT: " + s.deadman_alert + " (" + rel(s.deadman_alert_at) + ")";
+    const deadman = s.deadman || {};
+    const dmTitle = (deadman.title || deadman.alert || s.deadman_alert || "deadman alert");
+    const dmReason = deadman.reason || (s.deadman_alert_at ? ("active at " + rel(s.deadman_alert_at)) : "");
+    if(deadman.active || s.deadman_alert){
+      dmBanner.textContent = "DEADMAN ALERT: " + dmTitle + (dmReason ? " — " + dmReason : "") + " (" + rel(s.deadman_alert_at) + ")";
       dmBanner.className = "deadmanbanner show";
     } else {
       dmBanner.textContent = "";
@@ -1634,13 +4392,23 @@ function render(s){
   const atsPauseSource = doc.ats_pause_source || g.ats_pause_source || "operator";
   const paused = g.paused || g.should_halt;
   const banner = document.getElementById("banner");
-  banner.className = "banner " + ((paused || atsPause) ? "pause" : "run");
+  const stateSeverity = (state.severity || "warn").toLowerCase();
+  const bannerState = (stateSeverity === "ok" ? "run" : (stateSeverity === "halted" ? "pause" : "warn"));
+  banner.className = "banner " + bannerState;
   document.getElementById("bannerText").textContent =
     paused ? (g.should_halt && !g.paused ? "HALTED (spend cap)" : "PAUSED")
            : (atsPause ? ("ATS PAUSED (" + atsPauseSource + ")") : "RUNNING");
   document.getElementById("updated").textContent =
     "updated " + rel(s.now) + (g.should_halt ? " • halt active"
       : atsPause ? " • LinkedIn lane UNAFFECTED" : "");
+
+  const statusRecommendation = s.recommendation || {};
+  const statusRecommendationEl = document.getElementById("stateRecommendation");
+  if(statusRecommendationEl && statusRecommendation.title){
+    statusRecommendationEl.className = "mut";
+    statusRecommendationEl.textContent =
+      statusRecommendation.title + " — " + (statusRecommendation.reason || "review recommended action.");
+  }
 
   // H18: above-the-fold Doctor card + a toast when a NEW auto-fix appears between polls.
   const dc = document.getElementById("cDoctor");
@@ -1665,6 +4433,28 @@ function render(s){
   document.getElementById("cQueued").textContent = q.queued;
   document.getElementById("cLeasable").textContent = g.leasable;
   document.getElementById("cChallenges").textContent = s.challenges;
+  document.getElementById("cQueuedAts").textContent = laneRateText((q.by_lane && q.by_lane.ats) || {});
+  document.getElementById("cQueuedCompute").textContent = laneRateText((q.by_lane && q.by_lane.compute) || {});
+  document.getElementById("cQueuedOther").textContent = laneRateText((q.by_lane && q.by_lane.other) || {});
+  const queueFlow = updateQueueFlowMetrics(q);
+  document.getElementById("cQueueFlow").textContent = queueFlow.text;
+  document.getElementById("cQueueFlowHint").textContent = queueFlow.hint;
+  const byLane = q.by_lane || {};
+  const atsFlow = updateLaneFlowMetrics("ats", byLane.ats || {});
+  const computeFlow = updateLaneFlowMetrics("compute", byLane.compute || {});
+  const otherFlow = updateLaneFlowMetrics("other", byLane.other || {});
+  document.getElementById("cLaneFlowAts").textContent = atsFlow.text;
+  document.getElementById("cLaneFlowAtsHint").textContent = atsFlow.hint;
+  document.getElementById("cLaneFlowCompute").textContent = computeFlow.text;
+  document.getElementById("cLaneFlowComputeHint").textContent = computeFlow.hint;
+  document.getElementById("cLaneFlowOther").textContent = otherFlow.text;
+  document.getElementById("cLaneFlowOtherHint").textContent = otherFlow.hint;
+  const asCode = state.code || "unknown";
+  const asSeverity = (state.severity || "warn").toLowerCase();
+  const asCard = document.getElementById("applyStateCard");
+  if(asCard){ asCard.className = "card apply-state " + asSeverity; }
+  document.getElementById("applyState").textContent = asCode;
+  document.getElementById("applyStateHint").textContent = state.reason || "—";
 
   const versions = s.versions || {};
   document.getElementById("versionPinned").textContent = versions.pinned_worker_version || "not pinned";
@@ -1680,13 +4470,19 @@ function render(s){
   }).join("");
 
   const wt = document.getElementById("workers");
-  if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="5" class="mut">no apply workers heartbeating</td></tr>'; }
+    if(!s.workers.length){ wt.innerHTML = '<tr><td colspan="10" class="mut">no apply workers heartbeating</td></tr>'; }
   else wt.innerHTML = s.workers.map(w=>{
+    const sw = w.last_agent_switch_at ? (rel(w.last_agent_switch_at)+
+      (w.last_agent_switch_reason ? (" · " + esc(w.last_agent_switch_reason)) : "")) : "—";
     const cur = w.current ? esc((w.current.company||"")+" — "+(w.current.title||"")) : '<span class="mut">idle</span>';
     const beat = w.last_beat ? (rel(w.last_beat)+(w.seconds_since!=null?" ("+w.seconds_since+"s)":"")) : "never";
-    return '<tr><td>'+esc(w.worker_id)+'</td>'+
-      '<td><span class="ldot '+(w.alive?"on":"off")+'"></span>'+(w.alive?"alive":"down")+'</td>'+
-      '<td class="mut">'+esc(beat)+'</td><td>'+(w.applied||0)+'</td><td>'+cur+'</td></tr>';
+    return '<tr><td>'+esc(w.machine||"")+'</td><td>'+esc(w.worker_id)+'</td>'+
+       '<td><span class="ldot '+(w.alive?"on":"off")+'"></span>'+(w.alive?"alive":"down")+'</td>'+
+       '<td class="mut">'+esc(beat)+'</td><td>'+(w.applied||0)+'</td>'+
+       '<td>'+esc(w.current_agent || "—")+'</td><td>'+esc(w.current_model || "—")+'</td>'+
+       '<td class="mut">'+vendorChipHtml(w.current_model_vendor || "unknown")+'</td>'+
+       '<td class="mut">'+familyChipHtml(w.current_model_family || "unknown")+'</td>'+
+       '<td class="mut">'+esc(sw)+'</td><td>'+cur+'</td></tr>';
   }).join("");
 
   const rt = document.getElementById("recent");
@@ -1707,16 +4503,29 @@ function render(s){
   // Populate the worker-logs <select> from apply + discovery workers, preserving the
   // current selection. Only rebuild when the worker set changes (don't clobber an open
   // dropdown every 4s).
-  const ids = [];
-  (s.workers||[]).forEach(w=>ids.push(w.worker_id));
-  if(s.discovery && s.discovery.workers){ s.discovery.workers.forEach(w=>ids.push(w.worker_id)); }
+  const workerRows = [];
+  (s.workers || []).forEach(w=>{
+    workerRows.push({
+      id: w.worker_id,
+      label: (w.machine ? (w.machine + " · ") : "") + w.worker_id,
+    });
+  });
+  if(s.discovery && s.discovery.workers){
+    s.discovery.workers.forEach(w=>{
+      workerRows.push({
+        id: w.worker_id,
+        label: (w.machine ? ("[disc] " + w.machine + " · ") : "[disc] ") + w.worker_id,
+      });
+    });
+  }
+  const ids = workerRows.map(item => item.id);
   const sel = document.getElementById("logWorker");
-  const sig = ids.join("|");
+  const sig = workerRows.map(item => item.id + ":" + item.label).join("|");
   if(sel._sig !== sig){
     sel._sig = sig;
     const cur = sel.value;
     sel.innerHTML = '<option value="">— select worker —</option>' +
-      ids.map(id=>'<option value="'+esc(id)+'">'+esc(id)+'</option>').join("");
+      workerRows.map(item=>'<option value="'+esc(item.id)+'">'+esc(item.label)+'</option>').join("");
     if(ids.indexOf(cur) >= 0) sel.value = cur;
   }
 
@@ -1729,10 +4538,11 @@ function render(s){
     document.getElementById("dStagedHint").textContent = d.postings.pending_ingest + " pending ingest";
     document.getElementById("dFound24").textContent = d.postings.last24h;
     const dw = document.getElementById("discWorkers");
-    if(!d.workers.length){ dw.innerHTML = '<tr><td colspan="4" class="mut">no discovery workers heartbeating &mdash; start one with applypilot-fleet-discovery</td></tr>'; }
+    if(!d.workers.length){ dw.innerHTML = '<tr><td colspan="5" class="mut">no discovery workers heartbeating &mdash; start one with applypilot-fleet-discovery</td></tr>'; }
     else dw.innerHTML = d.workers.map(w=>{
       const beat = w.last_beat ? (rel(w.last_beat)+(w.seconds_since!=null?" ("+w.seconds_since+"s)":"")) : "never";
       return '<tr><td>'+esc(w.worker_id)+'</td>'+
+        '<td>'+esc(w.machine || "unknown")+'</td>'+
         '<td><span class="ldot '+(w.alive?"on":"off")+'"></span>'+(w.alive?"alive":"down")+'</td>'+
         '<td class="mut">'+esc(beat)+'</td><td>'+(w.found_24h||0)+'</td></tr>';
     }).join("");
@@ -1744,6 +4554,138 @@ function render(s){
         '</td><td>'+(search||'<span class="mut">—</span>')+'</td></tr>';
     }).join("");
   }
+}
+
+async function loadAgents(){
+  try{
+    const r = await fetch("/api/agents", {cache:"no-store"});
+    if(!r.ok) return;
+    const d = await r.json();
+    const rows = (d.workers || []);
+    const tb = document.getElementById("agents");
+    if(!rows.length){
+      tb.innerHTML = '<tr><td colspan="10" class="mut">no apply telemetry yet</td></tr>';
+      document.getElementById("aModelByMachine").innerHTML = '<tr><td colspan="7" class="mut">no apply telemetry yet</td></tr>';
+      document.getElementById("aDynamicWorked").textContent = "no";
+      document.getElementById("aLatestSwitch").textContent = "—";
+      document.getElementById("aSwitch").textContent = "unknown";
+      document.getElementById("aModelFamily").textContent = "—";
+      document.getElementById("aModelFamilyHint").textContent = "no model telemetry yet";
+      document.getElementById("aPrimaryModel").textContent = "—";
+      document.getElementById("aPrimaryModelHint").textContent = "no model telemetry yet";
+      return;
+    }
+    const machineRows = {};
+    let latestSwitchTs = null;
+    for(const w of rows){
+      const m = w.machine || "unknown";
+      const v = String(w.current_model_vendor || "unknown").toLowerCase();
+      if(!machineRows[m]) machineRows[m] = {workers:0, codex:0, claude:0, gemini:0, other:0, unknown:0};
+      machineRows[m].workers += 1;
+      const key = (v === "codex" || v === "claude" || v === "gemini" || v === "other" || v === "unknown")
+        ? v : "other";
+      machineRows[m][key] += 1;
+      if(w.last_agent_switch_at){
+        const t = Date.parse(w.last_agent_switch_at);
+        if(!Number.isNaN(t)){
+          latestSwitchTs = (!latestSwitchTs || t > latestSwitchTs) ? t : latestSwitchTs;
+        }
+      }
+    }
+    tb.innerHTML = rows.map(w=>{
+      const blocked = (w.active_blocked_agents && w.active_blocked_agents.length)
+        ? esc(w.active_blocked_agents.join(", ")) : "none";
+      const chain = (w.agent_chain || []).join(" → ");
+      const verdict = String(w.switch_verdict || "unknown");
+      const verdictClass = "v-" + verdict.toLowerCase().replace(/[^a-z-]/g, "-");
+      const verdictChip = esc(verdict);
+      const when = w.last_agent_switch_at ? esc(rel(w.last_agent_switch_at)) : "—";
+       return '<tr class="'+verdictClass+'"><td>'+esc(w.machine || "unknown")+'</td><td>'+esc(w.worker_id)+'</td>'+
+        '<td>'+esc(w.current_agent || "—")+'</td><td>'+esc(w.current_model || "—")+'</td>'+
+        '<td class="mut">'+vendorChipHtml(w.current_model_vendor || "unknown")+'</td>'+
+        '<td class="mut">'+familyChipHtml(w.current_model_family || "unknown")+'</td>'+
+        '<td class="mut">'+esc(chain || "—")+'</td><td class="mut">'+
+        '<span class="verdict-chip '+verdictClass+'">'+verdictChip+'</span></td>'+
+        '<td class="mut">'+blocked+'</td><td class="mut">'+when+(w.last_switch_reason?(" · "+esc(w.last_switch_reason)):"")+'</td></tr>';
+    }).join("");
+    document.getElementById("aBlocks").textContent = (d.agent_blocks ? Object.keys(d.agent_blocks).length : 0);
+    document.getElementById("aSpendRows").textContent = (d.agent_spend ? Object.keys(d.agent_spend).length : 0);
+    const machineList = Object.entries(machineRows).map(([name, s]) => ({
+      name,
+      workers: s.workers,
+      codex: s.codex,
+      claude: s.claude,
+      gemini: s.gemini,
+      other: s.other,
+      unknown: s.unknown,
+    }));
+    const mt = document.getElementById("aModelByMachine");
+    if(!machineList.length){
+      mt.innerHTML = '<tr><td colspan="7" class="mut">no model telemetry yet</td></tr>';
+    } else {
+      mt.innerHTML = machineList.sort((a,b)=>a.name.localeCompare(b.name)).map(v=>(
+        '<tr><td>'+esc(v.name)+'</td><td>'+esc(v.workers)+'</td><td>'+esc(v.codex)+'</td><td>'+
+        esc(v.claude)+'</td><td>'+esc(v.gemini)+'</td><td>'+esc(v.other)+'</td><td>'+esc(v.unknown)+'</td></tr>'
+      )).join("");
+    }
+  const switchingSummary = d.summary || {};
+    const switched = switchingSummary.switched_workers || 0;
+    document.getElementById("aDynamicWorked").textContent = (switched > 0 ? "yes" : "no");
+    document.getElementById("aLatestSwitch").textContent = latestSwitchTs ? rel(new Date(latestSwitchTs).toISOString()) : "—";
+
+  const modelUsage = Object.entries(switchingSummary.model_usage || {});
+  let modelText = "—";
+  if(modelUsage.length){
+      const [topModel, topCount] = modelUsage[0];
+      const totalModels = switchingSummary.model_count || modelUsage.reduce((n, [, c]) => n + c, 0);
+      modelText = topModel + " (" + topCount + "/" + totalModels + ")";
+      const mix = modelUsage.slice(0, 2).map(([m, c]) => m + ": " + c).join(" · ");
+      document.getElementById("aPrimaryModelHint").textContent = "model mix: " + (mix || "—");
+    } else {
+      document.getElementById("aPrimaryModelHint").textContent = "no model telemetry yet";
+    }
+  document.getElementById("aPrimaryModel").textContent = modelText;
+    const modelTrend = updateModelTrend(modelUsage, modelText);
+    if(document.getElementById("aModelTrend")){
+      document.getElementById("aModelTrend").textContent = modelText;
+    }
+    if(document.getElementById("aModelTrendHint")){
+      document.getElementById("aModelTrendHint").textContent = modelTrend.trend + " · " + modelTrend.window;
+    }
+
+  const familyUsage = Object.entries(switchingSummary.model_family_usage || {});
+  if(familyUsage.length){
+    const fam = familyUsage.map(([name,count]) => name + ": " + count).join(" · ");
+    document.getElementById("aModelFamilyHint").textContent = fam;
+    document.getElementById("aModelFamily").textContent = familyUsage[0][0];
+  } else {
+    document.getElementById("aModelFamily").textContent = "—";
+    document.getElementById("aModelFamilyHint").textContent = "no model family telemetry yet";
+  }
+
+  const dynamicEnabled = switchingSummary.dynamic_workers || 0;
+    const blocked = switchingSummary.blocked_workers || 0;
+    if(dynamicEnabled > 0){
+      document.getElementById("aSwitchStatus").textContent = switched + "/" + dynamicEnabled;
+      document.getElementById("aSwitchStatusHint").textContent =
+        "dynamic chain workers; blocked: " + blocked;
+    } else {
+      document.getElementById("aSwitchStatus").textContent = "off";
+      document.getElementById("aSwitchStatusHint").textContent = "no active dynamic chain configured";
+    }
+
+    const a = Array.isArray(rows) ? rows : [];
+    const tally = a.reduce((m, w)=>{
+      const v = w.switch_verdict || "unknown";
+      m[v] = (m[v] || 0) + 1;
+      return m;
+    }, {});
+    const parts = ["working", "blocked", "partial", "misconfigured", "unknown", "not triggered"];
+    document.getElementById("aSwitch").textContent = parts
+      .filter((p) => (tally[p] || 0) > 0)
+      .map((p) => p + "=" + tally[p])
+      .join(" / ") || "unknown";
+  }catch(e){ /* no-op; /api/status stays authoritative for connection */ }
 }
 
 async function poll(){
@@ -1787,7 +4729,7 @@ document.getElementById("btnArm").onclick = ()=>{
     "Arm "+k+" → the fleet will submit up to "+k+" REAL job applications under your name, then auto-pause. Continue?");
 };
 document.getElementById("btnLift").onclick = ()=>act("lift_canary", null,
-  "Lift canary → the fleet will apply UNBOUNDED (no cap on how many real applications it submits) and will be UNPAUSED. Continue?");
+  "Lift canary → disarm the current canary without resuming the fleet. Continue?");
 document.getElementById("btnResume").onclick = ()=>act("resume", null,
   "Resume → leasing is re-enabled and the fleet may submit real applications again. Continue?");
 document.getElementById("btnPause").onclick = ()=>act("pause", null);
@@ -1853,9 +4795,14 @@ function renderDiagnostics(d){
   if(!d.recommendations || !d.recommendations.length){ rc.className="mut"; rc.textContent = "no open recommendations"; }
   else { rc.className=""; rc.innerHTML = d.recommendations.map(r=>{
     const sev = (r.severity==="severe"?"severe":(r.severity==="warn"?"warn":""));
+    const scopeParts = [];
+    if(r.lane){ scopeParts.push("lane=" + esc(r.lane)); }
+    if(r.machine){ scopeParts.push("machine=" + esc(r.machine)); }
+    if(r.host){ scopeParts.push("host=" + esc(r.host)); }
+    if(r.sample_count){ scopeParts.push("samples=" + Number(r.sample_count)); }
+    const scopeLabel = scopeParts.length ? " · " + scopeParts.join(" · ") : "";
     return '<div class="rec"><div class="rh"><span class="sev '+sev+'">'+esc(r.severity||"info")+
-      '</span><span class="mut" style="font-size:12px">'+esc(r.reason||"")+
-      (r.host?(" · "+esc(r.host)):"")+'</span>'+
+      '</span><span class="mut" style="font-size:12px">'+esc(r.reason||"")+scopeLabel+'</span>'+
       '<button class="sm" style="margin-left:auto" data-dismiss="'+esc(r.diagnosis_id)+'">Dismiss</button></div>'+
       '<div class="body">'+esc(r.diagnosis||"")+'</div>'+
       '<div class="recm">'+esc(r.recommendation||"")+'</div></div>';
@@ -1864,14 +4811,307 @@ function renderDiagnostics(d){
     b.onclick = ()=>act("doctor_dismiss", {diagnosis_id: parseInt(b.getAttribute("data-dismiss"),10)})
       .then(loadDiagnostics);
   });
+
+  const bh = d.browser_health || {};
+  const bi = bh.summary || {};
+  document.getElementById("bWorkers").textContent = bi.workers || 0;
+  document.getElementById("bProblem").textContent = bi.problem_workers || 0;
+  document.getElementById("bHealthy").textContent = Math.max((bi.workers || 0) - (bi.problem_workers || 0), 0);
+  const byKind = bh.summary && bh.summary.by_issue ? Object.entries(bh.summary.by_issue) : [];
+  if(byKind.length){
+    const breakdown = byKind
+      .map(([name, count]) => esc(name + ": " + (count || 0)))
+      .join(" · ");
+    document.getElementById("bProblemHint").textContent = breakdown;
+  } else {
+    document.getElementById("bProblemHint").textContent = "workers with browser/backend symptoms";
+  }
+  const bhRows = document.getElementById("browserHealth");
+  const issues = (bh.issues || []);
+  if(!issues.length){ bhRows.innerHTML = '<tr><td colspan="8" class="mut">no browser/backend issues detected</td></tr>'; }
+  else bhRows.innerHTML = issues.map(x=>{
+    const cls = x.age !== null ? (" (" + x.age + "s ago)") : "";
+    const lastBeat = x.last_beat ? esc(rel(x.last_beat)) : "—";
+    return '<tr><td>'+esc(x.worker_id || "—")+'</td><td>'+esc(x.machine || "unknown")+'</td><td>'+
+      esc(x.role || "—")+'</td><td class="mut">'+esc(x.state || "—")+'</td><td>'+
+      '<span class="mut">'+esc(x.issue || "—")+'</span></td><td>'+(x.age !== null ? esc(String(x.age)) : "—")+
+      '</td><td class="mut">'+esc(x.evidence || "—")+'</td><td class="mut">'+lastBeat + cls+'</td></tr>';
+  }).join("");
+}
+
+function markDiagnosticsStale(reason){
+  const rc = document.getElementById("docRecs");
+  if(rc){
+    rc.className = "";
+    rc.innerHTML = '<div class="rec"><div class="rh"><span class="sev warn">warn</span>' +
+      '<span class="mut" style="font-size:12px">diagnostics endpoint</span></div>' +
+      '<div class="body">Diagnostics data is stale.</div>' +
+      '<div class="recm">' + esc(reason || "diagnostics endpoint failed") + '</div></div>';
+  }
+  const bhRows = document.getElementById("browserHealth");
+  if(bhRows){
+    bhRows.innerHTML = '<tr><td colspan="8" class="mut">diagnostics unavailable: ' +
+      esc(reason || "endpoint failed") + '</td></tr>';
+  }
 }
 
 async function loadDiagnostics(){
   try{
     const r = await fetch("/api/diagnostics", {cache:"no-store"});
-    if(!r.ok) return;
+    if(!r.ok){ markDiagnosticsStale("endpoint returned " + r.status); return; }
     renderDiagnostics(await r.json());
-  }catch(e){ /* leave the last render; the status poll drives the connection banner */ }
+  }catch(e){ markDiagnosticsStale("endpoint error: " + e.message); }
+}
+
+function renderDiagnosis(d){
+  const state = d.apply_state || {};
+  const headline = String(state.code || "unknown").replace(/_/g, " ");
+  document.getElementById("stateHeadline").textContent = headline;
+  document.getElementById("stateReason").textContent = state.reason || "No blocking reason detected.";
+  const action =
+    state.next_action
+      ? String(state.next_action)
+      : (state.severity === "halted")
+      ? "Resume from halt before applies can proceed."
+      : "Monitor queue and worker health until the next state transition.";
+  document.getElementById("stateAction").textContent = action;
+
+  const safety = d.safety || {};
+  const safetyRows = [
+    ["Fleet paused", safety.paused ? "yes" : "no"],
+    ["ATS paused", safety.ats_paused ? "yes" : "no"],
+    ["Spend cap", safety.spend_cap_usd > 0 ? "$" + Number(safety.spend_cap_usd).toFixed(2) : "none"],
+    ["Spent", "$" + Number(safety.spent_usd || 0).toFixed(2)],
+    ["Canary", safety.canary_enabled ? "enabled" : "off"],
+    ["Canary remaining", safety.canary_remaining == null ? "—" : String(safety.canary_remaining)],
+  ];
+  document.getElementById("safetyGrid").innerHTML = safetyRows.map(([label, value]) =>
+    '<div class="mini"><span>' + esc(label) + '</span><b>' + esc(value) + '</b></div>'
+  ).join("");
+
+  const recs = d.recommendations || [];
+  const why = document.getElementById("whyBody");
+  if(!recs.length){
+    why.innerHTML = '<div class="mini"><span>Why not applying</span><b>no open recommendations</b></div>';
+  } else {
+    why.innerHTML = recs.map(r=>(
+      '<div class="mini"><span>' + esc(r.severity || "info") + '</span><b>' + esc(r.title || "recommendation") +
+      '</b><div class="sub" style="margin-top:4px">' + esc(r.reason || "—") + '</div></div>'
+    )).join("");
+  }
+
+  const rec0 = recs[0] || {};
+  const stateRecommendation = document.getElementById("stateRecommendation");
+  stateRecommendation.className = "mut";
+  stateRecommendation.textContent =
+    rec0.title
+      ? rec0.title + " — " + (rec0.reason || "review recommended action.")
+      : "No recommended action now.";
+
+  const machines = (d.rollups && d.rollups.machines) || {};
+  const networkMachines = (d.rollups && d.rollups.network && d.rollups.network.machines) || {};
+  const machineRows = Object.entries(machines);
+  const machineWrap = document.getElementById("machineMap");
+  if(!machineRows.length){
+    machineWrap.innerHTML = '<div class="mini"><span>Machine health</span><b>no machine telemetry</b></div>';
+  } else {
+    machineWrap.innerHTML = machineRows.map(([name, m]) => {
+      const network = networkMachines[name] || {};
+      const roles = network.by_role || {};
+      const roleText = Object.entries(roles).map(([role, count]) => role + ":" + count).join(", ");
+      const workers = Number(m.workers || 0);
+      const alive = Number(m.alive || 0);
+      const working = Number(m.working || 0);
+      const applied = Number(m.applied_workers || 0);
+      const stale = Number(network.stale || 0);
+      const desired = m.desired == null ? null : Number(m.desired || 0);
+      const missing = m.missing == null ? null : Number(m.missing || 0);
+      const fleetWorkers = m.fleet_workers == null ? Number(network.workers || workers) : Number(m.fleet_workers || 0);
+      const fleetAlive = m.fleet_alive == null ? Number(network.alive || alive) : Number(m.fleet_alive || 0);
+      const fleetStale = m.fleet_stale == null ? stale : Number(m.fleet_stale || 0);
+      let meta = "fleet " + fleetAlive + "/" + fleetWorkers + " / apply alive " + alive +
+        " / working " + working + " / applied workers " + applied;
+      if(roleText){
+        meta += " / roles " + roleText + " / stale " + fleetStale;
+      }
+      if(desired !== null){
+        meta += " / desired " + desired + " / missing " + (missing || 0);
+      }
+      return '<div class="mini"><span>' + esc(name) + '</span><b>' + esc(workers) +
+        '</b><div class="sub" style="margin-top:4px">' +
+        esc(meta) + '</div></div>';
+    }).join("");
+  }
+
+  const agents = d.agents || {};
+  const agentBlocks = agents.active_agent_blocks || [];
+  const agentModels = Object.entries(agents.model_usage || {});
+  const modelText = agentModels.length
+    ? agentModels.slice(0, 2).map(([model, count]) => model + ":" + count).join(", ")
+    : "none";
+  const dynamicWorkers = Number(agents.dynamic_workers || 0);
+  const switchedWorkers = Number(agents.switched_workers || 0);
+  document.getElementById("agentBody").innerHTML = [
+    ["Workers", Number(agents.workers || 0), "apply workers with routing telemetry"],
+    ["Models", modelText, Number(agents.model_count || 0) + " reported model(s)"],
+    ["Dynamic switched", switchedWorkers + "/" + dynamicWorkers, switchedWorkers > 0 ? "worked" : "not triggered"],
+    ["Blocked agents", agentBlocks.length ? agentBlocks.join(", ") : "none", "active availability blocks"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const comparison = d.worker_comparison || {};
+  const comparisonRows = comparison.workers || [];
+  if(!comparisonRows.length){
+    document.getElementById("workerComparisonBody").innerHTML =
+      '<div class="fstep"><span>Workers</span><b>none</b><div class="sub">no apply worker comparison yet</div></div>';
+  } else {
+    document.getElementById("workerComparisonBody").innerHTML = comparisonRows.slice(0, 6).map((w) => {
+      const meta = "machine " + (w.machine || "unknown") +
+        " / applied " + Number(w.applied || 0) +
+        " / failed " + Number(w.failed || 0) +
+        " / challenges " + Number(w.challenges || 0) +
+        " / cost $" + Number(w.cost_usd || 0).toFixed(2) +
+        (w.avg_duration_ms == null ? "" : " / avg " + Math.round(Number(w.avg_duration_ms) / 1000) + "s");
+      return '<div class="fstep"><span>' + esc(w.worker_id || "unknown") + '</span><b>' +
+        esc(w.alive ? "alive" : "down") + '</b><div class="sub">' + esc(meta) + '</div></div>';
+    }).join("");
+  }
+
+  const funnel = (d.rollups && d.rollups.funnel) || {};
+  document.getElementById("funnelBody").innerHTML = ["ats", "compute", "other"].map((lane) => {
+    const q = funnel[lane] || {};
+    const queued = Number(q.queued || 0);
+    const leased = Number(q.leased || 0);
+    const applied = Number(q.applied || 0);
+    return '<div class="fstep"><span>' + esc(lane) +
+      '</span><b>' + esc(queued + "/" + leased + "/" + applied) +
+      '</b><div class="sub">queued/leased/applied</div></div>';
+  }).join("");
+
+  const forecast = d.forecast || {};
+  document.getElementById("forecastBody").innerHTML = [
+    ["Applies", Number(forecast.applies_last_1h || 0) + "/" + Number(forecast.applies_last_24h || 0), "last 1h / last 24h"],
+    ["Live workers", Number(forecast.live_apply_workers || 0), "apply workers alive"],
+    ["Leaseable", Number(forecast.leaseable_jobs || 0), "jobs available now"],
+    ["Challenges", Number(forecast.open_challenges || 0), "open auth challenges"],
+    ["ETA", forecast.eta_hours_to_exhaust_leaseable == null ? "—" : forecast.eta_hours_to_exhaust_leaseable + "h", forecast.assumption || "recent apply rate"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const goals = d.daily_goals || {};
+  document.getElementById("dailyGoalsBody").innerHTML = [
+    ["Applied today", Number(goals.applied_today || 0), goals.message || "No daily target configured"],
+    ["Target today", goals.target_today == null ? "none" : Number(goals.target_today || 0), goals.configured ? "configured" : "not configured"],
+    ["Remaining", goals.remaining_target == null ? "—" : Number(goals.remaining_target || 0), "remaining target"],
+    ["Shortfall", goals.projected_shortfall == null ? "—" : Number(goals.projected_shortfall || 0), "projected from current confirmed applies"],
+    ["Canary", goals.canary_remaining == null ? "—" : Number(goals.canary_remaining || 0), "ATS canary remaining"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const freshness = d.freshness || {};
+  document.getElementById("freshnessBody").innerHTML = [
+    ["Diagnosis", freshness.generated_at ? rel(freshness.generated_at) : "stale", freshness.endpoint || "diagnosis"],
+    ["Worker beat", freshness.last_worker_beat_at ? rel(freshness.last_worker_beat_at) : "none", "freshest fleet heartbeat"],
+    ["Last apply", freshness.last_apply_at ? rel(freshness.last_apply_at) : "none", "confirmed apply timestamp"],
+    ["Discovery", freshness.last_discovery_at ? rel(freshness.last_discovery_at) : "none", "latest staged posting"],
+    ["Compute", freshness.last_compute_at ? rel(freshness.last_compute_at) : "none", "latest score queue update"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const audit = d.audit || {};
+  const auditRows = audit.rows || [];
+  if(!audit.available){
+    document.getElementById("operatorAuditBody").innerHTML =
+      '<div class="fstep"><span>Audit</span><b>unavailable</b><div class="sub">fleet_console_audit table not found</div></div>';
+  } else if(!auditRows.length){
+    document.getElementById("operatorAuditBody").innerHTML =
+      '<div class="fstep"><span>Audit</span><b>empty</b><div class="sub">no console actions recorded yet</div></div>';
+  } else {
+    document.getElementById("operatorAuditBody").innerHTML = auditRows.slice(0, 6).map((row) => {
+      const meta = (row.created_at ? rel(row.created_at) : "time unknown") +
+        " / " + (row.lane || "fleet") +
+        " / " + (row.target || "target unknown") +
+        " / " + (row.message || "no message");
+      return '<div class="fstep"><span>' + esc(row.action || "action") + '</span><b>' +
+        esc(row.ok ? "ok" : "failed") + '</b><div class="sub">' + esc(meta) + '</div></div>';
+    }).join("");
+  }
+
+  const sourceQuality = d.source_quality || {};
+  const hostRows = sourceQuality.hosts || [];
+  if(!hostRows.length){
+    document.getElementById("hostQualityBody").innerHTML =
+      '<div class="fstep"><span>Hosts</span><b>none</b><div class="sub">no apply host telemetry yet</div></div>';
+  } else {
+    document.getElementById("hostQualityBody").innerHTML = hostRows.slice(0, 6).map((h) => {
+      const meta = "applied " + Number(h.applied || 0) +
+        " / failed " + Number(h.failed || 0) +
+        " / challenges " + Number(h.challenges || 0) +
+        " / queued " + Number(h.queued || 0) +
+        " / leaseable " + Number(h.leaseable || 0);
+      return '<div class="fstep"><span>' + esc(h.host || "unknown") + '</span><b>' +
+        esc(Number(h.challenge_rate || 0).toFixed(2)) +
+        '</b><div class="sub">' + esc(meta) + '</div></div>';
+    }).join("");
+  }
+
+  const li = d.linkedin || {};
+  document.getElementById("linkedinBody").innerHTML = [
+    ["Queued", Number(li.queued || 0), "ready for LinkedIn lane"],
+    ["Applied", Number(li.applied || 0), "terminal LinkedIn submits"],
+    ["Canary", li.canary_enabled ? "on" : "off", "LinkedIn bounded mode"],
+    ["Governor", li.halted ? "halted" : "open", "account:linkedin"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const disc = d.discovery || {};
+  const discTasks = disc.tasks || {};
+  const discPostings = disc.postings || {};
+  const discWorkers = disc.workers || [];
+  const liveDiscoveryWorkers = discWorkers.filter((w) => !!w.alive).length;
+  document.getElementById("discoveryBody").innerHTML = [
+    ["Due tasks", Number(discTasks.due_now || 0), (discTasks.enabled || 0) + " enabled"],
+    ["Staged", Number(discPostings.pending_ingest || 0), "pending ingest"],
+    ["Found 24h", Number(discPostings.last24h || 0), "new postings"],
+    ["Workers", liveDiscoveryWorkers + "/" + discWorkers.length, "alive/total discovery"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const compute = d.compute || {};
+  const computeQueue = compute.queue || {};
+  const computeWorkers = compute.score_workers || {};
+  const computeContext = compute.context || {};
+  document.getElementById("computeBody").innerHTML = [
+    ["Context", computeContext.version || (compute.unavailable ? "unavailable" : "missing"), "score context"],
+    ["Queue", Number((computeQueue.queued || {}).count || 0) + "/" + Number((computeQueue.leased || {}).count || 0), "queued/leased score tasks"],
+    ["Workers", Number(computeWorkers.active || 0), "active compute workers"],
+    ["Failures 15m", Number(computeWorkers.recent_failed_15m || 0), "rate limited " + Number(computeWorkers.recent_rate_limited_15m || 0)],
+    ["Unsynced done", Number((computeQueue.done || {}).unsynced || 0), "waiting for home pull"],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
+
+  const deadman = d.deadman || {};
+  document.getElementById("deadmanBody").innerHTML = [
+    ["Status", deadman.active ? "alert" : "clear", deadman.active ? "watchdog raised" : "no active alert"],
+    ["Alert", deadman.title || deadman.alert || "none", deadman.reason || (deadman.alert_at ? rel(deadman.alert_at) : "not set")],
+  ].map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
 }
 
 function renderOutcomes(d){
@@ -1894,15 +5134,60 @@ async function loadOutcomes(){
 loadOutcomes();
 setInterval(loadOutcomes, 15000);
 
+function markDiagnosisStale(reason){
+  const fb = document.getElementById("freshnessBody");
+  if(!fb) return;
+  fb.innerHTML = '<div class="fstep"><span>Diagnosis</span><b>diagnosis stale</b><div class="sub">' +
+    esc(reason || "diagnosis endpoint failed") + '</div></div>';
+}
+
+async function loadDiagnosis(){
+  try{
+    const r = await fetch("/api/diagnosis", {cache:"no-store"});
+    if(!r.ok){ markDiagnosisStale("endpoint returned " + r.status); return; }
+    renderDiagnosis(await r.json());
+  }catch(e){ markDiagnosisStale("endpoint error"); }
+}
+loadDiagnosis();
+setInterval(loadDiagnosis, 15000);
+
 // --- Challenges triage: its own fetch of /api/challenges, folded into the same 4s cycle. ---
 function renderChallenges(d){
   const wrap = document.getElementById("chList");
   const groups = (d && d.groups) || [];
   if(!groups.length){ wrap.className = "mut"; wrap.textContent = "no open challenges — nothing parked"; return; }
+  const triage = (d && d.triage) || {};
+  const clearFirst = triage.clear_first || [];
+  const resolveFirst = triage.resolve_first || [];
+  const fmtGroup = (g)=>{
+    if(!g) return "";
+    const parts = [];
+    parts.push((g.host || "unknown") + " / " + (g.kind || "unknown"));
+    parts.push(String(Number(g.rows || 0)) + " row(s)");
+    if(Number(g.stale_rows || 0) > 0) parts.push(String(Number(g.stale_rows || 0)) + " stale");
+    if(Number(g.missing_metadata_rows || 0) > 0) parts.push(String(Number(g.missing_metadata_rows || 0)) + " missing metadata");
+    if(g.oldest_age_hours != null) parts.push(String(g.oldest_age_hours) + "h oldest");
+    return esc(parts.join(" · "));
+  };
+  const triageHtml = (
+    '<div class="chgrp">' +
+      '<div class="chgrp-h"><b>Clear / drop first</b><span>·</span><span>' + esc(String(clearFirst.length)) + '</span></div>' +
+      (clearFirst.length
+        ? clearFirst.slice(0, 3).map((g)=>'<div class="chrow"><div class="meta"><div class="ct">' + fmtGroup(g) + '</div></div></div>').join("")
+        : '<div class="chrow"><div class="meta"><div class="sub">no stale or metadata-poor groups</div></div></div>') +
+    '</div>' +
+    '<div class="chgrp">' +
+      '<div class="chgrp-h"><b>Worth resolving</b><span>·</span><span>' + esc(String(resolveFirst.length)) + '</span></div>' +
+      (resolveFirst.length
+        ? resolveFirst.slice(0, 3).map((g)=>'<div class="chrow"><div class="meta"><div class="ct">' + fmtGroup(g) + '</div></div></div>').join("")
+        : '<div class="chrow"><div class="meta"><div class="sub">no fresh groups ready for manual resolution</div></div></div>') +
+    '</div>'
+  );
   wrap.className = "";
-  wrap.innerHTML = groups.map((g, gi)=>{
+  wrap.innerHTML = triageHtml + groups.map((g, gi)=>{
     const rows = g.rows || [];
     const lane = rows.length ? rows[0].lane : null;
+    const summary = g.summary || {};
     const rowsHtml = rows.map((r, ri)=>{
       const ct = esc([r.company, r.title].filter(Boolean).join(" — ")) || '<span class="mut">—</span>';
       const scoreTxt = (r.score!=null) ? (" · score " + r.score) : "";
@@ -1916,9 +5201,12 @@ function renderChallenges(d){
         '<button class="sm danger" data-skip="' + gi + ':' + ri + '">Skip</button>' +
         '</div></div>';
     }).join("");
+    const summaryParts = [String(rows.length)];
+    if(Number(summary.stale_rows || 0) > 0) summaryParts.push(String(Number(summary.stale_rows || 0)) + " stale");
+    if(Number(summary.missing_metadata_rows || 0) > 0) summaryParts.push(String(Number(summary.missing_metadata_rows || 0)) + " missing metadata");
     return '<div class="chgrp">' +
       '<div class="chgrp-h"><b>' + esc(g.kind||"") + '</b><span>·</span><b>' + esc(g.host||"") +
-      '</b><span>·</span><span>' + rows.length + '</span>' +
+      '</b><span>·</span><span>' + esc(summaryParts.join(" / ")) + '</span>' +
       '<button class="sm danger" style="margin-left:auto" data-skiphost="' + gi + '">Skip all on host</button>' +
       '</div>' + rowsHtml + '</div>';
   }).join("");
@@ -1961,6 +5249,8 @@ async function loadChallenges(){
 }
 loadChallenges();
 setInterval(loadChallenges, 4000);
+loadAgents();
+setInterval(loadAgents, 4000);
 
 poll();
 setInterval(poll, 4000);

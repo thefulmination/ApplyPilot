@@ -28,7 +28,7 @@ _V3_TABLES = [
     "inbox_outcomes",
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "command_acks",
     "fleet_assets", "discovered_postings", "fleet_knobs", "fleet_diagnoses",
-    "agent_availability", "autotriage_actions", "apply_result_events",
+    "fleet_console_audit", "agent_availability", "autotriage_actions", "apply_result_events",
     "fleet_machine_blackout",
 ]
 
@@ -108,8 +108,13 @@ def fleet_db(fleet_pg):
             cur.execute("UPDATE fleet_config SET spend_cap_usd=0, paused=FALSE, "
                         "cost_cap_daily_usd=0, cost_cap_total_usd=0, "
                         "last_window_roll_at=NULL, agent_timeout_override=NULL, "
-                        "canary_enabled=FALSE, canary_remaining=NULL, "
-                        "linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL, "
+                        "daily_apply_target=NULL, "
+                        # Most legacy queue tests focus on governor/dedup/lease behavior,
+                        # not the canary rail. Put test lanes in explicit steady mode with
+                        # canaries disarmed; canary-specific tests switch to canary mode.
+                        "pinned_worker_version=NULL, canary_version=NULL, canary_worker_id=NULL, "
+                        "ats_apply_mode='steady', canary_enabled=FALSE, canary_remaining=NULL, "
+                        "linkedin_apply_mode='steady', linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL, "
                         # Fleet Doctor hardening columns (H1/H2/H5/H8/H18) -- reset per test.
                         "ats_paused=FALSE, ats_pause_source=NULL, doctor_budget_day=NULL, "
                         "doctor_host_skips_today=0, doctor_pace_actions_today=0, "

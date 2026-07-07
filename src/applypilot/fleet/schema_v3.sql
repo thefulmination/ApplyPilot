@@ -36,10 +36,18 @@ ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS pinned_worker_version  TEXT;  
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_version         TEXT;            -- R12 staged update
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_worker_id       TEXT;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS last_window_roll_at    TIMESTAMPTZ;     -- nightly window roll guard
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS ats_apply_mode          TEXT NOT NULL DEFAULT 'stopped'; -- 'stopped'|'canary'|'steady'
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_enabled         BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS canary_remaining        INTEGER;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_apply_mode     TEXT NOT NULL DEFAULT 'stopped'; -- 'stopped'|'canary'|'steady'
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_canary_enabled  BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_canary_remaining INTEGER;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS daily_apply_target       INTEGER;        -- optional operator target; NULL = unconfigured
+
+UPDATE fleet_config SET ats_apply_mode='stopped'
+WHERE ats_apply_mode IS NULL OR ats_apply_mode NOT IN ('stopped', 'canary', 'steady');
+UPDATE fleet_config SET linkedin_apply_mode='stopped'
+WHERE linkedin_apply_mode IS NULL OR linkedin_apply_mode NOT IN ('stopped', 'canary', 'steady');
 
 -- ---------------------------------------------------------------------------
 -- Status enum shared by the compute + search-task queues.
@@ -147,6 +155,9 @@ CREATE TABLE IF NOT EXISTS linkedin_queue (LIKE apply_queue INCLUDING DEFAULTS I
 --   apply_external_host: the ATS base host when external (e.g. 'ashbyhq.com', 'greenhouse.io')
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS apply_channel TEXT;
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS apply_external_host TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolve_status TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolved_at TIMESTAMPTZ;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolve_error TEXT;
 
 -- ---------------------------------------------------------------------------
 -- rate_governor: outcome-aware + adaptive circuit-breaker (R6, R1, RF2).
@@ -410,7 +421,6 @@ CREATE TABLE IF NOT EXISTS remote_commands (
 );
 CREATE INDEX IF NOT EXISTS idx_commands_open ON remote_commands (worker_id) WHERE acked_at IS NULL;
 
-
 -- ---------------------------------------------------------------------------
 -- fleet_machine_blackout: central, expiring operator control for all fleet work
 -- on selected machine labels. Launchers/agents read this before starting apply,
@@ -576,6 +586,22 @@ CREATE INDEX IF NOT EXISTS idx_fleet_diagnoses_status
 CREATE INDEX IF NOT EXISTS idx_fleet_diagnoses_cluster
     ON fleet_diagnoses (cluster_key) WHERE status IN ('auto_applied','recommended','open');
 
+-- fleet_console_audit: append-only operator console action trail. This table records
+-- existing allow-listed console actions only; it never stores request bodies, tokens,
+-- DSNs, prompts, browser logs, resume/profile data, or raw secrets.
+CREATE TABLE IF NOT EXISTS fleet_console_audit (
+    id         BIGSERIAL PRIMARY KEY,
+    action     TEXT NOT NULL,
+    actor      TEXT,
+    lane       TEXT,
+    target     TEXT,
+    message    TEXT,
+    ok         BOOLEAN NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_console_audit_created
+    ON fleet_console_audit (created_at DESC);
+
 -- autotriage_actions: audit trail for autonomous bounded LLM/rule triage.
 -- The LLM may choose only from a fixed action menu, and the executor validates
 -- each action before mutating fleet state. This table records both applied and
@@ -618,12 +644,20 @@ CREATE TABLE IF NOT EXISTS apply_result_events (
     agent_model         TEXT,
     est_cost_usd        REAL,
     apply_duration_ms   INTEGER,
+    application_tool_calls INTEGER,
+    job_log_path        TEXT,
+    transcript_digest   TEXT,
+    final_result_source TEXT,
     result_line         TEXT,
     source              TEXT NOT NULL DEFAULT 'worker',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS queue_name TEXT NOT NULL DEFAULT 'apply_queue';
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'worker';
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS application_tool_calls INTEGER;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS job_log_path TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS transcript_digest TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS final_result_source TEXT;
 CREATE INDEX IF NOT EXISTS idx_apply_result_events_url_created
     ON apply_result_events (queue_name, url, created_at DESC);
 
