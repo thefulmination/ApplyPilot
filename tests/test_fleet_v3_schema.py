@@ -111,7 +111,13 @@ def test_linkedin_queue_freshness_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='linkedin_queue'")
         cols = {r["column_name"] for r in cur.fetchall()}
-    for c in ("linkedin_resolve_status", "linkedin_resolved_at", "linkedin_resolve_error"):
+    for c in (
+        "linkedin_resolve_status",
+        "linkedin_resolved_at",
+        "linkedin_resolve_error",
+        "linkedin_unresolved_kind",
+        "linkedin_next_action",
+    ):
         assert c in cols, f"linkedin_queue missing {c}"
 
 

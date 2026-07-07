@@ -257,6 +257,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "linkedin_resolve_error": "TEXT",
     "linkedin_resolve_attempts": "INTEGER DEFAULT 0",
     "linkedin_resolve_final_url": "TEXT",
+    "linkedin_unresolved_kind": "TEXT",
+    "linkedin_next_action": "TEXT",
     # Cross-source apply URL resolver. This lets LinkedIn rows inherit a real
     # ATS/company apply URL from an already-discovered matching job.
     "apply_url_resolved_at": "TEXT",

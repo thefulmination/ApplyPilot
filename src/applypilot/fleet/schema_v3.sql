@@ -158,6 +158,8 @@ ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS apply_external_host TEXT;
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolve_status TEXT;
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolved_at TIMESTAMPTZ;
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolve_error TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_unresolved_kind TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_next_action TEXT;
 
 -- ---------------------------------------------------------------------------
 -- rate_governor: outcome-aware + adaptive circuit-breaker (R6, R1, RF2).

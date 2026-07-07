@@ -18,6 +18,8 @@ def test_schema_adds_linkedin_resolver_columns(tmp_path):
         "linkedin_resolve_error",
         "linkedin_resolve_attempts",
         "linkedin_resolve_final_url",
+        "linkedin_unresolved_kind",
+        "linkedin_next_action",
     }.issubset(columns)
 
 
@@ -49,6 +51,8 @@ def test_schema_migrates_legacy_jobs_table(tmp_path):
         "linkedin_resolve_error",
         "linkedin_resolve_attempts",
         "linkedin_resolve_final_url",
+        "linkedin_unresolved_kind",
+        "linkedin_next_action",
     }.issubset(column_names)
     assert defaults["linkedin_resolve_attempts"] == "0"
 
