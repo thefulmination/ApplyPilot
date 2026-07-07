@@ -521,6 +521,12 @@ def test_tick_apply_status_passthrough(fleet_db):
                            "agent": "claude",
                            "agent_model": "claude-sonnet-4",
                            "duration_ms": 3210,
+                           "route": "agent",
+                           "failure_class": "zero_tool_no_result",
+                           "tool_calls_total": 0,
+                           "application_tool_calls": 0,
+                           "last_tool": "",
+                           "result_metadata": {"job_log": "worker.log"},
                        })
     assert loop2.run_once()["action"] == "crash_unconfirmed"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
@@ -529,6 +535,18 @@ def test_tick_apply_status_passthrough(fleet_db):
         assert row["status"] == "crash_unconfirmed"
         assert row["agent_model"] == "claude-sonnet-4"
         assert row["apply_duration_ms"] == 3210
+        cur.execute(
+            "SELECT route, failure_class, tool_calls_total, application_tool_calls, "
+            "last_tool, result_metadata->>'job_log' AS job_log "
+            "FROM apply_result_events WHERE url='jc'"
+        )
+        event = cur.fetchone()
+        assert event["route"] == "agent"
+        assert event["failure_class"] == "zero_tool_no_result"
+        assert event["tool_calls_total"] == 0
+        assert event["application_tool_calls"] == 0
+        assert event["last_tool"] == ""
+        assert event["job_log"] == "worker.log"
 
     # captcha -> parked (auth_challenge raised, lease frozen)
     with pgqueue.connect(fleet_db) as conn:

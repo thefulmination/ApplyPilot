@@ -188,6 +188,18 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
             stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
             # agent flows to write_apply_result -> llm_usage.provider for per-agent spend.
             out = {"run_status": status, "est_cost_usd": _real_cost(stats, model), "agent": agent}
+            out.update({
+                "route": stats.get("route") or "agent",
+                "failure_class": stats.get("failure_class"),
+                "tool_calls_total": stats.get("tool_calls_total"),
+                "application_tool_calls": stats.get("application_tool_calls"),
+                "last_tool": stats.get("last_tool"),
+                "result_metadata": {
+                    "job_log": stats.get("job_log"),
+                    "safe_requeue": stats.get("safe_requeue"),
+                    "worker_level_failure": stats.get("worker_level_failure"),
+                },
+            })
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
             # Chrome). This is needed for non-applied terminal statuses too: an
             # auth_required result on an external ATS is a job-level wall, not a

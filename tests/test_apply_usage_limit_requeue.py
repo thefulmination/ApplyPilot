@@ -45,6 +45,22 @@ def test_usage_limit_transcript_with_no_tool_calls_is_retryable():
     assert launcher._no_result_status(CODEX_SPARK_WALL, tool_calls=0) != "failed:no_result_line"
 
 
+def test_classified_usage_limit_stats_are_available_for_worker_metadata(monkeypatch):
+    from applypilot.apply.failure_classification import FailureEvidence, classify_apply_failure
+
+    result = classify_apply_failure(
+        FailureEvidence(
+            status="failed:no_result_line",
+            transcript="You've hit your usage limit. Switch to another model.",
+            application_tool_calls=0,
+            tool_calls_total=0,
+        )
+    )
+
+    assert result.failure_class == "usage_or_session_limit"
+    assert result.safe_requeue is True
+
+
 def test_session_limit_wording_with_no_tool_calls_is_retryable():
     """Live incident 2026-07-03: Claude CLI switched to 'session limit' wording with a
     'resets 12:40pm (America/New_York)' reset format. The old regex only matched 'usage

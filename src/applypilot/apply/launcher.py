@@ -29,6 +29,7 @@ from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
+from applypilot.apply.failure_classification import FailureEvidence, classify_apply_failure
 from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -1826,7 +1827,31 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         run_stats = dict(stats) if stats else {}
         run_stats["transcript"] = output[-20000:]
         run_stats["job_log"] = str(job_log)
-        _last_run_stats[worker_id] = run_stats
+
+        def _finish(status: str, duration_ms: int) -> tuple[str, int]:
+            ws = get_state(worker_id)
+            tool_calls_total = stats.get("turns", 0) or application_tool_calls[0]
+            last_tool = ws.last_action if ws else ""
+            run_stats["route"] = run_stats.get("route") or "agent"
+            run_stats["application_tool_calls"] = application_tool_calls[0]
+            run_stats["tool_calls_total"] = tool_calls_total
+            run_stats["last_tool"] = last_tool
+            if status != "applied":
+                classification = classify_apply_failure(
+                    FailureEvidence(
+                        status=status,
+                        transcript=output,
+                        application_tool_calls=application_tool_calls[0],
+                        tool_calls_total=tool_calls_total,
+                        last_tool=last_tool,
+                        timeout_seconds=AGENT_TIMEOUT_SECONDS,
+                    )
+                )
+                run_stats["failure_class"] = classification.failure_class
+                run_stats["safe_requeue"] = classification.safe_requeue
+                run_stats["worker_level_failure"] = classification.worker_level
+            _last_run_stats[worker_id] = run_stats
+            return status, duration_ms
 
         if stats:
             cost = stats.get("cost_usd", 0)
@@ -1863,14 +1888,14 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         if "RESULT:DRY_RUN" in result_source:
             add_event(f"[W{worker_id}] DRY-RUN OK ({elapsed}s): {job['title'][:30]}")
             update_state(worker_id, status="dry_run", last_action=f"DRY-RUN ({elapsed}s)")
-            return "dry_run", duration_ms
+            return _finish("dry_run", duration_ms)
 
         for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "AUTH_REQUIRED"]:
             if f"RESULT:{result_status}" in result_source:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
+                return _finish(result_status.lower(), duration_ms)
 
         if "RESULT:FAILED" in result_source:
             for out_line in result_source.split("\n"):
@@ -1886,12 +1911,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
                                      last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
+                        return _finish(reason, duration_ms)
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
+                    return _finish(f"failed:{reason}", duration_ms)
+            return _finish("failed:unknown", duration_ms)
 
         # No RESULT: line. Distinguish an agent usage/quota wall hit on turn 1 (no tool
         # calls -> the page was never touched -> RETRYABLE, re-queued upstream) from a
@@ -1903,7 +1928,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         else:
             add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
             update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return status, duration_ms
+        return _finish(status, duration_ms)
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
