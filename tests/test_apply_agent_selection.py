@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import io
+import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -231,3 +235,175 @@ def test_worker_loop_passes_selected_agent_to_run_job(monkeypatch) -> None:
     assert applied == 1 and failed == 0
     assert captured["agent"] == "codex"
     assert captured["model"] == "gpt-5"
+
+
+def test_route_from_greenhouse_result_names_shadow_and_submit():
+    from applypilot.apply import launcher
+
+    assert launcher._route_from_greenhouse_result(
+        {"route": "deterministic", "ready": True},
+        own=False,
+    ) == "adapter_shadow:greenhouse"
+    assert launcher._route_from_greenhouse_result(
+        {"route": "deterministic", "ready": True},
+        own=True,
+    ) == "adapter_submit:greenhouse"
+    assert launcher._route_from_greenhouse_result(
+        {"route": "agent_fallback", "ready": False},
+        own=False,
+    ) == "agent"
+
+
+def test_greenhouse_shadow_result_records_adapter_route_stats(monkeypatch, tmp_path: Path):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 91
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: False)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+
+    monkeypatch.setattr(
+        greenhouse_submit,
+        "apply_greenhouse",
+        lambda *args, **kwargs: {
+            "route": "deterministic",
+            "ready": True,
+            "plan": types.SimpleNamespace(free_text={}),
+        },
+    )
+
+    class FakePage:
+        def goto(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint: str):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    playwright_module = types.ModuleType("playwright")
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: FakePlaywrightContext()
+    playwright_module.sync_api = sync_api_module
+    monkeypatch.setitem(sys.modules, "playwright", playwright_module)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {
+            "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+            "url": "https://boards.greenhouse.io/acme/jobs/123",
+        },
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+    )
+
+    assert result is None
+    assert launcher._adapter_route_stats.pop(worker_id) == {
+        "route": "adapter_shadow:greenhouse",
+        "adapter_name": "greenhouse",
+        "adapter_plan_ready": True,
+    }
+
+
+def test_run_job_impl_merges_greenhouse_shadow_route_stats(monkeypatch, tmp_path: Path):
+    from applypilot.apply import launcher
+
+    worker_id = 92
+    launcher._adapter_route_stats.clear()
+    launcher._last_run_stats.pop(worker_id, None)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda worker_id: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["agent"])
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda worker_id: None)
+
+    def fake_greenhouse_apply(job, port, **kwargs):
+        launcher._adapter_route_stats[kwargs["worker_id"]] = {
+            "route": "adapter_shadow:greenhouse",
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": True,
+        }
+        return None
+
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", fake_greenhouse_apply)
+
+    class FakeStdin:
+        def write(self, text: str):
+            return len(text)
+
+        def close(self):
+            return None
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = io.StringIO(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "num_turns": 1,
+                        "total_cost_usd": 0,
+                        "result": "RESULT:APPLIED",
+                    }
+                )
+                + "\n"
+            )
+            self.returncode = 0
+            self.pid = 12345
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakePopen)
+
+    status, _duration_ms = launcher._run_job_impl(
+        {
+            "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+            "url": "https://boards.greenhouse.io/acme/jobs/123",
+            "title": "Software Engineer",
+            "site": "Acme",
+            "tailored_resume_path": None,
+        },
+        port=9222,
+        worker_id=worker_id,
+    )
+
+    stats = launcher._last_run_stats[worker_id]
+    assert status == "applied"
+    assert stats["route"] == "adapter_shadow:greenhouse"
+    assert stats["adapter_name"] == "greenhouse"
+    assert stats["adapter_plan_ready"] is True
+    assert worker_id not in launcher._adapter_route_stats

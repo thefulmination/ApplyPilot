@@ -180,6 +180,7 @@ _agent_procs: dict[int, subprocess.Popen] = {}
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
+_adapter_route_stats: dict[int, dict] = {}
 _agent_lock = threading.Lock()
 
 # Register cleanup on exit
@@ -1407,8 +1408,17 @@ def is_usage_limit_result(status: str | None) -> bool:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
+def _route_from_greenhouse_result(res: dict | None, *, own: bool) -> str | None:
+    if not res:
+        return None
+    if res.get("route") != "deterministic":
+        return "agent"
+    return "adapter_submit:greenhouse" if own else "adapter_shadow:greenhouse"
+
+
 def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
-                            resume_text: str, resume_path) -> tuple[str, int] | None:
+                            resume_text: str, resume_path,
+                            worker_id: int = 0) -> tuple[str, int] | None:
     """Opt-in deterministic Greenhouse path. Returns (status, duration_ms) if it
     OWNED the application, else None so the apply agent proceeds. Never raises.
 
@@ -1467,6 +1477,11 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
         plan = res.get("plan")
         logger.info("greenhouse shadow OK: ready=%s free_text=%s",
                     res.get("ready"), list(plan.free_text) if plan else [])
+        _adapter_route_stats[worker_id] = {
+            "route": _route_from_greenhouse_result(res, own=own),
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": bool(res.get("ready")),
+        }
         return None  # shadow: agent still owns the submission
 
     status = res.get("status", "failed:no_confirmation")
@@ -1568,6 +1583,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
     wrapper, not the run itself)."""
+    _adapter_route_stats.pop(worker_id, None)
     # Read tailored resume text
     resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -1604,8 +1620,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         worker_level_failure: bool | None = None,
     ) -> tuple[str, int]:
         run_stats = dict(stats_data or {})
+        adapter_stats = _adapter_route_stats.pop(worker_id, {})
+        run_stats.update(adapter_stats)
         transcript_text = transcript or ""
-        run_stats["route"] = route or run_stats.get("route") or "agent"
+        if route and not run_stats.get("route"):
+            run_stats["route"] = route
+        run_stats["route"] = run_stats.get("route") or "agent"
         run_stats["transcript"] = transcript_text[-20000:]
         if job_log is not None:
             run_stats["job_log"] = str(job_log)
@@ -1614,7 +1634,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         run_stats["tool_calls_total"] = int(tool_calls_total_count or 0)
         run_stats["last_tool"] = last_tool
 
-        if status != "applied":
+        if status != "applied" and "failure_class" not in run_stats:
             classification = classify_apply_failure(
                 FailureEvidence(
                     status=status,
@@ -1640,13 +1660,24 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     # APPLYPILOT_GREENHOUSE_ADAPTER is set). Owns the application only with the
     # second submit gate on a ready plan; otherwise validates + falls through.
     gh_result = _maybe_greenhouse_apply(job, port, dry_run=dry_run,
-                                        resume_text=resume_text, resume_path=resume_path)
+                                        resume_text=resume_text, resume_path=resume_path,
+                                        worker_id=worker_id)
     if gh_result is not None:
         status, duration_ms = gh_result
         return _record_run_metadata(
             status,
             duration_ms,
-            route="adapter_submit:greenhouse",
+            stats_data={
+                "route": "adapter_submit:greenhouse",
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": True,
+                "failure_class": (
+                    None if status == "applied" else "adapter_no_confirmation"
+                ),
+                "application_tool_calls": 0,
+                "tool_calls_total": 0,
+                "last_tool": "greenhouse_adapter",
+            },
             last_tool="greenhouse_adapter",
         )
     _maybe_lever_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
