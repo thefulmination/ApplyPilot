@@ -89,11 +89,18 @@ main() {
 
   while true; do
     if updates_available; then apply_update || log "WARN: update failed; running current code"; fi
+    fallback_args=()
+    if [ -n "${WORKER_FALLBACK_AGENT:-}" ]; then
+      fallback_args=(--fallback-agent "${WORKER_FALLBACK_AGENT}")
+    elif [ "${WORKER_AGENT:-claude}" = "claude" ]; then
+      fallback_args=(--fallback-agent "codex")
+    fi
     "$INSTALL_DIR/.venv/bin/applypilot-fleet-apply" \
       --worker-id "${WORKER_LABEL:-mac}-${WORKER_SLOT:-0}" \
       --agent "${WORKER_AGENT:-claude}" \
       --model "${WORKER_MODEL:-sonnet}" \
-      --machine-owner "${FLEET_MACHINE_OWNER:-mac}" &
+      --machine-owner "${FLEET_MACHINE_OWNER:-mac}" \
+      "${fallback_args[@]}" &
     child=$!
     log "worker started pid=$child id=${WORKER_LABEL:-mac}-${WORKER_SLOT:-0}"
     waited=0
