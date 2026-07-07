@@ -25,10 +25,12 @@ OAuth path unchanged.
 5. **Verify it reads:**
    ```powershell
    cd "C:\Users\JStal\OneDrive\Documents\New project\ApplyPilot"
-   .\.conda-env\python.exe -c "from applypilot.mail_source import get_mail_source; src=get_mail_source(); print(type(src).__name__); print(len(src.fetch(since_days=1, max_messages=1)))"
+   .\.conda-env\python.exe -c "from applypilot.mail_source import get_mail_source; src=get_mail_source(); print(type(src).__name__); print('count', len(src.fetch(since_days=1, max_messages=1)))"
    ```
-   It now reads over IMAP (no browser consent). This doubles as your first-run canary against
-   real Gmail.
+   The backend should print `ImapMailSource`. This canary does not print email content. Do not
+   use the wrapper's Gmail scan command as the IMAP canary unless the app-password file also exists
+   under that wrapper's `APPLYPILOT_DIR`; otherwise it may fall back to OAuth and give a
+   false-green result.
 6. **Clean up the dead OAuth token (optional):** once the app password works, the OAuth token is
    unused — `Remove-Item "$env:USERPROFILE\.applypilot\gmail_token.json"`. (Leaving it is harmless;
    the factory prefers the app password.)
