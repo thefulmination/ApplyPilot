@@ -16,12 +16,17 @@ import random
 import sqlite3
 import time
 from typing import Callable, Iterable, Sequence
-from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_worker, launch_chrome
+from applypilot.aggregator_resolver import (
+    UNRESOLVED_NEXT_ACTIONS,
+    is_external_apply_url,
+    next_action_for_unresolved_kind,
+    source_platform_from_url,
+)
 from applypilot.database import get_connection
 
 COMPLETED_STATUSES = {
@@ -128,23 +133,8 @@ class ResolverSummary:
             self.sample_urls = []
 
 
-def _host(url: str | None) -> str:
-    if not url:
-        return ""
-    host = (urlparse(url).hostname or "").lower()
-    return host[4:] if host.startswith("www.") else host
-
-
 def is_linkedin_url(url: str | None) -> bool:
-    host = _host(url)
-    return host == "linkedin.com" or host.endswith(".linkedin.com")
-
-
-def is_external_apply_url(url: str | None) -> bool:
-    if not url:
-        return False
-    parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and not is_linkedin_url(url)
+    return source_platform_from_url(url) == "linkedin"
 
 
 def _snapshot_text_lower(snapshot: PageSnapshot) -> str:
