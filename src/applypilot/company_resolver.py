@@ -20,6 +20,10 @@ from applypilot.linkedin_resolver import is_external_apply_url, is_linkedin_url
 
 
 RESOLVED_STATUS = "resolved_company_match"
+ATS_RECONSTRUCTION_NEXT_ACTION = "run_ats_reconstruction"
+ATS_RECONSTRUCTION_UNRESOLVED_KINDS = frozenset(
+    {"ats_reconstruction_needed", "apply_button_missing"}
+)
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,30 @@ def fetch_candidates(
     wanted_tiers = _normalize_tiers(tiers, include_low)
     tier_marks = ",".join("?" for _ in wanted_tiers)
     resolution_filter = "" if refresh else "AND COALESCE(apply_url_resolution_strategy, '') != 'company_match'"
+    metadata_filter = ""
+    ats_kind_values = tuple(sorted(ATS_RECONSTRUCTION_UNRESOLVED_KINDS))
+    if not refresh:
+        kind_marks = ",".join("?" for _ in ats_kind_values)
+        metadata_filter = f"""
+           AND (
+                COALESCE(linkedin_resolve_status, '') != 'unresolved'
+                OR COALESCE(linkedin_next_action, '') = ?
+                OR (
+                    COALESCE(linkedin_next_action, '') = ''
+                    AND (
+                        COALESCE(linkedin_unresolved_kind, '') IN ({kind_marks})
+                        OR COALESCE(linkedin_unresolved_kind, '') = ''
+                    )
+                )
+           )
+        """
+    metadata_params: tuple[str, ...] = ()
+    if not refresh:
+        metadata_params = (
+            ATS_RECONSTRUCTION_NEXT_ACTION,
+            *ats_kind_values,
+        )
+    order_kind_marks = ",".join("?" for _ in ats_kind_values)
     rows = conn.execute(
         f"""
         SELECT url, title, company, location, site, application_url,
@@ -189,7 +217,14 @@ def fetch_candidates(
            AND applied_at IS NULL
            AND COALESCE(audit_label, '') IN ({tier_marks})
            {resolution_filter}
+           {metadata_filter}
          ORDER BY
+           CASE
+                WHEN COALESCE(linkedin_next_action, '') = ? THEN 0
+                WHEN COALESCE(linkedin_next_action, '') = ''
+                     AND COALESCE(linkedin_unresolved_kind, '') IN ({order_kind_marks}) THEN 0
+                ELSE 1
+           END,
            CASE COALESCE(audit_label, '')
                 WHEN 'priority' THEN 0
                 WHEN 'recommended' THEN 1
@@ -203,7 +238,13 @@ def fetch_candidates(
            url ASC
          LIMIT ?
         """,
-        (*wanted_tiers, limit * 5),
+        (
+            *wanted_tiers,
+            *metadata_params,
+            ATS_RECONSTRUCTION_NEXT_ACTION,
+            *ats_kind_values,
+            limit * 5,
+        ),
     ).fetchall()
 
     candidates = []
