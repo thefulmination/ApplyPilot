@@ -514,6 +514,47 @@ def linkedin_resolve_apply_urls_command(
     console.print("[dim]Next: run `applypilot linkedin-split` to inspect the offsite/Easy Apply split.[/dim]")
 
 
+@app.command("indeed-resolve-apply-urls")
+def indeed_resolve_apply_urls_command(
+    limit: int = typer.Option(200, "--limit", help="Maximum unresolved Indeed jobs to inspect."),
+    tiers: str = typer.Option("priority,recommended", "--tiers", help="Comma-separated audit labels to include."),
+    include_low: bool = typer.Option(False, "--include-low", help="Also include review and low audit labels."),
+    refresh: bool = typer.Option(False, "--refresh", help="Revisit rows already processed by Indeed resolution."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview candidates without writing application_url metadata."),
+) -> None:
+    """Classify Indeed apply destinations without LLM/OCR or browser automation."""
+    _bootstrap()
+    from applypilot import indeed_resolver
+
+    parsed_tiers = tuple(t.strip() for t in tiers.split(",") if t.strip())
+    if not parsed_tiers:
+        console.print("[red]--tiers must include at least one audit label.[/red]")
+        raise typer.Exit(code=1)
+    if limit < 0:
+        console.print("[red]--limit must be 0 or a positive number.[/red]")
+        raise typer.Exit(code=1)
+
+    summary = indeed_resolver.run_resolver(
+        indeed_resolver.IndeedResolverOptions(
+            limit=limit,
+            tiers=parsed_tiers,
+            include_low=include_low,
+            refresh=refresh,
+            dry_run=dry_run,
+        )
+    )
+
+    console.print("\n[bold]Indeed apply URL resolver[/bold]")
+    console.print(f"  considered: {summary.considered}")
+    if summary.dry_run:
+        console.print("  mode:       dry run")
+    for status, count in sorted((summary.counts or {}).items()):
+        console.print(f"  {status}: {count}")
+    for url in summary.sample_urls or []:
+        console.print(f"  - {url}")
+    console.print("[dim]Browser-click Indeed resolution is not enabled; unresolved rows include next-action metadata.[/dim]")
+
+
 @app.command("resolve-company-apply-urls")
 def resolve_company_apply_urls_command(
     limit: int = typer.Option(200, "--limit", help="Maximum unresolved LinkedIn jobs to inspect."),

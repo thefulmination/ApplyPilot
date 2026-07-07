@@ -1,5 +1,6 @@
 import pytest
 
+from applypilot import database
 from applypilot import indeed_resolver
 
 
@@ -209,3 +210,207 @@ def test_click_and_capture_known_source_platform_popup_is_unresolved():
     assert decision.error == "https://www.linkedin.com/jobs/view/123"
     assert page.popup is not None
     assert page.popup.closed is True
+
+
+def _insert_job(
+    conn,
+    *,
+    url: str,
+    site: str = "indeed",
+    application_url: str | None = None,
+    audit_label: str | None = "recommended",
+    audit_score: float | None = 8.5,
+    fit_score: int | None = 8,
+    duplicate_of_url: str | None = None,
+    liveness_status: str | None = None,
+    applied_at: str | None = None,
+    strategy: str | None = None,
+):
+    conn.execute(
+        """
+        INSERT INTO jobs (
+            url, title, site, company, application_url, audit_label, audit_score,
+            fit_score, duplicate_of_url, liveness_status, applied_at,
+            apply_url_resolution_strategy, discovered_at
+        )
+        VALUES (?, 'Chief of Staff', ?, 'Acme', ?, ?, ?, ?, ?, ?, ?, ?, '2026-06-20T00:00:00+00:00')
+        """,
+        (
+            url,
+            site,
+            application_url,
+            audit_label,
+            audit_score,
+            fit_score,
+            duplicate_of_url,
+            liveness_status,
+            applied_at,
+            strategy,
+        ),
+    )
+    conn.commit()
+
+
+def test_fetch_candidates_selects_unresolved_indeed_rows(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=low", audit_label="low", audit_score=9.9)
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=dupe", duplicate_of_url="https://x")
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=dead", liveness_status="dead")
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=applied", applied_at="2026-06-20T01:00:00+00:00")
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=resolved", strategy="indeed_deterministic")
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=company-match", strategy="company_match")
+    _insert_job(conn, url="https://company.example/jobs/1", site="greenhouse")
+    _insert_job(conn, url="https://notindeed.com/job", site="greenhouse")
+    _insert_job(conn, url="https://company.example/jobs/indeed.com-shadow", site="greenhouse")
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=priority", audit_label="priority", audit_score=7.0)
+    _insert_job(conn, url="https://example.com/job", site="other", application_url="https://smartapply.indeed.com/apply")
+
+    rows = indeed_resolver.fetch_candidates(limit=10, tiers=("priority", "recommended"))
+
+    assert [row.url for row in rows] == [
+        "https://www.indeed.com/viewjob?jk=priority",
+        "https://example.com/job",
+    ]
+
+    refresh_rows = indeed_resolver.fetch_candidates(
+        limit=10,
+        tiers=("priority", "recommended"),
+        refresh=True,
+    )
+
+    assert "https://www.indeed.com/viewjob?jk=company-match" in {
+        row.url for row in refresh_rows
+    }
+
+
+def test_fetch_candidates_does_not_let_non_indeed_rows_crowd_out_indeed(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+
+    for idx in range(10):
+        _insert_job(
+            conn,
+            url=f"https://company.example/jobs/{idx}",
+            site="greenhouse",
+            audit_score=99.0 - idx,
+        )
+    _insert_job(
+        conn,
+        url="https://www.indeed.com/viewjob?jk=real",
+        site="indeed",
+        audit_score=1.0,
+    )
+
+    rows = indeed_resolver.fetch_candidates(limit=1, tiers=("priority", "recommended"))
+
+    assert [row.url for row in rows] == ["https://www.indeed.com/viewjob?jk=real"]
+
+
+def test_fetch_candidates_pages_past_path_shadow_indeed_false_positives(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+
+    for idx in range(60):
+        _insert_job(
+            conn,
+            url=f"https://company.example/redirect/www.indeed.com/{idx}",
+            site="greenhouse",
+            audit_score=99.0 - idx,
+        )
+    _insert_job(
+        conn,
+        url="https://www.indeed.com/viewjob?jk=real",
+        site="indeed",
+        audit_score=1.0,
+    )
+
+    rows = indeed_resolver.fetch_candidates(limit=1, tiers=("priority", "recommended"))
+
+    assert [row.url for row in rows] == ["https://www.indeed.com/viewjob?jk=real"]
+
+
+def test_run_resolver_records_external_application_url_without_browser(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+    _insert_job(
+        conn,
+        url="https://www.indeed.com/viewjob?jk=external",
+        application_url="https://jobs.ashbyhq.com/acme/123",
+    )
+
+    summary = indeed_resolver.run_resolver(indeed_resolver.IndeedResolverOptions(limit=10))
+
+    row = conn.execute(
+        """
+        SELECT application_url, apply_url_resolution_strategy, apply_url_resolution_source,
+               apply_url_resolution_error, apply_url_resolution_attempts, liveness_status
+          FROM jobs WHERE url = 'https://www.indeed.com/viewjob?jk=external'
+        """
+    ).fetchone()
+
+    assert summary.considered == 1
+    assert summary.counts == {"resolved_offsite": 1}
+    assert row["application_url"] == "https://jobs.ashbyhq.com/acme/123"
+    assert row["apply_url_resolution_strategy"] == "indeed_deterministic"
+    assert row["apply_url_resolution_source"] == "resolved_offsite"
+    assert row["apply_url_resolution_error"] is None
+    assert row["apply_url_resolution_attempts"] == 1
+    assert row["liveness_status"] == "live"
+
+
+def test_run_resolver_records_hosted_indeed_apply_without_external_url(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+    _insert_job(
+        conn,
+        url="https://www.indeed.com/viewjob?jk=hosted",
+        application_url="https://smartapply.indeed.com/apply?jk=hosted",
+    )
+
+    summary = indeed_resolver.run_resolver(indeed_resolver.IndeedResolverOptions(limit=10))
+
+    row = conn.execute(
+        """
+        SELECT application_url, apply_url_resolution_strategy, apply_url_resolution_source,
+               apply_url_resolution_error, apply_url_resolution_attempts, liveness_status
+          FROM jobs WHERE url = 'https://www.indeed.com/viewjob?jk=hosted'
+        """
+    ).fetchone()
+
+    assert summary.counts == {"hosted_apply": 1}
+    assert row["application_url"] == "https://smartapply.indeed.com/apply?jk=hosted"
+    assert row["apply_url_resolution_strategy"] == "indeed_deterministic"
+    assert row["apply_url_resolution_source"] == "hosted_apply"
+    assert row["apply_url_resolution_error"] is None
+    assert row["apply_url_resolution_attempts"] == 1
+    assert row["liveness_status"] == "live"
+
+
+def test_run_resolver_dry_run_does_not_write(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+    _insert_job(
+        conn,
+        url="https://www.indeed.com/viewjob?jk=dry",
+        application_url="https://jobs.lever.co/acme/456",
+    )
+
+    summary = indeed_resolver.run_resolver(
+        indeed_resolver.IndeedResolverOptions(limit=10, dry_run=True)
+    )
+
+    row = conn.execute(
+        """
+        SELECT apply_url_resolution_strategy, apply_url_resolution_attempts
+          FROM jobs WHERE url = 'https://www.indeed.com/viewjob?jk=dry'
+        """
+    ).fetchone()
+
+    assert summary.dry_run is True
+    assert summary.considered == 1
+    assert summary.counts == {"resolved_offsite": 1}
+    assert summary.sample_urls == ["https://jobs.lever.co/acme/456"]
+    assert row["apply_url_resolution_strategy"] is None
+    assert row["apply_url_resolution_attempts"] == 0

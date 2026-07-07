@@ -4,6 +4,7 @@ from typer.testing import CliRunner
 
 from applypilot import cli
 from applypilot import company_resolver
+from applypilot import indeed_resolver
 from applypilot import linkedin_resolver
 
 
@@ -70,6 +71,66 @@ def test_linkedin_resolve_apply_urls_rejects_bad_delay(monkeypatch):
 
     assert result.exit_code == 1
     assert "--delay-max must be greater than or equal to --delay-min" in result.output
+
+
+def test_indeed_resolve_apply_urls_dry_run_wires_options(monkeypatch):
+    captured = {}
+
+    def fake_run_resolver(options):
+        captured["options"] = options
+        return indeed_resolver.IndeedResolverSummary(
+            considered=2,
+            dry_run=True,
+            counts={"resolved_offsite": 2},
+            sample_urls=["https://www.indeed.com/viewjob?jk=1"],
+        )
+
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+    monkeypatch.setattr(indeed_resolver, "run_resolver", fake_run_resolver)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "indeed-resolve-apply-urls",
+            "--limit",
+            "2",
+            "--tiers",
+            "priority,recommended",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["options"].limit == 2
+    assert captured["options"].tiers == ("priority", "recommended")
+    assert captured["options"].dry_run is True
+    assert "Indeed apply URL resolver" in result.output
+    assert "dry run" in result.output.lower()
+    assert "resolved_offsite: 2" in result.output
+
+
+def test_indeed_resolve_apply_urls_rejects_empty_tiers(monkeypatch):
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["indeed-resolve-apply-urls", "--tiers", " , "],
+    )
+
+    assert result.exit_code == 1
+    assert "--tiers must include at least one audit label" in result.output
+
+
+def test_indeed_resolve_apply_urls_rejects_negative_limit(monkeypatch):
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["indeed-resolve-apply-urls", "--limit", "-1"],
+    )
+
+    assert result.exit_code == 1
+    assert "--limit must be 0 or a positive number" in result.output
 
 
 def test_boost_output_resolves_urls_and_generates_until_ready_target(monkeypatch):
