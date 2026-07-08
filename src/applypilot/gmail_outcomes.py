@@ -243,6 +243,12 @@ _GENERIC_DOMAINS: frozenset[str] = frozenset({
     "protonmail.com", "icloud.com", "mail.com",
 })
 
+# Board-relay senders can carry job-related content, but their domain is not employer
+# identity and must never attach to an arbitrary applied row via company-domain matching.
+_BOARD_RELAY_DOMAINS: frozenset[str] = frozenset({
+    "indeed.com", "match.indeed.com",
+})
+
 _CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
 
 
@@ -278,6 +284,14 @@ def _is_ats_domain(domain: str | None) -> bool:
     if not domain:
         return False
     return domain in _ATS_DOMAINS or any(domain.endswith(f".{d}") for d in _ATS_DOMAINS)
+
+
+def _is_board_relay_domain(domain: str | None) -> bool:
+    if not domain:
+        return False
+    return domain in _BOARD_RELAY_DOMAINS or any(
+        domain.endswith(f".{d}") for d in _BOARD_RELAY_DOMAINS
+    )
 
 
 def _confidence(weight: int) -> str:
@@ -730,7 +744,12 @@ def _match_tiers(
                 return job, "ats_domain", score
 
     # 2. Company domain: sender domain matches a job URL domain.
-    if sender_domain and sender_domain not in _GENERIC_DOMAINS and not is_ats:
+    if (
+        sender_domain
+        and sender_domain not in _GENERIC_DOMAINS
+        and not is_ats
+        and not _is_board_relay_domain(sender_domain)
+    ):
         for job in jobs:
             for url_key in ("url", "application_url"):
                 job_domain = _url_domain(job.get(url_key) or "")

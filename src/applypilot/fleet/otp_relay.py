@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from applypilot import inbox_auth
 
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
+_DEFAULT_SCAN_MAX_MESSAGES = 1000
 
 _PROVIDER_DOMAIN_GROUPS = (
     ("oraclecloud.com", "oracle.com", "taleo.net"),
@@ -157,7 +158,7 @@ def _answered_ttl_seconds(explicit: int | None) -> int:
 
 
 def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
-                   max_messages: int = 100, skew_seconds: int = 60,
+                   max_messages: int = _DEFAULT_SCAN_MAX_MESSAGES, skew_seconds: int = 60,
                    answered_ttl_seconds: int | None = None) -> int:
     """Read Gmail ONCE and answer every pending request whose code arrived after it.
 
@@ -167,7 +168,12 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
 
     When `gmail_service` is None (the default), the mailbox is read via
     get_mail_source() (IMAP app-password, falling back to the legacy Gmail API);
-    passing a `gmail_service` explicitly preserves the old direct-service path."""
+    passing a `gmail_service` explicitly preserves the old direct-service path.
+
+    The fetch budget defaults to 1000 because the home inbox is noisy enough that a
+    real verification mail can sit outside the newest 500 messages while still being
+    well inside the 15-minute OTP window.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id, requested_at, sender_hint FROM otp_request "
@@ -185,7 +191,11 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
         from applypilot.mail_source import get_mail_source
 
         since_days = max(1, (window_minutes + 1439) // 1440)
-        msgs = get_mail_source().fetch(since_days=since_days, max_messages=max_messages)
+        msgs = get_mail_source().fetch(
+            since_days=since_days,
+            max_messages=max_messages,
+            gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
+        )
         matches = inbox_auth.scan_gmail_for_auth_codes(
             messages=msgs, minutes=window_minutes, max_messages=max_messages)
     else:

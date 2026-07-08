@@ -108,6 +108,22 @@ def test_gmail_api_mail_source_fetch_maps_payload_to_mail_message():
     assert fake_service.messages_obj.get_calls == [("me", "1", "full")]
 
 
+def test_gmail_api_mail_source_fetch_uses_gmail_raw_query_when_provided():
+    fake_service = _FakeGmailService({"messages": []}, {})
+
+    source = GmailApiMailSource(build_service=lambda: fake_service)
+    result = source.fetch(
+        since_days=7,
+        max_messages=5,
+        gmail_raw_query='verification OR "magic link"',
+    )
+
+    assert result == []
+    assert fake_service.messages_obj.list_calls == [
+        ("me", 'newer_than:7d (verification OR "magic link")', 5)
+    ]
+
+
 def test_gmail_api_mail_source_fetch_returns_empty_when_no_messages():
     fake_service = _FakeGmailService({"messages": []}, {})
 

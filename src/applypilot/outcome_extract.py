@@ -8,7 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from applypilot.gmail_outcomes import classify_email_outcome
+from applypilot.gmail_outcomes import classify_email_outcome, _extract_domain, _is_board_relay_domain
 
 STAGES = (
     "acknowledged", "screen", "assessment", "interview", "offer", "rejected", "position_filled", "other"
@@ -119,6 +119,14 @@ def extract_outcome(
     confidence = str(obj.get("confidence") or "").strip().lower()
     if confidence not in _CONFIDENCE:
         confidence = "medium"
+
+    # Board relay mail can mention a job and company while still being a recommendation or
+    # promotion rather than a real application outcome. When the deterministic classifier
+    # says the message is not a job email, do not preserve an LLM-only progression stage.
+    heuristic = _heuristic(subject, body, sender)
+    sender_domain = _extract_domain(sender)
+    if _is_board_relay_domain(sender_domain) and heuristic.stage == "other" and stage != "other":
+        return heuristic
 
     return ExtractedOutcome(
         stage=stage,

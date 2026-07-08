@@ -122,13 +122,21 @@ def test_normalize_falls_back_to_uid_when_no_message_id():
 # ---------------------------------------------------------------------------
 
 class FakeImap:
-    def __init__(self, search_ids: list[bytes], messages_by_id: dict[bytes, bytes], login_error=None):
+    def __init__(
+        self,
+        search_ids: list[bytes],
+        messages_by_id: dict[bytes, bytes],
+        login_error=None,
+        gmraw_ids: list[bytes] | None = None,
+    ):
         self._search_ids = search_ids
+        self._gmraw_ids = gmraw_ids if gmraw_ids is not None else search_ids
         self._messages_by_id = messages_by_id
         self._login_error = login_error
         self.logged_out = False
         self.login_calls = []
         self.selected = None
+        self.uid_calls = []
 
     def login(self, email_addr, app_password):
         self.login_calls.append((email_addr, app_password))
@@ -148,6 +156,19 @@ class FakeImap:
         if raw is None:
             return "NO", [None]
         return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+
+    def uid(self, command, *args):
+        self.uid_calls.append((command, *args))
+        if command.upper() == "SEARCH":
+            return "OK", [b" ".join(self._gmraw_ids)]
+        if command.upper() == "FETCH":
+            uid = args[0]
+            key = uid.encode() if isinstance(uid, str) else uid
+            raw = self._messages_by_id.get(key)
+            if raw is None:
+                return "NO", [None]
+            return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+        return "NO", [b"unsupported uid command"]
 
     def logout(self):
         self.logged_out = True
@@ -189,6 +210,32 @@ def test_fetch_respects_max_messages_cap_when_fewer_available():
     result = source.fetch(since_days=7, max_messages=10)
 
     assert len(result) == 2
+
+
+def test_fetch_uses_gmail_raw_uid_search_when_query_provided():
+    ids = [b"1", b"2", b"3", b"4"]
+    gmraw_ids = [b"2", b"4"]
+    messages_by_id = {
+        b"1": _encoded_word_subject_raw(),
+        b"2": _base64_plain_raw(),
+        b"3": _html_only_raw(),
+        b"4": _multipart_alternative_raw(),
+    }
+    fake = FakeImap(search_ids=ids, gmraw_ids=gmraw_ids, messages_by_id=messages_by_id)
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    result = source.fetch(
+        since_days=7,
+        max_messages=10,
+        gmail_raw_query='verification OR "magic link"',
+    )
+
+    assert [m.id for m in result] == ["2", "4"]
+    assert fake.uid_calls[0] == (
+        "SEARCH",
+        "X-GM-RAW",
+        '"newer_than:7d (verification OR \\"magic link\\")"',
+    )
 
 
 def test_fetch_strips_spaces_from_app_password_before_login():

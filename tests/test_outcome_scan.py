@@ -41,6 +41,49 @@ def test_build_email_event_matches_job_and_extracts(tmp_path, monkeypatch):
     assert row["job_url"] == "https://boards.greenhouse.io/acme/jobs/1"
 
 
+def test_build_email_event_downgrades_llm_screen_when_heuristic_flags_non_job_relay(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    conn.execute(
+        "INSERT INTO jobs (url, title, company, site, application_url, apply_status, applied_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (
+            "https://www.indeed.com/viewjob?jk=d068539749bf3755",
+            "Chief of Staff to the CEO",
+            "TetraScience",
+            "TetraScience",
+            "https://apply.workable.com/j/8A0C14FB7D",
+            "applied",
+            "2026-07-04T00:04:01-04:00",
+        ),
+    )
+    conn.commit()
+    applied = [dict(r) for r in conn.execute("SELECT * FROM jobs").fetchall()]
+    msg = {
+        "message_id": "m-indeed-relay",
+        "thread_id": "t-indeed-relay",
+        "subject": "Principal Product Marketing Manager @ WitnessAI",
+        "sender": "Indeed <donotreply@match.indeed.com>",
+        "date": "Sat, 04 Jul 2026 08:31:05 +0000",
+        "body": (
+            "Hi Jonathan,\n\nYour background could be a strong fit for this "
+            "Principal Product Marketing Manager role at WitnessAI.\n\n"
+            "View job: https://cts.indeed.com/v3/example\n"
+            "Apply now: https://cts.indeed.com/v3/example2\n\n"
+            "unsubscribe sponsored"
+        ),
+    }
+    reply = (
+        '{"stage":"screen","outcome":null,"reason":null,'
+        '"title":"Principal Product Marketing Manager","company":"WitnessAI",'
+        '"confidence":"high"}'
+    )
+    row = S.build_email_event(msg, applied, client=FakeClient(reply))
+    assert row["stage"] == "other"
+    assert row["outcome"] is None
+    assert row["extracted_by"] == "heuristic_fallback"
+    assert row["job_url"] is None
+
+
 def test_upsert_is_idempotent(tmp_path):
     conn = database.init_db(tmp_path / "applypilot.db")
     row = {

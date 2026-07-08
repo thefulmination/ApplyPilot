@@ -133,6 +133,11 @@ _DEADMAN_KIND_DETAILS: dict[str, tuple[str, str, str]] = {
         "Email-2FA relay is not healthy; jobs waiting on email verification will stall.",
         "severe",
     ),
+    "owner_inbox_backlog": (
+        "Manual auth backlog requires attention",
+        "A manual-auth challenge backlog is building on the owner inbox path; review parked challenges in the console.",
+        "severe",
+    ),
     "running_hot": (
         "Daily spend is running hot",
         "24h spend has been near or above cap threshold; continue cautiously and watch the cap.",

@@ -280,3 +280,19 @@ def test_unknown_deadman_alert_keeps_raw_kind_and_detail(fleet_db, monkeypatch):
     assert body["deadman"]["title"] == "Unknown DeadMan alert: new_watchdog"
     assert "Unhandled watchdog alert" in body["deadman"]["reason"]
     assert "model reset unclear at 3am" in body["deadman"]["reason"]
+
+
+def test_known_owner_inbox_backlog_deadman_alert_is_humanized(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET deadman_alert=%s, deadman_alert_at=now() WHERE id=1",
+                ("owner_inbox_backlog: 7 fresh owner_inbox challenge(s) in the last 30m",),
+            )
+        conn.commit()
+
+    body = console_app.diagnosis()
+    assert body["deadman"]["code"] == "owner_inbox_backlog"
+    assert body["deadman"]["title"] == "Manual auth backlog requires attention"
+    assert "manual-auth challenge backlog" in body["deadman"]["reason"]

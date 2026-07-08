@@ -499,6 +499,40 @@ class TestMatchEmailToJob:
         assert job["site"] == "Acme Corp"
         assert method == "company_domain"
 
+    def test_indeed_relay_does_not_domain_match_arbitrary_indeed_job(self):
+        jobs = [
+            {
+                "url": "https://www.indeed.com/viewjob?jk=d068539749bf3755",
+                "application_url": "https://apply.workable.com/j/8A0C14FB7D",
+                "title": "Chief of Staff to the CEO",
+                "site": "TetraScience",
+                "company": "TetraScience",
+                "apply_status": "applied",
+            },
+            {
+                "url": "https://www.indeed.com/viewjob?jk=2150de97d20f63c3",
+                "application_url": "https://jobs.lever.co/cyngn/61d58f47-bc68-4c63-b87f-45a933fc59a4",
+                "title": "Senior Program Manager - Deployments",
+                "site": "CYNGN",
+                "company": "CYNGN",
+                "apply_status": "applied",
+            },
+        ]
+        result = match_email_to_job(
+            sender="Indeed <donotreply@match.indeed.com>",
+            subject="Principal Product Marketing Manager @ WitnessAI",
+            body=(
+                "Hi Jonathan, Your background could be a strong fit for this "
+                "Principal Product Marketing Manager role at WitnessAI. "
+                "View job: https://cts.indeed.com/v3/example "
+                "Apply now: https://cts.indeed.com/v3/example2"
+            ),
+            applied_jobs=jobs,
+        )
+        assert result.job is None
+        assert result.method is None
+        assert result.status == "unmatched"
+
     def test_generic_domain_falls_through_to_name(self):
         # gmail.com sender can't use domain match; should try company name
         job, method, _ = match_email_to_job(

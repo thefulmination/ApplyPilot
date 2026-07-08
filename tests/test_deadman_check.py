@@ -222,6 +222,70 @@ def test_stalled_queue_not_triggered_without_approved_queued_rows(fleet_db):
 
 
 # ---------------------------------------------------------------------------
+# owner_inbox_backlog
+# ---------------------------------------------------------------------------
+
+def test_owner_inbox_backlog_alerts_on_fresh_manual_challenge_surge(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+            cur.execute(
+                "INSERT INTO auth_challenge (url, kind, route, raised_at) VALUES "
+                "(%s, 'visible_captcha', 'owner_inbox', %s), "
+                "(%s, 'visible_captcha', 'owner_inbox', %s), "
+                "(%s, 'login_gate', 'owner_inbox', %s)",
+                (
+                    "https://example.com/challenge-1", NOW - dt.timedelta(minutes=10),
+                    "https://example.com/challenge-2", NOW - dt.timedelta(minutes=12),
+                    "https://example.com/challenge-3", NOW - dt.timedelta(minutes=14),
+                ),
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW)
+
+    kinds = _kinds(alerts)
+    assert "owner_inbox_backlog" in kinds
+    detail = next(a.detail for a in alerts if a.kind == "owner_inbox_backlog")
+    assert "3 fresh owner_inbox challenge(s)" in detail
+    assert "0 fresh otp_request(s)" in detail
+    assert "visible_captcha=2" in detail
+    assert "login_gate=1" in detail
+
+
+def test_owner_inbox_backlog_ignores_single_manual_challenge_when_otp_is_still_active(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            _doctor_pass(cur, NOW - dt.timedelta(minutes=5))
+            cur.execute(
+                "INSERT INTO auth_challenge (url, kind, route, raised_at) VALUES "
+                "(%s, 'login_gate', 'owner_inbox', %s)",
+                ("https://example.com/challenge-1", NOW - dt.timedelta(minutes=10)),
+            )
+            cur.execute(
+                "INSERT INTO otp_request (worker_id, url, sender_hint, requested_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    "m2-0",
+                    "https://example.com/job-1",
+                    "example.com",
+                    NOW - dt.timedelta(minutes=5),
+                    NOW + dt.timedelta(minutes=5),
+                ),
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW)
+
+    assert "owner_inbox_backlog" not in _kinds(alerts)
+
+# ---------------------------------------------------------------------------
 # selfheal_dead
 # ---------------------------------------------------------------------------
 

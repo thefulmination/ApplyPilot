@@ -32,6 +32,7 @@ STALE_MIN = 30          # silent_death / selfheal_dead: heartbeat staleness (min
 STALL_HOURS = 3         # stalled_queue: how long without an 'applied' row counts as stalled
 HOT_FRACTION = 0.95     # running_hot: fraction of cost_cap_daily_usd that counts as "hot"
 HOT_STREAK_MIN = 2      # running_hot: consecutive hot checks required before alerting
+OWNER_INBOX_WINDOW_MIN = 30
 
 _WATCHDOG_OR_LINKEDIN_RE = re.compile(r"watchdog|linkedin")
 _WATCHDOG_RE = re.compile(r"watchdog")
@@ -179,6 +180,47 @@ def _check_otp_relay(conn, now: dt.datetime, gmail_token_ok: bool | None) -> Ale
     return None
 
 
+def _check_owner_inbox_backlog(conn, cfg: dict, now: dt.datetime) -> Alert | None:
+    """Alert when the fleet quietly shifts into a manual-auth backlog.
+
+    ``owner_inbox`` challenges do not generate OTP emails; they park rows for manual
+    triage in the console. A sudden burst can look like "OTP stopped working" to the
+    operator even though the relay is healthy. Promote that burst into the same
+    DeadMan/banner channel used for other lane-stall conditions.
+    """
+    if not _is_armed(cfg):
+        return None
+    window_start = now - dt.timedelta(minutes=OWNER_INBOX_WINDOW_MIN)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, COUNT(*) AS n "
+            "FROM auth_challenge "
+            "WHERE resolved_at IS NULL AND route='owner_inbox' AND raised_at >= %s "
+            "GROUP BY kind ORDER BY n DESC, kind ASC",
+            (window_start,),
+        )
+        rows = cur.fetchall()
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM otp_request WHERE requested_at >= %s",
+            (window_start,),
+        )
+        otp_recent = int(cur.fetchone()["n"])
+    total = sum(int(row["n"]) for row in rows)
+    if total <= 0 or otp_recent > 0:
+        return None
+    kind_parts = [f"{row['kind']}={int(row['n'])}" for row in rows if row.get("kind")]
+    detail = (
+        f"{total} fresh owner_inbox challenge(s) in the last {OWNER_INBOX_WINDOW_MIN}m"
+        f"; {otp_recent} fresh otp_request(s)"
+        + (f" ({', '.join(kind_parts)})" if kind_parts else "")
+    )
+    return Alert(
+        kind="owner_inbox_backlog",
+        severity="critical",
+        detail=detail,
+    )
+
+
 def deadman_check(
     conn, *, now: dt.datetime, prev_hot_streak: int = 0, gmail_token_ok: bool | None = None
 ) -> tuple[list[Alert], int]:
@@ -212,6 +254,10 @@ def deadman_check(
     otp = _check_otp_relay(conn, now, gmail_token_ok)
     if otp:
         alerts.append(otp)
+
+    owner_inbox = _check_owner_inbox_backlog(conn, cfg, now)
+    if owner_inbox:
+        alerts.append(owner_inbox)
 
     hot_alert, new_streak = _check_running_hot(conn, cfg, now, prev_hot_streak)
     if hot_alert:

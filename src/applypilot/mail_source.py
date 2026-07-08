@@ -147,7 +147,13 @@ class ImapMailSource:
         self._app_password = (app_password or "").replace(" ", "")
         self._injected_imap = imap
 
-    def fetch(self, *, since_days: int, max_messages: int) -> list[MailMessage]:
+    def fetch(
+        self,
+        *,
+        since_days: int,
+        max_messages: int,
+        gmail_raw_query: str | None = None,
+    ) -> list[MailMessage]:
         imap = self._injected_imap or imaplib.IMAP4_SSL("imap.gmail.com", 993)
         try:
             try:
@@ -161,27 +167,36 @@ class ImapMailSource:
             status, data = imap.select("INBOX", readonly=True)
             _ensure_ok(status, "select", data)
 
-            since_date = (
-                datetime.date.today() - datetime.timedelta(days=since_days)
-            ).strftime("%d-%b-%Y")
-            status, data = imap.search(None, "SINCE", since_date)
-            _ensure_ok(status, "search", data)
-
-            ids: list[bytes | str] = []
-            if data and data[0]:
-                raw_ids = data[0]
-                if isinstance(raw_ids, bytes):
-                    ids = raw_ids.split()
-                else:
-                    ids = raw_ids.split()
+            if gmail_raw_query:
+                status, data = imap.uid(
+                    "SEARCH",
+                    "X-GM-RAW",
+                    _imap_quote_gmail_raw_query(
+                        since_days=since_days,
+                        gmail_raw_query=gmail_raw_query,
+                    ),
+                )
+                _ensure_ok(status, "uid search", data)
+                ids = _extract_search_ids(data)
+            else:
+                since_date = (
+                    datetime.date.today() - datetime.timedelta(days=since_days)
+                ).strftime("%d-%b-%Y")
+                status, data = imap.search(None, "SINCE", since_date)
+                _ensure_ok(status, "search", data)
+                ids = _extract_search_ids(data)
 
             newest_ids = ids[-max_messages:] if max_messages else ids
 
             messages: list[MailMessage] = []
             for msg_id in newest_ids:
                 uid = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
-                status, fetch_data = imap.fetch(uid, "(RFC822)")
-                _ensure_ok(status, f"fetch for message {uid}", fetch_data)
+                if gmail_raw_query:
+                    status, fetch_data = imap.uid("FETCH", uid, "(RFC822)")
+                    _ensure_ok(status, f"uid fetch for message {uid}", fetch_data)
+                else:
+                    status, fetch_data = imap.fetch(uid, "(RFC822)")
+                    _ensure_ok(status, f"fetch for message {uid}", fetch_data)
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
                     raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")
@@ -211,10 +226,32 @@ def _extract_raw_bytes(fetch_data) -> bytes | None:
     return None
 
 
+def _imap_quote_gmail_raw_query(*, since_days: int, gmail_raw_query: str) -> str:
+    escaped = gmail_raw_query.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"newer_than:{since_days}d ({escaped})"'
+
+
+def _extract_search_ids(search_data) -> list[bytes | str]:
+    ids: list[bytes | str] = []
+    if search_data and search_data[0]:
+        raw_ids = search_data[0]
+        if isinstance(raw_ids, bytes):
+            ids = raw_ids.split()
+        else:
+            ids = raw_ids.split()
+    return ids
+
+
 class MailSource(Protocol):
     """Structural type for a mail source: anything with a matching .fetch()."""
 
-    def fetch(self, *, since_days: int, max_messages: int) -> list[MailMessage]:
+    def fetch(
+        self,
+        *,
+        since_days: int,
+        max_messages: int,
+        gmail_raw_query: str | None = None,
+    ) -> list[MailMessage]:
         ...
 
 
@@ -240,14 +277,23 @@ class GmailApiMailSource:
             build_service = build_gmail_service
         self._build_service = build_service
 
-    def fetch(self, *, since_days: int, max_messages: int) -> list[MailMessage]:
+    def fetch(
+        self,
+        *,
+        since_days: int,
+        max_messages: int,
+        gmail_raw_query: str | None = None,
+    ) -> list[MailMessage]:
         from applypilot.gmail_outcomes import _get_text_body
 
         service = self._build_service()
+        query = f"newer_than:{since_days}d"
+        if gmail_raw_query:
+            query = f"{query} ({gmail_raw_query})"
         resp = (
             service.users()
             .messages()
-            .list(userId="me", q=f"newer_than:{since_days}d", maxResults=max_messages)
+            .list(userId="me", q=query, maxResults=max_messages)
             .execute()
         )
 

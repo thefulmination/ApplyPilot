@@ -209,9 +209,10 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
     scan_calls = {}
 
     class _FakeSource:
-        def fetch(self, *, since_days, max_messages):
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
             fetch_calls["since_days"] = since_days
             fetch_calls["max_messages"] = max_messages
+            fetch_calls["gmail_raw_query"] = gmail_raw_query
             return ["sentinel-messages"]
 
     def _fake_scan(*, messages=None, service=None, minutes=10, max_messages=25):
@@ -259,6 +260,7 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
     assert n == 0
     assert scan_calls["messages"] == ["sentinel-messages"]
     assert fetch_calls["max_messages"] == 25
+    assert "verification" in fetch_calls["gmail_raw_query"]
 
 
 def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):
@@ -270,7 +272,7 @@ def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
 
     class _FakeSource:
-        def fetch(self, *, since_days, max_messages):
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
             return [
                 MailMessage(
                     id="m9", thread_id="t9", subject="Verify your email",
@@ -296,3 +298,56 @@ def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):
 
     assert got is not None
     assert got.value == "998877"
+
+
+def test_answer_pending_fetches_enough_mail_for_busy_inbox(fleet_db, monkeypatch):
+    """A busy inbox can push a real auth mail outside the newest 100 messages.
+
+    The relay must fetch a larger slice so the older-in-window OTP email is still
+    scanned and matched.
+    """
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+
+    now = dt.datetime.now(dt.timezone.utc)
+    auth_msg = MailMessage(
+        id="auth-1",
+        thread_id="auth-1",
+        subject="Your Greenhouse verification code",
+        sender="no-reply@greenhouse.io",
+        date=_rfc(now + dt.timedelta(seconds=1)),
+        body="Use verification code 445566 to continue your application.",
+    )
+    filler = [
+        MailMessage(
+            id=f"fill-{i}",
+            thread_id=f"fill-{i}",
+            subject="Status update",
+            sender="noreply@example.com",
+            date=_rfc(now + dt.timedelta(seconds=10 + i)),
+            body="Nothing to verify here.",
+        )
+        for i in range(119)
+    ]
+    mailbox = [auth_msg, *filler]
+
+    class _BusySource:
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
+            return mailbox[-max_messages:]
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _BusySource()
+    )
+
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.ensure_schema_v3(conn)
+        rid = otp_relay.request_code(
+            conn, worker_id="mac-0", job_url="j",
+            application_url="https://greenhouse.io/a",
+        )
+        n = otp_relay.answer_pending(conn)
+        assert n == 1
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+
+    assert got is not None
+    assert got.value == "445566"

@@ -60,6 +60,11 @@ VERIFY_WORDS = {
     "continue your application",
 }
 
+AUTH_GMAIL_RAW_QUERY = (
+    'verification OR verify OR code OR "one-time" OR "one time" '
+    'OR "confirm your email" OR "magic link"'
+)
+
 _CODE_RE = re.compile(r"(?<![A-Za-z0-9-])\d{4,8}(?![A-Za-z0-9-])")
 _ALNUM_CODE_RE = re.compile(
     r"(?<![A-Za-z0-9-])(?=[A-Za-z0-9]{6,12}(?![A-Za-z0-9-]))"
@@ -572,10 +577,7 @@ def scan_gmail_for_auth_codes(
 
     window_minutes = max(1, int(minutes))
     max_older_days = max(1, (window_minutes + 1439) // 1440)
-    query = (
-        f'newer_than:{max_older_days}d (verification OR verify OR code OR "one-time" '
-        f'OR "one time" OR "confirm your email" OR "magic link")'
-    )
+    query = f"newer_than:{max_older_days}d ({AUTH_GMAIL_RAW_QUERY})"
     gmail_messages = (
         service.users()
         .messages()
