@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1697,9 +1698,15 @@ def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
             try:
                 page.goto(url, wait_until="networkidle", timeout=30_000)
                 fields = discover_fields(page)
+                answer_fn = None
+                if not own:
+                    answer_fn = lambda *args, **kwargs: types.SimpleNamespace(
+                        verified=False, text="",
+                    )
                 plan = build_ashby_plan(
                     fields, profile=profile, resume_text=resume_text,
                     job={"site": job.get("site", ""), "title": job.get("title", "")},
+                    answer_fn=answer_fn,
                 )
                 if not plan.ready:
                     unmapped = list(plan.unmapped_required)

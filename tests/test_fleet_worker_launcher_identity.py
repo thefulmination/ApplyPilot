@@ -81,3 +81,13 @@ def test_worker_launcher_enables_greenhouse_shadow_and_defaults_submit_sentinel_
     assert "Test-Path -LiteralPath $greenhouseSubmitFlag" in script
     assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "1"' in script
     assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "0"' in script
+
+
+def test_worker_launcher_enables_ashby_shadow_and_defaults_submit_sentinel_off():
+    script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
+
+    assert '$env:APPLYPILOT_ASHBY_ADAPTER = "1"' in script
+    assert "ashby-submit.enabled" in script
+    assert "Test-Path -LiteralPath $ashbySubmitFlag" in script
+    assert '$env:APPLYPILOT_ASHBY_ADAPTER_SUBMIT = "1"' in script
+    assert '$env:APPLYPILOT_ASHBY_ADAPTER_SUBMIT = "0"' in script
