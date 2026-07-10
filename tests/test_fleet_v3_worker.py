@@ -254,6 +254,64 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
     }], approved_batch="batchA")
 
 
+@pytest.mark.parametrize(("preflight_status", "preflight_reason"), [
+    ("live", "gh_api_200"),
+    ("uncertain", "blocked_403"),
+    ("unexpected", "new_probe_state"),
+])
+def test_apply_preflight_non_dead_statuses_fall_through(
+    fleet_db, preflight_status, preflight_reason,
+):
+    queue_url = f"preflight-{preflight_status}"
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, queue_url, host="jobs.example")
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        f"w-{queue_url}",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job["url"]) or {
+            "run_status": "applied",
+            "est_cost_usd": 0.25,
+        },
+        preflight_fn=lambda url: (preflight_status, preflight_reason),
+    )
+
+    result = loop.run_once()
+
+    assert result["action"] == "applied"
+    assert calls == [queue_url]
+
+
+def test_apply_preflight_exception_falls_through(fleet_db):
+    queue_url = "preflight-timeout"
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, queue_url, host="jobs.example")
+
+    def timed_out(_url):
+        raise TimeoutError("probe timed out")
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-preflight-timeout",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job["url"]) or {
+            "run_status": "applied",
+            "est_cost_usd": 0.25,
+        },
+        preflight_fn=timed_out,
+    )
+
+    result = loop.run_once()
+
+    assert result["action"] == "applied"
+    assert calls == [queue_url]
+
+
 def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
     calls = []
     preflight_urls = []
