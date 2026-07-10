@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -68,7 +69,15 @@ def _acquire_request_lock(
     *,
     timeout_seconds: float = _REQUEST_LOCK_TIMEOUT_SECONDS,
 ) -> None:
-    deadline = time.monotonic() + timeout_seconds
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise ValueError("request lock timeout must be from 0 to 60 seconds")
+    if timeout_seconds < 0 or timeout_seconds > 60:
+        raise ValueError("request lock timeout must be from 0 to 60 seconds")
+    normalized_timeout = float(timeout_seconds)
+    if not math.isfinite(normalized_timeout):
+        raise ValueError("request lock timeout must be from 0 to 60 seconds")
+
+    deadline = time.monotonic() + normalized_timeout
     while True:
         with conn.cursor() as cur:
             cur.execute(

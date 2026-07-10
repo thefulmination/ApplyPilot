@@ -169,6 +169,65 @@ def test_request_lock_timeout_is_bounded_and_rolls_back(monkeypatch):
     assert all(0 < delay <= 0.05 for delay in sleeps)
 
 
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [
+        float("nan"), float("inf"), float("-inf"), -0.01, True, "1", None,
+        60.01, 10 ** 1000,
+    ],
+)
+def test_request_lock_rejects_invalid_timeout_before_cursor(timeout_seconds):
+    class _Conn:
+        def cursor(self):
+            raise AssertionError("cursor must not be opened for an invalid timeout")
+
+    with pytest.raises(ValueError):
+        otp_relay._acquire_request_lock(
+            _Conn(), 17, timeout_seconds=timeout_seconds,
+        )
+
+
+def test_request_lock_zero_timeout_attempts_once_then_times_out(monkeypatch):
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params):
+            assert "pg_try_advisory_xact_lock(%s)" in query
+            assert params == (17,)
+
+        def fetchone(self):
+            return {"acquired": False}
+
+    class _Conn:
+        attempts = 0
+        rollbacks = 0
+
+        def cursor(self):
+            self.attempts += 1
+            return _Cursor()
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = _Conn()
+    monkeypatch.setattr(otp_relay.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(
+        otp_relay.time,
+        "sleep",
+        lambda _seconds: pytest.fail("zero timeout must not sleep"),
+    )
+
+    with pytest.raises(TimeoutError, match="^timed out acquiring OTP request lock$"):
+        otp_relay._acquire_request_lock(conn, 17, timeout_seconds=0)
+
+    assert conn.attempts == 1
+    assert conn.rollbacks == 1
+
+
 def test_concurrent_request_code_calls_share_one_active_row(fleet_db):
     worker_id = "concurrent-worker"
     target = "https://greenhouse.io/concurrent"
