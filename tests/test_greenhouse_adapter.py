@@ -10,6 +10,7 @@ from applypilot.apply.greenhouse_adapter import (
     build_answer_plan,
     fetch_questions,
     parse_greenhouse_url,
+    resolve_greenhouse_url,
 )
 
 
@@ -62,6 +63,22 @@ def test_fetch_questions_hits_public_endpoint_and_returns_the_list():
 
 def test_fetch_questions_returns_empty_when_absent():
     assert fetch_questions("acme", "1", fetch=lambda u: {"id": 1}) == []
+
+
+def test_resolve_greenhouse_url_follows_supported_short_link():
+    final = "https://job-boards.greenhouse.io/acme/jobs/123"
+
+    assert resolve_greenhouse_url(
+        "https://grnh.se/example",
+        resolve=lambda url: final,
+    ) == final
+
+
+def test_resolve_greenhouse_url_rejects_non_greenhouse_redirect():
+    assert resolve_greenhouse_url(
+        "https://grnh.se/example",
+        resolve=lambda url: "https://example.com/jobs/123",
+    ) is None
 
 
 # --- build_answer_plan -----------------------------------------------------

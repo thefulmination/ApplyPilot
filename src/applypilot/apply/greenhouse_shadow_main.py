@@ -14,6 +14,7 @@ from applypilot.apply.greenhouse_adapter import (
     build_answer_plan,
     fetch_questions,
     parse_greenhouse_url,
+    resolve_greenhouse_url,
 )
 from applypilot.apply.pgqueue import connect
 
@@ -35,7 +36,8 @@ def _no_model_answer(*args, **kwargs):
 
 
 def inventory_url(url: str, *, profile: dict, fetch=None) -> ShadowInventory:
-    parsed = parse_greenhouse_url(url)
+    resolved_url = resolve_greenhouse_url(url)
+    parsed = parse_greenhouse_url(resolved_url or "")
     if not parsed:
         return ShadowInventory(url, None, None, 0, 0, [], False, "unsupported_url")
     board, job_id = parsed
@@ -49,7 +51,7 @@ def inventory_url(url: str, *, profile: dict, fetch=None) -> ShadowInventory:
             job={"site": board},
         )
         return ShadowInventory(
-            url=url,
+            url=resolved_url,
             board=board,
             job_id=job_id,
             question_count=len(questions),
@@ -59,7 +61,7 @@ def inventory_url(url: str, *, profile: dict, fetch=None) -> ShadowInventory:
         )
     except Exception as exc:
         return ShadowInventory(
-            url, board, job_id, 0, 0, [], False,
+            resolved_url, board, job_id, 0, 0, [], False,
             f"{type(exc).__name__}:{exc}",
         )
 

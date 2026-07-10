@@ -1438,7 +1438,10 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     loop's lease / canary / cost gates before we get here.
     """
     try:
-        from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
+        from applypilot.apply.greenhouse_adapter import (
+            parse_greenhouse_url,
+            resolve_greenhouse_url,
+        )
         from applypilot.apply.greenhouse_submit import (
             adapter_enabled,
             apply_greenhouse,
@@ -1449,6 +1452,7 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     if not adapter_enabled():
         return None
     url = job.get("application_url") or job.get("url") or ""
+    url = resolve_greenhouse_url(url) or url
     if not parse_greenhouse_url(url):
         return None
 

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import httpx
 
 _GH_HOSTS = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+_GH_SHORT_HOSTS = {"grnh.se"}
 _QUESTIONS_API = "https://boards-api.greenhouse.io/v1/boards/{board}/jobs/{job_id}?questions=true"
 
 
@@ -44,6 +45,32 @@ def parse_greenhouse_url(url: str) -> tuple[str, str] | None:
     if not token or not job_id:
         return None
     return (token, job_id)
+
+
+def resolve_greenhouse_url(url: str, *, resolve=None) -> str | None:
+    """Return a canonical hosted Greenhouse URL, following ``grnh.se`` once.
+
+    Direct hosted URLs are returned without network I/O. A short URL is useful
+    only when its final redirect is still a parseable Greenhouse job.
+    """
+    if parse_greenhouse_url(url):
+        return url
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except (TypeError, ValueError):
+        return None
+    if host not in _GH_SHORT_HOSTS:
+        return None
+    if resolve is None:
+        def resolve(value):
+            response = httpx.get(value, follow_redirects=True, timeout=20)
+            response.raise_for_status()
+            return str(response.url)
+    try:
+        final_url = str(resolve(url) or "")
+    except Exception:
+        return None
+    return final_url if parse_greenhouse_url(final_url) else None
 
 
 def _default_fetch(url: str) -> dict:
