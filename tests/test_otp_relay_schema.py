@@ -59,6 +59,26 @@ def test_otp_request_allows_multiple_null_matched_message_ids(fleet_db):
         conn.commit()
 
 
+def test_otp_active_wait_index_is_partial_and_migration_is_idempotent(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.ensure_schema_v3(conn)
+        fleet_schema.ensure_schema_v3(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE tablename='otp_request' AND indexname='idx_otp_active_wait'"
+            )
+            rows = cur.fetchall()
+
+    assert len(rows) == 1
+    indexdef = rows[0]["indexdef"]
+    assert "(expires_at, requested_at, wait_started_at)" in indexdef
+    assert "code IS NULL" in indexdef
+    assert "consumed_at IS NULL" in indexdef
+    assert "wait_started_at IS NOT NULL" in indexdef
+    assert "expires_at IS NOT NULL" in indexdef
+
+
 def test_otp_request_dml_roundtrip(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         fleet_schema.ensure_schema_v3(conn)

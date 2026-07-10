@@ -309,6 +309,12 @@ ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS wait_started_at TIMESTAMPTZ;
 -- The responder's pending-scan: unanswered, unconsumed requests.
 CREATE INDEX IF NOT EXISTS idx_otp_pending ON otp_request (requested_at)
     WHERE code IS NULL AND consumed_at IS NULL;
+-- DeadMan active-demand summary: skip expired/legacy history and cover all
+-- timestamps needed by the count/oldest-wait query without visiting those rows.
+CREATE INDEX IF NOT EXISTS idx_otp_active_wait
+    ON otp_request (expires_at, requested_at, wait_started_at)
+    WHERE code IS NULL AND consumed_at IS NULL
+      AND wait_started_at IS NOT NULL AND expires_at IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_matched_message_unique
     ON otp_request (matched_message_id) WHERE matched_message_id IS NOT NULL;
 

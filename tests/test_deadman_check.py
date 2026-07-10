@@ -638,6 +638,43 @@ def test_inactive_otp_rows_do_not_create_demand(fleet_db, requested_at, expires_
     assert "otp_delivery_stalled" not in _kinds(alerts)
 
 
+def test_active_otp_demand_uses_partial_index_with_large_expired_history(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO otp_request "
+                "(worker_id, requested_at, expires_at, wait_started_at) "
+                "SELECT 'expired-' || n, %s - interval '20 minutes', "
+                "%s - interval '1 second', %s - interval '19 minutes' "
+                "FROM generate_series(1, 5000) AS n",
+                (NOW, NOW, NOW),
+            )
+            _otp_request(
+                cur,
+                requested_at=NOW - dt.timedelta(minutes=2),
+                expires_at=NOW + dt.timedelta(minutes=3),
+                wait_started_at=NOW - dt.timedelta(seconds=45),
+            )
+            cur.execute("SET LOCAL enable_seqscan = off")
+            cur.execute(
+                "EXPLAIN (FORMAT JSON) "
+                "SELECT COUNT(*) AS pending_count, "
+                "MIN(wait_started_at) AS oldest_wait_started_at "
+                "FROM otp_request "
+                "WHERE code IS NULL AND consumed_at IS NULL "
+                "AND wait_started_at IS NOT NULL "
+                "AND requested_at <= %s AND expires_at > %s",
+                (NOW, NOW),
+            )
+            plan = cur.fetchone()["QUERY PLAN"]
+
+        pending_count, oldest = deadman._active_otp_demand(conn, NOW)
+
+    assert "idx_otp_active_wait" in str(plan)
+    assert pending_count == 1
+    assert oldest == NOW - dt.timedelta(seconds=45)
+
+
 @pytest.mark.parametrize(
     ("code", "consumed_at"),
     [("123456", None), (None, NOW - dt.timedelta(seconds=1))],
