@@ -152,6 +152,22 @@ def test_apply_attempts_schema_and_unresolved_index(fleet_db):
     assert "submitted_unverified" in indexdef
 
 
+def test_apply_attempts_schema_revokes_destructive_worker_privileges():
+    schema = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "applypilot"
+        / "fleet"
+        / "schema_v3.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker" in schema
+    assert (
+        "REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON apply_attempts FROM fleet_worker"
+        in schema
+    )
+
+
 def test_apply_worker_schema_check_passes_with_current_schema(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         fleet_schema.require_apply_result_event_schema(conn)

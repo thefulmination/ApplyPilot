@@ -660,6 +660,7 @@ CREATE INDEX IF NOT EXISTS idx_apply_attempts_url_created
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fleet_worker') THEN
         GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker;
+        REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON apply_attempts FROM fleet_worker;
     END IF;
 END $$;
 
