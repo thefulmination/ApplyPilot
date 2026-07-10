@@ -195,6 +195,8 @@ class WorkerLoop:
         role:          one of ``apply`` / ``compute`` / ``discovery``.
         apply_fn:      INJECTED. ``apply_fn(job) -> html`` (or a 4-tuple). Wraps
                        ``container_worker.run_job``. STUBBED in tests.
+        preflight_fn:  INJECTED read-only posting probe. ``url -> (status, reason)``;
+                       only ``status == 'dead'`` prevents apply execution.
         score_fn:      INJECTED. ``score_fn(job) -> (result_dict, cost_usd)``.
                        Wraps the LLM scorer/auditor. STUBBED in tests.
         search_fn:     INJECTED. ``search_fn(task) -> list[posting]``. Wraps
@@ -212,6 +214,7 @@ class WorkerLoop:
         home_ip: str,
         role: str,
         apply_fn: Optional[Callable[[dict], Any]] = None,
+        preflight_fn: Optional[Callable[[str], tuple[str, str]]] = None,
         score_fn: Optional[Callable[[dict], tuple]] = None,
         search_fn: Optional[Callable[[dict], list]] = None,
         classify_fn: Callable[..., str] = _captcha.classify,
@@ -230,6 +233,7 @@ class WorkerLoop:
         self.home_ip = home_ip
         self.role = role
         self.apply_fn = apply_fn
+        self.preflight_fn = preflight_fn
         self.score_fn = score_fn
         self.search_fn = search_fn
         self.classify_fn = classify_fn
@@ -464,6 +468,41 @@ class WorkerLoop:
         self._beat(conn, state="applying", current_job=url)
         if self.apply_fn is None:
             raise RuntimeError("apply role requires an injected apply_fn")
+
+        if self.preflight_fn is not None:
+            try:
+                preflight_status, preflight_reason = self.preflight_fn(
+                    job.get("application_url") or url
+                )
+            except Exception as exc:
+                preflight_status = "uncertain"
+                preflight_reason = f"probe_err:{type(exc).__name__}"
+            preflight_status = str(preflight_status or "").strip().lower() or "uncertain"
+            preflight_reason = str(preflight_reason or "")
+            if not preflight_reason.strip():
+                preflight_reason = "unknown"
+            preflight_reason = preflight_reason[:160]
+            if preflight_status == "dead":
+                queue.write_apply_result(
+                    conn,
+                    self.worker_id,
+                    url,
+                    status="failed",
+                    apply_status="expired",
+                    apply_error=f"preflight_{preflight_reason}"[:200],
+                    est_cost_usd=0.0,
+                    target_host=target_host,
+                    home_ip=self.home_ip,
+                    route="preflight",
+                    failure_class="preflight_dead",
+                    result_metadata={
+                        "preflight_status": "dead",
+                        "preflight_reason": preflight_reason,
+                    },
+                )
+                self._record_event(f"wrote apply preflight_dead {url} ({preflight_reason})")
+                self._beat(conn, state="idle")
+                return {"action": "preflight_dead", "url": url, "reason": preflight_reason}
 
         # Drive the real browser (STUBBED in tests) and classify the resulting page.
         out = self.apply_fn(job)

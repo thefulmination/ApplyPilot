@@ -254,6 +254,52 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
     }], approved_batch="batchA")
 
 
+def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "preflight-dead", host="jobs.example")
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-preflight-dead",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job) or {"run_status": "applied"},
+        preflight_fn=lambda url: ("dead", "http_404"),
+    )
+
+    result = loop.run_once()
+
+    assert result == {
+        "action": "preflight_dead",
+        "url": "preflight-dead",
+        "reason": "http_404",
+    }
+    assert calls == []
+    with pgqueue.connect(fleet_db) as conn:
+        row = conn.execute(
+            "SELECT status::text, apply_status, apply_error, est_cost_usd "
+            "FROM apply_queue WHERE url=%s",
+            ("preflight-dead",),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT route, failure_class, result_metadata "
+            "FROM apply_result_events WHERE url=%s ORDER BY id DESC LIMIT 1",
+            ("preflight-dead",),
+        ).fetchone()
+    assert row == {
+        "status": "failed",
+        "apply_status": "expired",
+        "apply_error": "preflight_http_404",
+        "est_cost_usd": 0,
+    }
+    assert event["route"] == "preflight"
+    assert event["failure_class"] == "preflight_dead"
+    assert event["result_metadata"] == {
+        "preflight_status": "dead",
+        "preflight_reason": "http_404",
+    }
+
+
 def test_worker_apply_visible_captcha_parks_and_raises_challenge(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_one_apply(conn, "a1")
