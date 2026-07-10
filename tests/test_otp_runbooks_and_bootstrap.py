@@ -25,3 +25,12 @@ def test_otp_relay_runbook_points_to_imap_app_password_secret():
 
     assert "gmail_app_password.json" in runbook
     assert "~/.applypilot/gmail_credentials.json" not in runbook
+
+
+def test_otp_relay_runbook_covers_mission_grade_verification():
+    runbook = (REPO / "docs" / "fleet-otp-relay-runbook.md").read_text(encoding="utf-8")
+
+    assert "matched_message_id" in runbook
+    assert "otp_delivery_stalled" in runbook
+    assert "X-GM-RAW" in runbook
+    assert "controlled end-to-end" in runbook
