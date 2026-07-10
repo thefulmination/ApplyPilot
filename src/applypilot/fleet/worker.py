@@ -376,6 +376,8 @@ class WorkerLoop:
                                      and the job was PARKED (NOT marked applied).
             ``skipped``           -- an apply wall that no human can solve (cf /
                                      invisible_block): closed as blocked.
+            ``lease_lost``        -- the lease-owner-guarded terminal write was
+                                     rejected because ownership was lost.
             ``idle``              -- nothing eligible to lease.
             ``paused``            -- a remote 'pause' is in effect: heartbeat only.
             ``stop``              -- a remote 'restart'/'drain' arrived: the caller
