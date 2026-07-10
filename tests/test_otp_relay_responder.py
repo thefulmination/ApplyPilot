@@ -1,6 +1,7 @@
 """Home responder: match Gmail codes to pending requests (time-based, single-assign)."""
 import datetime as dt
 
+import pytest
 from psycopg.pq import TransactionStatus
 
 from applypilot.apply import pgqueue
@@ -76,7 +77,7 @@ def test_stale_email_before_request_is_not_matched(fleet_db, monkeypatch):
     assert got is None
 
 
-def test_two_requests_get_distinct_codes_one_message_each(fleet_db, monkeypatch):
+def test_two_same_provider_requests_and_two_messages_fail_closed(fleet_db, monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
     matches = [
         _Match("mA", _rfc(now + dt.timedelta(seconds=20)), "111111"),
@@ -88,11 +89,164 @@ def test_two_requests_get_distinct_codes_one_message_each(fleet_db, monkeypatch)
         r1 = _pending(conn, worker_id="mac-0")
         r2 = _pending(conn, worker_id="m2-0")
         n = otp_relay.answer_pending(conn, _FakeGmail(matches))
-        assert n == 2
+        assert n == 0
         c1 = otp_relay.poll_for_code(conn, r1, timeout_seconds=1, poll_seconds=0.1)
         c2 = otp_relay.poll_for_code(conn, r2, timeout_seconds=1, poll_seconds=0.1)
-    vals = {c1.value, c2.value}
-    assert vals == {"111111", "222222"}  # distinct codes, no double-assignment
+    assert c1 is None
+    assert c2 is None
+
+
+def test_two_same_provider_requests_and_one_message_fail_closed(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("mA", _rfc(now + dt.timedelta(seconds=20)), "111111")]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kw: matches,
+    )
+
+    with _fresh(fleet_db) as conn:
+        r1 = _pending(conn, worker_id="same-provider-1")
+        r2 = _pending(conn, worker_id="same-provider-2")
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        assert otp_relay.poll_for_code(conn, r1, timeout_seconds=0) is None
+        assert otp_relay.poll_for_code(conn, r2, timeout_seconds=0) is None
+
+
+def test_different_provider_requests_get_matching_messages(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match("greenhouse-message", _rfc(now + dt.timedelta(seconds=20)), "111111"),
+        _Match(
+            "workday-message",
+            _rfc(now + dt.timedelta(seconds=40)),
+            "222222",
+            sender="Workday <no-reply@myworkday.com>",
+        ),
+    ]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kw: matches,
+    )
+
+    with _fresh(fleet_db) as conn:
+        greenhouse = _pending(conn, worker_id="provider-greenhouse")
+        workday = _pending(
+            conn,
+            worker_id="provider-workday",
+            domain="tenant.myworkdayjobs.com",
+        )
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 2
+        greenhouse_code = otp_relay.poll_for_code(conn, greenhouse, timeout_seconds=0)
+        workday_code = otp_relay.poll_for_code(conn, workday, timeout_seconds=0)
+
+    assert greenhouse_code is not None and greenhouse_code.value == "111111"
+    assert workday_code is not None and workday_code.value == "222222"
+
+
+def test_mixed_graph_assigns_only_mutual_unique_pair(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match("greenhouse-1", _rfc(now + dt.timedelta(seconds=10)), "111111"),
+        _Match("greenhouse-2", _rfc(now + dt.timedelta(seconds=20)), "222222"),
+        _Match(
+            "workday-1",
+            _rfc(now + dt.timedelta(seconds=30)),
+            "333333",
+            sender="Workday <no-reply@myworkday.com>",
+        ),
+    ]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kw: matches,
+    )
+
+    with _fresh(fleet_db) as conn:
+        greenhouse_1 = _pending(conn, worker_id="mixed-greenhouse-1")
+        greenhouse_2 = _pending(conn, worker_id="mixed-greenhouse-2")
+        workday = _pending(
+            conn,
+            worker_id="mixed-workday",
+            domain="tenant.myworkdayjobs.com",
+        )
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 1
+        assert otp_relay.poll_for_code(conn, greenhouse_1, timeout_seconds=0) is None
+        assert otp_relay.poll_for_code(conn, greenhouse_2, timeout_seconds=0) is None
+        workday_code = otp_relay.poll_for_code(conn, workday, timeout_seconds=0)
+
+    assert workday_code is not None and workday_code.value == "333333"
+
+
+def test_answer_pending_returns_without_scan_when_responder_lock_is_held(
+    fleet_db, monkeypatch,
+):
+    scanner_called = False
+
+    def fail_if_scanned(**_kwargs):
+        nonlocal scanner_called
+        scanner_called = True
+        raise AssertionError("mail scanner must not run without the responder lock")
+
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", fail_if_scanned,
+    )
+
+    with _fresh(fleet_db) as owner, _fresh(fleet_db) as contender:
+        _pending(contender, worker_id="lock-contender")
+        with owner.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(%s) AS acquired",
+                (otp_relay._responder_lock_key(),),
+            )
+            assert cur.fetchone()["acquired"] is True
+        owner.commit()
+
+        try:
+            assert otp_relay.answer_pending(contender, _FakeGmail([])) == 0
+            assert scanner_called is False
+        finally:
+            with owner.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_unlock(%s) AS released",
+                    (otp_relay._responder_lock_key(),),
+                )
+                assert cur.fetchone()["released"] is True
+            owner.commit()
+
+
+def test_answer_pending_releases_responder_lock_when_scanner_aborts_transaction(
+    fleet_db, monkeypatch,
+):
+    with _fresh(fleet_db) as first, _fresh(fleet_db) as second:
+        _pending(first, worker_id="lock-release")
+
+        def abort_scan(**_kwargs):
+            with first.cursor() as cur:
+                cur.execute("SELECT 1 / 0")
+
+        monkeypatch.setattr(
+            otp_relay.inbox_auth, "scan_gmail_for_auth_codes", abort_scan,
+        )
+
+        with pytest.raises(Exception, match="division by zero"):
+            otp_relay.answer_pending(first, _FakeGmail([]))
+
+        with second.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(%s) AS acquired",
+                (otp_relay._responder_lock_key(),),
+            )
+            assert cur.fetchone()["acquired"] is True
+            cur.execute(
+                "SELECT pg_advisory_unlock(%s) AS released",
+                (otp_relay._responder_lock_key(),),
+            )
+            assert cur.fetchone()["released"] is True
+        second.commit()
+
+
+def test_responder_lock_key_is_stable_signed_64_bit():
+    key = otp_relay._responder_lock_key()
+
+    assert -(2**63) <= key < 2**63
+    assert key == otp_relay._responder_lock_key()
+    assert key == 6115416092012062024
 
 
 def test_consumed_message_is_not_reused_in_later_responder_cycle(fleet_db, monkeypatch):
@@ -140,8 +294,12 @@ def test_answer_history_lookup_is_bounded_to_candidate_message_ids(monkeypatch):
             return False
 
         def execute(self, query, params=None):
-            queries.append((query, params))
-            if "SELECT id, requested_at, sender_hint" in query:
+            if "pg_try_advisory_lock" in query:
+                self.rows = [{"acquired": True}]
+            elif "pg_advisory_unlock" in query:
+                self.rows = []
+            elif "SELECT id, requested_at, sender_hint" in query:
+                queries.append((query, params))
                 assert "array_agg" not in query
                 assert "CROSS JOIN" not in query
                 self.rows = [{
@@ -150,6 +308,7 @@ def test_answer_history_lookup_is_bounded_to_candidate_message_ids(monkeypatch):
                     "sender_hint": "greenhouse.io",
                 }]
             elif "matched_message_id = ANY(%s)" in query:
+                queries.append((query, params))
                 candidate_ids = params[0]
                 assert set(candidate_ids) == {"candidate-1", "candidate-2"}
                 assert len(candidate_ids) == 2
@@ -164,11 +323,17 @@ def test_answer_history_lookup_is_bounded_to_candidate_message_ids(monkeypatch):
         def fetchall(self):
             return self.rows
 
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
     class _Conn:
         def cursor(self):
             return _Cursor()
 
         def commit(self):
+            pass
+
+        def rollback(self):
             pass
 
     monkeypatch.setattr(
@@ -191,7 +356,12 @@ def test_answer_with_no_candidates_skips_history_query(monkeypatch):
             return False
 
         def execute(self, query, params=None):
-            queries.append((query, params))
+            if "pg_try_advisory_lock" in query:
+                self._row = {"acquired": True}
+            elif "pg_advisory_unlock" in query:
+                self._row = None
+            else:
+                queries.append((query, params))
 
         def fetchall(self):
             return [{
@@ -200,11 +370,17 @@ def test_answer_with_no_candidates_skips_history_query(monkeypatch):
                 "sender_hint": "greenhouse.io",
             }]
 
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
     class _Conn:
         def cursor(self):
             return _Cursor()
 
         def commit(self):
+            pass
+
+        def rollback(self):
             pass
 
     monkeypatch.setattr(
@@ -316,7 +492,9 @@ def test_unique_violation_race_rolls_back_and_continues(fleet_db, monkeypatch):
     assert usable == 1
 
 
-def test_oldest_request_gets_earliest_code(fleet_db, monkeypatch):
+def test_same_provider_requests_do_not_use_arrival_order_to_disambiguate(
+    fleet_db, monkeypatch,
+):
     now = dt.datetime.now(dt.timezone.utc)
     matches = [
         _Match("mEarly", _rfc(now + dt.timedelta(seconds=20)), "111111"),
@@ -327,11 +505,11 @@ def test_oldest_request_gets_earliest_code(fleet_db, monkeypatch):
     with _fresh(fleet_db) as conn:
         r_old = _pending(conn, worker_id="mac-0")   # filed first
         r_new = _pending(conn, worker_id="m2-0")    # filed second
-        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 2
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
         c_old = otp_relay.poll_for_code(conn, r_old, timeout_seconds=1, poll_seconds=0.1)
         c_new = otp_relay.poll_for_code(conn, r_new, timeout_seconds=1, poll_seconds=0.1)
-    # oldest request gets the earliest code (nearest-in-time pairing)
-    assert c_old.value == "111111" and c_new.value == "222222"
+    assert c_old is None
+    assert c_new is None
 
 
 def test_answer_does_not_shorten_request_window(fleet_db, monkeypatch):

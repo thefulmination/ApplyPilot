@@ -57,10 +57,17 @@ def _validate_ttl_seconds(value) -> int:
     return ttl_seconds
 
 
-def _request_lock_key(worker_id: str, target: str) -> int:
-    identity = f"applypilot:otp_request:{worker_id}:{target}"
+def _advisory_lock_key(identity: str) -> int:
     digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def _request_lock_key(worker_id: str, target: str) -> int:
+    return _advisory_lock_key(f"applypilot:otp_request:{worker_id}:{target}")
+
+
+def _responder_lock_key() -> int:
+    return _advisory_lock_key("applypilot:otp_responder")
 
 
 def _acquire_request_lock(
@@ -206,14 +213,112 @@ def _answered_ttl_seconds(explicit: int | None) -> int:
     return _DEFAULT_ANSWERED_TTL_SECONDS
 
 
+def _eligible_for_request(request, match, received_at, skew_seconds: int) -> bool:
+    requested_at = request["requested_at"]
+    if requested_at.tzinfo is None:
+        requested_at = requested_at.replace(tzinfo=_dt.timezone.utc)
+    else:
+        requested_at = requested_at.astimezone(_dt.timezone.utc)
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=_dt.timezone.utc)
+    else:
+        received_at = received_at.astimezone(_dt.timezone.utc)
+    requested_floor = requested_at - _dt.timedelta(seconds=skew_seconds)
+    return (
+        received_at >= requested_floor
+        and _match_belongs_to_request(request.get("sender_hint"), match)
+    )
+
+
+def _unique_assignments(pending, parsed, used_ids, skew_seconds: int):
+    remaining_requests = {request["id"]: request for request in pending}
+    remaining_messages = {}
+    for match, received_at in parsed:
+        if match.message_id and match.message_id not in used_ids:
+            remaining_messages.setdefault(match.message_id, (match, received_at))
+
+    assigned = []
+    while remaining_requests and remaining_messages:
+        request_edges = {}
+        message_edges = {message_id: set() for message_id in remaining_messages}
+        for request_id, request in remaining_requests.items():
+            eligible_ids = {
+                message_id
+                for message_id, (match, received_at) in remaining_messages.items()
+                if _eligible_for_request(request, match, received_at, skew_seconds)
+            }
+            request_edges[request_id] = eligible_ids
+            for message_id in eligible_ids:
+                message_edges[message_id].add(request_id)
+
+        mutual_unique = []
+        for request_id, message_ids in request_edges.items():
+            if len(message_ids) != 1:
+                continue
+            message_id = next(iter(message_ids))
+            if len(message_edges[message_id]) == 1:
+                mutual_unique.append((request_id, message_id))
+        if not mutual_unique:
+            break
+
+        for request_id, message_id in mutual_unique:
+            request = remaining_requests.pop(request_id)
+            match, _received_at = remaining_messages.pop(message_id)
+            assigned.append((request, match))
+
+    return assigned
+
+
 def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
                    max_messages: int = _DEFAULT_SCAN_MAX_MESSAGES, skew_seconds: int = 60,
                    answered_ttl_seconds: int | None = None) -> int:
-    """Read Gmail ONCE and answer every pending request whose code arrived after it.
+    """Serialize mailbox scans and answer only unambiguous pending requests."""
+    lock_key = _responder_lock_key()
+    acquired = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(%s) AS acquired",
+                (lock_key,),
+            )
+            acquired = bool(cur.fetchone()["acquired"])
+        conn.commit()
+        if not acquired:
+            return 0
+        return _answer_pending_locked(
+            conn,
+            gmail_service,
+            window_minutes=window_minutes,
+            max_messages=max_messages,
+            skew_seconds=skew_seconds,
+            answered_ttl_seconds=answered_ttl_seconds,
+        )
+    except Exception:
+        if not acquired:
+            conn.rollback()
+        raise
+    finally:
+        if acquired:
+            conn.rollback()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+
+def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15,
+                           max_messages: int = _DEFAULT_SCAN_MAX_MESSAGES,
+                           skew_seconds: int = 60,
+                           answered_ttl_seconds: int | None = None) -> int:
+    """Read Gmail once while holding the responder session lock.
 
     Home box only (this is the sole function that touches Gmail). Time-based match:
-    a candidate fits a request when its email arrived >= requested_at - skew. Each
-    message_id is assigned to at most one request. The code is NEVER logged.
+    a candidate fits a request when its email arrived >= requested_at - skew and
+    belongs to the same provider. Ambiguous request/message components are left
+    unanswered. The code is NEVER logged.
 
     When `gmail_service` is None (the default), the mailbox is read via
     get_mail_source() (IMAP app-password, falling back to the legacy Gmail API);
@@ -255,10 +360,6 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
         reference_time=_dt.datetime.now(_dt.timezone.utc),
         skew_seconds=skew_seconds,
     )
-    # Oldest email first: pair each request (iterated oldest-first) with the EARLIEST
-    # eligible code, so request order maps to email-arrival order (spec: nearest
-    # received_at > requested_at). Newest-first would hand the oldest request the
-    # newest code and mis-pair concurrent same-window applies.
     parsed = [(m, _parse_email_dt(m.received_at)) for m in matches]
     parsed = [(m, ts) for (m, ts) in parsed if ts is not None and m.message_id]
     parsed.sort(key=lambda mt: mt[1])
@@ -275,20 +376,11 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
         used_messages = {row["matched_message_id"] for row in cur.fetchall()}
     conn.commit()
 
+    assignments = _unique_assignments(
+        pending, parsed, used_messages, skew_seconds,
+    )
     answered = 0
-    for req in pending:
-        req_floor = req["requested_at"] - _dt.timedelta(seconds=skew_seconds)
-        chosen = None
-        for m, ts in parsed:
-            if m.message_id in used_messages:
-                continue
-            if not _match_belongs_to_request(req.get("sender_hint"), m):
-                continue
-            if ts >= req_floor:
-                chosen = m
-                break
-        if chosen is None:
-            continue
+    for req, chosen in assignments:
         try:
             with conn.cursor() as cur:
                 cur.execute(

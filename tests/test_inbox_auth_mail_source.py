@@ -275,6 +275,7 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
     class _FakeCursor:
         def __init__(self, rows):
             self._rows = rows
+            self._row = None
 
         def __enter__(self):
             return self
@@ -282,8 +283,14 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def execute(self, *a, **kw):
-            pass
+        def execute(self, query, params=None):
+            if "pg_try_advisory_lock" in query:
+                self._row = {"acquired": True}
+            elif "pg_advisory_unlock" in query:
+                self._row = {"released": True}
+
+        def fetchone(self):
+            return self._row
 
         def fetchall(self):
             return self._rows
@@ -298,6 +305,9 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
         def commit(self):
             pass
 
+        def rollback(self):
+            pass
+
     pending_row = {"id": 1, "requested_at": dt.datetime.now(dt.timezone.utc)}
     conn = _FakeConn([pending_row])
 
@@ -307,6 +317,20 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
     assert scan_calls["messages"] == ["sentinel-messages"]
     assert fetch_calls["max_messages"] == 25
     assert "verification" in fetch_calls["gmail_raw_query"]
+
+
+def test_answer_pending_does_not_fetch_mail_without_pending_rows(fleet_db, monkeypatch):
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+
+    def fail_if_resolved():
+        raise AssertionError("mail source must not be resolved without pending rows")
+
+    monkeypatch.setattr("applypilot.mail_source.get_mail_source", fail_if_resolved)
+
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.ensure_schema_v3(conn)
+        assert otp_relay.answer_pending(conn) == 0
 
 
 def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):
