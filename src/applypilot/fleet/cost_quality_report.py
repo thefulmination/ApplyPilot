@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping
 
 
 TERMINAL_STATUSES = {"applied", "failed", "blocked", "crash_unconfirmed"}
+ROUTE_COST_PRECISION = 4
 
 
 @dataclass
@@ -197,8 +198,10 @@ def summarize_result_routes(
     by_route: dict[str, CountCost] = {}
     for row in rows:
         status = _status(_get(row, "status", "apply_status"))
-        route = str(_get(row, "route") or "unknown").strip().lower()
+        route = str(_get(row, "route") or "").strip().lower() or "unknown"
         cost = _money(_get(row, "cost_usd", "est_cost_usd"))
+        count_value = _get(row, "event_count")
+        event_count = int(count_value) if count_value is not None else 1
         is_applied = status == "applied"
         is_terminal = status in TERMINAL_STATUSES
         _add_count_cost(
@@ -207,7 +210,10 @@ def summarize_result_routes(
             cost=cost,
             is_applied=is_applied,
             is_terminal=is_terminal,
+            count=event_count,
         )
+    for item in by_route.values():
+        item.cost = round(item.cost, ROUTE_COST_PRECISION)
     return RouteSummary(available=available, by_route=dict(sorted(by_route.items())))
 
 
@@ -238,8 +244,16 @@ def fetch_fleet_result_event_rows(pg_dsn: str) -> tuple[list[dict], bool]:
         with psycopg.connect(pg_dsn, row_factory=dict_row) as conn:
             rows = conn.execute(
                 """
-                SELECT status, route, COALESCE(est_cost_usd, 0) AS est_cost_usd
+                SELECT
+                    LOWER(BTRIM(status::text)) AS status,
+                    COALESCE(
+                        NULLIF(LOWER(BTRIM(route)), ''),
+                        'unknown'
+                    ) AS route,
+                    COUNT(*) AS event_count,
+                    COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
                 FROM apply_result_events
+                GROUP BY 1, 2
                 """
             ).fetchall()
     except (errors.UndefinedColumn, errors.UndefinedTable):
@@ -401,11 +415,12 @@ def _add_count_cost(
     cost: float,
     is_applied: bool,
     is_terminal: bool,
+    count: int = 1,
 ) -> None:
     item = summary.setdefault(key, CountCost())
-    item.count += 1
-    item.applied += int(is_applied)
-    item.terminal += int(is_terminal)
+    item.count += count
+    item.applied += count * int(is_applied)
+    item.terminal += count * int(is_terminal)
     item.cost += cost
 
 

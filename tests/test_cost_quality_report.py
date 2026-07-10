@@ -186,6 +186,57 @@ def test_summarize_result_routes_can_report_pre_migration_unavailable():
     assert summary == RouteSummary(available=False)
 
 
+def test_summarize_result_routes_accepts_grouped_weighted_rows():
+    rows = [
+        {
+            "status": "applied",
+            "route": "agent",
+            "event_count": 3,
+            "est_cost_usd": Decimal("0.30"),
+        },
+        {
+            "status": "failed",
+            "route": "agent",
+            "event_count": 2,
+            "est_cost_usd": Decimal("0.20"),
+        },
+        {
+            "status": "crash_unconfirmed",
+            "route": "unknown",
+            "event_count": 4,
+            "est_cost_usd": Decimal("0.40"),
+        },
+    ]
+
+    summary = summarize_result_routes(rows)
+
+    assert summary.by_route["agent"].count == 5
+    assert summary.by_route["agent"].applied == 3
+    assert summary.by_route["agent"].terminal == 5
+    assert summary.by_route["agent"].cost == 0.5
+    assert summary.by_route["unknown"].count == 4
+    assert summary.by_route["unknown"].terminal == 4
+
+
+def test_summarize_result_routes_rounds_accumulated_cost_to_report_precision():
+    summary = summarize_result_routes(
+        [
+            {"status": "applied", "route": "agent", "cost_usd": 0.10},
+            {"status": "failed", "route": "agent", "cost_usd": 0.20},
+        ]
+    )
+
+    assert summary.by_route["agent"].cost == 0.30
+
+
+def test_summarize_result_routes_normalizes_whitespace_route_to_unknown():
+    summary = summarize_result_routes(
+        [{"status": "failed", "route": " \t ", "cost_usd": 0}]
+    )
+
+    assert summary.by_route["unknown"].count == 1
+
+
 class _FakeRows:
     def __init__(self, rows):
         self.rows = rows
@@ -198,6 +249,7 @@ class _FakeEventConnection:
     def __init__(self, rows=None, error=None):
         self.rows = rows or []
         self.error = error
+        self.executed_sql = None
 
     def __enter__(self):
         return self
@@ -205,7 +257,8 @@ class _FakeEventConnection:
     def __exit__(self, *_args):
         return False
 
-    def execute(self, _sql):
+    def execute(self, sql):
+        self.executed_sql = sql
         if self.error is not None:
             raise self.error
         return _FakeRows(self.rows)
@@ -215,14 +268,22 @@ def test_fetch_fleet_result_event_rows_returns_rows(monkeypatch):
     expected = {
         "status": "applied",
         "route": "agent",
+        "event_count": 2,
         "est_cost_usd": Decimal("0.80"),
     }
+    connection = _FakeEventConnection([expected])
     monkeypatch.setattr(
         "psycopg.connect",
-        lambda *_args, **_kwargs: _FakeEventConnection([expected]),
+        lambda *_args, **_kwargs: connection,
     )
 
     assert fetch_fleet_result_event_rows("dsn") == ([expected], True)
+    sql = " ".join(connection.executed_sql.lower().split())
+    assert "lower(btrim(status::text)) as status" in sql
+    assert "nullif(lower(btrim(route)), '')" in sql
+    assert "count(*) as event_count" in sql
+    assert "sum(est_cost_usd)" in sql
+    assert "group by 1, 2" in sql
 
 
 def test_fetch_fleet_result_event_rows_tolerates_missing_route_column(monkeypatch):
