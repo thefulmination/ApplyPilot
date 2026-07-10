@@ -51,6 +51,35 @@ _SUCCESS_MARKERS = (
     "successfully submitted",
 )
 
+_POST_SUBMIT_SETTLED = """() => {
+    const text = (document.body?.innerText || '').toLowerCase();
+    const path = window.location.pathname.toLowerCase();
+    return path.includes('/confirmation') || path.includes('/thank') ||
+        path.includes('/submitted') ||
+        text.includes('thank you for applying') ||
+        text.includes('thanks for applying') ||
+        text.includes('application received') ||
+        text.includes('application submitted') ||
+        text.includes('your application has been submitted') ||
+        text.includes("we've received your application") ||
+        text.includes('we have received your application') ||
+        text.includes('successfully submitted') ||
+        text.includes('please correct') || text.includes('errors below') ||
+        text.includes('field is required');
+}"""
+
+
+def _wait_for_submission_settlement(page, *, timeout_ms: int = 15_000) -> None:
+    """Wait for Greenhouse's async POST to produce success or validation UI."""
+    wait_for_function = getattr(page, "wait_for_function", None)
+    if wait_for_function is None:
+        return
+    try:
+        wait_for_function(_POST_SUBMIT_SETTLED, timeout=timeout_ms)
+    except Exception:
+        # The independent verifier below remains fail-closed on timeout/browser errors.
+        pass
+
 
 def _page_content(page) -> str:
     try:
@@ -279,6 +308,7 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
               "report": report, "ready": True,
               "attempt_context": attempt_context}
     if report.submitted:
+        _wait_for_submission_settlement(page)
         verification = (verify_fn or verify_greenhouse_submission)(page)
         result["verification_status"] = verification.status
         result["verification_method"] = verification.method

@@ -368,6 +368,27 @@ def test_apply_greenhouse_owns_submit_and_reports_applied_on_confirmation():
     assert res["status"] == "applied"
 
 
+def test_apply_greenhouse_waits_for_async_confirmation_before_verifying():
+    class DelayedConfirmationPage(FakePage):
+        def wait_for_function(self, expression, *, timeout):
+            self.calls.append(("wait_for_function", timeout))
+            self.url = "https://job-boards.greenhouse.io/acme/jobs/123/confirmation"
+            self.set_content("Thank you for applying. Your application has been received.")
+
+    page = DelayedConfirmationPage()
+    page.set_content("<form>Application form</form>")
+
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
+    )
+
+    assert ("wait_for_function", 15_000) in page.calls
+    assert res["status"] == "applied"
+    assert res["verification_status"] == "verified"
+
+
 def test_apply_greenhouse_quarantines_when_success_not_seen_after_submit():
     page = FakePage()
     page.set_content("<form>Application form</form>")
