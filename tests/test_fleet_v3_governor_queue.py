@@ -265,6 +265,44 @@ def test_write_apply_result_records_llm_usage_cost(fleet_db):
         assert float(row["cost_usd"]) == 0.42
 
 
+def test_retry_preserves_challenge_cost_in_cumulative_spend(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "cost-retry", host="greenhouse.io", company="Gamma", title="Analyst")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        assert queue.park_challenge(conn, "w1", a["url"])
+        assert queue.record_apply_challenge_event(
+            conn,
+            "w1",
+            a["url"],
+            kind="email_otp",
+            target_host="greenhouse.io",
+            home_ip="1.2.3.4",
+            est_cost_usd=0.5821,
+        )
+        assert queue.resolve_challenge(conn, a["url"], requeue=True)
+
+        retried = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        assert retried["url"] == a["url"]
+        assert queue.write_apply_result(
+            conn,
+            "w1",
+            a["url"],
+            status="applied",
+            target_host="greenhouse.io",
+            home_ip="1.2.3.4",
+            est_cost_usd=0,
+        )
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT est_cost_usd, cumulative_cost_usd FROM apply_queue WHERE url=%s",
+                (a["url"],),
+            )
+            row = cur.fetchone()
+        assert float(row["est_cost_usd"]) == 0
+        assert float(row["cumulative_cost_usd"]) == 0.5821
+
+
 def test_write_apply_result_records_model_and_duration(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "evidence1", host="ashbyhq.com", company="Epsilon", title="Staff Engineer")

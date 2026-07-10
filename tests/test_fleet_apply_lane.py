@@ -82,7 +82,10 @@ def test_lease_blocked_when_spend_cap_breached(fleet_db):
     from applypilot.fleet import queue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         _seed_approved_apply_rows(conn, 1)
-        cur.execute("UPDATE apply_queue SET est_cost_usd = 5.0 WHERE url='u0'")  # already-spent row
+        cur.execute(
+            "UPDATE apply_queue SET est_cost_usd = 5.0, cumulative_cost_usd = 5.0 "
+            "WHERE url='u0'"
+        )  # already-spent row
         # add a second leasable row so the SUM (5.0) is what blocks, not an empty queue
         cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
                     "VALUES ('u1','http://acme.com/1','8','queued','ats','b1','dk1','acme.com')")

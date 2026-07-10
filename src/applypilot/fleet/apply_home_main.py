@@ -284,7 +284,7 @@ def _print_status(conn) -> None:
         depth = {r["status"]: r["n"] for r in cur.fetchall()}
         cur.execute("SELECT paused, canary_enabled, canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1")
         cfg = cur.fetchone()
-        cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM apply_queue")
+        cur.execute("SELECT COALESCE(SUM(cumulative_cost_usd),0) AS s FROM apply_queue")
         spend = float(cur.fetchone()["s"])
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
         open_ch = cur.fetchone()["n"]

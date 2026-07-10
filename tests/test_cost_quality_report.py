@@ -287,6 +287,16 @@ def test_fetch_fleet_result_event_rows_returns_rows(monkeypatch):
     assert "group by 1, 2" in sql
 
 
+def test_fetch_fleet_queue_rows_uses_cumulative_spend(monkeypatch):
+    connection = _FakeEventConnection([])
+    monkeypatch.setattr("psycopg.connect", lambda *_args, **_kwargs: connection)
+
+    cost_quality_report.fetch_fleet_queue_rows("dsn")
+
+    sql = " ".join(connection.executed_sql.lower().split())
+    assert "coalesce(cumulative_cost_usd, 0) as est_cost_usd" in sql
+
+
 def test_fetch_fleet_result_event_rows_tolerates_missing_route_column(monkeypatch):
     from psycopg import errors
 

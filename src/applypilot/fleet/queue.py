@@ -52,7 +52,7 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_
          AND NOT COALESCE(cfg.ats_paused, FALSE)
          AND (NOT COALESCE(cfg.canary_enabled, FALSE) OR cfg.canary_remaining > 0)
          AND (COALESCE(cfg.spend_cap_usd, 0) <= 0
-              OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
+              OR (SELECT COALESCE(SUM(cumulative_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
          AND (glob.count_24h IS NULL OR glob.count_24h < glob.daily_cap)
          AND COALESCE(home.breaker_state, 'ok') != 'demoted'
          AND COALESCE(NOT (home.breaker_state = 'paused' AND COALESCE(home.breaker_until, 'infinity'::timestamptz) >= now()), TRUE)
@@ -183,12 +183,14 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
              if status == "applied" else ", last_attempt_at = now()")
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, "
+            "est_cost_usd=COALESCE(%s,0), "
+            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+COALESCE(%s,0), "
             "agent_model=%s, apply_duration_ms=%s, "
             "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
             "WHERE url=%s AND lease_owner=%s",
             (
-                status, apply_status, apply_error, est_cost_usd,
+                status, apply_status, apply_error, est_cost_usd, est_cost_usd,
                 agent_model, apply_duration_ms,
                 status, worker_id, url, worker_id,
             ),
@@ -289,9 +291,10 @@ def record_apply_challenge_event(
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE apply_queue SET est_cost_usd=COALESCE(est_cost_usd,0)+%s, "
+            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+%s, "
             "agent_model=COALESCE(%s,agent_model), worker_id=%s, updated_at=now() "
             "WHERE url=%s AND lease_owner=%s AND status='leased'",
-            (cost, agent_model, worker_id, url, worker_id),
+            (cost, cost, agent_model, worker_id, url, worker_id),
         )
         if cur.rowcount == 0:
             if commit:
@@ -749,11 +752,14 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
         outcome = {"applied": "success", "blocked": "block", "captcha": "captcha"}.get(status)
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE linkedin_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "UPDATE linkedin_queue SET status=%s, apply_status=%s, apply_error=%s, "
+            "est_cost_usd=COALESCE(%s,0), "
+            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+COALESCE(%s,0), "
             "apply_channel=COALESCE(%s, apply_channel), apply_external_host=COALESCE(%s, apply_external_host), "
             "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
             "WHERE url=%s AND lease_owner=%s",
-            (status, apply_status, apply_error, est_cost_usd, apply_channel, apply_external_host,
+            (status, apply_status, apply_error, est_cost_usd, est_cost_usd,
+             apply_channel, apply_external_host,
              status, worker_id, url, worker_id),
         )
         if cur.rowcount == 0:

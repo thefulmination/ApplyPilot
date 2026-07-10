@@ -106,8 +106,37 @@ def test_apply_queue_v3_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='apply_queue'")
         cols = {r["column_name"] for r in cur.fetchall()}
-    for c in ("worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch"):
+    for c in (
+        "worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch",
+        "cumulative_cost_usd",
+    ):
         assert c in cols, f"apply_queue missing {c}"
+
+
+def test_v3_schema_backfills_cumulative_cost_from_latest_or_events(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, est_cost_usd, cumulative_cost_usd) "
+            "VALUES ('legacy-latest', 'legacy-latest', 1, 1.25, 0), "
+            "('legacy-events', 'legacy-events', 1, 0, 0)"
+        )
+        cur.execute(
+            "INSERT INTO apply_result_events (url, est_cost_usd) "
+            "VALUES ('legacy-latest', 0.25), ('legacy-events', 0.40), "
+            "('legacy-events', 0.35)"
+        )
+        conn.commit()
+
+        fleet_schema.ensure_schema_v3(conn)
+
+        cur.execute(
+            "SELECT url, cumulative_cost_usd FROM apply_queue "
+            "WHERE url LIKE 'legacy-%%' ORDER BY url"
+        )
+        rows = {row["url"]: float(row["cumulative_cost_usd"]) for row in cur.fetchall()}
+
+    assert rows == {"legacy-events": 0.75, "legacy-latest": 1.25}
 
 
 def test_apply_result_events_include_cost_router_metadata(fleet_db):

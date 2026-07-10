@@ -229,7 +229,7 @@ def fetch_fleet_queue_rows(pg_dsn: str) -> list[dict]:
                 status::text AS status,
                 apply_error,
                 application_url,
-                COALESCE(est_cost_usd, 0) AS est_cost_usd
+                COALESCE(cumulative_cost_usd, 0) AS est_cost_usd
             FROM apply_queue
             """
         ).fetchall()

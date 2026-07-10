@@ -49,6 +49,7 @@ _APPLY_ATTEMPT_REQUIRED_COLUMNS = frozenset({
     "evidence",
     "created_at",
 })
+_APPLY_QUEUE_COST_REQUIRED_COLUMNS = frozenset({"cumulative_cost_usd"})
 
 
 def ensure_schema_v3(conn) -> None:
@@ -91,6 +92,27 @@ def require_apply_result_event_schema(conn) -> None:
         raise RuntimeError(
             "fleet schema is missing apply_result_events columns: "
             + ", ".join(missing)
+            + "; run applypilot-fleet-apply-home with the owner/home DSN once to migrate "
+            "before starting remote apply workers"
+        )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'apply_queue'"
+        )
+        queue_cols = {
+            row["column_name"] if hasattr(row, "get") else row[0]
+            for row in cur.fetchall()
+        }
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    missing_queue = sorted(_APPLY_QUEUE_COST_REQUIRED_COLUMNS - queue_cols)
+    if missing_queue:
+        raise RuntimeError(
+            "fleet schema is missing apply_queue columns: "
+            + ", ".join(missing_queue)
             + "; run applypilot-fleet-apply-home with the owner/home DSN once to migrate "
             "before starting remote apply workers"
         )

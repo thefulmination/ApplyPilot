@@ -704,6 +704,27 @@ ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS final_result_source TEX
 CREATE INDEX IF NOT EXISTS idx_apply_result_events_url_created
     ON apply_result_events (queue_name, url, created_at DESC);
 
+-- Preserve all-in spend across retries. est_cost_usd remains the latest/current
+-- attempt value for diagnostics; cumulative_cost_usd is the cap/reporting ledger.
+ALTER TABLE apply_queue
+    ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
+UPDATE apply_queue q
+SET cumulative_cost_usd = GREATEST(
+    COALESCE(q.cumulative_cost_usd, 0),
+    COALESCE(q.est_cost_usd, 0),
+    COALESCE((
+        SELECT SUM(e.est_cost_usd)
+        FROM apply_result_events e
+        WHERE e.queue_name = 'apply_queue' AND e.url = q.url
+    ), 0)
+);
+ALTER TABLE linkedin_queue
+    ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
+UPDATE linkedin_queue
+SET cumulative_cost_usd = GREATEST(
+    COALESCE(cumulative_cost_usd, 0), COALESCE(est_cost_usd, 0)
+);
+
 -- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on
 -- the diagnosis row, so a Reverse / audit can report exactly which/how-many rows were affected,
 -- how many prior incidents, and how broad the block was -- without re-deriving from transient state.
