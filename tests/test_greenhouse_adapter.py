@@ -71,6 +71,7 @@ PROFILE = {
         "full_name": "Jordan Rivera", "email": "jordan@example.com",
         "phone": "5551234567", "city": "Jersey City",
         "province_state": "NJ", "country": "USA",
+        "preferred_name": "Jordy", "linkedin_url": "https://linkedin.com/in/jordan",
     },
     "work_authorization": {"legally_authorized_to_work": "Yes", "require_sponsorship": "No"},
 }
@@ -125,6 +126,21 @@ def test_identity_only_job_is_ready():
     plan = _plan()
     assert plan.ready is True
     assert plan.unmapped_required == []
+
+
+def test_maps_profile_backed_custom_text_questions():
+    q = [
+        {"required": True, "label": "Preferred First Name",
+         "fields": [{"name": "question_1", "type": "input_text"}]},
+        {"required": True, "label": "LinkedIn Profile",
+         "fields": [{"name": "question_2", "type": "input_text"}]},
+    ]
+
+    plan = _plan(q)
+
+    assert plan.fields["question_1"] == "Jordy"
+    assert plan.fields["question_2"] == "https://linkedin.com/in/jordan"
+    assert plan.ready is True
 
 
 def test_free_text_question_goes_through_the_answerer():

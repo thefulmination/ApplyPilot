@@ -169,6 +169,29 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     mapped = True
                 continue
 
+            # Custom Greenhouse questions often use opaque names such as
+            # question_123 even when the answer already exists in the profile.
+            # Map only high-confidence labels; ambiguous questions still fall
+            # through to the answerer or unmapped-required guard.
+            if ftype == "input_text":
+                value = None
+                if "preferred" in low and "name" in low:
+                    value = personal.get("preferred_name") or first
+                elif "linkedin" in low:
+                    value = personal.get("linkedin_url")
+                elif "github" in low:
+                    value = personal.get("github_url")
+                elif "portfolio" in low:
+                    value = personal.get("portfolio_url")
+                elif "website" in low:
+                    value = personal.get("website_url")
+                elif "postal" in low or "zip code" in low:
+                    value = personal.get("postal_code")
+                if value:
+                    fields[name] = value
+                    mapped = True
+                continue
+
             # Greenhouse offers resume/cover-letter as a paste TEXTAREA too
             # (name resume_text / cover_letter_text). These are documents, not
             # questions -- fill the resume verbatim, never send them to the
