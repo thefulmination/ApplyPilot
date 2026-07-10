@@ -51,22 +51,75 @@ Register persistent startup once:
 .\register-otp-responder-startup.ps1
 ```
 
-For a deployment restart, use the existing responder launcher. It removes stale
-responder instances scoped to this checkout before starting the replacement; it
-does not restart apply, discovery, doctor, or watchdog processes.
+For a deployment restart, preserve the persistent `-Supervise` launcher. If its
+child is running, stop only that child and let the supervisor relaunch it. If no
+supervisor exists for this checkout, start the existing launcher in supervised
+mode. Never stop the supervisor.
 
 ```powershell
-.\run-otp-responder.ps1
-Start-Sleep -Seconds 8
+$Launcher = (Resolve-Path -LiteralPath ".\run-otp-responder.ps1").Path
+$ExpectedResponderExe = (
+    Resolve-Path -LiteralPath ".\.conda-env\Scripts\applypilot-fleet-otp-home.exe"
+).Path
+
+$Supervisor = @(
+    Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $_.CommandLine -and
+        $_.CommandLine.IndexOf($Launcher, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $_.CommandLine -match '(?i)(?:^|\s)-Supervise(?:\s|$)'
+    }
+)
+if ($Supervisor.Count -gt 1) {
+    throw "Multiple OTP supervisors exist for this checkout; resolve before restart."
+}
+
+if ($Supervisor.Count -eq 1) {
+    Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $_.ExecutablePath -and
+        $_.ExecutablePath -eq $ExpectedResponderExe
+    } | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+    }
+} else {
+    $LauncherArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-WindowStyle", "Hidden",
+        "-File", ('"{0}"' -f $Launcher),
+        "-Supervise"
+    )
+    Start-Process -FilePath "powershell.exe" -WindowStyle Hidden `
+        -WorkingDirectory $PWD.Path -ArgumentList $LauncherArguments | Out-Null
+}
+
+$RestartDeadline = (Get-Date).AddSeconds(45)
+do {
+    Start-Sleep -Seconds 1
+    $ResponderCount = @(
+        Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $_.ExecutablePath -and
+            $_.ExecutablePath -eq $ExpectedResponderExe
+        }
+    ).Count
+} while ($ResponderCount -ne 1 -and (Get-Date) -lt $RestartDeadline)
+
+if ($ResponderCount -ne 1) {
+    throw "Expected exactly one production-checkout OTP responder after restart."
+}
+Write-Output "responder_process_count=$ResponderCount"
 ```
 
 Verify exactly one responder executable and a fresh heartbeat without printing
 command lines or connection details:
 
 ```powershell
+$ExpectedResponderExe = (
+    Resolve-Path -LiteralPath ".\.conda-env\Scripts\applypilot-fleet-otp-home.exe"
+).Path
 $ResponderCount = @(
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "applypilot-fleet-otp-home.exe"
+    Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $_.ExecutablePath -and
+        $_.ExecutablePath -eq $ExpectedResponderExe
     }
 ).Count
 Write-Output "responder_process_count=$ResponderCount"
@@ -180,29 +233,43 @@ Do not synthesize a database answer: the controlled end-to-end check must prove
 the mailbox path.
 
 1. Confirm the schema, process count, heartbeat, and `X-GM-RAW` canary above.
-2. Set a unique non-secret worker label and capture the start time.
+2. Generate a GUID-suffixed non-secret worker label and capture the start time.
 3. Run one headed, supervised application with relay auth enabled. The worker
    creates one request, waits for the responder answer, atomically consumes it,
    clears the secret value, and performs at most one assisted retry.
 
 ```powershell
-$ControlledUrl = Read-Host "Controlled application URL"
-$env:FLEET_WORKER_ID = "otp-e2e-home"
-$env:APPLYPILOT_INBOX_AUTH = "1"
-$env:APPLYPILOT_INBOX_AUTH_MODE = "relay"
-$env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
-$env:OTP_E2E_STARTED_AT = (Get-Date).ToUniversalTime().ToString("o")
-.\run-applypilot.ps1 apply --url $ControlledUrl --inbox-auth --workers 1
-```
+& {
+    $EnvironmentNames = @(
+        "FLEET_WORKER_ID",
+        "APPLYPILOT_INBOX_AUTH",
+        "APPLYPILOT_INBOX_AUTH_MODE",
+        "FLEET_PG_DSN",
+        "OTP_E2E_STARTED_AT"
+    )
+    $PreviousEnvironment = @{}
+    foreach ($Name in $EnvironmentNames) {
+        $Existing = Get-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+        $PreviousEnvironment[$Name] = [pscustomobject]@{
+            Existed = $null -ne $Existing
+            Value = if ($null -ne $Existing) { $Existing.Value } else { $null }
+        }
+    }
 
-Observe that the one assisted retry reaches a terminal result: submitted, or the
-expected bounded controlled failure. Do not infer this from a mailbox match alone
-and do not paste agent output if it contains prohibited material.
+    try {
+        $ControlledUrl = Read-Host "Controlled application URL"
+        $TestWorkerId = "otp-e2e-home-$([guid]::NewGuid().ToString('N'))"
+        $env:FLEET_WORKER_ID = $TestWorkerId
+        $env:APPLYPILOT_INBOX_AUTH = "1"
+        $env:APPLYPILOT_INBOX_AUTH_MODE = "relay"
+        $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+        $env:OTP_E2E_STARTED_AT = (Get-Date).ToUniversalTime().ToString("o")
 
-Run the lifecycle proof immediately afterward. It emits only required booleans:
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File ".\run-applypilot.ps1" apply --url $ControlledUrl `
+            --inbox-auth --workers 1
 
-```powershell
-@'
+        @'
 import datetime as dt
 import os
 
@@ -230,18 +297,15 @@ for key in (
 ):
     print(f"{key}={'yes' if bool(facts[key]) else 'no'}")
 '@ | .\.conda-env\python.exe -
-```
 
-After confirming the worker's terminal result, record only:
+        $TerminalResult = Read-Host `
+            "Did exactly one assisted retry reach a terminal result? Enter yes or no"
+        $TerminalPassed = $TerminalResult.Trim().ToLowerInvariant() -eq "yes"
+        Write-Output (
+            "assisted_retry_terminal=" + $(if ($TerminalPassed) { "yes" } else { "no" })
+        )
 
-```text
-assisted_retry_terminal=yes
-```
-
-Finally, check for OTP-specific DeadMan alerts without printing alert details:
-
-```powershell
-@'
+        @'
 import datetime as dt
 
 from applypilot.apply import pgqueue
@@ -258,7 +322,28 @@ with pgqueue.connect(dsn) as conn:
 otp_alerts = [a for a in alerts if a.kind in {"otp_relay_down", "otp_delivery_stalled"}]
 print(f"deadman_otp_alerts={len(otp_alerts)}")
 '@ | .\.conda-env\python.exe -
+    }
+    finally {
+        foreach ($Name in $EnvironmentNames) {
+            $Prior = $PreviousEnvironment[$Name]
+            if ($Prior.Existed) {
+                [Environment]::SetEnvironmentVariable($Name, $Prior.Value, "Process")
+            } else {
+                Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
 ```
+
+The outer script block keeps the URL, GUID worker ID, and timestamp local. Its
+`finally` restores prior environment values or removes newly introduced values,
+even if the apply command or a verification command fails. The apply wrapper runs
+in a child PowerShell process, so its own environment setup cannot remain active
+in the operator shell. Observe that exactly one assisted retry reaches a terminal
+result: submitted, or the expected bounded controlled failure. Do not infer this
+from a mailbox match alone and do not paste agent output if it contains prohibited
+material.
 
 Acceptance requires these exact non-secret facts:
 
