@@ -8,6 +8,7 @@ is read only by ``answer_pending`` (home box). See the 2026-07-03 relay spec."""
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from applypilot import inbox_auth
 
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
 _DEFAULT_SCAN_MAX_MESSAGES = 1000
+_REQUEST_LOCK_TIMEOUT_SECONDS = 5.0
+_REQUEST_LOCK_RETRY_SECONDS = 0.05
 
 @dataclass(frozen=True)
 class RelayCode:
@@ -35,21 +38,64 @@ def _match_belongs_to_request(sender_hint: str | None, match) -> bool:
     return inbox_auth.match_belongs_to_provider(match, sender_hint)
 
 
+def _validate_ttl_seconds(value) -> int:
+    if isinstance(value, bool):
+        raise ValueError("ttl_seconds must be an integer from 1 to 86400")
+    if isinstance(value, int):
+        ttl_seconds = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        digits = raw[1:] if raw[:1] in ("+", "-") else raw
+        if not digits.isdigit():
+            raise ValueError("ttl_seconds must be an integer from 1 to 86400")
+        ttl_seconds = int(raw)
+    else:
+        raise ValueError("ttl_seconds must be an integer from 1 to 86400")
+    if not 1 <= ttl_seconds <= 86400:
+        raise ValueError("ttl_seconds must be an integer from 1 to 86400")
+    return ttl_seconds
+
+
+def _request_lock_key(worker_id: str, target: str) -> int:
+    identity = f"applypilot:otp_request:{worker_id}:{target}"
+    digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def _acquire_request_lock(
+    conn,
+    lock_key: int,
+    *,
+    timeout_seconds: float = _REQUEST_LOCK_TIMEOUT_SECONDS,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_xact_lock(%s) AS acquired",
+                (lock_key,),
+            )
+            if cur.fetchone()["acquired"]:
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            conn.rollback()
+            raise TimeoutError("timed out acquiring OTP request lock")
+        time.sleep(min(_REQUEST_LOCK_RETRY_SECONDS, remaining))
+
+
 def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
                  ttl_seconds: int = 300) -> int:
     """Return the active request row's id after serializing concurrent duplicates.
 
     Requests for the same worker and target serialize under a transaction advisory lock.
     """
+    ttl_seconds = _validate_ttl_seconds(ttl_seconds)
     target = application_url or job_url
-    lock_key = f"applypilot:otp_request:{worker_id}:{target}"
+    _acquire_request_lock(conn, _request_lock_key(worker_id, target))
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT pg_advisory_xact_lock(hashtext(%s))",
-            (lock_key,),
-        )
-        cur.execute(
-            "SELECT id FROM otp_request "
+            "SELECT id, code FROM otp_request "
             "WHERE worker_id=%s AND url=%s AND consumed_at IS NULL "
             "      AND (expires_at IS NULL OR expires_at > now()) "
             "ORDER BY requested_at DESC, id DESC LIMIT 1",
@@ -58,12 +104,13 @@ def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
         active = cur.fetchone()
         if active:
             rid = active["id"]
-            cur.execute(
-                "UPDATE otp_request "
-                "SET expires_at=GREATEST(expires_at, now() + make_interval(secs => %s)) "
-                "WHERE id=%s",
-                (ttl_seconds, rid),
-            )
+            if active["code"] is None:
+                cur.execute(
+                    "UPDATE otp_request "
+                    "SET expires_at=GREATEST(expires_at, now() + make_interval(secs => %s)) "
+                    "WHERE id=%s AND code IS NULL",
+                    (ttl_seconds, rid),
+                )
         else:
             cur.execute(
                 "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
@@ -169,12 +216,7 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     """
     with conn.cursor() as cur:
         cur.execute(
-            "WITH used AS ("
-            "  SELECT array_agg(matched_message_id) AS message_ids FROM otp_request "
-            "  WHERE matched_message_id IS NOT NULL"
-            ") "
-            "SELECT id, requested_at, sender_hint, used.message_ids AS used_message_ids "
-            "FROM otp_request CROSS JOIN used "
+            "SELECT id, requested_at, sender_hint FROM otp_request "
             "WHERE code IS NULL AND consumed_at IS NULL "
             "      AND (expires_at IS NULL OR expires_at > now()) "
             "ORDER BY requested_at"
@@ -183,7 +225,6 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     conn.commit()
     if not pending:
         return 0
-    used_messages = set(pending[0].get("used_message_ids") or [])
     answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
 
     if gmail_service is None:
@@ -210,8 +251,20 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     # received_at > requested_at). Newest-first would hand the oldest request the
     # newest code and mis-pair concurrent same-window applies.
     parsed = [(m, _parse_email_dt(m.received_at)) for m in matches]
-    parsed = [(m, ts) for (m, ts) in parsed if ts is not None]
+    parsed = [(m, ts) for (m, ts) in parsed if ts is not None and m.message_id]
     parsed.sort(key=lambda mt: mt[1])
+    if not parsed:
+        return 0
+
+    candidate_message_ids = list(dict.fromkeys(m.message_id for m, _ts in parsed))
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT matched_message_id FROM otp_request "
+            "WHERE matched_message_id = ANY(%s)",
+            (candidate_message_ids,),
+        )
+        used_messages = {row["matched_message_id"] for row in cur.fetchall()}
+    conn.commit()
 
     answered = 0
     for req in pending:

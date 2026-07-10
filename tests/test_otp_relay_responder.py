@@ -120,6 +120,202 @@ def test_consumed_message_is_not_reused_in_later_responder_cycle(fleet_db, monke
     assert [row["matched_message_id"] for row in rows] == ["greenhouse-message-1", None]
 
 
+def test_answer_history_lookup_is_bounded_to_candidate_message_ids(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match("candidate-1", _rfc(now + dt.timedelta(seconds=10)), "111111"),
+        _Match("candidate-2", _rfc(now + dt.timedelta(seconds=20)), "222222"),
+    ]
+    historical_ids = {f"historical-{index}" for index in range(10_000)}
+    historical_ids.update(match.message_id for match in matches)
+    queries = []
+
+    class _Cursor:
+        rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            queries.append((query, params))
+            if "SELECT id, requested_at, sender_hint" in query:
+                assert "array_agg" not in query
+                assert "CROSS JOIN" not in query
+                self.rows = [{
+                    "id": 1,
+                    "requested_at": now,
+                    "sender_hint": "greenhouse.io",
+                }]
+            elif "matched_message_id = ANY(%s)" in query:
+                candidate_ids = params[0]
+                assert set(candidate_ids) == {"candidate-1", "candidate-2"}
+                assert len(candidate_ids) == 2
+                self.rows = [
+                    {"matched_message_id": message_id}
+                    for message_id in candidate_ids
+                    if message_id in historical_ids
+                ]
+            else:
+                raise AssertionError(f"unexpected query: {query}")
+
+        def fetchall(self):
+            return self.rows
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kwargs: matches,
+    )
+
+    assert otp_relay.answer_pending(_Conn(), _FakeGmail(matches)) == 0
+    assert len(queries) == 2
+
+
+def test_answer_with_no_candidates_skips_history_query(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    queries = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            queries.append((query, params))
+
+        def fetchall(self):
+            return [{
+                "id": 1,
+                "requested_at": now,
+                "sender_hint": "greenhouse.io",
+            }]
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kwargs: [],
+    )
+
+    assert otp_relay.answer_pending(_Conn(), _FakeGmail([])) == 0
+    assert len(queries) == 1
+
+
+def test_scan_time_reservation_is_filtered_and_other_provider_is_answered(
+    fleet_db, monkeypatch,
+):
+    now = dt.datetime.now(dt.timezone.utc)
+    greenhouse = _Match(
+        "scan-reserved-greenhouse", _rfc(now + dt.timedelta(seconds=10)), "111111",
+    )
+    workday = _Match(
+        "scan-workday", _rfc(now + dt.timedelta(seconds=20)), "222222",
+        sender="Workday <no-reply@myworkday.com>",
+    )
+
+    with _fresh(fleet_db) as conn:
+        greenhouse_request = _pending(conn, worker_id="scan-greenhouse")
+        workday_request = _pending(
+            conn, worker_id="scan-workday", domain="tenant.myworkdayjobs.com",
+        )
+
+        def scan_and_reserve(**_kwargs):
+            with pgqueue.connect(fleet_db) as competing:
+                with competing.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO otp_request "
+                        "(worker_id, matched_message_id, consumed_at) "
+                        "VALUES ('scan-audit', %s, now())",
+                        (greenhouse.message_id,),
+                    )
+                competing.commit()
+            return [greenhouse, workday]
+
+        monkeypatch.setattr(
+            otp_relay.inbox_auth, "scan_gmail_for_auth_codes", scan_and_reserve,
+        )
+        assert otp_relay.answer_pending(conn, _FakeGmail([])) == 1
+        assert otp_relay.poll_for_code(
+            conn, greenhouse_request, timeout_seconds=0,
+        ) is None
+        consumed = otp_relay.poll_for_code(
+            conn, workday_request, timeout_seconds=0,
+        )
+
+    assert consumed is not None and consumed.value == "222222"
+
+
+def test_unique_violation_race_rolls_back_and_continues(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    greenhouse = _Match(
+        "raced-greenhouse", _rfc(now + dt.timedelta(seconds=10)), "111111",
+    )
+    workday = _Match(
+        "raced-workday", _rfc(now + dt.timedelta(seconds=20)), "222222",
+        sender="Workday <no-reply@myworkday.com>",
+    )
+    monkeypatch.setattr(
+        otp_relay.inbox_auth,
+        "scan_gmail_for_auth_codes",
+        lambda **_kwargs: [greenhouse, workday],
+    )
+    original_matcher = otp_relay._match_belongs_to_request
+    reserved = False
+
+    def reserve_after_history_lookup(sender_hint, match):
+        nonlocal reserved
+        if not reserved and match.message_id == greenhouse.message_id:
+            with pgqueue.connect(fleet_db) as competing:
+                with competing.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO otp_request "
+                        "(worker_id, matched_message_id, consumed_at) "
+                        "VALUES ('race-audit', %s, now())",
+                        (greenhouse.message_id,),
+                    )
+                competing.commit()
+            reserved = True
+        return original_matcher(sender_hint, match)
+
+    monkeypatch.setattr(
+        otp_relay, "_match_belongs_to_request", reserve_after_history_lookup,
+    )
+
+    with _fresh(fleet_db) as conn:
+        greenhouse_request = _pending(conn, worker_id="race-greenhouse")
+        workday_request = _pending(
+            conn, worker_id="race-workday", domain="tenant.myworkdayjobs.com",
+        )
+
+        assert otp_relay.answer_pending(conn, _FakeGmail([])) == 1
+        assert otp_relay.poll_for_code(
+            conn, greenhouse_request, timeout_seconds=0,
+        ) is None
+        consumed = otp_relay.poll_for_code(
+            conn, workday_request, timeout_seconds=0,
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 AS usable")
+            usable = cur.fetchone()["usable"]
+
+    assert consumed is not None and consumed.value == "222222"
+    assert usable == 1
+
+
 def test_oldest_request_gets_earliest_code(fleet_db, monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
     matches = [
