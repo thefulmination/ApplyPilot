@@ -52,16 +52,45 @@ _SUCCESS_MARKERS = (
 )
 
 
+def _page_content(page) -> str:
+    try:
+        return page.content() or ""
+    except Exception:
+        return ""
+
+
+def verify_greenhouse_submission(page):
+    """Normalize Greenhouse page evidence through the independent verifier."""
+    from applypilot.apply.submission_verifier import (
+        SubmissionEvidence,
+        verify_submission,
+    )
+
+    content = _page_content(page)
+    lowered = content.lower()
+    validation_errors = ()
+    if any(
+        marker in lowered
+        for marker in ("please correct", "errors below", "field is required")
+    ):
+        validation_errors = ("greenhouse form validation error",)
+    page_url = str(getattr(page, "url", "") or "")
+    return verify_submission(
+        SubmissionEvidence(
+            page_url=page_url,
+            allowed_success_hosts=("greenhouse.io",),
+            success_url_markers=("/confirmation", "/thank", "/submitted"),
+            dom_text=content,
+            validation_errors=validation_errors,
+        )
+    )
+
+
 def detect_confirmation(page) -> str:
     """Inspect the post-submit page. Return 'applied' only on positive
     confirmation, else 'failed:no_confirmation'. Never raises."""
-    try:
-        html = (page.content() or "").lower()
-    except Exception:
-        return "failed:no_confirmation"
-    if any(marker in html for marker in _SUCCESS_MARKERS):
-        return "applied"
-    return "failed:no_confirmation"
+    result = verify_greenhouse_submission(page)
+    return "applied" if result.status == "verified" else "failed:no_confirmation"
 
 # Greenhouse hosted-form input ids equal the API field name (e.g. id="first_name",
 # id="question_12074265004"); the submit button is id="submit_app".
@@ -112,7 +141,8 @@ def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[
     return actions
 
 
-def execute_form(actions, page, *, dry_run: bool = True) -> SubmitReport:
+def execute_form(actions, page, *, dry_run: bool = True,
+                 before_submit=None) -> SubmitReport:
     """Run form actions against ``page``. Dry-run (default) never clicks submit.
 
     ``page`` is any object exposing ``fill``, ``set_input_files``,
@@ -124,6 +154,8 @@ def execute_form(actions, page, *, dry_run: bool = True) -> SubmitReport:
             if dry_run:
                 report.skipped_submit = True
                 continue
+            if before_submit is not None:
+                before_submit()
             page.click(a.selector)
             report.submitted = True
             continue
@@ -167,7 +199,8 @@ def capture_answers(plan, questions, job, *, remember_fn=None) -> int:
 
 def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
                      corpus=None, fetch=None, answer_fn=None, remember_fn=None,
-                     dry_run: bool = True) -> dict:
+                     dry_run: bool = True, on_plan_ready=None,
+                     before_submit=None, verify_fn=None) -> dict:
     """End-to-end: parse -> fetch questions -> plan -> route.
 
     When the plan is complete (``ready``) it fills the form deterministically
@@ -194,12 +227,34 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
         return {"route": "agent_fallback", "plan": plan, "unmapped": reasons, "ready": False}
 
     actions = plan_form_actions(plan, questions, resume_path=resume_path)
-    report = execute_form(actions, page, dry_run=dry_run)
+    attempt_context = None
+    if not dry_run and on_plan_ready is not None:
+        attempt_context = on_plan_ready(plan, actions)
+
+    checkpoint = None
+    if not dry_run and before_submit is not None:
+        def checkpoint():
+            return before_submit(attempt_context)
+    report = execute_form(
+        actions,
+        page,
+        dry_run=dry_run,
+        before_submit=checkpoint,
+    )
     result = {"route": "deterministic", "plan": plan, "actions": actions,
-              "report": report, "ready": True}
+              "report": report, "ready": True,
+              "attempt_context": attempt_context}
     if report.submitted:
-        result["status"] = detect_confirmation(page)
-        if result["status"] == "applied":
+        verification = (verify_fn or verify_greenhouse_submission)(page)
+        result["verification_status"] = verification.status
+        result["verification_method"] = verification.method
+        result["verification_ref"] = verification.reference
+        if verification.status == "verified":
+            result["status"] = "applied"
             result["captured"] = capture_answers(plan, questions, {"site": board},
                                                   remember_fn=remember_fn)
+        elif verification.status == "contradicted":
+            result["status"] = "failed:validation_error"
+        else:
+            result["status"] = "crash_unconfirmed"
     return result

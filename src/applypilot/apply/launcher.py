@@ -1421,7 +1421,8 @@ def _route_from_greenhouse_result(res: dict | None, *, own: bool) -> str | None:
 
 def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
                             resume_text: str, resume_path,
-                            worker_id: int = 0) -> tuple[str, int] | None:
+                            worker_id: int = 0,
+                            attempt_store=None) -> tuple[str, int] | None:
     """Opt-in deterministic Greenhouse path. Returns (status, duration_ms) if it
     OWNED the application, else None so the apply agent proceeds. Never raises.
 
@@ -1451,9 +1452,41 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     if not parse_greenhouse_url(url):
         return None
 
-    own = submit_enabled() and not dry_run  # may we actually submit and own the outcome?
+    # A real adapter submit is impossible without the durable attempt ledger.
+    # With the submit flag on but no injected store, stay in shadow and let the
+    # existing agent path own the application.
+    own = submit_enabled() and not dry_run and attempt_store is not None
     t0 = time.time()
     res = None
+    attempt_id = None
+    attempt_state = None
+
+    def on_plan_ready(plan, actions):
+        nonlocal attempt_id, attempt_state
+        attempt_id = attempt_store.create_prepared(
+            route="adapter_submit:greenhouse",
+            route_version="greenhouse-v1",
+            evidence={
+                "plan_ready": bool(plan.ready),
+                "unmapped_required_count": len(plan.unmapped_required or []),
+                "action_count": len(actions or []),
+                "adapter_name": "greenhouse",
+                "adapter_version": "v1",
+            },
+        )
+        attempt_state = "prepared"
+        return attempt_id
+
+    def before_submit(context):
+        nonlocal attempt_state
+        attempt_store.transition(
+            context,
+            expected="prepared",
+            state="submit_started",
+            evidence={"submit_checkpoint_state": "submit_started"},
+        )
+        attempt_state = "submit_started"
+
     try:
         from playwright.sync_api import sync_playwright
         profile = config.load_profile()
@@ -1465,11 +1498,36 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 res = apply_greenhouse(url, profile=profile, resume_text=resume_text,
-                                       resume_path=pdf, page=page, dry_run=not own)
+                                       resume_path=pdf, page=page, dry_run=not own,
+                                       on_plan_ready=on_plan_ready if own else None,
+                                       before_submit=before_submit if own else None)
             finally:
                 page.close()
     except Exception:
-        logger.debug("greenhouse adapter failed (non-fatal); agent proceeds", exc_info=True)
+        if attempt_id and attempt_state:
+            final_state = (
+                "quarantined" if attempt_state == "submit_started" else "failed_pre_submit"
+            )
+            try:
+                attempt_store.transition(
+                    attempt_id,
+                    expected=attempt_state,
+                    state=final_state,
+                    evidence={"adapter_exception": True},
+                )
+                attempt_state = final_state
+            except Exception:
+                logger.exception("greenhouse attempt finalization failed")
+            if final_state == "quarantined":
+                _adapter_route_stats[worker_id] = {
+                    "route": "adapter_submit:greenhouse",
+                    "adapter_name": "greenhouse",
+                    "adapter_plan_ready": True,
+                    "attempt_id": attempt_id,
+                    "submit_checkpoint_state": "quarantined",
+                }
+                return ("crash_unconfirmed", int((time.time() - t0) * 1000))
+        logger.debug("greenhouse adapter failed pre-submit; agent proceeds", exc_info=True)
         return None
 
     if not res or res.get("route") != "deterministic":
@@ -1487,7 +1545,38 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
         }
         return None  # shadow: agent still owns the submission
 
-    status = res.get("status", "failed:no_confirmation")
+    verification_status = res.get("verification_status") or "unverified"
+    final_state = {
+        "verified": "verified",
+        "contradicted": "contradicted",
+        "unverified": "quarantined",
+    }.get(verification_status, "quarantined")
+    attempt_store.transition(
+        attempt_id,
+        expected="submit_started",
+        state=final_state,
+        verification_method=res.get("verification_method"),
+        verification_ref=res.get("verification_ref"),
+        evidence={
+            "verification_status": verification_status,
+            "verification_method": res.get("verification_method"),
+            "verification_ref": res.get("verification_ref"),
+        },
+    )
+    attempt_state = final_state
+    status = res.get("status", "crash_unconfirmed")
+    _adapter_route_stats[worker_id] = {
+        "route": "adapter_submit:greenhouse",
+        "adapter_name": "greenhouse",
+        "adapter_plan_ready": True,
+        "attempt_id": attempt_id,
+        "route_version": "greenhouse-v1",
+        "adapter_version": "v1",
+        "submit_checkpoint_state": attempt_state,
+        "verification_status": verification_status,
+        "verification_method": res.get("verification_method"),
+        "verification_ref": res.get("verification_ref"),
+    }
     duration_ms = int((time.time() - t0) * 1000)
     logger.info("greenhouse adapter OWNED submit for %s -> %s", url, status)
     return (status, duration_ms)
@@ -1543,7 +1632,7 @@ def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) 
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str | None = "sonnet", dry_run: bool = False,
             agent: str = "claude", inbox_auth_hint: str | None = None,
-            supervised: bool = False) -> tuple[str, int]:
+            supervised: bool = False, attempt_store=None) -> tuple[str, int]:
     """Spawn an apply-agent session for one job application.
 
     Args:
@@ -1566,7 +1655,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     """
     status, duration_ms = _run_job_impl(
         job, port, worker_id=worker_id, model=model, dry_run=dry_run,
-        agent=agent, inbox_auth_hint=inbox_auth_hint,
+        agent=agent, inbox_auth_hint=inbox_auth_hint, attempt_store=attempt_store,
     )
     if supervised:
         apply_url = job.get("application_url") or job.get("url") or ""
@@ -1581,7 +1670,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                    model: str | None = "sonnet", dry_run: bool = False,
                    agent: str = "claude",
-                   inbox_auth_hint: str | None = None) -> tuple[str, int]:
+                   inbox_auth_hint: str | None = None,
+                   attempt_store=None) -> tuple[str, int]:
     """Actual apply-agent run. See run_job for the public contract; this has
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
@@ -1675,7 +1765,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     # second submit gate on a ready plan; otherwise validates + falls through.
     gh_result = _maybe_greenhouse_apply(job, port, dry_run=dry_run,
                                         resume_text=resume_text, resume_path=resume_path,
-                                        worker_id=worker_id)
+                                        worker_id=worker_id,
+                                        attempt_store=attempt_store)
     if gh_result is not None:
         status, duration_ms = gh_result
         return _record_run_metadata(

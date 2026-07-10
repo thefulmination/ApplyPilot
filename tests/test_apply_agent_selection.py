@@ -330,6 +330,108 @@ def test_greenhouse_shadow_result_records_adapter_route_stats(monkeypatch, tmp_p
     }
 
 
+def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeypatch, tmp_path: Path):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 93
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+
+    class FakeStore:
+        def __init__(self):
+            self.calls = []
+
+        def create_prepared(self, **kwargs):
+            self.calls.append(("create_prepared", kwargs))
+            return "attempt-1"
+
+        def transition(self, attempt_id, **kwargs):
+            self.calls.append(("transition", attempt_id, kwargs))
+            return {"state": kwargs["state"]}
+
+    store = FakeStore()
+
+    def fake_apply(*args, **kwargs):
+        context = kwargs["on_plan_ready"](
+            types.SimpleNamespace(ready=True, unmapped_required=[]),
+            [types.SimpleNamespace(kind="fill"), types.SimpleNamespace(kind="submit")],
+        )
+        kwargs["before_submit"](context)
+        return {
+            "route": "deterministic",
+            "ready": True,
+            "status": "applied",
+            "verification_status": "verified",
+            "verification_method": "confirmation_dom",
+            "verification_ref": "application submitted",
+            "attempt_context": context,
+        }
+
+    monkeypatch.setattr(greenhouse_submit, "apply_greenhouse", fake_apply)
+
+    class FakePage:
+        def goto(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint: str):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    playwright_module = types.ModuleType("playwright")
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: FakePlaywrightContext()
+    playwright_module.sync_api = sync_api_module
+    monkeypatch.setitem(sys.modules, "playwright", playwright_module)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {
+            "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+            "url": "https://boards.greenhouse.io/acme/jobs/123",
+        },
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=store,
+    )
+
+    assert result[0] == "applied"
+    assert [call[0] for call in store.calls] == [
+        "create_prepared", "transition", "transition"
+    ]
+    assert store.calls[1][2]["state"] == "submit_started"
+    assert store.calls[2][2]["state"] == "verified"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["attempt_id"] == "attempt-1"
+    assert stats["verification_method"] == "confirmation_dom"
+    assert stats["submit_checkpoint_state"] == "verified"
+
+
 def test_run_job_impl_merges_greenhouse_shadow_route_stats(monkeypatch, tmp_path: Path):
     from applypilot.apply import launcher
 

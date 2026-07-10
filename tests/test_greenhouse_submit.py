@@ -6,6 +6,8 @@ contract: execute_form DEFAULTS to dry-run and never clicks submit unless
 explicitly told to. No real browser and no real submission in these tests.
 """
 
+import pytest
+
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply.greenhouse_submit import (
     adapter_enabled,
@@ -106,6 +108,39 @@ def test_execute_form_clicks_submit_only_when_dry_run_false():
                        page, dry_run=False)
     assert rep.submitted is True
     assert ("click", "#submit_app") in page.calls
+
+
+def test_execute_form_checkpoints_immediately_before_submit():
+    page = FakePage()
+
+    def checkpoint():
+        page.calls.append(("checkpoint",))
+
+    execute_form(
+        plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+        page,
+        dry_run=False,
+        before_submit=checkpoint,
+    )
+
+    assert page.calls[-2:] == [("checkpoint",), ("click", "#submit_app")]
+
+
+def test_execute_form_checkpoint_failure_prevents_submit():
+    page = FakePage()
+
+    def checkpoint():
+        raise RuntimeError("checkpoint unavailable")
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        execute_form(
+            plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+            page,
+            dry_run=False,
+            before_submit=checkpoint,
+        )
+
+    assert ("click", "#submit_app") not in page.calls
 
 
 # --- decide_route (the "both 1 and 2" glue) --------------------------------
@@ -264,16 +299,65 @@ def test_apply_greenhouse_owns_submit_and_reports_applied_on_confirmation():
     assert res["status"] == "applied"
 
 
-def test_apply_greenhouse_reports_no_confirmation_when_success_not_seen():
+def test_apply_greenhouse_quarantines_when_success_not_seen_after_submit():
     page = FakePage()
-    page.set_content("<form>Please correct the errors below.</form>")
+    page.set_content("<form>Application form</form>")
     res = apply_greenhouse(
         "https://boards.greenhouse.io/acme/jobs/123",
         profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
         fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
     )
     assert res["report"].submitted is True
-    assert res["status"] == "failed:no_confirmation"
+    assert res["status"] == "crash_unconfirmed"
+    assert res["verification_status"] == "unverified"
+
+
+def test_apply_greenhouse_creates_prepared_context_only_for_ready_live_submit():
+    page = FakePage()
+    page.set_content("Your application has been submitted. Thanks for applying!")
+    calls = []
+
+    def on_plan_ready(plan, actions):
+        calls.append(("prepared", plan.ready, len(actions)))
+        return "attempt-1"
+
+    def before_submit(context):
+        calls.append(("submit_started", context))
+
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE,
+        resume_text=_RESUME,
+        resume_path="/r.pdf",
+        page=page,
+        fetch=lambda u: {"questions": _READY_QS},
+        answer_fn=_good,
+        dry_run=False,
+        on_plan_ready=on_plan_ready,
+        before_submit=before_submit,
+    )
+
+    assert calls[0][0] == "prepared"
+    assert calls[1] == ("submit_started", "attempt-1")
+    assert res["attempt_context"] == "attempt-1"
+
+
+def test_unready_greenhouse_plan_creates_no_attempt_context():
+    calls = []
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE,
+        resume_text=_RESUME,
+        resume_path="/r.pdf",
+        page=FakePage(),
+        fetch=lambda u: {"questions": _UNREADY_QS},
+        answer_fn=_good,
+        dry_run=False,
+        on_plan_ready=lambda *args: calls.append(args),
+    )
+
+    assert res["route"] == "agent_fallback"
+    assert calls == []
 
 
 # --- remember_answer capture loop ------------------------------------------
