@@ -7,6 +7,39 @@ import pytest
 from applypilot import database
 
 
+_NOW = "2026-07-10T00:00:00Z"
+
+
+def _insert_policy(conn, policy_version: str = "policy-v1", lane: str = "ats", status: str = "draft") -> None:
+    conn.execute(
+        """
+        INSERT INTO decision_policy_versions(policy_version, lane, status, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (policy_version, lane, status, _NOW),
+    )
+
+
+def _insert_decision(
+    conn,
+    decision_id: str,
+    *,
+    job_url: str = "https://example.test/job",
+    policy_version: str = "policy-v1",
+    lane: str = "ats",
+    input_hash: str = "input-hash",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO job_decisions(
+            decision_id, job_url, policy_version, lane, qualification_verdict,
+            action, input_hash, created_at
+        ) VALUES (?, ?, ?, ?, 'qualified', 'apply', ?, ?)
+        """,
+        (decision_id, job_url, policy_version, lane, input_hash, _NOW),
+    )
+
+
 def test_init_db_creates_canonical_decision_schema(tmp_path) -> None:
     conn = database.init_db(tmp_path / "brain.db")
 
@@ -37,6 +70,164 @@ def test_init_db_creates_canonical_decision_schema(tmp_path) -> None:
         """
     ).fetchone()
     assert tuple(projection) == (None, None, None, None, None)
+
+
+def test_init_db_enables_foreign_keys_and_is_idempotent(tmp_path) -> None:
+    db_path = tmp_path / "brain.db"
+
+    first = database.init_db(db_path)
+    second = database.init_db(db_path)
+
+    assert first is second
+    assert second.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert {
+        "decision_policy_versions",
+        "job_decisions",
+        "reviewed_outcomes",
+    } <= {
+        row[0]
+        for row in second.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+
+    database.close_connection(db_path)
+    reopened = database.init_db(db_path)
+    assert reopened is not first
+    assert reopened.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_init_db_migrates_existing_jobs_database_additively(tmp_path) -> None:
+    db_path = tmp_path / "existing.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.execute("CREATE TABLE jobs(url TEXT PRIMARY KEY, title TEXT)")
+    legacy.execute(
+        "INSERT INTO jobs(url, title) VALUES ('https://example.test/legacy', 'Legacy role')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = database.init_db(db_path)
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    assert {
+        "canonical_decision_id",
+        "canonical_policy_version",
+        "canonical_action",
+        "canonical_score",
+        "canonical_decided_at",
+    } <= columns
+    assert conn.execute(
+        "SELECT title FROM jobs WHERE url = 'https://example.test/legacy'"
+    ).fetchone()[0] == "Legacy role"
+    assert {"decision_policy_versions", "job_decisions", "reviewed_outcomes"} <= {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+
+
+def test_orphan_decision_and_reviewed_outcome_foreign_keys_fail(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "brain.db")
+    conn.execute("INSERT INTO jobs(url) VALUES ('https://example.test/job')")
+    conn.execute(
+        """
+        INSERT INTO email_events(message_id, occurred_at, stage, scanned_at)
+        VALUES ('event-1', ?, 'screen', ?)
+        """,
+        (_NOW, _NOW),
+    )
+    _insert_policy(conn)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_decision(
+            conn,
+            "orphan-job",
+            job_url="https://example.test/missing",
+            input_hash="orphan-job",
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_decision(
+            conn,
+            "orphan-policy",
+            policy_version="missing-policy",
+            input_hash="orphan-policy",
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO reviewed_outcomes(event_id, job_url, review_status, created_at)
+            VALUES ('missing-event', 'https://example.test/job', 'needs_review', ?)
+            """,
+            (_NOW,),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO reviewed_outcomes(event_id, job_url, review_status, created_at)
+            VALUES ('event-1', 'https://example.test/missing', 'needs_review', ?)
+            """,
+            (_NOW,),
+        )
+
+
+def test_decision_lane_must_match_policy_lane(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "brain.db")
+    conn.execute("INSERT INTO jobs(url) VALUES ('https://example.test/job')")
+    _insert_policy(conn, lane="ats")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_decision(conn, "lane-mismatch", lane="linkedin")
+
+
+def test_decision_input_identity_is_unique(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "brain.db")
+    conn.execute("INSERT INTO jobs(url) VALUES ('https://example.test/job')")
+    _insert_policy(conn)
+    _insert_decision(conn, "decision-1")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_decision(conn, "decision-2")
+
+
+def test_only_one_active_policy_is_allowed_per_lane(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "brain.db")
+    _insert_policy(conn, "ats-active", lane="ats", status="active")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_policy(conn, "second-ats-active", lane="ats", status="active")
+
+    _insert_policy(conn, "linkedin-active", lane="linkedin", status="active")
+
+
+def test_canonical_schema_has_required_indexes(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "brain.db")
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND tbl_name IN (
+                  'decision_policy_versions', 'job_decisions', 'reviewed_outcomes'
+              )
+            """
+        ).fetchall()
+    }
+
+    assert {
+        "idx_decision_policy_versions_status_lane",
+        "idx_decision_policy_versions_active_lane",
+        "idx_decision_policy_versions_version_lane",
+        "idx_job_decisions_job",
+        "idx_job_decisions_policy",
+        "idx_job_decisions_action",
+        "idx_job_decisions_expires",
+        "idx_reviewed_outcomes_job",
+        "idx_reviewed_outcomes_status",
+    } <= indexes
 
 
 def test_canonical_schema_constraints_reject_invalid_values(tmp_path) -> None:

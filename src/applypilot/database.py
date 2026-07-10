@@ -84,6 +84,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
             pass
 
     conn = sqlite3.connect(path, timeout=60)
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     # Tolerate write contention from parallel stages/workers and OneDrive sync
     # locking the DB file: wait up to 60s for the writer lock instead of failing
@@ -724,7 +725,8 @@ def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> 
             created_at           TEXT NOT NULL,
             validated_at         TEXT,
             activated_at         TEXT,
-            retired_at           TEXT
+            retired_at           TEXT,
+            UNIQUE(policy_version, lane)
         )
     """)
     conn.execute("""
@@ -753,7 +755,8 @@ def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> 
             expires_at             TEXT,
             UNIQUE(job_url, policy_version, input_hash),
             FOREIGN KEY(job_url) REFERENCES jobs(url),
-            FOREIGN KEY(policy_version) REFERENCES decision_policy_versions(policy_version)
+            FOREIGN KEY(policy_version, lane)
+                REFERENCES decision_policy_versions(policy_version, lane)
         )
     """)
     conn.execute("""
@@ -780,6 +783,10 @@ def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> 
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_decision_policy_versions_status_lane
         ON decision_policy_versions(status, lane)
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_policy_versions_version_lane
+        ON decision_policy_versions(policy_version, lane)
     """)
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_policy_versions_active_lane
