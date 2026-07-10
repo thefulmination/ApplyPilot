@@ -844,6 +844,20 @@ def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> 
             SELECT RAISE(ABORT, 'decision policy lane mismatch');
         END
     """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_decision_policy_versions_lane_update
+        BEFORE UPDATE OF lane ON decision_policy_versions
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1
+            FROM job_decisions
+            WHERE policy_version = OLD.policy_version
+              AND lane <> NEW.lane
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'policy lane has decisions');
+        END
+    """)
     conn.commit()
 
     violations: list[str] = []

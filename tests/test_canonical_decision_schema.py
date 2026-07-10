@@ -205,12 +205,18 @@ def test_upgrade_installs_lane_consistency_triggers(tmp_path) -> None:
     triggers = {
         row[0]
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'job_decisions'"
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'trigger'
+              AND tbl_name IN ('job_decisions', 'decision_policy_versions')
+            """
         ).fetchall()
     }
     assert {
         "trg_job_decisions_policy_lane_insert",
         "trg_job_decisions_policy_lane_update",
+        "trg_decision_policy_versions_lane_update",
     } <= triggers
 
     with pytest.raises(sqlite3.IntegrityError, match="decision policy lane mismatch"):
@@ -221,6 +227,19 @@ def test_upgrade_installs_lane_consistency_triggers(tmp_path) -> None:
         conn.execute(
             "UPDATE job_decisions SET lane = 'linkedin' WHERE decision_id = 'valid-decision'"
         )
+
+    with pytest.raises(sqlite3.IntegrityError, match="policy lane has decisions"):
+        conn.execute(
+            "UPDATE decision_policy_versions SET lane = 'linkedin' WHERE policy_version = 'policy-v1'"
+        )
+
+    _insert_policy(conn, "childless-policy", lane="ats")
+    conn.execute(
+        "UPDATE decision_policy_versions SET lane = 'linkedin' WHERE policy_version = 'childless-policy'"
+    )
+    assert conn.execute(
+        "SELECT lane FROM decision_policy_versions WHERE policy_version = 'childless-policy'"
+    ).fetchone()[0] == "linkedin"
 
 
 @pytest.mark.parametrize(
@@ -329,6 +348,26 @@ def test_decision_lane_must_match_policy_lane(tmp_path) -> None:
 
     with pytest.raises(sqlite3.IntegrityError):
         _insert_decision(conn, "lane-mismatch", lane="linkedin")
+
+
+def test_fresh_schema_protects_policy_lane_updates_with_decisions(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "brain.db")
+    conn.execute("INSERT INTO jobs(url) VALUES ('https://example.test/job')")
+    _insert_policy(conn)
+    _insert_decision(conn, "decision-1")
+
+    with pytest.raises(sqlite3.IntegrityError, match="policy lane has decisions"):
+        conn.execute(
+            "UPDATE decision_policy_versions SET lane = 'linkedin' WHERE policy_version = 'policy-v1'"
+        )
+
+    _insert_policy(conn, "childless-policy", lane="ats")
+    conn.execute(
+        "UPDATE decision_policy_versions SET lane = 'linkedin' WHERE policy_version = 'childless-policy'"
+    )
+    assert conn.execute(
+        "SELECT lane FROM decision_policy_versions WHERE policy_version = 'childless-policy'"
+    ).fetchone()[0] == "linkedin"
 
 
 def test_decision_input_identity_is_unique(tmp_path) -> None:
