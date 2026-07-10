@@ -63,9 +63,16 @@ class LocalJobsSummary:
 
 
 @dataclass
+class RouteSummary:
+    available: bool = True
+    by_route: dict[str, CountCost] = field(default_factory=dict)
+
+
+@dataclass
 class CostQualityReport:
     fleet: FleetQueueSummary
     local: LocalJobsSummary
+    routes: RouteSummary = field(default_factory=RouteSummary)
 
 
 def _money(value: Any) -> float:
@@ -184,6 +191,26 @@ def summarize_local_jobs(rows: Iterable[dict]) -> LocalJobsSummary:
     )
 
 
+def summarize_result_routes(
+    rows: Iterable[dict], *, available: bool = True
+) -> RouteSummary:
+    by_route: dict[str, CountCost] = {}
+    for row in rows:
+        status = _status(_get(row, "status", "apply_status"))
+        route = str(_get(row, "route") or "unknown").strip().lower()
+        cost = _money(_get(row, "cost_usd", "est_cost_usd"))
+        is_applied = status == "applied"
+        is_terminal = status in TERMINAL_STATUSES
+        _add_count_cost(
+            by_route,
+            route,
+            cost=cost,
+            is_applied=is_applied,
+            is_terminal=is_terminal,
+        )
+    return RouteSummary(available=available, by_route=dict(sorted(by_route.items())))
+
+
 def fetch_fleet_queue_rows(pg_dsn: str) -> list[dict]:
     from psycopg.rows import dict_row
     import psycopg
@@ -200,6 +227,24 @@ def fetch_fleet_queue_rows(pg_dsn: str) -> list[dict]:
             """
         ).fetchall()
     return list(rows)
+
+
+def fetch_fleet_result_event_rows(pg_dsn: str) -> tuple[list[dict], bool]:
+    from psycopg import errors
+    from psycopg.rows import dict_row
+    import psycopg
+
+    try:
+        with psycopg.connect(pg_dsn, row_factory=dict_row) as conn:
+            rows = conn.execute(
+                """
+                SELECT status, route, COALESCE(est_cost_usd, 0) AS est_cost_usd
+                FROM apply_result_events
+                """
+            ).fetchall()
+    except (errors.UndefinedColumn, errors.UndefinedTable):
+        return [], False
+    return list(rows), True
 
 
 def fetch_local_job_rows(sqlite_path: str | Path) -> list[dict]:
@@ -234,9 +279,14 @@ def build_report(
         "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
     )
     local_path = sqlite_path if sqlite_path is not None else default_sqlite_path()
+    event_rows, route_metrics_available = fetch_fleet_result_event_rows(pg_dsn)
     return CostQualityReport(
         fleet=summarize_fleet_queue(fetch_fleet_queue_rows(pg_dsn)),
         local=summarize_local_jobs(fetch_local_job_rows(local_path)),
+        routes=summarize_result_routes(
+            event_rows,
+            available=route_metrics_available,
+        ),
     )
 
 
