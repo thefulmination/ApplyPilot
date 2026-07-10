@@ -1,0 +1,139 @@
+topic: "Web browser automation options for minimizing ApplyPilot cost per verified job application"
+field_categories:
+  - category: identity
+    detail_level: brief
+    fields:
+      - name: name
+        description: "Canonical project, product, protocol, or route name."
+      - name: category
+        description: "Deterministic, driver, agent control, hosted browser, vision, verification, or watchlist."
+      - name: official_sources
+        description: "Primary documentation, repository, release, and pricing links."
+      - name: maintenance_status
+        description: "Release activity and material maintenance since January 2025."
+      - name: license
+        description: "License and constraints relevant to ApplyPilot's AGPL-3.0 codebase."
+  - category: cost_economics
+    detail_level: detailed
+    fields:
+      - name: pricing_model
+        description: "Subscription, token, query, browser-hour, compute-hour, concurrency, or self-hosted pricing."
+      - name: marginal_cost_per_attempt
+        description: "Estimated incremental cash cost for one ApplyPilot attempt, with assumptions."
+      - name: projected_cost_per_verified_apply
+        description: "Expected all-in cost using ApplyPilot success and fallback rates, not vendor demos."
+      - name: billing_granularity
+        description: "Minimum units, idle billing, cold starts, concurrency fees, egress, and included usage."
+      - name: model_cost
+        description: "Model and token cost, including fixed-subscription amortization where applicable."
+      - name: infrastructure_cost
+        description: "CPU, RAM, GPU, storage, power, and managed-service cost."
+      - name: human_recovery_cost
+        description: "Expected operator minutes and waiting cost for login, OTP, or ambiguous outcomes."
+      - name: adapter_maintenance_tco
+        description: "Engineering and repair cost amortized over verified applications."
+  - category: reliability
+    detail_level: detailed
+    fields:
+      - name: verified_completion_rate
+        description: "Rate of positively confirmed applications under an ATS-stratified benchmark."
+      - name: failure_modes
+        description: "Expired, policy, auth, challenge, browser, actor, unsupported-field, and confirmation failures."
+      - name: crash_recovery
+        description: "Trace, replay, resume, and isolation behavior after browser or actor failure."
+      - name: exactly_once_submit_safety
+        description: "Duplicate detection, pre-submit checkpoints, and ambiguous-result quarantine."
+      - name: verification_evidence_tier
+        description: "ATS ID, response, confirmation DOM, email, screenshot, or inference."
+      - name: verification_latency
+        description: "Synchronous and delayed reconciliation time for confirmation evidence."
+      - name: headless_headed_parity
+        description: "Observed differences between headed, headless, and user-controlled browser modes."
+  - category: applypilot_fit
+    detail_level: detailed
+    fields:
+      - name: python_integration
+        description: "Python support and compatibility with the existing ApplyPilot runtime."
+      - name: playwright_cdp_reuse
+        description: "Ability to reuse current Chrome profiles, CDP ports, adapters, and test fixtures."
+      - name: migration_effort
+        description: "Small, medium, or large implementation effort with affected components."
+      - name: ats_fit
+        description: "Suitability for Ashby, Greenhouse, Lever, Workable, Workday, and long-tail hosts."
+      - name: deterministic_coverage
+        description: "Expected share completed without a general browser agent."
+      - name: escape_rate
+        description: "Expected share requiring semantic, vision, premium-agent, or human fallback."
+      - name: control_plane_overhead
+        description: "Context size, serialization, process startup, round trips, and tool-call overhead."
+      - name: observability_joinability
+        description: "Ability to join one attempt across queue, browser, model, network, and email evidence."
+  - category: authentication
+    detail_level: detailed
+    fields:
+      - name: persistent_profiles
+        description: "Profile creation, locking, cloning, portability, and browser-version constraints."
+      - name: existing_session_attach
+        description: "Ability to attach safely to an authenticated browser or tab."
+      - name: login_and_otp
+        description: "Login, email verification, OTP relay, and owner takeover support."
+      - name: extension_support
+        description: "Support for narrowly permissioned extensions, content scripts, and native messaging."
+      - name: session_data_boundary
+        description: "Where cookies, credentials, resumes, screenshots, and traces are transmitted or retained."
+  - category: quality_and_safety
+    detail_level: detailed
+    fields:
+      - name: required_field_completeness
+        description: "Ability to identify all required fields and refuse incomplete plans."
+      - name: answer_provenance
+        description: "Ability to constrain answers to profile, resume, and approved-answer evidence."
+      - name: unsupported_question_fallback
+        description: "Safe escalation behavior for unknown, sensitive, or free-text questions."
+      - name: prompt_injection_resistance
+        description: "Domain allowlists, tool restrictions, hostile-page tests, and secret protection."
+      - name: site_permission_and_terms
+        description: "Documented interfaces, relevant terms, and whether the route is appropriate to operate."
+      - name: irreversible_action_guard
+        description: "Confirmation boundary and controls around the final submit action."
+  - category: operations
+    detail_level: moderate
+    fields:
+      - name: concurrency
+        description: "Practical concurrent sessions and associated caps or surcharges."
+      - name: startup_latency
+        description: "Cold and warm startup time."
+      - name: warm_session_reuse
+        description: "Ability to reuse browser, profile, or cached action state safely."
+      - name: tracing_and_replay
+        description: "Network, console, DOM, screenshot, video, and deterministic replay support."
+      - name: deployment_modes
+        description: "Local, self-hosted, container, managed cloud, and hybrid availability."
+      - name: browser_version_matrix
+        description: "Chrome, Chromium, Firefox, WebKit, CDP, and BiDi compatibility."
+      - name: canary_stop_loss
+        description: "Per-route step, time, dollar, and failure-rate circuit breakers."
+  - category: benchmark
+    detail_level: detailed
+    fields:
+      - name: benchmark_design
+        description: "Matched ATS-stratified samples, repeated runs, and synthetic form coverage."
+      - name: route_funnel
+        description: "Eligibility, selected route, fallback, retry, verification, and final disposition."
+      - name: step_context_budget
+        description: "Actions, observations, DOM or accessibility tokens, screenshots, and model output."
+      - name: cache_replay_yield
+        description: "Warm hit rate, invalidation frequency, no-model replay rate, and savings."
+      - name: confidence_intervals
+        description: "Uncertainty around completion, failure, and cost estimates."
+      - name: historical_bucket_impact
+        description: "Projected savings against live Workday, expired, runtime, Ashby, Greenhouse, and long-tail spend."
+      - name: recommendation
+        description: "Adopt, canary, watch, or reject with an explicit rationale."
+uncertain:
+  - "Vendor prices or included usage that cannot be verified from a current primary source."
+  - "Success claims that are not measured on job-application workflows."
+  - "Anti-detection claims or behavior that would require bypassing access controls."
+  - "Projected savings without an ApplyPilot historical-data calculation."
+  - "Project maintenance or license status that cannot be verified."
+  - "Quality claims without positive submission evidence."
