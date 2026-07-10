@@ -166,6 +166,36 @@ def test_magic_link_rejects_conflicting_ats_sender_even_when_destination_matches
     assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
 
 
+def test_magic_link_rejects_smartrecruiters_alternate_sender_for_greenhouse():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "smartrecruiters-conflict",
+        now,
+        sender="no-reply@smartrecruiters-mail.com",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_alternate_ats_sender_domains_relate_to_provider_domains():
+    assert inbox_auth.domains_related(
+        "smartrecruiters-mail.com", "smartrecruiters.com"
+    )
+    assert inbox_auth.domains_related("workablemail.com", "workable.com")
+    assert inbox_auth.domains_related("ashby.email", "ashbyhq.com")
+    assert inbox_auth.domains_related("ashbyhq-mail.com", "ashbyhq.com")
+
+
+def test_inbox_auth_and_gmail_outcomes_share_canonical_ats_sender_registry():
+    from applypilot import gmail_outcomes
+    from applypilot.ats_domains import ATS_SENDER_DOMAINS
+
+    assert inbox_auth.KNOWN_ATS_DOMAINS is ATS_SENDER_DOMAINS
+    assert gmail_outcomes._ATS_DOMAINS is ATS_SENDER_DOMAINS
+
+
 def test_workday_alternate_sender_is_related_to_request_domain():
     now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
     match = _auth_match(

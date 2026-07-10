@@ -11,47 +11,13 @@ from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from applypilot.ats_domains import ATS_SENDER_DOMAINS, PROVIDER_DOMAIN_GROUPS
 from applypilot.database import get_connection
 
 Confidence = Literal["low", "medium", "high"]
 CandidateKind = Literal["code", "magic_link"]
 
-KNOWN_ATS_DOMAINS = {
-    "greenhouse.io",
-    "boards.greenhouse.io",
-    "myworkday.com",
-    "myworkdayjobs.com",
-    "lever.co",
-    "ashbyhq.com",
-    "icims.com",
-    "smartrecruiters.com",
-    "workable.com",
-    "taleo.net",
-    "oraclecloud.com",
-    "oracle.com",
-    "workday.com",
-    "greenhouse-mail.io",
-    "adp.com",
-    "workforcenow.adp.com",
-    "amazon.jobs",
-    "jobs.amazon.com",
-    "eightfold.ai",
-}
-
-PROVIDER_DOMAIN_GROUPS = (
-    ("oraclecloud.com", "oracle.com", "taleo.net"),
-    (
-        "myworkday.com",
-        "myworkdayjobs.com",
-        "myworkdaysite.com",
-        "workdayjobs.com",
-        "workday.com",
-    ),
-    ("greenhouse.io", "greenhouse-mail.io"),
-    ("adp.com", "workforcenow.adp.com"),
-    ("amazon.jobs", "jobs.amazon.com"),
-    ("eightfold.ai",),
-)
+KNOWN_ATS_DOMAINS = ATS_SENDER_DOMAINS
 
 VERIFY_WORDS = {
     "verification",
