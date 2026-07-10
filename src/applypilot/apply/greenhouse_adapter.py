@@ -188,7 +188,7 @@ def _profile_text_answer(
 
 
 def _profile_select_value(
-    low: str, values, *, personal, work_auth, experience, compensation, job,
+    low: str, values, *, personal, work_auth, experience, compensation, resume_facts, job,
 ):
     label = " ".join(low.split()).strip(" :?*")
     if "resident of the following states" in label:
@@ -217,10 +217,24 @@ def _profile_select_value(
     if any(phrase in label for phrase in (
         "privacy acknowledgement", "privacy policy", "data protection notice",
     )):
-        return _pick_value(
+        acknowledged = _pick_value(
             values,
             lambda option: "acknowledge" in option or option == "confirm",
         )
+        return acknowledged if acknowledged is not None else _pick_value(
+            values, lambda option: option == "yes",
+        )
+    if "receive communications via sms" in label or "receive communications via whatsapp" in label:
+        return _pick_value(values, lambda option: option == "no")
+    if label.startswith("have you worked at "):
+        employer = re.sub(r"^have you worked at\s+|\?$", "", label).strip()
+        preserved = [
+            re.sub(r"[^a-z0-9]+", "", str(company).lower())
+            for company in (resume_facts.get("preserved_companies") or [])
+        ]
+        normalized_employer = re.sub(r"[^a-z0-9]+", "", employer)
+        if preserved and normalized_employer not in preserved:
+            return _pick_value(values, lambda option: "not worked" in option)
     if "declare" in label and "particulars" in label and "true" in label:
         return _pick_value(values, lambda option: option == "yes")
     if "documents" in label and "employment eligibility" in label:
@@ -247,6 +261,10 @@ def _profile_select_value(
             "chief", "coo", "ceo", "president", "director", "manager", "head", "vp",
         ))
         answer = "yes" if has_leadership else "no"
+        return _pick_value(values, lambda option: option == answer)
+    if "graduated" in label and "bachelor" in label and "degree" in label:
+        education = str(experience.get("education_level") or "").lower()
+        answer = "yes" if "bachelor" in education else "no"
         return _pick_value(values, lambda option: option == answer)
     if "compensation range match your expectation" in label:
         description = str((job or {}).get("description") or "")
@@ -301,6 +319,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
     compensation = (profile or {}).get("compensation", {})
     experience = (profile or {}).get("experience", {})
     availability = (profile or {}).get("availability", {})
+    resume_facts = (profile or {}).get("resume_facts", {})
     first, last = _name_parts(personal.get("full_name", ""))
 
     fields: dict = {}
@@ -430,6 +449,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     work_auth=work_auth,
                     experience=experience,
                     compensation=compensation,
+                    resume_facts=resume_facts,
                     job=job,
                 )
                 if _has(low, _DEMOGRAPHIC):
@@ -453,6 +473,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     work_auth=work_auth,
                     experience=experience,
                     compensation=compensation,
+                    resume_facts=resume_facts,
                     job=job,
                 )
                 if val is not None:

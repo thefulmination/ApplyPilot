@@ -93,6 +93,7 @@ PROFILE = {
     "work_authorization": {"legally_authorized_to_work": "Yes", "require_sponsorship": "No"},
     "compensation": {"salary_expectation": 175000},
     "experience": {"education_level": "Bachelor's degree", "years_of_experience_total": 12},
+    "resume_facts": {"preserved_companies": ["Acme Capital", "Example Labs"]},
 }
 RESUME = "Quantitative Developer. Built Python risk models at a trading desk supporting a $300M book."
 JOB = {"title": "Quant Developer", "site": "Acme Capital", "description": "Python pricing models."}
@@ -308,6 +309,43 @@ def test_maps_location_availability_leadership_and_overlapping_compensation():
     assert plan.fields["start_q"] == "Immediately"
     assert plan.fields["leadership_q"] == 1
     assert plan.fields["comp_q"] == 1
+    assert plan.ready is True
+
+
+def test_maps_prior_employment_from_profile_history_and_opts_out_of_sms():
+    job = {**JOB, "company": "doordashusa", "site": "doordashusa"}
+    q = _identity_qs() + [
+        {"required": True, "label": "Have you worked at DoorDash?",
+         "fields": [{"name": "history_q", "type": "multi_value_single_select",
+                     "values": [{"label": "I am a previous employee", "value": 60},
+                                {"label": "I have not worked at DoorDash", "value": 61}]}]},
+        {"required": True, "label": "Applicant Privacy Acknowledgement",
+         "fields": [{"name": "privacy_yes_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+        {"required": True,
+         "label": "Would you like to receive communications via SMS and/or WhatsApp about your application process?",
+         "fields": [{"name": "sms_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+    ]
+
+    plan = build_answer_plan(q, profile=PROFILE, resume_text=RESUME, answer_fn=_bad_fn, job=job)
+
+    assert plan.fields["history_q"] == 61
+    assert plan.fields["privacy_yes_q"] == 1
+    assert plan.fields["sms_q"] == 0
+    assert plan.ready is True
+
+
+def test_maps_completed_bachelors_degree_from_profile_education():
+    q = _identity_qs() + [
+        {"required": True, "label": "Have you graduated with your Bachelor's Degree?",
+         "fields": [{"name": "degree_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+    ]
+
+    plan = build_answer_plan(q, profile=PROFILE, resume_text=RESUME, answer_fn=_bad_fn, job=JOB)
+
+    assert plan.fields["degree_q"] == 1
     assert plan.ready is True
 
 
