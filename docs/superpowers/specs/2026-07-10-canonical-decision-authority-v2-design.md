@@ -60,6 +60,7 @@ Workers execute leases. They do not score, reinterpret, or repair a decision. Ce
 One row per policy build:
 
 - `policy_version` TEXT primary key
+- `lane` TEXT constrained to `ats` or `linkedin`
 - `status` TEXT constrained to `draft`, `validated`, `canary`, `active`, `retired`
 - `qualification_model`, `preference_model`, `outcome_model`
 - `kg_version`, `label_snapshot`, `pairwise_snapshot`, `outcome_snapshot`
@@ -114,10 +115,11 @@ No event enters model fitting until `review_status='accepted'`. Recommendation/n
 Add to both queue tables:
 
 - `decision_id`, `policy_version`, `decision_action`
-- `qualification_score`, `preference_score`, `outcome_score`
+- `qualification_verdict`, `qualification_score`, `qualification_floor`
+- `preference_score`, `outcome_score`
 - `decision_confidence`, `decision_created_at`, `decision_expires_at`
 
-Queue score remains available for ordering but is copied from `job_decisions.final_score`; it is not independently computed.
+Queue score remains available for ordering but is copied from `job_decisions.final_score`; it is not independently computed. Lease enforcement requires `qualification_verdict='qualified'` and `qualification_score >= qualification_floor`.
 
 ## 6. Scoring policy
 
