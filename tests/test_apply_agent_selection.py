@@ -255,6 +255,86 @@ def test_route_from_greenhouse_result_names_shadow_and_submit():
     ) == "agent"
 
 
+def test_ashby_owned_submit_uses_attempt_store(monkeypatch, tmp_path: Path):
+    from applypilot.apply import ashby_adapter, launcher
+
+    worker_id = 98
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(ashby_adapter, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(ashby_adapter, "submit_enabled", lambda: True)
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+    monkeypatch.setattr(ashby_adapter, "discover_fields", lambda page: [{"path": "name"}])
+    monkeypatch.setattr(
+        ashby_adapter,
+        "build_ashby_plan",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            ready=True, unmapped_required=[], free_text={}, resume_field=None, fields={"name": "J"},
+        ),
+    )
+    monkeypatch.setattr(
+        ashby_adapter, "plan_ashby_actions",
+        lambda *args, **kwargs: [types.SimpleNamespace(kind="submit")],
+    )
+
+    def execute(actions, page, *, dry_run, before_submit):
+        assert dry_run is False
+        before_submit()
+        return {"submitted": True}
+
+    monkeypatch.setattr(ashby_adapter, "execute_ashby_actions", execute)
+    monkeypatch.setattr(ashby_adapter, "verify_ashby_submission", lambda page: True)
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def create_prepared(self, **kwargs):
+            self.calls.append(("create", kwargs))
+            return "ashby-attempt"
+
+        def transition(self, attempt_id, **kwargs):
+            self.calls.append(("transition", attempt_id, kwargs))
+
+    store = Store()
+    page = types.SimpleNamespace(
+        goto=lambda *args, **kwargs: None,
+        close=lambda: None,
+    )
+    browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(new_page=lambda: page)])
+    playwright = types.SimpleNamespace(
+        chromium=types.SimpleNamespace(connect_over_cdp=lambda endpoint: browser),
+    )
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return playwright
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: PlaywrightContext()
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_ashby_apply(
+        {"application_url": "https://jobs.ashbyhq.com/acme/123/application"},
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=store,
+    )
+
+    assert result[0] == "applied"
+    assert [call[0] for call in store.calls] == ["create", "transition", "transition"]
+    assert store.calls[1][2]["state"] == "submit_started"
+    assert store.calls[2][2]["state"] == "verified"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["route"] == "adapter_submit:ashby"
+    assert stats["submit_checkpoint_state"] == "verified"
+
+
 def test_greenhouse_shadow_result_records_adapter_route_stats(monkeypatch, tmp_path: Path):
     from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
 

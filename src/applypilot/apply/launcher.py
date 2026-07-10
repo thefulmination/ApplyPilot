@@ -1647,6 +1647,166 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     return (status, duration_ms)
 
 
+def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
+                       resume_text: str, resume_path, worker_id: int = 0,
+                       attempt_store=None) -> tuple[str, int] | None:
+    """Deterministic Ashby path with shadow and independently gated ownership."""
+    try:
+        from applypilot.apply.ashby_adapter import (
+            adapter_enabled,
+            build_ashby_plan,
+            discover_fields,
+            execute_ashby_actions,
+            parse_ashby_url,
+            plan_ashby_actions,
+            submit_enabled,
+            verify_ashby_submission,
+        )
+        from applypilot.apply.greenhouse_submit import RequiredFormFieldsError
+    except Exception:
+        return None
+    if not adapter_enabled():
+        return None
+    url = job.get("application_url") or job.get("url") or ""
+    if not parse_ashby_url(url):
+        return None
+
+    started = time.time()
+    submit_requested = submit_enabled() and not dry_run
+    own = submit_requested and attempt_store is not None
+    if submit_requested and attempt_store is None:
+        _adapter_route_stats[worker_id] = {
+            "route": "adapter_plan:ashby",
+            "adapter_name": "ashby",
+            "adapter_plan_ready": False,
+            "failure_class": "attempt_store_unavailable",
+        }
+        return ("adapter_blocked", int((time.time() - started) * 1000))
+
+    attempt_id = None
+    attempt_state = None
+    plan = None
+    try:
+        from playwright.sync_api import sync_playwright
+        profile = config.load_profile()
+        pdf = str(Path(resume_path).with_suffix(".pdf")) if resume_path else None
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=30_000)
+                fields = discover_fields(page)
+                plan = build_ashby_plan(
+                    fields, profile=profile, resume_text=resume_text,
+                    job={"site": job.get("site", ""), "title": job.get("title", "")},
+                )
+                if not plan.ready:
+                    unmapped = list(plan.unmapped_required)
+                    _adapter_route_stats[worker_id] = {
+                        "route": "adapter_plan:ashby",
+                        "adapter_name": "ashby",
+                        "adapter_plan_ready": False,
+                        "failure_class": "adapter_unmapped_required",
+                        "unmapped_required": unmapped,
+                        "unmapped_required_count": len(unmapped),
+                    }
+                    if submit_requested:
+                        return ("profile_required", int((time.time() - started) * 1000))
+                    return None
+
+                actions = plan_ashby_actions(
+                    plan, fields, resume_path=pdf, include_submit=True,
+                )
+                if own:
+                    attempt_id = attempt_store.create_prepared(
+                        route="adapter_submit:ashby",
+                        route_version="ashby-v1",
+                        evidence={
+                            "plan_ready": True,
+                            "action_count": len(actions),
+                            "adapter_name": "ashby",
+                            "adapter_version": "v1",
+                        },
+                    )
+                    attempt_state = "prepared"
+
+                def before_submit():
+                    nonlocal attempt_state
+                    attempt_store.transition(
+                        attempt_id, expected="prepared", state="submit_started",
+                        evidence={"submit_checkpoint_state": "submit_started"},
+                    )
+                    attempt_state = "submit_started"
+
+                execute_ashby_actions(
+                    actions, page, dry_run=not own,
+                    before_submit=before_submit if own else None,
+                )
+                if not own:
+                    _adapter_route_stats[worker_id] = {
+                        "route": "adapter_shadow:ashby",
+                        "adapter_name": "ashby",
+                        "adapter_plan_ready": True,
+                    }
+                    return None
+                verified = verify_ashby_submission(page)
+            finally:
+                page.close()
+    except Exception as exc:
+        if attempt_id and attempt_state:
+            final_state = "quarantined" if attempt_state == "submit_started" else "failed_pre_submit"
+            try:
+                attempt_store.transition(
+                    attempt_id, expected=attempt_state, state=final_state,
+                    evidence={"adapter_exception": type(exc).__name__},
+                )
+            except Exception:
+                logger.exception("ashby attempt finalization failed")
+            _adapter_route_stats[worker_id] = {
+                "route": "adapter_submit:ashby",
+                "adapter_name": "ashby",
+                "adapter_plan_ready": bool(plan and plan.ready),
+                "attempt_id": attempt_id,
+                "submit_checkpoint_state": final_state,
+                "failure_class": (
+                    "runtime_required_fields"
+                    if isinstance(exc, RequiredFormFieldsError)
+                    else "adapter_runtime_error"
+                ),
+            }
+            status = "crash_unconfirmed" if final_state == "quarantined" else "profile_required"
+            return (status, int((time.time() - started) * 1000))
+        logger.debug("ashby adapter failed pre-submit; agent proceeds", exc_info=True)
+        return None
+
+    final_state = "verified" if verified else "quarantined"
+    status = "applied" if verified else "crash_unconfirmed"
+    try:
+        attempt_store.transition(
+            attempt_id, expected="submit_started", state=final_state,
+            verification_method="ashby_dom_confirmation" if verified else None,
+            verification_ref=str(url)[:500] if verified else None,
+            evidence={"verification_status": "verified" if verified else "unverified"},
+        )
+    except Exception:
+        logger.exception("ashby post-submit attempt finalization failed")
+        final_state = "quarantined"
+        status = "crash_unconfirmed"
+    _adapter_route_stats[worker_id] = {
+        "route": "adapter_submit:ashby",
+        "adapter_name": "ashby",
+        "adapter_plan_ready": True,
+        "attempt_id": attempt_id,
+        "route_version": "ashby-v1",
+        "adapter_version": "v1",
+        "submit_checkpoint_state": final_state,
+        "verification_status": "verified" if status == "applied" else "unverified",
+        "verification_method": "ashby_dom_confirmation" if status == "applied" else None,
+    }
+    return (status, int((time.time() - started) * 1000))
+
+
 def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) -> None:
     """Opt-in SHADOW validation of the deterministic Lever adapter.
 
@@ -1824,6 +1984,29 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
         _last_run_stats[worker_id] = run_stats
         return status, duration_ms
+
+    ashby_result = _maybe_ashby_apply(
+        job, port, dry_run=dry_run, resume_text=resume_text,
+        resume_path=resume_path, worker_id=worker_id, attempt_store=attempt_store,
+    )
+    if ashby_result is not None:
+        status, duration_ms = ashby_result
+        return _record_run_metadata(
+            status,
+            duration_ms,
+            stats_data={
+                "route": "adapter_submit:ashby",
+                "adapter_name": "ashby",
+                "adapter_plan_ready": True,
+                "failure_class": None if status == "applied" else "adapter_no_confirmation",
+                "safe_requeue": False,
+                "worker_level_failure": False,
+                "application_tool_calls": 0,
+                "tool_calls_total": 0,
+                "last_tool": "ashby_adapter",
+            },
+            last_tool="ashby_adapter",
+        )
 
     # Opt-in deterministic Greenhouse adapter (no-op unless
     # APPLYPILOT_GREENHOUSE_ADAPTER is set). Owns the application only with the
