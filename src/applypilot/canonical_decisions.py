@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -76,6 +77,7 @@ _APPLY_REQUIRED_COLUMNS = (
     "blockers_json",
     "evidence_node_ids_json",
     "uncertainty_json",
+    "title_signals_json",
     "explanation",
     "created_at",
     "expires_at",
@@ -178,13 +180,99 @@ def _complete_row(
 
 
 def _assert_equal(
-    existing: Mapping[str, Any], proposed: Mapping[str, Any], *, identity: str
+    existing: Mapping[str, Any],
+    proposed: Mapping[str, Any],
+    *,
+    identity: str,
+    timestamp_columns: tuple[str, ...] = (),
 ) -> None:
-    changed = [key for key in proposed if existing.get(key) != proposed[key]]
+    changed = []
+    for key in proposed:
+        if key in timestamp_columns:
+            try:
+                existing_value = _normalize_timestamp(
+                    existing.get(key), field=key, allow_none=True
+                )
+                proposed_value = _normalize_timestamp(
+                    proposed[key], field=key, allow_none=True
+                )
+            except ValueError:
+                existing_value = existing.get(key)
+                proposed_value = proposed[key]
+        else:
+            existing_value = existing.get(key)
+            proposed_value = proposed[key]
+        if existing_value != proposed_value:
+            changed.append(key)
     if changed:
         raise ImmutableDecisionConflict(
             f"immutable row {identity!r} differs in: {', '.join(changed)}"
         )
+
+
+def _parse_json(value: Any, *, field: str) -> Any:
+    if not isinstance(value, str):
+        raise PolicyValidationError(f"{field} must be JSON text")
+
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {constant}")
+
+    try:
+        return json.loads(value, parse_constant=reject_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise PolicyValidationError(f"{field} must contain valid JSON") from exc
+
+
+def _validate_apply_semantics(row: Mapping[str, Any]) -> None:
+    uncertainty = _parse_json(row["uncertainty_json"], field="uncertainty_json")
+    blockers = _parse_json(row["blockers_json"], field="blockers_json")
+    requirements = _parse_json(row["requirements_json"], field="requirements_json")
+    evidence_ids = _parse_json(
+        row["evidence_node_ids_json"], field="evidence_node_ids_json"
+    )
+    title_signals = _parse_json(row["title_signals_json"], field="title_signals_json")
+
+    if not isinstance(uncertainty, dict):
+        raise PolicyValidationError("uncertainty_json must contain an object")
+    if not isinstance(blockers, list):
+        raise PolicyValidationError("blockers_json must contain a list")
+    if not isinstance(requirements, list) or not requirements:
+        raise PolicyValidationError("requirements_json must contain a nonempty list")
+    if (
+        not isinstance(evidence_ids, list)
+        or not evidence_ids
+        or any(not isinstance(value, str) or not value.strip() for value in evidence_ids)
+    ):
+        raise PolicyValidationError(
+            "evidence_node_ids_json must contain nonblank string IDs"
+        )
+    if not isinstance(title_signals, list):
+        raise PolicyValidationError("title_signals_json must contain a list")
+    if not isinstance(row["explanation"], str) or not row["explanation"].strip():
+        raise PolicyValidationError("explanation must be nonblank")
+
+    for field in (
+        "qualification_score",
+        "preference_score",
+        "outcome_score",
+        "final_score",
+    ):
+        value = row[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 <= value <= 10
+        ):
+            raise PolicyValidationError(f"{field} must be finite and between 0 and 10")
+    confidence = row["confidence"]
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence)
+        or not 0 <= confidence <= 1
+    ):
+        raise PolicyValidationError("confidence must be finite and between 0 and 1")
 
 
 def _prepare_decision(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -201,6 +289,7 @@ def _prepare_decision(row: Mapping[str, Any]) -> dict[str, Any]:
             raise PolicyValidationError(
                 f"apply decision missing required fields: {', '.join(missing)}"
             )
+        _validate_apply_semantics(proposed)
     return proposed
 
 
@@ -266,7 +355,12 @@ def insert_decisions(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]]
                 (decision_id,),
             )
             if existing is not None:
-                _assert_equal(existing, proposed, identity=str(decision_id))
+                _assert_equal(
+                    existing,
+                    proposed,
+                    identity=str(decision_id),
+                    timestamp_columns=("created_at", "expires_at"),
+                )
                 continue
 
             identity_match = _select_one(
@@ -493,16 +587,36 @@ def eligible_decision(
           AND p.status IN ('canary', 'active')
           AND d.action = 'apply'
           AND d.qualification_verdict = 'qualified'
-          AND d.qualification_score IS NOT NULL
-          AND d.preference_score IS NOT NULL
-          AND d.outcome_score IS NOT NULL
-          AND d.final_score IS NOT NULL
-          AND d.confidence IS NOT NULL
-          AND d.requirements_json IS NOT NULL
-          AND d.blockers_json IS NOT NULL
-          AND d.evidence_node_ids_json IS NOT NULL
-          AND d.uncertainty_json IS NOT NULL
+          AND d.qualification_score BETWEEN 0 AND 10
+          AND d.preference_score BETWEEN 0 AND 10
+          AND d.outcome_score BETWEEN 0 AND 10
+          AND d.final_score BETWEEN 0 AND 10
+          AND d.confidence BETWEEN 0 AND 1
+          AND CASE WHEN json_valid(d.uncertainty_json)
+                   THEN json_type(d.uncertainty_json) END = 'object'
+          AND CASE WHEN json_valid(d.blockers_json)
+                   THEN json_type(d.blockers_json) END = 'array'
+          AND CASE WHEN json_valid(d.requirements_json)
+                   THEN json_type(d.requirements_json) END = 'array'
+          AND CASE WHEN json_valid(d.requirements_json)
+                   THEN json_array_length(d.requirements_json) END > 0
+          AND CASE WHEN json_valid(d.evidence_node_ids_json)
+                   THEN json_type(d.evidence_node_ids_json) END = 'array'
+          AND CASE WHEN json_valid(d.evidence_node_ids_json)
+                   THEN json_array_length(d.evidence_node_ids_json) END > 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(
+                  CASE WHEN json_valid(d.evidence_node_ids_json)
+                       THEN d.evidence_node_ids_json ELSE '[]' END
+              ) AS evidence
+              WHERE evidence.type <> 'text'
+                 OR trim(CAST(evidence.value AS TEXT)) = ''
+          )
+          AND CASE WHEN json_valid(d.title_signals_json)
+                   THEN json_type(d.title_signals_json) END = 'array'
           AND d.explanation IS NOT NULL
+          AND trim(d.explanation) <> ''
           AND d.created_at IS NOT NULL
           AND julianday(d.created_at) IS NOT NULL
           AND d.expires_at IS NOT NULL

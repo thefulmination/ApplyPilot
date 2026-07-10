@@ -55,10 +55,10 @@ def decision(
         "qualification_verdict": verdict,
         "action": action,
         "confidence": 0.88,
-        "uncertainty_json": "[]",
+        "uncertainty_json": "{}",
         "blockers_json": "[]",
-        "requirements_json": "[]",
-        "evidence_node_ids_json": "[]",
+        "requirements_json": '[{"requirement":"Python"}]',
+        "evidence_node_ids_json": '["evidence-1"]',
         "title_signals_json": "[]",
         "explanation": "Evidence-backed match",
         "input_hash": f"hash-{decision_id}",
@@ -84,6 +84,32 @@ def prepare_policy(conn, version: str = "p1", lane: str = "ats") -> None:
 def validate(conn, version: str = "p1") -> None:
     repo.record_replay_metrics(conn, version, valid_metrics())
     repo.validate_policy(conn, version)
+
+
+def persist_raw_decision(conn, row: dict, *, project: bool = False) -> None:
+    columns = tuple(row)
+    conn.execute(
+        f"INSERT INTO job_decisions ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        tuple(row[column] for column in columns),
+    )
+    if project:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET canonical_decision_id = ?, canonical_policy_version = ?,
+                canonical_action = ?, canonical_score = ?, canonical_decided_at = ?
+            WHERE url = ?
+            """,
+            (
+                row["decision_id"],
+                row["policy_version"],
+                row["action"],
+                row["final_score"],
+                row["created_at"],
+                row["job_url"],
+            ),
+        )
 
 
 def test_create_draft_policy_is_idempotent_but_changed_row_conflicts(conn) -> None:
@@ -190,6 +216,22 @@ def test_canonical_identity_conflict_raises_repository_exception(conn) -> None:
     with pytest.raises(repo.ImmutableDecisionConflict):
         repo.insert_decisions(conn, [conflicting])
 
+    assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 1
+
+
+def test_timestamp_format_equivalent_replay_is_idempotent(conn) -> None:
+    prepare_policy(conn)
+    stored = decision() | {
+        "created_at": "2026-07-10T12:00:00Z",
+        "expires_at": "2026-07-11T12:00:00Z",
+    }
+    persist_raw_decision(conn, stored)
+    replay = decision() | {
+        "created_at": "2026-07-10T12:00:00+00:00",
+        "expires_at": "2026-07-11T12:00:00.000+00:00",
+    }
+
+    assert repo.insert_decisions(conn, [replay]) == 0
     assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 1
 
 
@@ -466,27 +508,90 @@ def test_insert_rejects_unorderable_decision_timestamps(conn, timestamp_change) 
     assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize(
+    "invalid_change",
+    (
+        {"uncertainty_json": "not-json"},
+        {"uncertainty_json": '{"spread":NaN}'},
+        {"uncertainty_json": "[]"},
+        {"blockers_json": "{}"},
+        {"requirements_json": "{}"},
+        {"evidence_node_ids_json": "{}"},
+        {"title_signals_json": "{}"},
+    ),
+)
+def test_insert_rejects_malformed_or_wrong_shape_apply_json(conn, invalid_change) -> None:
+    prepare_policy(conn)
+
+    with pytest.raises((repo.PolicyValidationError, ValueError)):
+        repo.insert_decisions(conn, [decision() | invalid_change])
+
+    assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "empty_change",
+    (
+        {"requirements_json": "[]"},
+        {"evidence_node_ids_json": "[]"},
+        {"evidence_node_ids_json": '["evidence-1", "  "]'},
+        {"explanation": "   "},
+    ),
+)
+def test_insert_rejects_empty_apply_evidence(conn, empty_change) -> None:
+    prepare_policy(conn)
+
+    with pytest.raises((repo.PolicyValidationError, ValueError)):
+        repo.insert_decisions(conn, [decision() | empty_change])
+
+
+@pytest.mark.parametrize(
+    "numeric_change",
+    (
+        {"qualification_score": -0.1},
+        {"preference_score": 10.1},
+        {"outcome_score": float("inf")},
+        {"final_score": float("nan")},
+        {"confidence": -0.1},
+        {"confidence": 1.1},
+        {"confidence": float("inf")},
+    ),
+)
+def test_insert_rejects_out_of_range_or_nonfinite_apply_numbers(conn, numeric_change) -> None:
+    prepare_policy(conn)
+
+    with pytest.raises((repo.PolicyValidationError, ValueError)):
+        repo.insert_decisions(conn, [decision() | numeric_change])
+
+
+@pytest.mark.parametrize(
+    "malformed_change",
+    (
+        {"uncertainty_json": "not-json"},
+        {"requirements_json": "[]"},
+        {"evidence_node_ids_json": '[""]'},
+        {"title_signals_json": "{}"},
+        {"final_score": float("inf")},
+        {"confidence": 2.0},
+        {"explanation": "  "},
+    ),
+)
+def test_malformed_persisted_apply_decision_is_not_eligible(conn, malformed_change) -> None:
+    prepare_policy(conn)
+    validate(conn)
+    repo.activate_policy(conn, "p1", lane="ats")
+    persist_raw_decision(conn, decision() | malformed_change, project=True)
+
+    assert repo.eligible_decision(conn, "u1", lane="ats", now=NOW) is None
+
+
 def test_incomplete_persisted_apply_decision_is_not_eligible(conn) -> None:
     prepare_policy(conn)
     validate(conn)
     repo.activate_policy(conn, "p1", lane="ats")
     incomplete = decision()
     incomplete["confidence"] = None
-    columns = tuple(incomplete)
-    conn.execute(
-        f"INSERT INTO job_decisions ({', '.join(columns)}) "
-        f"VALUES ({', '.join('?' for _ in columns)})",
-        tuple(incomplete[column] for column in columns),
-    )
-    conn.execute(
-        """
-        UPDATE jobs
-        SET canonical_decision_id = ?, canonical_policy_version = ?,
-            canonical_action = ?, canonical_score = ?, canonical_decided_at = ?
-        WHERE url = ?
-        """,
-        ("d1", "p1", "apply", 0.81, NOW, "u1"),
-    )
+    persist_raw_decision(conn, incomplete, project=True)
 
     assert repo.eligible_decision(conn, "u1", lane="ats", now=NOW) is None
 
