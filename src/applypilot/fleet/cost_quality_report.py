@@ -381,6 +381,35 @@ def render_report_markdown(report: CostQualityReport) -> str:
     else:
         lines.append("| n/a | 0 | n/a | 0 |")
 
+    lines.extend(
+        [
+            "",
+            "## Result Event Routes",
+            "",
+            "Append-only result events; this table is not the canonical queue all-in denominator.",
+            "",
+        ]
+    )
+    if not report.routes.available:
+        lines.append(
+            "Route metrics unavailable until the home schema migration runs."
+        )
+    else:
+        lines.extend(
+            [
+                "| Route | Events | Applied | Cost | Cost/applied |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for route, item in report.routes.by_route.items():
+            lines.append(
+                f"| {route} | {item.count} | {item.applied} | "
+                f"{_fmt_money(item.cost)} | "
+                f"{_fmt_money(item.cost_per_applied) if item.applied else 'n/a'} |"
+            )
+        if not report.routes.by_route:
+            lines.append("| n/a | 0 | 0 | $0.0000 | n/a |")
+
     return "\n".join(lines) + "\n"
 
 

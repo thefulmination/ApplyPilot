@@ -6,6 +6,7 @@ import pytest
 from applypilot.fleet import cost_quality_report
 from applypilot.fleet.cost_quality_report import (
     build_report,
+    CountCost,
     CostQualityReport,
     FailureBucket,
     FleetQueueSummary,
@@ -386,3 +387,51 @@ def test_render_report_markdown_includes_local_only_failure_bucket():
     rendered = render_report_markdown(report)
 
     assert "| email_auth_related | 0 | n/a | 3 |" in rendered
+
+
+def test_render_report_includes_append_only_route_table():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(
+            by_route={
+                "preflight": CountCost(count=4, terminal=4, cost=0),
+                "agent": CountCost(count=2, terminal=2, applied=1, cost=0.75),
+            }
+        ),
+    )
+
+    rendered = render_report_markdown(report)
+
+    assert "## Result Event Routes" in rendered
+    assert "Append-only result events" in rendered
+    assert "not the canonical queue all-in denominator" in rendered
+    assert "| Route | Events | Applied | Cost | Cost/applied |" in rendered
+    assert "| agent | 2 | 1 | $0.7500 | $0.7500 |" in rendered
+    assert "| preflight | 4 | 0 | $0.0000 | n/a |" in rendered
+    assert rendered.index("## Result Event Routes") > rendered.index("## Failure Buckets")
+
+
+def test_render_report_marks_route_metrics_unavailable_before_migration():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(available=False),
+    )
+
+    assert (
+        "Route metrics unavailable until the home schema migration runs."
+        in render_report_markdown(report)
+    )
+
+
+def test_render_report_includes_na_route_row_when_no_events_exist():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(),
+    )
+
+    assert (
+        "| n/a | 0 | 0 | $0.0000 | n/a |" in render_report_markdown(report)
+    )
