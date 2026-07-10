@@ -315,16 +315,31 @@ def _perfect_component_matching(component_requests, request_edges):
         return found
 
     def augment(request_id):
-        for message_id in request_edges[request_id]:
+        stack = [(request_id, 0)]
+        path = []
+        while stack:
+            current_request, edge_index = stack[-1]
+            edges = request_edges[current_request]
+            if edge_index == len(edges):
+                distance[current_request] = None
+                stack.pop()
+                if path and len(path) >= len(stack):
+                    path.pop()
+                continue
+
+            message_id = edges[edge_index]
+            stack[-1] = (current_request, edge_index + 1)
             paired_request = pair_message.get(message_id)
-            if paired_request is None or (
-                distance[paired_request] == distance[request_id] + 1
-                and augment(paired_request)
-            ):
-                pair_request[request_id] = message_id
-                pair_message[message_id] = request_id
+            if paired_request is None:
+                pair_request[current_request] = message_id
+                pair_message[message_id] = current_request
+                for path_request, path_message in reversed(path):
+                    pair_request[path_request] = path_message
+                    pair_message[path_message] = path_request
                 return True
-        distance[request_id] = None
+            if distance[paired_request] == distance[current_request] + 1:
+                path.append((current_request, message_id))
+                stack.append((paired_request, 0))
         return False
 
     matched = 0
@@ -449,8 +464,8 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
         cur.execute(
             "SELECT id, requested_at, sender_hint FROM otp_request "
             "WHERE code IS NULL AND consumed_at IS NULL "
-            "      AND (expires_at IS NULL OR expires_at > now()) "
-            "ORDER BY requested_at LIMIT 1000"
+            "      AND expires_at > now() "
+            "ORDER BY requested_at, id LIMIT 1000"
         )
         pending = cur.fetchall()
     conn.commit()

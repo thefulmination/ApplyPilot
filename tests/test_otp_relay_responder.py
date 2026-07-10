@@ -1,5 +1,6 @@
 """Home responder: match Gmail codes to pending requests (time-based, single-assign)."""
 import datetime as dt
+import sys
 
 import pytest
 from psycopg.pq import TransactionStatus
@@ -202,6 +203,24 @@ def test_unique_assignments_finds_globally_unique_complete_matching():
     ]
 
 
+def test_perfect_matching_handles_1000_item_augmenting_path_iteratively():
+    size = 1000
+    request_edges = {
+        request_id: list(range(size - 1, request_id - 1, -1))
+        for request_id in range(size)
+    }
+
+    original_recursion_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(500)
+        matching = otp_relay._perfect_component_matching(range(size), request_edges)
+    finally:
+        sys.setrecursionlimit(original_recursion_limit)
+
+    assert matching == {request_id: request_id for request_id in range(size)}
+    assert otp_relay._matching_is_unique(matching, request_edges) is True
+
+
 def test_answer_pending_finds_globally_unique_complete_matching(fleet_db, monkeypatch):
     base = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=4)
     matches = [
@@ -234,6 +253,33 @@ def test_answer_pending_finds_globally_unique_complete_matching(fleet_db, monkey
 
     assert first_code is not None and first_code.value == "111111"
     assert second_code is not None and second_code.value == "222222"
+
+
+def test_legacy_null_expiry_rows_cannot_starve_current_request(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match("current-message", _rfc(now + dt.timedelta(seconds=10)), "654321"),
+    ]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kw: matches,
+    )
+
+    with _fresh(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO otp_request "
+                "(worker_id, url, sender_hint, requested_at, expires_at) "
+                "SELECT 'legacy-' || value, 'https://greenhouse.io/' || value, "
+                "       'greenhouse.io', now() - interval '1 day', NULL "
+                "FROM generate_series(1, 1001) AS value"
+            )
+        conn.commit()
+        current = _pending(conn, worker_id="current-after-legacy")
+
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 1
+        code = otp_relay.poll_for_code(conn, current, timeout_seconds=0)
+
+    assert code is not None and code.value == "654321"
 
 
 def test_answer_pending_bounds_pending_and_candidate_matching_sets(
