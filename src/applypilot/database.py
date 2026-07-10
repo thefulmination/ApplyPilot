@@ -646,6 +646,27 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_status ON auth_challenges(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_job_url ON auth_challenges(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)")
+    claim_index_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        ("idx_auth_challenges_inbox_event_unique",),
+    ).fetchone()
+    if claim_index_exists is None:
+        conn.execute("""
+            UPDATE auth_challenges
+               SET inbox_event_id = NULL
+             WHERE inbox_event_id IS NOT NULL
+               AND id NOT IN (
+                   SELECT MIN(id)
+                     FROM auth_challenges
+                    WHERE inbox_event_id IS NOT NULL
+                    GROUP BY inbox_event_id
+               )
+        """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_challenges_inbox_event_unique
+        ON auth_challenges(inbox_event_id)
+        WHERE inbox_event_id IS NOT NULL
+    """)
     conn.commit()
 
 

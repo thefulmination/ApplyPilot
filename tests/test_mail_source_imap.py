@@ -212,6 +212,18 @@ def test_fetch_respects_max_messages_cap_when_fewer_available():
     assert len(result) == 2
 
 
+def test_fetch_nonpositive_budget_does_no_imap_work():
+    fake = FakeImap(search_ids=[b"1"], messages_by_id={b"1": _base64_plain_raw()})
+    source = ImapMailSource("me@example.com", "app password", imap=fake)
+
+    assert source.fetch(since_days=7, max_messages=0) == []
+    assert source.fetch(since_days=7, max_messages=-1) == []
+    assert fake.login_calls == []
+    assert fake.selected is None
+    assert fake.uid_calls == []
+    assert fake.logged_out is False
+
+
 def test_fetch_uses_gmail_raw_uid_search_when_query_provided():
     ids = [b"1", b"2", b"3", b"4"]
     gmraw_ids = [b"2", b"4"]

@@ -157,3 +157,33 @@ def test_local_mode_passes_request_context_and_busy_inbox_default(monkeypatch):
     assert seen["provider_domain"] == "boards.greenhouse.io"
     assert seen["not_before"] >= before
     assert seen["not_before"].tzinfo is timezone.utc
+
+
+def test_local_mode_returns_hint_only_after_durable_claim(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "local")
+    monkeypatch.setattr(launcher.inbox_auth, "create_auth_challenge", lambda **_kw: 42)
+    monkeypatch.setattr(launcher.inbox_auth, "set_auth_challenge_status", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "mark_auth_challenge_attempt", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "expire_stale_challenges", lambda: 0)
+
+    from applypilot.inbox_auth import AuthEmailMatch, VerificationCandidate
+
+    match = AuthEmailMatch(
+        message_id="m-claim", thread_id="t", sender="no-reply@greenhouse.io",
+        subject="Verify", received_at=datetime.now(timezone.utc).isoformat(),
+        snippet="verification message", candidate=VerificationCandidate(
+            kind="code", value="123456", confidence="high", reasons=("verification_language",), position=0
+        ), reasons=("verification_language",),
+    )
+    monkeypatch.setattr(launcher.inbox_auth, "watch_gmail_for_auth_code", lambda **_kw: match)
+    monkeypatch.setattr(launcher.inbox_auth, "record_inbox_event", lambda **_kw: 9)
+    monkeypatch.setattr(launcher.inbox_auth, "resolve_auth_challenge", lambda **_kw: True)
+    monkeypatch.setattr(
+        launcher.inbox_auth, "claim_auth_match",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+
+    assert launcher._poll_inbox_auth_hint(
+        {"url": "j", "application_url": "https://greenhouse.io/a"}
+    ) is None

@@ -154,6 +154,10 @@ class ImapMailSource:
         max_messages: int,
         gmail_raw_query: str | None = None,
     ) -> list[MailMessage]:
+        budget = int(max_messages)
+        if budget <= 0:
+            return []
+
         imap = self._injected_imap or imaplib.IMAP4_SSL("imap.gmail.com", 993)
         try:
             try:
@@ -186,7 +190,7 @@ class ImapMailSource:
                 _ensure_ok(status, "search", data)
                 ids = _extract_search_ids(data)
 
-            newest_ids = ids[-max_messages:] if max_messages else ids
+            newest_ids = ids[-budget:]
 
             messages: list[MailMessage] = []
             for msg_id in newest_ids:

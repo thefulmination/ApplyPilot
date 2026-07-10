@@ -2221,19 +2221,9 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         inbox_auth.mark_auth_challenge_attempt(challenge_id, "polling")
         inbox_auth.expire_stale_challenges()
 
-        match = inbox_auth.watch_gmail_for_auth_code(
-            timeout_seconds=timeout,
-            poll_seconds=poll,
-            max_errors=max_errors,
-            minutes=minutes,
-            max_messages=max_messages,
-            not_before=challenge_started_at,
-            provider_domain=provider,
-        )
-        if not match:
-            return None
-        try:
-            event_id = inbox_auth.record_inbox_event(
+        def claim_match(match: inbox_auth.AuthEmailMatch) -> bool:
+            return inbox_auth.claim_auth_match(
+                challenge_id,
                 message_id=match.message_id,
                 thread_id=match.thread_id,
                 sender=match.sender,
@@ -2246,9 +2236,22 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
                 snippet=match.snippet,
                 received_at=match.received_at,
             )
-            inbox_auth.resolve_auth_challenge(challenge_id=challenge_id, inbox_event_id=event_id)
-        except Exception:
-            logger.debug("Failed to persist inbox auth event/challenge resolution", exc_info=True)
+
+        match = inbox_auth.watch_gmail_for_auth_code(
+            timeout_seconds=timeout,
+            poll_seconds=poll,
+            max_errors=max_errors,
+            minutes=minutes,
+            max_messages=max_messages,
+            not_before=challenge_started_at,
+            provider_domain=provider,
+            excluded_message_ids=inbox_auth.claimed_auth_message_ids(),
+            claim_match=claim_match,
+        )
+        if not match:
+            return None
+        if not claim_match(match):
+            return None
 
         return _format_inbox_auth_hint(match)
     except Exception:

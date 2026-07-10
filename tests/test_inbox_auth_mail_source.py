@@ -37,6 +37,42 @@ def test_scan_gmail_for_auth_codes_messages_path_extracts_code():
     assert match.candidate.value == "123456"
 
 
+def test_scan_nonpositive_message_budget_does_not_touch_message_list():
+    class _MustNotIterate:
+        def __getitem__(self, key):
+            raise AssertionError(f"message list touched: {key}")
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        messages=_MustNotIterate(), max_messages=0
+    ) == []
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        messages=_MustNotIterate(), max_messages=-1
+    ) == []
+
+
+def test_scan_nonpositive_service_budget_does_not_touch_gmail_api():
+    class _MustNotBuildService:
+        def users(self):
+            raise AssertionError("Gmail API touched")
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        service=_MustNotBuildService(), max_messages=0
+    ) == []
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        service=_MustNotBuildService(), max_messages=-1
+    ) == []
+
+
+def test_watch_nonpositive_budget_does_not_resolve_mail_source(monkeypatch):
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source",
+        lambda: (_ for _ in ()).throw(AssertionError("mail source touched")),
+    )
+
+    assert inbox_auth.watch_gmail_for_auth_code(max_messages=0) is None
+    assert inbox_auth.watch_gmail_for_auth_code(max_messages=-1) is None
+
+
 def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
     """Same subject/sender/body through both paths -> identical candidate value
     and confidence, proving the parser itself is untouched."""
@@ -171,6 +207,47 @@ def test_watch_gmail_for_auth_code_picks_newest_recent_match(monkeypatch):
     assert match is not None
     assert match.message_id == "newer"
     assert match.candidate.value == "222222"
+
+
+def test_watch_continues_after_losing_atomic_message_claim(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    calls = {"fetch": 0, "claim": []}
+
+    def message(message_id, code, seconds):
+        return MailMessage(
+            id=message_id,
+            thread_id=message_id,
+            subject="Verify your email",
+            sender="no-reply@greenhouse.io",
+            date=_rfc(now + dt.timedelta(seconds=seconds)),
+            body=f"Use verification code {code} to continue.",
+        )
+
+    class _RacingSource:
+        def fetch(self, **_kwargs):
+            calls["fetch"] += 1
+            if calls["fetch"] == 1:
+                return [message("lost", "111111", 1)]
+            return [message("lost", "111111", 1), message("won", "222222", 2)]
+
+    def claim(match):
+        calls["claim"].append(match.message_id)
+        return match.message_id == "won"
+
+    monkeypatch.setattr("applypilot.mail_source.get_mail_source", lambda: _RacingSource())
+
+    match = inbox_auth.watch_gmail_for_auth_code(
+        timeout_seconds=1,
+        poll_seconds=0,
+        max_errors=1,
+        minutes=10,
+        max_messages=25,
+        claim_match=claim,
+    )
+
+    assert match is not None
+    assert match.message_id == "won"
+    assert calls["claim"] == ["lost", "won"]
 
 
 def test_watch_rejects_prechallenge_and_wrong_provider_messages(monkeypatch):
