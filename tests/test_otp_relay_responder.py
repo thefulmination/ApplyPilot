@@ -173,6 +173,112 @@ def test_mixed_graph_assigns_only_mutual_unique_pair(fleet_db, monkeypatch):
     assert workday_code is not None and workday_code.value == "333333"
 
 
+def test_unique_assignments_finds_globally_unique_complete_matching():
+    base = dt.datetime(2026, 1, 1, 10, 0, tzinfo=dt.timezone.utc)
+    requests = [
+        {"id": 1, "requested_at": base, "sender_hint": "greenhouse.io"},
+        {
+            "id": 2,
+            "requested_at": base + dt.timedelta(minutes=2),
+            "sender_hint": "greenhouse.io",
+        },
+    ]
+    first = _Match("m1", _rfc(base + dt.timedelta(minutes=1)), "111111")
+    second = _Match("m2", _rfc(base + dt.timedelta(minutes=3)), "222222")
+
+    assignments = otp_relay._unique_assignments(
+        requests,
+        [
+            (first, base + dt.timedelta(minutes=1)),
+            (second, base + dt.timedelta(minutes=3)),
+        ],
+        set(),
+        0,
+    )
+
+    assert [(request["id"], match.message_id) for request, match in assignments] == [
+        (1, "m1"),
+        (2, "m2"),
+    ]
+
+
+def test_answer_pending_finds_globally_unique_complete_matching(fleet_db, monkeypatch):
+    base = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=4)
+    matches = [
+        _Match("global-m1", _rfc(base + dt.timedelta(minutes=1)), "111111"),
+        _Match("global-m2", _rfc(base + dt.timedelta(minutes=3)), "222222"),
+    ]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **_kw: matches,
+    )
+
+    with _fresh(fleet_db) as conn:
+        first = _pending(conn, worker_id="global-first")
+        second = _pending(conn, worker_id="global-second")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE otp_request SET requested_at=%s WHERE id=%s",
+                (base, first),
+            )
+            cur.execute(
+                "UPDATE otp_request SET requested_at=%s WHERE id=%s",
+                (base + dt.timedelta(minutes=2), second),
+            )
+        conn.commit()
+
+        assert otp_relay.answer_pending(
+            conn, _FakeGmail(matches), skew_seconds=0,
+        ) == 2
+        first_code = otp_relay.poll_for_code(conn, first, timeout_seconds=0)
+        second_code = otp_relay.poll_for_code(conn, second, timeout_seconds=0)
+
+    assert first_code is not None and first_code.value == "111111"
+    assert second_code is not None and second_code.value == "222222"
+
+
+def test_answer_pending_bounds_pending_and_candidate_matching_sets(
+    fleet_db, monkeypatch,
+):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [
+        _Match(f"bounded-{index}", _rfc(now), f"{index % 1_000_000:06d}")
+        for index in range(1001)
+    ]
+    observed = {}
+
+    def scan(**kwargs):
+        observed["scan_max_messages"] = kwargs["max_messages"]
+        return matches
+
+    def capture(pending, parsed, used_ids, skew_seconds):
+        observed["pending"] = len(pending)
+        observed["parsed"] = len(parsed)
+        return []
+
+    monkeypatch.setattr(otp_relay.inbox_auth, "scan_gmail_for_auth_codes", scan)
+    monkeypatch.setattr(otp_relay, "_unique_assignments", capture)
+
+    with _fresh(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
+                "SELECT 'bounded-' || value, 'https://greenhouse.io/' || value, "
+                "       'greenhouse.io', now() + interval '5 minutes' "
+                "FROM generate_series(1, 1001) AS value"
+            )
+        conn.commit()
+
+        assert otp_relay.answer_pending(
+            conn, _FakeGmail(matches), max_messages=5000,
+        ) == 0
+
+    assert observed == {
+        "scan_max_messages": 1000,
+        "pending": 1000,
+        "parsed": 1000,
+    }
+
+
 def test_answer_pending_returns_without_scan_when_responder_lock_is_held(
     fleet_db, monkeypatch,
 ):
@@ -239,6 +345,54 @@ def test_answer_pending_releases_responder_lock_when_scanner_aborts_transaction(
             )
             assert cur.fetchone()["released"] is True
         second.commit()
+
+
+def test_answer_pending_preserves_original_error_when_cleanup_rollback_fails(
+    monkeypatch,
+):
+    class CleanupFailure(Exception):
+        pass
+
+    class Cursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            if "pg_try_advisory_lock" in query:
+                self.row = {"acquired": True}
+            elif "pg_advisory_unlock" in query:
+                self.conn.unlock_attempted = True
+
+        def fetchone(self):
+            return self.row
+
+    class Conn:
+        unlock_attempted = False
+
+        def cursor(self):
+            return Cursor(self)
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            raise CleanupFailure("rollback failed")
+
+    def fail_responder(*_args, **_kwargs):
+        raise RuntimeError("scanner failed")
+
+    conn = Conn()
+    monkeypatch.setattr(otp_relay, "_answer_pending_locked", fail_responder)
+
+    with pytest.raises(RuntimeError, match="scanner failed"):
+        otp_relay.answer_pending(conn, _FakeGmail([]))
+    assert conn.unlock_attempted is True
 
 
 def test_responder_lock_key_is_stable_signed_64_bit():

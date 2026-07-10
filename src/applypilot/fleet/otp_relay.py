@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import itertools
 import math
 import os
 import time
@@ -22,6 +23,7 @@ from applypilot import inbox_auth
 
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
 _DEFAULT_SCAN_MAX_MESSAGES = 1000
+_MAX_RESPONDER_ITEMS = 1000
 _REQUEST_LOCK_TIMEOUT_SECONDS = 5.0
 _REQUEST_LOCK_RETRY_SECONDS = 0.05
 
@@ -231,42 +233,160 @@ def _eligible_for_request(request, match, received_at, skew_seconds: int) -> boo
 
 
 def _unique_assignments(pending, parsed, used_ids, skew_seconds: int):
-    remaining_requests = {request["id"]: request for request in pending}
+    remaining_requests = {
+        request["id"]: request for request in pending[:_MAX_RESPONDER_ITEMS]
+    }
     remaining_messages = {}
     for match, received_at in parsed:
         if match.message_id and match.message_id not in used_ids:
             remaining_messages.setdefault(match.message_id, (match, received_at))
+            if len(remaining_messages) == _MAX_RESPONDER_ITEMS:
+                break
 
-    assigned = []
-    while remaining_requests and remaining_messages:
-        request_edges = {}
-        message_edges = {message_id: set() for message_id in remaining_messages}
-        for request_id, request in remaining_requests.items():
-            eligible_ids = {
-                message_id
-                for message_id, (match, received_at) in remaining_messages.items()
-                if _eligible_for_request(request, match, received_at, skew_seconds)
-            }
-            request_edges[request_id] = eligible_ids
-            for message_id in eligible_ids:
-                message_edges[message_id].add(request_id)
+    request_edges = {}
+    message_edges = {message_id: [] for message_id in remaining_messages}
+    for request_id, request in remaining_requests.items():
+        eligible_ids = []
+        for message_id, (match, received_at) in remaining_messages.items():
+            if _eligible_for_request(request, match, received_at, skew_seconds):
+                eligible_ids.append(message_id)
+                message_edges[message_id].append(request_id)
+        request_edges[request_id] = eligible_ids
 
-        mutual_unique = []
-        for request_id, message_ids in request_edges.items():
-            if len(message_ids) != 1:
+    assigned_by_request = {}
+    seen_requests = set()
+    for start_request_id in remaining_requests:
+        if start_request_id in seen_requests or not request_edges[start_request_id]:
+            continue
+        component_requests = set()
+        component_messages = set()
+        request_queue = [start_request_id]
+        while request_queue:
+            request_id = request_queue.pop()
+            if request_id in component_requests:
                 continue
-            message_id = next(iter(message_ids))
-            if len(message_edges[message_id]) == 1:
-                mutual_unique.append((request_id, message_id))
-        if not mutual_unique:
-            break
+            component_requests.add(request_id)
+            seen_requests.add(request_id)
+            for message_id in request_edges[request_id]:
+                if message_id in component_messages:
+                    continue
+                component_messages.add(message_id)
+                request_queue.extend(message_edges[message_id])
 
-        for request_id, message_id in mutual_unique:
-            request = remaining_requests.pop(request_id)
-            match, _received_at = remaining_messages.pop(message_id)
-            assigned.append((request, match))
+        if len(component_requests) != len(component_messages):
+            continue
+        matching = _perfect_component_matching(component_requests, request_edges)
+        if matching is None or not _matching_is_unique(matching, request_edges):
+            continue
+        assigned_by_request.update(matching)
 
-    return assigned
+    return [
+        (request, remaining_messages[assigned_by_request[request["id"]]][0])
+        for request in pending[:_MAX_RESPONDER_ITEMS]
+        if request["id"] in assigned_by_request
+    ]
+
+
+def _perfect_component_matching(component_requests, request_edges):
+    pair_request = {request_id: None for request_id in component_requests}
+    pair_message = {}
+    distance = {}
+
+    def find_augmenting_layers():
+        queue = []
+        for request_id in component_requests:
+            if pair_request[request_id] is None:
+                distance[request_id] = 0
+                queue.append(request_id)
+            else:
+                distance[request_id] = None
+        found = False
+        index = 0
+        while index < len(queue):
+            request_id = queue[index]
+            index += 1
+            for message_id in request_edges[request_id]:
+                paired_request = pair_message.get(message_id)
+                if paired_request is None:
+                    found = True
+                elif distance[paired_request] is None:
+                    distance[paired_request] = distance[request_id] + 1
+                    queue.append(paired_request)
+        return found
+
+    def augment(request_id):
+        for message_id in request_edges[request_id]:
+            paired_request = pair_message.get(message_id)
+            if paired_request is None or (
+                distance[paired_request] == distance[request_id] + 1
+                and augment(paired_request)
+            ):
+                pair_request[request_id] = message_id
+                pair_message[message_id] = request_id
+                return True
+        distance[request_id] = None
+        return False
+
+    matched = 0
+    while find_augmenting_layers():
+        for request_id in component_requests:
+            if pair_request[request_id] is None and augment(request_id):
+                matched += 1
+    if matched != len(component_requests):
+        return None
+    return pair_request
+
+
+def _matching_is_unique(matching, request_edges) -> bool:
+    matched_request_for_message = {
+        message_id: request_id for request_id, message_id in matching.items()
+    }
+    alternating_edges = {request_id: set() for request_id in matching}
+    indegree = {request_id: 0 for request_id in matching}
+    for request_id in matching:
+        for message_id in request_edges[request_id]:
+            paired_request = matched_request_for_message[message_id]
+            if paired_request == request_id:
+                continue
+            if paired_request not in alternating_edges[request_id]:
+                alternating_edges[request_id].add(paired_request)
+                indegree[paired_request] += 1
+
+    queue = [request_id for request_id, degree in indegree.items() if degree == 0]
+    visited = 0
+    while queue:
+        request_id = queue.pop()
+        visited += 1
+        for paired_request in alternating_edges[request_id]:
+            indegree[paired_request] -= 1
+            if indegree[paired_request] == 0:
+                queue.append(paired_request)
+    return visited == len(matching)
+
+
+def _rollback_quietly(conn) -> None:
+    try:
+        conn.rollback()
+    except BaseException:
+        pass
+
+
+def _release_responder_lock(conn, lock_key: int) -> None:
+    cleanup_error = None
+    try:
+        conn.rollback()
+    except BaseException as exc:
+        cleanup_error = exc
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+        conn.commit()
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+        _rollback_quietly(conn)
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
@@ -285,7 +405,7 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
         conn.commit()
         if not acquired:
             return 0
-        return _answer_pending_locked(
+        answered = _answer_pending_locked(
             conn,
             gmail_service,
             window_minutes=window_minutes,
@@ -293,20 +413,17 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
             skew_seconds=skew_seconds,
             answered_ttl_seconds=answered_ttl_seconds,
         )
-    except Exception:
-        if not acquired:
-            conn.rollback()
-        raise
-    finally:
+    except BaseException:
         if acquired:
-            conn.rollback()
             try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+                _release_responder_lock(conn, lock_key)
+            except BaseException:
+                pass
+        else:
+            _rollback_quietly(conn)
+        raise
+    _release_responder_lock(conn, lock_key)
+    return answered
 
 
 def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15,
@@ -333,13 +450,14 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
             "SELECT id, requested_at, sender_hint FROM otp_request "
             "WHERE code IS NULL AND consumed_at IS NULL "
             "      AND (expires_at IS NULL OR expires_at > now()) "
-            "ORDER BY requested_at"
+            "ORDER BY requested_at LIMIT 1000"
         )
         pending = cur.fetchall()
     conn.commit()
     if not pending:
         return 0
     answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
+    scan_max_messages = min(max_messages, _MAX_RESPONDER_ITEMS)
 
     if gmail_service is None:
         from applypilot.mail_source import get_mail_source
@@ -347,22 +465,29 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
         since_days = max(1, (window_minutes + 1439) // 1440)
         msgs = get_mail_source().fetch(
             since_days=since_days,
-            max_messages=max_messages,
+            max_messages=scan_max_messages,
             gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
         )
         matches = inbox_auth.scan_gmail_for_auth_codes(
-            messages=msgs, minutes=window_minutes, max_messages=max_messages)
+            messages=msgs, minutes=window_minutes, max_messages=scan_max_messages)
     else:
         matches = inbox_auth.scan_gmail_for_auth_codes(
-            service=gmail_service, minutes=window_minutes, max_messages=max_messages)
+            service=gmail_service, minutes=window_minutes,
+            max_messages=scan_max_messages)
     matches = inbox_auth.eligible_auth_matches(
-        matches,
+        list(itertools.islice(matches, _MAX_RESPONDER_ITEMS)),
         reference_time=_dt.datetime.now(_dt.timezone.utc),
         skew_seconds=skew_seconds,
     )
     parsed = [(m, _parse_email_dt(m.received_at)) for m in matches]
     parsed = [(m, ts) for (m, ts) in parsed if ts is not None and m.message_id]
     parsed.sort(key=lambda mt: mt[1])
+    unique_parsed = {}
+    for match, received_at in parsed:
+        unique_parsed.setdefault(match.message_id, (match, received_at))
+        if len(unique_parsed) == _MAX_RESPONDER_ITEMS:
+            break
+    parsed = list(unique_parsed.values())
     if not parsed:
         return 0
 
