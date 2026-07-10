@@ -816,7 +816,61 @@ def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> 
         CREATE INDEX IF NOT EXISTS idx_reviewed_outcomes_status
         ON reviewed_outcomes(review_status)
     """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_job_decisions_policy_lane_insert
+        BEFORE INSERT ON job_decisions
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM decision_policy_versions
+            WHERE policy_version = NEW.policy_version
+              AND lane = NEW.lane
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'decision policy lane mismatch');
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_job_decisions_policy_lane_update
+        BEFORE UPDATE OF policy_version, lane ON job_decisions
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM decision_policy_versions
+            WHERE policy_version = NEW.policy_version
+              AND lane = NEW.lane
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'decision policy lane mismatch');
+        END
+    """)
     conn.commit()
+
+    violations: list[str] = []
+    for table in ("job_decisions", "reviewed_outcomes"):
+        for row in conn.execute(f"PRAGMA foreign_key_check({table})").fetchall():
+            violations.append(
+                f"foreign key violation: {row[0]} rowid={row[1]} "
+                f"references {row[2]} (fk={row[3]})"
+            )
+
+    lane_mismatches = conn.execute("""
+        SELECT d.decision_id, d.policy_version, d.lane, p.lane
+        FROM job_decisions d
+        JOIN decision_policy_versions p ON p.policy_version = d.policy_version
+        WHERE d.lane <> p.lane
+        ORDER BY d.decision_id
+    """).fetchall()
+    for row in lane_mismatches:
+        violations.append(
+            f"lane mismatch: decision_id={row[0]} policy_version={row[1]} "
+            f"decision_lane={row[2]} policy_lane={row[3]}"
+        )
+
+    if violations:
+        raise RuntimeError(
+            "Canonical decision schema integrity check failed: " + "; ".join(violations)
+        )
 
 
 def ensure_tenant_tables(conn: sqlite3.Connection | None = None) -> None:

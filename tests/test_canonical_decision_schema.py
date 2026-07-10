@@ -40,6 +40,74 @@ def _insert_decision(
     )
 
 
+def _create_previous_canonical_schema(db_path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE jobs (
+            url TEXT PRIMARY KEY,
+            title TEXT
+        );
+        CREATE TABLE email_events (
+            message_id TEXT PRIMARY KEY,
+            job_url TEXT,
+            occurred_at TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            scanned_at TEXT NOT NULL,
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        );
+        CREATE TABLE decision_policy_versions (
+            policy_version TEXT PRIMARY KEY,
+            lane TEXT NOT NULL CHECK(lane IN ('ats', 'linkedin')),
+            status TEXT NOT NULL CHECK(status IN ('draft', 'validated', 'canary', 'active', 'retired')),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE job_decisions (
+            decision_id TEXT PRIMARY KEY,
+            job_url TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            lane TEXT NOT NULL CHECK(lane IN ('ats', 'linkedin')),
+            qualification_verdict TEXT NOT NULL,
+            action TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            UNIQUE(job_url, policy_version, input_hash),
+            FOREIGN KEY(job_url) REFERENCES jobs(url),
+            FOREIGN KEY(policy_version) REFERENCES decision_policy_versions(policy_version)
+        );
+        CREATE TABLE reviewed_outcomes (
+            event_id TEXT NOT NULL,
+            job_url TEXT NOT NULL,
+            review_status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(event_id, job_url),
+            FOREIGN KEY(event_id) REFERENCES email_events(message_id),
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO jobs(url, title) VALUES ('https://example.test/job', 'Existing role')"
+    )
+    conn.execute(
+        """
+        INSERT INTO email_events(message_id, occurred_at, stage, scanned_at)
+        VALUES ('event-1', ?, 'screen', ?)
+        """,
+        (_NOW, _NOW),
+    )
+    conn.execute(
+        """
+        INSERT INTO decision_policy_versions(policy_version, lane, status, created_at)
+        VALUES ('policy-v1', 'ats', 'draft', ?)
+        """,
+        (_NOW,),
+    )
+    conn.commit()
+    return conn
+
+
 def test_init_db_creates_canonical_decision_schema(tmp_path) -> None:
     conn = database.init_db(tmp_path / "brain.db")
 
@@ -126,6 +194,88 @@ def test_init_db_migrates_existing_jobs_database_additively(tmp_path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
     }
+
+
+def test_upgrade_installs_lane_consistency_triggers(tmp_path) -> None:
+    db_path = tmp_path / "previous.db"
+    previous = _create_previous_canonical_schema(db_path)
+    previous.close()
+
+    conn = database.init_db(db_path)
+    triggers = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'job_decisions'"
+        ).fetchall()
+    }
+    assert {
+        "trg_job_decisions_policy_lane_insert",
+        "trg_job_decisions_policy_lane_update",
+    } <= triggers
+
+    with pytest.raises(sqlite3.IntegrityError, match="decision policy lane mismatch"):
+        _insert_decision(conn, "insert-mismatch", lane="linkedin")
+
+    _insert_decision(conn, "valid-decision")
+    with pytest.raises(sqlite3.IntegrityError, match="decision policy lane mismatch"):
+        conn.execute(
+            "UPDATE job_decisions SET lane = 'linkedin' WHERE decision_id = 'valid-decision'"
+        )
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected"),
+    (
+        ("orphan_decision", "foreign key violation: job_decisions"),
+        ("orphan_outcome", "foreign key violation: reviewed_outcomes"),
+        ("lane_mismatch", "lane mismatch: decision_id=lane-mismatch"),
+    ),
+)
+def test_upgrade_rejects_preexisting_canonical_integrity_violations(
+    tmp_path, corruption: str, expected: str
+) -> None:
+    db_path = tmp_path / f"{corruption}.db"
+    previous = _create_previous_canonical_schema(db_path)
+    if corruption == "orphan_decision":
+        previous.execute(
+            """
+            INSERT INTO job_decisions(
+                decision_id, job_url, policy_version, lane, qualification_verdict,
+                action, input_hash, created_at
+            ) VALUES (
+                'orphan-decision', 'https://example.test/missing', 'policy-v1',
+                'ats', 'qualified', 'review', 'orphan-hash', ?
+            )
+            """,
+            (_NOW,),
+        )
+    elif corruption == "orphan_outcome":
+        previous.execute(
+            """
+            INSERT INTO reviewed_outcomes(event_id, job_url, review_status, created_at)
+            VALUES ('missing-event', 'https://example.test/job', 'needs_review', ?)
+            """,
+            (_NOW,),
+        )
+    else:
+        previous.execute(
+            """
+            INSERT INTO job_decisions(
+                decision_id, job_url, policy_version, lane, qualification_verdict,
+                action, input_hash, created_at
+            ) VALUES (
+                'lane-mismatch', 'https://example.test/job', 'policy-v1',
+                'linkedin', 'qualified', 'review', 'lane-hash', ?
+            )
+            """,
+            (_NOW,),
+        )
+    previous.commit()
+    previous.close()
+
+    with pytest.raises(RuntimeError, match=expected):
+        database.init_db(db_path)
+    database.close_connection(db_path)
 
 
 def test_orphan_decision_and_reviewed_outcome_foreign_keys_fail(tmp_path) -> None:
