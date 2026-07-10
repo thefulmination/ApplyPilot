@@ -91,6 +91,15 @@ def test_required_builtin_education_is_unmapped_when_profile_is_incomplete():
     assert all(label.startswith("Education:") for label in plan.unmapped_required)
     assert len(plan.unmapped_required) == 5
 
+
+def test_optional_builtin_education_is_left_unfilled():
+    questions = builtin_questions_from_payload(
+        {"education": "education_optional", "questions": []},
+        profile={"resume_facts": {"education": {"school": "Stevens"}}},
+    )
+
+    assert questions == []
+
 _GH_JOB = {
     "id": 4012345,
     "title": "Quant Developer",

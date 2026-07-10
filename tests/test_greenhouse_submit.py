@@ -10,6 +10,8 @@ import pytest
 
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply.greenhouse_submit import (
+    SubmitReport,
+    _complete_greenhouse_email_challenge,
     adapter_enabled,
     apply_greenhouse,
     capture_answers,
@@ -320,6 +322,67 @@ def test_execute_form_does_not_click_twice_when_response_wait_times_out():
 
     assert page.calls.count(("click", "button[type='submit']")) == 1
     assert report.response_wait_error == "TimeoutError"
+
+
+def test_greenhouse_email_challenge_uses_fresh_eight_digit_code_and_retries_submit():
+    class Request:
+        method = "POST"
+
+    class Response:
+        request = Request()
+        url = "https://boards.greenhouse.io/alpaca/jobs/123"
+        status = 200
+
+        def header_value(self, name):
+            return "request-456" if name == "x-request-id" else None
+
+        def json(self):
+            return {}
+
+    class ExpectedResponse:
+        value = Response()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class ChallengePage(FakePage):
+        def wait_for_selector(self, selector, *, state, timeout):
+            self.calls.append(("wait", selector, state, timeout))
+
+        def expect_response(self, predicate, *, timeout):
+            assert predicate(Response())
+            return ExpectedResponse()
+
+    page = ChallengePage()
+    report = SubmitReport(
+        dry_run=False,
+        submitted=True,
+        response_status=428,
+        response_code="captcha-failed",
+    )
+
+    completed = _complete_greenhouse_email_challenge(
+        page,
+        board="alpaca",
+        company_name="Alpaca",
+        expected_submit_url="https://boards.greenhouse.io/alpaca/jobs/123",
+        report=report,
+        code_fn=lambda **kwargs: "12345678",
+    )
+
+    assert completed is True
+    assert [(call[1], call[2]) for call in page.calls if call[0] == "fill"] == [
+        (f"#security-input-{index}", digit) for index, digit in enumerate("12345678")
+    ]
+    assert page.calls.count(("click", "button[type='submit']")) == 1
+    assert report.challenge_response_status == 428
+    assert report.challenge_response_code == "captcha-failed"
+    assert report.response_status == 200
+    assert report.response_request_id == "request-456"
+    assert report.security_code_used is True
 
 
 def test_execute_form_checkpoints_immediately_before_submit():

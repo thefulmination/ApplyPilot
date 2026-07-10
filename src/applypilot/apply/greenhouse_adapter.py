@@ -131,9 +131,8 @@ def builtin_questions_from_payload(payload: dict, *, profile: dict) -> list[dict
         })
 
     education_mode = str((payload or {}).get("education") or "")
-    if education_mode:
+    if education_mode == "education_required":
         education = ((profile or {}).get("resume_facts") or {}).get("education") or {}
-        required = education_mode == "education_required"
         definitions = (
             ("school--0", "School", "react_select", education.get("school")),
             ("degree--0", "Degree", "react_select", education.get("degree")),
@@ -148,7 +147,7 @@ def builtin_questions_from_payload(payload: dict, *, profile: dict) -> list[dict
                 if field_type == "react_select":
                     field["values"] = [{"label": str(value), "value": str(value)}]
             questions.append({
-                "required": required,
+                "required": True,
                 "label": f"Education: {label}",
                 "fields": [field],
             })

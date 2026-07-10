@@ -15,7 +15,11 @@ canary / approval / cost guards.
 from __future__ import annotations
 
 import os
+import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from applypilot.apply.greenhouse_adapter import AnswerPlan
@@ -115,12 +119,149 @@ def _response_request_id(response) -> str | None:
     return None
 
 
+def _response_code(response) -> str | None:
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    code = str(payload.get("code") or "") if isinstance(payload, dict) else ""
+    return code if re.fullmatch(r"[a-z0-9_-]{1,80}", code) else None
+
+
+def _click_for_response(page, selector: str, expected_url: str | None) -> dict:
+    observation = {
+        "clicked": False,
+        "status": None,
+        "url": None,
+        "request_id": None,
+        "code": None,
+        "wait_error": None,
+    }
+    expect_response = getattr(page, "expect_response", None)
+    if expected_url and expect_response is not None:
+        try:
+            with expect_response(
+                lambda response: _is_expected_submit_response(response, expected_url),
+                timeout=15_000,
+            ) as response_info:
+                page.click(selector)
+                observation["clicked"] = True
+            response = response_info.value
+            observation.update({
+                "status": int(response.status),
+                "url": _safe_url(response.url),
+                "request_id": _response_request_id(response),
+                "code": _response_code(response),
+            })
+        except Exception as exc:
+            observation["wait_error"] = type(exc).__name__
+    if not observation["clicked"]:
+        page.click(selector)
+        observation["clicked"] = True
+    return observation
+
+
+def _received_at(raw: str | None) -> datetime | None:
+    try:
+        value = parsedate_to_datetime(raw or "")
+    except Exception:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _normalized_company(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _wait_for_greenhouse_security_code(
+    *, board: str, company_name: str, not_before: datetime,
+    timeout_seconds: int = 90,
+) -> str | None:
+    from applypilot import inbox_auth
+    from applypilot.mail_source import get_mail_source
+
+    expected = {
+        item for item in (_normalized_company(board), _normalized_company(company_name)) if item
+    }
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            messages = get_mail_source().fetch(
+                since_days=1,
+                max_messages=50,
+                gmail_raw_query='"security code" OR "verification code"',
+            )
+            matches = inbox_auth.scan_gmail_for_auth_codes(
+                messages=messages, minutes=10, max_messages=50,
+            )
+            matches.sort(
+                key=lambda match: _received_at(match.received_at)
+                or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            for match in matches:
+                received = _received_at(match.received_at)
+                subject = _normalized_company(match.subject)
+                candidate = match.candidate
+                if (
+                    received is not None
+                    and received >= not_before - timedelta(seconds=5)
+                    and candidate.kind == "code"
+                    and re.fullmatch(r"\d{8}", candidate.value)
+                    and any(item in subject for item in expected)
+                ):
+                    return candidate.value
+        except Exception:
+            pass
+        time.sleep(3)
+    return None
+
+
+def _complete_greenhouse_email_challenge(
+    page, *, board: str, company_name: str, expected_submit_url: str,
+    report, code_fn=None,
+) -> bool:
+    if report.response_status != 428 or report.response_code != "captcha-failed":
+        return False
+    try:
+        page.wait_for_selector("#security-input-0", state="visible", timeout=10_000)
+    except Exception:
+        return False
+    not_before = datetime.now(timezone.utc)
+    fetch_code = code_fn or _wait_for_greenhouse_security_code
+    code = fetch_code(
+        board=board,
+        company_name=company_name,
+        not_before=not_before,
+    )
+    if not code or not re.fullmatch(r"\d{8}", str(code)):
+        return False
+    for index, digit in enumerate(str(code)):
+        page.fill(f"#security-input-{index}", digit)
+    report.challenge_response_status = report.response_status
+    report.challenge_response_code = report.response_code
+    observation = _click_for_response(page, _SUBMIT_SELECTOR, expected_submit_url)
+    report.response_status = observation["status"]
+    report.response_url = observation["url"]
+    report.response_request_id = observation["request_id"]
+    report.response_code = observation["code"]
+    report.response_wait_error = observation["wait_error"]
+    report.security_code_used = True
+    return True
+
+
 def _collect_submission_diagnostics(page, report) -> dict:
     diagnostics = {
         "response_status": report.response_status,
         "response_url": report.response_url,
         "response_request_id": report.response_request_id,
+        "response_code": report.response_code,
         "response_wait_error": report.response_wait_error,
+        "challenge_response_status": report.challenge_response_status,
+        "challenge_response_code": report.challenge_response_code,
+        "security_code_used": report.security_code_used,
         "settlement_error": report.settlement_error,
         "final_url": _safe_url(getattr(page, "url", None)),
         "invalid_fields": [],
@@ -217,8 +358,12 @@ class SubmitReport:
     response_status: int | None = None
     response_url: str | None = None
     response_request_id: str | None = None
+    response_code: str | None = None
     response_wait_error: str | None = None
     settlement_error: str | None = None
+    challenge_response_status: int | None = None
+    challenge_response_code: str | None = None
+    security_code_used: bool = False
 
 
 def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[FormAction]:
@@ -292,26 +437,12 @@ def execute_form(actions, page, *, dry_run: bool = True,
                 continue
             if before_submit is not None:
                 before_submit()
-            expect_response = getattr(page, "expect_response", None)
-            clicked = False
-            if expected_submit_url and expect_response is not None:
-                try:
-                    with expect_response(
-                        lambda response: _is_expected_submit_response(
-                            response, expected_submit_url
-                        ),
-                        timeout=15_000,
-                    ) as response_info:
-                        page.click(a.selector)
-                        clicked = True
-                    response = response_info.value
-                    report.response_status = int(response.status)
-                    report.response_url = _safe_url(response.url)
-                    report.response_request_id = _response_request_id(response)
-                except Exception as exc:
-                    report.response_wait_error = type(exc).__name__
-            if not clicked:
-                page.click(a.selector)
+            observation = _click_for_response(page, a.selector, expected_submit_url)
+            report.response_status = observation["status"]
+            report.response_url = observation["url"]
+            report.response_request_id = observation["request_id"]
+            report.response_code = observation["code"]
+            report.response_wait_error = observation["wait_error"]
             report.submitted = True
             continue
         if a.kind == "file":
@@ -379,8 +510,8 @@ def capture_answers(plan, questions, job, *, remember_fn=None) -> int:
 
 def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
                      corpus=None, fetch=None, answer_fn=None, remember_fn=None,
-                     dry_run: bool = True, on_plan_ready=None,
-                     before_submit=None, verify_fn=None) -> dict:
+                      dry_run: bool = True, on_plan_ready=None,
+                      before_submit=None, verify_fn=None, auth_code_fn=None) -> dict:
     """End-to-end: parse -> fetch questions -> plan -> route.
 
     When the plan is complete (``ready``) it fills the form deterministically
@@ -431,6 +562,14 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
               "report": report, "ready": True,
               "attempt_context": attempt_context}
     if report.submitted:
+        _complete_greenhouse_email_challenge(
+            page,
+            board=board,
+            company_name=str(payload.get("company_name") or board),
+            expected_submit_url=f"https://boards.greenhouse.io/{board}/jobs/{job_id}",
+            report=report,
+            code_fn=auth_code_fn,
+        )
         report.settlement_error = _wait_for_submission_settlement(page)
         result["submission_diagnostics"] = _collect_submission_diagnostics(page, report)
         verification = (verify_fn or verify_greenhouse_submission)(page)
