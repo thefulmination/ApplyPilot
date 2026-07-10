@@ -30,6 +30,7 @@ from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
+from applypilot.apply.failure_classification import FailureEvidence, classify_apply_failure
 from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -180,6 +181,7 @@ _agent_procs: dict[int, subprocess.Popen] = {}
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
+_adapter_route_stats: dict[int, dict] = {}
 _agent_lock = threading.Lock()
 
 # Register cleanup on exit
@@ -1407,8 +1409,17 @@ def is_usage_limit_result(status: str | None) -> bool:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
+def _route_from_greenhouse_result(res: dict | None, *, own: bool) -> str | None:
+    if not res:
+        return None
+    if res.get("route") != "deterministic":
+        return "agent"
+    return "adapter_submit:greenhouse" if own else "adapter_shadow:greenhouse"
+
+
 def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
-                            resume_text: str, resume_path) -> tuple[str, int] | None:
+                            resume_text: str, resume_path,
+                            worker_id: int = 0) -> tuple[str, int] | None:
     """Opt-in deterministic Greenhouse path. Returns (status, duration_ms) if it
     OWNED the application, else None so the apply agent proceeds. Never raises.
 
@@ -1467,6 +1478,11 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
         plan = res.get("plan")
         logger.info("greenhouse shadow OK: ready=%s free_text=%s",
                     res.get("ready"), list(plan.free_text) if plan else [])
+        _adapter_route_stats[worker_id] = {
+            "route": _route_from_greenhouse_result(res, own=own),
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": bool(res.get("ready")),
+        }
         return None  # shadow: agent still owns the submission
 
     status = res.get("status", "failed:no_confirmation")
@@ -1568,6 +1584,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
     wrapper, not the run itself)."""
+    _adapter_route_stats.pop(worker_id, None)
     # Read tailored resume text
     resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -1575,13 +1592,108 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
+    def _write_job_log(transcript: str, *, label: str | None = None) -> Path | None:
+        if not transcript:
+            return None
+        try:
+            config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            agent_label = label or agent or "agent"
+            site = str(job.get("site", "unknown"))[:20]
+            job_log_path = config.LOG_DIR / f"{agent_label}_{ts}_w{worker_id}_{site}.txt"
+            job_log_path.write_text(transcript, encoding="utf-8")
+            return job_log_path
+        except Exception:
+            logger.debug("apply-agent job log write failed", exc_info=True)
+            return None
+
+    def _record_run_metadata(
+        status: str,
+        duration_ms: int,
+        *,
+        transcript: str | None = "",
+        stats_data: dict | None = None,
+        application_tool_calls_count: int = 0,
+        tool_calls_total_count: int = 0,
+        last_tool: str = "",
+        route: str | None = "agent",
+        job_log: Path | str | None = None,
+        final_result_source: str | None = None,
+        worker_level_failure: bool | None = None,
+    ) -> tuple[str, int]:
+        run_stats = dict(stats_data or {})
+        adapter_stats = _adapter_route_stats.pop(worker_id, {})
+        run_stats.update(adapter_stats)
+        transcript_text = transcript or ""
+        if route and not run_stats.get("route"):
+            run_stats["route"] = route
+        run_stats["route"] = run_stats.get("route") or "agent"
+        run_stats["transcript"] = transcript_text[-20000:]
+        if job_log is not None:
+            run_stats["job_log"] = str(job_log)
+            run_stats["job_log_path"] = str(job_log)
+        if transcript_text:
+            run_stats["transcript_digest"] = (
+                "sha256:"
+                + hashlib.sha256(
+                    transcript_text.encode("utf-8", errors="replace")
+                ).hexdigest()
+            )
+        if final_result_source:
+            run_stats["final_result_source"] = final_result_source
+
+        run_stats["application_tool_calls"] = int(application_tool_calls_count or 0)
+        run_stats["tool_calls_total"] = int(tool_calls_total_count or 0)
+        run_stats["last_tool"] = last_tool
+
+        if status != "applied" and "failure_class" not in run_stats:
+            classification = classify_apply_failure(
+                FailureEvidence(
+                    status=status,
+                    transcript=transcript_text,
+                    application_tool_calls=run_stats["application_tool_calls"],
+                    tool_calls_total=run_stats["tool_calls_total"],
+                    last_tool=last_tool,
+                    timeout_seconds=AGENT_TIMEOUT_SECONDS,
+                )
+            )
+            run_stats["failure_class"] = classification.failure_class
+            run_stats["safe_requeue"] = classification.safe_requeue
+            run_stats["worker_level_failure"] = (
+                classification.worker_level
+                if worker_level_failure is None
+                else worker_level_failure
+            )
+
+        _last_run_stats[worker_id] = run_stats
+        return status, duration_ms
+
     # Opt-in deterministic Greenhouse adapter (no-op unless
     # APPLYPILOT_GREENHOUSE_ADAPTER is set). Owns the application only with the
     # second submit gate on a ready plan; otherwise validates + falls through.
     gh_result = _maybe_greenhouse_apply(job, port, dry_run=dry_run,
-                                        resume_text=resume_text, resume_path=resume_path)
+                                        resume_text=resume_text, resume_path=resume_path,
+                                        worker_id=worker_id)
     if gh_result is not None:
-        return gh_result
+        status, duration_ms = gh_result
+        return _record_run_metadata(
+            status,
+            duration_ms,
+            stats_data={
+                "route": "adapter_submit:greenhouse",
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": True,
+                "failure_class": (
+                    None if status == "applied" else "adapter_no_confirmation"
+                ),
+                "safe_requeue": False,
+                "worker_level_failure": False,
+                "application_tool_calls": 0,
+                "tool_calls_total": 0,
+                "last_tool": "greenhouse_adapter",
+            },
+            last_tool="greenhouse_adapter",
+        )
     _maybe_lever_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
 
     # Reset the worker's isolated working directory FIRST. build_prompt stages
@@ -1637,6 +1749,15 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
     start = time.time()
     stats: dict = {}
+    stats_holder: dict = {}
+    text_parts: list[str] = []
+    final_result_text: list[str] = []  # text from the final 'result' message
+    # Count all actual tool calls separately from application-touching calls. ZERO
+    # app tool calls + a usage-limit signature == safely re-queuable, while total
+    # calls preserves non-application tool activity for worker metadata.
+    application_tool_calls = [0]
+    tool_calls_total = [0]
+    last_tool_seen = [""]
     proc = None
 
     try:
@@ -1653,14 +1774,6 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         )
         with _agent_lock:
             _agent_procs[worker_id] = proc
-
-        text_parts: list[str] = []
-        final_result_text: list[str] = []  # text from the final 'result' message
-        stats_holder: dict = {}
-        # Count only application-touching tool calls. ZERO app tool calls + a usage-limit
-        # signature == the agent hit a wall before touching the page -> safely re-queuable
-        # (see _no_result_status). A list so the daemon-thread closure can mutate it.
-        application_tool_calls = [0]
 
         def _consume_stream() -> None:
             """Read the agent's stream-json stdout to EOF.
@@ -1690,6 +1803,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         .replace("mcp__playwright__", "")
                                         .replace("mcp__gmail__", "gmail:")
                                     )
+                                    tool_calls_total[0] += 1
                                     if _tool_call_touches_application(name):
                                         application_tool_calls[0] += 1
                                     inp = block.get("input", {})
@@ -1704,6 +1818,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     else:
                                         desc = name
 
+                                    last_tool_seen[0] = desc[:35]
                                     lf.write(f"  >> {desc}\n")
                                     ws = get_state(worker_id)
                                     cur_actions = ws.actions if ws else 0
@@ -1735,8 +1850,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     lf.write(text + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
                                 name = item.get("name") or item.get("tool_name") or item_type
+                                tool_calls_total[0] += 1
                                 if _tool_call_touches_application(str(name)):
                                     application_tool_calls[0] += 1
+                                last_tool_seen[0] = str(name)[:35]
                                 lf.write(f"  >> {name}\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
@@ -1794,7 +1911,20 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             elapsed = int(time.time() - start)
             add_event(f"[W{worker_id}] TIMEOUT/hung ({elapsed}s)")
             update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-            return "failed:timeout", int((time.time() - start) * 1000)
+            output = "\n".join(text_parts)
+            duration_ms = int((time.time() - start) * 1000)
+            job_log = _write_job_log(output, label=agent)
+            return _record_run_metadata(
+                "failed:timeout",
+                duration_ms,
+                transcript=output,
+                stats_data=stats_holder,
+                application_tool_calls_count=application_tool_calls[0],
+                tool_calls_total_count=tool_calls_total[0],
+                last_tool=last_tool_seen[0],
+                route="agent",
+                job_log=job_log,
+            )
 
         try:
             proc.wait(timeout=30)
@@ -1809,7 +1939,20 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         proc = None
 
         if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
+            output = "\n".join(text_parts)
+            duration_ms = int((time.time() - start) * 1000)
+            job_log = _write_job_log(output, label=agent)
+            return _record_run_metadata(
+                "skipped",
+                duration_ms,
+                transcript=output,
+                stats_data=stats,
+                application_tool_calls_count=application_tool_calls[0],
+                tool_calls_total_count=tool_calls_total[0],
+                last_tool=last_tool_seen[0],
+                route="agent",
+                job_log=job_log,
+            )
 
         output = "\n".join(text_parts)
         # Prefer the agent's FINAL result message for the RESULT code; only fall
@@ -1821,19 +1964,25 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
-        run_stats = dict(stats) if stats else {}
-        run_stats["transcript"] = output[-20000:]
-        run_stats["job_log"] = str(job_log)
-        run_stats["job_log_path"] = str(job_log)
-        run_stats["application_tool_calls"] = application_tool_calls[0]
-        run_stats["transcript_digest"] = (
-            "sha256:" + hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
-        )
-        run_stats["final_result_source"] = "final_message" if final_text and "RESULT:" in final_text else "transcript"
-        _last_run_stats[worker_id] = run_stats
+        job_log = _write_job_log(output, label=agent)
+
+        def _finish(status: str, duration_ms: int) -> tuple[str, int]:
+            return _record_run_metadata(
+                status,
+                duration_ms,
+                transcript=output,
+                stats_data=stats,
+                application_tool_calls_count=application_tool_calls[0],
+                tool_calls_total_count=tool_calls_total[0],
+                last_tool=last_tool_seen[0],
+                route="agent",
+                job_log=job_log,
+                final_result_source=(
+                    "final_message"
+                    if final_text and "RESULT:" in final_text
+                    else "transcript"
+                ),
+            )
 
         if stats:
             cost = stats.get("cost_usd", 0)
@@ -1870,14 +2019,14 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         if "RESULT:DRY_RUN" in result_source:
             add_event(f"[W{worker_id}] DRY-RUN OK ({elapsed}s): {job['title'][:30]}")
             update_state(worker_id, status="dry_run", last_action=f"DRY-RUN ({elapsed}s)")
-            return "dry_run", duration_ms
+            return _finish("dry_run", duration_ms)
 
         for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "AUTH_REQUIRED"]:
             if f"RESULT:{result_status}" in result_source:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
+                return _finish(result_status.lower(), duration_ms)
 
         if "RESULT:FAILED" in result_source:
             for out_line in result_source.split("\n"):
@@ -1893,12 +2042,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
                                      last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
+                        return _finish(reason, duration_ms)
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
+                    return _finish(f"failed:{reason}", duration_ms)
+            return _finish("failed:unknown", duration_ms)
 
         # No RESULT: line. Distinguish an agent usage/quota wall hit on turn 1 (no tool
         # calls -> the page was never touched -> RETRYABLE, re-queued upstream) from a
@@ -1910,19 +2059,44 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         else:
             add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
             update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return status, duration_ms
+        return _finish(status, duration_ms)
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        output = "\n".join(text_parts)
+        job_log = _write_job_log(output, label=agent)
+        return _record_run_metadata(
+            "failed:timeout",
+            duration_ms,
+            transcript=output,
+            stats_data=stats_holder or stats,
+            application_tool_calls_count=application_tool_calls[0],
+            tool_calls_total_count=tool_calls_total[0],
+            last_tool=last_tool_seen[0],
+            route="agent",
+            job_log=job_log,
+        )
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        status = f"failed:{str(e)[:100]}"
+        transcript = str(e)
+        job_log = _write_job_log(transcript, label=agent)
+        return _record_run_metadata(
+            status,
+            duration_ms,
+            transcript=transcript,
+            stats_data=stats_holder or stats,
+            application_tool_calls_count=application_tool_calls[0],
+            tool_calls_total_count=tool_calls_total[0],
+            last_tool=last_tool_seen[0],
+            route="agent",
+            job_log=job_log,
+        )
     finally:
         with _agent_lock:
             _agent_procs.pop(worker_id, None)

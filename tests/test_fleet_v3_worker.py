@@ -254,6 +254,153 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
     }], approved_batch="batchA")
 
 
+@pytest.mark.parametrize(("preflight_status", "preflight_reason"), [
+    ("live", "gh_api_200"),
+    ("uncertain", "blocked_403"),
+    ("unknown", "unknown_probe_state"),
+])
+def test_apply_preflight_non_dead_statuses_fall_through(
+    fleet_db, preflight_status, preflight_reason,
+):
+    queue_url = f"preflight-{preflight_status}"
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, queue_url, host="jobs.example")
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        f"w-{queue_url}",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job["url"]) or {
+            "run_status": "applied",
+            "est_cost_usd": 0.25,
+        },
+        preflight_fn=lambda url: (preflight_status, preflight_reason),
+    )
+
+    result = loop.run_once()
+
+    assert result["action"] == "applied"
+    assert calls == [queue_url]
+    with pgqueue.connect(fleet_db) as conn:
+        row = conn.execute(
+            "SELECT status::text, apply_status FROM apply_queue WHERE url=%s",
+            (queue_url,),
+        ).fetchone()
+    assert row == {"status": "applied", "apply_status": "applied"}
+
+
+def test_apply_preflight_exception_falls_through(fleet_db):
+    queue_url = "preflight-timeout"
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, queue_url, host="jobs.example")
+
+    def timed_out(_url):
+        raise TimeoutError("probe timed out")
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-preflight-timeout",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job["url"]) or {
+            "run_status": "applied",
+            "est_cost_usd": 0.25,
+        },
+        preflight_fn=timed_out,
+    )
+
+    result = loop.run_once()
+
+    assert result["action"] == "applied"
+    assert calls == [queue_url]
+    with pgqueue.connect(fleet_db) as conn:
+        row = conn.execute(
+            "SELECT status::text, apply_status FROM apply_queue WHERE url=%s",
+            (queue_url,),
+        ).fetchone()
+    assert row == {"status": "applied", "apply_status": "applied"}
+
+
+def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
+    calls = []
+    preflight_urls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "preflight-dead", host="jobs.example")
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-preflight-dead",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job) or {"run_status": "applied"},
+        preflight_fn=lambda url: preflight_urls.append(url) or ("dead", "http_404"),
+    )
+
+    result = loop.run_once()
+
+    assert result == {
+        "action": "preflight_dead",
+        "url": "preflight-dead",
+        "reason": "http_404",
+    }
+    assert calls == []
+    assert preflight_urls == ["https://jobs.example/jobs/1"]
+    with pgqueue.connect(fleet_db) as conn:
+        row = conn.execute(
+            "SELECT status::text, apply_status, apply_error, est_cost_usd "
+            "FROM apply_queue WHERE url=%s",
+            ("preflight-dead",),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT route, failure_class, result_metadata "
+            "FROM apply_result_events WHERE url=%s ORDER BY id DESC LIMIT 1",
+            ("preflight-dead",),
+        ).fetchone()
+    assert row == {
+        "status": "failed",
+        "apply_status": "expired",
+        "apply_error": "preflight_http_404",
+        "est_cost_usd": 0,
+    }
+    assert event["route"] == "preflight"
+    assert event["failure_class"] == "preflight_dead"
+    assert event["result_metadata"] == {
+        "preflight_status": "dead",
+        "preflight_reason": "http_404",
+    }
+
+
+def test_apply_preflight_dead_reports_lost_lease_when_write_rejected(fleet_db, monkeypatch):
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "preflight-lease-lost", host="jobs.example")
+    monkeypatch.setattr(queue, "write_apply_result", lambda *args, **kwargs: False)
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-preflight-lease-lost",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job) or {"run_status": "applied"},
+        preflight_fn=lambda url: ("dead", "http_404"),
+    )
+
+    result = loop.run_once()
+
+    assert result == {
+        "action": "lease_lost",
+        "url": "preflight-lease-lost",
+        "reason": "http_404",
+    }
+    assert calls == []
+    assert any(
+        "preflight_dead write rejected (lease lost) preflight-lease-lost" in event
+        for event in loop._events
+    )
+    assert not any("wrote apply preflight_dead" in event for event in loop._events)
+
+
 def test_worker_apply_visible_captcha_parks_and_raises_challenge(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_one_apply(conn, "a1")
@@ -380,6 +527,53 @@ def test_worker_login_gate_parks_without_feeding_breaker(fleet_db):
 def test_worker_role_validation():
     with pytest.raises(ValueError):
         WorkerLoop(_factory("x"), "w", home_ip="1.1.1.1", role="bogus")
+
+
+def test_greenhouse_adapter_no_confirmation_is_crash_unconfirmed(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_apply_jobs(
+            conn,
+            [{
+                "url": "gh-no-confirm",
+                "company": "Acme",
+                "title": "Staff Engineer",
+                "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+                "score": 9.0,
+                "target_host": "greenhouse.io",
+                "dedup_key": "dk-gh-no-confirm",
+            }],
+            approved_batch="batchA",
+        )
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-gh-adapter",
+        home_ip="4.4.4.4",
+        role="apply",
+        apply_fn=lambda job: {
+            "run_status": "failed:no_confirmation",
+            "est_cost_usd": 0.0,
+            "route": "adapter_submit:greenhouse",
+            "failure_class": "adapter_no_confirmation",
+            "last_tool": "greenhouse_adapter",
+        },
+    )
+
+    assert loop.run_once()["action"] == "crash_unconfirmed"
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, apply_status, apply_error FROM apply_queue WHERE url='gh-no-confirm'")
+        q = cur.fetchone()
+        assert q["status"] == "crash_unconfirmed"
+        assert q["apply_status"] == "crash_unconfirmed"
+        assert q["apply_error"] == "failed:no_confirmation"
+        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-gh-no-confirm'")
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT route, failure_class, last_tool FROM apply_result_events WHERE url='gh-no-confirm'")
+        event = cur.fetchone()
+        assert event["route"] == "adapter_submit:greenhouse"
+        assert event["failure_class"] == "adapter_no_confirmation"
+        assert event["last_tool"] == "greenhouse_adapter"
 
 
 # ===========================================================================
@@ -521,6 +715,16 @@ def test_tick_apply_status_passthrough(fleet_db):
                            "agent": "claude",
                            "agent_model": "claude-sonnet-4",
                            "duration_ms": 3210,
+                           "route": "agent",
+                           "failure_class": "zero_tool_no_result",
+                           "tool_calls_total": 0,
+                           "application_tool_calls": 0,
+                           "last_tool": "",
+                           "result_metadata": {
+                               "job_log": "worker.log",
+                               "adapter_name": "greenhouse",
+                               "adapter_plan_ready": True,
+                           },
                        })
     assert loop2.run_once()["action"] == "crash_unconfirmed"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
@@ -529,6 +733,22 @@ def test_tick_apply_status_passthrough(fleet_db):
         assert row["status"] == "crash_unconfirmed"
         assert row["agent_model"] == "claude-sonnet-4"
         assert row["apply_duration_ms"] == 3210
+        cur.execute(
+            "SELECT route, failure_class, tool_calls_total, application_tool_calls, "
+            "last_tool, result_metadata->>'job_log' AS job_log, "
+            "result_metadata->>'adapter_name' AS adapter_name, "
+            "result_metadata->>'adapter_plan_ready' AS adapter_plan_ready "
+            "FROM apply_result_events WHERE url='jc'"
+        )
+        event = cur.fetchone()
+        assert event["route"] == "agent"
+        assert event["failure_class"] == "zero_tool_no_result"
+        assert event["tool_calls_total"] == 0
+        assert event["application_tool_calls"] == 0
+        assert event["last_tool"] == ""
+        assert event["job_log"] == "worker.log"
+        assert event["adapter_name"] == "greenhouse"
+        assert event["adapter_plan_ready"] == "true"
 
     # captcha -> parked (auth_challenge raised, lease frozen)
     with pgqueue.connect(fleet_db) as conn:

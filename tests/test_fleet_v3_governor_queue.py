@@ -328,6 +328,55 @@ def test_write_apply_result_records_durable_result_event(fleet_db):
         assert row["result_line"] == "RESULT:failed:no_result_line"
 
 
+def test_write_apply_result_persists_router_metadata(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(
+            conn,
+            "u-meta",
+            host="boards.greenhouse.io",
+            company="Acme",
+            title="Analyst",
+        )
+        a = queue.lease_apply(conn, "w1", home_ip="127.0.0.1")
+        ok = queue.write_apply_result(
+            conn,
+            "w1",
+            a["url"],
+            status="failed",
+            apply_status="failed",
+            apply_error="failed:no_result_line",
+            target_host="boards.greenhouse.io",
+            home_ip="127.0.0.1",
+            est_cost_usd=0.25,
+            agent="claude",
+            agent_model="sonnet",
+            route="agent",
+            failure_class="zero_tool_no_result",
+            tool_calls_total=0,
+            application_tool_calls=0,
+            last_tool="",
+            host_policy="allow:greenhouse",
+            result_metadata={"job_log": "worker.log"},
+        )
+
+        assert ok is True
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT route, failure_class, tool_calls_total, application_tool_calls, "
+                "last_tool, host_policy, result_metadata->>'job_log' AS job_log "
+                "FROM apply_result_events WHERE url='u-meta'"
+            )
+            row = cur.fetchone()
+
+        assert row["route"] == "agent"
+        assert row["failure_class"] == "zero_tool_no_result"
+        assert row["tool_calls_total"] == 0
+        assert row["application_tool_calls"] == 0
+        assert row["last_tool"] == ""
+        assert row["host_policy"] == "allow:greenhouse"
+        assert row["job_log"] == "worker.log"
+
+
 def test_write_apply_result_records_submit_risk_evidence(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "event-risk", host="ashbyhq.com", score=9, company="Epsilon", title="Staff Engineer")

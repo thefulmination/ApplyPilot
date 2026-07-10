@@ -12,7 +12,7 @@ import uuid
 
 from applypilot import config
 from applypilot.apply import pgqueue
-from applypilot.fleet import queue, queue_diagnosis, sync
+from applypilot.fleet import queue, queue_diagnosis, schema as fleet_schema, sync
 
 logger = logging.getLogger("applypilot.fleet.apply_home_main")
 
@@ -238,6 +238,7 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         if args.cmd == "push":
             print("pushed", push_home(conn, score_floor=args.score_floor, limit=args.limit,
                                       include_research=args.include_research,

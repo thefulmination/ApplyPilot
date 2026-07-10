@@ -1,0 +1,141 @@
+topic: "Web browser automation options for minimizing ApplyPilot cost per verified job application"
+time_range: "since 2025-01-01"
+authoritative_local_evidence:
+  - "Live fleet Postgres apply_queue, apply_result_events, llm_usage, and worker_heartbeat"
+  - "Local ApplyPilot SQLite application history"
+  - "docs/superpowers/specs/2026-07-06-apply-cost-quality-router-design.md"
+research_rules:
+  - "Use primary sources for technical behavior, maintenance status, and pricing."
+  - "Treat vendor prices as planning inputs; use ApplyPilot history for the baseline."
+  - "Optimize all-in cost per positively verified application, not cost per attempt."
+  - "Preserve exactly-once submission behavior and quarantine ambiguous outcomes."
+  - "Do not recommend bypassing access controls, CAPTCHAs, or site restrictions."
+items:
+  - id: direct_ats_http
+    name: "Direct ATS HTTP or supported API submission"
+    category: "deterministic"
+    rationale: "Potential near-zero browser and model cost where a legitimate public flow supports it."
+  - id: browser_assisted_http
+    name: "Browser-assisted HTTP handoff with Playwright APIRequestContext"
+    category: "deterministic"
+    rationale: "Uses browser session and CSRF state while avoiding repeated DOM-agent turns."
+  - id: deterministic_playwright_adapters
+    name: "ATS-specific deterministic Playwright adapters"
+    category: "deterministic"
+    rationale: "Best fit with the existing Greenhouse and Lever adapter architecture."
+  - id: playwright_mcp
+    name: "Playwright MCP over local Chrome CDP"
+    category: "agent_control"
+    rationale: "Current ApplyPilot baseline and required control arm."
+  - id: playwright_cli
+    name: "Playwright CLI and Playwright skills"
+    category: "agent_control"
+    rationale: "Candidate lower-context control plane with browser session reuse."
+  - id: selenium_webdriver
+    name: "Selenium WebDriver"
+    category: "driver"
+    rationale: "Established deterministic Python browser automation baseline."
+  - id: webdriver_bidi
+    name: "WebDriver BiDi and WebdriverIO"
+    category: "driver"
+    rationale: "Standards-based bidirectional browser control comparator."
+  - id: puppeteer
+    name: "Puppeteer"
+    category: "driver"
+    rationale: "Mature Chromium automation comparator with a Node.js integration cost."
+  - id: raw_cdp
+    name: "Raw Chrome DevTools Protocol"
+    category: "driver"
+    rationale: "Lowest-level Chromium control and potential minimum serialization overhead."
+  - id: chrome_devtools_mcp
+    name: "Chrome DevTools MCP and CLI"
+    category: "agent_control"
+    rationale: "Candidate for network-aware adapter discovery and confirmation evidence."
+  - id: stagehand
+    name: "Stagehand"
+    category: "model_assisted"
+    rationale: "Structured model-assisted actions with caching and replay potential."
+  - id: browser_use
+    name: "Browser Use"
+    category: "model_assisted"
+    rationale: "Python-compatible open-source browser-agent framework with local and hosted paths."
+  - id: skyvern
+    name: "Skyvern"
+    category: "model_assisted"
+    rationale: "Workflow-oriented automation for variable long-tail forms."
+  - id: agentql
+    name: "AgentQL semantic locator layer"
+    category: "model_assisted"
+    rationale: "Potential low-cost bridge between fixed selectors and full browser agents."
+  - id: crawlee_adaptive
+    name: "Crawlee AdaptivePlaywrightCrawler"
+    category: "preflight"
+    rationale: "Potential HTTP-first expired and eligibility classification route."
+  - id: browserbase
+    name: "Browserbase"
+    category: "hosted_browser"
+    rationale: "Managed browser sessions, profiles, and observability comparator."
+  - id: browserless
+    name: "Browserless"
+    category: "hosted_browser"
+    rationale: "Hosted or self-hosted CDP-compatible browser infrastructure comparator."
+  - id: steel
+    name: "Steel"
+    category: "hosted_browser"
+    rationale: "Open-source and managed browser infrastructure candidate."
+  - id: cloudflare_browser_run
+    name: "Cloudflare Browser Rendering and Browser Run"
+    category: "hosted_browser"
+    rationale: "Low browser-hour pricing candidate for burst capacity and controlled experiments."
+  - id: apify_browser_automation
+    name: "Apify browser automation"
+    category: "hosted_browser"
+    rationale: "Managed browser execution and reusable actor ecosystem comparator."
+  - id: bright_data_scraping_browser
+    name: "Bright Data Scraping Browser"
+    category: "hosted_browser"
+    rationale: "Managed CDP endpoint comparator; assess cost, data handling, and suitability carefully."
+  - id: nova_act
+    name: "Amazon Nova Act"
+    category: "premium_agent"
+    rationale: "Managed Playwright-actuated workflow system with human takeover support."
+  - id: magnitude
+    name: "Magnitude"
+    category: "vision_agent"
+    rationale: "Vision-first long-tail comparator with Playwright access and visual assertions."
+  - id: fara_local_cua
+    name: "Microsoft Fara and local small computer-use models"
+    category: "vision_agent"
+    rationale: "Owned-hardware cost floor for experimental long-tail browser control."
+  - id: profile_extension_executor
+    name: "Existing-browser extension and content-script executor"
+    category: "authenticated_browser"
+    rationale: "Reuses authenticated user tabs and profiles without another browser launch."
+  - id: camoufox
+    name: "Camoufox"
+    category: "compatibility_browser"
+    rationale: "Assess legitimate browser compatibility, profile handling, project health, and integration cost."
+  - id: patchright
+    name: "Patchright"
+    category: "compatibility_browser"
+    rationale: "Assess Playwright compatibility and maintenance risk without bypass use cases."
+  - id: nodriver
+    name: "nodriver"
+    category: "compatibility_browser"
+    rationale: "Assess asynchronous Python CDP control, profile support, and operational maturity."
+  - id: independent_verifier
+    name: "Independent deterministic submission verifier"
+    category: "verification"
+    rationale: "Separates acting from positive confirmation and reduces duplicate retries."
+  - id: webmcp
+    name: "WebMCP"
+    category: "watchlist"
+    rationale: "Future structured web-agent interface that could eliminate DOM interpretation where adopted."
+  - id: browsergym_agentlab
+    name: "BrowserGym and AgentLab evaluation harness"
+    category: "evaluation"
+    rationale: "Pattern for repeatable synthetic ATS benchmarks before live canaries."
+execution:
+  batch_size: 6
+  items_per_agent: 3
+  output_dir: "./results"

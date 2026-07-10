@@ -192,10 +192,21 @@ def make_apply_fn(model: str, agent: str, slot: int = 0):
                 "est_cost_usd": _real_cost(stats, model),
                 "agent": agent,
                 "agent_model": model,
+                "route": stats.get("route") or "agent",
+                "failure_class": stats.get("failure_class"),
+                "tool_calls_total": stats.get("tool_calls_total"),
                 "application_tool_calls": stats.get("application_tool_calls"),
+                "last_tool": stats.get("last_tool"),
                 "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
                 "transcript_digest": stats.get("transcript_digest"),
                 "final_result_source": stats.get("final_result_source"),
+                "result_metadata": {
+                    "job_log": stats.get("job_log"),
+                    "safe_requeue": stats.get("safe_requeue"),
+                    "worker_level_failure": stats.get("worker_level_failure"),
+                    "adapter_name": stats.get("adapter_name"),
+                    "adapter_plan_ready": stats.get("adapter_plan_ready"),
+                },
             }
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
             # Chrome). This is needed for non-applied terminal statuses too: an
@@ -300,13 +311,13 @@ def _apply_timeout_override(dsn=None, *, conn=None) -> None:
 
 def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", machine_owner=None, slot=0):
     _setup_apply_env()
-    from applypilot.apply import pgqueue
+    from applypilot.apply import liveness, pgqueue
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)
     return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
-                      log_tail_fn=make_log_tail_fn(slot))
+                      log_tail_fn=make_log_tail_fn(slot), preflight_fn=liveness.probe_url)
 
 
 # When all agents are usage-limit-walled the worker pauses until the nearer reset. Cap a
@@ -584,7 +595,13 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     enforce_host_identity(args.machine_owner)
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
     from applypilot.fleet.agent_switch import AgentSwitcher
+    with pgqueue.connect(args.dsn) as conn:
+        try:
+            fleet_schema.require_apply_result_event_schema(conn)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
                             model=args.model, agent=args.agent, machine_owner=args.machine_owner,
                             slot=slot)

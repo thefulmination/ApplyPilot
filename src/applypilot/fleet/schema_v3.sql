@@ -654,7 +654,13 @@ CREATE TABLE IF NOT EXISTS apply_result_events (
 );
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS queue_name TEXT NOT NULL DEFAULT 'apply_queue';
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'worker';
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS route TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS failure_class TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS tool_calls_total INTEGER;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS application_tool_calls INTEGER;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS last_tool TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS host_policy TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS result_metadata JSONB;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS job_log_path TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS transcript_digest TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS final_result_source TEXT;

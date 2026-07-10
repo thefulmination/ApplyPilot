@@ -169,6 +169,22 @@ def test_apply_greenhouse_deterministic_path_is_dry_run_by_default():
     assert ("click", "#submit_app") not in page.calls
 
 
+def test_apply_greenhouse_result_includes_route_for_deterministic_dry_run():
+    page = FakePage()
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE,
+        resume_text=_RESUME,
+        resume_path="/r.pdf",
+        page=page,
+        fetch=lambda u: {"questions": _READY_QS},
+        answer_fn=_good,
+    )
+
+    assert res["route"] == "deterministic"
+    assert res["ready"] is True
+
+
 def test_apply_greenhouse_falls_back_to_agent_and_never_touches_the_form():
     page = FakePage()
     res = apply_greenhouse(

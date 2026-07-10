@@ -697,6 +697,21 @@ def boost_output_command(
         console.print("[dim]Apply was not started. Pass --start-apply after stopping any existing apply worker.[/dim]")
 
 
+@app.command("apply-cost-report")
+def apply_cost_report_command(
+    pg_dsn: Optional[str] = typer.Option(None, "--dsn", help="Fleet Postgres DSN. Defaults to FLEET_PG_DSN or local fleet DB."),
+    sqlite_path: Optional[str] = typer.Option(None, "--sqlite", help="Local ApplyPilot SQLite brain path."),
+) -> None:
+    """Print quality-adjusted apply cost and success metrics."""
+    from applypilot.config import load_env
+
+    load_env()
+    from applypilot.fleet.cost_quality_report import build_report, render_report_markdown
+
+    report = build_report(pg_dsn=pg_dsn, sqlite_path=sqlite_path)
+    console.print(render_report_markdown(report), markup=False)
+
+
 @app.command("apply-failures")
 def apply_failures_command(
     reason: Optional[str] = typer.Option(None, "--reason", help="Filter to one reason (e.g. captcha, auth_required, expired, no_result_line)."),
