@@ -102,6 +102,27 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["dedup_key"] == dedup.dedup_key("Acme Inc", "Chief of Staff")
 
 
+def test_push_apply_eligible_recovers_blank_company_from_greenhouse_board(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(
+        sq,
+        "source-job",
+        company=None,
+        title="Business Operations",
+        application_url="https://job-boards.greenhouse.io/kikoff/jobs/4187038009",
+    )
+
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, approved_batch="b1") == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT company, dedup_key FROM apply_queue WHERE url='source-job'")
+            row = cur.fetchone()
+
+    from applypilot.fleet import dedup
+    assert row["company"] == "kikoff"
+    assert row["dedup_key"] == dedup.dedup_key("kikoff", "Business Operations")
+
+
 def test_push_apply_rows_parks_untrusted_workday_hosts(fleet_db):
     rows = [
         {

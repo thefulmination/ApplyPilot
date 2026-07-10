@@ -331,6 +331,8 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                     "worker_level_failure": stats.get("worker_level_failure"),
                     "adapter_name": stats.get("adapter_name"),
                     "adapter_plan_ready": stats.get("adapter_plan_ready"),
+                    "unmapped_required": stats.get("unmapped_required"),
+                    "unmapped_required_count": stats.get("unmapped_required_count"),
                     "attempt_id": stats.get("attempt_id"),
                     "route_version": stats.get("route_version"),
                     "adapter_version": stats.get("adapter_version"),

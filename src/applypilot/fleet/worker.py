@@ -570,6 +570,7 @@ class WorkerLoop:
         return {"action": "parked_challenge", "url": url, "kind": kind, "route": route}
 
     _WALL_STATUSES = ("captcha", "login_issue", "auth_required")
+    _PROFILE_STATUSES = ("profile_required", "adapter_blocked")
     _CRASH_STATUSES = ("failed:no_result_line", "failed:timeout")
 
     @staticmethod
@@ -694,6 +695,23 @@ class WorkerLoop:
                 kind,
                 route=route,
                 outcome=wall_outcome,
+                target_host=target_host,
+                telemetry={
+                    "est_cost_usd": cost,
+                    "agent": agent,
+                    "agent_model": agent_model,
+                    "apply_duration_ms": duration_ms,
+                    **result_evidence,
+                },
+            )
+            return {"action": "parked_challenge", "url": url}
+        if run_status in self._PROFILE_STATUSES:
+            self._raise_and_park(
+                conn,
+                url,
+                run_status,
+                route="owner_inbox",
+                outcome=None,
                 target_host=target_host,
                 telemetry={
                     "est_cost_usd": cost,

@@ -108,6 +108,22 @@ _SPONSOR = ("sponsorship", "visa sponsor", "require sponsorship", "need sponsors
 _DECLINE = ("decline", "prefer not", "don't wish", "do not wish", "not to answer",
             "not to disclose", "not to identify", "not wish to")
 
+_US_STATE_NAMES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island",
+    "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas",
+    "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "Washington, D.C.",
+}
+
 
 def _name_parts(full: str) -> tuple[str, str]:
     toks = (full or "").split()
@@ -123,6 +139,56 @@ def _pick_value(values, pred):
 
 def _has(label: str, needles) -> bool:
     return any(n in label for n in needles)
+
+
+def _profile_text_answer(low: str, *, personal, compensation, experience, first, last):
+    label = " ".join(low.split()).strip(" :?*")
+    if "desired salary" in label or "salary expectation" in label:
+        value = compensation.get("salary_expectation") or compensation.get("salary_range_min")
+        return str(value) if value not in (None, "") else None
+    if "legal first name" in label:
+        return first or None
+    if "legal last name" in label:
+        return last or None
+    if label in {"address", "address line 1", "street address", "mailing address"}:
+        return personal.get("address")
+    if label in {"city", "current city"}:
+        return personal.get("city")
+    if "highest level of education" in label:
+        return experience.get("education_level")
+    if label in {"years of work experience", "total years of experience"}:
+        value = experience.get("years_of_experience_total")
+        return str(value) if value not in (None, "") else None
+    return None
+
+
+def _profile_select_value(low: str, values, *, personal):
+    label = " ".join(low.split()).strip(" :?*")
+    state = str(personal.get("province_state") or "").strip()
+    if "state" in label and state:
+        candidates = {state.lower(), _US_STATE_NAMES.get(state.upper(), state).lower()}
+        return _pick_value(values, lambda option: option in candidates)
+    if label in {"country", "country of residence"}:
+        country = str(personal.get("country") or "").strip().lower()
+        aliases = {country}
+        if country in {"us", "usa", "united states", "united states of america"}:
+            aliases.update({"us", "usa", "united states", "united states of america"})
+        return _pick_value(values, lambda option: option in aliases)
+    if label == "address type" and personal.get("address"):
+        return _pick_value(values, lambda option: option == "home")
+    if "location" in label and "closest" in label:
+        city = str(personal.get("city") or "").strip()
+        province = str(personal.get("province_state") or "").strip()
+        state_code = province.upper()
+        if len(state_code) != 2:
+            state_code = next(
+                (code for code, name in _US_STATE_NAMES.items() if name.lower() == province.lower()),
+                "",
+            )
+        if city and state_code:
+            exact = f"{state_code} | {city}".lower()
+            return _pick_value(values, lambda option: option == exact)
+    return None
 
 
 def build_answer_plan(questions, *, profile, resume_text, corpus=None,
@@ -142,6 +208,8 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
 
     personal = (profile or {}).get("personal", {})
     work_auth = (profile or {}).get("work_authorization", {})
+    compensation = (profile or {}).get("compensation", {})
+    experience = (profile or {}).get("experience", {})
     first, last = _name_parts(personal.get("full_name", ""))
 
     fields: dict = {}
@@ -201,7 +269,14 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
             # Map only high-confidence labels; ambiguous questions still fall
             # through to the answerer or unmapped-required guard.
             if ftype == "input_text":
-                value = None
+                value = _profile_text_answer(
+                    low,
+                    personal=personal,
+                    compensation=compensation,
+                    experience=experience,
+                    first=first,
+                    last=last,
+                )
                 if "preferred" in low and "name" in low:
                     value = personal.get("preferred_name") or first
                 elif "linkedin" in low:
@@ -215,8 +290,21 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 elif "postal" in low or "zip code" in low:
                     value = personal.get("postal_code")
                 if value:
-                    fields[name] = value
+                    fields[name] = str(value)
                     mapped = True
+                continue
+
+            profile_text = _profile_text_answer(
+                low,
+                personal=personal,
+                compensation=compensation,
+                experience=experience,
+                first=first,
+                last=last,
+            )
+            if ftype == "textarea" and profile_text:
+                fields[name] = str(profile_text)
+                mapped = True
                 continue
 
             # Greenhouse offers resume/cover-letter as a paste TEXTAREA too
@@ -242,7 +330,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 continue  # unverified -> never submit; leave unmapped
 
             if ftype == "multi_value_single_select":
-                val = None
+                val = _profile_select_value(low, values, personal=personal)
                 if _has(low, _DEMOGRAPHIC):
                     val = _pick_value(values, lambda label_l: _has(label_l, _DECLINE))
                 elif _has(low, _SPONSOR):
@@ -251,6 +339,13 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 elif _has(low, _WORK_AUTH):
                     if str(work_auth.get("legally_authorized_to_work", "")).strip().lower() in ("yes", "true", "y"):
                         val = _pick_value(values, lambda label_l: label_l == "yes")
+                if val is not None:
+                    fields[name] = val
+                    mapped = True
+                continue
+
+            if ftype == "multi_value_multi_select":
+                val = _profile_select_value(low, values, personal=personal)
                 if val is not None:
                     fields[name] = val
                     mapped = True

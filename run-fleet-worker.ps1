@@ -137,7 +137,13 @@ $env:APPLYPILOT_PREFLIGHT_LIVENESS = "1"
 # Phase 2B rollout: inventory deterministic Greenhouse plans in shadow, but
 # hard-disable ownership of the irreversible submit until shadow acceptance.
 $env:APPLYPILOT_GREENHOUSE_ADAPTER = "1"
-$env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "0"
+$programDataRoot = if ($env:ProgramData) { $env:ProgramData } else { "C:\ProgramData" }
+$greenhouseSubmitFlag = Join-Path $programDataRoot "ApplyPilot\greenhouse-submit.enabled"
+if (Test-Path -LiteralPath $greenhouseSubmitFlag) {
+  $env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "1"
+} else {
+  $env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "0"
+}
 $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
 
 $margs = @(); if ($Model) { $margs = @("--model", $Model) }

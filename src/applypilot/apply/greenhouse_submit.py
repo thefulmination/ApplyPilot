@@ -94,7 +94,7 @@ def detect_confirmation(page) -> str:
 
 # Greenhouse hosted-form input ids equal the API field name (e.g. id="first_name",
 # id="question_12074265004"); the submit button is id="submit_app".
-_SUBMIT_SELECTOR = "#submit_app"
+_SUBMIT_SELECTOR = "button[type='submit']"
 
 
 @dataclass
@@ -102,6 +102,7 @@ class FormAction:
     kind: str          # "fill" | "textarea" | "file" | "select" | "submit"
     selector: str
     value: object = None
+    option_label: str | None = None
 
 
 @dataclass
@@ -119,23 +120,41 @@ def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[
     fill text, fill a textarea, upload a file, or pick a select option.
     """
     types: dict = {}
+    option_labels: dict = {}
     for q in questions or []:
         for f in q.get("fields", []) or []:
-            types[f.get("name")] = f.get("type")
+            name = f.get("name")
+            types[name] = f.get("type")
+            option_labels[name] = {
+                value.get("value"): value.get("label")
+                for value in (f.get("values") or [])
+            }
+
+    def selector(name: str) -> str:
+        if name.endswith("[]"):
+            return f'[id="{name}"]'
+        return f"#{name}"
 
     actions: list[FormAction] = []
     if plan.resume_field and resume_path:
-        actions.append(FormAction("file", f"#{plan.resume_field}", resume_path))
+        actions.append(FormAction("file", selector(plan.resume_field), resume_path))
 
     for name, value in plan.fields.items():
-        selector = f"#{name}"
+        if name == "resume_text" and plan.resume_field and resume_path:
+            continue
+        field_selector = selector(name)
         ftype = types.get(name)
         if ftype == "textarea":
-            actions.append(FormAction("textarea", selector, value))
-        elif ftype == "multi_value_single_select":
-            actions.append(FormAction("select", selector, value))
+            actions.append(FormAction("textarea", field_selector, value))
+        elif ftype in ("multi_value_single_select", "multi_value_multi_select"):
+            actions.append(FormAction(
+                "select",
+                field_selector,
+                value,
+                option_label=option_labels.get(name, {}).get(value),
+            ))
         else:
-            actions.append(FormAction("fill", selector, value))
+            actions.append(FormAction("fill", field_selector, value))
 
     actions.append(FormAction("submit", _SUBMIT_SELECTOR))
     return actions
@@ -162,7 +181,19 @@ def execute_form(actions, page, *, dry_run: bool = True,
         if a.kind == "file":
             page.set_input_files(a.selector, a.value)
         elif a.kind == "select":
-            page.select_option(a.selector, a.value)
+            tag_name = None
+            if hasattr(page, "locator"):
+                try:
+                    tag_name = page.locator(a.selector).evaluate(
+                        "element => element.tagName.toLowerCase()"
+                    )
+                except Exception:
+                    tag_name = None
+            if tag_name == "input" and a.option_label and hasattr(page, "get_by_role"):
+                page.click(a.selector)
+                page.get_by_role("option", name=a.option_label, exact=True).click()
+            else:
+                page.select_option(a.selector, a.value)
         else:  # fill / textarea
             page.fill(a.selector, a.value)
         report.filled.append(a.selector)

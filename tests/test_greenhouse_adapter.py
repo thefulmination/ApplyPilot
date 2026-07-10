@@ -87,10 +87,12 @@ PROFILE = {
     "personal": {
         "full_name": "Jordan Rivera", "email": "jordan@example.com",
         "phone": "5551234567", "city": "Jersey City",
-        "province_state": "NJ", "country": "USA",
+        "province_state": "NJ", "country": "USA", "address": "1 Main St",
         "preferred_name": "Jordy", "linkedin_url": "https://linkedin.com/in/jordan",
     },
     "work_authorization": {"legally_authorized_to_work": "Yes", "require_sponsorship": "No"},
+    "compensation": {"salary_expectation": 175000},
+    "experience": {"education_level": "Bachelor's degree", "years_of_experience_total": 12},
 }
 RESUME = "Quantitative Developer. Built Python risk models at a trading desk supporting a $300M book."
 JOB = {"title": "Quant Developer", "site": "Acme Capital", "description": "Python pricing models."}
@@ -157,6 +159,80 @@ def test_maps_profile_backed_custom_text_questions():
 
     assert plan.fields["question_1"] == "Jordy"
     assert plan.fields["question_2"] == "https://linkedin.com/in/jordan"
+    assert plan.ready is True
+
+
+def test_maps_profile_backed_salary_address_and_education_questions():
+    q = [
+        {"required": True, "label": "What is your desired salary?",
+         "fields": [{"name": "salary_q", "type": "input_text"}]},
+        {"required": True, "label": "Legal First Name",
+         "fields": [{"name": "legal_first", "type": "input_text"}]},
+        {"required": True, "label": "Legal Last Name",
+         "fields": [{"name": "legal_last", "type": "input_text"}]},
+        {"required": True, "label": "Address Line 1",
+         "fields": [{"name": "address_q", "type": "textarea"}]},
+        {"required": True, "label": "City",
+         "fields": [{"name": "city_q", "type": "textarea"}]},
+        {"required": True, "label": "What is your highest level of education completed?",
+         "fields": [{"name": "education_q", "type": "textarea"}]},
+    ]
+
+    plan = _plan(q, answer_fn=_bad_fn)
+
+    assert plan.fields["salary_q"] == "175000"
+    assert plan.fields["legal_first"] == "Jordan"
+    assert plan.fields["legal_last"] == "Rivera"
+    assert plan.fields["address_q"] == "1 Main St"
+    assert plan.fields["city_q"] == "Jersey City"
+    assert plan.fields["education_q"] == "Bachelor's degree"
+    assert plan.ready is True
+
+
+def test_maps_profile_backed_state_country_and_address_type_selects():
+    q = [
+        {"required": True, "label": "Which state do you currently reside in?",
+         "fields": [{"name": "state_q", "type": "multi_value_single_select",
+                     "values": [{"label": "New Jersey", "value": 10},
+                                {"label": "New York", "value": 11}]}]},
+        {"required": True, "label": "Country",
+         "fields": [{"name": "country_q", "type": "multi_value_single_select",
+                     "values": [{"label": "USA", "value": 20},
+                                {"label": "Outside-USA", "value": 21}]}]},
+        {"required": True, "label": "Address Type",
+         "fields": [{"name": "address_type_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Home", "value": 30}]}]},
+    ]
+
+    plan = _plan(q, answer_fn=_bad_fn)
+
+    assert plan.fields["state_q"] == 10
+    assert plan.fields["country_q"] == 20
+    assert plan.fields["address_type_q"] == 30
+    assert plan.ready is True
+
+
+def test_maps_exact_profile_city_for_location_multi_select():
+    profile = {
+        **PROFILE,
+        "personal": {
+            **PROFILE["personal"],
+            "city": "San Francisco",
+            "province_state": "California",
+        },
+    }
+    q = _identity_qs() + [
+        {"required": True,
+         "label": "Which location is closest to where you currently live or are actively planning on relocating to?",
+         "fields": [{"name": "location_q[]", "type": "multi_value_multi_select",
+                     "values": [{"label": "CA | Los Angeles", "value": 40},
+                                {"label": "CA | San Francisco", "value": 41},
+                                {"label": "NY | New York", "value": 42}]}]},
+    ]
+
+    plan = build_answer_plan(q, profile=profile, resume_text=RESUME, answer_fn=_bad_fn, job=JOB)
+
+    assert plan.fields["location_q[]"] == 41
     assert plan.ready is True
 
 

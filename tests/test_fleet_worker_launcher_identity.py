@@ -73,8 +73,11 @@ def test_windows_apply_worker_forces_inbox_relay_not_direct_gmail():
     assert "hydrate-gmail.py" not in script
 
 
-def test_worker_launcher_enables_greenhouse_shadow_but_hard_disables_submit():
+def test_worker_launcher_enables_greenhouse_shadow_and_defaults_submit_sentinel_off():
     script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
 
     assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER = "1"' in script
+    assert "greenhouse-submit.enabled" in script
+    assert "Test-Path -LiteralPath $greenhouseSubmitFlag" in script
+    assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "1"' in script
     assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "0"' in script

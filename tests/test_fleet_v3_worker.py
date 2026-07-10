@@ -685,7 +685,6 @@ def test_tick_apply_status_passthrough(fleet_db):
     # The new contract: apply_fn returns {"run_status": ...}. Prove crash != phantom-applied.
     from applypilot.fleet.worker import WorkerLoop
     from applypilot.apply import pgqueue
-    from applypilot.fleet import queue
 
     def _seed(conn, url, domain="acme.com"):
         # use a distinct apply_domain per sub-case so the host-governor min-gap
@@ -784,6 +783,32 @@ def test_tick_apply_status_passthrough(fleet_db):
         assert event["est_cost_usd"] == pytest.approx(0.12)
         assert event["tool_calls_total"] == 4
         assert event["application_tool_calls"] == 2
+
+    # adapter plan gaps are a zero-spend owner/profile task, never a paid-agent failure.
+    with pgqueue.connect(fleet_db) as conn:
+        _seed(conn, "jprofile", "greenhouse-profile.com")
+    loop4 = WorkerLoop(
+        lambda: pgqueue.connect(fleet_db),
+        "w4",
+        home_ip="4.4.4.4",
+        role="apply",
+        apply_fn=lambda job: {
+            "run_status": "profile_required",
+            "est_cost_usd": 0.0,
+            "route": "adapter_plan:greenhouse",
+            "failure_class": "adapter_unmapped_required",
+            "result_metadata": {"unmapped_required": ["Relocation"]},
+        },
+    )
+    assert loop4.run_once()["action"] == "parked_challenge"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, apply_status, est_cost_usd FROM apply_queue WHERE url='jprofile'")
+        parked = cur.fetchone()
+        assert parked["status"] == "leased"
+        assert parked["apply_status"] == "challenge_pending"
+        assert float(parked["est_cost_usd"]) == 0.0
+        cur.execute("SELECT kind FROM auth_challenge WHERE url='jprofile' AND resolved_at IS NULL")
+        assert cur.fetchone()["kind"] == "profile_required"
 
 
 def test_apply_worker_injects_attempt_store_only_when_factory_configured(fleet_db):

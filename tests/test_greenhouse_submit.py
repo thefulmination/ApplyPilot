@@ -73,15 +73,83 @@ def test_plan_form_actions_maps_each_type_to_the_right_action():
             for a in plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")]
     assert ("file", "#resume", "/r.pdf") in acts
     assert ("fill", "#first_name", "Jordan") in acts
-    assert ("textarea", "#resume_text", "REAL RESUME") in acts
+    assert not any(selector == "#resume_text" for _, selector, _ in acts)
     assert ("textarea", "#question_1", "why text") in acts
     assert ("select", "#question_2", 1) in acts
+
+
+def test_plan_form_actions_keeps_manual_resume_when_no_file_is_available():
+    acts = [(action.kind, action.selector, action.value)
+            for action in plan_form_actions(_ready_plan(), QUESTIONS, resume_path=None)]
+
+    assert ("textarea", "#resume_text", "REAL RESUME") in acts
+
+
+def test_plan_form_actions_uses_select_for_multi_select_fields():
+    plan = AnswerPlan(
+        fields={"location_q[]": 41},
+        resume_field=None,
+        free_text={},
+        unmapped_required=[],
+        ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "location_q[]", "type": "multi_value_multi_select",
+                     "values": [{"label": "CA | San Francisco", "value": 41}]}]},
+    ]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("select", '[id="location_q[]"]', 41, "CA | San Francisco") in [
+        (action.kind, action.selector, action.value, action.option_label) for action in actions
+    ]
 
 
 def test_plan_form_actions_puts_submit_last():
     acts = plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")
     assert acts[-1].kind == "submit"
-    assert [a for a in acts if a.kind == "submit"][0].selector == "#submit_app"
+    assert [a for a in acts if a.kind == "submit"][0].selector == "button[type='submit']"
+
+
+def test_execute_form_selects_react_combobox_option_by_label():
+    class FakeLocator:
+        def evaluate(self, script):
+            return "input"
+
+    class FakeOption:
+        def __init__(self, calls, label):
+            self.calls = calls
+            self.label = label
+
+        def click(self):
+            self.calls.append(("option", self.label))
+
+    class FakeReactPage(FakePage):
+        def locator(self, selector):
+            self.calls.append(("locator", selector))
+            return FakeLocator()
+
+        def get_by_role(self, role, *, name, exact):
+            self.calls.append(("role", role, name, exact))
+            return FakeOption(self.calls, name)
+
+    plan = AnswerPlan(
+        fields={"location_q[]": 41},
+        resume_field=None,
+        free_text={},
+        unmapped_required=[],
+        ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "location_q[]", "type": "multi_value_multi_select",
+                     "values": [{"label": "CA | San Francisco", "value": 41}]}]},
+    ]
+    page = FakeReactPage()
+
+    execute_form(plan_form_actions(plan, questions), page)
+
+    assert ("click", '[id="location_q[]"]') in page.calls
+    assert ("option", "CA | San Francisco") in page.calls
 
 
 def test_plan_form_actions_never_touches_unplanned_fields():
@@ -98,7 +166,7 @@ def test_execute_form_dry_run_fills_but_NEVER_clicks_submit():
     assert rep.dry_run is True
     assert rep.submitted is False
     assert rep.skipped_submit is True
-    assert ("click", "#submit_app") not in page.calls
+    assert ("click", "button[type='submit']") not in page.calls
     assert ("fill", "#first_name", "Jordan") in page.calls
     assert ("file", "#resume", "/r.pdf") in page.calls
 
@@ -108,7 +176,7 @@ def test_execute_form_clicks_submit_only_when_dry_run_false():
     rep = execute_form(plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
                        page, dry_run=False)
     assert rep.submitted is True
-    assert ("click", "#submit_app") in page.calls
+    assert ("click", "button[type='submit']") in page.calls
 
 
 def test_execute_form_checkpoints_immediately_before_submit():
@@ -124,7 +192,7 @@ def test_execute_form_checkpoints_immediately_before_submit():
         before_submit=checkpoint,
     )
 
-    assert page.calls[-2:] == [("checkpoint",), ("click", "#submit_app")]
+    assert page.calls[-2:] == [("checkpoint",), ("click", "button[type='submit']")]
 
 
 def test_execute_form_checkpoint_failure_prevents_submit():
@@ -141,7 +209,7 @@ def test_execute_form_checkpoint_failure_prevents_submit():
             before_submit=checkpoint,
         )
 
-    assert ("click", "#submit_app") not in page.calls
+    assert ("click", "button[type='submit']") not in page.calls
 
 
 # --- decide_route (the "both 1 and 2" glue) --------------------------------
@@ -202,7 +270,7 @@ def test_apply_greenhouse_deterministic_path_is_dry_run_by_default():
     assert res["report"].submitted is False
     assert res["report"].skipped_submit is True
     assert ("fill", "#first_name", "Jordan") in page.calls
-    assert ("click", "#submit_app") not in page.calls
+    assert ("click", "button[type='submit']") not in page.calls
 
 
 def test_apply_greenhouse_result_includes_route_for_deterministic_dry_run():
@@ -296,7 +364,7 @@ def test_apply_greenhouse_owns_submit_and_reports_applied_on_confirmation():
         fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
     )
     assert res["report"].submitted is True
-    assert ("click", "#submit_app") in page.calls
+    assert ("click", "button[type='submit']") in page.calls
     assert res["status"] == "applied"
 
 

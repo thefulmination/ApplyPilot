@@ -432,6 +432,75 @@ def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeyp
     assert stats["submit_checkpoint_state"] == "verified"
 
 
+def test_greenhouse_submit_mode_parks_incomplete_plan_without_agent_fallback(
+    monkeypatch, tmp_path: Path,
+):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 94
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+    monkeypatch.setattr(
+        greenhouse_submit,
+        "apply_greenhouse",
+        lambda *args, **kwargs: {
+            "route": "agent_fallback",
+            "ready": False,
+            "unmapped": ["Prior employment", "Relocation"],
+        },
+    )
+
+    class FakePage:
+        def goto(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+    class FakePlaywright:
+        chromium = types.SimpleNamespace(connect_over_cdp=lambda endpoint: FakeBrowser())
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    playwright_module = types.ModuleType("playwright")
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: FakePlaywrightContext()
+    playwright_module.sync_api = sync_api_module
+    monkeypatch.setitem(sys.modules, "playwright", playwright_module)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {"application_url": "https://boards.greenhouse.io/acme/jobs/123"},
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=types.SimpleNamespace(),
+    )
+
+    assert result[0] == "profile_required"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["route"] == "adapter_plan:greenhouse"
+    assert stats["failure_class"] == "adapter_unmapped_required"
+    assert stats["unmapped_required_count"] == 2
+
+
 def test_run_job_impl_merges_greenhouse_shadow_route_stats(monkeypatch, tmp_path: Path):
     from applypilot.apply import launcher
 

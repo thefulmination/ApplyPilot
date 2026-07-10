@@ -27,6 +27,7 @@ import pandas as pd
 
 from applypilot import config, database
 from applypilot.apply import pgqueue
+from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
 from applypilot.database import THIN_DESCRIPTION_CHARS
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import queue as _queue
@@ -166,6 +167,19 @@ def _target_host(application_url: str | None) -> str | None:
     return host or None
 
 
+def _routing_company(company: str | None, application_url: str | None) -> str | None:
+    """Recover a stable employer key from a hosted Greenhouse board.
+
+    Aggregators frequently omit company even though the application URL carries
+    the tenant. Keeping company blank makes unrelated generic roles collide in
+    posting-level dedup, so use the public board token when it is available.
+    """
+    if str(company or "").strip():
+        return company
+    parsed = parse_greenhouse_url(application_url or "")
+    return parsed[0] if parsed else company
+
+
 def push_apply_rows(
     conn: Any,
     rows: list[dict[str, Any]],
@@ -286,11 +300,12 @@ def push_apply_eligible(
             params.append(int(limit))
         for r in sq.execute(sql, params).fetchall():
             host = _target_host(r["application_url"])
+            company = _routing_company(r["company"], r["application_url"])
             out.append({
-                "url": r["url"], "company": r["company"], "title": r["title"],
+                "url": r["url"], "company": company, "title": r["title"],
                 "application_url": r["application_url"], "score": r["score"],
                 "target_host": host, "apply_domain": host,
-                "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
+                "dedup_key": _dedup.dedup_key(company, r["title"]),
             })
             if limit and len(out) >= limit:
                 break

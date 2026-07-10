@@ -1459,8 +1459,17 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     # A real adapter submit is impossible without the durable attempt ledger.
     # With the submit flag on but no injected store, stay in shadow and let the
     # existing agent path own the application.
-    own = submit_enabled() and not dry_run and attempt_store is not None
     t0 = time.time()
+    submit_requested = submit_enabled() and not dry_run
+    own = submit_requested and attempt_store is not None
+    if submit_requested and attempt_store is None:
+        _adapter_route_stats[worker_id] = {
+            "route": "adapter_plan:greenhouse",
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": False,
+            "failure_class": "attempt_store_unavailable",
+        }
+        return ("adapter_blocked", int((time.time() - t0) * 1000))
     res = None
     attempt_id = None
     attempt_state = None
@@ -1553,6 +1562,17 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     if not res or res.get("route") != "deterministic":
         logger.info("greenhouse adapter: deferring to agent (route=%s unmapped=%s)",
                     (res or {}).get("route"), (res or {}).get("unmapped"))
+        if submit_requested:
+            unmapped = list((res or {}).get("unmapped") or [])
+            _adapter_route_stats[worker_id] = {
+                "route": "adapter_plan:greenhouse",
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": False,
+                "failure_class": "adapter_unmapped_required",
+                "unmapped_required": unmapped,
+                "unmapped_required_count": len(unmapped),
+            }
+            return ("profile_required", int((time.time() - t0) * 1000))
         return None
     if not own:
         plan = res.get("plan")
