@@ -368,6 +368,11 @@ def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeyp
             "verification_method": "confirmation_dom",
             "verification_ref": "application submitted",
             "attempt_context": context,
+            "submission_diagnostics": {
+                "response_status": 200,
+                "response_request_id": "request-123",
+                "final_url": "https://job-boards.greenhouse.io/acme/jobs/123/confirmation",
+            },
         }
 
     monkeypatch.setattr(greenhouse_submit, "apply_greenhouse", fake_apply)
@@ -430,6 +435,10 @@ def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeyp
     assert stats["attempt_id"] == "attempt-1"
     assert stats["verification_method"] == "confirmation_dom"
     assert stats["submit_checkpoint_state"] == "verified"
+    assert stats["submission_diagnostics"]["response_status"] == 200
+    assert store.calls[2][2]["evidence"]["submission_diagnostics"][
+        "response_request_id"
+    ] == "request-123"
 
 
 def test_greenhouse_submit_mode_parks_incomplete_plan_without_agent_fallback(

@@ -179,6 +179,70 @@ def test_execute_form_clicks_submit_only_when_dry_run_false():
     assert ("click", "button[type='submit']") in page.calls
 
 
+def test_execute_form_captures_expected_greenhouse_post_response():
+    class Request:
+        method = "POST"
+
+    class Response:
+        request = Request()
+        url = "https://boards.greenhouse.io/acme/jobs/123"
+        status = 200
+
+        def header_value(self, name):
+            return "request-123" if name == "x-request-id" else None
+
+    class ExpectedResponse:
+        value = Response()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class ResponsePage(FakePage):
+        def expect_response(self, predicate, *, timeout):
+            self.calls.append(("expect_response", timeout))
+            assert predicate(Response())
+            return ExpectedResponse()
+
+    page = ResponsePage()
+    report = execute_form(
+        plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+        page,
+        dry_run=False,
+        expected_submit_url="https://boards.greenhouse.io/acme/jobs/123",
+    )
+
+    assert report.response_status == 200
+    assert report.response_url == "https://boards.greenhouse.io/acme/jobs/123"
+    assert report.response_request_id == "request-123"
+
+
+def test_execute_form_does_not_click_twice_when_response_wait_times_out():
+    class TimeoutResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            raise TimeoutError("no matching response")
+
+    class TimeoutPage(FakePage):
+        def expect_response(self, predicate, *, timeout):
+            return TimeoutResponse()
+
+    page = TimeoutPage()
+    report = execute_form(
+        plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+        page,
+        dry_run=False,
+        expected_submit_url="https://boards.greenhouse.io/acme/jobs/123",
+    )
+
+    assert page.calls.count(("click", "button[type='submit']")) == 1
+    assert report.response_wait_error == "TimeoutError"
+
+
 def test_execute_form_checkpoints_immediately_before_submit():
     page = FakePage()
 

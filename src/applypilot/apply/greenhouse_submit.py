@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 
@@ -69,16 +70,89 @@ _POST_SUBMIT_SETTLED = """() => {
 }"""
 
 
-def _wait_for_submission_settlement(page, *, timeout_ms: int = 15_000) -> None:
+def _wait_for_submission_settlement(page, *, timeout_ms: int = 15_000) -> str | None:
     """Wait for Greenhouse's async POST to produce success or validation UI."""
     wait_for_function = getattr(page, "wait_for_function", None)
     if wait_for_function is None:
-        return
+        return None
     try:
         wait_for_function(_POST_SUBMIT_SETTLED, timeout=timeout_ms)
-    except Exception:
+        return None
+    except Exception as exc:
         # The independent verifier below remains fail-closed on timeout/browser errors.
-        pass
+        return type(exc).__name__
+
+
+def _safe_url(url: object) -> str | None:
+    try:
+        parsed = urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))[:500]
+
+
+def _is_expected_submit_response(response, expected_url: str) -> bool:
+    try:
+        method = str(response.request.method or "").upper()
+        return method == "POST" and _safe_url(response.url) == _safe_url(expected_url)
+    except Exception:
+        return False
+
+
+def _response_request_id(response) -> str | None:
+    header_value = getattr(response, "header_value", None)
+    if header_value is None:
+        return None
+    for name in ("x-request-id", "x-amzn-trace-id", "traceparent"):
+        try:
+            value = str(header_value(name) or "").strip()
+        except Exception:
+            continue
+        if value:
+            return value[:300]
+    return None
+
+
+def _collect_submission_diagnostics(page, report) -> dict:
+    diagnostics = {
+        "response_status": report.response_status,
+        "response_url": report.response_url,
+        "response_request_id": report.response_request_id,
+        "response_wait_error": report.response_wait_error,
+        "settlement_error": report.settlement_error,
+        "final_url": _safe_url(getattr(page, "url", None)),
+        "invalid_fields": [],
+        "validation_messages": [],
+    }
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is not None:
+        try:
+            dom = evaluate("""() => {
+                const visible = element => !!(element.offsetWidth || element.offsetHeight ||
+                    element.getClientRects().length);
+                const invalidFields = [...document.querySelectorAll('[aria-invalid="true"]')]
+                    .filter(visible)
+                    .map(element => element.id || element.getAttribute('name') || element.tagName)
+                    .filter(Boolean).slice(0, 20);
+                const messages = [...document.querySelectorAll(
+                    '[role="alert"], .field-error, .error-message, [id$="-error"]')]
+                    .filter(visible)
+                    .map(element => (element.innerText || element.textContent || '').trim())
+                    .filter(Boolean).slice(0, 20);
+                return {invalid_fields: invalidFields, validation_messages: messages};
+            }""")
+            if isinstance(dom, dict):
+                diagnostics["invalid_fields"] = [
+                    str(item)[:200] for item in (dom.get("invalid_fields") or [])[:20]
+                ]
+                diagnostics["validation_messages"] = [
+                    str(item)[:300] for item in (dom.get("validation_messages") or [])[:20]
+                ]
+        except Exception:
+            pass
+    return diagnostics
 
 
 def _page_content(page) -> str:
@@ -140,6 +214,11 @@ class SubmitReport:
     submitted: bool = False
     dry_run: bool = True
     skipped_submit: bool = False
+    response_status: int | None = None
+    response_url: str | None = None
+    response_request_id: str | None = None
+    response_wait_error: str | None = None
+    settlement_error: str | None = None
 
 
 def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[FormAction]:
@@ -190,7 +269,7 @@ def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[
 
 
 def execute_form(actions, page, *, dry_run: bool = True,
-                 before_submit=None) -> SubmitReport:
+                 before_submit=None, expected_submit_url: str | None = None) -> SubmitReport:
     """Run form actions against ``page``. Dry-run (default) never clicks submit.
 
     ``page`` is any object exposing ``fill``, ``set_input_files``,
@@ -204,7 +283,26 @@ def execute_form(actions, page, *, dry_run: bool = True,
                 continue
             if before_submit is not None:
                 before_submit()
-            page.click(a.selector)
+            expect_response = getattr(page, "expect_response", None)
+            clicked = False
+            if expected_submit_url and expect_response is not None:
+                try:
+                    with expect_response(
+                        lambda response: _is_expected_submit_response(
+                            response, expected_submit_url
+                        ),
+                        timeout=15_000,
+                    ) as response_info:
+                        page.click(a.selector)
+                        clicked = True
+                    response = response_info.value
+                    report.response_status = int(response.status)
+                    report.response_url = _safe_url(response.url)
+                    report.response_request_id = _response_request_id(response)
+                except Exception as exc:
+                    report.response_wait_error = type(exc).__name__
+            if not clicked:
+                page.click(a.selector)
             report.submitted = True
             continue
         if a.kind == "file":
@@ -303,12 +401,14 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
         page,
         dry_run=dry_run,
         before_submit=checkpoint,
+        expected_submit_url=f"https://boards.greenhouse.io/{board}/jobs/{job_id}",
     )
     result = {"route": "deterministic", "plan": plan, "actions": actions,
               "report": report, "ready": True,
               "attempt_context": attempt_context}
     if report.submitted:
-        _wait_for_submission_settlement(page)
+        report.settlement_error = _wait_for_submission_settlement(page)
+        result["submission_diagnostics"] = _collect_submission_diagnostics(page, report)
         verification = (verify_fn or verify_greenhouse_submission)(page)
         result["verification_status"] = verification.status
         result["verification_method"] = verification.method

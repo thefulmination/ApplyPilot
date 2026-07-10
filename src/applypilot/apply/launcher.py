@@ -1586,6 +1586,7 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
         return None  # shadow: agent still owns the submission
 
     verification_status = res.get("verification_status") or "unverified"
+    submission_diagnostics = dict(res.get("submission_diagnostics") or {})
     final_state = {
         "verified": "verified",
         "contradicted": "contradicted",
@@ -1603,6 +1604,7 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
                 "verification_status": verification_status,
                 "verification_method": res.get("verification_method"),
                 "verification_ref": res.get("verification_ref"),
+                "submission_diagnostics": submission_diagnostics,
             },
         )
         attempt_state = final_state
@@ -1624,6 +1626,7 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
         "verification_status": verification_status,
         "verification_method": res.get("verification_method"),
         "verification_ref": res.get("verification_ref"),
+        "submission_diagnostics": submission_diagnostics,
     }
     duration_ms = int((time.time() - t0) * 1000)
     logger.info("greenhouse adapter OWNED submit for %s -> %s", url, status)

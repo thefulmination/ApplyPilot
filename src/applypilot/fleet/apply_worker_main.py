@@ -340,6 +340,7 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                     "verification_status": stats.get("verification_status"),
                     "verification_method": stats.get("verification_method"),
                     "verification_ref": stats.get("verification_ref"),
+                    "submission_diagnostics": stats.get("submission_diagnostics"),
                     "attempt_count": len(attempt_stats),
                     "prior_attempt_status": (
                         attempt_statuses[0] if len(attempt_statuses) > 1 else None
