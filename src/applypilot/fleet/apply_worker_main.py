@@ -311,13 +311,13 @@ def _apply_timeout_override(dsn=None, *, conn=None) -> None:
 
 def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", machine_owner=None, slot=0):
     _setup_apply_env()
-    from applypilot.apply import pgqueue
+    from applypilot.apply import liveness, pgqueue
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)
     return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot), machine_owner=machine_owner,
-                      log_tail_fn=make_log_tail_fn(slot))
+                      log_tail_fn=make_log_tail_fn(slot), preflight_fn=liveness.probe_url)
 
 
 # When all agents are usage-limit-walled the worker pauses until the nearer reset. Cap a
