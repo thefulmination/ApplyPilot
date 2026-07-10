@@ -70,7 +70,18 @@ _RELEASE_GATES = (
 
 @contextmanager
 def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
-    """Use a savepoint so calls compose with caller-owned transactions."""
+    """Own a write transaction, or isolate work within the caller's transaction."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        return
+
     name = f"canonical_decisions_{next(_SAVEPOINT_IDS)}"
     conn.execute(f"SAVEPOINT {name}")
     try:
@@ -182,14 +193,31 @@ def insert_decisions(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]]
             )
             if existing is not None:
                 _assert_equal(existing, proposed, identity=str(decision_id))
-            else:
-                placeholders = ", ".join("?" for _ in _DECISION_COLUMNS)
-                conn.execute(
-                    f"INSERT INTO job_decisions ({', '.join(_DECISION_COLUMNS)}) "
-                    f"VALUES ({placeholders})",
-                    tuple(proposed[column] for column in _DECISION_COLUMNS),
+                continue
+
+            identity_match = _select_one(
+                conn,
+                f"SELECT {', '.join(_DECISION_COLUMNS)} FROM job_decisions "
+                "WHERE job_url = ? AND policy_version = ? AND input_hash = ?",
+                (
+                    proposed["job_url"],
+                    proposed["policy_version"],
+                    proposed["input_hash"],
+                ),
+            )
+            if identity_match is not None:
+                raise ImmutableDecisionConflict(
+                    "canonical identity already belongs to decision "
+                    f"{identity_match['decision_id']!r}"
                 )
-                inserted += 1
+
+            placeholders = ", ".join("?" for _ in _DECISION_COLUMNS)
+            conn.execute(
+                f"INSERT INTO job_decisions ({', '.join(_DECISION_COLUMNS)}) "
+                f"VALUES ({placeholders})",
+                tuple(proposed[column] for column in _DECISION_COLUMNS),
+            )
+            inserted += 1
 
             conn.execute(
                 """

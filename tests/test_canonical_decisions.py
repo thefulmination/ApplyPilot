@@ -121,6 +121,35 @@ def test_insert_decisions_is_immutable_idempotent_and_projects_exact_action(conn
         repo.insert_decisions(conn, [{**apply_row, "final_score": 0.2}])
 
 
+def test_identical_decision_replay_does_not_revert_newer_projection(conn) -> None:
+    prepare_policy(conn)
+    old = decision()
+    newer = decision("d2")
+    repo.insert_decisions(conn, [old])
+    repo.insert_decisions(conn, [newer])
+
+    assert repo.insert_decisions(conn, [dict(old)]) == 0
+    projection = conn.execute(
+        "SELECT canonical_decision_id, canonical_score FROM jobs WHERE url = 'u1'"
+    ).fetchone()
+    assert tuple(projection) == ("d2", newer["final_score"])
+
+
+def test_canonical_identity_conflict_raises_repository_exception(conn) -> None:
+    prepare_policy(conn)
+    existing = decision()
+    repo.insert_decisions(conn, [existing])
+
+    conflicting = {
+        **existing,
+        "decision_id": "different-id",
+    }
+    with pytest.raises(repo.ImmutableDecisionConflict):
+        repo.insert_decisions(conn, [conflicting])
+
+    assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 1
+
+
 def test_insert_decisions_rolls_back_batch_and_projection_on_failure(conn) -> None:
     prepare_policy(conn)
 
@@ -145,6 +174,53 @@ def test_repository_savepoint_preserves_callers_outer_transaction(conn) -> None:
     assert conn.execute("SELECT title FROM jobs WHERE url = 'u1'").fetchone()[0] == "outer change"
     conn.rollback()
     assert conn.execute("SELECT title FROM jobs WHERE url = 'u1'").fetchone()[0] == "One"
+
+
+def test_repository_uses_begin_immediate_and_commit_without_outer_transaction(conn) -> None:
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    prepare_policy(conn)
+
+    conn.set_trace_callback(None)
+    transaction_sql = [statement.upper() for statement in statements]
+    assert "BEGIN IMMEDIATE" in transaction_sql
+    assert "COMMIT" in transaction_sql
+    assert not any(statement.startswith("SAVEPOINT ") for statement in transaction_sql)
+    assert not conn.in_transaction
+
+
+def test_repository_uses_savepoint_inside_outer_transaction(conn) -> None:
+    conn.execute("BEGIN")
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    prepare_policy(conn)
+
+    conn.set_trace_callback(None)
+    transaction_sql = [statement.upper() for statement in statements]
+    assert any(statement.startswith("SAVEPOINT ") for statement in transaction_sql)
+    assert any(statement.startswith("RELEASE SAVEPOINT ") for statement in transaction_sql)
+    assert "BEGIN IMMEDIATE" not in transaction_sql
+    assert "COMMIT" not in transaction_sql
+    assert conn.in_transaction
+    conn.rollback()
+
+
+def test_repository_uses_rollback_for_failed_root_transaction(conn) -> None:
+    prepare_policy(conn)
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.insert_decisions(conn, [decision(job_url="missing")])
+
+    conn.set_trace_callback(None)
+    transaction_sql = [statement.upper() for statement in statements]
+    assert "BEGIN IMMEDIATE" in transaction_sql
+    assert "ROLLBACK" in transaction_sql
+    assert not any(statement.startswith("SAVEPOINT ") for statement in transaction_sql)
+    assert not conn.in_transaction
 
 
 def test_failed_batch_does_not_overwrite_an_existing_projection(conn) -> None:
