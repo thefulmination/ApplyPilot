@@ -256,6 +256,7 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
 
 def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
     calls = []
+    preflight_urls = []
     with pgqueue.connect(fleet_db) as conn:
         _seed_one_apply(conn, "preflight-dead", host="jobs.example")
     loop = WorkerLoop(
@@ -264,7 +265,7 @@ def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
         home_ip="1.2.3.4",
         role="apply",
         apply_fn=lambda job: calls.append(job) or {"run_status": "applied"},
-        preflight_fn=lambda url: ("dead", "http_404"),
+        preflight_fn=lambda url: preflight_urls.append(url) or ("dead", "http_404"),
     )
 
     result = loop.run_once()
@@ -275,6 +276,7 @@ def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
         "reason": "http_404",
     }
     assert calls == []
+    assert preflight_urls == ["https://jobs.example/jobs/1"]
     with pgqueue.connect(fleet_db) as conn:
         row = conn.execute(
             "SELECT status::text, apply_status, apply_error, est_cost_usd "
@@ -298,6 +300,35 @@ def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
         "preflight_status": "dead",
         "preflight_reason": "http_404",
     }
+
+
+def test_apply_preflight_dead_reports_lost_lease_when_write_rejected(fleet_db, monkeypatch):
+    calls = []
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "preflight-lease-lost", host="jobs.example")
+    monkeypatch.setattr(queue, "write_apply_result", lambda *args, **kwargs: False)
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-preflight-lease-lost",
+        home_ip="1.2.3.4",
+        role="apply",
+        apply_fn=lambda job: calls.append(job) or {"run_status": "applied"},
+        preflight_fn=lambda url: ("dead", "http_404"),
+    )
+
+    result = loop.run_once()
+
+    assert result == {
+        "action": "lease_lost",
+        "url": "preflight-lease-lost",
+        "reason": "http_404",
+    }
+    assert calls == []
+    assert any(
+        "preflight_dead write rejected (lease lost) preflight-lease-lost" in event
+        for event in loop._events
+    )
+    assert not any("wrote apply preflight_dead" in event for event in loop._events)
 
 
 def test_worker_apply_visible_captcha_parks_and_raises_challenge(fleet_db):

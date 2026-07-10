@@ -483,7 +483,7 @@ class WorkerLoop:
                 preflight_reason = "unknown"
             preflight_reason = preflight_reason[:160]
             if preflight_status == "dead":
-                queue.write_apply_result(
+                wrote_result = queue.write_apply_result(
                     conn,
                     self.worker_id,
                     url,
@@ -500,6 +500,10 @@ class WorkerLoop:
                         "preflight_reason": preflight_reason,
                     },
                 )
+                if not wrote_result:
+                    self._record_event(f"preflight_dead write rejected (lease lost) {url}")
+                    self._beat(conn, state="idle")
+                    return {"action": "lease_lost", "url": url, "reason": preflight_reason}
                 self._record_event(f"wrote apply preflight_dead {url} ({preflight_reason})")
                 self._beat(conn, state="idle")
                 return {"action": "preflight_dead", "url": url, "reason": preflight_reason}
