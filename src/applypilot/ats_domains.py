@@ -3,6 +3,7 @@
 ATS_SENDER_DOMAINS: frozenset[str] = frozenset(
     {
         "greenhouse.io",
+        "boards.greenhouse.io",
         "greenhouse-mail.io",
         "lever.co",
         "hire.lever.co",
@@ -16,6 +17,12 @@ ATS_SENDER_DOMAINS: frozenset[str] = frozenset(
         "workable.com",
         "workablemail.com",
         "taleo.net",
+        "oraclecloud.com",
+        "oracle.com",
+        "adp.com",
+        "workforcenow.adp.com",
+        "amazon.jobs",
+        "jobs.amazon.com",
         "jobvite.com",
         "jobvite-mail.com",
         "recruitee.com",

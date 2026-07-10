@@ -196,6 +196,55 @@ def test_inbox_auth_and_gmail_outcomes_share_canonical_ats_sender_registry():
     assert gmail_outcomes._ATS_DOMAINS is ATS_SENDER_DOMAINS
 
 
+def test_canonical_ats_sender_registry_preserves_both_legacy_consumer_sets():
+    from applypilot.ats_domains import ATS_SENDER_DOMAINS
+
+    legacy_outcome_domains = {
+        "greenhouse.io", "greenhouse-mail.io", "lever.co", "hire.lever.co",
+        "workday.com", "myworkdayjobs.com", "myworkday.com", "icims.com",
+        "brassring.com", "smartrecruiters.com", "smartrecruiters-mail.com",
+        "workable.com", "workablemail.com", "taleo.net", "jobvite.com",
+        "jobvite-mail.com", "recruitee.com", "ashbyhq.com", "ashbyhq-mail.com",
+        "ashby.email", "successfactors.com", "applytojob.com", "bamboohr.com",
+        "rippling.com", "eightfold.ai", "beamery.com", "paradox.ai",
+        "fountain.com", "dover.com", "dover.io", "teamtailor.com",
+        "teamtailor-mail.com", "pinpointhq.com", "comeet.co", "gem.com",
+        "breezy.hr", "hiringthing.com",
+    }
+    legacy_auth_domains = {
+        "greenhouse.io", "boards.greenhouse.io", "myworkday.com",
+        "myworkdayjobs.com", "lever.co", "ashbyhq.com", "icims.com",
+        "smartrecruiters.com", "workable.com", "taleo.net", "oraclecloud.com",
+        "oracle.com", "workday.com", "greenhouse-mail.io", "adp.com",
+        "workforcenow.adp.com", "amazon.jobs", "jobs.amazon.com", "eightfold.ai",
+    }
+
+    assert ATS_SENDER_DOMAINS >= legacy_outcome_domains
+    assert ATS_SENDER_DOMAINS >= legacy_auth_domains
+
+
+def test_oracle_adp_and_amazon_senders_keep_high_confidence_code_extraction():
+    for domain in (
+        "oraclecloud.com",
+        "oracle.com",
+        "adp.com",
+        "workforcenow.adp.com",
+        "amazon.jobs",
+        "jobs.amazon.com",
+    ):
+        candidates = inbox_auth.extract_verification_candidates(
+            subject="Verify your email",
+            body="Use verification code 123456 to continue.",
+            sender=f"no-reply@{domain}",
+        )
+
+        assert inbox_auth.is_known_ats_domain(domain), domain
+        assert any(
+            candidate.kind == "code" and candidate.confidence == "high"
+            for candidate in candidates
+        ), domain
+
+
 def test_workday_alternate_sender_is_related_to_request_domain():
     now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
     match = _auth_match(
