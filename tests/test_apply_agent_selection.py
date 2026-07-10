@@ -441,6 +441,78 @@ def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeyp
     ] == "request-123"
 
 
+def test_greenhouse_runtime_required_fields_park_before_submit_without_agent(
+    monkeypatch, tmp_path: Path,
+):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 96
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def create_prepared(self, **kwargs):
+            self.calls.append(("create", kwargs))
+            return "attempt-required"
+
+        def transition(self, attempt_id, **kwargs):
+            self.calls.append(("transition", attempt_id, kwargs))
+            return {"state": kwargs["state"]}
+
+    store = Store()
+
+    def reject_runtime_fields(*args, **kwargs):
+        kwargs["on_plan_ready"](
+            types.SimpleNamespace(ready=True, unmapped_required=[]),
+            [types.SimpleNamespace(kind="submit")],
+        )
+        raise greenhouse_submit.RequiredFormFieldsError(["Location (City)", "Gender"])
+
+    monkeypatch.setattr(greenhouse_submit, "apply_greenhouse", reject_runtime_fields)
+
+    page = types.SimpleNamespace(
+        goto=lambda *args, **kwargs: None,
+        close=lambda: None,
+    )
+    browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(new_page=lambda: page)])
+    playwright = types.SimpleNamespace(
+        chromium=types.SimpleNamespace(connect_over_cdp=lambda endpoint: browser),
+    )
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return playwright
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: PlaywrightContext()
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {"application_url": "https://boards.greenhouse.io/acme/jobs/123", "url": "u"},
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=store,
+    )
+
+    assert result[0] == "profile_required"
+    assert store.calls[-1][2]["state"] == "failed_pre_submit"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["failure_class"] == "runtime_required_fields"
+    assert stats["unmapped_required"] == ["Location (City)", "Gender"]
+
+
 def test_greenhouse_submit_mode_parks_incomplete_plan_without_agent_fallback(
     monkeypatch, tmp_path: Path,
 ):

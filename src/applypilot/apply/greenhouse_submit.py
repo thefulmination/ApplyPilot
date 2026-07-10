@@ -25,6 +25,12 @@ from urllib.parse import urlsplit, urlunsplit
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 
 
+class RequiredFormFieldsError(RuntimeError):
+    def __init__(self, fields: list[str]):
+        self.fields = fields
+        super().__init__("required Greenhouse fields remain invalid: " + ", ".join(fields))
+
+
 def _flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -296,6 +302,25 @@ def _collect_submission_diagnostics(page, report) -> dict:
     return diagnostics
 
 
+def _invalid_required_controls(page) -> list[str]:
+    locator = getattr(page, "locator", None)
+    if locator is None:
+        return []
+    try:
+        form = locator("form")
+        if form.count() == 0 or form.evaluate("form => form.checkValidity()"):
+            return []
+        return form.locator(":invalid").evaluate_all("""elements => elements.map(element => {
+            if (element.id || element.name) return element.id || element.name;
+            const container = element.parentElement?.parentElement;
+            const label = container?.querySelector('label, legend');
+            return (label?.innerText || container?.innerText || element.tagName)
+                .replace(/\\s+/g, ' ').trim().slice(0, 200);
+        }).filter(Boolean).slice(0, 30)""")
+    except Exception:
+        return []
+
+
 def _page_content(page) -> str:
     try:
         return page.content() or ""
@@ -435,6 +460,9 @@ def execute_form(actions, page, *, dry_run: bool = True,
             if dry_run:
                 report.skipped_submit = True
                 continue
+            invalid_fields = _invalid_required_controls(page)
+            if invalid_fields:
+                raise RequiredFormFieldsError(invalid_fields)
             if before_submit is not None:
                 before_submit()
             observation = _click_for_response(page, a.selector, expected_submit_url)

@@ -1443,6 +1443,7 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
             resolve_greenhouse_url,
         )
         from applypilot.apply.greenhouse_submit import (
+            RequiredFormFieldsError,
             adapter_enabled,
             apply_greenhouse,
             submit_enabled,
@@ -1517,6 +1518,7 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
             finally:
                 page.close()
     except Exception as exc:
+        runtime_incomplete = isinstance(exc, RequiredFormFieldsError)
         try:
             from applypilot.fleet.apply_attempts import AttemptConflictError
 
@@ -1546,6 +1548,18 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
                     "submit_checkpoint_state": "quarantined",
                 }
                 return ("crash_unconfirmed", int((time.time() - t0) * 1000))
+            if runtime_incomplete and submit_requested:
+                _adapter_route_stats[worker_id] = {
+                    "route": "adapter_plan:greenhouse",
+                    "adapter_name": "greenhouse",
+                    "adapter_plan_ready": False,
+                    "attempt_id": attempt_id,
+                    "submit_checkpoint_state": "failed_pre_submit",
+                    "failure_class": "runtime_required_fields",
+                    "unmapped_required": list(exc.fields),
+                    "unmapped_required_count": len(exc.fields),
+                }
+                return ("profile_required", int((time.time() - t0) * 1000))
             if conflict:
                 _adapter_route_stats[worker_id] = {
                     "route": "adapter_submit:greenhouse",

@@ -10,6 +10,7 @@ import pytest
 
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply.greenhouse_submit import (
+    RequiredFormFieldsError,
     SubmitReport,
     _complete_greenhouse_email_challenge,
     adapter_enabled,
@@ -415,6 +416,46 @@ def test_execute_form_checkpoint_failure_prevents_submit():
             before_submit=checkpoint,
         )
 
+    assert ("click", "button[type='submit']") not in page.calls
+
+
+def test_execute_form_blocks_invalid_required_controls_before_checkpoint():
+    class InvalidControls:
+        def evaluate_all(self, expression):
+            return ["Location (City)", "Gender"]
+
+    class InvalidForm:
+        def count(self):
+            return 1
+
+        def evaluate(self, expression):
+            return False
+
+        def locator(self, selector):
+            assert selector == ":invalid"
+            return InvalidControls()
+
+    class InvalidPage(FakePage):
+        def locator(self, selector):
+            assert selector == "form"
+            return InvalidForm()
+
+    page = InvalidPage()
+    checkpoints = []
+
+    with pytest.raises(RequiredFormFieldsError) as raised:
+        execute_form(
+            [
+                type("Action", (), {"kind": "fill", "selector": "#first_name", "value": "J"})(),
+                type("Action", (), {"kind": "submit", "selector": "button[type='submit']"})(),
+            ],
+            page,
+            dry_run=False,
+            before_submit=lambda: checkpoints.append(True),
+        )
+
+    assert raised.value.fields == ["Location (City)", "Gender"]
+    assert checkpoints == []
     assert ("click", "button[type='submit']") not in page.calls
 
 
