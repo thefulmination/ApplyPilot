@@ -37,7 +37,10 @@ def _match_belongs_to_request(sender_hint: str | None, match) -> bool:
 
 def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
                  ttl_seconds: int = 300) -> int:
-    """File or extend a worker's active OTP request; return its id. Never blocks."""
+    """Return the active request row's id after serializing concurrent duplicates.
+
+    Requests for the same worker and target serialize under a transaction advisory lock.
+    """
     target = application_url or job_url
     lock_key = f"applypilot:otp_request:{worker_id}:{target}"
     with conn.cursor() as cur:
