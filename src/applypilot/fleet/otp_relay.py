@@ -154,6 +154,11 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     else:
         matches = inbox_auth.scan_gmail_for_auth_codes(
             service=gmail_service, minutes=window_minutes, max_messages=max_messages)
+    matches = inbox_auth.eligible_auth_matches(
+        matches,
+        reference_time=_dt.datetime.now(_dt.timezone.utc),
+        skew_seconds=skew_seconds,
+    )
     # Oldest email first: pair each request (iterated oldest-first) with the EARLIEST
     # eligible code, so request order maps to email-arrival order (spec: nearest
     # received_at > requested_at). Newest-first would hand the oldest request the

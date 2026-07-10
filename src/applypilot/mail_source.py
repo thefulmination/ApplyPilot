@@ -286,19 +286,39 @@ class GmailApiMailSource:
     ) -> list[MailMessage]:
         from applypilot.gmail_outcomes import _get_text_body
 
+        budget = int(max_messages)
+        if budget <= 0:
+            return []
+
         service = self._build_service()
         query = f"newer_than:{since_days}d"
         if gmail_raw_query:
             query = f"{query} ({gmail_raw_query})"
-        resp = (
-            service.users()
-            .messages()
-            .list(userId="me", q=query, maxResults=max_messages)
-            .execute()
-        )
+
+        refs = []
+        page_token = None
+        while len(refs) < budget:
+            page_size = min(500, budget - len(refs))
+            list_kwargs = {
+                "userId": "me",
+                "q": query,
+                "maxResults": page_size,
+            }
+            if page_token is not None:
+                list_kwargs["pageToken"] = page_token
+            resp = service.users().messages().list(**list_kwargs).execute()
+            page_refs = resp.get("messages", [])
+            if not page_refs:
+                break
+            refs.extend(page_refs[: budget - len(refs)])
+            if len(refs) >= budget:
+                break
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
 
         messages: list[MailMessage] = []
-        for ref in resp.get("messages", []):
+        for ref in refs:
             msg = (
                 service.users()
                 .messages()

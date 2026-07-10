@@ -40,7 +40,13 @@ KNOWN_ATS_DOMAINS = {
 
 PROVIDER_DOMAIN_GROUPS = (
     ("oraclecloud.com", "oracle.com", "taleo.net"),
-    ("myworkdayjobs.com", "myworkdaysite.com", "workdayjobs.com", "workday.com"),
+    (
+        "myworkday.com",
+        "myworkdayjobs.com",
+        "myworkdaysite.com",
+        "workdayjobs.com",
+        "workday.com",
+    ),
     ("greenhouse.io", "greenhouse-mail.io"),
     ("adp.com", "workforcenow.adp.com"),
     ("amazon.jobs", "jobs.amazon.com"),
@@ -198,14 +204,21 @@ def match_belongs_to_provider(
 ) -> bool:
     if not provider_domain:
         return True
-    evidence = [sender_domain(getattr(match, "sender", "") or "")]
+    sender = sender_domain(getattr(match, "sender", "") or "")
     candidate = getattr(match, "candidate", None)
     if getattr(candidate, "kind", None) == "magic_link":
-        evidence.append(url_domain(getattr(candidate, "value", "") or ""))
-    evidence = [domain for domain in evidence if domain]
-    return bool(evidence) and any(
-        domains_related(provider_domain, domain) for domain in evidence
-    )
+        destination = url_domain(getattr(candidate, "value", "") or "")
+        if not destination or not domains_related(provider_domain, destination):
+            return False
+        sender_is_provider = is_known_ats_domain(sender) or any(
+            sender == domain or sender.endswith(f".{domain}")
+            for group in PROVIDER_DOMAIN_GROUPS
+            for domain in group
+        )
+        if sender_is_provider and not domains_related(provider_domain, sender):
+            return False
+        return True
+    return bool(sender) and domains_related(provider_domain, sender)
 
 
 def now_utc() -> str:
@@ -584,14 +597,22 @@ def eligible_auth_matches(
     provider_domain: str | None = None,
     skew_seconds: int = 60,
     excluded_message_ids: set[str] | None = None,
+    reference_time: datetime | None = None,
 ) -> list[AuthEmailMatch]:
     excluded = excluded_message_ids or set()
+    skew = max(0, skew_seconds)
+    if reference_time is None:
+        reference_time = datetime.now(timezone.utc)
+    elif reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    reference_time = reference_time.astimezone(timezone.utc)
+    ceiling = reference_time + timedelta(seconds=skew)
     floor = None
     if not_before is not None:
         if not_before.tzinfo is None:
             not_before = not_before.replace(tzinfo=timezone.utc)
         floor = not_before.astimezone(timezone.utc) - timedelta(
-            seconds=max(0, skew_seconds)
+            seconds=skew
         )
 
     eligible = []
@@ -600,6 +621,8 @@ def eligible_auth_matches(
         if match.message_id in excluded or received is None:
             continue
         if floor is not None and received < floor:
+            continue
+        if received > ceiling:
             continue
         if not match_belongs_to_provider(match, provider_domain):
             continue
@@ -621,68 +644,32 @@ def scan_gmail_for_auth_codes(
       iterated directly through the frozen parser.
     - `service`: legacy Gmail-API service object -- back-compat path.
     """
-    if messages is not None:
-        window_minutes = max(1, int(minutes))
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-        matches: list[AuthEmailMatch] = []
-        filtered = []
-        for m in messages[: max(0, int(max_messages or 0)) or None]:
-            if not _received_at_in_window(m.date, cutoff=cutoff):
-                continue
-            filtered.append(m)
-        for m in filtered:
-            matches.extend(
-                _high_confidence_matches(
-                    message_id=m.id,
-                    thread_id=m.thread_id,
-                    subject=m.subject,
-                    sender=m.sender,
-                    received_at=m.date,
-                    body=m.body,
-                )
-            )
-        return matches
-
     window_minutes = max(1, int(minutes))
-    max_older_days = max(1, (window_minutes + 1439) // 1440)
-    query = f"newer_than:{max_older_days}d ({AUTH_GMAIL_RAW_QUERY})"
-    gmail_messages = (
-        service.users()
-        .messages()
-        .list(userId="me", q=query, maxResults=max_messages)
-        .execute()
-        .get("messages", [])
-    )
+    if messages is None:
+        from applypilot.mail_source import GmailApiMailSource
 
-    matches = []
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-    for ref in gmail_messages:
-        msg = (
-            service.users()
-            .messages()
-            .get(userId="me", id=ref["id"], format="full")
-            .execute()
+        max_older_days = max(1, (window_minutes + 1439) // 1440)
+        messages = GmailApiMailSource(build_service=lambda: service).fetch(
+            since_days=max_older_days,
+            max_messages=max_messages,
+            gmail_raw_query=AUTH_GMAIL_RAW_QUERY,
         )
-        payload = msg.get("payload", {})
-        hdrs = _headers(payload)
-        subject = hdrs.get("subject", "")
-        sender = hdrs.get("from", "")
-        received_at = hdrs.get("date")
-        if not _received_at_in_window(received_at, cutoff=cutoff):
-            continue
-        body = _payload_text(payload)
 
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    matches: list[AuthEmailMatch] = []
+    for message in messages[: max(0, int(max_messages or 0)) or None]:
+        if not _received_at_in_window(message.date, cutoff=cutoff):
+            continue
         matches.extend(
             _high_confidence_matches(
-                message_id=ref["id"],
-                thread_id=ref.get("threadId"),
-                subject=subject,
-                sender=sender,
-                received_at=received_at,
-                body=body,
+                message_id=message.id,
+                thread_id=message.thread_id,
+                subject=message.subject,
+                sender=message.sender,
+                received_at=message.date,
+                body=message.body,
             )
         )
-
     return matches
 
 

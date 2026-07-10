@@ -178,6 +178,23 @@ def test_unparseable_email_date_is_skipped(fleet_db, monkeypatch):
     assert got is None
 
 
+def test_future_dated_email_is_not_matched(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("mFuture", _rfc(now + dt.timedelta(days=1)), "123123")]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth,
+        "scan_gmail_for_auth_codes",
+        lambda **kw: matches,
+    )
+
+    with _fresh(fleet_db) as conn:
+        rid = _pending(conn)
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.1)
+
+    assert got is None
+
+
 def test_answer_pending_releases_select_transaction_before_mail_scan(fleet_db, monkeypatch):
     observed_statuses = []
 

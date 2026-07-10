@@ -20,10 +20,13 @@ class _FakeMessages:
         self._message_payloads = message_payloads
         self._list_calls = 0
 
-    def list(self, userId, q, maxResults):
+    def list(self, userId, q, maxResults, pageToken=None):
         index = min(self._list_calls, len(self._message_batches) - 1)
         self._list_calls += 1
-        return _FakeRequest({"messages": self._message_batches[index]})
+        batch = self._message_batches[index]
+        if isinstance(batch, dict) and "messages" in batch:
+            return _FakeRequest(batch)
+        return _FakeRequest({"messages": batch})
 
     def get(self, userId, id, format):  # noqa: A002
         return _FakeRequest(self._message_payloads[id])
@@ -95,7 +98,7 @@ def _auth_match(
 
 def _build_service(messages_by_poll, message_payloads):
     batches = messages_by_poll
-    if batches and isinstance(batches[0], dict):
+    if batches and isinstance(batches[0], dict) and "messages" not in batches[0]:
         batches = [batches]
     return _FakeService(
         batches,
@@ -124,6 +127,56 @@ def test_provider_matching_accepts_groups_and_rejects_unrelated_or_missing_evide
     assert inbox_auth.match_belongs_to_provider(magic_link, "greenhouse.io")
 
 
+def test_magic_link_rejects_conflicting_provider_destination():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "conflict",
+        now,
+        sender="no-reply@greenhouse-mail.io",
+        kind="magic_link",
+        value="https://workday.com/verify?token=abc",
+    )
+
+    assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_magic_link_accepts_matching_destination_with_generic_sender():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "generic-sender",
+        now,
+        sender="notifications@example.com",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_magic_link_rejects_conflicting_ats_sender_even_when_destination_matches():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "conflicting-sender",
+        now,
+        sender="no-reply@workday.com",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_workday_alternate_sender_is_related_to_request_domain():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "workday-alternate",
+        now,
+        sender="no-reply@myworkday.com",
+    )
+
+    assert inbox_auth.match_belongs_to_provider(match, "tenant.myworkdayjobs.com")
+
+
 def test_eligible_auth_matches_applies_exclusions_and_sixty_second_skew_in_order():
     now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
     matches = [
@@ -141,6 +194,57 @@ def test_eligible_auth_matches_applies_exclusions_and_sixty_second_skew_in_order
     )
 
     assert [match.message_id for match in eligible] == ["inside", "fresh"]
+
+
+def test_eligible_auth_matches_rejects_far_future_but_allows_sixty_second_skew():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    matches = [
+        _auth_match("allowed", now + dt.timedelta(seconds=60)),
+        _auth_match("far-future", now + dt.timedelta(days=1)),
+    ]
+
+    eligible = inbox_auth.eligible_auth_matches(
+        matches,
+        reference_time=now.replace(tzinfo=None),
+        provider_domain="greenhouse.io",
+    )
+
+    assert [match.message_id for match in eligible] == ["allowed"]
+
+
+def test_scan_gmail_for_auth_codes_service_path_follows_next_page_token():
+    now = dt.datetime.now(dt.timezone.utc)
+    service = _build_service(
+        [
+            {
+                "messages": [{"id": "miss", "threadId": "t-miss"}],
+                "nextPageToken": "page-2",
+            },
+            {"messages": [{"id": "hit", "threadId": "t-hit"}]},
+        ],
+        {
+            "miss": {"payload": _make_payload(
+                subject="Unrelated",
+                sender="news@example.com",
+                body="Weekly newsletter.",
+                date=_rfc(now),
+            )},
+            "hit": {"payload": _make_payload(
+                subject="Verify your email",
+                sender="no-reply@greenhouse.io",
+                body="Use verification code 818283 to continue.",
+                date=_rfc(now),
+            )},
+        },
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        minutes=10,
+        max_messages=2,
+    )
+
+    assert [match.message_id for match in matches] == ["hit"]
 
 
 def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():
