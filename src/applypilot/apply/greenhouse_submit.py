@@ -254,7 +254,16 @@ def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[
         ftype = types.get(name)
         if ftype == "textarea":
             actions.append(FormAction("textarea", field_selector, value))
-        elif ftype in ("multi_value_single_select", "multi_value_multi_select"):
+        elif ftype == "phone_country_select":
+            actions.append(FormAction(
+                "phone_country",
+                field_selector,
+                value,
+                option_label=option_labels.get(name, {}).get(value),
+            ))
+        elif ftype in (
+            "multi_value_single_select", "multi_value_multi_select", "react_select",
+        ):
             actions.append(FormAction(
                 "select",
                 field_selector,
@@ -307,6 +316,18 @@ def execute_form(actions, page, *, dry_run: bool = True,
             continue
         if a.kind == "file":
             page.set_input_files(a.selector, a.value)
+        elif a.kind == "phone_country":
+            input_locator = page.locator(a.selector)
+            container = input_locator.locator(
+                'xpath=ancestor::div[contains(@class,"select__container")]'
+            )
+            container.get_by_role("button").click()
+            listbox_id = input_locator.get_attribute("aria-controls")
+            if not listbox_id or not a.option_label:
+                raise RuntimeError("phone country options unavailable")
+            page.locator(f"#{listbox_id}").get_by_role(
+                "option", name=a.option_label, exact=True,
+            ).click()
         elif a.kind == "select":
             tag_name = None
             if hasattr(page, "locator"):
@@ -318,6 +339,7 @@ def execute_form(actions, page, *, dry_run: bool = True,
                     tag_name = None
             if tag_name == "input" and a.option_label and hasattr(page, "get_by_role"):
                 page.click(a.selector)
+                page.fill(a.selector, a.option_label)
                 page.get_by_role("option", name=a.option_label, exact=True).click()
             else:
                 page.select_option(a.selector, a.value)
@@ -367,6 +389,7 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
     off to the existing apply agent (passing the plan makes even that cheaper).
     """
     from applypilot.apply.greenhouse_adapter import (
+        builtin_questions_from_payload,
         build_answer_plan,
         fetch_job,
         job_context_from_payload,
@@ -380,6 +403,7 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
 
     payload = fetch_job(board, job_id, fetch=fetch)
     questions = list(payload.get("questions") or [])
+    questions.extend(builtin_questions_from_payload(payload, profile=profile))
     plan = build_answer_plan(questions, profile=profile, resume_text=resume_text,
                              corpus=corpus, answer_fn=answer_fn,
                              job=job_context_from_payload(payload, board=board))

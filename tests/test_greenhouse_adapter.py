@@ -7,6 +7,7 @@ it cannot map. No browser, no network in these tests (fetch + answerer injected)
 """
 
 from applypilot.apply.greenhouse_adapter import (
+    builtin_questions_from_payload,
     build_answer_plan,
     fetch_questions,
     parse_greenhouse_url,
@@ -37,6 +38,58 @@ def test_parse_greenhouse_without_job_id_returns_none():
 
 
 # --- fetch_questions -------------------------------------------------------
+
+
+def test_builtin_questions_include_required_phone_country_and_education():
+    profile = {
+        "personal": {"phone": "5551234567", "country": "USA"},
+        "resume_facts": {
+            "education": {
+                "school": "Stevens Institute of Technology",
+                "degree": "Bachelor's Degree",
+                "discipline": "Finance",
+                "start_year": "2012",
+                "end_year": "2016",
+            },
+        },
+    }
+    payload = {
+        "id": 123,
+        "education": "education_required",
+        "questions": [
+            {"required": True, "label": "Phone", "fields": [
+                {"name": "phone", "type": "input_text"},
+            ]},
+        ],
+    }
+
+    questions = builtin_questions_from_payload(payload, profile=profile)
+
+    by_label = {question["label"]: question for question in questions}
+    assert by_label["Phone Country"]["fields"][0]["name"] == "country"
+    education = [
+        question for question in questions if question["label"].startswith("Education:")
+    ]
+    assert all(question["required"] is True for question in education)
+    assert {question["fields"][0]["name"] for question in education} == {
+        "school--0", "degree--0", "discipline--0", "start-year--0", "end-year--0",
+    }
+
+
+def test_required_builtin_education_is_unmapped_when_profile_is_incomplete():
+    payload = {"education": "education_required", "questions": []}
+    questions = builtin_questions_from_payload(payload, profile={})
+
+    plan = build_answer_plan(
+        questions,
+        profile={"personal": {"full_name": "Jordan Rivera", "email": "j@x.com"}},
+        resume_text="resume",
+        answer_fn=lambda *args, **kwargs: None,
+    )
+
+    assert plan.ready is False
+    assert all(label.startswith("Education:") for label in plan.unmapped_required)
+    assert len(plan.unmapped_required) == 5
 
 _GH_JOB = {
     "id": 4012345,

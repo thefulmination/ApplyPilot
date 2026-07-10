@@ -96,6 +96,65 @@ def fetch_questions(board_token, job_id, *, fetch=None) -> list[dict]:
     return list(data.get("questions") or [])
 
 
+def _phone_country_code(value: object) -> str | None:
+    country = str(value or "").strip().lower()
+    if country in {"us", "usa", "united states", "united states of america"}:
+        return "us"
+    if len(country) == 2 and country.isalpha():
+        return country
+    return None
+
+
+def builtin_questions_from_payload(payload: dict, *, profile: dict) -> list[dict]:
+    """Describe modern Greenhouse built-ins omitted from ``questions``."""
+    questions: list[dict] = []
+    api_questions = list((payload or {}).get("questions") or [])
+    phone_question = next(
+        (
+            question for question in api_questions
+            if any(field.get("name") == "phone" for field in question.get("fields") or [])
+        ),
+        None,
+    )
+    personal = (profile or {}).get("personal") or {}
+    if phone_question is not None and (payload or {}).get("id") is not None:
+        country_code = _phone_country_code(personal.get("country"))
+        field = {"name": "country", "type": "phone_country_select", "values": []}
+        if country_code:
+            field["profile_value"] = country_code
+            if country_code == "us":
+                field["values"] = [{"label": "United States +1", "value": "us"}]
+        questions.append({
+            "required": bool(phone_question.get("required")),
+            "label": "Phone Country",
+            "fields": [field],
+        })
+
+    education_mode = str((payload or {}).get("education") or "")
+    if education_mode:
+        education = ((profile or {}).get("resume_facts") or {}).get("education") or {}
+        required = education_mode == "education_required"
+        definitions = (
+            ("school--0", "School", "react_select", education.get("school")),
+            ("degree--0", "Degree", "react_select", education.get("degree")),
+            ("discipline--0", "Discipline", "react_select", education.get("discipline")),
+            ("start-year--0", "Start year", "input_text", education.get("start_year")),
+            ("end-year--0", "End year", "input_text", education.get("end_year")),
+        )
+        for name, label, field_type, value in definitions:
+            field = {"name": name, "type": field_type, "values": []}
+            if value not in (None, ""):
+                field["profile_value"] = str(value)
+                if field_type == "react_select":
+                    field["values"] = [{"label": str(value), "value": str(value)}]
+            questions.append({
+                "required": required,
+                "label": f"Education: {label}",
+                "fields": [field],
+            })
+    return questions
+
+
 def job_context_from_payload(data: dict, *, board: str) -> dict:
     return {
         "site": board,
@@ -337,6 +396,11 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
             name = f.get("name", "")
             ftype = f.get("type", "")
             values = f.get("values") or []
+
+            if f.get("profile_value") not in (None, ""):
+                fields[name] = f["profile_value"]
+                mapped = True
+                continue
 
             if ftype == "input_hidden":
                 mapped = True

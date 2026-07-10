@@ -105,6 +105,25 @@ def test_plan_form_actions_uses_select_for_multi_select_fields():
     ]
 
 
+def test_plan_form_actions_maps_phone_country_widget():
+    plan = AnswerPlan(
+        fields={"country": "us"},
+        resume_field=None,
+        free_text={},
+        unmapped_required=[],
+        ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "country", "type": "phone_country_select"}]},
+    ]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("phone_country", "#country", "us") in [
+        (action.kind, action.selector, action.value) for action in actions
+    ]
+
+
 def test_plan_form_actions_puts_submit_last():
     acts = plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")
     assert acts[-1].kind == "submit"
@@ -150,6 +169,66 @@ def test_execute_form_selects_react_combobox_option_by_label():
 
     assert ("click", '[id="location_q[]"]') in page.calls
     assert ("option", "CA | San Francisco") in page.calls
+
+
+def test_execute_form_selects_phone_country_by_country_code():
+    class ClickTarget:
+        def __init__(self, calls, value):
+            self.calls = calls
+            self.value = value
+
+        def click(self):
+            self.calls.append(("click_target", self.value))
+
+    class CountryContainer:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def get_by_role(self, role):
+            return ClickTarget(self.calls, role)
+
+    class InputLocator:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def locator(self, selector):
+            self.calls.append(("ancestor", selector))
+            return CountryContainer(self.calls)
+
+        def get_attribute(self, name):
+            assert name == "aria-controls"
+            return "react-select-country-listbox"
+
+    class CountryListbox:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def get_by_role(self, role, *, name, exact):
+            self.calls.append(("country_option", role, name, exact))
+            return ClickTarget(self.calls, name)
+
+    class PhoneCountryPage(FakePage):
+        def locator(self, selector):
+            self.calls.append(("locator", selector))
+            if selector == "#react-select-country-listbox":
+                return CountryListbox(self.calls)
+            return InputLocator(self.calls)
+
+    action_plan = AnswerPlan(
+        fields={"country": "us"}, resume_field=None, free_text={},
+        unmapped_required=[], ready=True,
+    )
+    questions = [{"fields": [
+        {"name": "country", "type": "phone_country_select", "values": [
+            {"label": "United States +1", "value": "us"},
+        ]},
+    ]}]
+    page = PhoneCountryPage()
+
+    execute_form(plan_form_actions(action_plan, questions), page)
+
+    assert ("click_target", "button") in page.calls
+    assert ("click_target", "United States +1") in page.calls
 
 
 def test_plan_form_actions_never_touches_unplanned_fields():
@@ -303,7 +382,8 @@ _UNREADY_QS = _READY_QS + [
     {"required": True, "label": "Favorite color?",
      "fields": [{"name": "q_c", "type": "multi_value_single_select", "values": [{"label": "Red", "value": 1}]}]},
 ]
-_PROFILE = {"personal": {"full_name": "Jordan Rivera", "email": "j@x.com", "phone": "5551234567"},
+_PROFILE = {"personal": {"full_name": "Jordan Rivera", "email": "j@x.com",
+                         "phone": "5551234567", "country": "USA"},
             "work_authorization": {}}
 _RESUME = "Quant developer, Python, supported a $300M book."
 
