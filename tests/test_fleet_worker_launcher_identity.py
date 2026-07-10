@@ -71,3 +71,10 @@ def test_windows_apply_worker_forces_inbox_relay_not_direct_gmail():
     assert 'APPLYPILOT_INBOX_AUTH_MODE = "relay"' in script
     assert 'APPLYPILOT_ENABLE_GMAIL_MCP = "0"' in script
     assert "hydrate-gmail.py" not in script
+
+
+def test_worker_launcher_enables_greenhouse_shadow_but_hard_disables_submit():
+    script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
+
+    assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER = "1"' in script
+    assert '$env:APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT = "0"' in script
