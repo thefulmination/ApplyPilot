@@ -236,6 +236,81 @@ def test_maps_exact_profile_city_for_location_multi_select():
     assert plan.ready is True
 
 
+def test_maps_online_job_board_source_and_required_privacy_acknowledgement():
+    q = _identity_qs() + [
+        {"required": True, "label": "How did you hear about this job?",
+         "fields": [{"name": "source_q", "type": "input_text"}]},
+        {"required": True, "label": "Data Protection Notice",
+         "fields": [{"name": "privacy_q[]", "type": "multi_value_multi_select",
+                     "values": [{"label": "Acknowledge/Confirm", "value": 50}]}]},
+    ]
+
+    plan = build_answer_plan(q, profile=PROFILE, resume_text=RESUME, answer_fn=_bad_fn, job=JOB)
+
+    assert plan.fields["source_q"] == "Online job board"
+    assert plan.fields["privacy_q[]"] == 50
+    assert plan.ready is True
+
+
+def test_maps_profile_backed_residency_and_application_attestations():
+    q = _identity_qs() + [
+        {"required": True,
+         "label": "Are you a resident of the following states in which we can employ? CA, NJ, NY, TX.",
+         "fields": [{"name": "resident_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+        {"required": True,
+         "label": "I hereby declare that the given particulars are true to the best of my knowledge and belief",
+         "fields": [{"name": "truth_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+        {"required": True,
+         "label": "If provided a job offer, I understand I must provide documents establishing identity and employment eligibility",
+         "fields": [{"name": "documents_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+    ]
+
+    plan = build_answer_plan(q, profile=PROFILE, resume_text=RESUME, answer_fn=_bad_fn, job=JOB)
+
+    assert plan.fields["resident_q"] == 1
+    assert plan.fields["truth_q"] == 1
+    assert plan.fields["documents_q"] == 1
+    assert plan.ready is True
+
+
+def test_maps_location_availability_leadership_and_overlapping_compensation():
+    profile = {
+        **PROFILE,
+        "personal": {**PROFILE["personal"], "city": "San Francisco", "province_state": "California"},
+        "availability": {"earliest_start_date": "Immediately"},
+        "experience": {**PROFILE["experience"], "current_title": "COO"},
+        "compensation": {"salary_range_min": "80000", "salary_range_max": "230000"},
+    }
+    job = {
+        **JOB,
+        "description": "Level: Individual Contributor. Compensation: $75,000 - $110,000.",
+    }
+    q = _identity_qs() + [
+        {"required": True, "label": "Are you located in San Francisco, CA?",
+         "fields": [{"name": "location_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+        {"required": True, "label": "What is your preferred start date?",
+         "fields": [{"name": "start_q", "type": "input_text"}]},
+        {"required": True, "label": "Do you have leadership/management experience?",
+         "fields": [{"name": "leadership_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+        {"required": True, "label": "Does the listed compensation range match your expectation?",
+         "fields": [{"name": "comp_q", "type": "multi_value_single_select",
+                     "values": [{"label": "Yes", "value": 1}, {"label": "No", "value": 0}]}]},
+    ]
+
+    plan = build_answer_plan(q, profile=profile, resume_text=RESUME, answer_fn=_bad_fn, job=job)
+
+    assert plan.fields["location_q"] == 1
+    assert plan.fields["start_q"] == "Immediately"
+    assert plan.fields["leadership_q"] == 1
+    assert plan.fields["comp_q"] == 1
+    assert plan.ready is True
+
+
 def test_free_text_question_goes_through_the_answerer():
     q = [{"required": False, "label": "Why do you want to work here?",
           "fields": [{"name": "question_1", "type": "textarea"}]}]

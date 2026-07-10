@@ -241,7 +241,8 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
     """
     from applypilot.apply.greenhouse_adapter import (
         build_answer_plan,
-        fetch_questions,
+        fetch_job,
+        job_context_from_payload,
         parse_greenhouse_url,
     )
 
@@ -250,9 +251,11 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
         return {"route": "not_greenhouse"}
     board, job_id = parsed
 
-    questions = fetch_questions(board, job_id, fetch=fetch)
+    payload = fetch_job(board, job_id, fetch=fetch)
+    questions = list(payload.get("questions") or [])
     plan = build_answer_plan(questions, profile=profile, resume_text=resume_text,
-                             corpus=corpus, answer_fn=answer_fn, job={"site": board})
+                             corpus=corpus, answer_fn=answer_fn,
+                             job=job_context_from_payload(payload, board=board))
     route, reasons = decide_route(plan)
     if route != "deterministic":
         return {"route": "agent_fallback", "plan": plan, "unmapped": reasons, "ready": False}

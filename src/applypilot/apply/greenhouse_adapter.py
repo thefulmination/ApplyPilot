@@ -20,6 +20,7 @@ import urllib.parse
 from dataclasses import dataclass
 
 import httpx
+from bs4 import BeautifulSoup
 
 _GH_HOSTS = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
 _GH_SHORT_HOSTS = {"grnh.se"}
@@ -79,15 +80,31 @@ def _default_fetch(url: str) -> dict:
     return resp.json()
 
 
+def fetch_job(board_token, job_id, *, fetch=None) -> dict:
+    """Return one public Greenhouse job payload, including form questions."""
+    fetch = fetch or _default_fetch
+    return fetch(_QUESTIONS_API.format(board=board_token, job_id=job_id)) or {}
+
+
 def fetch_questions(board_token, job_id, *, fetch=None) -> list[dict]:
     """Return the job's application ``questions`` list from the public API.
 
     ``fetch`` is an injectable ``url -> parsed-json-dict`` callable (defaults to
     an unauthenticated httpx GET).
     """
-    fetch = fetch or _default_fetch
-    data = fetch(_QUESTIONS_API.format(board=board_token, job_id=job_id)) or {}
+    data = fetch_job(board_token, job_id, fetch=fetch)
     return list(data.get("questions") or [])
+
+
+def job_context_from_payload(data: dict, *, board: str) -> dict:
+    return {
+        "site": board,
+        "company": board,
+        "title": str(data.get("title") or ""),
+        "description": BeautifulSoup(
+            str(data.get("content") or ""), "html.parser",
+        ).get_text("\n", strip=True),
+    }
 
 
 @dataclass
@@ -141,7 +158,9 @@ def _has(label: str, needles) -> bool:
     return any(n in label for n in needles)
 
 
-def _profile_text_answer(low: str, *, personal, compensation, experience, first, last):
+def _profile_text_answer(
+    low: str, *, personal, compensation, experience, availability, first, last,
+):
     label = " ".join(low.split()).strip(" :?*")
     if "desired salary" in label or "salary expectation" in label:
         value = compensation.get("salary_expectation") or compensation.get("salary_range_min")
@@ -159,11 +178,30 @@ def _profile_text_answer(low: str, *, personal, compensation, experience, first,
     if label in {"years of work experience", "total years of experience"}:
         value = experience.get("years_of_experience_total")
         return str(value) if value not in (None, "") else None
+    if any(phrase in label for phrase in (
+        "how did you hear", "how did you learn", "how did you first learn",
+    )):
+        return "Online job board"
+    if "preferred start date" in label:
+        return availability.get("earliest_start_date")
     return None
 
 
-def _profile_select_value(low: str, values, *, personal):
+def _profile_select_value(
+    low: str, values, *, personal, work_auth, experience, compensation, job,
+):
     label = " ".join(low.split()).strip(" :?*")
+    if "resident of the following states" in label:
+        province = str(personal.get("province_state") or "").strip()
+        state_code = province.upper()
+        if len(state_code) != 2:
+            state_code = next(
+                (code for code, name in _US_STATE_NAMES.items() if name.lower() == province.lower()),
+                "",
+            )
+        allowed = bool(state_code and re.search(rf"\b{re.escape(state_code.lower())}\b", label))
+        answer = "yes" if allowed else "no"
+        return _pick_value(values, lambda option: option == answer)
     state = str(personal.get("province_state") or "").strip()
     if "state" in label and state:
         candidates = {state.lower(), _US_STATE_NAMES.get(state.upper(), state).lower()}
@@ -176,6 +214,58 @@ def _profile_select_value(low: str, values, *, personal):
         return _pick_value(values, lambda option: option in aliases)
     if label == "address type" and personal.get("address"):
         return _pick_value(values, lambda option: option == "home")
+    if any(phrase in label for phrase in (
+        "privacy acknowledgement", "privacy policy", "data protection notice",
+    )):
+        return _pick_value(
+            values,
+            lambda option: "acknowledge" in option or option == "confirm",
+        )
+    if "declare" in label and "particulars" in label and "true" in label:
+        return _pick_value(values, lambda option: option == "yes")
+    if "documents" in label and "employment eligibility" in label:
+        authorized = str(work_auth.get("legally_authorized_to_work") or "").lower()
+        if authorized in {"yes", "true", "y"}:
+            return _pick_value(values, lambda option: option == "yes")
+    if label.startswith("are you located in "):
+        city = str(personal.get("city") or "").strip().lower()
+        province = str(personal.get("province_state") or "").strip()
+        state_code = province.upper()
+        if len(state_code) != 2:
+            state_code = next(
+                (code for code, name in _US_STATE_NAMES.items() if name.lower() == province.lower()),
+                "",
+            )
+        located = bool(city and city in label and state_code and re.search(
+            rf"\b{re.escape(state_code.lower())}\b", label,
+        ))
+        answer = "yes" if located else "no"
+        return _pick_value(values, lambda option: option == answer)
+    if "leadership/management experience" in label:
+        title = str(experience.get("current_title") or "").lower()
+        has_leadership = any(token in title for token in (
+            "chief", "coo", "ceo", "president", "director", "manager", "head", "vp",
+        ))
+        answer = "yes" if has_leadership else "no"
+        return _pick_value(values, lambda option: option == answer)
+    if "compensation range match your expectation" in label:
+        description = str((job or {}).get("description") or "")
+        match = re.search(
+            r"\$\s*([\d,]+)\s*(?:-|\u2013|\u2014|to)\s*\$?\s*([\d,]+)",
+            description,
+            re.I,
+        )
+        try:
+            expected_min = float(str(compensation.get("salary_range_min") or "").replace(",", ""))
+            expected_max = float(str(compensation.get("salary_range_max") or "").replace(",", ""))
+            job_min = float(match.group(1).replace(",", "")) if match else 0
+            job_max = float(match.group(2).replace(",", "")) if match else 0
+        except (TypeError, ValueError):
+            return None
+        if expected_min and expected_max and job_min and job_max:
+            overlaps = max(expected_min, job_min) <= min(expected_max, job_max)
+            answer = "yes" if overlaps else "no"
+            return _pick_value(values, lambda option: option == answer)
     if "location" in label and "closest" in label:
         city = str(personal.get("city") or "").strip()
         province = str(personal.get("province_state") or "").strip()
@@ -210,6 +300,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
     work_auth = (profile or {}).get("work_authorization", {})
     compensation = (profile or {}).get("compensation", {})
     experience = (profile or {}).get("experience", {})
+    availability = (profile or {}).get("availability", {})
     first, last = _name_parts(personal.get("full_name", ""))
 
     fields: dict = {}
@@ -274,6 +365,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     personal=personal,
                     compensation=compensation,
                     experience=experience,
+                    availability=availability,
                     first=first,
                     last=last,
                 )
@@ -299,6 +391,7 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 personal=personal,
                 compensation=compensation,
                 experience=experience,
+                availability=availability,
                 first=first,
                 last=last,
             )
@@ -330,7 +423,15 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 continue  # unverified -> never submit; leave unmapped
 
             if ftype == "multi_value_single_select":
-                val = _profile_select_value(low, values, personal=personal)
+                val = _profile_select_value(
+                    low,
+                    values,
+                    personal=personal,
+                    work_auth=work_auth,
+                    experience=experience,
+                    compensation=compensation,
+                    job=job,
+                )
                 if _has(low, _DEMOGRAPHIC):
                     val = _pick_value(values, lambda label_l: _has(label_l, _DECLINE))
                 elif _has(low, _SPONSOR):
@@ -345,7 +446,15 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 continue
 
             if ftype == "multi_value_multi_select":
-                val = _profile_select_value(low, values, personal=personal)
+                val = _profile_select_value(
+                    low,
+                    values,
+                    personal=personal,
+                    work_auth=work_auth,
+                    experience=experience,
+                    compensation=compensation,
+                    job=job,
+                )
                 if val is not None:
                     fields[name] = val
                     mapped = True
