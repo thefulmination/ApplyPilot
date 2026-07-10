@@ -30,6 +30,10 @@ def _stub_schema_check(monkeypatch):
         "applypilot.fleet.schema.require_apply_result_event_schema",
         lambda _conn: None,
     )
+    monkeypatch.setattr(
+        "applypilot.fleet.schema.require_apply_attempt_schema",
+        lambda _conn: None,
+    )
 
 
 def test_fleet_apply_worker_defaults_to_codex():
