@@ -629,6 +629,35 @@ CREATE INDEX IF NOT EXISTS idx_autotriage_url
 CREATE INDEX IF NOT EXISTS idx_autotriage_status
     ON autotriage_actions (action_status, created_at);
 
+-- apply_attempts: durable adapter submit boundary. An unresolved irreversible
+-- action for a dedup key excludes every second submit path until it is verified,
+-- contradicted, or quarantined by the owner-controlled workflow.
+CREATE TABLE IF NOT EXISTS apply_attempts (
+    attempt_id          UUID PRIMARY KEY,
+    queue_name          TEXT NOT NULL,
+    url                 TEXT NOT NULL,
+    dedup_key           TEXT,
+    worker_id           TEXT NOT NULL,
+    route               TEXT NOT NULL,
+    route_version       TEXT,
+    state               TEXT NOT NULL CHECK (state IN (
+        'prepared', 'submit_started', 'submitted_unverified', 'verified',
+        'contradicted', 'quarantined', 'failed_pre_submit'
+    )),
+    submit_started_at   TIMESTAMPTZ,
+    finalized_at        TIMESTAMPTZ,
+    verification_method TEXT,
+    verification_ref   TEXT,
+    evidence            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_apply_attempts_unresolved_dedup
+    ON apply_attempts (dedup_key)
+    WHERE dedup_key IS NOT NULL
+      AND state IN ('submit_started', 'submitted_unverified');
+CREATE INDEX IF NOT EXISTS idx_apply_attempts_url_created
+    ON apply_attempts (queue_name, url, created_at DESC);
+
 -- apply_result_events: durable per-job terminal evidence written by the worker when
 -- it closes a lease. worker_heartbeat.recent_log is only a moving tail; repair tools
 -- should prefer this table for job-specific result evidence.

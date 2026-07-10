@@ -13,6 +13,7 @@ EXPECTED_TABLES = {
     "compute_queue", "search_tasks", "linkedin_queue", "rate_governor", "llm_usage",
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "autotriage_actions",
+    "apply_attempts",
 }
 
 
@@ -127,6 +128,28 @@ def test_apply_result_events_include_cost_router_metadata(fleet_db):
     assert "job_log_path" in cols
     assert "transcript_digest" in cols
     assert "final_result_source" in cols
+
+
+def test_apply_attempts_schema_and_unresolved_index(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='apply_attempts'"
+        )
+        cols = {r["column_name"] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename='apply_attempts' AND indexname='uq_apply_attempts_unresolved_dedup'"
+        )
+        indexdef = cur.fetchone()["indexdef"]
+
+    assert {
+        "attempt_id", "queue_name", "url", "dedup_key", "worker_id", "route",
+        "route_version", "state", "submit_started_at", "finalized_at",
+        "verification_method", "verification_ref", "evidence", "created_at",
+    } <= cols
+    assert "submit_started" in indexdef
+    assert "submitted_unverified" in indexdef
 
 
 def test_apply_worker_schema_check_passes_with_current_schema(fleet_db):
