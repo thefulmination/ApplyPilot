@@ -2092,6 +2092,7 @@ def _prearm_inbox_auth_request(job: dict) -> int | None:
         agent_timeout = max(
             1,
             int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or AGENT_TIMEOUT_SECONDS),
+            AGENT_TIMEOUT_SECONDS,
         )
         ttl_seconds = agent_timeout + timeout
         apply_target = job.get("application_url") or job["url"]

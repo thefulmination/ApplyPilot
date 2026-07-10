@@ -125,9 +125,10 @@ def poll_for_code(conn, request_id: int, *, timeout_seconds: int = 300,
         code = _try_consume(conn, request_id)
         if code is not None:
             return code
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return None
-        time.sleep(max(0.0, poll_seconds))
+        time.sleep(min(max(0.05, poll_seconds), remaining))
 
 
 def _parse_email_dt(raw):

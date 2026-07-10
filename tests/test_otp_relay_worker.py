@@ -70,3 +70,52 @@ def test_poll_ignores_expired_code(fleet_db):
         conn.commit()
         got = otp_relay.poll_for_code(conn, rid, timeout_seconds=1, poll_seconds=0.2)
     assert got is None
+
+
+def test_poll_sleep_never_exceeds_remaining_deadline(monkeypatch):
+    sleeps = []
+    monotonic_values = iter((10.0, 10.0, 11.0))
+
+    monkeypatch.setattr(otp_relay, "_try_consume", lambda conn, request_id: None)
+    monkeypatch.setattr(otp_relay.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(otp_relay.time, "sleep", sleeps.append)
+
+    assert otp_relay.poll_for_code(object(), 7, timeout_seconds=1, poll_seconds=5) is None
+    assert sum(sleeps) <= 1.0
+
+
+def test_poll_clamps_nonpositive_interval_without_passing_deadline(monkeypatch):
+    monkeypatch.setattr(otp_relay, "_try_consume", lambda conn, request_id: None)
+
+    for poll_seconds in (0, -1):
+        sleeps = []
+        monotonic_values = iter((20.0, 20.0, 21.0))
+        monkeypatch.setattr(otp_relay.time, "monotonic", lambda: next(monotonic_values))
+        monkeypatch.setattr(otp_relay.time, "sleep", sleeps.append)
+
+        assert otp_relay.poll_for_code(
+            object(),
+            8,
+            timeout_seconds=1,
+            poll_seconds=poll_seconds,
+        ) is None
+        assert sleeps == [0.05]
+        assert sum(sleeps) <= 1.0
+
+
+def test_poll_attempts_immediate_consume_with_zero_timeout(monkeypatch):
+    expected = otp_relay.RelayCode(value="482913", kind="code")
+    attempts = []
+    sleeps = []
+
+    def fake_consume(conn, request_id):
+        attempts.append(request_id)
+        return expected
+
+    monkeypatch.setattr(otp_relay, "_try_consume", fake_consume)
+    monkeypatch.setattr(otp_relay.time, "monotonic", lambda: 30.0)
+    monkeypatch.setattr(otp_relay.time, "sleep", sleeps.append)
+
+    assert otp_relay.poll_for_code(object(), 9, timeout_seconds=0, poll_seconds=5) == expected
+    assert attempts == [9]
+    assert sleeps == []

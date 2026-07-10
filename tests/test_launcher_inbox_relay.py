@@ -84,6 +84,32 @@ def test_prearm_request_ttl_covers_agent_run_plus_postrun_poll(monkeypatch):
     assert seen["ttl_seconds"] >= 900
 
 
+def test_prearm_request_ttl_uses_effective_agent_timeout_override(monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://stub")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300")
+    monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT", "300")
+    monkeypatch.setattr(launcher, "AGENT_TIMEOUT_SECONDS", 720)
+    seen = {}
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def close(self): pass
+
+    def fake_request_code(conn, **kw):
+        seen.update(kw)
+        return 13
+
+    monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn: _Conn())
+    monkeypatch.setattr(otp_relay, "request_code", fake_request_code)
+
+    assert launcher._prearm_inbox_auth_request({
+        "url": "j",
+        "application_url": "https://greenhouse.io/a",
+    }) == 13
+    assert seen["ttl_seconds"] >= 1020
+
+
 def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypatch):
     monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
     monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "relay")

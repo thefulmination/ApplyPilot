@@ -258,3 +258,35 @@ def test_auth_required_reuses_prearmed_request_for_full_bounded_wait(monkeypatch
     assert sum(timeout for _, timeout in consume_calls) <= 300
     assert run_calls == [None, hint]
     assert out["run_status"] == "applied"
+
+
+def test_auth_required_assisted_retry_runs_at_most_once(monkeypatch):
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    hint = "code=246810\nsource=fleet_relay"
+    run_calls = []
+
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+    monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
+    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher,
+        "_consume_prearmed_inbox_auth_hint",
+        lambda request_id, *, timeout_seconds: hint,
+    )
+
+    def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
+        run_calls.append(inbox_auth_hint)
+        return "auth_required", 1.0
+
+    monkeypatch.setattr(launcher, "run_job", fake_run_job)
+    monkeypatch.setattr(launcher, "_last_run_stats", {3: {}}, raising=False)
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=3)({"url": "https://example.test/job"})
+
+    assert run_calls == [None, hint]
+    assert out["run_status"] == "auth_required"
