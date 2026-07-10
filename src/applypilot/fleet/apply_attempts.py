@@ -111,4 +111,3 @@ def transition(
         raise AttemptConflictError(
             "another unresolved submit already exists for this dedup key"
         ) from exc
-

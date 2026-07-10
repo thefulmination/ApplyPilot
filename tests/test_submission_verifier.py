@@ -32,11 +32,27 @@ def test_known_success_url_requires_confirmation_dom():
 
 def test_confirmation_dom_is_verified_without_success_url():
     result = verify_submission(
-        SubmissionEvidence(dom_text="Your application has been submitted successfully")
+        SubmissionEvidence(
+            page_url="https://job-boards.greenhouse.io/acme/jobs/1",
+            allowed_success_hosts=("job-boards.greenhouse.io",),
+            dom_text="Your application has been submitted successfully",
+        )
     )
 
     assert result.status == "verified"
     assert result.method == "confirmation_dom"
+
+
+def test_confirmation_words_on_unallowlisted_page_are_not_proof():
+    result = verify_submission(
+        SubmissionEvidence(
+            page_url="https://example.test/job-description",
+            allowed_success_hosts=("job-boards.greenhouse.io",),
+            dom_text="After applying, you may see: Your application has been submitted.",
+        )
+    )
+
+    assert result.status == "unverified"
 
 
 def test_matched_confirmation_email_is_verified():
@@ -80,4 +96,3 @@ def test_unallowlisted_response_identifier_is_not_verified():
     )
 
     assert result.status == "unverified"
-

@@ -1503,7 +1503,13 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
                                        before_submit=before_submit if own else None)
             finally:
                 page.close()
-    except Exception:
+    except Exception as exc:
+        try:
+            from applypilot.fleet.apply_attempts import AttemptConflictError
+
+            conflict = isinstance(exc, AttemptConflictError)
+        except Exception:
+            conflict = False
         if attempt_id and attempt_state:
             final_state = (
                 "quarantined" if attempt_state == "submit_started" else "failed_pre_submit"
@@ -1525,6 +1531,16 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
                     "adapter_plan_ready": True,
                     "attempt_id": attempt_id,
                     "submit_checkpoint_state": "quarantined",
+                }
+                return ("crash_unconfirmed", int((time.time() - t0) * 1000))
+            if conflict:
+                _adapter_route_stats[worker_id] = {
+                    "route": "adapter_submit:greenhouse",
+                    "adapter_name": "greenhouse",
+                    "adapter_plan_ready": True,
+                    "attempt_id": attempt_id,
+                    "submit_checkpoint_state": "failed_pre_submit",
+                    "failure_class": "unresolved_submit_conflict",
                 }
                 return ("crash_unconfirmed", int((time.time() - t0) * 1000))
         logger.debug("greenhouse adapter failed pre-submit; agent proceeds", exc_info=True)
@@ -1551,20 +1567,28 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
         "contradicted": "contradicted",
         "unverified": "quarantined",
     }.get(verification_status, "quarantined")
-    attempt_store.transition(
-        attempt_id,
-        expected="submit_started",
-        state=final_state,
-        verification_method=res.get("verification_method"),
-        verification_ref=res.get("verification_ref"),
-        evidence={
-            "verification_status": verification_status,
-            "verification_method": res.get("verification_method"),
-            "verification_ref": res.get("verification_ref"),
-        },
-    )
-    attempt_state = final_state
     status = res.get("status", "crash_unconfirmed")
+    try:
+        attempt_store.transition(
+            attempt_id,
+            expected="submit_started",
+            state=final_state,
+            verification_method=res.get("verification_method"),
+            verification_ref=res.get("verification_ref"),
+            evidence={
+                "verification_status": verification_status,
+                "verification_method": res.get("verification_method"),
+                "verification_ref": res.get("verification_ref"),
+            },
+        )
+        attempt_state = final_state
+    except Exception:
+        # The click already happened. A ledger outage can never escape into the
+        # agent fallback or queue reclaim path; close the lease ambiguously.
+        logger.exception("greenhouse post-submit attempt finalization failed")
+        attempt_state = "quarantined"
+        verification_status = "unverified"
+        status = "crash_unconfirmed"
     _adapter_route_stats[worker_id] = {
         "route": "adapter_submit:greenhouse",
         "adapter_name": "greenhouse",

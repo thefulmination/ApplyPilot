@@ -113,3 +113,38 @@ def test_pg_attempt_store_binds_queue_job_and_worker_identity(fleet_db):
     assert row["dedup_key"] == "bound-dedup"
     assert row["worker_id"] == "m4-7"
     assert row["state"] == "failed_pre_submit"
+
+
+def test_unresolved_submit_blocks_a_second_queue_lease(fleet_db):
+    from applypilot.fleet import queue
+
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_apply_jobs(
+            conn,
+            [{
+                "url": "second-source",
+                "company": "Acme",
+                "title": "Operator",
+                "application_url": "https://boards.greenhouse.io/acme/jobs/2",
+                "score": 9.0,
+                "target_host": "boards.greenhouse.io",
+                "dedup_key": "same-role",
+            }],
+            approved_batch="batchA",
+        )
+        attempt_id = apply_attempts.create_prepared(
+            conn,
+            queue_name="apply_queue",
+            url="first-source",
+            dedup_key="same-role",
+            worker_id="m4-0",
+            route="adapter_submit:greenhouse",
+            route_version="greenhouse-v1",
+        )
+        apply_attempts.transition(
+            conn, attempt_id, expected="prepared", state="submit_started"
+        )
+
+        leased = queue.lease_apply(conn, "m4-1", home_ip="1.2.3.4")
+
+    assert leased is None

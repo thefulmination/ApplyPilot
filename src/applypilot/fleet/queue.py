@@ -64,6 +64,11 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_
          -- NOT an approved_batch=NULL un-approve -- so vetted owner approval is preserved and
          -- the skip auto-reverts at its TTL exactly like the breaker's breaker_until.
          AND COALESCE(g.doctor_skip_until, '-infinity'::timestamptz) < now()
+         AND NOT EXISTS (
+           SELECT 1 FROM apply_attempts aa
+           WHERE aa.dedup_key = q.dedup_key
+             AND aa.state IN ('submit_started', 'submitted_unverified')
+         )
          AND NOT (
            LOWER(TRIM(COALESCE(q.company,''))) = ANY(%(blocked_names)s)
            OR q.url ILIKE ANY(%(blocked_pats)s)

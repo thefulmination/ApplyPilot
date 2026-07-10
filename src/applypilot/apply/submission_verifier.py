@@ -87,7 +87,7 @@ def verify_submission(evidence: SubmissionEvidence) -> VerificationResult:
         and _host_allowed(success_url, evidence.allowed_success_hosts)
     ):
         return VerificationResult("verified", "success_url_dom", success_url[:500])
-    if marker:
+    if marker and _host_allowed(success_url, evidence.allowed_success_hosts):
         return VerificationResult("verified", "confirmation_dom", marker)
 
     email_ref = (evidence.confirmation_email_ref or "").strip()
@@ -95,4 +95,3 @@ def verify_submission(evidence: SubmissionEvidence) -> VerificationResult:
         return VerificationResult("verified", "confirmation_email", email_ref[:500])
 
     return VerificationResult("unverified")
-

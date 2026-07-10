@@ -144,6 +144,12 @@ def test_apply_worker_main_validates_schema_before_building_loop(monkeypatch):
         lambda c: calls.append(("schema_check", c)),
         raising=False,
     )
+    monkeypatch.setattr(
+        fleet_schema,
+        "require_apply_attempt_schema",
+        lambda c: calls.append(("attempt_schema_check", c)),
+        raising=False,
+    )
     monkeypatch.setattr(am, "build_apply_loop", lambda **kwargs: calls.append("build") or object())
     monkeypatch.setattr(am, "install_stop_handler", lambda: calls.append("install"))
     monkeypatch.setattr(am, "run_apply", lambda conn_factory, loop, **kwargs: calls.append("run") or {})
@@ -152,6 +158,8 @@ def test_apply_worker_main_validates_schema_before_building_loop(monkeypatch):
 
     assert ("schema_check", conn) in calls
     assert calls.index(("schema_check", conn)) < calls.index("build")
+    assert calls.index(("schema_check", conn)) < calls.index(("attempt_schema_check", conn))
+    assert calls.index(("attempt_schema_check", conn)) < calls.index("build")
     assert calls.index("build") < calls.index("run")
 
 

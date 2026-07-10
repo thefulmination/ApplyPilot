@@ -764,13 +764,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     with pgqueue.connect(args.dsn) as conn:
         try:
             fleet_schema.require_apply_result_event_schema(conn)
-            if (
-                os.environ.get("APPLYPILOT_GREENHOUSE_ADAPTER", "").strip().lower()
-                in {"1", "true", "yes", "on"}
-                and os.environ.get("APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT", "").strip().lower()
-                in {"1", "true", "yes", "on"}
-            ):
-                fleet_schema.require_apply_attempt_schema(conn)
+            fleet_schema.require_apply_attempt_schema(conn)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from None
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,

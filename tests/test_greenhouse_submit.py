@@ -45,6 +45,7 @@ class FakePage:
     def __init__(self):
         self.calls = []
         self._content = ""
+        self.url = "https://boards.greenhouse.io/acme/jobs/123"
 
     def set_content(self, html):
         self._content = html
