@@ -257,7 +257,7 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
 @pytest.mark.parametrize(("preflight_status", "preflight_reason"), [
     ("live", "gh_api_200"),
     ("uncertain", "blocked_403"),
-    ("unexpected", "new_probe_state"),
+    ("unknown", "unknown_probe_state"),
 ])
 def test_apply_preflight_non_dead_statuses_fall_through(
     fleet_db, preflight_status, preflight_reason,
@@ -283,6 +283,12 @@ def test_apply_preflight_non_dead_statuses_fall_through(
 
     assert result["action"] == "applied"
     assert calls == [queue_url]
+    with pgqueue.connect(fleet_db) as conn:
+        row = conn.execute(
+            "SELECT status::text, apply_status FROM apply_queue WHERE url=%s",
+            (queue_url,),
+        ).fetchone()
+    assert row == {"status": "applied", "apply_status": "applied"}
 
 
 def test_apply_preflight_exception_falls_through(fleet_db):
@@ -310,6 +316,12 @@ def test_apply_preflight_exception_falls_through(fleet_db):
 
     assert result["action"] == "applied"
     assert calls == [queue_url]
+    with pgqueue.connect(fleet_db) as conn:
+        row = conn.execute(
+            "SELECT status::text, apply_status FROM apply_queue WHERE url=%s",
+            (queue_url,),
+        ).fetchone()
+    assert row == {"status": "applied", "apply_status": "applied"}
 
 
 def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
