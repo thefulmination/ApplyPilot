@@ -36,8 +36,8 @@ The 2026-07-10 audit also identified remaining reliability gaps:
 4. A second responder process can race the first because scan ownership is not
    protected by a database singleton lock.
 5. DeadMan does not treat a missing responder heartbeat as critical when a
-   request is pending, and it does not distinguish a live responder from a
-   responder that is failing to answer old pending requests.
+   worker is actively waiting for a request, and it does not distinguish a live
+   responder from one that is failing to answer old active waits.
 6. The Gmail API fallback reads one page, while the IMAP path and current busy
    inbox budget can require more than one Gmail API page.
 
@@ -69,8 +69,9 @@ fleet throughput and is unnecessary when ambiguous cases can fail closed.
    when provider and timing evidence cannot identify one request.
 8. A worker performs at most one assisted retry with a code or magic link.
 9. Codes are never logged and are nulled atomically when consumed or expired.
-10. A pending request with no healthy responder, or an overdue request with a
-    fresh responder heartbeat, produces an operator-visible alert.
+10. An actively waiting request with no healthy responder, or an overdue active
+    wait with a fresh responder heartbeat, produces an operator-visible alert.
+    A merely prearmed row does not create a false alarm during a long apply run.
 
 ## Component Changes
 
@@ -89,6 +90,10 @@ application URL when a caller repeats the operation after a recoverable local
 error. The prearm TTL covers the agent timeout plus the complete inbox-auth
 timeout. The answered TTL may extend availability but may never revive an
 already expired request.
+
+`poll_for_code` stamps nullable `wait_started_at` once, before its first consume
+attempt. This separates prearmed rows, which may exist throughout a normal
+browser run, from actual worker demand that monitoring must service promptly.
 
 ### Shared Candidate Eligibility
 
@@ -114,11 +119,12 @@ code.
 
 ### Persistent Message Idempotency
 
-Add nullable `matched_message_id TEXT` to `otp_request`. Create partial unique
-index `idx_otp_matched_message_unique` for non-null values. The responder loads
-previously matched IDs and writes the chosen message ID in the same guarded
-update that writes the short-lived code. A uniqueness conflict is treated as
-"already used" and does not expose or log the code.
+Add nullable `matched_message_id TEXT` and `wait_started_at TIMESTAMPTZ` to
+`otp_request`. Create partial unique index `idx_otp_matched_message_unique` for
+non-null message IDs. The responder loads previously matched IDs and writes the
+chosen message ID in the same guarded update that writes the short-lived code.
+A uniqueness conflict is treated as "already used" and does not expose or log
+the code.
 
 The message ID is non-secret audit metadata. Raw bodies and permanent codes
 remain prohibited.
@@ -147,12 +153,13 @@ The parser, confidence rules, and read-only Gmail boundary remain unchanged.
 
 ### Monitoring
 
-DeadMan evaluates responder health against actual demand:
+DeadMan evaluates responder health against actual demand, defined as an
+unexpired, unconsumed request with `wait_started_at IS NOT NULL`:
 
-- no pending request: a never-started responder does not create noise;
-- pending request plus no heartbeat: critical `otp_relay_down`;
-- pending request plus stale heartbeat: critical `otp_relay_down`;
-- pending request older than the delivery threshold while heartbeat and mail
+- no active wait: a never-started responder does not create noise;
+- active wait plus no heartbeat: critical `otp_relay_down`;
+- active wait plus stale heartbeat: critical `otp_relay_down`;
+- active wait older than the delivery threshold while heartbeat and mail
   source are healthy: critical `otp_delivery_stalled`;
 - failed IMAP or Gmail API health probe: critical `otp_relay_down`.
 
@@ -171,8 +178,8 @@ links, credentials, or DSNs.
    and applies shared time/provider/confidence checks.
 4. A uniquely eligible message is persisted with `matched_message_id`, the
    short-lived code, and audit timestamps in one guarded update.
-5. The worker polls the original request ID, atomically captures and nulls the
-   code, and performs one assisted retry.
+5. The worker stamps `wait_started_at`, polls the original request ID,
+   atomically captures and nulls the code, and performs one assisted retry.
 6. If no unique candidate arrives before expiry, the job remains
    `auth_required`/manual rather than being falsely marked applied or retried in
    a loop.
@@ -203,11 +210,14 @@ pre-change implementation.
 - local watcher rejects a recent but pre-challenge code;
 - local watcher rejects a different ATS provider and selects the valid provider;
 - the same message ID cannot answer another request in a later responder cycle;
+- the first worker poll stamps `wait_started_at` once;
 - expired requests are not revived;
 - concurrent responder lock ownership prevents a second scan;
 - ambiguous same-provider mappings remain unanswered;
 - Gmail API fallback paginates and honors the exact caller budget;
-- DeadMan alerts for pending-without-heartbeat and overdue-pending conditions;
+- DeadMan alerts for active-wait-without-heartbeat and overdue-active-wait
+  conditions;
+- DeadMan ignores a merely prearmed request for delivery-stall purposes;
 - DeadMan remains quiet when there is no demand and no historical heartbeat.
 
 ### Broader verification
@@ -249,8 +259,8 @@ The work is complete only when all of the following are proven in current state:
 - one message and one code are delivered at most once;
 - local and relay modes apply the same request-relative eligibility rules;
 - IMAP and Gmail API fallback both satisfy the bounded scan contract;
-- pending demand cannot coexist silently with a missing, stale, or stalled
-  responder;
+- active waiting demand cannot coexist silently with a missing, stale, or
+  stalled responder, while merely prearmed requests remain alert-free;
 - no password, OAuth secret, app password, raw body, code, or magic link is
   logged or moved to a remote worker outside the short-lived existing hint;
 - all focused and broader regression suites pass; and
