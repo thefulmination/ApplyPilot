@@ -11,6 +11,7 @@ from typing import Iterable
 
 from applypilot import config
 from applypilot.apply.greenhouse_adapter import (
+    builtin_questions_from_payload,
     build_answer_plan,
     fetch_job,
     job_context_from_payload,
@@ -45,6 +46,7 @@ def inventory_url(url: str, *, profile: dict, fetch=None) -> ShadowInventory:
     try:
         payload = fetch_job(board, job_id, fetch=fetch)
         questions = list(payload.get("questions") or [])
+        questions.extend(builtin_questions_from_payload(payload, profile=profile))
         plan = build_answer_plan(
             questions,
             profile=profile,

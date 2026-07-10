@@ -117,6 +117,51 @@ def builtin_questions_from_payload(payload: dict, *, profile: dict) -> list[dict
         None,
     )
     personal = (profile or {}).get("personal") or {}
+
+    province = str(personal.get("province_state") or "").strip()
+    province = _US_STATE_NAMES.get(province.upper(), province)
+    country = str(personal.get("country") or "").strip()
+    if country.lower() in {"us", "usa", "united states of america"}:
+        country = "United States"
+    city = str(personal.get("city") or "").strip()
+    location_value = ", ".join(
+        value for value in (city, province, country) if value
+    ) if city else ""
+    for question in (payload or {}).get("location_questions") or []:
+        fields = []
+        for source_field in question.get("fields") or []:
+            name = str(source_field.get("name") or "")
+            field = dict(source_field)
+            field["type"] = "location_autocomplete" if name == "location" else "location_virtual"
+            if name == "location" and location_value:
+                field["profile_value"] = location_value
+            fields.append(field)
+        questions.append({
+            "required": bool(question.get("required")),
+            "label": f"Location: {question.get('label') or 'Field'}",
+            "fields": fields,
+        })
+
+    demographic = (payload or {}).get("demographic_questions") or {}
+    for question in demographic.get("questions") or []:
+        values = [
+            {
+                "label": option.get("label"),
+                "value": option.get("id"),
+                "decline_to_answer": bool(option.get("decline_to_answer")),
+            }
+            for option in (question.get("answer_options") or [])
+        ]
+        questions.append({
+            "required": bool(question.get("required")),
+            "label": str(question.get("label") or "Demographic question"),
+            "fields": [{
+                "name": str(question.get("id") or ""),
+                "type": str(question.get("type") or "multi_value_single_select"),
+                "values": values,
+            }],
+        })
+
     if phone_question is not None and (payload or {}).get("id") is not None:
         country_code = _phone_country_code(personal.get("country"))
         field = {"name": "country", "type": "phone_country_select", "values": []}
@@ -401,6 +446,18 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 mapped = True
                 continue
 
+            if ftype == "location_virtual":
+                # The hosted React location widget populates these API fields
+                # internally after an autocomplete option is selected. They do
+                # not exist as DOM inputs and must never be filled directly.
+                mapped = bool(personal.get("city"))
+                continue
+
+            if ftype == "location_autocomplete":
+                # A profile-backed value is handled above. Do not fall through
+                # to the generic location field, which would accept country-only.
+                continue
+
             if ftype == "input_hidden":
                 mapped = True
                 continue
@@ -539,12 +596,14 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     resume_facts=resume_facts,
                     job=job,
                 )
+                if _has(low, _DEMOGRAPHIC):
+                    val = _pick_value(values, lambda label_l: _has(label_l, _DECLINE))
                 if val is not None:
                     fields[name] = val
                     mapped = True
                 continue
 
-            # multi_value_multi_select / unknown types: not handled in this slice.
+            # Unknown types remain unmapped and fail closed when required.
 
         if required and not mapped:
             unmapped.append(label)

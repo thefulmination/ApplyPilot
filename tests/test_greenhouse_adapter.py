@@ -76,6 +76,89 @@ def test_builtin_questions_include_required_phone_country_and_education():
     }
 
 
+def test_builtin_questions_include_profile_location_and_demographic_declines():
+    payload = {
+        "location_questions": [
+            {"required": True, "label": "Longitude", "fields": [
+                {"name": "longitude", "type": "input_hidden", "values": []},
+            ]},
+            {"required": True, "label": "Latitude", "fields": [
+                {"name": "latitude", "type": "input_hidden", "values": []},
+            ]},
+            {"required": True, "label": "Location", "fields": [
+                {"name": "location", "type": "input_text", "values": []},
+            ]},
+        ],
+        "demographic_questions": {"questions": [
+            {"id": 864, "label": "Gender", "required": True,
+             "type": "multi_value_multi_select", "answer_options": [
+                 {"id": 4653, "label": "Male", "decline_to_answer": False},
+                 {"id": 4660, "label": "I don't wish to answer", "decline_to_answer": True},
+             ]},
+            {"id": 1337, "label": "Disability Status", "required": True,
+             "type": "multi_value_single_select", "answer_options": [
+                 {"id": 7533, "label": "No", "decline_to_answer": False},
+                 {"id": 7534, "label": "I don't wish to answer", "decline_to_answer": True},
+             ]},
+        ]},
+    }
+    profile = {"personal": {
+        "full_name": "Jordan Rivera", "email": "j@x.com",
+        "city": "San Francisco", "province_state": "California", "country": "USA",
+        "latitude": 37.7749, "longitude": -122.4194,
+    }}
+
+    questions = [
+        {"required": True, "label": "First Name", "fields": [
+            {"name": "first_name", "type": "input_text"},
+        ]},
+        {"required": True, "label": "Email", "fields": [
+            {"name": "email", "type": "input_text"},
+        ]},
+    ] + builtin_questions_from_payload(payload, profile=profile)
+    plan = build_answer_plan(
+        questions, profile=profile, resume_text="resume",
+        answer_fn=lambda *args, **kwargs: None,
+    )
+
+    assert plan.fields["location"] == "San Francisco, California, United States"
+    assert "latitude" not in plan.fields
+    assert "longitude" not in plan.fields
+    assert plan.fields["864"] == 4660
+    assert plan.fields["1337"] == 7534
+    assert plan.ready is True
+
+
+def test_required_builtin_location_is_unmapped_without_city():
+    payload = {"location_questions": [
+        {"required": True, "label": "Longitude", "fields": [
+            {"name": "longitude", "type": "input_hidden", "values": []},
+        ]},
+        {"required": True, "label": "Latitude", "fields": [
+            {"name": "latitude", "type": "input_hidden", "values": []},
+        ]},
+        {"required": True, "label": "Location", "fields": [
+            {"name": "location", "type": "input_text", "values": []},
+        ]},
+    ]}
+
+    questions = builtin_questions_from_payload(
+        payload,
+        profile={"personal": {"country": "USA"}},
+    )
+    plan = build_answer_plan(
+        questions,
+        profile={"personal": {"country": "USA"}},
+        resume_text="resume",
+        answer_fn=lambda *args, **kwargs: None,
+    )
+
+    assert plan.ready is False
+    assert {
+        "Location: Longitude", "Location: Latitude", "Location: Location",
+    } <= set(plan.unmapped_required)
+
+
 def test_required_builtin_education_is_unmapped_when_profile_is_incomplete():
     payload = {"education": "education_required", "questions": []}
     questions = builtin_questions_from_payload(payload, profile={})

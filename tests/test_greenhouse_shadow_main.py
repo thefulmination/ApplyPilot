@@ -49,3 +49,45 @@ def test_inventory_rejects_non_greenhouse_url_without_fetching():
 
     assert result.error == "unsupported_url"
     assert result.question_count == 0
+
+
+def test_inventory_counts_location_and_demographic_builtins():
+    payload = {
+        "questions": [{
+            "label": "Name", "required": True,
+            "fields": [
+                {"name": "first_name", "type": "input_text"},
+                {"name": "email", "type": "input_text"},
+            ],
+        }],
+        "location_questions": [{
+            "label": "Location", "required": True,
+            "fields": [{"name": "location", "type": "input_text"}],
+        }],
+        "demographic_questions": {"questions": [{
+            "id": 864, "label": "Gender", "required": True,
+            "type": "multi_value_single_select",
+            "answer_options": [{
+                "id": 4660, "label": "I don't wish to answer",
+                "decline_to_answer": True,
+            }],
+        }]},
+    }
+    profile = {
+        **PROFILE,
+        "personal": {
+            **PROFILE["personal"], "city": "San Francisco",
+            "province_state": "California", "country": "USA",
+        },
+    }
+
+    result = inventory_url(
+        "https://job-boards.greenhouse.io/acme/jobs/123",
+        profile=profile,
+        fetch=lambda url: payload,
+    )
+
+    assert result.question_count == 3
+    assert result.required_count == 3
+    assert result.unmapped_required == []
+    assert result.ready_without_free_text is True

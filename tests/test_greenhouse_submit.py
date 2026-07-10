@@ -108,6 +108,23 @@ def test_plan_form_actions_uses_select_for_multi_select_fields():
     ]
 
 
+def test_plan_form_actions_uses_attribute_selector_for_numeric_demographic_id():
+    plan = AnswerPlan(
+        fields={"864": 4660}, resume_field=None, free_text={},
+        unmapped_required=[], ready=True,
+    )
+    questions = [{"fields": [{
+        "name": "864", "type": "multi_value_multi_select",
+        "values": [{"label": "I don't wish to answer", "value": 4660}],
+    }]}]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("select", '[id="864"]', 4660) in [
+        (action.kind, action.selector, action.value) for action in actions
+    ]
+
+
 def test_plan_form_actions_maps_phone_country_widget():
     plan = AnswerPlan(
         fields={"country": "us"},
@@ -125,6 +142,70 @@ def test_plan_form_actions_maps_phone_country_widget():
     assert ("phone_country", "#country", "us") in [
         (action.kind, action.selector, action.value) for action in actions
     ]
+
+
+def test_plan_form_actions_maps_location_and_coordinates_to_real_dom_controls():
+    plan = AnswerPlan(
+        fields={
+            "location": "San Francisco, California, United States",
+        },
+        resume_field=None, free_text={}, unmapped_required=[], ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "location", "type": "location_autocomplete"}]},
+        {"fields": [{"name": "latitude", "type": "location_virtual"}]},
+        {"fields": [{"name": "longitude", "type": "location_virtual"}]},
+    ]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("location", "#candidate-location", "San Francisco, California, United States") in [
+        (action.kind, action.selector, action.value) for action in actions
+    ]
+    assert not any(action.selector in {"#latitude", "#longitude"} for action in actions)
+
+
+def test_execute_form_selects_location_autocomplete_option():
+    class LocationInput:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def click(self):
+            self.calls.append(("location_click",))
+
+        def fill(self, value):
+            self.calls.append(("location_fill", value))
+
+        def press_sequentially(self, value, *, delay):
+            self.calls.append(("location_type", value, delay))
+
+    class LocationOption:
+        def __init__(self, calls, name):
+            self.calls = calls
+            self.name = name
+
+        def click(self):
+            self.calls.append(("location_option", self.name))
+
+    class LocationPage(FakePage):
+        def locator(self, selector):
+            assert selector == "#candidate-location"
+            return LocationInput(self.calls)
+
+        def get_by_role(self, role, *, name, exact):
+            assert role == "option" and exact is True
+            return LocationOption(self.calls, name)
+
+    actions = [
+        type("Action", (), {"kind": "location", "selector": "#candidate-location",
+                             "value": "San Francisco, California, United States"})(),
+    ]
+    page = LocationPage()
+
+    execute_form(actions, page)
+
+    assert ("location_type", "San Francisco, California, United States", 50) in page.calls
+    assert ("location_option", "San Francisco, California, United States") in page.calls
 
 
 def test_plan_form_actions_puts_submit_last():

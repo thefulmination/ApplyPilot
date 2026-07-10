@@ -409,7 +409,7 @@ def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[
             }
 
     def selector(name: str) -> str:
-        if name.endswith("[]"):
+        if name.endswith("[]") or (name and name[0].isdigit()):
             return f'[id="{name}"]'
         return f"#{name}"
 
@@ -422,7 +422,9 @@ def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[
             continue
         field_selector = selector(name)
         ftype = types.get(name)
-        if ftype == "textarea":
+        if ftype == "location_autocomplete":
+            actions.append(FormAction("location", "#candidate-location", value))
+        elif ftype == "textarea":
             actions.append(FormAction("textarea", field_selector, value))
         elif ftype == "phone_country_select":
             actions.append(FormAction(
@@ -475,6 +477,12 @@ def execute_form(actions, page, *, dry_run: bool = True,
             continue
         if a.kind == "file":
             page.set_input_files(a.selector, a.value)
+        elif a.kind == "location":
+            location_input = page.locator(a.selector)
+            location_input.click()
+            location_input.fill("")
+            location_input.press_sequentially(str(a.value), delay=50)
+            page.get_by_role("option", name=str(a.value), exact=True).click()
         elif a.kind == "phone_country":
             input_locator = page.locator(a.selector)
             container = input_locator.locator(
@@ -501,7 +509,7 @@ def execute_form(actions, page, *, dry_run: bool = True,
                 page.fill(a.selector, a.option_label)
                 page.get_by_role("option", name=a.option_label, exact=True).click()
             else:
-                page.select_option(a.selector, a.value)
+                page.select_option(a.selector, str(a.value))
         else:  # fill / textarea
             page.fill(a.selector, a.value)
         report.filled.append(a.selector)
