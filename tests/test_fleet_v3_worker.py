@@ -754,11 +754,77 @@ def test_tick_apply_status_passthrough(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed(conn, "jp", "acme-p.com")
     loop3 = WorkerLoop(lambda: pgqueue.connect(fleet_db), "w3", home_ip="3.3.3.3", role="apply",
-                       apply_fn=lambda job: {"run_status": "captcha", "est_cost_usd": 0.0})
+                       apply_fn=lambda job: {
+                           "run_status": "captcha",
+                           "est_cost_usd": 0.12,
+                           "agent": "codex",
+                           "agent_model": "gpt-test",
+                           "route": "agent",
+                           "tool_calls_total": 4,
+                           "application_tool_calls": 2,
+                           "last_tool": "browser_click",
+                           "result_metadata": {"preflight_status": "live"},
+                       })
     assert loop3.run_once()["action"] == "parked_challenge"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='jp' AND resolved_at IS NULL")
         assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT status, apply_status, est_cost_usd FROM apply_queue WHERE url='jp'")
+        parked = cur.fetchone()
+        assert parked["status"] == "leased"
+        assert parked["apply_status"] == "challenge_pending"
+        assert float(parked["est_cost_usd"]) == 0.12
+        cur.execute(
+            "SELECT status, route, est_cost_usd, tool_calls_total, application_tool_calls "
+            "FROM apply_result_events WHERE url='jp'"
+        )
+        event = cur.fetchone()
+        assert event["status"] == "challenge_pending"
+        assert event["route"] == "agent"
+        assert event["est_cost_usd"] == pytest.approx(0.12)
+        assert event["tool_calls_total"] == 4
+        assert event["application_tool_calls"] == 2
+
+
+def test_apply_worker_injects_attempt_store_only_when_factory_configured(fleet_db):
+    captured = {}
+
+    with pgqueue.connect(fleet_db) as conn:
+        queue.push_apply_jobs(
+            conn,
+            [{
+                "url": "attempt-store-job",
+                "company": "Acme",
+                "title": "Operator",
+                "application_url": "https://boards.greenhouse.io/acme/jobs/1",
+                "score": 9.0,
+                "target_host": "boards.greenhouse.io",
+                "dedup_key": "attempt-store-dedup",
+            }],
+            approved_batch="batchA",
+        )
+
+    sentinel = object()
+
+    def factory(conn, job):
+        captured["factory_job"] = job["url"]
+        return sentinel
+
+    def apply_fn(job, *, attempt_store=None):
+        captured["store"] = attempt_store
+        return {"run_status": "failed:form_error", "est_cost_usd": 0.0}
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-attempt-store",
+        home_ip="5.5.5.5",
+        role="apply",
+        apply_fn=apply_fn,
+        attempt_store_factory=factory,
+    )
+
+    assert loop.run_once()["action"] == "failed"
+    assert captured == {"factory_job": "attempt-store-job", "store": sentinel}
 
 
 # ===========================================================================

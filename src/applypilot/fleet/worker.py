@@ -214,6 +214,7 @@ class WorkerLoop:
         home_ip: str,
         role: str,
         apply_fn: Optional[Callable[[dict], Any]] = None,
+        attempt_store_factory: Optional[Callable[[Any, dict], Any]] = None,
         preflight_fn: Optional[Callable[[str], tuple[str, str]]] = None,
         score_fn: Optional[Callable[[dict], tuple]] = None,
         search_fn: Optional[Callable[[dict], list]] = None,
@@ -233,6 +234,7 @@ class WorkerLoop:
         self.home_ip = home_ip
         self.role = role
         self.apply_fn = apply_fn
+        self.attempt_store_factory = attempt_store_factory
         self.preflight_fn = preflight_fn
         self.score_fn = score_fn
         self.search_fn = search_fn
@@ -511,7 +513,11 @@ class WorkerLoop:
                 return {"action": "preflight_dead", "url": url, "reason": preflight_reason}
 
         # Drive the real browser (STUBBED in tests) and classify the resulting page.
-        out = self.apply_fn(job)
+        if self.attempt_store_factory is not None:
+            attempt_store = self.attempt_store_factory(conn, job)
+            out = self.apply_fn(job, attempt_store=attempt_store)
+        else:
+            out = self.apply_fn(job)
         if isinstance(out, dict) and "run_status" in out:
             return self._apply_status_passthrough(conn, url, target_host, out)
         # --- legacy html-classify path (existing test fakes return html/4-tuple) ---
@@ -682,7 +688,21 @@ class WorkerLoop:
             kind = "login_gate" if run_status in ("login_issue", "auth_required") else "visible_captcha"
             route = _captcha.route_for(kind, on_owner_machine=self.on_owner_machine)
             wall_outcome = None if kind == "login_gate" else "captcha"
-            self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome, target_host=target_host)
+            self._raise_and_park(
+                conn,
+                url,
+                kind,
+                route=route,
+                outcome=wall_outcome,
+                target_host=target_host,
+                telemetry={
+                    "est_cost_usd": cost,
+                    "agent": agent,
+                    "agent_model": agent_model,
+                    "apply_duration_ms": duration_ms,
+                    **result_evidence,
+                },
+            )
             return {"action": "parked_challenge", "url": url}
         if (
             run_status in self._CRASH_STATUSES
@@ -706,7 +726,8 @@ class WorkerLoop:
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}
 
-    def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host) -> int:
+    def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host,
+                        telemetry=None) -> int:
         """Raise an auth_challenge row, optionally record the wall outcome on the
         governor, and FREEZE the held lease out of the reclaim pool
         (``queue.park_challenge``) so the SAME wall is never reclaimed and re-driven
@@ -724,6 +745,29 @@ class WorkerLoop:
                 scopes.append(governor.host_scope(target_host))
             governor.record_outcome(conn, scopes, outcome, commit=False)
         queue.park_challenge(conn, self.worker_id, url, commit=False)
+        if telemetry is not None:
+            queue.record_apply_challenge_event(
+                conn,
+                self.worker_id,
+                url,
+                kind=kind,
+                target_host=target_host,
+                home_ip=self.home_ip,
+                est_cost_usd=telemetry.get("est_cost_usd", 0),
+                agent=telemetry.get("agent"),
+                agent_model=telemetry.get("agent_model"),
+                apply_duration_ms=telemetry.get("apply_duration_ms"),
+                route=telemetry.get("route"),
+                failure_class=telemetry.get("failure_class"),
+                tool_calls_total=telemetry.get("tool_calls_total"),
+                application_tool_calls=telemetry.get("application_tool_calls"),
+                last_tool=telemetry.get("last_tool"),
+                result_metadata=telemetry.get("result_metadata"),
+                job_log_path=telemetry.get("job_log_path"),
+                transcript_digest=telemetry.get("transcript_digest"),
+                final_result_source=telemetry.get("final_result_source"),
+                commit=False,
+            )
         conn.commit()
         self._record_event(f"parked challenge {url} ({kind}->{route})")
         self._beat(conn, state="challenge_pending", current_job=url)

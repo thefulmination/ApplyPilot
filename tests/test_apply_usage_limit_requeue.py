@@ -277,6 +277,9 @@ def test_apply_fn_forwards_adapter_metadata_from_launcher_stats(monkeypatch):
                 "worker_level_failure": False,
                 "adapter_name": "greenhouse",
                 "adapter_plan_ready": True,
+                "attempt_id": "attempt-1",
+                "submit_checkpoint_state": "quarantined",
+                "verification_status": "unverified",
                 "cost_usd": 0,
             }
         },
@@ -293,6 +296,9 @@ def test_apply_fn_forwards_adapter_metadata_from_launcher_stats(monkeypatch):
     assert out["result_metadata"]["worker_level_failure"] is False
     assert out["result_metadata"]["adapter_name"] == "greenhouse"
     assert out["result_metadata"]["adapter_plan_ready"] is True
+    assert out["result_metadata"]["attempt_id"] == "attempt-1"
+    assert out["result_metadata"]["submit_checkpoint_state"] == "quarantined"
+    assert out["result_metadata"]["verification_status"] == "unverified"
 
 
 def test_session_limit_wording_with_no_tool_calls_is_retryable():

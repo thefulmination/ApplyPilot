@@ -83,3 +83,33 @@ def test_second_unresolved_submit_for_dedup_key_is_rejected(fleet_db):
                 conn, second, expected="prepared", state="submit_started"
             )
 
+
+def test_pg_attempt_store_binds_queue_job_and_worker_identity(fleet_db):
+    from applypilot.fleet.apply_worker_main import PgAttemptStore
+
+    with pgqueue.connect(fleet_db) as conn:
+        store = PgAttemptStore(
+            conn,
+            {
+                "url": "bound-job",
+                "dedup_key": "bound-dedup",
+            },
+            worker_id="m4-7",
+        )
+        attempt_id = store.create_prepared(
+            route="adapter_submit:greenhouse",
+            route_version="greenhouse-v1",
+            evidence={"plan_ready": True},
+        )
+        store.transition(
+            attempt_id, expected="prepared", state="failed_pre_submit"
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM apply_attempts WHERE attempt_id=%s", (attempt_id,))
+            row = cur.fetchone()
+
+    assert row["queue_name"] == "apply_queue"
+    assert row["url"] == "bound-job"
+    assert row["dedup_key"] == "bound-dedup"
+    assert row["worker_id"] == "m4-7"
+    assert row["state"] == "failed_pre_submit"

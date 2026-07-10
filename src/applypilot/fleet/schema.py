@@ -33,6 +33,22 @@ _APPLY_RESULT_EVENT_REQUIRED_COLUMNS = frozenset({
     "transcript_digest",
     "final_result_source",
 })
+_APPLY_ATTEMPT_REQUIRED_COLUMNS = frozenset({
+    "attempt_id",
+    "queue_name",
+    "url",
+    "dedup_key",
+    "worker_id",
+    "route",
+    "route_version",
+    "state",
+    "submit_started_at",
+    "finalized_at",
+    "verification_method",
+    "verification_ref",
+    "evidence",
+    "created_at",
+})
 
 
 def ensure_schema_v3(conn) -> None:
@@ -77,4 +93,29 @@ def require_apply_result_event_schema(conn) -> None:
             + ", ".join(missing)
             + "; run applypilot-fleet-apply-home with the owner/home DSN once to migrate "
             "before starting remote apply workers"
+        )
+
+
+def require_apply_attempt_schema(conn) -> None:
+    """Read-only compatibility check required before adapter submit ownership."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name='apply_attempts'"
+        )
+        cols = {
+            row["column_name"] if hasattr(row, "get") else row[0]
+            for row in cur.fetchall()
+        }
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    missing = sorted(_APPLY_ATTEMPT_REQUIRED_COLUMNS - cols)
+    if missing:
+        raise RuntimeError(
+            "fleet schema is missing apply_attempts columns: "
+            + ", ".join(missing)
+            + "; run applypilot-fleet-apply-home with the owner/home DSN once before "
+            "enabling APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT"
         )

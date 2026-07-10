@@ -155,6 +155,7 @@ def test_apply_attempts_schema_and_unresolved_index(fleet_db):
 def test_apply_worker_schema_check_passes_with_current_schema(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         fleet_schema.require_apply_result_event_schema(conn)
+        fleet_schema.require_apply_attempt_schema(conn)
 
 
 def test_apply_worker_schema_check_reports_missing_columns():
@@ -180,6 +181,31 @@ def test_apply_worker_schema_check_reports_missing_columns():
 
     with pytest.raises(RuntimeError, match="apply_result_events.*route"):
         fleet_schema.require_apply_result_event_schema(_Conn())
+
+
+def test_apply_attempt_schema_check_reports_missing_columns():
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchall(self):
+            return [{"column_name": "attempt_id"}, {"column_name": "url"}]
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def rollback(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="apply_attempts.*state"):
+        fleet_schema.require_apply_attempt_schema(_Conn())
 
 
 def test_linkedin_queue_freshness_columns(fleet_db):

@@ -256,6 +256,69 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
     return True
 
 
+def record_apply_challenge_event(
+    conn,
+    worker_id,
+    url,
+    *,
+    kind,
+    target_host,
+    home_ip,
+    est_cost_usd=0,
+    agent=None,
+    agent_model=None,
+    apply_duration_ms=None,
+    route=None,
+    failure_class=None,
+    tool_calls_total=None,
+    application_tool_calls=None,
+    last_tool=None,
+    result_metadata=None,
+    job_log_path=None,
+    transcript_digest=None,
+    final_result_source=None,
+    commit=True,
+):
+    """Persist nonterminal challenge spend without closing the held lease."""
+    cost = float(est_cost_usd or 0)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE apply_queue SET est_cost_usd=COALESCE(est_cost_usd,0)+%s, "
+            "agent_model=COALESCE(%s,agent_model), worker_id=%s, updated_at=now() "
+            "WHERE url=%s AND lease_owner=%s AND status='leased'",
+            (cost, agent_model, worker_id, url, worker_id),
+        )
+        if cur.rowcount == 0:
+            if commit:
+                conn.rollback()
+            return False
+        cur.execute(
+            "INSERT INTO apply_result_events ("
+            "queue_name,url,worker_id,status,apply_status,apply_error,target_host,home_ip,"
+            "agent,agent_model,est_cost_usd,apply_duration_ms,result_line,source,route,"
+            "failure_class,tool_calls_total,application_tool_calls,last_tool,result_metadata,"
+            "job_log_path,transcript_digest,final_result_source"
+            ") VALUES ("
+            "%s,%s,%s,'challenge_pending','challenge_pending',%s,%s,%s,%s,%s,%s,%s,"
+            "'RESULT:challenge_pending','worker',%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                "apply_queue", url, worker_id, f"challenge:{kind}", target_host, home_ip,
+                agent, agent_model, cost, apply_duration_ms, route, failure_class,
+                tool_calls_total, application_tool_calls, last_tool,
+                Jsonb(result_metadata or {}) if result_metadata is not None else None,
+                job_log_path, transcript_digest, final_result_source,
+            ),
+        )
+        if cost > 0:
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id,task,provider,cost_usd) VALUES (%s,%s,%s,%s)",
+                (worker_id, "apply_agent", agent, cost),
+            )
+    if commit:
+        conn.commit()
+    return True
+
+
 def suppress_applied_set_duplicates(conn, *, commit=True) -> int:
     """Retire queued apply rows whose dedup key is already in ``applied_set``.
 

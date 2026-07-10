@@ -657,6 +657,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_apply_attempts_unresolved_dedup
       AND state IN ('submit_started', 'submitted_unverified');
 CREATE INDEX IF NOT EXISTS idx_apply_attempts_url_created
     ON apply_attempts (queue_name, url, created_at DESC);
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fleet_worker') THEN
+        GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker;
+    END IF;
+END $$;
 
 -- apply_result_events: durable per-job terminal evidence written by the worker when
 -- it closes a lease. worker_heartbeat.recent_log is only a moving tail; repair tools

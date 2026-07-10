@@ -202,6 +202,34 @@ def _should_launch_chrome_headless() -> bool:
     return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
 
 
+class PgAttemptStore:
+    """Bind the generic attempt ledger to one held queue lease."""
+
+    def __init__(self, conn, job: dict, *, worker_id: str):
+        self.conn = conn
+        self.job = job
+        self.worker_id = worker_id
+
+    def create_prepared(self, *, route, route_version, evidence=None):
+        from applypilot.fleet import apply_attempts
+
+        return apply_attempts.create_prepared(
+            self.conn,
+            queue_name="apply_queue",
+            url=self.job["url"],
+            dedup_key=self.job.get("dedup_key"),
+            worker_id=self.worker_id,
+            route=route,
+            route_version=route_version,
+            evidence=evidence,
+        )
+
+    def transition(self, attempt_id, **kwargs):
+        from applypilot.fleet import apply_attempts
+
+        return apply_attempts.transition(self.conn, attempt_id, **kwargs)
+
+
 def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | None = None):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
@@ -215,7 +243,7 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
     from applypilot.apply.chrome import BASE_CDP_PORT
     from applypilot.apply.container_worker import _real_cost
 
-    def apply_fn(job: dict) -> dict:
+    def apply_fn(job: dict, *, attempt_store=None) -> dict:
         # `slot` keys this worker's Chrome profile + CDP port + per-run logs, so multiple
         # workers on ONE machine (distinct slots) never collide in a shared browser.
         worker_id = slot
@@ -234,7 +262,10 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 if launcher._should_prearm_inbox_auth(job)
                 else None
             )
-            status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
+            run_kwargs = {"model": model, "agent": agent}
+            if attempt_store is not None:
+                run_kwargs["attempt_store"] = attempt_store
+            status, _dur = launcher.run_job(job, port, worker_id, **run_kwargs)
             first_stats = dict(
                 (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
             )
@@ -248,13 +279,15 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 if not inbox_hint and launcher._is_auth_required_result(status):
                     inbox_hint = launcher._poll_inbox_auth_hint(job)
                 if inbox_hint:
+                    retry_kwargs = {
+                        "model": model,
+                        "agent": agent,
+                        "inbox_auth_hint": inbox_hint,
+                    }
+                    if attempt_store is not None:
+                        retry_kwargs["attempt_store"] = attempt_store
                     status, _dur = launcher.run_job(
-                        job,
-                        port,
-                        worker_id,
-                        model=model,
-                        agent=agent,
-                        inbox_auth_hint=inbox_hint,
+                        job, port, worker_id, **retry_kwargs
                     )
                     attempt_statuses.append(status)
                     attempt_stats.append(
@@ -298,6 +331,13 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                     "worker_level_failure": stats.get("worker_level_failure"),
                     "adapter_name": stats.get("adapter_name"),
                     "adapter_plan_ready": stats.get("adapter_plan_ready"),
+                    "attempt_id": stats.get("attempt_id"),
+                    "route_version": stats.get("route_version"),
+                    "adapter_version": stats.get("adapter_version"),
+                    "submit_checkpoint_state": stats.get("submit_checkpoint_state"),
+                    "verification_status": stats.get("verification_status"),
+                    "verification_method": stats.get("verification_method"),
+                    "verification_ref": stats.get("verification_ref"),
                     "attempt_count": len(attempt_stats),
                     "prior_attempt_status": (
                         attempt_statuses[0] if len(attempt_statuses) > 1 else None
@@ -434,6 +474,9 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
         machine_owner=machine_owner,
         log_tail_fn=make_log_tail_fn(slot),
         preflight_fn=liveness.probe_url,
+        attempt_store_factory=lambda conn, job: PgAttemptStore(
+            conn, job, worker_id=worker_id
+        ),
     )
 
 
@@ -721,6 +764,13 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     with pgqueue.connect(args.dsn) as conn:
         try:
             fleet_schema.require_apply_result_event_schema(conn)
+            if (
+                os.environ.get("APPLYPILOT_GREENHOUSE_ADAPTER", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+                and os.environ.get("APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                fleet_schema.require_apply_attempt_schema(conn)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from None
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
