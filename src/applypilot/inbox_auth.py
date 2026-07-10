@@ -38,6 +38,15 @@ KNOWN_ATS_DOMAINS = {
     "eightfold.ai",
 }
 
+PROVIDER_DOMAIN_GROUPS = (
+    ("oraclecloud.com", "oracle.com", "taleo.net"),
+    ("myworkdayjobs.com", "myworkdaysite.com", "workdayjobs.com", "workday.com"),
+    ("greenhouse.io", "greenhouse-mail.io"),
+    ("adp.com", "workforcenow.adp.com"),
+    ("amazon.jobs", "jobs.amazon.com"),
+    ("eightfold.ai",),
+)
+
 VERIFY_WORDS = {
     "verification",
     "verification code",
@@ -168,6 +177,35 @@ class AuthEmailMatch:
     snippet: str
     candidate: VerificationCandidate
     reasons: tuple[str, ...]
+
+
+def domains_related(left: str | None, right: str | None) -> bool:
+    left = _normalize_domain(left or "")
+    right = _normalize_domain(right or "")
+    if not left or not right:
+        return False
+    if left == right or left.endswith(f".{right}") or right.endswith(f".{left}"):
+        return True
+    return any(
+        any(left == domain or left.endswith(f".{domain}") for domain in group)
+        and any(right == domain or right.endswith(f".{domain}") for domain in group)
+        for group in PROVIDER_DOMAIN_GROUPS
+    )
+
+
+def match_belongs_to_provider(
+    match: AuthEmailMatch, provider_domain: str | None
+) -> bool:
+    if not provider_domain:
+        return True
+    evidence = [sender_domain(getattr(match, "sender", "") or "")]
+    candidate = getattr(match, "candidate", None)
+    if getattr(candidate, "kind", None) == "magic_link":
+        evidence.append(url_domain(getattr(candidate, "value", "") or ""))
+    evidence = [domain for domain in evidence if domain]
+    return bool(evidence) and any(
+        domains_related(provider_domain, domain) for domain in evidence
+    )
 
 
 def now_utc() -> str:
@@ -539,6 +577,36 @@ def _received_at_in_window(raw: str | None, *, cutoff: datetime) -> bool:
     return received >= cutoff
 
 
+def eligible_auth_matches(
+    matches: list[AuthEmailMatch],
+    *,
+    not_before: datetime | None = None,
+    provider_domain: str | None = None,
+    skew_seconds: int = 60,
+    excluded_message_ids: set[str] | None = None,
+) -> list[AuthEmailMatch]:
+    excluded = excluded_message_ids or set()
+    floor = None
+    if not_before is not None:
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+        floor = not_before.astimezone(timezone.utc) - timedelta(
+            seconds=max(0, skew_seconds)
+        )
+
+    eligible = []
+    for match in matches:
+        received = _received_at_dt(match.received_at)
+        if match.message_id in excluded or received is None:
+            continue
+        if floor is not None and received < floor:
+            continue
+        if not match_belongs_to_provider(match, provider_domain):
+            continue
+        eligible.append(match)
+    return eligible
+
+
 def scan_gmail_for_auth_codes(
     *,
     service=None,
@@ -626,6 +694,9 @@ def watch_gmail_for_auth_code(
     max_errors: int = 3,
     minutes: int = 10,
     max_messages: int = 25,
+    not_before: datetime | None = None,
+    provider_domain: str | None = None,
+    skew_seconds: int = 60,
 ) -> AuthEmailMatch | None:
     deadline = time.monotonic() + timeout_seconds
     errors = 0
@@ -635,7 +706,11 @@ def watch_gmail_for_auth_code(
                 from applypilot.mail_source import get_mail_source
 
                 since_days = max(1, (minutes + 1439) // 1440)
-                msgs = get_mail_source().fetch(since_days=since_days, max_messages=max_messages)
+                msgs = get_mail_source().fetch(
+                    since_days=since_days,
+                    max_messages=max_messages,
+                    gmail_raw_query=AUTH_GMAIL_RAW_QUERY,
+                )
                 matches = scan_gmail_for_auth_codes(
                     messages=msgs,
                     minutes=minutes,
@@ -647,6 +722,12 @@ def watch_gmail_for_auth_code(
                     minutes=minutes,
                     max_messages=max_messages,
                 )
+            matches = eligible_auth_matches(
+                matches,
+                not_before=not_before,
+                provider_domain=provider_domain,
+                skew_seconds=skew_seconds,
+            )
             matches.sort(
                 key=lambda match: _received_at_dt(match.received_at)
                 or datetime.min.replace(tzinfo=timezone.utc),

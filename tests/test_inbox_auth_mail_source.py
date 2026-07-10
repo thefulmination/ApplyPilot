@@ -145,7 +145,8 @@ def test_watch_gmail_for_auth_code_picks_newest_recent_match(monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
 
     class _FakeSource:
-        def fetch(self, *, since_days, max_messages):
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
+            assert "verification" in gmail_raw_query
             return [
                 MailMessage(
                     id="older", thread_id="t-old", subject="Verify your email",
@@ -172,14 +173,58 @@ def test_watch_gmail_for_auth_code_picks_newest_recent_match(monkeypatch):
     assert match.candidate.value == "222222"
 
 
+def test_watch_rejects_prechallenge_and_wrong_provider_messages(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
+            assert "verification" in gmail_raw_query
+            return [
+                MailMessage(
+                    id="stale-greenhouse", thread_id="1", subject="Verify your email",
+                    sender="no-reply@greenhouse.io", date=_rfc(now - dt.timedelta(minutes=2)),
+                    body="Use verification code 111111 to continue.",
+                ),
+                MailMessage(
+                    id="fresh-workday", thread_id="2", subject="Verify your email",
+                    sender="no-reply@workday.com", date=_rfc(now + dt.timedelta(seconds=5)),
+                    body="Use verification code 222222 to continue.",
+                ),
+                MailMessage(
+                    id="fresh-greenhouse", thread_id="3", subject="Verify your email",
+                    sender="no-reply@greenhouse-mail.io", date=_rfc(now + dt.timedelta(seconds=10)),
+                    body="Use verification code 333333 to continue.",
+                ),
+            ]
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _FakeSource()
+    )
+
+    match = inbox_auth.watch_gmail_for_auth_code(
+        not_before=now,
+        provider_domain="greenhouse.io",
+        timeout_seconds=1,
+        poll_seconds=0,
+        max_errors=1,
+        minutes=15,
+        max_messages=1000,
+    )
+
+    assert match is not None
+    assert match.message_id == "fresh-greenhouse"
+    assert match.candidate.value == "333333"
+
+
 def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
     """service=None -> resolves via get_mail_source().fetch(...) then scans."""
     seen = {}
 
     class _FakeSource:
-        def fetch(self, *, since_days, max_messages):
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
             seen["since_days"] = since_days
             seen["max_messages"] = max_messages
+            seen["gmail_raw_query"] = gmail_raw_query
             return [
                 MailMessage(
                     id="m3", thread_id="t3", subject="Verify your email",
@@ -200,6 +245,7 @@ def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
     assert match.candidate.value == "654321"
     assert seen["max_messages"] == 25
     assert seen["since_days"] == 1
+    assert "verification" in seen["gmail_raw_query"]
 
 
 def test_answer_pending_defaults_to_mail_source(monkeypatch):

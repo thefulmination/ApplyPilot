@@ -67,6 +67,32 @@ def _make_payload(subject: str, sender: str, body: str, *, date: str | None = No
     }
 
 
+def _auth_match(
+    message_id: str,
+    received_at: dt.datetime,
+    *,
+    sender: str = "no-reply@greenhouse-mail.io",
+    kind: str = "code",
+    value: str = "123456",
+) -> inbox_auth.AuthEmailMatch:
+    candidate = inbox_auth.VerificationCandidate(
+        kind=kind,
+        value=value,
+        confidence="high",
+        reasons=("test",),
+    )
+    return inbox_auth.AuthEmailMatch(
+        message_id=message_id,
+        thread_id=None,
+        sender=sender,
+        subject="Verify your email",
+        received_at=_rfc(received_at),
+        snippet="",
+        candidate=candidate,
+        reasons=candidate.reasons,
+    )
+
+
 def _build_service(messages_by_poll, message_payloads):
     batches = messages_by_poll
     if batches and isinstance(batches[0], dict):
@@ -75,6 +101,46 @@ def _build_service(messages_by_poll, message_payloads):
         batches,
         message_payloads,
     )
+
+
+def test_provider_matching_accepts_groups_and_rejects_unrelated_or_missing_evidence():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    grouped = _auth_match("grouped", now)
+    unrelated = _auth_match("unrelated", now, sender="no-reply@workday.com")
+    no_evidence = _auth_match("missing", now, sender="")
+    magic_link = _auth_match(
+        "magic",
+        now,
+        sender="",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert inbox_auth.domains_related("jobs.greenhouse.io", "greenhouse-mail.io")
+    assert not inbox_auth.domains_related("greenhouse.io", "workday.com")
+    assert inbox_auth.match_belongs_to_provider(grouped, "greenhouse.io")
+    assert not inbox_auth.match_belongs_to_provider(unrelated, "greenhouse.io")
+    assert not inbox_auth.match_belongs_to_provider(no_evidence, "greenhouse.io")
+    assert inbox_auth.match_belongs_to_provider(magic_link, "greenhouse.io")
+
+
+def test_eligible_auth_matches_applies_exclusions_and_sixty_second_skew_in_order():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    matches = [
+        _auth_match("outside", now - dt.timedelta(seconds=61)),
+        _auth_match("inside", now - dt.timedelta(seconds=60)),
+        _auth_match("excluded", now + dt.timedelta(seconds=1)),
+        _auth_match("fresh", now + dt.timedelta(seconds=2)),
+    ]
+
+    eligible = inbox_auth.eligible_auth_matches(
+        matches,
+        not_before=now.replace(tzinfo=None),
+        provider_domain="greenhouse.io",
+        excluded_message_ids={"excluded"},
+    )
+
+    assert [match.message_id for match in eligible] == ["inside", "fresh"]
 
 
 def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():

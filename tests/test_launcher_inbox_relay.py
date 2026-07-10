@@ -1,4 +1,6 @@
 """Launcher relay mode returns the standard hint via the fleet, not local Gmail."""
+from datetime import datetime, timezone
+
 from applypilot.apply import launcher
 from applypilot.fleet import otp_relay
 
@@ -127,3 +129,31 @@ def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypat
 def test_local_mode_unchanged_when_disabled(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_INBOX_AUTH", raising=False)  # disabled entirely
     assert launcher._poll_inbox_auth_hint({"url": "j", "application_url": "https://greenhouse.io/a"}) is None
+
+
+def test_local_mode_passes_request_context_and_busy_inbox_default(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "local")
+    monkeypatch.delenv("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", raising=False)
+    seen = {}
+
+    monkeypatch.setattr(launcher.inbox_auth, "create_auth_challenge", lambda **_kw: 42)
+    monkeypatch.setattr(launcher.inbox_auth, "set_auth_challenge_status", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "mark_auth_challenge_attempt", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "expire_stale_challenges", lambda: 0)
+
+    def fake_watch(**kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(launcher.inbox_auth, "watch_gmail_for_auth_code", fake_watch)
+    before = datetime.now(timezone.utc)
+
+    assert launcher._poll_inbox_auth_hint(
+        {"url": "j", "application_url": "https://boards.greenhouse.io/a"}
+    ) is None
+
+    assert seen["max_messages"] == 1000
+    assert seen["provider_domain"] == "boards.greenhouse.io"
+    assert seen["not_before"] >= before
+    assert seen["not_before"].tzinfo is timezone.utc

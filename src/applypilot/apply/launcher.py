@@ -2202,7 +2202,7 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
         max_errors = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_ERRORS", "3"))
         minutes = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MINUTES", "15"))
-        max_messages = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "25"))
+        max_messages = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "1000"))
         challenge_type = os.environ.get("APPLYPILOT_INBOX_AUTH_CHALLENGE_TYPE", "email_code").strip().lower()
         if challenge_type not in {"email_code", "magic_link"}:
             logger.debug(
@@ -2210,6 +2210,7 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
                 challenge_type,
             )
             challenge_type = "email_code"
+        challenge_started_at = datetime.now(timezone.utc)
         challenge_id = inbox_auth.create_auth_challenge(
             job_url=job["url"],
             application_url=apply_target,
@@ -2226,6 +2227,8 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
             max_errors=max_errors,
             minutes=minutes,
             max_messages=max_messages,
+            not_before=challenge_started_at,
+            provider_domain=provider,
         )
         if not match:
             return None

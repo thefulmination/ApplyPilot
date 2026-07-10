@@ -13,9 +13,17 @@ class _Cand:
 
 
 class _Match:
-    def __init__(self, message_id, received_at, value, kind="code"):
+    def __init__(
+        self,
+        message_id,
+        received_at,
+        value,
+        kind="code",
+        sender="Greenhouse <no-reply@greenhouse-mail.io>",
+    ):
         self.message_id = message_id
         self.received_at = received_at  # RFC2822 string
+        self.sender = sender
         self.candidate = _Cand(value, kind)
 
 

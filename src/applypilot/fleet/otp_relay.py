@@ -19,16 +19,6 @@ from applypilot import inbox_auth
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
 _DEFAULT_SCAN_MAX_MESSAGES = 1000
 
-_PROVIDER_DOMAIN_GROUPS = (
-    ("oraclecloud.com", "oracle.com", "taleo.net"),
-    ("myworkdayjobs.com", "myworkdaysite.com", "workdayjobs.com", "workday.com"),
-    ("greenhouse.io", "greenhouse-mail.io"),
-    ("adp.com", "workforcenow.adp.com"),
-    ("amazon.jobs", "jobs.amazon.com"),
-    ("eightfold.ai",),
-)
-
-
 @dataclass(frozen=True)
 class RelayCode:
     value: str
@@ -39,46 +29,8 @@ def _apply_domain(application_url: str) -> str:
     return (urlparse(application_url or "").hostname or "").lower()
 
 
-def _normalize_domain(domain: str | None) -> str:
-    return (domain or "").strip().lower().strip(".")
-
-
-def _domain_related(left: str, right: str) -> bool:
-    left = _normalize_domain(left)
-    right = _normalize_domain(right)
-    if not left or not right:
-        return False
-    if left == right or left.endswith(f".{right}") or right.endswith(f".{left}"):
-        return True
-    for group in _PROVIDER_DOMAIN_GROUPS:
-        if any(left == d or left.endswith(f".{d}") for d in group) and any(
-            right == d or right.endswith(f".{d}") for d in group
-        ):
-            return True
-    return False
-
-
-def _candidate_url_domain(match) -> str:
-    candidate = getattr(match, "candidate", None)
-    if getattr(candidate, "kind", None) != "magic_link":
-        return ""
-    return _apply_domain(getattr(candidate, "value", "") or "")
-
-
 def _match_belongs_to_request(sender_hint: str | None, match) -> bool:
-    hint = _normalize_domain(sender_hint)
-    if not hint:
-        return True
-    evidence = [
-        inbox_auth.sender_domain(getattr(match, "sender", "") or ""),
-        _candidate_url_domain(match),
-    ]
-    evidence = [d for d in evidence if d]
-    if not evidence:
-        # Older unit-test doubles predate sender/link metadata. Production matches always
-        # carry sender, so keep legacy doubles from becoming unrelated failures.
-        return True
-    return any(_domain_related(hint, domain) for domain in evidence)
+    return inbox_auth.match_belongs_to_provider(match, sender_hint)
 
 
 def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
