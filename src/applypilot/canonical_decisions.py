@@ -66,6 +66,20 @@ _RELEASE_GATES = (
     "queue_provenance_failures",
     "title_only_promotions",
 )
+_APPLY_REQUIRED_COLUMNS = (
+    "qualification_score",
+    "preference_score",
+    "outcome_score",
+    "final_score",
+    "confidence",
+    "requirements_json",
+    "blockers_json",
+    "evidence_node_ids_json",
+    "uncertainty_json",
+    "explanation",
+    "created_at",
+    "expires_at",
+)
 
 
 @contextmanager
@@ -95,17 +109,42 @@ def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    normalized = _normalize_timestamp(datetime.now(timezone.utc), field="timestamp")
+    assert normalized is not None
+    return normalized
+
+
+def _normalize_timestamp(
+    value: Any | None, *, field: str, allow_none: bool = False
+) -> str | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{field} is required")
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+    else:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include a timezone")
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _timestamp(value: Any | None) -> str:
     if value is None:
         return _utc_now()
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    return str(value)
+    normalized = _normalize_timestamp(value, field="now")
+    assert normalized is not None
+    return normalized
 
 
 def _dict_row(cursor: sqlite3.Cursor, row: Any | None) -> dict[str, Any] | None:
@@ -148,6 +187,41 @@ def _assert_equal(
         )
 
 
+def _prepare_decision(row: Mapping[str, Any]) -> dict[str, Any]:
+    proposed = _complete_row(row, _DECISION_COLUMNS)
+    proposed["created_at"] = _normalize_timestamp(
+        proposed["created_at"], field="created_at"
+    )
+    proposed["expires_at"] = _normalize_timestamp(
+        proposed["expires_at"], field="expires_at", allow_none=True
+    )
+    if proposed["action"] == "apply":
+        missing = [column for column in _APPLY_REQUIRED_COLUMNS if proposed[column] is None]
+        if missing:
+            raise PolicyValidationError(
+                f"apply decision missing required fields: {', '.join(missing)}"
+            )
+    return proposed
+
+
+def _should_project(
+    current_decision_id: Any | None,
+    current_decided_at: Any | None,
+    proposed: Mapping[str, Any],
+) -> bool:
+    if current_decision_id is None or current_decided_at is None:
+        return True
+    current_timestamp = _normalize_timestamp(
+        current_decided_at, field="canonical_decided_at"
+    )
+    proposed_timestamp = proposed["created_at"]
+    assert current_timestamp is not None
+    return proposed_timestamp > current_timestamp or (
+        proposed_timestamp == current_timestamp
+        and str(proposed["decision_id"]) > str(current_decision_id)
+    )
+
+
 def create_draft_policy(conn: sqlite3.Connection, row: Mapping[str, Any]) -> None:
     """Insert one lane-scoped draft policy, idempotently when fully identical."""
     if row.get("status", "draft") != "draft":
@@ -179,7 +253,7 @@ def create_draft_policy(conn: sqlite3.Connection, row: Mapping[str, Any]) -> Non
 
 def insert_decisions(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]]) -> int:
     """Insert immutable decisions and update their job projections atomically."""
-    proposed_rows = [_complete_row(row, _DECISION_COLUMNS) for row in rows]
+    proposed_rows = [_prepare_decision(row) for row in rows]
     inserted = 0
 
     with _transaction(conn):
@@ -219,25 +293,33 @@ def insert_decisions(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]]
             )
             inserted += 1
 
-            conn.execute(
-                """
-                UPDATE jobs
-                SET canonical_decision_id = ?,
-                    canonical_policy_version = ?,
-                    canonical_action = ?,
-                    canonical_score = ?,
-                    canonical_decided_at = ?
-                WHERE url = ?
-                """,
-                (
-                    proposed["decision_id"],
-                    proposed["policy_version"],
-                    proposed["action"],
-                    proposed["final_score"],
-                    proposed["created_at"],
-                    proposed["job_url"],
-                ),
-            )
+            current_projection = conn.execute(
+                "SELECT canonical_decision_id, canonical_decided_at "
+                "FROM jobs WHERE url = ?",
+                (proposed["job_url"],),
+            ).fetchone()
+            if _should_project(
+                current_projection[0], current_projection[1], proposed
+            ):
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET canonical_decision_id = ?,
+                        canonical_policy_version = ?,
+                        canonical_action = ?,
+                        canonical_score = ?,
+                        canonical_decided_at = ?
+                    WHERE url = ?
+                    """,
+                    (
+                        proposed["decision_id"],
+                        proposed["policy_version"],
+                        proposed["action"],
+                        proposed["final_score"],
+                        proposed["created_at"],
+                        proposed["job_url"],
+                    ),
+                )
 
     return inserted
 
@@ -411,7 +493,20 @@ def eligible_decision(
           AND p.status IN ('canary', 'active')
           AND d.action = 'apply'
           AND d.qualification_verdict = 'qualified'
-          AND (d.expires_at IS NULL OR julianday(d.expires_at) > julianday(?))
+          AND d.qualification_score IS NOT NULL
+          AND d.preference_score IS NOT NULL
+          AND d.outcome_score IS NOT NULL
+          AND d.final_score IS NOT NULL
+          AND d.confidence IS NOT NULL
+          AND d.requirements_json IS NOT NULL
+          AND d.blockers_json IS NOT NULL
+          AND d.evidence_node_ids_json IS NOT NULL
+          AND d.uncertainty_json IS NOT NULL
+          AND d.explanation IS NOT NULL
+          AND d.created_at IS NOT NULL
+          AND julianday(d.created_at) IS NOT NULL
+          AND d.expires_at IS NOT NULL
+          AND julianday(d.expires_at) > julianday(?)
         """,
         (job_url, lane, lane, _timestamp(now)),
     )

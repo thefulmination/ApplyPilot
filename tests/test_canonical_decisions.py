@@ -9,7 +9,7 @@ from applypilot import canonical_decisions as repo
 from applypilot import database
 
 
-NOW = "2026-07-10T12:00:00Z"
+NOW = "2026-07-10T12:00:00.000000Z"
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def decision(
         "explanation": "Evidence-backed match",
         "input_hash": f"hash-{decision_id}",
         "created_at": NOW,
-        "expires_at": "2026-07-11T12:00:00Z",
+        "expires_at": "2026-07-11T12:00:00.000000Z",
     }
 
 
@@ -133,6 +133,49 @@ def test_identical_decision_replay_does_not_revert_newer_projection(conn) -> Non
         "SELECT canonical_decision_id, canonical_score FROM jobs WHERE url = 'u1'"
     ).fetchone()
     assert tuple(projection) == ("d2", newer["final_score"])
+
+
+def test_older_apply_cannot_replace_newer_reject_or_become_eligible(conn) -> None:
+    prepare_policy(conn)
+    validate(conn)
+    repo.activate_policy(conn, "p1", lane="ats")
+    newer_reject = decision("d2", action="reject", verdict="unqualified") | {
+        "created_at": "2026-07-10T12:00:02-04:00",
+        "expires_at": None,
+    }
+    older_apply = decision() | {"created_at": "2026-07-10T15:59:59Z"}
+
+    repo.insert_decisions(conn, [newer_reject])
+    repo.insert_decisions(conn, [older_apply])
+
+    projection = conn.execute(
+        "SELECT canonical_decision_id, canonical_action, canonical_decided_at "
+        "FROM jobs WHERE url = 'u1'"
+    ).fetchone()
+    assert tuple(projection) == (
+        "d2",
+        "reject",
+        "2026-07-10T16:00:02.000000Z",
+    )
+    assert repo.eligible_decision(
+        conn,
+        "u1",
+        lane="ats",
+        now="2026-07-10T15:30:00Z",
+    ) is None
+
+
+@pytest.mark.parametrize("arrival_order", [("d2", "d1"), ("d1", "d2")])
+def test_equal_timestamp_projection_uses_decision_id_tie_break(conn, arrival_order) -> None:
+    prepare_policy(conn)
+    rows = {decision_id: decision(decision_id) for decision_id in arrival_order}
+
+    for decision_id in arrival_order:
+        repo.insert_decisions(conn, [rows[decision_id]])
+
+    assert conn.execute(
+        "SELECT canonical_decision_id FROM jobs WHERE url = 'u1'"
+    ).fetchone()[0] == "d2"
 
 
 def test_canonical_identity_conflict_raises_repository_exception(conn) -> None:
@@ -374,6 +417,78 @@ def test_eligible_decision_accepts_canary_policy(conn) -> None:
     repo.insert_decisions(conn, [decision()])
 
     assert repo.eligible_decision(conn, "u1", lane="ats", now=NOW)["decision_id"] == "d1"
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "qualification_score",
+        "preference_score",
+        "outcome_score",
+        "final_score",
+        "confidence",
+        "requirements_json",
+        "blockers_json",
+        "evidence_node_ids_json",
+        "uncertainty_json",
+        "explanation",
+        "created_at",
+        "expires_at",
+    ),
+)
+def test_insert_rejects_incomplete_apply_decision(conn, missing_field) -> None:
+    prepare_policy(conn)
+    incomplete = decision()
+    incomplete.pop(missing_field)
+
+    with pytest.raises((repo.PolicyValidationError, ValueError)):
+        repo.insert_decisions(conn, [incomplete])
+
+    assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT canonical_decision_id FROM jobs WHERE url = 'u1'"
+    ).fetchone()[0] is None
+
+
+@pytest.mark.parametrize(
+    "timestamp_change",
+    (
+        {"created_at": "2026-07-10T12:00:00"},
+        {"expires_at": "not-a-timestamp"},
+    ),
+)
+def test_insert_rejects_unorderable_decision_timestamps(conn, timestamp_change) -> None:
+    prepare_policy(conn)
+
+    with pytest.raises(ValueError):
+        repo.insert_decisions(conn, [decision() | timestamp_change])
+
+    assert conn.execute("SELECT COUNT(*) FROM job_decisions").fetchone()[0] == 0
+
+
+def test_incomplete_persisted_apply_decision_is_not_eligible(conn) -> None:
+    prepare_policy(conn)
+    validate(conn)
+    repo.activate_policy(conn, "p1", lane="ats")
+    incomplete = decision()
+    incomplete["confidence"] = None
+    columns = tuple(incomplete)
+    conn.execute(
+        f"INSERT INTO job_decisions ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        tuple(incomplete[column] for column in columns),
+    )
+    conn.execute(
+        """
+        UPDATE jobs
+        SET canonical_decision_id = ?, canonical_policy_version = ?,
+            canonical_action = ?, canonical_score = ?, canonical_decided_at = ?
+        WHERE url = ?
+        """,
+        ("d1", "p1", "apply", 0.81, NOW, "u1"),
+    )
+
+    assert repo.eligible_decision(conn, "u1", lane="ats", now=NOW) is None
 
 
 @pytest.mark.parametrize(
