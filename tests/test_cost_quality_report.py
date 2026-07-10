@@ -406,6 +406,11 @@ def test_render_report_includes_append_only_route_table():
     assert "## Result Event Routes" in rendered
     assert "Append-only result events" in rendered
     assert "not the canonical queue all-in denominator" in rendered
+    assert (
+        "Applied and Cost/applied are applied event-row counts and cost per "
+        "applied event, not distinct applications."
+        in rendered
+    )
     assert "| Route | Events | Applied | Cost | Cost/applied |" in rendered
     assert "| agent | 2 | 1 | $0.7500 | $0.7500 |" in rendered
     assert "| preflight | 4 | 0 | $0.0000 | n/a |" in rendered
@@ -432,6 +437,97 @@ def test_render_report_includes_na_route_row_when_no_events_exist():
         routes=RouteSummary(),
     )
 
+    rendered = render_report_markdown(report)
+
+    disclaimer = (
+        "No result events recorded; the placeholder row below is not an observation."
+    )
+    placeholder = "| n/a | 0 | 0 | $0.0000 | n/a |"
+    assert disclaimer in rendered
+    assert placeholder in rendered
+    assert rendered.index(disclaimer) < rendered.index(placeholder)
+
+
+def test_render_report_escapes_untrusted_route_labels_for_markdown():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(
+            by_route={
+                "pipe|route": CountCost(count=1),
+                "line\r\nbreak": CountCost(count=2),
+                r"back\slash": CountCost(count=3),
+                "[bold red]route[/bold red]": CountCost(count=4),
+            }
+        ),
+    )
+
+    rendered = render_report_markdown(report)
+
+    assert "| pipe\\|route | 1 | 0 | $0.0000 | n/a |" in rendered
+    assert "| line break | 2 | 0 | $0.0000 | n/a |" in rendered
+    assert r"| back\\slash | 3 | 0 | $0.0000 | n/a |" in rendered
+    assert "| [bold red]route[/bold red] | 4 | 0 | $0.0000 | n/a |" in rendered
+    assert "line\r" not in rendered
+    assert "line\n" not in rendered
+
+
+def test_render_report_sorts_route_rows_by_raw_route_label():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(
+            by_route={
+                "zeta": CountCost(count=1),
+                "agent": CountCost(count=2),
+                "preflight": CountCost(count=3),
+            }
+        ),
+    )
+
+    rendered = render_report_markdown(report)
+    rows = [
+        line
+        for line in rendered.splitlines()
+        if line.startswith(("| agent ", "| preflight ", "| zeta "))
+    ]
+
+    assert rows == [
+        "| agent | 2 | 0 | $0.0000 | n/a |",
+        "| preflight | 3 | 0 | $0.0000 | n/a |",
+        "| zeta | 1 | 0 | $0.0000 | n/a |",
+    ]
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf")])
+def test_render_report_marks_non_finite_route_costs_unavailable(cost):
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(
+            by_route={"agent": CountCost(count=1, applied=1, cost=cost)}
+        ),
+    )
+
+    assert "| agent | 1 | 1 | n/a | n/a |" in render_report_markdown(report)
+
+
+def test_render_report_preserves_finite_zero_and_large_route_costs():
+    report = CostQualityReport(
+        fleet=FleetQueueSummary(),
+        local=LocalJobsSummary(),
+        routes=RouteSummary(
+            by_route={
+                "zero": CountCost(count=1, applied=1, cost=0),
+                "large": CountCost(count=1, applied=1, cost=1_000_000_000.25),
+            }
+        ),
+    )
+
+    rendered = render_report_markdown(report)
+
+    assert "| zero | 1 | 1 | $0.0000 | $0.0000 |" in rendered
     assert (
-        "| n/a | 0 | 0 | $0.0000 | n/a |" in render_report_markdown(report)
+        "| large | 1 | 1 | $1000000000.2500 | $1000000000.2500 |"
+        in rendered
     )

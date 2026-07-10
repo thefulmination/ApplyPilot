@@ -5,6 +5,7 @@ their behavior stays independent from the live database fetch helpers below.
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from dataclasses import dataclass, field
@@ -305,9 +306,14 @@ def build_report(
 
 
 def _fmt_money(value: float | None) -> str:
-    if value is None:
+    if value is None or not math.isfinite(value):
         return "n/a"
     return f"${value:.4f}"
+
+
+def _escape_markdown_table_cell(value: str) -> str:
+    normalized = value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return normalized.replace("\\", "\\\\").replace("|", "\\|")
 
 
 def render_report_markdown(report: CostQualityReport) -> str:
@@ -387,6 +393,7 @@ def render_report_markdown(report: CostQualityReport) -> str:
             "## Result Event Routes",
             "",
             "Append-only result events; this table is not the canonical queue all-in denominator.",
+            "Applied and Cost/applied are applied event-row counts and cost per applied event, not distinct applications.",
             "",
         ]
     )
@@ -401,13 +408,17 @@ def render_report_markdown(report: CostQualityReport) -> str:
                 "| --- | ---: | ---: | ---: | ---: |",
             ]
         )
-        for route, item in report.routes.by_route.items():
+        for route, item in sorted(report.routes.by_route.items()):
             lines.append(
-                f"| {route} | {item.count} | {item.applied} | "
+                f"| {_escape_markdown_table_cell(route)} | {item.count} | "
+                f"{item.applied} | "
                 f"{_fmt_money(item.cost)} | "
                 f"{_fmt_money(item.cost_per_applied) if item.applied else 'n/a'} |"
             )
         if not report.routes.by_route:
+            lines.append(
+                "No result events recorded; the placeholder row below is not an observation."
+            )
             lines.append("| n/a | 0 | 0 | $0.0000 | n/a |")
 
     return "\n".join(lines) + "\n"

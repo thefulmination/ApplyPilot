@@ -709,7 +709,7 @@ def apply_cost_report_command(
     from applypilot.fleet.cost_quality_report import build_report, render_report_markdown
 
     report = build_report(pg_dsn=pg_dsn, sqlite_path=sqlite_path)
-    console.print(render_report_markdown(report))
+    console.print(render_report_markdown(report), markup=False)
 
 
 @app.command("apply-failures")

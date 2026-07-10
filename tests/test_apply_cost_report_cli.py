@@ -69,3 +69,31 @@ def test_apply_cost_report_command_forwards_paths(monkeypatch):
         "pg_dsn": "postgres://fleet",
         "sqlite_path": "C:/tmp/applypilot.db",
     }
+
+
+def test_apply_cost_report_command_disables_rich_markup(monkeypatch):
+    runner = CliRunner()
+    report = CostQualityReport(fleet=FleetQueueSummary(), local=LocalJobsSummary())
+    print_calls = []
+
+    monkeypatch.setattr("applypilot.config.load_env", lambda: None)
+    monkeypatch.setattr(
+        "applypilot.fleet.cost_quality_report.build_report",
+        lambda pg_dsn=None, sqlite_path=None: report,
+    )
+    monkeypatch.setattr(
+        "applypilot.fleet.cost_quality_report.render_report_markdown",
+        lambda r: "[bold red]database route[/bold red]",
+    )
+    monkeypatch.setattr(
+        cli.console,
+        "print",
+        lambda value, **kwargs: print_calls.append((value, kwargs)),
+    )
+
+    result = runner.invoke(cli.app, ["apply-cost-report"])
+
+    assert result.exit_code == 0
+    assert print_calls == [
+        ("[bold red]database route[/bold red]", {"markup": False})
+    ]
