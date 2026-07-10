@@ -184,7 +184,9 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id: "code=246810\nsource=fleet_relay" if request_id == 42 else None,
+        lambda request_id, *, timeout_seconds: (
+            "code=246810\nsource=fleet_relay" if request_id == 42 else None
+        ),
     )
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
@@ -212,3 +214,47 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
     assert calls == [None, "code=246810\nsource=fleet_relay"]
     assert out["run_status"] == "applied"
     assert cleaned == [(3, proc)]
+
+
+def test_auth_required_reuses_prearmed_request_for_full_bounded_wait(monkeypatch):
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    hint = "code=246810\nsource=fleet_relay"
+    consume_calls = []
+    run_calls = []
+    monotonic_values = iter((100.0, 145.0))
+
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT", "45")
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+    monkeypatch.setattr(awm.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
+    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher,
+        "_poll_inbox_auth_hint",
+        lambda job: (_ for _ in ()).throw(AssertionError("must reuse prearmed request")),
+    )
+
+    def fake_consume(request_id, *, timeout_seconds):
+        consume_calls.append((request_id, timeout_seconds))
+        return None if len(consume_calls) == 1 else hint
+
+    def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
+        run_calls.append(inbox_auth_hint)
+        return ("auth_required", 1.0) if len(run_calls) == 1 else ("applied", 1.0)
+
+    monkeypatch.setattr(launcher, "_consume_prearmed_inbox_auth_hint", fake_consume)
+    monkeypatch.setattr(launcher, "run_job", fake_run_job)
+    monkeypatch.setattr(launcher, "_last_run_stats", {3: {}}, raising=False)
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=3)({"url": "https://example.test/job"})
+
+    assert [request_id for request_id, _ in consume_calls] == [73, 73]
+    assert sum(timeout for _, timeout in consume_calls) <= 300
+    assert run_calls == [None, hint]
+    assert out["run_status"] == "applied"

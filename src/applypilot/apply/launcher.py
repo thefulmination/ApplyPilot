@@ -2088,10 +2088,12 @@ def _prearm_inbox_auth_request(job: dict) -> int | None:
         if not dsn:
             return None
         worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
-        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
-        agent_timeout = int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT", str(AGENT_TIMEOUT_SECONDS)))
-        postrun_timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or "45")
-        ttl_seconds = max(timeout, agent_timeout + postrun_timeout)
+        timeout = max(1, int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT") or 300))
+        agent_timeout = max(
+            1,
+            int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or AGENT_TIMEOUT_SECONDS),
+        )
+        ttl_seconds = agent_timeout + timeout
         apply_target = job.get("application_url") or job["url"]
         with pgqueue.connect(dsn) as conn:
             return otp_relay.request_code(

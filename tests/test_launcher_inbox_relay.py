@@ -81,7 +81,7 @@ def test_prearm_request_ttl_covers_agent_run_plus_postrun_poll(monkeypatch):
         "url": "j",
         "application_url": "https://greenhouse.io/a",
     }) == 12
-    assert seen["ttl_seconds"] >= 645
+    assert seen["ttl_seconds"] >= 900
 
 
 def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypatch):

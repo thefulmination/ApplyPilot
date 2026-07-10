@@ -231,9 +231,26 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 or _browser_tool_retryable(status)
                 or _prearmed_auth_retryable(status)
             ):
-                inbox_hint = launcher._consume_prearmed_inbox_auth_hint(prearmed_request_id)
+                total_timeout = max(
+                    0,
+                    int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT") or 300),
+                )
+                postrun_timeout = max(
+                    0,
+                    int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or 45),
+                )
+                wait_started = time.monotonic()
+                inbox_hint = launcher._consume_prearmed_inbox_auth_hint(
+                    prearmed_request_id,
+                    timeout_seconds=min(total_timeout, postrun_timeout),
+                )
                 if not inbox_hint and launcher._is_auth_required_result(status):
-                    inbox_hint = launcher._poll_inbox_auth_hint(job)
+                    elapsed = time.monotonic() - wait_started
+                    remaining = max(0, int(total_timeout - elapsed))
+                    inbox_hint = launcher._consume_prearmed_inbox_auth_hint(
+                        prearmed_request_id,
+                        timeout_seconds=remaining,
+                    )
                 if inbox_hint:
                     status, _dur = launcher.run_job(
                         job,
