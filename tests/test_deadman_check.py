@@ -13,11 +13,12 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import deadman
-from applypilot import mail_source as deadman_mail_source
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import deadman  # noqa: E402
+from applypilot import mail_source as deadman_mail_source  # noqa: E402
 
 NOW = dt.datetime(2026, 7, 3, 12, 0, 0, tzinfo=dt.timezone.utc)
+_DEFAULT = object()
 
 
 def _arm(cur):
@@ -54,6 +55,35 @@ def _llm_usage(cur, cost_usd, ts=None):
 def _doctor_pass(cur, ts):
     # The Fleet Doctor stamps fleet_config.doctor_last_pass_at each pass (its liveness signal).
     cur.execute("UPDATE fleet_config SET doctor_last_pass_at=%s WHERE id=1;", (ts,))
+
+
+def _otp_request(
+    cur,
+    *,
+    requested_at=_DEFAULT,
+    expires_at=_DEFAULT,
+    wait_started_at=None,
+    code=None,
+    consumed_at=None,
+    worker_id="test-worker",
+    url="https://example.com/job",
+    sender_hint="example.com",
+):
+    cur.execute(
+        "INSERT INTO otp_request "
+        "(worker_id, url, sender_hint, requested_at, expires_at, wait_started_at, code, consumed_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            worker_id,
+            url,
+            sender_hint,
+            NOW - dt.timedelta(minutes=5) if requested_at is _DEFAULT else requested_at,
+            NOW + dt.timedelta(minutes=5) if expires_at is _DEFAULT else expires_at,
+            wait_started_at,
+            code,
+            consumed_at,
+        ),
+    )
 
 
 def _kinds(alerts):
@@ -545,6 +575,181 @@ def test_otp_relay_unknown_token_no_responder_does_not_alarm(fleet_db):
         alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=None)
 
     assert "otp_relay_down" not in _kinds(alerts)
+
+
+def test_otp_relay_down_when_active_wait_has_no_responder_heartbeat(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _otp_request(cur, wait_started_at=NOW - dt.timedelta(seconds=10))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" in _kinds(alerts)
+
+
+def test_otp_delivery_stalled_when_active_wait_exceeds_threshold(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_OTP_STALL_SECONDS", "120")
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(seconds=10))
+            _otp_request(cur, wait_started_at=NOW - dt.timedelta(seconds=121))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_delivery_stalled" in _kinds(alerts)
+
+
+def test_prearmed_otp_request_does_not_require_responder_heartbeat(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _otp_request(cur, wait_started_at=None)
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" not in _kinds(alerts)
+    assert "otp_delivery_stalled" not in _kinds(alerts)
+
+
+@pytest.mark.parametrize(
+    ("requested_at", "expires_at"),
+    [
+        (NOW + dt.timedelta(seconds=1), NOW + dt.timedelta(minutes=5)),
+        (NOW - dt.timedelta(minutes=5), NOW),
+        (NOW - dt.timedelta(minutes=5), None),
+    ],
+)
+def test_inactive_otp_rows_do_not_create_demand(fleet_db, requested_at, expires_at):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _otp_request(
+                cur,
+                requested_at=requested_at,
+                expires_at=expires_at,
+                wait_started_at=NOW - dt.timedelta(minutes=10),
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" not in _kinds(alerts)
+    assert "otp_delivery_stalled" not in _kinds(alerts)
+
+
+@pytest.mark.parametrize(
+    ("code", "consumed_at"),
+    [("123456", None), (None, NOW - dt.timedelta(seconds=1))],
+)
+def test_answered_or_consumed_otp_rows_do_not_create_demand(
+    fleet_db, code, consumed_at
+):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _otp_request(
+                cur,
+                wait_started_at=NOW - dt.timedelta(minutes=10),
+                code=code,
+                consumed_at=consumed_at,
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" not in _kinds(alerts)
+    assert "otp_delivery_stalled" not in _kinds(alerts)
+
+
+def test_otp_stall_exact_threshold_does_not_alert(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_OTP_STALL_SECONDS", "120")
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(seconds=10))
+            _otp_request(cur, wait_started_at=NOW - dt.timedelta(seconds=120))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_delivery_stalled" not in _kinds(alerts)
+
+
+def test_otp_stall_just_over_exact_threshold_alerts(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_OTP_STALL_SECONDS", "120")
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(seconds=10))
+            _otp_request(
+                cur,
+                wait_started_at=NOW - dt.timedelta(seconds=120, microseconds=1),
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_delivery_stalled" in _kinds(alerts)
+
+
+def test_otp_stall_threshold_is_clamped_to_minimum(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_OTP_STALL_SECONDS", "5")
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(seconds=10))
+            _otp_request(cur, wait_started_at=NOW - dt.timedelta(seconds=31))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_delivery_stalled" in _kinds(alerts)
+
+
+def test_invalid_otp_stall_threshold_uses_default(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_OTP_STALL_SECONDS", "invalid")
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(seconds=10))
+            _otp_request(cur, wait_started_at=NOW - dt.timedelta(seconds=121))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_delivery_stalled" in _kinds(alerts)
+
+
+def test_active_wait_with_stale_responder_alerts_relay_down(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _heartbeat(cur, "otp_responder", NOW - dt.timedelta(minutes=40))
+            _otp_request(cur, wait_started_at=NOW - dt.timedelta(seconds=10))
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    assert "otp_relay_down" in _kinds(alerts)
+
+
+def test_otp_alert_details_do_not_expose_request_secrets(fleet_db):
+    secrets = {
+        "worker_id": "secret-worker-id",
+        "url": "https://secret.example/private-job?token=credential",
+        "sender_hint": "secret-sender.example",
+    }
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _otp_request(
+                cur,
+                wait_started_at=NOW - dt.timedelta(seconds=10),
+                **secrets,
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW, gmail_token_ok=True)
+
+    detail = " ".join(
+        alert.detail for alert in alerts if alert.kind.startswith("otp_")
+    )
+    assert detail
+    assert all(secret not in detail for secret in secrets.values())
 
 
 # ---------------------------------------------------------------------------
