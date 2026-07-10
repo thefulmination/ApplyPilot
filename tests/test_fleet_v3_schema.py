@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import schema as fleet_schema
 
@@ -105,6 +107,56 @@ def test_apply_queue_v3_columns(fleet_db):
         cols = {r["column_name"] for r in cur.fetchall()}
     for c in ("worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch"):
         assert c in cols, f"apply_queue missing {c}"
+
+
+def test_apply_result_events_include_cost_router_metadata(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='apply_result_events'"
+        )
+        cols = {r["column_name"] for r in cur.fetchall()}
+
+    assert "route" in cols
+    assert "failure_class" in cols
+    assert "tool_calls_total" in cols
+    assert "application_tool_calls" in cols
+    assert "last_tool" in cols
+    assert "host_policy" in cols
+    assert "result_metadata" in cols
+    assert "job_log_path" in cols
+    assert "transcript_digest" in cols
+    assert "final_result_source" in cols
+
+
+def test_apply_worker_schema_check_passes_with_current_schema(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.require_apply_result_event_schema(conn)
+
+
+def test_apply_worker_schema_check_reports_missing_columns():
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchall(self):
+            return [{"column_name": "url"}, {"column_name": "status"}]
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def rollback(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="apply_result_events.*route"):
+        fleet_schema.require_apply_result_event_schema(_Conn())
 
 
 def test_linkedin_queue_freshness_columns(fleet_db):

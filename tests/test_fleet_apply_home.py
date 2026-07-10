@@ -249,6 +249,30 @@ def test_push_home_survives_inbox_outcomes_failure(fleet_db, tmp_path, monkeypat
     assert n == 0  # no eligible jobs staged; the point is it didn't raise
 
 
+def test_apply_home_main_ensures_schema_before_command(monkeypatch):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.fleet import schema as fleet_schema
+
+    calls = []
+    conn = object()
+
+    class _Ctx:
+        def __enter__(self):
+            calls.append("connect")
+            return conn
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(hm.pgqueue, "connect", lambda dsn: _Ctx())
+    monkeypatch.setattr(fleet_schema, "ensure_schema_v3", lambda c: calls.append(("schema", c)))
+    monkeypatch.setattr(hm, "_print_status", lambda c: calls.append(("status", c)))
+
+    assert hm.main(["--dsn", "postgresql://fleet", "status"]) == 0
+
+    assert calls == ["connect", ("schema", conn), ("status", conn)]
+
+
 def test_apply_home_resolve_challenge(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     from applypilot.fleet import queue

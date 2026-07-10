@@ -15,6 +15,9 @@ classified no_result_line -> crash_unconfirmed.
 """
 from __future__ import annotations
 
+import io
+import json
+
 from applypilot.apply import launcher
 from applypilot.apply import container_worker
 from applypilot.apply import pgqueue
@@ -41,12 +44,255 @@ CODEX_UNAUTH_WALL = (
 )
 
 
+class _FakeStdin:
+    def write(self, text):
+        self.text = text
+
+    def close(self):
+        pass
+
+
+class _FakeProc:
+    pid = 12345
+    returncode = 0
+
+    def __init__(self, stdout_text):
+        self.stdout = io.StringIO(stdout_text)
+        self.stdin = _FakeStdin()
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class _FakeWorkerState:
+    actions = 0
+    total_cost = 0.0
+    last_action = ""
+
+
+def _job():
+    return {
+        "title": "Analyst",
+        "site": "Acme",
+        "url": "https://example.com/job",
+        "application_url": "https://example.com/apply",
+        "fit_score": 8,
+        "tailored_resume_path": None,
+    }
+
+
+def _patch_launcher_agent_io(monkeypatch, tmp_path, *, stdout_text="", popen_error=None):
+    state = _FakeWorkerState()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(launcher.config, "APP_DIR", tmp_path)
+    monkeypatch.setattr(launcher.config, "LOG_DIR", log_dir)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", lambda *a, **k: None)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *a, **k: None)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["fake-agent"])
+    monkeypatch.setattr(launcher, "add_event", lambda message: None)
+    monkeypatch.setattr(launcher, "get_state", lambda worker_id: state)
+
+    def fake_reset_worker_dir(worker_id):
+        worker_dir = tmp_path / f"worker-{worker_id}"
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        return worker_dir
+
+    def fake_update_state(worker_id, **kwargs):
+        for key, value in kwargs.items():
+            setattr(state, key, value)
+
+    def fake_popen(*args, **kwargs):
+        if popen_error is not None:
+            raise RuntimeError(popen_error)
+        return _FakeProc(stdout_text)
+
+    monkeypatch.setattr(launcher, "reset_worker_dir", fake_reset_worker_dir)
+    monkeypatch.setattr(launcher, "update_state", fake_update_state)
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    return state
+
+
+def _stream_line(payload):
+    return json.dumps(payload) + "\n"
+
+
 def test_usage_limit_transcript_with_no_tool_calls_is_retryable():
     """The exact incident: usage-limit wall, agent never called a browser tool."""
     assert launcher._no_result_status(CODEX_SPARK_WALL, tool_calls=0) == launcher.USAGE_LIMIT_STATUS
     assert launcher._no_result_status(CLAUDE_WALL, tool_calls=0) == launcher.USAGE_LIMIT_STATUS
     # and it is explicitly NOT the crash-bound no_result_line status
     assert launcher._no_result_status(CODEX_SPARK_WALL, tool_calls=0) != "failed:no_result_line"
+
+
+def test_classified_usage_limit_stats_are_available_for_worker_metadata(monkeypatch):
+    from applypilot.apply.failure_classification import FailureEvidence, classify_apply_failure
+
+    result = classify_apply_failure(
+        FailureEvidence(
+            status="failed:no_result_line",
+            transcript="You've hit your usage limit. Switch to another model.",
+            application_tool_calls=0,
+            tool_calls_total=0,
+        )
+    )
+
+    assert result.failure_class == "usage_or_session_limit"
+    assert result.safe_requeue is True
+
+
+def test_launcher_metadata_counts_total_tool_calls_separately(monkeypatch, tmp_path):
+    stdout_text = "".join(
+        [
+            _stream_line(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "ToolSearch", "input": {}},
+                        ],
+                    },
+                }
+            ),
+            _stream_line(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "mcp_tool_call", "name": "browser_click"},
+                }
+            ),
+            _stream_line(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "num_turns": 99,
+                    "total_cost_usd": 0,
+                    "result": "RESULT:FAILED:no_result_line",
+                }
+            ),
+        ]
+    )
+    _patch_launcher_agent_io(monkeypatch, tmp_path, stdout_text=stdout_text)
+
+    status, _duration_ms = launcher._run_job_impl(_job(), port=9222, worker_id=44)
+
+    stats = launcher._last_run_stats[44]
+    assert status == "failed:no_result_line"
+    assert stats["tool_calls_total"] == 2
+    assert stats["application_tool_calls"] == 1
+    assert stats["last_tool"] == "browser_click"
+
+
+def test_launcher_zero_tool_terminal_failure_keeps_last_tool_empty(monkeypatch, tmp_path):
+    stdout_text = _stream_line(
+        {
+            "type": "result",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "num_turns": 1,
+            "total_cost_usd": 0,
+            "result": "RESULT:FAILED:no_result_line",
+        }
+    )
+    _patch_launcher_agent_io(monkeypatch, tmp_path, stdout_text=stdout_text)
+
+    status, _duration_ms = launcher._run_job_impl(_job(), port=9225, worker_id=47)
+
+    stats = launcher._last_run_stats[47]
+    assert status == "failed:no_result_line"
+    assert stats["tool_calls_total"] == 0
+    assert stats["application_tool_calls"] == 0
+    assert stats["last_tool"] == ""
+
+
+def test_launcher_exception_path_overwrites_stale_metadata(monkeypatch, tmp_path):
+    _patch_launcher_agent_io(monkeypatch, tmp_path, popen_error="agent launch exploded")
+    launcher._last_run_stats[45] = {
+        "route": "stale",
+        "failure_class": "stale",
+        "tool_calls_total": 99,
+        "application_tool_calls": 99,
+    }
+
+    status, _duration_ms = launcher._run_job_impl(_job(), port=9223, worker_id=45)
+
+    stats = launcher._last_run_stats[45]
+    assert status == "failed:agent launch exploded"
+    assert stats["route"] == "agent"
+    assert "agent launch exploded" in stats["transcript"]
+    assert stats["failure_class"] == "malformed_result"
+    assert stats["tool_calls_total"] == 0
+    assert stats["application_tool_calls"] == 0
+
+
+def test_greenhouse_owned_result_updates_launcher_metadata(monkeypatch):
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(
+        launcher,
+        "_maybe_greenhouse_apply",
+        lambda *a, **k: ("failed:no_confirmation", 42),
+    )
+    launcher._last_run_stats[46] = {"route": "stale", "failure_class": "stale"}
+
+    status, duration_ms = launcher._run_job_impl(_job(), port=9224, worker_id=46)
+
+    stats = launcher._last_run_stats[46]
+    assert (status, duration_ms) == ("failed:no_confirmation", 42)
+    assert stats["route"] == "adapter_submit:greenhouse"
+    assert stats["last_tool"] == "greenhouse_adapter"
+    assert stats["tool_calls_total"] == 0
+    assert stats["application_tool_calls"] == 0
+    assert stats["failure_class"] == "adapter_no_confirmation"
+    assert stats["safe_requeue"] is False
+    assert stats["worker_level_failure"] is False
+    assert stats["adapter_name"] == "greenhouse"
+    assert stats["adapter_plan_ready"] is True
+
+
+def test_apply_fn_forwards_adapter_metadata_from_launcher_stats(monkeypatch):
+    from applypilot.apply import chrome
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **_kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(
+        launcher,
+        "run_job",
+        lambda job, port, worker_id, model, agent: ("failed:no_confirmation", 42),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_last_run_stats",
+        {
+            5: {
+                "route": "adapter_submit:greenhouse",
+                "failure_class": "adapter_no_confirmation",
+                "tool_calls_total": 0,
+                "application_tool_calls": 0,
+                "last_tool": "greenhouse_adapter",
+                "safe_requeue": False,
+                "worker_level_failure": False,
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": True,
+                "cost_usd": 0,
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+
+    out = awm.make_apply_fn("sonnet", "claude", slot=5)(_job())
+
+    assert out["route"] == "adapter_submit:greenhouse"
+    assert out["failure_class"] == "adapter_no_confirmation"
+    assert out["last_tool"] == "greenhouse_adapter"
+    assert out["result_metadata"]["safe_requeue"] is False
+    assert out["result_metadata"]["worker_level_failure"] is False
+    assert out["result_metadata"]["adapter_name"] == "greenhouse"
+    assert out["result_metadata"]["adapter_plan_ready"] is True
 
 
 def test_session_limit_wording_with_no_tool_calls_is_retryable():

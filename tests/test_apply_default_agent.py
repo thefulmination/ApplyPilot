@@ -13,6 +13,25 @@ from applypilot.fleet import apply_worker_main as awm
 from applypilot.fleet.apply_worker_main import build_parser
 
 
+class _SchemaConnection:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def _stub_schema_check(monkeypatch):
+    monkeypatch.setattr(
+        "applypilot.apply.pgqueue.connect",
+        lambda *_args, **_kwargs: _SchemaConnection(),
+    )
+    monkeypatch.setattr(
+        "applypilot.fleet.schema.require_apply_result_event_schema",
+        lambda _conn: None,
+    )
+
+
 def test_fleet_apply_worker_defaults_to_codex():
     args = build_parser().parse_args(["--worker-id", "w0"])
     assert args.agent == "codex"
@@ -29,6 +48,7 @@ def test_fleet_apply_worker_once_limits_loop_iterations(monkeypatch):
     monkeypatch.setattr(awm, "build_apply_loop", lambda **_kw: object())
     monkeypatch.setattr(awm, "install_stop_handler", lambda: None)
     monkeypatch.setattr(awm, "make_apply_fn", lambda *_a, **_kw: (lambda _job: {}))
+    _stub_schema_check(monkeypatch)
 
     captured = {}
 
@@ -53,6 +73,7 @@ def test_fleet_apply_worker_max_iterations_limits_loop_iterations(monkeypatch):
     monkeypatch.setattr(awm, "build_apply_loop", lambda **_kw: object())
     monkeypatch.setattr(awm, "install_stop_handler", lambda: None)
     monkeypatch.setattr(awm, "make_apply_fn", lambda *_a, **_kw: (lambda _job: {}))
+    _stub_schema_check(monkeypatch)
 
     captured = {}
 

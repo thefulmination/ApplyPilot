@@ -95,6 +95,15 @@ blocked_sso:
 # These are valid targets, but often require account creation, saved
 # credentials, email verification, or 2FA. ApplyPilot routes them into the
 # assisted workflow instead of burning retries in full auto-apply.
+#
+# Some ATSes benefit from proactive inbox relay without being globally gated.
+# Keep those in inbox_auth_prearm so deterministic/agent apply paths remain
+# available while an OTP request is already waiting if verification appears.
+inbox_auth_prearm:
+  domains:
+    - "greenhouse.io"
+    - "boards.greenhouse.io"
+
 auth_gated:
   domains:
     - "myworkdayjobs.com"
@@ -102,8 +111,6 @@ auth_gated:
     - "workdayjobs.com"
     - "taleo.net"
     - "successfactors.com"
-    - "greenhouse.io"
-    - "boards.greenhouse.io"
     - "icims.com"
     - "brassring.com"
     - "adp.com"

@@ -2,6 +2,10 @@
 linkedin.com) vs external (redirected to an off-LinkedIn ATS) from the browser tabs
 the agent ended on. Zero LinkedIn scraping -- it reads tabs the apply already opened.
 """
+import os
+
+import pytest
+
 from applypilot.fleet.apply_worker_main import classify_apply_channel, classify_apply_channel_from_text
 
 
@@ -189,10 +193,19 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
         calls.append(inbox_auth_hint)
+        attempt = len(calls)
         monkeypatch.setattr(
             launcher,
             "_last_run_stats",
-            {3: {"application_tool_calls": 1}},
+            {
+                3: {
+                    "application_tool_calls": 0 if attempt == 1 else 1,
+                    "tool_calls_total": 0 if attempt == 1 else 1,
+                    "safe_requeue": True if attempt == 1 else None,
+                    "cost_usd": 1.25 if attempt == 1 else 0.50,
+                    "route": "agent",
+                }
+            },
             raising=False,
         )
         if len(calls) == 1:
@@ -211,4 +224,80 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
     assert prearm_worker_ids == ["mint-0"]
     assert calls == [None, "code=246810\nsource=fleet_relay"]
     assert out["run_status"] == "applied"
+    assert out["est_cost_usd"] == 1.75
+    assert out["application_tool_calls"] == 1
+    assert out["tool_calls_total"] == 1
+    assert out["result_metadata"]["attempt_count"] == 2
+    assert out["result_metadata"]["prior_attempt_cost_usd"] == 1.25
     assert cleaned == [(3, proc)]
+    assert "FLEET_WORKER_ID" not in os.environ
+
+
+def test_make_apply_fn_does_not_otp_retry_after_application_touch(monkeypatch):
+    from applypilot.apply import chrome, launcher
+    from applypilot.fleet import apply_worker_main as awm
+
+    proc = object()
+    calls = []
+    monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
+    monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
+    monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
+    monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
+    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 42)
+    monkeypatch.setattr(
+        launcher,
+        "_consume_prearmed_inbox_auth_hint",
+        lambda request_id: "code=246810\nsource=fleet_relay",
+    )
+
+    def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
+        calls.append(inbox_auth_hint)
+        monkeypatch.setattr(
+            launcher,
+            "_last_run_stats",
+            {
+                3: {
+                    "application_tool_calls": 1,
+                    "tool_calls_total": 1,
+                    "safe_requeue": False,
+                    "cost_usd": 1.25,
+                    "route": "agent",
+                }
+            },
+            raising=False,
+        )
+        return "failed:timeout", 1.0
+
+    monkeypatch.setattr(launcher, "run_job", fake_run_job)
+
+    out = awm.make_apply_fn("sonnet", "codex", slot=3, fleet_worker_id="mint-0")(
+        {"url": "https://example.test/job"}
+    )
+
+    assert calls == [None]
+    assert out["run_status"] == "failed:timeout"
+    assert out["est_cost_usd"] == 1.25
+
+
+def test_make_apply_fn_restores_worker_id_when_chrome_launch_fails(monkeypatch):
+    from applypilot.apply import chrome
+    from applypilot.fleet import apply_worker_main as awm
+
+    monkeypatch.setenv("FLEET_WORKER_ID", "prior-worker")
+    monkeypatch.setattr(
+        chrome,
+        "launch_chrome",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
+
+    apply_fn = awm.make_apply_fn(
+        "sonnet",
+        "codex",
+        slot=3,
+        fleet_worker_id="mint-0",
+    )
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        apply_fn({"url": "https://example.test/job"})
+
+    assert os.environ["FLEET_WORKER_ID"] == "prior-worker"
