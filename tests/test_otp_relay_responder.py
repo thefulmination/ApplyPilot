@@ -95,6 +95,31 @@ def test_two_requests_get_distinct_codes_one_message_each(fleet_db, monkeypatch)
     assert vals == {"111111", "222222"}  # distinct codes, no double-assignment
 
 
+def test_consumed_message_is_not_reused_in_later_responder_cycle(fleet_db, monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("greenhouse-message-1", _rfc(now + dt.timedelta(seconds=20)), "111111")]
+    monkeypatch.setattr(
+        otp_relay.inbox_auth, "scan_gmail_for_auth_codes", lambda **kw: matches,
+    )
+    with _fresh(fleet_db) as conn:
+        first = _pending(conn, worker_id="mac-0")
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 1
+        assert otp_relay.poll_for_code(conn, first, timeout_seconds=0).value == "111111"
+
+        second = _pending(conn, worker_id="mac-1")
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        assert otp_relay.poll_for_code(conn, second, timeout_seconds=0) is None
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT matched_message_id FROM otp_request WHERE id IN (%s, %s) ORDER BY id",
+                (first, second),
+            )
+            rows = cur.fetchall()
+
+    assert [row["matched_message_id"] for row in rows] == ["greenhouse-message-1", None]
+
+
 def test_oldest_request_gets_earliest_code(fleet_db, monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
     matches = [
@@ -217,11 +242,17 @@ def test_purge_expired_nulls_code_keeps_row(fleet_db, monkeypatch):
         rid = _pending(conn)
         with conn.cursor() as cur:
             cur.execute("UPDATE otp_request SET code='777', code_kind='code', "
+                        "matched_message_id='purge-message', wait_started_at=now(), "
                         "expires_at=now() - interval '1 min' WHERE id=%s", (rid,))
         conn.commit()
         purged = otp_relay.purge_expired(conn)
         assert purged == 1
         with conn.cursor() as cur:
-            cur.execute("SELECT code, worker_id FROM otp_request WHERE id=%s", (rid,))
+            cur.execute(
+                "SELECT code, worker_id, matched_message_id, wait_started_at "
+                "FROM otp_request WHERE id=%s", (rid,),
+            )
             row = cur.fetchone()
     assert row["code"] is None and row["worker_id"] == "mac-0"  # audit row kept
+    assert row["matched_message_id"] == "purge-message"
+    assert row["wait_started_at"] is not None

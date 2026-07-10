@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
+import psycopg
+
 from applypilot import inbox_auth
 
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
@@ -35,14 +37,37 @@ def _match_belongs_to_request(sender_hint: str | None, match) -> bool:
 
 def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
                  ttl_seconds: int = 300) -> int:
-    """File a pending OTP request; return its id. Never blocks."""
+    """File or extend a worker's active OTP request; return its id. Never blocks."""
+    target = application_url or job_url
+    lock_key = f"applypilot:otp_request:{worker_id}:{target}"
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
-            "VALUES (%s, %s, %s, now() + make_interval(secs => %s)) RETURNING id",
-            (worker_id, application_url or job_url, _apply_domain(application_url), ttl_seconds),
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (lock_key,),
         )
-        rid = cur.fetchone()["id"]
+        cur.execute(
+            "SELECT id FROM otp_request "
+            "WHERE worker_id=%s AND url=%s AND consumed_at IS NULL "
+            "      AND (expires_at IS NULL OR expires_at > now()) "
+            "ORDER BY requested_at DESC, id DESC LIMIT 1",
+            (worker_id, target),
+        )
+        active = cur.fetchone()
+        if active:
+            rid = active["id"]
+            cur.execute(
+                "UPDATE otp_request "
+                "SET expires_at=GREATEST(expires_at, now() + make_interval(secs => %s)) "
+                "WHERE id=%s",
+                (ttl_seconds, rid),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
+                "VALUES (%s, %s, %s, now() + make_interval(secs => %s)) RETURNING id",
+                (worker_id, target, _apply_domain(target), ttl_seconds),
+            )
+            rid = cur.fetchone()["id"]
     conn.commit()
     return rid
 
@@ -73,6 +98,7 @@ def poll_for_code(conn, request_id: int, *, timeout_seconds: int = 300,
                   poll_seconds: float = 5.0) -> RelayCode | None:
     """Poll the request row until a code is available, consuming it, or timeout."""
     deadline = time.monotonic() + timeout_seconds
+    _stamp_wait_started(conn, request_id)
     while True:
         code = _try_consume(conn, request_id)
         if code is not None:
@@ -81,6 +107,17 @@ def poll_for_code(conn, request_id: int, *, timeout_seconds: int = 300,
         if remaining <= 0:
             return None
         time.sleep(min(max(0.05, poll_seconds), remaining))
+
+
+def _stamp_wait_started(conn, request_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE otp_request SET wait_started_at=COALESCE(wait_started_at, now()) "
+            "WHERE id=%s AND consumed_at IS NULL "
+            "      AND (expires_at IS NULL OR expires_at > now())",
+            (request_id,),
+        )
+    conn.commit()
 
 
 def _parse_email_dt(raw):
@@ -129,7 +166,12 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, requested_at, sender_hint FROM otp_request "
+            "WITH used AS ("
+            "  SELECT array_agg(matched_message_id) AS message_ids FROM otp_request "
+            "  WHERE matched_message_id IS NOT NULL"
+            ") "
+            "SELECT id, requested_at, sender_hint, used.message_ids AS used_message_ids "
+            "FROM otp_request CROSS JOIN used "
             "WHERE code IS NULL AND consumed_at IS NULL "
             "      AND (expires_at IS NULL OR expires_at > now()) "
             "ORDER BY requested_at"
@@ -138,6 +180,7 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     conn.commit()
     if not pending:
         return 0
+    used_messages = set(pending[0].get("used_message_ids") or [])
     answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
 
     if gmail_service is None:
@@ -167,7 +210,6 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
     parsed = [(m, ts) for (m, ts) in parsed if ts is not None]
     parsed.sort(key=lambda mt: mt[1])
 
-    used_messages: set = set()
     answered = 0
     for req in pending:
         req_floor = req["requested_at"] - _dt.timedelta(seconds=skew_seconds)
@@ -182,19 +224,27 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
                 break
         if chosen is None:
             continue
-        used_messages.add(chosen.message_id)
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE otp_request SET code=%s, code_kind=%s, matched_email_ts=%s, "
-                "answered_at=now(), expires_at = GREATEST(expires_at, now() + make_interval(secs => %s)) "
-                "WHERE id=%s AND code IS NULL AND consumed_at IS NULL "
-                "AND (expires_at IS NULL OR expires_at > now())",
-                (chosen.candidate.value, chosen.candidate.kind,
-                 _parse_email_dt(chosen.received_at), answered_ttl_seconds, req["id"]),
-            )
-            if cur.rowcount:
-                answered += 1
-        conn.commit()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE otp_request SET code=%s, code_kind=%s, matched_email_ts=%s, "
+                    "matched_message_id=%s, answered_at=now(), "
+                    "expires_at=GREATEST(expires_at, now() + make_interval(secs => %s)) "
+                    "WHERE id=%s AND code IS NULL AND consumed_at IS NULL "
+                    "AND (expires_at IS NULL OR expires_at > now())",
+                    (chosen.candidate.value, chosen.candidate.kind,
+                     _parse_email_dt(chosen.received_at), chosen.message_id,
+                     answered_ttl_seconds, req["id"]),
+                )
+                updated = cur.rowcount
+            conn.commit()
+        except psycopg.errors.UniqueViolation:
+            conn.rollback()
+            used_messages.add(chosen.message_id)
+            continue
+        if updated:
+            used_messages.add(chosen.message_id)
+            answered += updated
     return answered
 
 

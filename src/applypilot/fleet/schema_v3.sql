@@ -283,10 +283,10 @@ CREATE TABLE IF NOT EXISTS auth_challenge (
 CREATE INDEX IF NOT EXISTS idx_challenge_open ON auth_challenge (url) WHERE resolved_at IS NULL;
 
 -- ---------------------------------------------------------------------------
--- otp_request: Gmail relay bookkeeping (R4). The CODE is NEVER persisted (E1) --
--- it is returned only over the broker RPC response. This row is the request +
--- consumed AUDIT TRAIL; single-delivery (not handing one code to two workers) is
--- enforced by the owner-side relay that matches+consumes the email, not by this row.
+-- otp_request: Gmail relay bookkeeping (R4). The code is persisted only for the
+-- short interval between the home responder answering and the worker consuming it.
+-- This row is also the consumed audit trail; matched_message_id prevents one email
+-- from being delivered to multiple requests, including across responder cycles.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS otp_request (
     id               BIGSERIAL PRIMARY KEY,
@@ -304,9 +304,13 @@ ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS code        TEXT;
 ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS code_kind   TEXT;   -- 'code' | 'magic_link'
 ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS expires_at  TIMESTAMPTZ;
 ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ;
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS matched_message_id TEXT;
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS wait_started_at TIMESTAMPTZ;
 -- The responder's pending-scan: unanswered, unconsumed requests.
 CREATE INDEX IF NOT EXISTS idx_otp_pending ON otp_request (requested_at)
     WHERE code IS NULL AND consumed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_matched_message_unique
+    ON otp_request (matched_message_id) WHERE matched_message_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- inbox_events: outcome tracking / feedback loop (R8). Written by the inbox
