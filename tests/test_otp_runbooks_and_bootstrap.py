@@ -34,3 +34,27 @@ def test_otp_relay_runbook_covers_mission_grade_verification():
     assert "otp_delivery_stalled" in runbook
     assert "X-GM-RAW" in runbook
     assert "controlled end-to-end" in runbook
+
+
+def test_otp_relay_controlled_cycle_uses_runtime_configuration_and_health_probe():
+    runbook = (REPO / "docs" / "fleet-otp-relay-runbook.md").read_text(encoding="utf-8")
+
+    assert "$env:FLEET_PG_DSN =" in runbook
+    assert "$env:APPLYPILOT_FLEET_DSN =" not in runbook
+    assert "gmail_token_ok=True" not in runbook
+    assert "deadman.mail_source_alive()" in runbook
+
+
+def test_otp_relay_controlled_cycle_lists_exact_approved_evidence():
+    runbook = (REPO / "docs" / "fleet-otp-relay-runbook.md").read_text(encoding="utf-8")
+
+    for fact in (
+        "request_created=yes",
+        "responder_answered=yes",
+        "worker_consumed=yes",
+        "code_cleared=yes",
+        "matched_message_id_retained=yes",
+        "assisted_retry_terminal=yes",
+        "deadman_otp_alerts=0",
+    ):
+        assert fact in runbook

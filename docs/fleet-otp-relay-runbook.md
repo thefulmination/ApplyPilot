@@ -190,7 +190,7 @@ $ControlledUrl = Read-Host "Controlled application URL"
 $env:FLEET_WORKER_ID = "otp-e2e-home"
 $env:APPLYPILOT_INBOX_AUTH = "1"
 $env:APPLYPILOT_INBOX_AUTH_MODE = "relay"
-$env:APPLYPILOT_FLEET_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
+$env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
 $env:OTP_E2E_STARTED_AT = (Get-Date).ToUniversalTime().ToString("o")
 .\run-applypilot.ps1 apply --url $ControlledUrl --inbox-auth --workers 1
 ```
@@ -228,7 +228,7 @@ for key in (
     "request_created", "responder_answered", "worker_consumed",
     "code_cleared", "matched_message_id_retained",
 ):
-    print(f"{key}={str(bool(facts[key])).lower()}")
+    print(f"{key}={'yes' if bool(facts[key]) else 'no'}")
 '@ | .\.conda-env\python.exe -
 ```
 
@@ -249,10 +249,11 @@ from applypilot.fleet import deadman
 
 dsn = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
 with pgqueue.connect(dsn) as conn:
+    mail_source_ok = deadman.mail_source_alive()
     alerts, _ = deadman.deadman_check(
         conn,
         now=dt.datetime.now(dt.timezone.utc),
-        gmail_token_ok=True,
+        gmail_token_ok=mail_source_ok,
     )
 otp_alerts = [a for a in alerts if a.kind in {"otp_relay_down", "otp_delivery_stalled"}]
 print(f"deadman_otp_alerts={len(otp_alerts)}")
@@ -262,11 +263,11 @@ print(f"deadman_otp_alerts={len(otp_alerts)}")
 Acceptance requires these exact non-secret facts:
 
 ```text
-request_created=true
-responder_answered=true
-worker_consumed=true
-code_cleared=true
-matched_message_id_retained=true
+request_created=yes
+responder_answered=yes
+worker_consumed=yes
+code_cleared=yes
+matched_message_id_retained=yes
 assisted_retry_terminal=yes
 deadman_otp_alerts=0
 ```
