@@ -20,14 +20,17 @@ apply subprocess dies, so recovery is automatic instead of a 40-minute manual ca
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
 from applypilot import config
-from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_orphaned_browser
+from applypilot.apply.chrome import BASE_CDP_PORT, reserve_browser_cleanup
 
 
 def _applied_count() -> int:
@@ -65,44 +68,117 @@ def _apply_cost_total() -> float:
 _ORPHAN_PATTERN = "_npx|playwright|modelcontextprotocol|@playwright"
 
 
-def _orphan_kill_cmd() -> list[str]:
-    """Platform command to kill orphaned Playwright-MCP node servers. Matched by command
-    line so the desktop app / unrelated node processes are never touched."""
+def _process_snapshot() -> list[dict]:
+    """Return minimal process ancestry metadata; callers must hold browser ownership."""
     if sys.platform == "win32":
-        return ["powershell", "-NoProfile", "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-                f"Where-Object {{ $_.CommandLine -match '{_ORPHAN_PATTERN}' }} | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"]
-    # Mirror the Windows branch's Name='node.exe' pre-filter: require a node
-    # executable at the start of the command line so ONLY node processes
-    # (the MCP servers) can match -- never Chromium or python tooling whose
-    # paths merely contain 'playwright'.
-    return ["pkill", "-f", f"(^|/)node .*({_ORPHAN_PATTERN})"]
+        script = (
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+            "ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        raw = json.loads(result.stdout)
+        rows = raw if isinstance(raw, list) else [raw]
+        return [{
+            "pid": int(row.get("ProcessId") or 0),
+            "ppid": int(row.get("ParentProcessId") or 0),
+            "name": str(row.get("Name") or ""),
+            "command": str(row.get("CommandLine") or ""),
+        } for row in rows]
+
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,comm=,args="],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append({
+                "pid": int(parts[0]),
+                "ppid": int(parts[1]),
+                "name": parts[2],
+                "command": parts[3] if len(parts) == 4 else "",
+            })
+    return rows
 
 
-def _cleanup_orphans(log) -> None:
+def _associated_auxiliary_pids(processes: list[dict], owner_pid: int) -> list[int]:
+    descendants = {int(owner_pid)}
+    changed = True
+    while changed:
+        changed = False
+        for row in processes:
+            pid = int(row.get("pid") or 0)
+            ppid = int(row.get("ppid") or 0)
+            if pid and ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    eligible = []
+    for row in processes:
+        pid = int(row.get("pid") or 0)
+        name = os.path.basename(str(row.get("name") or "")).lower()
+        command = str(row.get("command") or "")
+        if (
+            pid in descendants
+            and pid != owner_pid
+            and name in {"node", "node.exe"}
+            and re.search(_ORPHAN_PATTERN, command, flags=re.IGNORECASE)
+        ):
+            eligible.append(pid)
+    return sorted(set(eligible))
+
+
+def _kill_auxiliary_process(pid: int) -> None:
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    else:
+        os.kill(pid, signal.SIGKILL)
+
+
+def _cleanup_orphans(log, *, owner_pid: int | None = None) -> bool:
     """Between attempts: free the CDP port (kill any leftover Chrome) and kill orphaned
     Playwright-MCP node servers so a fresh agent can't be hijacked. A hard-killed run
     leaves these behind. Best-effort; never raises."""
+    ownership = reserve_browser_cleanup(
+        0,
+        BASE_CDP_PORT,
+        config.CHROME_WORKER_DIR / "worker-0",
+    )
+    if ownership is None:
+        log("ORPHAN-CLEANUP: browser slot occupied; left all processes untouched")
+        return False
     try:
-        cleaned = cleanup_orphaned_browser(
-            0,
-            BASE_CDP_PORT,
-            config.CHROME_WORKER_DIR / "worker-0",
-        )
-        if not cleaned:
-            log("ORPHAN-CLEANUP: browser slot occupied or cleanup unconfirmed; left untouched")
+        processes = _process_snapshot() if owner_pid is not None else []
+        browser_cleaned = ownership.cleanup_browser()
+        auxiliaries_cleaned = True
+        for pid in _associated_auxiliary_pids(processes, owner_pid) if owner_pid is not None else []:
+            try:
+                _kill_auxiliary_process(pid)
+            except Exception:
+                auxiliaries_cleaned = False
+        return browser_cleaned and auxiliaries_cleaned
     except Exception:
-        pass
-    # Kill orphaned Playwright MCP node servers (apply's browser automation). Matched by
-    # command line so we never touch the desktop app or unrelated node processes.
-    try:
-        subprocess.run(
-            _orphan_kill_cmd(),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
-        )
-    except Exception:
-        pass
+        return False
+    finally:
+        ownership.release()
 
 
 def supervise(
@@ -184,6 +260,7 @@ def supervise(
 
     start = time.monotonic()
     attempt = 0
+    previous_apply_pid: int | None = None
     log(f"SUPERVISOR start: total_budget=${total_cost_usd:.0f}, baseline_applied={baseline}, "
         f"baseline_cost=${max(0.0, baseline_cost):.2f}, stall={stall_minutes}m, "
         f"max_attempts={max_attempts}, max_hours={max_hours}, est_cost_per_apply=${est_cost_per_apply}")
@@ -215,7 +292,7 @@ def supervise(
                 break
 
         attempt += 1
-        _cleanup_orphans(log)
+        _cleanup_orphans(log, owner_pid=previous_apply_pid)
         offsite_backup()  # periodic off-machine backup at each restart boundary
         # Reclaim any lease stranded by the previous crash so its job is retryable.
         try:
@@ -247,6 +324,7 @@ def supervise(
         out_path = config.LOG_DIR / f"supervised_attempt_{attempt}.out"
         with open(out_path, "w", encoding="utf-8") as out:
             proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=child_env)
+        previous_apply_pid = proc.pid
 
         last_applied = applied_now
         last_progress = time.monotonic()

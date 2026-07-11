@@ -211,20 +211,44 @@ def _reserve_browser_launch(
         raise
 
 
-def cleanup_orphaned_browser(worker_id: int, port: int, profile_dir: Path) -> bool:
-    """Clean an unreserved browser orphan while holding slot/profile/port ownership."""
+class BrowserCleanupOwnership:
+    """Exclusive slot/profile/port ownership for coordinated orphan cleanup."""
+
+    def __init__(self, reservation: _BrowserReservation) -> None:
+        self._reservation = reservation
+
+    def cleanup_browser(self) -> bool:
+        _kill_on_port(self._reservation.port)
+        return not _port_is_listening(self._reservation.port)
+
+    def release(self) -> None:
+        self._reservation.release()
+
+
+def reserve_browser_cleanup(
+    worker_id: int,
+    port: int,
+    profile_dir: Path,
+) -> BrowserCleanupOwnership | None:
     try:
         reservation = _acquire_browser_reservation(worker_id, port, profile_dir)
     except BrowserSlotOccupiedError:
+        return None
+    return BrowserCleanupOwnership(reservation)
+
+
+def cleanup_orphaned_browser(worker_id: int, port: int, profile_dir: Path) -> bool:
+    """Clean an unreserved browser orphan while holding slot/profile/port ownership."""
+    ownership = reserve_browser_cleanup(worker_id, port, profile_dir)
+    if ownership is None:
         return False
     try:
-        _kill_on_port(port)
-        return not _port_is_listening(port)
+        return ownership.cleanup_browser()
     except Exception:
         logger.debug("Orphan browser cleanup failed for slot %s", worker_id, exc_info=True)
         return False
     finally:
-        reservation.release()
+        ownership.release()
 
 
 # ---------------------------------------------------------------------------
