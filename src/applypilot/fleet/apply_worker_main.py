@@ -190,15 +190,24 @@ def _prearmed_auth_retryable(status: str | None) -> bool:
     )
 
 
-def _assisted_retry_is_terminal(status: str | None, launcher) -> bool:
-    """Classify only the final assisted run, without exposing its result details."""
-    return bool(
-        status
-        and not launcher._is_auth_required_result(status)
-        and not launcher.is_usage_limit_result(status)
-        and not _browser_tool_retryable(status)
-        and not _prearmed_auth_retryable(status)
-    )
+_ASSISTED_RETRY_TERMINAL_STATUSES = frozenset({
+    "applied",
+    "already_applied",
+    "dry_run",
+    "expired",
+    "failed:already_applied",
+    "failed:not_eligible_location",
+    "failed:not_eligible_work_auth",
+    "failed:not_eligible_salary",
+    "failed:not_a_job_application",
+    "failed:unsafe_permissions",
+    "failed:unsafe_verification",
+})
+
+
+def _assisted_retry_is_terminal(status: str | None) -> bool:
+    """Accept only final outcomes whose launcher meaning is explicit and bounded."""
+    return (status or "").strip().lower() in _ASSISTED_RETRY_TERMINAL_STATUSES
 
 
 def _should_launch_chrome_headless() -> bool:
@@ -288,7 +297,7 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 "inbox_auth_prearmed": prearmed_request_id is not None,
                 "assisted_retry_terminal": (
                     assisted_retry_count == 1
-                    and _assisted_retry_is_terminal(status, launcher)
+                    and _assisted_retry_is_terminal(status)
                 ),
             }
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills

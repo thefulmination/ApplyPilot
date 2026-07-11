@@ -345,7 +345,7 @@ def test_assisted_retry_terminal_includes_bounded_terminal_failure(monkeypatch):
     from applypilot.fleet import apply_worker_main as awm
 
     proc = object()
-    statuses = iter(("auth_required", "failed:application_rejected"))
+    statuses = iter(("auth_required", "failed:not_eligible_location"))
     run_calls = []
 
     monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
@@ -369,25 +369,44 @@ def test_assisted_retry_terminal_includes_bounded_terminal_failure(monkeypatch):
     out = awm.make_apply_fn("sonnet", "codex", slot=3)({"url": "https://example.test/job"})
 
     assert len(run_calls) == 2
-    assert out["run_status"] == "failed:application_rejected"
+    assert out["run_status"] == "failed:not_eligible_location"
     assert out["assisted_retry_count"] == 1
     assert out["inbox_auth_prearmed"] is True
     assert out["assisted_retry_terminal"] is True
 
 
-def test_assisted_retry_terminal_rejects_every_retryable_class():
-    from applypilot.apply import launcher
+def test_assisted_retry_terminal_uses_closed_launcher_status_set():
     from applypilot.fleet import apply_worker_main as awm
 
-    for status in (
-        "auth_required",
-        "login_issue",
-        "failed:usage_limit",
-        "failed:browser_tool_unavailable",
-        "failed:timeout",
-        "crash_unconfirmed",
-    ):
-        assert awm._assisted_retry_is_terminal(status, launcher) is False
+    cases = {
+        None: False,
+        "": False,
+        "unknown": False,
+        "skipped": False,
+        "no_result": False,
+        "no_result_line": False,
+        "crash_unconfirmed": False,
+        "auth_required": False,
+        "login_issue": False,
+        "timeout": False,
+        "failed:timeout": False,
+        "failed:usage_limit": False,
+        "failed:browser_tool_unavailable": False,
+        "failed:worker_error": False,
+        "failed:unknown": False,
+        "failed:no_result_line": False,
+        "applied": True,
+        "already_applied": True,
+        "dry_run": True,
+        "expired": True,
+        "failed:already_applied": True,
+        "failed:not_eligible_location": True,
+        "failed:not_eligible_work_auth": True,
+        "failed:not_eligible_salary": True,
+        "failed:not_a_job_application": True,
+        "failed:unsafe_permissions": True,
+        "failed:unsafe_verification": True,
+    }
 
-    assert awm._assisted_retry_is_terminal("applied", launcher) is True
-    assert awm._assisted_retry_is_terminal("failed:application_rejected", launcher) is True
+    for status, expected in cases.items():
+        assert awm._assisted_retry_is_terminal(status) is expected

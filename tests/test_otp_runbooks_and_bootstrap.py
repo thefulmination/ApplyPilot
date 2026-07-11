@@ -150,6 +150,33 @@ def test_otp_relay_controlled_cycle_uses_production_prearm_and_automatic_evidenc
     assert "apply --url" not in controlled
     assert "print(result" not in controlled
     assert "run_status" not in controlled
+    for field in (
+        '"url"',
+        '"application_url"',
+        '"title"',
+        '"company"',
+        '"site"',
+        '"score"',
+        '"fit_score"',
+        '"description"',
+        '"source"',
+        '"tailored_resume_path"',
+    ):
+        assert field in controlled
+
+
+def test_otp_relay_controlled_cycle_fails_closed_on_unknown_mail_health():
+    runbook = _otp_runbook()
+    controlled = _section(
+        runbook,
+        "## Controlled end-to-end acceptance",
+        "Acceptance requires these exact non-secret facts:",
+    )
+
+    assert "mail_source_ok is True" in controlled
+    assert "otp_alert_count = max(1," in controlled
+    assert "deadman_otp_alerts={otp_alert_count}" in controlled
+    assert "mail_source_ok=" not in controlled
 
 
 def test_otp_relay_runbook_powershell_and_embedded_python_parse():

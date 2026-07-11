@@ -317,6 +317,14 @@ slot = int(os.environ["APPLYPILOT_OTP_E2E_SLOT"])
 job = {
     "url": os.environ["APPLYPILOT_OTP_E2E_URL"],
     "application_url": os.environ["APPLYPILOT_OTP_E2E_URL"],
+    "title": "Controlled email-auth acceptance",
+    "company": "Owner-approved controlled target",
+    "site": "Owner-approved controlled target",
+    "score": 10,
+    "fit_score": 10,
+    "description": "Owner-approved controlled acceptance cycle.",
+    "source": "controlled_acceptance",
+    "tailored_resume_path": None,
 }
 
 apply_fn = apply_worker_main.make_apply_fn(
@@ -357,6 +365,9 @@ try:
                 alert for alert in alerts
                 if alert.kind in {"otp_relay_down", "otp_delivery_stalled"}
             ]
+            otp_alert_count = len(otp_alerts)
+            if mail_source_ok is not True:
+                otp_alert_count = max(1, otp_alert_count)
 except Exception:
     raise SystemExit(1) from None
 
@@ -368,7 +379,7 @@ for key in (
 print(f"inbox_auth_prearmed={'yes' if result['inbox_auth_prearmed'] else 'no'}")
 print(f"assisted_retry_count={result['assisted_retry_count']}")
 print(f"assisted_retry_terminal={'yes' if result['assisted_retry_terminal'] else 'no'}")
-print(f"deadman_otp_alerts={len(otp_alerts)}")
+print(f"deadman_otp_alerts={otp_alert_count}")
 
 accepted = (
     all(bool(facts[key]) for key in (
@@ -378,7 +389,8 @@ accepted = (
     and result["inbox_auth_prearmed"] is True
     and result["assisted_retry_count"] == 1
     and result["assisted_retry_terminal"] is True
-    and not otp_alerts
+    and mail_source_ok is True
+    and otp_alert_count == 0
 )
 if not accepted:
     raise SystemExit(1)
