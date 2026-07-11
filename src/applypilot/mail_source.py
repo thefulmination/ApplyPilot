@@ -251,8 +251,12 @@ class ImapMailSource:
 
             messages: list[MailMessage] = []
             scanned_bytes = 0
-            for msg_id in newest_ids:
+            for index, msg_id in enumerate(newest_ids):
                 uid = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+                if scanned_bytes >= self._max_scan_bytes:
+                    raise MailSourceOverflowError(
+                        "mail scan byte budget left candidates unread"
+                    )
                 if gmail_raw_query:
                     status, size_data = imap.uid(
                         "FETCH", uid, "(RFC822.SIZE)"
@@ -263,9 +267,13 @@ class ImapMailSource:
                     _ensure_ok(status, f"size fetch for message {uid}", size_data)
                 message_size = _extract_imap_size(size_data)
                 if message_size is None or message_size > self._max_message_bytes:
-                    continue
+                    raise MailSourceOverflowError(
+                        f"message {uid} could not be included in bounded snapshot"
+                    )
                 if scanned_bytes + message_size > self._max_scan_bytes:
-                    break
+                    raise MailSourceOverflowError(
+                        "mail scan byte budget cannot include complete snapshot"
+                    )
 
                 remaining_scan_bytes = self._max_scan_bytes - scanned_bytes
                 retrieval_limit = min(
@@ -282,14 +290,27 @@ class ImapMailSource:
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
                     scanned_bytes = self._max_scan_bytes
-                    raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")
+                    raise MailSourceOverflowError(
+                        f"message {uid} returned malformed bounded payload"
+                    )
                 actual_size = len(raw)
                 scanned_bytes += actual_size
                 if actual_size > remaining_scan_bytes:
-                    break
+                    raise MailSourceOverflowError(
+                        "mail scan byte budget cannot include complete snapshot"
+                    )
                 if actual_size > self._max_message_bytes:
-                    continue
+                    raise MailSourceOverflowError(
+                        f"message {uid} exceeds bounded message size"
+                    )
                 messages.append(_normalize(uid, raw))
+                if (
+                    scanned_bytes >= self._max_scan_bytes
+                    and index + 1 < len(newest_ids)
+                ):
+                    raise MailSourceOverflowError(
+                        "mail scan byte budget left candidates unread"
+                    )
 
             return messages
         finally:
@@ -621,9 +642,11 @@ class GmailApiAuthMailSource(GmailApiMailSource):
         refs = _gmail_candidate_refs(service, query=query, budget=budget)
         messages: list[MailMessage] = []
         scanned_bytes = 0
-        for ref in refs:
+        for index, ref in enumerate(refs):
             if scanned_bytes >= self._max_scan_bytes:
-                break
+                raise MailSourceOverflowError(
+                    "mail scan byte budget left candidates unread"
+                )
             message = (
                 service.users()
                 .messages()
@@ -646,12 +669,18 @@ class GmailApiAuthMailSource(GmailApiMailSource):
             )
             if actual_size is None:
                 scanned_bytes = self._max_scan_bytes
-                break
+                raise MailSourceOverflowError(
+                    f"message {ref['id']} returned malformed bounded metadata"
+                )
             scanned_bytes += actual_size
             if actual_size > remaining_scan_bytes:
-                break
+                raise MailSourceOverflowError(
+                    "mail scan byte budget cannot include complete snapshot"
+                )
             if actual_size > self._max_message_bytes:
-                continue
+                raise MailSourceOverflowError(
+                    f"message {ref['id']} exceeds bounded metadata size"
+                )
             size_estimate = message.get("sizeEstimate")
             if (
                 isinstance(size_estimate, bool)
@@ -659,7 +688,9 @@ class GmailApiAuthMailSource(GmailApiMailSource):
                 or size_estimate < 0
                 or size_estimate > self._max_message_bytes
             ):
-                continue
+                raise MailSourceOverflowError(
+                    f"message {ref['id']} has unsafe size metadata"
+                )
             payload = message.get("payload", {})
             headers = _gmail_headers(payload)
             messages.append(
@@ -672,6 +703,10 @@ class GmailApiAuthMailSource(GmailApiMailSource):
                     body=message.get("snippet", ""),
                 )
             )
+            if scanned_bytes >= self._max_scan_bytes and index + 1 < len(refs):
+                raise MailSourceOverflowError(
+                    "mail scan byte budget left candidates unread"
+                )
         return messages
 
 

@@ -263,7 +263,7 @@ def test_imap_exact_candidate_bound_remains_bounded():
     ids = [str(index).encode() for index in range(1000)]
     fake = FakeImap(
         search_ids=ids,
-        messages_by_id={message_id: b"XX" for message_id in ids},
+        messages_by_id={message_id: b"" for message_id in ids},
     )
 
     result = ImapMailSource(
@@ -274,9 +274,9 @@ def test_imap_exact_candidate_bound_remains_bounded():
         max_scan_bytes=1000,
     ).fetch(since_days=7, max_messages=1000)
 
-    assert result == []
-    assert len(fake.fetch_calls) == 1000
-    assert all(call[1] == "(RFC822.SIZE)" for call in fake.fetch_calls)
+    assert len(result) == 1000
+    assert len(fake.fetch_calls) == 2000
+    assert not any(call[1] == "(RFC822)" for call in fake.fetch_calls)
 
 
 def test_imap_body_fetch_uses_one_byte_sentinel_partial_range():
@@ -312,7 +312,7 @@ def test_imap_body_fetch_uses_one_byte_sentinel_partial_range():
     )
 
 
-def test_imap_skips_oversize_message_without_full_fetch():
+def test_imap_oversize_message_fails_snapshot_without_body_fetch():
     raw = _base64_plain_raw()
     fake = FakeImap(search_ids=[b"1"], messages_by_id={b"1": raw})
     source = ImapMailSource(
@@ -323,7 +323,8 @@ def test_imap_skips_oversize_message_without_full_fetch():
         max_scan_bytes=len(raw) * 2,
     )
 
-    assert source.fetch(since_days=7, max_messages=1) == []
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        source.fetch(since_days=7, max_messages=1)
     assert fake.fetch_calls == [("1", "(RFC822.SIZE)")]
 
 
@@ -361,13 +362,35 @@ def test_imap_aggregate_cap_stops_further_full_fetches():
         max_scan_bytes=len(raw) * 2,
     )
 
-    result = source.fetch(since_days=7, max_messages=3)
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        source.fetch(since_days=7, max_messages=3)
 
-    assert [message.id for message in result] == ["1", "2"]
     assert not any(
         uid == "3" and "BODY.PEEK" in parts
         for uid, parts in fake.fetch_calls
     )
+
+
+def test_imap_first_candidate_exhausting_budget_with_remaining_fails_closed():
+    raw = _base64_plain_raw()
+    fake = FakeImap(
+        search_ids=[b"1", b"2"],
+        messages_by_id={b"1": raw, b"2": raw},
+    )
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=len(raw),
+        max_scan_bytes=len(raw),
+    )
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        source.fetch(since_days=7, max_messages=2)
+
+    assert [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]] == [
+        ("1", f"(BODY.PEEK[]<0.{len(raw) + 1}>)")
+    ]
 
 
 def test_imap_understated_oversize_sequence_charges_aggregate_budget():
@@ -389,12 +412,13 @@ def test_imap_understated_oversize_sequence_charges_aggregate_budget():
         max_scan_bytes=50,
     )
 
-    assert source.fetch(since_days=7, max_messages=4) == []
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        source.fetch(since_days=7, max_messages=4)
     body_calls = [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]]
     assert body_calls == [("1", "(BODY.PEEK[]<0.51>)")]
 
 
-def test_imap_understated_actual_bytes_accept_exact_aggregate_boundary():
+def test_imap_exact_aggregate_boundary_with_remaining_candidate_fails_closed():
     fake = UnderstatedSizeImap(
         search_ids=[b"1", b"2", b"3"],
         messages_by_id={
@@ -411,9 +435,9 @@ def test_imap_understated_actual_bytes_accept_exact_aggregate_boundary():
         max_scan_bytes=50,
     )
 
-    result = source.fetch(since_days=7, max_messages=3)
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        source.fetch(since_days=7, max_messages=3)
 
-    assert [message.id for message in result] == ["1", "2"]
     assert [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]] == [
         ("1", "(BODY.PEEK[]<0.31>)"),
         ("2", "(BODY.PEEK[]<0.21>)"),
@@ -440,7 +464,7 @@ def test_imap_malformed_full_fetch_fails_closed_before_later_downloads():
         max_scan_bytes=200,
     )
 
-    with pytest.raises(MailSourceError, match="no RFC822 payload"):
+    with pytest.raises(mail_source.MailSourceOverflowError, match="malformed"):
         source.fetch(since_days=7, max_messages=2)
 
     assert [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]] == [
@@ -479,9 +503,10 @@ def test_imap_malformed_size_metadata_fails_closed_without_full_fetch():
         search_ids=[b"1"], messages_by_id={b"1": _base64_plain_raw()}
     )
 
-    assert ImapMailSource("me@example.com", "password", imap=fake).fetch(
-        since_days=7, max_messages=1
-    ) == []
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        ImapMailSource("me@example.com", "password", imap=fake).fetch(
+            since_days=7, max_messages=1
+        )
 
 
 def test_fetch_nonpositive_budget_does_no_imap_work():

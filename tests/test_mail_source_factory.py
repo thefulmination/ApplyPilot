@@ -210,6 +210,95 @@ def test_gmail_auth_source_never_requests_full_or_raw_message():
     assert len(service.messages_obj.metadata_calls) == 1
 
 
+def test_gmail_auth_first_candidate_exhausting_budget_with_remaining_overflows():
+    first = {
+        "id": "first",
+        "threadId": "first",
+        "sizeEstimate": 100,
+        "snippet": "Use verification code 111111 to continue.",
+        "payload": {"headers": []},
+    }
+    second = {
+        "id": "second",
+        "threadId": "second",
+        "sizeEstimate": 100,
+        "snippet": "Use verification code 222222 to continue.",
+        "payload": {"headers": []},
+    }
+    first_size = mail_source._gmail_auth_metadata_bytes(first, limit=10_000)
+    assert first_size is not None
+    service = _FakeGmailService(
+        {"messages": [{"id": "first"}, {"id": "second"}]},
+        {},
+        metadata_result={"first": first, "second": second},
+    )
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        GmailApiAuthMailSource(
+            build_service=lambda: service,
+            max_message_bytes=200,
+            max_scan_bytes=first_size,
+        ).fetch(since_days=7, max_messages=2)
+
+    assert len(service.messages_obj.metadata_calls) == 1
+
+
+def test_gmail_auth_exact_budget_without_remaining_candidate_succeeds():
+    metadata = {
+        "id": "only",
+        "threadId": "only",
+        "sizeEstimate": 100,
+        "snippet": "Use verification code 333333 to continue.",
+        "payload": {"headers": []},
+    }
+    actual_size = mail_source._gmail_auth_metadata_bytes(metadata, limit=10_000)
+    assert actual_size is not None
+    service = _FakeGmailService(
+        {"messages": [{"id": "only"}]},
+        {},
+        metadata_result=metadata,
+    )
+
+    messages = GmailApiAuthMailSource(
+        build_service=lambda: service,
+        max_message_bytes=200,
+        max_scan_bytes=actual_size,
+    ).fetch(since_days=7, max_messages=1)
+
+    assert [message.id for message in messages] == ["only"]
+
+
+def test_gmail_auth_oversized_candidate_with_remaining_fails_closed():
+    oversized = {
+        "id": "oversized",
+        "threadId": "oversized",
+        "sizeEstimate": 10,
+        "snippet": "A" * 100,
+        "payload": {"headers": []},
+    }
+    normal = {
+        "id": "normal",
+        "threadId": "normal",
+        "sizeEstimate": 10,
+        "snippet": "Use verification code 444444 to continue.",
+        "payload": {"headers": []},
+    }
+    service = _FakeGmailService(
+        {"messages": [{"id": "oversized"}, {"id": "normal"}]},
+        {},
+        metadata_result={"oversized": oversized, "normal": normal},
+    )
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        GmailApiAuthMailSource(
+            build_service=lambda: service,
+            max_message_bytes=50,
+            max_scan_bytes=200,
+        ).fetch(since_days=7, max_messages=2)
+
+    assert len(service.messages_obj.metadata_calls) == 1
+
+
 def test_gmail_api_exact_candidate_bound_remains_bounded():
     pages = [
         {
