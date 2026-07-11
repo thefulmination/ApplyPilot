@@ -30,7 +30,7 @@ from rich.live import Live
 from applypilot import config
 from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
-from applypilot.auth_event_storage import canonical_ats_sender_domain
+from applypilot.ats_domains import ATS_SENDER_DOMAINS
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
 from applypilot import inbox_auth
@@ -184,39 +184,6 @@ _agent_procs: dict[int, subprocess.Popen] = {}
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
 INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
-_COMMON_AUTH_VALUES = frozenset(
-    {"", "0", "1", "false", "true", "yes", "no", "continue", "verify", "login"}
-)
-_SENSITIVE_QUERY_KEY_PARTS = frozenset(
-    {
-        "auth",
-        "authentication",
-        "authorization",
-        "code",
-        "key",
-        "otp",
-        "secret",
-        "state",
-        "t",
-        "token",
-        "verification",
-        "verifier",
-        "verify",
-    }
-)
-_SENSITIVE_QUERY_KEY_COMPOUNDS = frozenset(
-    {
-        "accesstoken",
-        "apikey",
-        "authcode",
-        "authtoken",
-        "magiclinktoken",
-        "otpcode",
-        "secretkey",
-        "verificationcode",
-        "verifycode",
-    }
-)
 _SENSITIVE_PATH_MARKERS = frozenset(
     {
         "auth",
@@ -299,64 +266,13 @@ def _exact_secret_variants(value: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
-def _sensitive_query_key(value: str) -> bool:
-    decoded = unquote_plus(value).strip()
-    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", decoded)
-    parts = {
-        part.lower()
-        for part in re.split(r"[^A-Za-z0-9]+", separated)
-        if part
-    }
-    compact = re.sub(r"[^a-z0-9]", "", decoded.lower())
-    return bool(parts & _SENSITIVE_QUERY_KEY_PARTS) or (
-        compact in _SENSITIVE_QUERY_KEY_COMPOUNDS
-    )
-
-
-def _specific_auth_value(value: str, *, minimum: int) -> bool:
-    stripped = value.strip()
-    return (
-        len(stripped) >= minimum
-        and stripped.lower() not in _COMMON_AUTH_VALUES
-        and not any(character.isspace() for character in stripped)
-    )
-
-
-def _nontrivial_unknown_auth_value(value: str) -> bool:
-    literal = value
-    form_decoded = value
-    while True:
-        next_literal = unquote(literal)
-        if next_literal == literal:
-            break
-        literal = next_literal
-    while True:
-        next_form = unquote_plus(form_decoded)
-        if next_form == form_decoded:
-            break
-        form_decoded = next_form
-    return any(
-        _specific_auth_value(candidate, minimum=4)
-        for candidate in (literal, form_decoded)
-    )
-
-
-def _token_like_path_segment(value: str) -> bool:
-    if not re.fullmatch(r"[A-Za-z0-9._~%+-]+", value):
-        return False
-    has_alpha = any(character.isalpha() for character in value)
-    has_digit = any(character.isdigit() for character in value)
-    return len(value) >= (12 if has_alpha and has_digit else 16)
-
-
-def _token_like_subdomain_label(value: str) -> bool:
-    if not re.fullmatch(r"[A-Za-z0-9-]+", value):
-        return False
-    has_alpha = any(character.isalpha() for character in value)
-    has_digit = any(character.isdigit() for character in value)
-    return (len(value) >= 6 and has_digit) or (
-        len(value) >= 16 and has_alpha
-    )
+def _trusted_ats_host_suffix(hostname: str) -> str | None:
+    matches = [
+        domain
+        for domain in ATS_SENDER_DOMAINS
+        if hostname == domain or hostname.endswith(f".{domain}")
+    ]
+    return max(matches, key=lambda domain: (domain.count("."), len(domain))) if matches else None
 
 
 def _magic_link_secrets(url: str) -> set[str]:
@@ -380,14 +296,12 @@ def _magic_link_secrets(url: str) -> set[str]:
             secrets.add(variant)
 
     def add_parameter_token(token: str) -> None:
-        raw_key, separator, raw_value = token.partition("=")
+        _raw_key, separator, raw_value = token.partition("=")
         if not separator:
-            if _nontrivial_unknown_auth_value(token):
+            if token:
                 add_variants(token)
             return
-        if _sensitive_query_key(raw_key) or _nontrivial_unknown_auth_value(
-            raw_value
-        ):
+        if raw_value:
             add_variants(raw_value)
 
     add_variants(url)
@@ -402,11 +316,11 @@ def _magic_link_secrets(url: str) -> set[str]:
                 add_variants(password)
 
         hostname = parsed.hostname or ""
-        canonical_domain = canonical_ats_sender_domain(hostname)
-        if canonical_domain and hostname.endswith(f".{canonical_domain}"):
-            prefix = hostname[: -(len(canonical_domain) + 1)]
+        trusted_suffix = _trusted_ats_host_suffix(hostname)
+        if trusted_suffix and hostname.endswith(f".{trusted_suffix}"):
+            prefix = hostname[: -(len(trusted_suffix) + 1)]
             for label in prefix.split("."):
-                if _token_like_subdomain_label(label):
+                if label:
                     add_variants(label)
 
         for raw_component in (parsed.query, parsed.fragment):
@@ -430,8 +344,7 @@ def _magic_link_secrets(url: str) -> set[str]:
             if normalized in _SENSITIVE_PATH_MARKERS:
                 expect_path_secret = True
                 continue
-            variants = _exact_secret_variants(path_value)
-            if any(_token_like_path_segment(variant) for variant in variants):
+            if path_value:
                 add_variants(path_value)
     return secrets
 
