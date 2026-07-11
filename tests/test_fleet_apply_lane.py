@@ -37,16 +37,21 @@ def test_canary_caps_total_leases_fleetwide(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_approved_apply_rows(conn, 5)
         with conn.cursor() as cur:
-            cur.execute("UPDATE fleet_config SET canary_enabled=TRUE, canary_remaining=2, paused=FALSE WHERE id=1")
+            cur.execute(
+                "UPDATE fleet_config SET ats_apply_mode='canary', "
+                "canary_enabled=TRUE, canary_remaining=2, paused=FALSE WHERE id=1"
+            )
         conn.commit()
         a = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
         b = queue.lease_apply(conn, "w2", home_ip="1.1.1.1")
         c = queue.lease_apply(conn, "w3", home_ip="1.1.1.1")
     assert a is not None and b is not None and c is None  # exactly 2 leases
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT canary_remaining, paused FROM fleet_config WHERE id=1")
+        cur.execute("SELECT canary_remaining, paused, ats_apply_mode FROM fleet_config WHERE id=1")
         row = cur.fetchone()
-        assert row["canary_remaining"] == 0 and row["paused"] is True
+        assert row["canary_remaining"] == 0
+        assert row["paused"] is False
+        assert row["ats_apply_mode"] == "stopped"
 
 
 def test_canary_atomic_under_concurrency(fleet_db):
@@ -55,7 +60,10 @@ def test_canary_atomic_under_concurrency(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_approved_apply_rows(conn, 8)
         with conn.cursor() as cur:
-            cur.execute("UPDATE fleet_config SET canary_enabled=TRUE, canary_remaining=1, paused=FALSE WHERE id=1")
+            cur.execute(
+                "UPDATE fleet_config SET ats_apply_mode='canary', "
+                "canary_enabled=TRUE, canary_remaining=1, paused=FALSE WHERE id=1"
+            )
         conn.commit()
 
     def _lease(i):
@@ -67,10 +75,10 @@ def test_canary_atomic_under_concurrency(fleet_db):
     assert sum(results) == 1  # exactly one of eight workers leased
 
 
-def test_canary_disabled_does_not_decrement(fleet_db):
+def test_steady_mode_with_canary_disabled_does_not_decrement(fleet_db):
     from applypilot.fleet import queue
     with pgqueue.connect(fleet_db) as conn:
-        _seed_approved_apply_rows(conn, 1)  # canary disabled by fixture default
+        _seed_approved_apply_rows(conn, 1)  # steady mode with canary disabled by fixture default
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is not None
         with conn.cursor() as cur:
             cur.execute("SELECT canary_remaining FROM fleet_config WHERE id=1")

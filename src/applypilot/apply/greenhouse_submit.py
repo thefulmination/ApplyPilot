@@ -15,6 +15,7 @@ canary / approval / cost guards.
 from __future__ import annotations
 
 import os
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 
 from applypilot.apply.greenhouse_adapter import AnswerPlan
@@ -52,15 +53,39 @@ _SUCCESS_MARKERS = (
 )
 
 
-def detect_confirmation(page) -> str:
+_SUCCESS_PATH_PARTS = frozenset({"confirmation", "confirmed", "thank-you", "thank_you", "thanks"})
+
+
+def _completion_url_confirmed(url: str) -> bool:
+    """Accept only explicit completion routes or query values, never a generic job URL."""
+    try:
+        parsed = urlparse(url or "")
+        parts = {part.lower() for part in parsed.path.split("/") if part}
+        if parts & _SUCCESS_PATH_PARTS:
+            return True
+        query = parse_qs(parsed.query)
+        values = {value.lower() for group in query.values() for value in group}
+        return bool(values & {"submitted", "complete", "completed", "success"})
+    except Exception:
+        return False
+
+
+def detect_confirmation(page, *, inbox_confirmed: bool = False) -> str:
     """Inspect the post-submit page. Return 'applied' only on positive
     confirmation, else 'failed:no_confirmation'. Never raises."""
+    if inbox_confirmed:
+        return "applied"
     try:
         html = (page.content() or "").lower()
     except Exception:
-        return "failed:no_confirmation"
+        html = ""
     if any(marker in html for marker in _SUCCESS_MARKERS):
         return "applied"
+    try:
+        if _completion_url_confirmed(str(page.url)):
+            return "applied"
+    except Exception:
+        pass
     return "failed:no_confirmation"
 
 # Greenhouse hosted-form input ids equal the API field name (e.g. id="first_name",
@@ -78,9 +103,11 @@ class FormAction:
 @dataclass
 class SubmitReport:
     filled: list = field(default_factory=list)   # selectors acted on (excluding submit)
+    submit_attempted: bool = False
     submitted: bool = False
     dry_run: bool = True
     skipped_submit: bool = False
+    submit_error: str | None = None
 
 
 def plan_form_actions(plan: AnswerPlan, questions, *, resume_path=None) -> list[FormAction]:
@@ -124,8 +151,15 @@ def execute_form(actions, page, *, dry_run: bool = True) -> SubmitReport:
             if dry_run:
                 report.skipped_submit = True
                 continue
-            page.click(a.selector)
-            report.submitted = True
+            # Record ownership before dispatch. A browser exception can happen after
+            # the click reached the page, so retrying through an agent would risk a
+            # duplicate application.
+            report.submit_attempted = True
+            try:
+                page.click(a.selector)
+                report.submitted = True
+            except Exception as exc:
+                report.submit_error = type(exc).__name__
             continue
         if a.kind == "file":
             page.set_input_files(a.selector, a.value)
@@ -167,6 +201,7 @@ def capture_answers(plan, questions, job, *, remember_fn=None) -> int:
 
 def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
                      corpus=None, fetch=None, answer_fn=None, remember_fn=None,
+                     inbox_confirmation_fn=None,
                      dry_run: bool = True) -> dict:
     """End-to-end: parse -> fetch questions -> plan -> route.
 
@@ -197,9 +232,22 @@ def apply_greenhouse(job_url, *, profile, resume_text, resume_path, page,
     report = execute_form(actions, page, dry_run=dry_run)
     result = {"route": "deterministic", "plan": plan, "actions": actions,
               "report": report, "ready": True}
-    if report.submitted:
-        result["status"] = detect_confirmation(page)
+    if report.submit_attempted:
+        inbox_confirmed = False
+        if inbox_confirmation_fn is not None:
+            try:
+                inbox_confirmed = bool(inbox_confirmation_fn(board=board, job_id=job_id))
+            except Exception:
+                inbox_confirmed = False
+        result["status"] = detect_confirmation(page, inbox_confirmed=inbox_confirmed)
         if result["status"] == "applied":
-            result["captured"] = capture_answers(plan, questions, {"site": board},
-                                                  remember_fn=remember_fn)
+            try:
+                result["captured"] = capture_answers(
+                    plan, questions, {"site": board}, remember_fn=remember_fn
+                )
+            except Exception:
+                # Corpus persistence is an optimization after submission. It cannot
+                # invalidate positive submission evidence or release agent fallback.
+                result["captured"] = 0
+                result["capture_failed"] = True
     return result

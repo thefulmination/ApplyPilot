@@ -154,6 +154,13 @@ def _insert_leased(conn, url, *, owner, attempts, apply_error, expires_delta_sec
 # Tests
 # ---------------------------------------------------------------------------
 
+def test_get_dsn_prefers_applypilot_specific_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://live.example/postgres")
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://test.example/postgres")
+
+    assert pgqueue.get_dsn() == "postgresql://test.example/postgres"
+
+
 def test_ensure_schema_is_idempotent(db):
     with pgqueue.connect(db) as conn:
         pgqueue.ensure_schema(conn)   # second run must not raise

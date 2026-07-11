@@ -13,6 +13,7 @@ from applypilot.config import APPLICATION_EXPORT_DIR
 from applypilot.outcome_dashboard import build_application_rows
 from applypilot.outcome_implied import implied_status
 from applypilot.outcome_lane_signal import annotate_job_signal, compute_lane_report
+from applypilot.outcome_review import build_effective_events
 
 _RAW_EVENTS_SQL = (
     "SELECT message_id, thread_id, job_url, occurred_at, sender, sender_domain, subject, "
@@ -54,6 +55,7 @@ def export_outcome_events(output_dir: str | Path | None = None, *, conn=None) ->
 
     email_events = [_row_to_dict(r) for r in conn.execute(_RAW_EVENTS_SQL).fetchall()]
     rows = build_application_rows(conn)
+    effective_events = build_effective_events(conn, include_ignored=True)
     report = compute_lane_report(rows)
     timelines = []
     for row in rows:
@@ -72,6 +74,9 @@ def export_outcome_events(output_dir: str | Path | None = None, *, conn=None) ->
         "exported_at": _now(),
         "email_events_exported": len(email_events),
         "outcome_timelines_exported": len(timelines),
+        "trusted_event_count": sum(1 for event in effective_events if event.get("is_trusted")),
+        "excluded_event_count": sum(1 for event in effective_events if event.get("excluded")),
+        "needs_review_event_count": sum(1 for event in effective_events if event.get("needs_action")),
         "email_events_path": str(events_path),
         "outcome_timelines_path": str(timelines_path),
         "output_dir": str(destination),

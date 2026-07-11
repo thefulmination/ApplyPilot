@@ -22,7 +22,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from applypilot import config
+from applypilot import config, inbox_auth
 from applypilot.mail_source import ImapMailSource, MailSourceError
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,8 @@ STALL_HOURS = 3         # stalled_queue: how long without an 'applied' row count
 HOT_FRACTION = 0.95     # running_hot: fraction of cost_cap_daily_usd that counts as "hot"
 HOT_STREAK_MIN = 2      # running_hot: consecutive hot checks required before alerting
 OWNER_INBOX_WINDOW_MIN = 30
+OTP_STALL_SECONDS_DEFAULT = 120
+OTP_STALL_SECONDS_MIN = 30
 
 _WATCHDOG_OR_LINKEDIN_RE = re.compile(r"watchdog|linkedin")
 _WATCHDOG_RE = re.compile(r"watchdog")
@@ -159,25 +161,87 @@ def _check_running_hot(
     return None, 0
 
 
-def _check_otp_relay(conn, now: dt.datetime, gmail_token_ok: bool | None) -> Alert | None:
-    """The OTP relay (otp_responder + the home Gmail token) gives the WHOLE fleet its
-    email-verification / two-step (2FA) capability: remote workers file otp_request rows and
-    the home box reads Gmail to answer them (otp_relay.answer_pending). It is DOWN if the
-    backing Gmail token is dead (`gmail_token_ok is False` -> the responder can't read codes,
-    so every email-2FA apply stalls) OR if a once-running otp_responder stopped heartbeating.
-    `gmail_token_ok` is injected (None = couldn't check -> skip). The heartbeat is only alarmed
-    when a row EXISTS but is stale (absent = the relay simply isn't in use). Not armed-gated:
-    a dead relay matters whenever the fleet applies."""
-    reasons: list[str] = []
+def _otp_stall_seconds() -> int:
+    raw = os.environ.get("APPLYPILOT_OTP_STALL_SECONDS")
+    if raw is None:
+        return OTP_STALL_SECONDS_DEFAULT
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        return OTP_STALL_SECONDS_DEFAULT
+    return max(configured, OTP_STALL_SECONDS_MIN)
+
+
+def _active_otp_demand(conn, now: dt.datetime) -> tuple[int, dt.datetime | None]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS pending_count, "
+            "MIN(wait_started_at) AS oldest_wait_started_at "
+            "FROM otp_request "
+            "WHERE code IS NULL AND consumed_at IS NULL "
+            "AND wait_started_at IS NOT NULL "
+            "AND requested_at <= %s AND expires_at > %s",
+            (now, now),
+        )
+        row = cur.fetchone()
+    if not row:
+        return 0, None
+    return int(row["pending_count"]), row["oldest_wait_started_at"]
+
+
+def _check_otp_relay(
+    conn, now: dt.datetime, gmail_token_ok: bool | None
+) -> list[Alert]:
+    """Report relay health and delivery stalls without exposing request data."""
+    alerts: list[Alert] = []
+    relay_down_reasons: list[str] = []
     if gmail_token_ok is False:
-        reasons.append("Gmail token dead -- can't read verification codes")
+        relay_down_reasons.append("mail source authentication failed")
+
+    pending_count, oldest_wait_started_at = _active_otp_demand(conn, now)
     otp_beat = _max_last_beat(conn, "otp_responder", negate=False)
-    if otp_beat is not None and otp_beat < now - dt.timedelta(minutes=STALE_MIN):
-        reasons.append(f"otp_responder heartbeat stale ({otp_beat.isoformat()})")
-    if reasons:
-        return Alert(kind="otp_relay_down", severity="critical",
-                     detail="OTP relay down: " + "; ".join(reasons))
-    return None
+    stale_before = now - dt.timedelta(minutes=STALE_MIN)
+    if otp_beat is None and pending_count:
+        relay_down_reasons.append(
+            f"responder heartbeat absent with {pending_count} active wait(s)"
+        )
+    elif otp_beat is not None and otp_beat < stale_before:
+        stale_seconds = max(0, int((now - otp_beat).total_seconds()))
+        relay_down_reasons.append(
+            f"responder heartbeat stale by {stale_seconds}s"
+        )
+
+    if relay_down_reasons:
+        alerts.append(
+            Alert(
+                kind="otp_relay_down",
+                severity="critical",
+                detail="OTP relay down: " + "; ".join(relay_down_reasons),
+            )
+        )
+
+    responder_fresh = otp_beat is not None and otp_beat >= stale_before
+    if (
+        pending_count
+        and oldest_wait_started_at is not None
+        and responder_fresh
+        and gmail_token_ok is True
+    ):
+        wait_age = max(dt.timedelta(0), now - oldest_wait_started_at)
+        wait_age_seconds = int(wait_age.total_seconds())
+        if wait_age.total_seconds() > _otp_stall_seconds():
+            alerts.append(
+                Alert(
+                    kind="otp_delivery_stalled",
+                    severity="critical",
+                    detail=(
+                        f"{pending_count} active wait(s); oldest age "
+                        f"{wait_age_seconds}s; responder and mail source healthy"
+                    ),
+                )
+            )
+
+    return alerts
 
 
 def _check_owner_inbox_backlog(conn, cfg: dict, now: dt.datetime) -> Alert | None:
@@ -251,9 +315,7 @@ def deadman_check(
     if selfheal:
         alerts.append(selfheal)
 
-    otp = _check_otp_relay(conn, now, gmail_token_ok)
-    if otp:
-        alerts.append(otp)
+    alerts.extend(_check_otp_relay(conn, now, gmail_token_ok))
 
     owner_inbox = _check_owner_inbox_backlog(conn, cfg, now)
     if owner_inbox:
@@ -323,7 +385,11 @@ def mail_source_alive() -> bool | None:
         return gmail_token_alive()
 
     try:
-        ImapMailSource(creds[0], creds[1]).fetch(since_days=1, max_messages=1)
+        ImapMailSource(creds[0], creds[1]).fetch(
+            since_days=1,
+            max_messages=1,
+            gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
+        )
         return True
     except MailSourceError:
         return False

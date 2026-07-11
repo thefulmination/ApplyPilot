@@ -28,12 +28,15 @@ _JOBS_DDL = """
 CREATE TABLE jobs (
     url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
     audit_score REAL, fit_score INTEGER, full_description TEXT, liveness_status TEXT,
+    last_verified_live TEXT, liveness_reason TEXT,
     apply_status TEXT, apply_error TEXT, duplicate_of_url TEXT,
     applied_at TEXT, agent_id TEXT, verification_confidence TEXT,
     apply_duration_ms INTEGER, apply_attempts INTEGER DEFAULT 0,
     research_fit_score REAL, research_decision TEXT,
     discovered_at TEXT, decision_source TEXT, fit_gap_category TEXT,
     recommended_action TEXT, audit_flags TEXT,
+    linkedin_resolve_status TEXT, linkedin_resolved_at TEXT,
+    linkedin_resolve_error TEXT,
     linkedin_unresolved_kind TEXT, linkedin_next_action TEXT
 );
 """
@@ -85,7 +88,8 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
         assert n == 1
         with pg.cursor() as cur:
             cur.execute("SELECT url, target_host, apply_domain, dedup_key, approved_batch, "
-                        "lane, status FROM apply_queue")
+                        "lane, status, liveness_required, eligibility_required, "
+                        "eligibility_status, eligibility_reason FROM apply_queue")
             rows = cur.fetchall()
 
     assert len(rows) == 1
@@ -96,6 +100,10 @@ def test_push_apply_eligible_filters_and_stamps(fleet_db, tmp_path):
     assert row["approved_batch"] == "batch-A"
     assert row["lane"] == "ats"
     assert row["status"] == "queued"
+    assert row["liveness_required"] is True
+    assert row["eligibility_required"] is True
+    assert row["eligibility_status"] == "eligible"
+    assert row["eligibility_reason"] == "no_deterministic_exclusion"
     # dedup_key is the board-agnostic (company, role) hash -- present + correct.
     assert row["dedup_key"]
     from applypilot.fleet import dedup
@@ -158,6 +166,53 @@ def test_push_apply_eligible_retires_existing_applied_set_duplicates(fleet_db, t
     assert row["approved_batch"] == "old-batch"
 
 
+def test_push_apply_eligible_retires_queued_rows_marked_dead_in_home_db(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/alive/jobs/1", company="Acme", title="Chief of Staff")
+    _add_job(
+        sq,
+        "https://boards.greenhouse.io/dead/jobs/1",
+        company="Dead Co",
+        title="Former PM",
+        application_url="https://boards.greenhouse.io/dead/jobs/apply/1",
+        liveness_status="dead",
+    )
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO apply_queue (url, company, title, application_url, score, lane, status, approved_batch)
+                VALUES
+                  ('https://boards.greenhouse.io/dead/jobs/1', 'Dead Co', 'Former PM',
+                   'https://boards.greenhouse.io/dead/jobs/apply/1', 9.0, 'ats', 'queued', 'legacy'),
+                  ('https://boards.greenhouse.io/dead/jobs/mapped-by-appurl', 'Dead Co', 'Former PM',
+                   'https://boards.greenhouse.io/dead/jobs/apply/1', 9.0, 'ats', 'queued', 'legacy'),
+                  ('https://boards.greenhouse.io/other/jobs/1', 'Other Co', 'Other', 'https://boards.greenhouse.io/other/jobs/apply/1', 9.0, 'ats', 'queued', 'legacy')
+                """
+            )
+        pg.commit()
+        sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, approved_batch="batch-A")
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT url, status, apply_status, apply_error FROM apply_queue "
+                "WHERE url IN ("
+                " 'https://boards.greenhouse.io/alive/jobs/1',"
+                " 'https://boards.greenhouse.io/dead/jobs/1',"
+                " 'https://boards.greenhouse.io/dead/jobs/mapped-by-appurl',"
+                " 'https://boards.greenhouse.io/other/jobs/1'"
+                ") ORDER BY url"
+            )
+            rows = {r["url"]: r for r in cur.fetchall()}
+
+    assert rows["https://boards.greenhouse.io/dead/jobs/1"]["status"] == "failed"
+    assert rows["https://boards.greenhouse.io/dead/jobs/1"]["apply_status"] == "failed"
+    assert rows["https://boards.greenhouse.io/dead/jobs/1"]["apply_error"] == "expired"
+    assert rows["https://boards.greenhouse.io/dead/jobs/mapped-by-appurl"]["status"] == "failed"
+    assert rows["https://boards.greenhouse.io/dead/jobs/mapped-by-appurl"]["apply_status"] == "failed"
+    assert rows["https://boards.greenhouse.io/dead/jobs/mapped-by-appurl"]["apply_error"] == "expired"
+
+    assert rows["https://boards.greenhouse.io/alive/jobs/1"]["status"] == "queued"
+    assert rows["https://boards.greenhouse.io/other/jobs/1"]["status"] == "queued"
 def test_push_apply_eligible_can_opt_into_research_scores(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://boards.greenhouse.io/research/jobs/1",
@@ -179,6 +234,26 @@ def test_push_apply_eligible_can_opt_into_research_scores(fleet_db, tmp_path):
     assert len(rows) == 1
     assert rows[0]["url"].endswith("/research/jobs/1")
     assert float(rows[0]["score"]) == 8.0
+
+
+def test_push_apply_eligible_accepts_decimal_score_floor(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/58",
+             company="Acme Inc", title="Chief of Staff", audit_score=5.8)
+    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/57",
+             company="Acme Inc", title="BizOps Analyst", audit_score=5.7)
+
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(
+            sqlite_conn=sq, pg_conn=pg, score_floor=5.8, approved_batch="batch-A", limit=None
+        )
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url, score FROM apply_queue ORDER BY url")
+            rows = cur.fetchall()
+
+    assert [r["url"] for r in rows] == ["https://boards.greenhouse.io/acme/jobs/58"]
+    assert float(rows[0]["score"]) == 5.8
 
 
 def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
@@ -281,9 +356,11 @@ def test_push_apply_eligible_can_disable_lane_filter(fleet_db, tmp_path):
 def test_push_linkedin_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://www.linkedin.com/jobs/view/acme",
-             company="Acme", title="Chief of Staff", audit_score=9.0)
+             company="Acme", title="Chief of Staff", audit_score=9.0,
+             linkedin_resolve_status="easy_apply", linkedin_resolved_at="2026-07-06T12:00:00")
     _add_job(sq, "https://www.linkedin.com/jobs/view/openai",
-             company="OpenAI", title="Strategy", audit_score=10.0)
+             company="OpenAI", title="Strategy", audit_score=10.0,
+             linkedin_resolve_status="easy_apply", linkedin_resolved_at="2026-07-06T12:00:00")
 
     with pgqueue.connect(fleet_db) as pg:
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg,
@@ -304,22 +381,33 @@ def test_push_linkedin_eligible_carries_resolver_metadata(fleet_db, tmp_path):
         company="Acme",
         title="Chief of Staff",
         audit_score=9.0,
+        linkedin_resolve_status="easy_apply",
+        linkedin_resolved_at="2026-07-06T12:00:00",
+        linkedin_resolve_error="no_primary_apply_button",
         linkedin_unresolved_kind="apply_button_missing",
         linkedin_next_action="run_ats_reconstruction",
     )
 
     with pgqueue.connect(fleet_db) as pg:
-        n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg,
-                                        score_floor=7, approved_batch="batch-L", limit=None)
+        n = sync.push_linkedin_eligible(
+            sqlite_conn=sq,
+            pg_conn=pg,
+            score_floor=7,
+            approved_batch="batch-L",
+            limit=None,
+        )
         assert n == 1
         with pg.cursor() as cur:
-            cur.execute("""
-                SELECT linkedin_unresolved_kind, linkedin_next_action
+            cur.execute(
+                """
+                SELECT linkedin_resolve_error, linkedin_unresolved_kind, linkedin_next_action
                   FROM linkedin_queue
                  WHERE url = 'https://www.linkedin.com/jobs/view/metadata'
-            """)
+                """
+            )
             row = cur.fetchone()
 
+    assert row["linkedin_resolve_error"] == "no_primary_apply_button"
     assert row["linkedin_unresolved_kind"] == "apply_button_missing"
     assert row["linkedin_next_action"] == "run_ats_reconstruction"
 
@@ -342,6 +430,29 @@ def test_push_apply_eligible_excludes_crash_unconfirmed(fleet_db, tmp_path):
     assert any(u.endswith("/ok/jobs/1") for u in urls)
     assert not any(("/cu/jobs/2" in u or "/ce/jobs/3" in u) for u in urls), \
         "a crash_unconfirmed / no_confirmation posting must not be re-pushed"
+
+
+def test_push_apply_eligible_excludes_exhausted_attempts(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://boards.greenhouse.io/ok/jobs/1", company="OK", title="COS")
+    _add_job(
+        sq,
+        "https://boards.greenhouse.io/exhausted/jobs/2",
+        company="Exhausted",
+        title="Ops",
+        audit_score=9.0,
+        apply_status="failed",
+        apply_error="expired",
+        apply_attempts=99,
+    )
+    with pgqueue.connect(fleet_db) as pg:
+        n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="b1")
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("SELECT url FROM apply_queue")
+            urls = {r["url"] for r in cur.fetchall()}
+    assert any(u.endswith("/ok/jobs/1") for u in urls)
+    assert not any("/exhausted/jobs/2" in u for u in urls)
 
 
 def test_push_apply_eligible_respects_limit(fleet_db, tmp_path):
@@ -380,6 +491,11 @@ def test_pull_apply_results_maps_applied_and_idempotent(fleet_db, tmp_path):
     _add_job(sq, url, company="Acme", title="COS")
     with pgqueue.connect(fleet_db) as pg:
         sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, approved_batch="b1")
+        check = fleet_queue.claim_liveness_check(pg, "preflight-w1")
+        assert check is not None and check["url"] == url
+        assert fleet_queue.write_liveness_result(
+            pg, "preflight-w1", url, status="live", reason="greenhouse_api_200"
+        )
         job = fleet_queue.lease_apply(pg, "w1", home_ip="1.2.3.4")
         assert job is not None and job["url"] == url
         ok = fleet_queue.write_apply_result(
@@ -419,6 +535,11 @@ def test_pull_apply_results_blocked_maps_to_failed_and_pins(fleet_db, tmp_path):
     _add_job(sq, url, company="Acme", title="COS")
     with pgqueue.connect(fleet_db) as pg:
         sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, approved_batch="b1")
+        check = fleet_queue.claim_liveness_check(pg, "preflight-w1")
+        assert check is not None and check["url"] == url
+        assert fleet_queue.write_liveness_result(
+            pg, "preflight-w1", url, status="live", reason="lever_api_200"
+        )
         job = fleet_queue.lease_apply(pg, "w1", home_ip="1.2.3.4")
         fleet_queue.write_apply_result(
             pg, "w1", job["url"], status="blocked", target_host="jobs.lever.co",
@@ -625,6 +746,57 @@ def test_pull_linkedin_results_maps_applied_and_idempotent(fleet_db, tmp_path):
 
         # re-pull is a no-op (linkedin_queue row stamped synced_to_home_at)
         assert sync.pull_linkedin_results(sqlite_conn=sq, pg_conn=pg) == {}
+
+
+def test_registered_tenant_stages_opaque_session_profile(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    url = "https://acme.wd5.myworkdayjobs.com/site/job/Role/JR-session"
+    _add_job(sq, url, company="Acme", title="Role")
+    from applypilot import tenants
+    from applypilot import database
+    from applypilot.apply import tenant_sessions
+
+    database.ensure_tenant_tables(sq)
+    tenants.set_tenant(sq, "acme.wd5.myworkdayjobs.com", "supervised")
+    with pgqueue.connect(fleet_db) as pg:
+        sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg, approved_batch="session-batch")
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT session_required, tenant_profile_id FROM apply_queue WHERE url=%s",
+                (url,),
+            )
+            row = cur.fetchone()
+    assert row["session_required"] is True
+    assert row["tenant_profile_id"] == tenant_sessions.profile_id_for_host(
+        "acme.wd5.myworkdayjobs.com"
+    )
+
+
+def test_pull_linkedin_results_marks_expired_jobs_dead(fleet_db, tmp_path):
+    sq = _home_sqlite(tmp_path)
+    url = "https://www.linkedin.com/jobs/view/expired"
+    _add_job(sq, url, company="Acme", title="COS", liveness_status="live")
+    with pgqueue.connect(fleet_db) as pg:
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score, status, apply_error) "
+                "VALUES (%s,%s,%s,'failed','expired')",
+                (url, url, 8.0),
+            )
+        pg.commit()
+
+        assert sync.pull_linkedin_results(sqlite_conn=sq, pg_conn=pg).get("failed") == 1
+        brain = sq.execute(
+            "SELECT apply_status, apply_error, liveness_status, liveness_reason, last_verified_live "
+            "FROM jobs WHERE url=?",
+            (url,),
+        ).fetchone()
+
+    assert brain["apply_status"] == "failed"
+    assert brain["apply_error"] == "expired"
+    assert brain["liveness_status"] == "dead"
+    assert brain["liveness_reason"] == "fleet_result_expired"
+    assert brain["last_verified_live"] is not None
 
 
 def test_lane_pulls_do_not_cross_consume(fleet_db, tmp_path):

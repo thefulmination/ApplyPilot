@@ -33,6 +33,9 @@ def _seed(conn):
 def test_export_writes_both_jsonl_with_enrichment(tmp_path):
     conn = database.init_db(tmp_path / "applypilot.db")
     _seed(conn)
+    from applypilot.outcome_review import record_review
+
+    record_review(conn, "m2", resolution="ignored")
     out = tmp_path / "exp"
     summary = export_outcome_events(output_dir=out, conn=conn)
 
@@ -45,14 +48,20 @@ def test_export_writes_both_jsonl_with_enrichment(tmp_path):
 
     tl = timelines[0]
     assert tl["job_url"] == "https://acme/1"
-    assert tl["outcome"] == "rejected"
-    assert tl["implied_status"]["implied_status"] == "rejected"   # #3 field, inert
+    assert tl["outcome"] is None
+    assert tl["trust_state"] == "trusted"
+    assert tl["trusted_event_count"] == 1
+    assert tl["excluded_event_count"] == 1
+    assert tl["implied_status"] is None
     assert "outcome_signal" in tl                                 # #5 field, advisory
     # body_text stripped from timeline events (lean); snippet kept
     assert "body_text" not in tl["events"][0]
     assert tl["events"][0]["snippet"] == "hello"
+    assert tl["events"][0]["trust_state"] == "trusted"
     # raw archive carries body_text (lossless)
     assert next(e for e in events if e["message_id"] == "m1")["body_text"] == "hello"
     # summary sidecar is written to disk
     summary_on_disk = json.loads((out / "outcomes_summary.json").read_text(encoding="utf-8"))
     assert summary_on_disk["email_events_exported"] == 2
+    assert summary_on_disk["trusted_event_count"] == 1
+    assert summary_on_disk["excluded_event_count"] == 1

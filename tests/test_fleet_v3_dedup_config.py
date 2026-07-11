@@ -49,6 +49,15 @@ def test_approval_policy_roundtrip(fleet_db):
     assert abs(float(cfg["approval_sampling_rate"]) - 0.1) < 1e-6
 
 
+def test_approval_policy_rejects_threshold_below_hard_floor(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        try:
+            fcfg.set_approval_policy(conn, threshold=5.7)
+            assert False, "approval threshold below 5.8 must be rejected"
+        except ValueError as exc:
+            assert "threshold" in str(exc)
+
+
 def test_cost_caps_and_pause(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         fcfg.set_cost_caps(conn, daily_usd=5.0, total_usd=50.0)

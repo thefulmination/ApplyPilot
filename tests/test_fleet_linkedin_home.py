@@ -5,8 +5,11 @@ from applypilot.apply import pgqueue
 def test_linkedin_approve_gated_by_canary(fleet_db):
     from applypilot.fleet import linkedin_home_main as hm, queue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane) "
-                    "VALUES ('q1','https://linkedin.com/jobs/1','9','queued','ats')")
+        cur.execute(
+            "INSERT INTO linkedin_queue "
+            "(url, application_url, score, status, lane, linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES ('q1','https://linkedin.com/jobs/1','9','queued','ats','easy_apply',now())"
+        )
         conn.commit()
         try:
             hm.approve(conn, all_pushed=True); assert False, "must refuse without canary"

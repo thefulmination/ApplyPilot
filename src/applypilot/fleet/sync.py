@@ -19,7 +19,9 @@ schema, profile, and local paths never cross. See spec S2 / S8 / S8.5 / S10.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -27,8 +29,12 @@ import pandas as pd
 
 from applypilot import config, database
 from applypilot.apply import pgqueue
+from applypilot.apply import tenant_sessions as _tenant_sessions
 from applypilot.database import THIN_DESCRIPTION_CHARS
 from applypilot.fleet import dedup as _dedup
+from applypilot.fleet import eligibility as _eligibility
+from applypilot.fleet import tenant_router as _tenant_router
+from applypilot.fleet import host_framework as _host_framework
 from applypilot.fleet import queue as _queue
 from applypilot.discovery.jobspy import store_jobspy_results
 
@@ -44,7 +50,7 @@ from applypilot.discovery.jobspy import store_jobspy_results
 # crash_unconfirmed / no_confirmation are EXCLUDED (v1 parity): a posting that may
 # already have been submitted under the user's name must never be re-pushed/re-applied.
 _PUSH_APPLY_SELECT = """
-SELECT url, company, title, application_url,
+SELECT url, company, title, application_url, {location_expr}, full_description,
        CAST({score_expr} AS REAL) AS score
 FROM jobs
 WHERE duplicate_of_url IS NULL
@@ -53,6 +59,7 @@ WHERE duplicate_of_url IS NULL
   AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
+  AND COALESCE(apply_attempts, 0) < {max_apply_attempts}
   AND application_url LIKE 'http%'
   AND application_url NOT LIKE '%linkedin.com%'
   {company_blocklist}
@@ -74,6 +81,42 @@ def _applications_table_exists(sqlite_conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'"
     ).fetchone()
     return row is not None
+
+
+def _tenant_route_policy(sqlite_conn: sqlite3.Connection, host: str) -> dict:
+    try:
+        row = sqlite_conn.execute(
+            "SELECT status, profile_id, session_state, halted_until FROM ats_tenants WHERE host = ?",
+            (host,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is None:
+        return _host_framework.unregistered_host_policy(host)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    adapter_enabled = os.environ.get("APPLYPILOT_WORKDAY_ADAPTER_ENABLED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    adapter_supported = adapter_enabled and host.endswith(
+        ("myworkdayjobs.com", "myworkdaysite.com", "workdayjobs.com")
+    )
+    decision = _tenant_router.route_tenant(
+        tenant_status=row["status"],
+        session_state=row["session_state"],
+        adapter_supported=adapter_supported,
+        halted=bool(row["halted_until"] and now_iso < row["halted_until"]),
+    )
+    return {
+        "session_required": row["status"] in {"supervised", "trusted"},
+        "tenant_profile_id": row["profile_id"] or _tenant_sessions.profile_id_for_host(host),
+        "routing_required": decision.routing_required,
+        "execution_route": decision.route,
+        "host_policy": decision.reason,
+    }
+
+
+def _jobs_column_exists(sqlite_conn: sqlite3.Connection, column: str) -> bool:
+    return any(row[1] == column for row in sqlite_conn.execute("PRAGMA table_info(jobs)").fetchall())
 
 
 def _company_blocklist_sql() -> tuple[str, list[str]]:
@@ -157,6 +200,43 @@ def backfill_applied_set(sqlite_conn: sqlite3.Connection, pg_conn: Any) -> int:
     return n
 
 
+def _dead_urls(sqlite_conn: sqlite3.Connection) -> tuple[list[str], list[str]]:
+    """Return URL + effective URL lists for local jobs marked dead."""
+    rows = sqlite_conn.execute(
+        "SELECT url, application_url FROM jobs WHERE COALESCE(liveness_status, '') = 'dead'"
+    ).fetchall()
+    urls = [r["url"] for r in rows if r["url"]]
+    app_urls = [r["application_url"] for r in rows if r["application_url"]]
+    return urls, app_urls
+
+
+def _stale_linkedin_urls(
+    sqlite_conn: sqlite3.Connection,
+    *,
+    max_age_days: int | None,
+) -> tuple[list[str], list[str]]:
+    if not max_age_days or int(max_age_days) <= 0:
+        return [], []
+
+    rows = sqlite_conn.execute(
+        """
+        SELECT url,
+               CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END AS application_url
+          FROM jobs
+         WHERE (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
+           AND (
+                discovered_at IS NULL
+                OR julianday(discovered_at) IS NULL
+                OR julianday(discovered_at) < julianday('now', ?)
+           )
+        """,
+        (f"-{int(max_age_days)} days",),
+    ).fetchall()
+    urls = [r["url"] for r in rows if r["url"]]
+    app_urls = [r["application_url"] for r in rows if r["application_url"]]
+    return urls, app_urls
+
+
 def _target_host(application_url: str | None) -> str | None:
     """Effective apply host (the governor key) -- the application_url netloc, port + creds
     stripped. Returns None when the URL has no parseable host."""
@@ -170,7 +250,7 @@ def push_apply_eligible(
     *,
     sqlite_conn: sqlite3.Connection | None = None,
     pg_conn: Any | None = None,
-    score_floor: int = 7,
+    score_floor: float = 7.0,
     approved_batch: str | None = None,
     limit: int | None = None,
     include_research: bool = False,
@@ -186,8 +266,21 @@ def push_apply_eligible(
     pg = pg_conn or pgqueue.connect()
     try:
         backfill_applied_set(sq, pg)
+        dead_urls, dead_app_urls = _dead_urls(sq)
+        if dead_urls or dead_app_urls:
+            _queue.retire_queued_dead_jobs(
+                pg,
+                dead_urls=dead_urls,
+                dead_application_urls=dead_app_urls,
+            )
         _queue.suppress_applied_set_duplicates(pg)
         out: list[dict[str, Any]] = []
+        search_config = config.load_search_config()
+        try:
+            profile = config.load_profile()
+        except (FileNotFoundError, ValueError, OSError):
+            profile = {}
+        work_authorization = profile.get("work_authorization", {}) if isinstance(profile, dict) else {}
         # Build the eligibility SQL; append the ledger cross-check when the home brain
         # has an applications table (the check is a no-op on minimal test fixtures).
         company_blocklist, company_params = _company_blocklist_sql()
@@ -198,8 +291,10 @@ def push_apply_eligible(
         )
         base_sql = _PUSH_APPLY_SELECT.format(
             score_expr=score_expr,
+            location_expr="location" if _jobs_column_exists(sq, "location") else "NULL AS location",
             company_blocklist=company_blocklist,
             thin_description_chars=THIN_DESCRIPTION_CHARS,
+            max_apply_attempts=config.DEFAULTS["max_apply_attempts"],
         )
         if _applications_table_exists(sq):
             # Inject the cross-check before the ORDER BY clause.
@@ -219,15 +314,31 @@ def push_apply_eligible(
             params.append(int(limit))
         for r in sq.execute(sql, params).fetchall():
             host = _target_host(r["application_url"])
+            eligibility_status, eligibility_reason = _eligibility.evaluate_job_eligibility(
+                location=r["location"],
+                description=r["full_description"],
+                location_policy=search_config.get("location", {}),
+                work_authorization=work_authorization,
+            )
+            route_policy = _tenant_route_policy(sq, host)
             out.append({
                 "url": r["url"], "company": r["company"], "title": r["title"],
                 "application_url": r["application_url"], "score": r["score"],
                 "target_host": host, "apply_domain": host,
                 "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
+                "eligibility_status": eligibility_status,
+                "eligibility_reason": eligibility_reason,
+                **route_policy,
             })
             if limit and len(out) >= limit:
                 break
-        return _queue.push_apply_jobs(pg, out, approved_batch=approved_batch)
+        return _queue.push_apply_jobs(
+            pg,
+            out,
+            approved_batch=approved_batch,
+            require_liveness=True,
+            require_eligibility=True,
+        )
     finally:
         if own_sq:
             sq.close()
@@ -268,9 +379,25 @@ WHERE url = :url
   AND COALESCE(apply_status, '') != 'applied'   -- never demote a confirmed apply
 """
 
+_PULL_MARK_DEAD = """
+UPDATE jobs
+SET liveness_status   = 'dead',
+    liveness_reason   = :liveness_reason,
+    last_verified_live = :last_verified_live
+WHERE url = :url
+  AND COALESCE(apply_status, '') != 'applied'
+"""
+
 
 def _iso(v: Any) -> Any:
     return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+def _result_marks_dead(res: Any) -> bool:
+    status = str(res.get("status") or "").strip().lower()
+    apply_status = str(res.get("apply_status") or "").strip().lower()
+    apply_error = str(res.get("apply_error") or "").strip().lower()
+    return "expired" in {status, apply_status, apply_error}
 
 
 def pull_apply_results(
@@ -328,6 +455,12 @@ def _pull_results(
                     "url": url, "status": status, "apply_error": res["apply_error"],
                     "apply_duration_ms": res["apply_duration_ms"],
                 })
+                if _result_marks_dead(res):
+                    sq.execute(_PULL_MARK_DEAD, {
+                        "url": url,
+                        "liveness_reason": "fleet_result_expired",
+                        "last_verified_live": datetime.now(timezone.utc).isoformat(),
+                    })
             sq.commit()
             pgqueue.mark_synced(pg, url, table=table)
             counts[status] = counts.get(status, 0) + 1
@@ -357,12 +490,16 @@ def _pull_results(
 _PUSH_LINKEDIN_SELECT = """
 SELECT url, company, title,
        CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END AS application_url,
-       CAST(COALESCE(audit_score, fit_score) AS REAL) AS score,
+       CAST({score_expr} AS REAL) AS score,
+       linkedin_resolve_status, linkedin_resolved_at, linkedin_resolve_error,
        linkedin_unresolved_kind, linkedin_next_action
 FROM jobs
 WHERE duplicate_of_url IS NULL
-  AND COALESCE(audit_score, fit_score) >= ?
+  AND {score_expr} >= ?
   AND COALESCE(liveness_status, '') != 'dead'
+  AND COALESCE(linkedin_resolve_status, '') IN ({fresh_statuses})
+  AND linkedin_resolved_at IS NOT NULL
+  {resolve_recency}
   AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
@@ -379,11 +516,13 @@ def push_linkedin_eligible(
     *,
     sqlite_conn=None,
     pg_conn=None,
-    score_floor: int = 7,
+    score_floor: float = 7.0,
     max_age_days: int | None = None,
     approved_batch=None,
     limit=None,
     lane_filter: bool = True,
+    max_resolved_age_days: int | None = _queue.LINKEDIN_FRESH_MAX_AGE_DAYS,
+    include_research: bool = False,
 ) -> int:
     """Push LinkedIn-eligible jobs from the brain into ``linkedin_queue`` (idempotent).
 
@@ -394,22 +533,54 @@ def push_linkedin_eligible(
     the LinkedIn canary gate). Returns the number of rows the UPSERT touched.
 
     ``max_age_days``: when > 0, only push postings discovered within that many days.
-    LinkedIn can't be network-probed for liveness (blocked host), so recency is the
-    safest pre-flight filter against stale/expired postings; None/0 disables it."""
+    ``max_resolved_age_days``: when > 0, require a recent logged-in LinkedIn resolver
+    decision (``easy_apply`` or ``resolved_offsite``). The resolver check is the
+    authoritative freshness gate because anonymous network liveness probes are blocked
+    for LinkedIn."""
     own_sq, own_pg = sqlite_conn is None, pg_conn is None
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
     try:
+        dead_urls, dead_app_urls = _dead_urls(sq)
+        if dead_urls or dead_app_urls:
+            _queue.retire_queued_dead_jobs(
+                pg,
+                dead_urls=dead_urls,
+                dead_application_urls=dead_app_urls,
+                table="linkedin_queue",
+            )
+        stale_urls, stale_app_urls = _stale_linkedin_urls(sq, max_age_days=max_age_days)
+        if stale_urls or stale_app_urls:
+            _queue.retire_queued_dead_jobs(
+                pg,
+                dead_urls=stale_urls,
+                dead_application_urls=stale_app_urls,
+                table="linkedin_queue",
+            )
         out = []
         params = [score_floor]
+        params.extend(_queue.LINKEDIN_FRESH_STATUSES)
+        resolve_recency_params: list[str] = []
+        resolve_recency = ""
+        if max_resolved_age_days and int(max_resolved_age_days) > 0:
+            resolve_recency = "AND julianday(linkedin_resolved_at) >= julianday('now', ?)"
+            resolve_recency_params.append(f"-{int(max_resolved_age_days)} days")
         recency_params: list[str] = []
         recency = ""
         if max_age_days and int(max_age_days) > 0:
             recency = "AND discovered_at IS NOT NULL AND julianday(discovered_at) >= julianday('now', ?)"
             recency_params.append(f"-{int(max_age_days)} days")
         company_blocklist, company_params = _company_blocklist_sql()
+        score_expr = (
+            "COALESCE(audit_score, fit_score, research_fit_score)"
+            if include_research
+            else "COALESCE(audit_score, fit_score)"
+        )
         sql = _PUSH_LINKEDIN_SELECT.format(
+            score_expr=score_expr,
             company_blocklist=company_blocklist,
+            fresh_statuses=",".join("?" for _ in _queue.LINKEDIN_FRESH_STATUSES),
+            resolve_recency=resolve_recency,
             recency=recency,
             thin_description_chars=THIN_DESCRIPTION_CHARS,
         )
@@ -417,6 +588,7 @@ def push_linkedin_eligible(
         if lane_filter:
             lane_sql, lane_params = _lane_filter_sql()
             sql = _inject_before_order_by(sql, lane_sql)
+        params.extend(resolve_recency_params)
         params.extend(company_params)
         params.extend(recency_params)
         params.extend(lane_params)
@@ -428,6 +600,9 @@ def push_linkedin_eligible(
                 "url": r["url"], "company": r["company"], "title": r["title"],
                 "application_url": r["application_url"], "score": r["score"],
                 "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
+                "linkedin_resolve_status": r["linkedin_resolve_status"],
+                "linkedin_resolved_at": r["linkedin_resolved_at"],
+                "linkedin_resolve_error": r["linkedin_resolve_error"],
                 "linkedin_unresolved_kind": r["linkedin_unresolved_kind"],
                 "linkedin_next_action": r["linkedin_next_action"],
             })
@@ -447,7 +622,7 @@ def push_linkedin_eligible(
 _COUNT_LINKEDIN_UNSCORED = """
 SELECT COUNT(*) FROM jobs
 WHERE duplicate_of_url IS NULL
-  AND audit_score IS NULL AND fit_score IS NULL
+  AND {missing_score_predicate}
   AND COALESCE(liveness_status, '') != 'dead'
   AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
   AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
@@ -457,7 +632,7 @@ WHERE duplicate_of_url IS NULL
 """
 
 
-def count_linkedin_unscored(sqlite_conn=None) -> int:
+def count_linkedin_unscored(sqlite_conn=None, *, include_research: bool = False) -> int:
     """Count apply-shaped LinkedIn postings excluded from the push SOLELY because they
     are unscored (audit_score AND fit_score both NULL). These are correctly NOT applied
     to -- you don't apply to a job you haven't scored for fit -- but the count makes the
@@ -465,7 +640,13 @@ def count_linkedin_unscored(sqlite_conn=None) -> int:
     own = sqlite_conn is None
     sq = sqlite_conn or _home_conn()
     try:
-        return int(sq.execute(_COUNT_LINKEDIN_UNSCORED).fetchone()[0])
+        missing_score_predicate = "audit_score IS NULL AND fit_score IS NULL"
+        if include_research:
+            missing_score_predicate += " AND research_fit_score IS NULL"
+        sql = _COUNT_LINKEDIN_UNSCORED.format(
+            missing_score_predicate=missing_score_predicate,
+        )
+        return int(sq.execute(sql).fetchone()[0])
     finally:
         if own:
             sq.close()

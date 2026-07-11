@@ -48,6 +48,64 @@ def test_resume_if_safe_never_overrides_ats_paused(fleet_db):
             assert cur.fetchone()["ats_pause_source"] == "doctor", "ats_pause_source must never be touched"
 
 
+def test_resume_if_safe_clears_stale_codex_canary_pause_without_live_blockers(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, "
+                    "ats_pause_source='codex_canary_blocked_agent_limits' WHERE id=1")
+        conn.commit()
+    with pgqueue.connect(fleet_db) as conn:
+        result = hm.resume_if_safe(conn)
+        assert result is True
+        paused, ats_paused = _get_flags(conn)
+        assert paused is False
+        assert ats_paused is False
+        with conn.cursor() as cur:
+            cur.execute("SELECT ats_pause_source FROM fleet_config WHERE id=1")
+            assert cur.fetchone()["ats_pause_source"] is None
+
+
+def test_resume_if_safe_keeps_codex_canary_pause_when_paused_breaker_is_live(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, "
+                    "ats_pause_source='codex_canary_blocked_agent_limits' WHERE id=1")
+        cur.execute("INSERT INTO rate_governor (scope_key, breaker_state) VALUES (%s, %s)",
+                    ("host:example.com", "paused"))
+        conn.commit()
+    with pgqueue.connect(fleet_db) as conn:
+        result = hm.resume_if_safe(conn)
+        assert result is False
+        paused, ats_paused = _get_flags(conn)
+        assert paused is True
+        assert ats_paused is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT ats_pause_source FROM fleet_config WHERE id=1")
+            assert cur.fetchone()["ats_pause_source"] == "codex_canary_blocked_agent_limits"
+
+
+def test_resume_if_safe_keeps_codex_canary_pause_when_active_knob_exists(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, "
+                    "ats_pause_source='codex_canary_blocked_agent_limits' WHERE id=1")
+        cur.execute(
+            "INSERT INTO fleet_knobs (knob_type, scope_key, value_text, reason, created_by, active) "
+            "VALUES (%s, %s, %s, %s, %s, TRUE)",
+            ("pace_or_pause", "ats", "paused", "test live blocker", "doctor"),
+        )
+        conn.commit()
+    with pgqueue.connect(fleet_db) as conn:
+        result = hm.resume_if_safe(conn)
+        assert result is False
+        paused, ats_paused = _get_flags(conn)
+        assert paused is True
+        assert ats_paused is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT ats_pause_source FROM fleet_config WHERE id=1")
+            assert cur.fetchone()["ats_pause_source"] == "codex_canary_blocked_agent_limits"
+
+
 def test_resume_if_safe_leaves_paused_when_cap_exceeded(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:

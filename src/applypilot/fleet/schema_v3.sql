@@ -19,10 +19,33 @@ ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS target_host    TEXT;   -- effec
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS lane           TEXT NOT NULL DEFAULT 'ats';
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS dedup_key      TEXT;   -- (company, normalized_role) -- R9
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS approved_batch TEXT;   -- owner approval token -- R11
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_status TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_reason TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_checked_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_check_owner TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_check_expires_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_status TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_reason TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_checked_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS infrastructure_failure_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS infrastructure_last_failure_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS session_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS tenant_profile_id TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS routing_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS execution_route TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS host_policy TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_apply_queue_dedup ON apply_queue (dedup_key);
 CREATE INDEX IF NOT EXISTS idx_apply_queue_approved
     ON apply_queue (score DESC) WHERE status = 'queued' AND approved_batch IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_apply_queue_liveness
+    ON apply_queue (liveness_checked_at, score DESC)
+    WHERE status = 'queued' AND liveness_required;
+CREATE INDEX IF NOT EXISTS idx_apply_queue_infrastructure_pending
+    ON apply_queue (infrastructure_last_failure_at DESC)
+    WHERE apply_status = 'infrastructure_pending';
 
 -- ---------------------------------------------------------------------------
 -- Extend fleet_config (single-row id=1) with v3 controls (R11, R12, R14).
@@ -283,10 +306,10 @@ CREATE TABLE IF NOT EXISTS auth_challenge (
 CREATE INDEX IF NOT EXISTS idx_challenge_open ON auth_challenge (url) WHERE resolved_at IS NULL;
 
 -- ---------------------------------------------------------------------------
--- otp_request: Gmail relay bookkeeping (R4). The CODE is NEVER persisted (E1) --
--- it is returned only over the broker RPC response. This row is the request +
--- consumed AUDIT TRAIL; single-delivery (not handing one code to two workers) is
--- enforced by the owner-side relay that matches+consumes the email, not by this row.
+-- otp_request: Gmail relay bookkeeping (R4). The code is persisted only for the
+-- short interval between the home responder answering and the worker consuming it.
+-- This row is also the consumed audit trail; matched_message_id prevents one email
+-- from being delivered to multiple requests, including across responder cycles.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS otp_request (
     id               BIGSERIAL PRIMARY KEY,
@@ -304,9 +327,19 @@ ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS code        TEXT;
 ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS code_kind   TEXT;   -- 'code' | 'magic_link'
 ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS expires_at  TIMESTAMPTZ;
 ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ;
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS matched_message_id TEXT;
+ALTER TABLE otp_request ADD COLUMN IF NOT EXISTS wait_started_at TIMESTAMPTZ;
 -- The responder's pending-scan: unanswered, unconsumed requests.
 CREATE INDEX IF NOT EXISTS idx_otp_pending ON otp_request (requested_at)
     WHERE code IS NULL AND consumed_at IS NULL;
+-- DeadMan active-demand summary: skip expired/legacy history and cover all
+-- timestamps needed by the count/oldest-wait query without visiting those rows.
+CREATE INDEX IF NOT EXISTS idx_otp_active_wait
+    ON otp_request (expires_at, requested_at, wait_started_at)
+    WHERE code IS NULL AND consumed_at IS NULL
+      AND wait_started_at IS NOT NULL AND expires_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_matched_message_unique
+    ON otp_request (matched_message_id) WHERE matched_message_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- inbox_events: outcome tracking / feedback loop (R8). Written by the inbox
@@ -650,6 +683,7 @@ CREATE TABLE IF NOT EXISTS apply_result_events (
     job_log_path        TEXT,
     transcript_digest   TEXT,
     final_result_source TEXT,
+    result_metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
     result_line         TEXT,
     source              TEXT NOT NULL DEFAULT 'worker',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -660,6 +694,10 @@ ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS application_tool_calls 
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS job_log_path TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS transcript_digest TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS final_result_source TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS result_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+UPDATE apply_result_events SET result_metadata = '{}'::jsonb WHERE result_metadata IS NULL;
+ALTER TABLE apply_result_events ALTER COLUMN result_metadata SET DEFAULT '{}'::jsonb;
+ALTER TABLE apply_result_events ALTER COLUMN result_metadata SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_apply_result_events_url_created
     ON apply_result_events (queue_name, url, created_at DESC);
 

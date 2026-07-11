@@ -27,6 +27,21 @@ app = typer.Typer(
     help="AI-powered end-to-end job application pipeline.",
     no_args_is_help=True,
 )
+outcomes_review_app = typer.Typer(
+    name="outcomes-review",
+    help="Review and correct outcome evidence before alerts/analytics consume it.",
+)
+app.add_typer(outcomes_review_app)
+outcomes_alerts_app = typer.Typer(
+    name="outcomes-alerts",
+    help="Build critical/warning alerts and digest artifacts for outcome monitoring.",
+)
+app.add_typer(outcomes_alerts_app)
+outcomes_learn_app = typer.Typer(
+    name="outcomes-learn",
+    help="Trusted-only learning exports and policy-review reports.",
+)
+app.add_typer(outcomes_learn_app)
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -875,6 +890,7 @@ def smart_health_command(
     table = Table(title="Smart Extract Source Health")
     table.add_column("Source")
     table.add_column("Status")
+    table.add_column("Session")
     table.add_column("Issue")
     table.add_column("Failures", justify="right")
     table.add_column("Timeouts", justify="right")
@@ -1127,7 +1143,7 @@ def apply(
     _bootstrap()
 
     from applypilot import config
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
     if min_score is None:
@@ -1245,7 +1261,7 @@ def apply(
     # --- Full apply mode ---
 
     # Check 1: Tier 3 required (Claude Code CLI or Codex CLI + Chrome)
-    check_tier(3, "auto-apply")
+    config.check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -1331,7 +1347,7 @@ def apply(
     # browser; if it isn't authenticated, every job dies in seconds and the whole
     # run is wasted. Version checks are not enough, so probe with a minimal query.
     # Skipped for --gen.
-    if not gen:
+    if not gen and preflight:
         import os as _os
         import subprocess as _sp
         from applypilot.apply.launcher import build_agent_canary_command
@@ -2148,6 +2164,124 @@ def outcomes_dashboard_command(
     serve(host=host, port=port)
 
 
+@app.command("outcomes-operator")
+def outcomes_operator_command(
+    port: int = typer.Option(8765, "--port", "-p", help="Port to serve on (localhost)."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind (loopback/private only)."),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the browser."),
+) -> None:
+    """Serve the outcomes operator surface with review/action queues."""
+    outcomes_dashboard_command(port=port, host=host, open_browser=open_browser)
+
+
+@outcomes_review_app.command("queue")
+def outcomes_review_queue_command() -> None:
+    """Show outcome events that still need review."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.outcome_review import list_review_queue
+
+    conn = get_connection()
+    rows = list_review_queue(conn)
+    if not rows:
+        console.print("[dim]No outcome review items queued.[/dim]")
+        return
+
+    table = Table(title="Outcome review queue", show_header=True, header_style="bold")
+    table.add_column("Message")
+    table.add_column("Trust")
+    table.add_column("Company")
+    table.add_column("Title")
+    table.add_column("Stage")
+    table.add_column("Reason")
+    for row in rows:
+        table.add_row(
+            row["message_id"],
+            row["trust_state"],
+            str(row.get("company") or ""),
+            str(row.get("title") or ""),
+            str(row.get("stage") or ""),
+            str(row.get("match_reason") or row.get("reason") or ""),
+        )
+    console.print(table)
+
+
+@outcomes_review_app.command("resolve")
+def outcomes_review_resolve_command(
+    message_id: str = typer.Argument(..., help="email_events.message_id to resolve."),
+    resolution: str = typer.Option(..., "--resolution", help="trusted | needs_review | ignored | corrected"),
+    job_url: Optional[str] = typer.Option(None, "--job-url", help="Override the matched job URL."),
+    stage: Optional[str] = typer.Option(None, "--stage", help="Override the effective stage."),
+    outcome: Optional[str] = typer.Option(None, "--outcome", help="Override the effective outcome."),
+    confidence: Optional[str] = typer.Option(None, "--confidence", help="Override the effective confidence."),
+    review_action: Optional[str] = typer.Option(None, "--review-action", help="Explicit review action label."),
+    note: Optional[str] = typer.Option(None, "--note", help="Optional operator note."),
+) -> None:
+    """Resolve one outcome review item."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.outcome_review import record_review
+
+    conn = get_connection()
+    try:
+        row = record_review(
+            conn,
+            message_id,
+            resolution=resolution,
+            review_action=review_action,
+            corrected_job_url=job_url,
+            corrected_stage=stage,
+            corrected_outcome=outcome,
+            corrected_confidence=confidence,
+            note=note,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Recorded outcome review[/green] for [bold]{message_id}[/bold] "
+        f"as [bold]{row['resolution']}[/bold]."
+    )
+
+
+@outcomes_alerts_app.command("digest")
+def outcomes_alerts_digest_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder for digest artifacts."),
+) -> None:
+    """Write the current outcome digest as text/json artifacts."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.outcome_alerts import write_digest
+
+    conn = get_connection()
+    summary = write_digest(conn, output_dir=output)
+    console.print("\n[bold green]Outcome digest written[/bold green]")
+    console.print(f"  Critical alerts: {summary['critical_count']}")
+    console.print(f"  Warning alerts:  {summary['warning_count']}")
+    console.print(f"  Folder:          {summary['digest_dir']}")
+    console.print()
+
+
+@outcomes_learn_app.command("export")
+def outcomes_learn_export_command(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Destination folder for trusted-learning exports."),
+) -> None:
+    """Export trusted-only learning reports and recommendation artifacts."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot.outcome_learning import export_learning_bundle
+
+    conn = get_connection()
+    summary = export_learning_bundle(output_dir=output, conn=conn)
+    console.print("\n[bold green]Outcome learning export complete[/bold green]")
+    console.print(f"  Trusted rows:    {summary['trusted_rows']}")
+    console.print(f"  Review queue:    {summary['review_queue_count']}")
+    console.print(f"  Action queue:    {summary['action_queue_count']}")
+    console.print(f"  Folder:          {summary['output_dir']}")
+    console.print()
+
+
 @app.command("linkedin-login")
 def linkedin_login_command(
     timeout: int = typer.Option(420, "--timeout", help="Max seconds to wait for you to log in."),
@@ -2852,6 +2986,7 @@ def _tenants_list() -> None:
         table.add_row(
             host,
             row["status"],
+            row.get("session_state") or "supervised",
             str(row["clean_submits"]),
             str(row["failed_submits"]),
             str(row["daily_cap"]),
@@ -2861,6 +2996,11 @@ def _tenants_list() -> None:
 
     if rows:
         console.print(table)
+        for row in rows:
+            console.print(
+                f"[dim]{row['host']} status={row['status']} "
+                f"session={row.get('session_state') or 'supervised'}[/dim]"
+            )
     else:
         console.print("[dim]No tenants registered yet.[/dim]")
 
@@ -2918,6 +3058,36 @@ def tenants_halt_command(
     tenants.halt_tenant(conn, host, until_iso)
 
     console.print(f"[bold yellow]{host}[/bold yellow] halted until [bold]{until_iso}[/bold]")
+
+
+@tenants_app.command("session")
+def tenants_session_command(
+    host: str = typer.Argument(..., help="ATS tenant host."),
+    state: str = typer.Argument(..., help="ready | supervised | expired."),
+    ttl_hours: int = typer.Option(12, "--ttl-hours", min=1, help="Ready-session TTL."),
+    reason: Optional[str] = typer.Option(None, "--reason", help="Non-secret readiness note."),
+) -> None:
+    """Set this machine's tenant browser-session readiness."""
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot import tenants
+
+    conn = get_connection()
+    try:
+        row = tenants.set_session_state(
+            conn,
+            host,
+            state,
+            ttl_hours=ttl_hours if state == "ready" else None,
+            reason=reason,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[bold green]{host}[/bold green] session set to "
+        f"[bold]{row['session_state']}[/bold] (profile {row['profile_id']})"
+    )
 
 
 if __name__ == "__main__":

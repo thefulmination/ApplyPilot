@@ -13,6 +13,7 @@ whole module is unit-testable offline.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -154,6 +155,8 @@ class PastAnswer:
     answer: str
     job_title: str = ""
     company: str = ""
+    kind: str = ""
+    approved: bool = True
 
 
 class AnswerCorpus:
@@ -168,8 +171,9 @@ class AnswerCorpus:
     def __init__(self, records: list[PastAnswer] | None = None) -> None:
         self._records: list[PastAnswer] = list(records or [])
 
-    def add(self, question: str, answer: str, *, job_title: str = "", company: str = "") -> None:
-        self._records.append(PastAnswer(question, answer, job_title, company))
+    def add(self, question: str, answer: str, *, job_title: str = "", company: str = "",
+            kind: str = "", approved: bool = True) -> None:
+        self._records.append(PastAnswer(question, answer, job_title, company, kind, approved))
 
     def top_k(self, question: str, k: int = 3) -> list[PastAnswer]:
         q = _tokens(question)
@@ -182,6 +186,50 @@ class AnswerCorpus:
             reverse=True,
         )
         return [r for _, r in ranked[:k]]
+
+    def find_compatible(
+        self,
+        question: str,
+        *,
+        job: dict,
+        profile: dict,
+        resume_text: str,
+        kind: str | None,
+        min_question_jaccard: float = 0.65,
+        min_title_jaccard: float = 0.30,
+    ) -> PastAnswer | None:
+        """Return an approved answer that remains verified for the current job."""
+        question_tokens = _tokens(question)
+        title_tokens = _tokens(str(job.get("title") or ""))
+        ranked: list[tuple[float, PastAnswer]] = []
+        for record in self._records:
+            if not record.approved:
+                continue
+            if record.kind and kind and record.kind != kind:
+                continue
+            record_question = _tokens(record.question)
+            union = question_tokens | record_question
+            question_score = len(question_tokens & record_question) / len(union) if union else 0
+            if question_score < min_question_jaccard:
+                continue
+            record_title = _tokens(record.job_title)
+            if title_tokens and record_title:
+                title_union = title_tokens | record_title
+                title_score = len(title_tokens & record_title) / len(title_union)
+                if title_score < min_title_jaccard:
+                    continue
+            checks = verify_answer(
+                record.answer,
+                question,
+                resume_text=resume_text,
+                profile=profile,
+                job=job,
+                kind=kind,
+            )
+            if checks:
+                continue
+            ranked.append((question_score, record))
+        return max(ranked, key=lambda item: item[0])[1] if ranked else None
 
     def save_jsonl(self, path) -> None:
         p = Path(path)
@@ -209,6 +257,8 @@ class AnswerCorpus:
                         answer=d.get("answer", ""),
                         job_title=d.get("job_title", ""),
                         company=d.get("company", ""),
+                        kind=d.get("kind", ""),
+                        approved=bool(d.get("approved", True)),
                     )
                 )
         return cls(records)
@@ -227,6 +277,7 @@ class AnswerResult:
     model: str                      # provider/model that produced it
     retrieved: list[str] = field(default_factory=list)  # exemplar questions used
     escalate: bool = False          # caller should leave blank / hand to human
+    metadata: dict = field(default_factory=dict)
 
 
 _SYSTEM_PROMPT = (
@@ -347,6 +398,118 @@ def answer_question(
         text="", verified=False, checks=checks, attempts=max_attempts,
         model=model, retrieved=retrieved, escalate=True,
     )
+
+
+def answer_question_bounded(
+    question: str,
+    *,
+    job: dict,
+    profile: dict,
+    resume_text: str,
+    corpus: AnswerCorpus | None = None,
+    kind: str | None = None,
+    client=None,
+    local_transport=None,
+    budget=None,
+) -> AnswerResult:
+    """Try local Qwen once, then allow at most one paid fallback call."""
+    from applypilot.apply import qwen_provider
+    from applypilot.apply.phase_budget import PhaseBudgetManager
+
+    budget = budget or PhaseBudgetManager()
+
+    corpus = corpus if corpus is not None else AnswerCorpus()
+    exemplars = corpus.top_k(question, k=3)
+    cached = corpus.find_compatible(
+        question,
+        job=job,
+        profile=profile,
+        resume_text=resume_text,
+        kind=kind,
+    )
+    if cached is not None:
+        return AnswerResult(
+            text=cached.answer,
+            verified=True,
+            checks=[],
+            attempts=0,
+            model="cache/approved",
+            retrieved=[cached.question],
+            escalate=False,
+            metadata={
+                "cache_hit": True,
+                "local_attempts": 0,
+                "paid_fallback_calls": 0,
+            },
+        )
+    local_result = None
+    if qwen_provider.enabled():
+        budget.check("answer")
+        user_prompt = _user_prompt(
+            question,
+            job,
+            profile,
+            resume_text,
+            exemplars,
+            kind,
+            correction=[],
+        )
+        with budget.track("answer"):
+            local_result = qwen_provider.answer_locally(
+                system_prompt=_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                verify=lambda text: verify_answer(
+                    text,
+                    question,
+                    resume_text=resume_text,
+                    profile=profile,
+                    job=job,
+                    kind=kind,
+                ),
+                transport=local_transport,
+            )
+        if local_result.verified:
+            return AnswerResult(
+                text=local_result.text,
+                verified=True,
+                checks=[],
+                attempts=1,
+                model=f"local/{local_result.model}",
+                retrieved=[item.question for item in exemplars],
+                escalate=False,
+                metadata={
+                    "cache_hit": False,
+                    "local_attempts": 1,
+                    "paid_fallback_calls": 0,
+                    "local_latency_ms": local_result.latency_ms,
+                    "local_error": None,
+                    "phase_budget": budget.metadata()["answer"],
+                },
+            )
+
+    paid_reservation = float(os.environ.get("APPLYPILOT_PAID_ANSWER_RESERVATION_USD") or 0.02)
+    budget.reserve("answer", turns=1, cost_usd=paid_reservation)
+    with budget.track("answer"):
+        paid = answer_question(
+            question,
+            job=job,
+            profile=profile,
+            resume_text=resume_text,
+            corpus=corpus,
+            kind=kind,
+            client=client,
+            max_attempts=1,
+        )
+    paid.metadata.update({
+        "cache_hit": False,
+        "local_attempts": 1 if local_result is not None else 0,
+        "paid_fallback_calls": 1,
+        "local_latency_ms": local_result.latency_ms if local_result else None,
+        "local_error": local_result.error if local_result else "disabled",
+        "local_checks": list(local_result.checks) if local_result else [],
+        "phase_budget": budget.metadata()["answer"],
+    })
+    return paid
 
 
 def default_corpus_path() -> Path:

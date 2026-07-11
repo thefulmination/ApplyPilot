@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import urllib.request
+from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
 
 from applypilot import database
@@ -95,3 +96,74 @@ def test_server_serves_json_and_csv(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_server_api_includes_review_and_action_queues(tmp_path):
+    db = tmp_path / "applypilot.db"
+    conn = database.init_db(db)
+    _seed(conn)
+
+    handler = D._make_handler(str(db))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/data") as resp:
+            data = json.loads(resp.read())
+        assert "review_queue" in data
+        assert "action_queue" in data
+        assert "alerts" in data
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_server_post_review_persists_resolution(tmp_path):
+    db = tmp_path / "applypilot.db"
+    conn = database.init_db(db)
+    _seed(conn)
+
+    handler = D._make_handler(str(db))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        body = json.dumps({"message_id": "m2", "resolution": "ignored"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/review",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+        assert result["resolution"] == "ignored"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dashboard_uses_effective_events_after_ignore(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed(conn)
+
+    from applypilot.outcome_review import record_review
+
+    record_review(conn, "m2", resolution="ignored")
+    rows = D.build_application_rows(conn, now_iso="2026-06-20T00:00:00+00:00")
+
+    assert rows[0]["current_stage"] == "acknowledged"
+    assert rows[0]["outcome"] is None
+    assert [e["message_id"] for e in rows[0]["events"]] == ["m1"]
+
+
+def test_dashboard_exposes_actionable_trust_state(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed(conn)
+
+    rows = D.build_application_rows(conn, now_iso="2026-06-20T00:00:00+00:00")
+
+    assert rows[0]["trust_state"] == "trusted"
+    assert rows[0]["needs_action"] is True

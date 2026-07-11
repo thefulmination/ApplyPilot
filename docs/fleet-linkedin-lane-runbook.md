@@ -112,7 +112,20 @@ the home box already submitted in a prior session:
 applypilot-fleet-linkedin-home --dsn $FLEET_PG_DSN pull
 ```
 
-### Step 3 — Push eligible LinkedIn jobs
+### Step 3 — Refresh LinkedIn posting availability
+
+Run the logged-in LinkedIn resolver before pushing. It records whether the page is
+still reachable and still has an apply path, without submitting anything:
+
+```bash
+applypilot linkedin-resolve-apply-urls --limit 200
+```
+
+Rows classified as `unavailable` are stamped `liveness_status='dead'`. The fleet
+push/approval/lease path accepts only rows with a recent positive resolver status
+(`easy_apply` or `resolved_offsite`; default max age 3 days).
+
+### Step 4 — Push eligible LinkedIn jobs
 
 Push high-score LinkedIn rows from the brain into `linkedin_queue`:
 
@@ -120,14 +133,13 @@ Push high-score LinkedIn rows from the brain into `linkedin_queue`:
 applypilot-fleet-linkedin-home --dsn $FLEET_PG_DSN push --score-floor 7
 ```
 
-The push now applies two extra eligibility guards beyond score:
+The push now applies three extra eligibility guards beyond score:
 
-- **Recency (`--max-age-days`, default 21).** LinkedIn is a network-probe BLOCKED host
-  (probing it from the apply IP is the ban risk), so there is **no pre-apply liveness
-  check for LinkedIn** — `verify-live` skips it by policy. Posting recency is the only
-  safe pre-filter against expired postings; apply-time detection (the logged-in worker
-  sees a closed page and never phantom-applies) is the real liveness gate. Pass
-  `--max-age-days 0` to disable and push all ages.
+- **Resolver freshness (`--max-resolved-age-days`, default 3).** LinkedIn is a
+  network-probe BLOCKED host, so `verify-live` still skips it by policy. Instead,
+  the logged-in resolver is the pre-approval availability check.
+- **Discovery recency (`--max-age-days`, default 21).** Pass `--max-age-days 0`
+  only when intentionally backfilling old, freshly resolver-checked rows.
 - **Company + title required.** Postings with neither are unapplyable and collapse onto a
   single `(company,title)` dedup_key, so they are excluded.
 

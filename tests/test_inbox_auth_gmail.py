@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import datetime as dt
 
+import pytest
+
 from applypilot import inbox_auth
+from applypilot import mail_source
 
 
 class _FakeRequest:
@@ -19,14 +22,43 @@ class _FakeMessages:
         self._message_batches = message_batches
         self._message_payloads = message_payloads
         self._list_calls = 0
+        self.get_calls = []
 
-    def list(self, userId, q, maxResults):
+    def list(self, userId, q, maxResults, pageToken=None):
         index = min(self._list_calls, len(self._message_batches) - 1)
         self._list_calls += 1
-        return _FakeRequest({"messages": self._message_batches[index]})
+        batch = self._message_batches[index]
+        if isinstance(batch, dict) and "messages" in batch:
+            return _FakeRequest(batch)
+        return _FakeRequest({"messages": batch})
 
-    def get(self, userId, id, format):  # noqa: A002
-        return _FakeRequest(self._message_payloads[id])
+    def get(  # noqa: A002
+        self,
+        userId,
+        id,
+        format,
+        fields=None,
+        metadataHeaders=None,
+    ):
+        self.get_calls.append((id, format, fields, metadataHeaders))
+        payload = self._message_payloads[id]
+        if format == "metadata":
+            message_payload = payload.get("payload", {})
+            snippet = payload.get("snippet")
+            if snippet is None:
+                encoded = message_payload.get("body", {}).get("data", "")
+                padding = "=" * (-len(encoded) % 4)
+                snippet = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            return _FakeRequest(
+                {
+                    "id": id,
+                    "threadId": id,
+                    "sizeEstimate": len(repr(payload)),
+                    "snippet": snippet,
+                    "payload": {"headers": message_payload.get("headers", [])},
+                }
+            )
+        return _FakeRequest(payload)
 
 
 class _FakeUsers:
@@ -67,14 +99,295 @@ def _make_payload(subject: str, sender: str, body: str, *, date: str | None = No
     }
 
 
+def _auth_match(
+    message_id: str,
+    received_at: dt.datetime,
+    *,
+    sender: str = "no-reply@greenhouse-mail.io",
+    kind: str = "code",
+    value: str = "123456",
+) -> inbox_auth.AuthEmailMatch:
+    candidate = inbox_auth.VerificationCandidate(
+        kind=kind,
+        value=value,
+        confidence="high",
+        reasons=("test",),
+    )
+    return inbox_auth.AuthEmailMatch(
+        message_id=message_id,
+        thread_id=None,
+        sender=sender,
+        subject="Verify your email",
+        received_at=_rfc(received_at),
+        snippet="",
+        candidate=candidate,
+        reasons=candidate.reasons,
+    )
+
+
 def _build_service(messages_by_poll, message_payloads):
     batches = messages_by_poll
-    if batches and isinstance(batches[0], dict):
+    if batches and isinstance(batches[0], dict) and "messages" not in batches[0]:
         batches = [batches]
     return _FakeService(
         batches,
         message_payloads,
     )
+
+
+def test_provider_matching_accepts_groups_and_rejects_unrelated_or_missing_evidence():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    grouped = _auth_match("grouped", now)
+    unrelated = _auth_match("unrelated", now, sender="no-reply@workday.com")
+    no_evidence = _auth_match("missing", now, sender="")
+    magic_link = _auth_match(
+        "magic",
+        now,
+        sender="",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert inbox_auth.domains_related("jobs.greenhouse.io", "greenhouse-mail.io")
+    assert not inbox_auth.domains_related("greenhouse.io", "workday.com")
+    assert inbox_auth.match_belongs_to_provider(grouped, "greenhouse.io")
+    assert not inbox_auth.match_belongs_to_provider(unrelated, "greenhouse.io")
+    assert not inbox_auth.match_belongs_to_provider(no_evidence, "greenhouse.io")
+    assert inbox_auth.match_belongs_to_provider(magic_link, "greenhouse.io")
+
+
+def test_magic_link_rejects_conflicting_provider_destination():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "conflict",
+        now,
+        sender="no-reply@greenhouse-mail.io",
+        kind="magic_link",
+        value="https://workday.com/verify?token=abc",
+    )
+
+    assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_magic_link_accepts_matching_destination_with_generic_sender():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "generic-sender",
+        now,
+        sender="notifications@example.com",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_magic_link_rejects_conflicting_ats_sender_even_when_destination_matches():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "conflicting-sender",
+        now,
+        sender="no-reply@workday.com",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_magic_link_rejects_smartrecruiters_alternate_sender_for_greenhouse():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "smartrecruiters-conflict",
+        now,
+        sender="no-reply@smartrecruiters-mail.com",
+        kind="magic_link",
+        value="https://boards.greenhouse.io/verify?token=abc",
+    )
+
+    assert not inbox_auth.match_belongs_to_provider(match, "greenhouse.io")
+
+
+def test_alternate_ats_sender_domains_relate_to_provider_domains():
+    assert inbox_auth.domains_related(
+        "smartrecruiters-mail.com", "smartrecruiters.com"
+    )
+    assert inbox_auth.domains_related("workablemail.com", "workable.com")
+    assert inbox_auth.domains_related("ashby.email", "ashbyhq.com")
+    assert inbox_auth.domains_related("ashbyhq-mail.com", "ashbyhq.com")
+
+
+def test_inbox_auth_and_gmail_outcomes_share_canonical_ats_sender_registry():
+    from applypilot import gmail_outcomes
+    from applypilot.ats_domains import ATS_SENDER_DOMAINS
+
+    assert inbox_auth.KNOWN_ATS_DOMAINS is ATS_SENDER_DOMAINS
+    assert gmail_outcomes._ATS_DOMAINS is ATS_SENDER_DOMAINS
+
+
+def test_canonical_ats_sender_registry_preserves_both_legacy_consumer_sets():
+    from applypilot.ats_domains import ATS_SENDER_DOMAINS
+
+    legacy_outcome_domains = {
+        "greenhouse.io", "greenhouse-mail.io", "lever.co", "hire.lever.co",
+        "workday.com", "myworkdayjobs.com", "myworkday.com", "icims.com",
+        "brassring.com", "smartrecruiters.com", "smartrecruiters-mail.com",
+        "workable.com", "workablemail.com", "taleo.net", "jobvite.com",
+        "jobvite-mail.com", "recruitee.com", "ashbyhq.com", "ashbyhq-mail.com",
+        "ashby.email", "successfactors.com", "applytojob.com", "bamboohr.com",
+        "rippling.com", "eightfold.ai", "beamery.com", "paradox.ai",
+        "fountain.com", "dover.com", "dover.io", "teamtailor.com",
+        "teamtailor-mail.com", "pinpointhq.com", "comeet.co", "gem.com",
+        "breezy.hr", "hiringthing.com",
+    }
+    legacy_auth_domains = {
+        "greenhouse.io", "boards.greenhouse.io", "myworkday.com",
+        "myworkdayjobs.com", "lever.co", "ashbyhq.com", "icims.com",
+        "smartrecruiters.com", "workable.com", "taleo.net", "oraclecloud.com",
+        "oracle.com", "workday.com", "greenhouse-mail.io", "adp.com",
+        "workforcenow.adp.com", "amazon.jobs", "jobs.amazon.com", "eightfold.ai",
+    }
+
+    assert ATS_SENDER_DOMAINS >= legacy_outcome_domains
+    assert ATS_SENDER_DOMAINS >= legacy_auth_domains
+
+
+def test_oracle_adp_and_amazon_senders_keep_high_confidence_code_extraction():
+    for domain in (
+        "oraclecloud.com",
+        "oracle.com",
+        "adp.com",
+        "workforcenow.adp.com",
+        "amazon.jobs",
+        "jobs.amazon.com",
+    ):
+        candidates = inbox_auth.extract_verification_candidates(
+            subject="Verify your email",
+            body="Use verification code 123456 to continue.",
+            sender=f"no-reply@{domain}",
+        )
+
+        assert inbox_auth.is_known_ats_domain(domain), domain
+        assert any(
+            candidate.kind == "code" and candidate.confidence == "high"
+            for candidate in candidates
+        ), domain
+
+
+def test_workday_alternate_sender_is_related_to_request_domain():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    match = _auth_match(
+        "workday-alternate",
+        now,
+        sender="no-reply@myworkday.com",
+    )
+
+    assert inbox_auth.match_belongs_to_provider(match, "tenant.myworkdayjobs.com")
+
+
+def test_workday_password_reset_link_is_high_confidence_magic_link():
+    candidates = inbox_auth.extract_verification_candidates(
+        subject="Reset your password",
+        body=("Use this link to reset your password: "
+              "https://tenant.myworkdayjobs.com/en-US/site/reset/password?token=abc123"),
+        sender="no-reply@myworkday.com",
+    )
+    links = [candidate for candidate in candidates if candidate.kind == "magic_link"]
+    assert links
+    assert links[0].confidence == "high"
+
+
+def test_eligible_auth_matches_applies_exclusions_and_sixty_second_skew_in_order():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    matches = [
+        _auth_match("outside", now - dt.timedelta(seconds=61)),
+        _auth_match("inside", now - dt.timedelta(seconds=60)),
+        _auth_match("excluded", now + dt.timedelta(seconds=1)),
+        _auth_match("fresh", now + dt.timedelta(seconds=2)),
+    ]
+
+    eligible = inbox_auth.eligible_auth_matches(
+        matches,
+        not_before=now.replace(tzinfo=None),
+        provider_domain="greenhouse.io",
+        excluded_message_ids={"excluded"},
+    )
+
+    assert [match.message_id for match in eligible] == ["inside", "fresh"]
+
+
+def test_eligible_auth_matches_rejects_far_future_but_allows_sixty_second_skew():
+    now = dt.datetime(2026, 7, 10, 12, 0, tzinfo=dt.timezone.utc)
+    matches = [
+        _auth_match("allowed", now + dt.timedelta(seconds=60)),
+        _auth_match("far-future", now + dt.timedelta(days=1)),
+    ]
+
+    eligible = inbox_auth.eligible_auth_matches(
+        matches,
+        reference_time=now.replace(tzinfo=None),
+        provider_domain="greenhouse.io",
+    )
+
+    assert [match.message_id for match in eligible] == ["allowed"]
+
+
+def test_scan_gmail_for_auth_codes_service_path_follows_next_page_token():
+    now = dt.datetime.now(dt.timezone.utc)
+    service = _build_service(
+        [
+            {
+                "messages": [{"id": "miss", "threadId": "t-miss"}],
+                "nextPageToken": "page-2",
+            },
+            {"messages": [{"id": "hit", "threadId": "t-hit"}]},
+        ],
+        {
+            "miss": {"payload": _make_payload(
+                subject="Unrelated",
+                sender="news@example.com",
+                body="Weekly newsletter.",
+                date=_rfc(now),
+            )},
+            "hit": {"payload": _make_payload(
+                subject="Verify your email",
+                sender="no-reply@greenhouse.io",
+                body="Use verification code 818283 to continue.",
+                date=_rfc(now),
+            )},
+        },
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        minutes=10,
+        max_messages=2,
+    )
+
+    assert [match.message_id for match in matches] == ["hit"]
+
+
+def test_explicit_gmail_service_candidate_overflow_fails_before_get():
+    pages = [
+        {
+            "messages": [{"id": str(index)} for index in range(500)],
+            "nextPageToken": "page-2",
+        },
+        {
+            "messages": [{"id": str(index)} for index in range(500, 1000)],
+            "nextPageToken": "page-3",
+        },
+        {"messages": [{"id": "1000"}]},
+    ]
+    service = _FakeService(pages, {})
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        inbox_auth.scan_gmail_for_auth_codes(
+            service=service,
+            max_messages=1000,
+        )
+
+    assert service.users().messages().get_calls == []
 
 
 def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():
@@ -93,6 +406,88 @@ def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():
     assert matches[0].message_id == "m1"
     assert matches[0].candidate.kind == "code"
     assert matches[0].candidate.value == "839214"
+
+
+def test_explicit_gmail_auth_scan_uses_metadata_and_bounded_snippet_only():
+    payload = _make_payload(
+        subject="Verify your email",
+        sender="no-reply@greenhouse.io",
+        body="body must not be fetched",
+    )
+    service = _build_service(
+        [{"id": "metadata-code", "threadId": "thread"}],
+        {
+            "metadata-code": {
+                "snippet": "Use verification code 246810 to continue.",
+                "payload": payload,
+            }
+        },
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        max_messages=1,
+    )
+
+    assert [match.candidate.value for match in matches] == ["246810"]
+    calls = service.users().messages().get_calls
+    assert calls and all(call[1] == "metadata" for call in calls)
+    assert all(call[1] not in {"full", "raw"} for call in calls)
+
+
+def test_explicit_gmail_auth_scan_finds_code_in_metadata_subject():
+    payload = _make_payload(
+        subject="Your verification code is 135790",
+        sender="no-reply@greenhouse.io",
+        body="body must not be fetched",
+    )
+    service = _build_service(
+        [{"id": "subject-code", "threadId": "thread"}],
+        {
+            "subject-code": {
+                "snippet": "Open this message to continue.",
+                "payload": payload,
+            }
+        },
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        max_messages=1,
+    )
+
+    assert [match.candidate.value for match in matches] == ["135790"]
+    assert all(
+        call[1] == "metadata"
+        for call in service.users().messages().get_calls
+    )
+
+
+def test_explicit_gmail_auth_scan_does_not_use_magic_link_hidden_in_body():
+    hidden_link = "https://boards.greenhouse.io/verify?token=hidden-secret"
+    payload = _make_payload(
+        subject="Verify your email",
+        sender="no-reply@greenhouse.io",
+        body=f"Continue with {hidden_link}",
+    )
+    service = _build_service(
+        [{"id": "body-only-link", "threadId": "thread"}],
+        {
+            "body-only-link": {
+                "snippet": "Open the message to continue.",
+                "payload": payload,
+            }
+        },
+    )
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        max_messages=1,
+    ) == []
+    assert all(
+        call[1] == "metadata"
+        for call in service.users().messages().get_calls
+    )
 
 
 def test_scan_gmail_for_auth_codes_service_path_drops_codes_outside_minutes_window():

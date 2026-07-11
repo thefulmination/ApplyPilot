@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+MIN_APPROVAL_THRESHOLD = 5.8
+
 
 def get_config(conn) -> dict[str, Any]:
     with conn.cursor() as cur:
@@ -35,6 +37,8 @@ def set_approval_policy(
     strong fit AND confident qualified-verdict AND no red-flags. A WIDE default
     band comes from the system *confidently qualifying many jobs*, not a low bar.
     """
+    if threshold is not None and float(threshold) < MIN_APPROVAL_THRESHOLD:
+        raise ValueError(f"approval threshold must be >= {MIN_APPROVAL_THRESHOLD:g}")
     policy = {
         "min_fit": min_fit,
         "min_confidence": min_confidence,
@@ -88,3 +92,35 @@ def version_for_worker(conn, worker_id: str) -> str | None:
     if cfg.get("canary_worker_id") == worker_id and cfg.get("canary_version"):
         return cfg["canary_version"]
     return cfg.get("pinned_worker_version")
+
+
+def reported_version_for_worker(conn, worker_id: str) -> str | None:
+    """Return the last version this worker reported in its heartbeat, if any."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT sw_version FROM worker_heartbeat WHERE worker_id=%s", (worker_id,))
+        row = cur.fetchone()
+    return row["sw_version"] if row else None
+
+
+def version_status_for_worker(
+    conn,
+    worker_id: str,
+    *,
+    sw_version: str | None = None,
+) -> dict[str, Any]:
+    """Compare a worker's running source version to its configured rollout target.
+
+    A missing fleet pin means version gating is disabled for backwards-compatible
+    local development. Once a pin is configured, a worker must report exactly the
+    expected version for its identity; the canary worker may match canary_version,
+    while every other worker must match pinned_worker_version.
+    """
+    expected = version_for_worker(conn, worker_id)
+    actual = sw_version if sw_version is not None else reported_version_for_worker(conn, worker_id)
+    matches = not expected or actual == expected
+    return {"expected_version": expected, "sw_version": actual, "matches": matches}
+
+
+def worker_version_matches(conn, worker_id: str, *, sw_version: str | None = None) -> bool:
+    """True when the worker may lease under the current source-version rollout gate."""
+    return bool(version_status_for_worker(conn, worker_id, sw_version=sw_version)["matches"])

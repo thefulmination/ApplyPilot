@@ -99,7 +99,7 @@ def _has(label: str, needles) -> bool:
 
 
 def build_answer_plan(questions, *, profile, resume_text, corpus=None,
-                      answer_fn=None, job=None) -> AnswerPlan:
+                      answer_fn=None, job=None, budget=None) -> AnswerPlan:
     """Compute a complete, deterministic submission plan for a Greenhouse job.
 
     Identity/phone/location and standard selects (work-auth, demographic-decline)
@@ -109,9 +109,12 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
     the adapter can't confidently fill is recorded in ``unmapped_required`` and
     makes ``ready`` False -- the caller escalates or skips instead of faking it.
     """
-    if answer_fn is None:
-        from applypilot.apply.answerer import answer_question
-        answer_fn = answer_question
+    default_answerer = answer_fn is None
+    if default_answerer:
+        from applypilot.apply.answerer import answer_question_bounded
+        answer_fn = answer_question_bounded
+        from applypilot.apply.phase_budget import PhaseBudgetManager
+        budget = budget or PhaseBudgetManager()
 
     personal = (profile or {}).get("personal", {})
     work_auth = (profile or {}).get("work_authorization", {})
@@ -183,8 +186,17 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 continue
 
             if ftype == "textarea":
-                res = answer_fn(label, job=job or {}, profile=profile,
-                                resume_text=resume_text, corpus=corpus, kind="open")
+                try:
+                    res = answer_fn(
+                        label, job=job or {}, profile=profile, resume_text=resume_text,
+                        corpus=corpus, kind="open",
+                        **({"budget": budget} if default_answerer else {}),
+                    )
+                except Exception as exc:
+                    from applypilot.apply.phase_budget import PhaseBudgetExceeded
+                    if not isinstance(exc, PhaseBudgetExceeded):
+                        raise
+                    continue
                 if getattr(res, "verified", False):
                     fields[name] = res.text
                     free_text[name] = res.text

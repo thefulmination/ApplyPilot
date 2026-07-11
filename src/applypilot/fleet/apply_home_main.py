@@ -17,7 +17,7 @@ from applypilot.fleet import queue, queue_diagnosis, sync
 logger = logging.getLogger("applypilot.fleet.apply_home_main")
 
 
-def push_home(conn, *, sqlite_conn=None, score_floor: int = 7, limit: int | None = None,
+def push_home(conn, *, sqlite_conn=None, score_floor: float = 7.0, limit: int | None = None,
               include_research: bool = False, lane_filter: bool = True) -> int:
     """The home 'push' cadence: stage apply-eligible jobs (+ backfill applied_set,
     inside push_apply_eligible), and best-effort push the brain's email_events outcome
@@ -39,7 +39,8 @@ def set_canary(conn, k: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE fleet_config "
-            "SET canary_enabled=TRUE, canary_remaining=%s, paused=FALSE, updated_at=now() "
+            "SET ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=%s, "
+            "paused=FALSE, updated_at=now() "
             "WHERE id=1 AND ats_paused=FALSE",
             (k,),
         )
@@ -51,25 +52,45 @@ def set_canary(conn, k: int) -> None:
 
 def lift_canary(conn) -> None:
     with conn.cursor() as cur:
-        cur.execute("UPDATE fleet_config SET canary_enabled=FALSE, canary_remaining=NULL WHERE id=1")
+        cur.execute(
+            "UPDATE fleet_config "
+            "SET ats_apply_mode='stopped', canary_enabled=FALSE, canary_remaining=NULL "
+            "WHERE id=1"
+        )
     conn.commit()
 
 
-def _canary_armed(conn) -> bool:
+def _canary_capacity(conn) -> int:
     with conn.cursor() as cur:
-        cur.execute("SELECT canary_enabled FROM fleet_config WHERE id=1")
+        cur.execute("SELECT ats_apply_mode, canary_enabled, canary_remaining FROM fleet_config WHERE id=1")
         row = cur.fetchone()
-    return bool(row and row["canary_enabled"])
+    if not row or row["ats_apply_mode"] != "canary" or not row["canary_enabled"]:
+        return 0
+    remaining = row["canary_remaining"]
+    if remaining is None:
+        return 0
+    return max(int(remaining), 0)
+
+
+def _canary_armed(conn) -> bool:
+    return _canary_capacity(conn) > 0
 
 
 def approve(conn, *, urls=None, all_pushed=False) -> str:
     """Stamp a fresh batch token on the given (or all queued-unapproved) rows. REFUSES
     unless the canary is armed (so the runbook's arm-then-approve order can't invert)."""
-    if not _canary_armed(conn):
-        raise SystemExit("refusing to approve: arm the canary first (apply-home canary <K>)")
+    capacity = _canary_capacity(conn)
+    if capacity <= 0:
+        raise SystemExit("refusing to approve: arm the canary with positive remaining capacity first (apply-home canary <K>)")
     if all_pushed:
         with conn.cursor() as cur:
-            cur.execute("SELECT url FROM apply_queue WHERE status='queued' AND approved_batch IS NULL")
+            cur.execute(
+                "SELECT q.url FROM apply_queue q CROSS JOIN fleet_config cfg "
+                "WHERE q.status='queued' AND q.approved_batch IS NULL "
+                "AND q.score >= COALESCE(cfg.approval_threshold, 7) "
+                "ORDER BY q.score DESC, q.url LIMIT %s",
+                (capacity,),
+            )
             urls = [r["url"] for r in cur.fetchall()]
     token = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     queue.approve_jobs(conn, urls or [], token)
@@ -83,13 +104,31 @@ def arm_canary_if_safe(conn, k: int) -> bool:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE fleet_config "
-            "SET canary_enabled=TRUE, canary_remaining=%s, paused=FALSE, updated_at=now() "
+            "SET ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=%s, "
+            "paused=FALSE, updated_at=now() "
             "WHERE id=1 AND ats_paused=FALSE",
             (k,),
         )
         n = cur.rowcount
     conn.commit()
     return n > 0
+
+
+def _stale_codex_canary_pause_clearable(conn) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT ats_paused, COALESCE(ats_pause_source, '') AS ats_pause_source "
+                    "FROM fleet_config WHERE id=1")
+        row = cur.fetchone()
+        if not row or not row["ats_paused"] or not row["ats_pause_source"].startswith("codex_canary_"):
+            return False
+        cur.execute("SELECT EXISTS (SELECT 1 FROM fleet_knobs WHERE active) AS has_active_knob")
+        if cur.fetchone()["has_active_knob"]:
+            return False
+        cur.execute("SELECT EXISTS (SELECT 1 FROM rate_governor WHERE breaker_state='paused') "
+                    "AS has_paused_breaker")
+        if cur.fetchone()["has_paused_breaker"]:
+            return False
+    return True
 
 
 def resume_if_safe(conn) -> bool:
@@ -109,6 +148,14 @@ def resume_if_safe(conn) -> bool:
             "WHERE id=1 AND paused=TRUE AND ats_paused=FALSE"
         )
         n = cur.rowcount
+        if n == 0 and _stale_codex_canary_pause_clearable(conn):
+            cur.execute(
+                "UPDATE fleet_config "
+                "SET paused=FALSE, ats_paused=FALSE, ats_pause_source=NULL, updated_at=now() "
+                "WHERE id=1 AND ats_paused=TRUE "
+                "AND COALESCE(ats_pause_source, '') LIKE 'codex_canary_%'"
+            )
+            n = cur.rowcount
     conn.commit()
     return n > 0
 
@@ -216,7 +263,7 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     p = argparse.ArgumentParser(prog="applypilot-fleet-apply-home")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
     sub = p.add_subparsers(dest="cmd", required=True)
-    sp = sub.add_parser("push"); sp.add_argument("--score-floor", type=int, default=7); sp.add_argument("--limit", type=int, default=None)
+    sp = sub.add_parser("push"); sp.add_argument("--score-floor", type=float, default=7.0); sp.add_argument("--limit", type=int, default=None)
     sp.add_argument("--include-research", action="store_true",
                     help="Also stage jobs whose fleet research_fit_score meets the score floor.")
     sp.add_argument("--no-lane-filter", action="store_true",
@@ -281,12 +328,13 @@ def _print_status(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT status, count(*) AS n FROM apply_queue GROUP BY status")
         depth = {r["status"]: r["n"] for r in cur.fetchall()}
-        cur.execute("SELECT paused, canary_enabled, canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1")
+        cur.execute("SELECT paused, ats_apply_mode, canary_enabled, canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1")
         cfg = cur.fetchone()
         cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM apply_queue")
         spend = float(cur.fetchone()["s"])
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
         open_ch = cur.fetchone()["n"]
-    print({"queue": depth, "paused": cfg["paused"], "canary_remaining": cfg["canary_remaining"],
+    print({"queue": depth, "paused": cfg["paused"], "ats_apply_mode": cfg["ats_apply_mode"],
+           "canary_remaining": cfg["canary_remaining"],
            "spend_cap_usd": float(cfg["spend_cap_usd"] or 0), "apply_spend": spend,
            "open_challenges": open_ch, "queue_diagnosis": queue_diagnosis.queue_diagnosis(conn)})

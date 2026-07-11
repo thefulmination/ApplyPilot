@@ -322,11 +322,22 @@ def test_classify_snapshot_does_not_treat_generic_checkpoint_text_as_challenge()
     assert decision.status == "resolved_offsite"
 
 
+def test_extract_company_hint_from_linkedin_snapshot_text():
+    snapshot = linkedin_resolver.PageSnapshot(
+        url="https://www.linkedin.com/jobs/view/123",
+        text="Chief of Staff\nVercel\nUnited States\n2 weeks ago",
+        controls=(),
+    )
+
+    assert linkedin_resolver.extract_company_hint(snapshot) == "Vercel"
+
+
 def _insert_job(
     conn,
     *,
     url: str,
     title: str = "Chief of Staff",
+    company: str | None = "Acme",
     site: str = "linkedin",
     application_url: str | None = None,
     audit_label: str | None = "recommended",
@@ -345,12 +356,13 @@ def _insert_job(
             fit_score, duplicate_of_url, liveness_status, applied_at,
             linkedin_resolve_status, discovered_at
         )
-        VALUES (?, ?, ?, 'Acme', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             url,
             title,
             site,
+            company,
             application_url,
             audit_label,
             audit_score,
@@ -654,6 +666,48 @@ def test_record_resolution_sets_offsite_application_url_and_attempt_metadata(tmp
     assert row["linkedin_resolved_at"]
 
 
+def test_record_resolution_fills_blank_company_from_page_hint(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/company-hint", company=None)
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/company-hint",
+        status="easy_apply",
+        company_hint="ParetoHealth",
+    )
+
+    row = conn.execute(
+        "SELECT company, linkedin_resolve_status FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/company-hint",),
+    ).fetchone()
+    assert row["company"] == "ParetoHealth"
+    assert row["linkedin_resolve_status"] == "easy_apply"
+
+
+def test_record_resolution_keeps_existing_company_over_page_hint(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/company-existing",
+        company="ExistingCo",
+    )
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/company-existing",
+        status="resolved_offsite",
+        final_url="https://jobs.ashbyhq.com/newco/role",
+        company_hint="NewCo",
+    )
+
+    company = conn.execute(
+        "SELECT company FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/company-existing",),
+    ).fetchone()[0]
+    assert company == "ExistingCo"
+
+
 def test_record_resolution_unresolved_defaults_taxonomy_metadata(tmp_path, monkeypatch):
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
@@ -709,6 +763,29 @@ def test_record_resolution_resolved_clears_stale_unresolved_metadata(tmp_path, m
     assert row["linkedin_resolve_status"] == "easy_apply"
     assert row["linkedin_unresolved_kind"] is None
     assert row["linkedin_next_action"] is None
+
+
+def test_record_resolution_unavailable_marks_job_dead(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.linkedin.com/jobs/view/unavailable")
+
+    linkedin_resolver.record_resolution(
+        "https://www.linkedin.com/jobs/view/unavailable",
+        status="unavailable",
+    )
+
+    row = conn.execute(
+        """
+        SELECT linkedin_resolve_status, liveness_status, liveness_reason, last_verified_live
+        FROM jobs WHERE url = ?
+        """,
+        ("https://www.linkedin.com/jobs/view/unavailable",),
+    ).fetchone()
+    assert row["linkedin_resolve_status"] == "unavailable"
+    assert row["liveness_status"] == "dead"
+    assert row["liveness_reason"] == "linkedin_resolver_unavailable"
+    assert row["last_verified_live"]
 
 
 def test_record_resolution_does_not_overwrite_existing_offsite_without_refresh(tmp_path, monkeypatch):
@@ -890,6 +967,35 @@ def test_run_candidates_summary_counts_and_sample_urls(tmp_path, monkeypatch):
         "https://jobs.lever.co/acme/one",
         "https://www.linkedin.com/jobs/view/two",
     ]
+
+
+def test_run_candidates_records_company_hint_from_page_decision(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(linkedin_resolver, "get_connection", lambda: conn)
+    monkeypatch.setattr(linkedin_resolver, "_sleep_between", lambda options: None)
+    _insert_job(
+        conn,
+        url="https://www.linkedin.com/jobs/view/company-from-runner",
+        company=None,
+        audit_label="priority",
+    )
+
+    summary = linkedin_resolver._run_candidates_for_test(
+        linkedin_resolver.fetch_candidates(limit=1, tiers=("priority",)),
+        linkedin_resolver.ResolverOptions(limit=1),
+        lambda candidate, options: linkedin_resolver.PageDecision(
+            status="easy_apply",
+            company_hint="Easy Aerial",
+        ),
+    )
+
+    row = conn.execute(
+        "SELECT company, linkedin_resolve_status FROM jobs WHERE url = ?",
+        ("https://www.linkedin.com/jobs/view/company-from-runner",),
+    ).fetchone()
+    assert summary.counts == {"easy_apply": 1}
+    assert row["company"] == "Easy Aerial"
+    assert row["linkedin_resolve_status"] == "easy_apply"
 
 
 class _FakeLocator:

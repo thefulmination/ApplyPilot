@@ -1,4 +1,6 @@
 """Launcher relay mode returns the standard hint via the fleet, not local Gmail."""
+from datetime import datetime, timezone
+
 from applypilot.apply import launcher
 from applypilot.fleet import otp_relay
 
@@ -81,7 +83,33 @@ def test_prearm_request_ttl_covers_agent_run_plus_postrun_poll(monkeypatch):
         "url": "j",
         "application_url": "https://greenhouse.io/a",
     }) == 12
-    assert seen["ttl_seconds"] >= 645
+    assert seen["ttl_seconds"] >= 900
+
+
+def test_prearm_request_ttl_uses_effective_agent_timeout_override(monkeypatch):
+    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://stub")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300")
+    monkeypatch.setenv("APPLYPILOT_AGENT_TIMEOUT", "300")
+    monkeypatch.setattr(launcher, "AGENT_TIMEOUT_SECONDS", 720)
+    seen = {}
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def close(self): pass
+
+    def fake_request_code(conn, **kw):
+        seen.update(kw)
+        return 13
+
+    monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn: _Conn())
+    monkeypatch.setattr(otp_relay, "request_code", fake_request_code)
+
+    assert launcher._prearm_inbox_auth_request({
+        "url": "j",
+        "application_url": "https://greenhouse.io/a",
+    }) == 13
+    assert seen["ttl_seconds"] >= 1020
 
 
 def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypatch):
@@ -101,3 +129,115 @@ def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypat
 def test_local_mode_unchanged_when_disabled(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_INBOX_AUTH", raising=False)  # disabled entirely
     assert launcher._poll_inbox_auth_hint({"url": "j", "application_url": "https://greenhouse.io/a"}) is None
+
+
+def test_local_mode_passes_request_context_and_busy_inbox_default(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "local")
+    monkeypatch.delenv("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", raising=False)
+    seen = {}
+
+    monkeypatch.setattr(launcher.inbox_auth, "create_auth_challenge", lambda **_kw: 42)
+    monkeypatch.setattr(launcher.inbox_auth, "set_auth_challenge_status", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "mark_auth_challenge_attempt", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "expire_stale_challenges", lambda: 0)
+
+    def fake_watch(**kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(launcher.inbox_auth, "watch_gmail_for_auth_code", fake_watch)
+    before = datetime.now(timezone.utc)
+
+    assert launcher._poll_inbox_auth_hint(
+        {"url": "j", "application_url": "https://boards.greenhouse.io/a"}
+    ) is None
+
+    assert seen["max_messages"] == 1000
+    assert seen["provider_domain"] == "boards.greenhouse.io"
+    assert seen["not_before"] >= before
+    assert seen["not_before"].tzinfo is timezone.utc
+    assert callable(seen["claim_matches"])
+    assert "excluded_message_ids" not in seen
+
+
+def test_local_mode_returns_hint_only_after_durable_claim(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "local")
+    monkeypatch.setattr(launcher.inbox_auth, "create_auth_challenge", lambda **_kw: 42)
+    monkeypatch.setattr(launcher.inbox_auth, "set_auth_challenge_status", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "mark_auth_challenge_attempt", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "expire_stale_challenges", lambda: 0)
+
+    from applypilot.inbox_auth import AuthEmailMatch, VerificationCandidate
+
+    match = AuthEmailMatch(
+        message_id="m-claim", thread_id="t", sender="no-reply@greenhouse.io",
+        subject="Verify", received_at=datetime.now(timezone.utc).isoformat(),
+        snippet="verification message", candidate=VerificationCandidate(
+            kind="code", value="123456", confidence="high", reasons=("verification_language",), position=0
+        ), reasons=("verification_language",),
+    )
+    monkeypatch.setattr(
+        launcher.inbox_auth,
+        "watch_gmail_for_auth_code",
+        lambda **kwargs: kwargs["claim_matches"]([match]),
+    )
+    monkeypatch.setattr(
+        launcher.inbox_auth, "claim_unique_auth_match",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+
+    assert launcher._poll_inbox_auth_hint(
+        {"url": "j", "application_url": "https://greenhouse.io/a"}
+    ) is None
+
+
+def test_local_mode_claims_complete_watcher_snapshot_once(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "local")
+    monkeypatch.setattr(launcher.inbox_auth, "create_auth_challenge", lambda **_kw: 42)
+    monkeypatch.setattr(launcher.inbox_auth, "set_auth_challenge_status", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "mark_auth_challenge_attempt", lambda *_a: None)
+    monkeypatch.setattr(launcher.inbox_auth, "expire_stale_challenges", lambda: 0)
+
+    from applypilot.inbox_auth import AuthEmailMatch, VerificationCandidate
+
+    def match(message_id, value):
+        candidate = VerificationCandidate(
+            kind="code",
+            value=value,
+            confidence="high",
+            reasons=("verification_language",),
+            position=0,
+        )
+        return AuthEmailMatch(
+            message_id=message_id,
+            thread_id=message_id,
+            sender="no-reply@greenhouse.io",
+            subject="Verify",
+            received_at=datetime.now(timezone.utc).isoformat(),
+            snippet="verification message",
+            candidate=candidate,
+            reasons=candidate.reasons,
+        )
+
+    snapshot = [match("m-1", "123456"), match("m-2", "654321")]
+    observed = []
+
+    def claim_unique(challenge_id, matches):
+        observed.append((challenge_id, list(matches)))
+        return matches[0]
+
+    def watch(**kwargs):
+        return kwargs["claim_matches"](snapshot)
+
+    monkeypatch.setattr(launcher.inbox_auth, "claim_unique_auth_match", claim_unique)
+    monkeypatch.setattr(launcher.inbox_auth, "watch_gmail_for_auth_code", watch)
+
+    hint = launcher._poll_inbox_auth_hint(
+        {"url": "j", "application_url": "https://greenhouse.io/a"}
+    )
+
+    assert hint == "code=123456"
+    assert observed == [(42, snapshot)]

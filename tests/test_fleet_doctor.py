@@ -14,9 +14,19 @@ from applypilot.fleet import doctor, queue
 # ---------------------------------------------------------------------------
 # Seed helpers
 # ---------------------------------------------------------------------------
-def _seed_apply_failure(conn, *, url, host, worker_id="home-0", apply_error=None,
-                        apply_status=None, status="failed", approved_batch="b1",
-                        queued=False):
+def _seed_apply_failure(
+    conn,
+    *,
+    url,
+    host,
+    worker_id="home-0",
+    apply_error=None,
+    apply_status=None,
+    status="failed",
+    approved_batch="b1",
+    queued=False,
+    score=8.5,
+):
     """Insert one apply_queue row carrying a failure signal (recent updated_at). When
     ``queued`` is True the row is left status='queued' + approved (so host_skip can un-approve
     it); otherwise it's a terminal failure row used for clustering."""
@@ -29,12 +39,12 @@ def _seed_apply_failure(conn, *, url, host, worker_id="home-0", apply_error=None
             "INSERT INTO apply_queue (url, company, title, application_url, score, "
             "apply_domain, target_host, lane, dedup_key, approved_batch, status, "
             "apply_error, apply_status, worker_id, updated_at) "
-            "VALUES (%s,'Co','T',%s,1.0,%s,%s,'ats',%s,%s,%s,%s,%s,%s, now()) "
+            "VALUES (%s,'Co','T',%s,%s,%s,%s,'ats',%s,%s,%s,%s,%s,%s, now()) "
             "ON CONFLICT (url) DO UPDATE SET apply_error=EXCLUDED.apply_error, "
             "apply_status=EXCLUDED.apply_status, status=EXCLUDED.status, "
             "approved_batch=EXCLUDED.approved_batch, target_host=EXCLUDED.target_host, "
             "worker_id=EXCLUDED.worker_id, updated_at=now()",
-            (url, url, host, host, url, approved_batch, st, apply_error, apply_status, worker_id),
+            (url, url, score, host, host, url, approved_batch, st, apply_error, apply_status, worker_id),
         )
     conn.commit()
 

@@ -16,7 +16,7 @@ from applypilot.fleet import governor
 from applypilot.fleet import queue
 
 
-def _seed_apply(conn, url, *, host, score=5.0, company="Co", title="Role", approved="b1", dedup_key=None):
+def _seed_apply(conn, url, *, host, score=8.0, company="Co", title="Role", approved="b1", dedup_key=None):
     queue.push_apply_jobs(conn, [{
         "url": url, "company": company, "title": title,
         "application_url": f"https://{host}/jobs/x", "score": score,
@@ -33,6 +33,192 @@ def test_lease_requires_approval(fleet_db):
         assert queue.approve_jobs(conn, ["u1"], "batchA") == 1
         leased = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
         assert leased and leased["url"] == "u1"
+
+
+def test_lease_apply_enforces_approval_threshold_even_when_approved(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET approval_threshold=7 WHERE id=1")
+        conn.commit()
+        _seed_apply(conn, "too-low", host="greenhouse.io", score=6.9, approved="batch-low")
+
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
+
+
+def test_lease_apply_respects_operator_threshold_below_seven(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET approval_threshold=6.5 WHERE id=1")
+        conn.commit()
+        _seed_apply(conn, "at-floor", host="greenhouse.io", score=6.5, approved="batch-ok")
+
+        leased = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
+
+    assert leased and leased["url"] == "at-floor"
+
+
+def test_lease_apply_requires_positive_canary_capacity(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "canary-required", host="greenhouse.io", score=9, approved="batch-ok")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET paused=FALSE, ats_paused=FALSE, "
+                "ats_apply_mode='canary', canary_enabled=FALSE, canary_remaining=NULL WHERE id=1"
+            )
+        conn.commit()
+
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
+
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=0 WHERE id=1")
+        conn.commit()
+
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET status='queued', lease_owner=NULL, lease_expires_at=NULL WHERE url='canary-required'"
+            )
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=1 WHERE id=1")
+        conn.commit()
+        assert queue.lease_apply(conn, "w2", home_ip="1.1.1.1") is not None
+
+
+def test_repush_apply_job_clears_stale_approval_when_score_drops_below_threshold(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET approval_threshold=7 WHERE id=1")
+        conn.commit()
+        _seed_apply(conn, "score-drift", host="greenhouse.io", score=8.0, approved="batch-high")
+
+        queue.push_apply_jobs(conn, [{
+            "url": "score-drift",
+            "company": "Co",
+            "title": "Role",
+            "application_url": "https://greenhouse.io/jobs/x",
+            "score": 5.0,
+            "target_host": "greenhouse.io",
+        }], approved_batch=None)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT score, approved_batch FROM apply_queue WHERE url='score-drift'")
+            row = cur.fetchone()
+
+    assert float(row["score"]) == 5.0
+    assert row["approved_batch"] is None
+
+
+def test_lease_linkedin_enforces_approval_threshold_even_when_approved(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET approval_threshold=7, "
+                "linkedin_apply_mode='canary', linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL WHERE id=1"
+            )
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-low', 'Co', 'Role', 'https://linkedin.com/jobs/low', 6.9, 'linkedin', 'batch-low')"
+            )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
+        conn.commit()
+
+        assert queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1") is None
+
+
+def test_lease_linkedin_requires_positive_canary_capacity(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-canary-required', 'Co', 'Role', 'https://linkedin.com/jobs/canary', 9, 'linkedin', 'batch-ok')"
+            )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_apply_mode='canary', "
+                "linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL WHERE id=1"
+            )
+        conn.commit()
+
+        assert queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1") is None
+
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET linkedin_apply_mode='canary', linkedin_canary_enabled=TRUE, linkedin_canary_remaining=0 WHERE id=1")
+        conn.commit()
+        assert queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1") is None
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE linkedin_queue SET status='queued', lease_owner=NULL, lease_expires_at=NULL WHERE url='li-canary-required'"
+            )
+            cur.execute("UPDATE fleet_config SET linkedin_apply_mode='canary', linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1 WHERE id=1")
+        conn.commit()
+        assert queue.lease_linkedin(conn, "w2", public_ip="1.1.1.1", owner_ip="1.1.1.1") is not None
+
+
+def test_ats_canary_exhaustion_does_not_globally_pause_linkedin(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "ats-one", host="greenhouse.io", score=9, approved="ats-batch")
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch, dedup_key) "
+                "VALUES ('li-after-ats', 'Co', 'Role', 'https://linkedin.com/jobs/after-ats', 9, 'linkedin', 'li-batch', 'li-after-ats')"
+            )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
+            cur.execute(
+                "UPDATE fleet_config SET paused=FALSE, ats_paused=FALSE, "
+                "ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=1, "
+                "linkedin_apply_mode='canary', linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1 "
+                "WHERE id=1"
+            )
+        conn.commit()
+
+        assert queue.lease_apply(conn, "ats-worker", home_ip="1.1.1.1") is not None
+        with conn.cursor() as cur:
+            cur.execute("SELECT paused, ats_apply_mode, canary_remaining FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+
+        assert cfg["paused"] is False
+        assert cfg["ats_apply_mode"] == "stopped"
+        assert cfg["canary_remaining"] == 0
+        assert queue.lease_linkedin(
+            conn, "li-worker", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        ) is not None
+
+
+def test_linkedin_canary_exhaustion_does_not_block_ats(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "ats-after-li", host="greenhouse.io", score=9, approved="ats-batch")
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch, dedup_key) "
+                "VALUES ('li-one', 'Co', 'Role', 'https://linkedin.com/jobs/one', 9, 'linkedin', 'li-batch', 'li-one')"
+            )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
+            cur.execute(
+                "UPDATE fleet_config SET paused=FALSE, ats_paused=FALSE, "
+                "ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=1, "
+                "linkedin_apply_mode='canary', linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1 "
+                "WHERE id=1"
+            )
+        conn.commit()
+
+        assert queue.lease_linkedin(
+            conn, "li-worker", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        ) is not None
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT paused, linkedin_apply_mode, linkedin_canary_remaining FROM fleet_config WHERE id=1"
+            )
+            cfg = cur.fetchone()
+
+        assert cfg["paused"] is False
+        assert cfg["linkedin_apply_mode"] == "stopped"
+        assert cfg["linkedin_canary_remaining"] == 0
+        assert queue.lease_apply(conn, "ats-worker", home_ip="1.1.1.1") is not None
 
 
 def test_lease_apply_skips_company_blocklist_match(fleet_db):
@@ -68,6 +254,7 @@ def test_lease_linkedin_skips_company_blocklist_match(fleet_db):
                 "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
                 "VALUES ('li-acme', 'Acme', 'Role', 'https://linkedin.com/jobs/acme', 9, 'linkedin', 'b1')"
             )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
         conn.commit()
 
         leased = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1")
@@ -253,16 +440,49 @@ def test_write_apply_result_records_llm_usage_cost(fleet_db):
         _seed_apply(conn, "cost1", host="greenhouse.io", company="Gamma", title="Analyst")
         a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
         ok = queue.write_apply_result(conn, "w1", a["url"], status="applied",
-                                      target_host="greenhouse.io", home_ip="1.2.3.4", est_cost_usd=0.42)
+                                      target_host="greenhouse.io", home_ip="1.2.3.4", est_cost_usd=0.42,
+                                      agent="codex", agent_model="gpt-5")
         assert ok
         with conn.cursor() as cur:
-            cur.execute("SELECT worker_id, task, cost_usd FROM llm_usage")
+            cur.execute("SELECT worker_id, task, provider, model, machine_owner, cost_usd FROM llm_usage")
             rows = cur.fetchall()
         assert len(rows) == 1, "expected exactly one llm_usage row for the apply-agent cost"
         row = rows[0]
         assert row["worker_id"] == "w1"
         assert row["task"] == "apply_agent"
+        assert row["provider"] == "codex"
+        assert row["model"] == "gpt-5"
+        assert row["machine_owner"] is None
         assert float(row["cost_usd"]) == 0.42
+
+
+def test_write_apply_result_records_llm_usage_machine_and_model(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "cost-machine", host="ashbyhq.com", company="Gamma", title="Analyst")
+        a = queue.lease_apply(conn, "w-machine", home_ip="1.2.3.4")
+        ok = queue.write_apply_result(
+            conn,
+            "w-machine",
+            a["url"],
+            status="applied",
+            target_host="ashbyhq.com",
+            home_ip="1.2.3.4",
+            est_cost_usd=0.55,
+            agent="claude",
+            agent_model="claude-sonnet-4",
+            machine_owner="m2",
+        )
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT worker_id, task, provider, model, machine_owner, cost_usd "
+                "FROM llm_usage WHERE worker_id='w-machine'"
+            )
+            row = cur.fetchone()
+        assert row["provider"] == "claude"
+        assert row["model"] == "claude-sonnet-4"
+        assert row["machine_owner"] == "m2"
+        assert float(row["cost_usd"]) == 0.55
 
 
 def test_write_apply_result_records_model_and_duration(fleet_db):
@@ -326,6 +546,41 @@ def test_write_apply_result_records_durable_result_event(fleet_db):
         assert row["agent_model"] == "claude-sonnet-4"
         assert row["apply_duration_ms"] == 4567
         assert row["result_line"] == "RESULT:failed:no_result_line"
+
+
+def test_write_apply_result_records_submit_risk_evidence(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "event-risk", host="ashbyhq.com", company="Epsilon", title="Staff Engineer")
+        a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
+        ok = queue.write_apply_result(
+            conn,
+            "w1",
+            a["url"],
+            status="crash_unconfirmed",
+            apply_status="crash_unconfirmed",
+            apply_error="failed:no_result_line",
+            target_host="ashbyhq.com",
+            home_ip="1.2.3.4",
+            est_cost_usd=0.03,
+            agent="claude",
+            agent_model="claude-sonnet-4",
+            apply_duration_ms=4567,
+            application_tool_calls=0,
+            job_log_path="C:/logs/job.txt",
+            transcript_digest="sha256:abc123",
+            final_result_source="transcript",
+        )
+        assert ok
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT application_tool_calls, job_log_path, transcript_digest, final_result_source "
+                "FROM apply_result_events WHERE url='event-risk'"
+            )
+            row = cur.fetchone()
+        assert row["application_tool_calls"] == 0
+        assert row["job_log_path"] == "C:/logs/job.txt"
+        assert row["transcript_digest"] == "sha256:abc123"
+        assert row["final_result_source"] == "transcript"
 
 
 def test_write_apply_result_no_llm_usage_row_when_cost_zero_or_none(fleet_db):
@@ -454,6 +709,7 @@ def test_linkedin_owner_ip_and_mutex(fleet_db):
                 cur.execute("INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
                             "VALUES (%s,'Co','Role','https://linkedin.com/jobs/%s', %s, 'linkedin', 'b1')",
                             (f"li{i}", i, 9 - i))
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
         conn.commit()
         # wrong IP -> refused
         assert queue.lease_linkedin(conn, "w1", public_ip="3.3.3.3", owner_ip="1.1.1.1") is None
@@ -472,7 +728,7 @@ def test_apply_lease_atomic_under_concurrency(fleet_db):
     n_jobs, n_workers = 24, 6
     with pgqueue.connect(fleet_db) as conn:
         for i in range(n_jobs):
-            _seed_apply(conn, f"j{i}", host=f"host{i}.io", score=float(i))  # distinct hosts -> gap never blocks
+            _seed_apply(conn, f"j{i}", host=f"host{i}.io", score=float(i + 7))  # distinct hosts -> gap never blocks
 
     grabbed: list[str] = []
     lock = threading.Lock()
@@ -510,6 +766,7 @@ def test_linkedin_lease_serializes_under_concurrency(fleet_db):
                     "VALUES (%s,'Co','Role','https://linkedin.com/jobs/%s',%s,'linkedin','b1')",
                     (f"li{i}", i, 9 - i),
                 )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
         conn.commit()
 
     leased: list[str] = []
@@ -538,6 +795,7 @@ def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
                 "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
                 "VALUES ('li-x','Co','Role','https://linkedin.com/jobs/x',9,'linkedin','b1')",
             )
+            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
         conn.commit()
         a = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1")
         assert a and a["url"] == "li-x"
@@ -618,7 +876,7 @@ def test_parked_challenge_frozen_against_reclaim(fleet_db):
         # double-submit fix an expired lease is parked crash_unconfirmed (never re-queued, since
         # it may have crashed mid-submit); the contrast that matters here is swept-vs-frozen, and
         # the parked wall below stays untouched.
-        _seed_apply(conn, "ctrl", host="c.io", score=5)
+        _seed_apply(conn, "ctrl", host="c.io", score=8)
         queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
         with conn.cursor() as cur:
             cur.execute("UPDATE apply_queue SET lease_expires_at = now() - interval '1 hour' WHERE url='ctrl'")

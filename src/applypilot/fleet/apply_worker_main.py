@@ -190,21 +190,53 @@ def _prearmed_auth_retryable(status: str | None) -> bool:
     )
 
 
+_ASSISTED_RETRY_TERMINAL_STATUSES = frozenset({
+    "applied",
+    "already_applied",
+    "dry_run",
+    "expired",
+    "failed:already_applied",
+    "failed:not_eligible_location",
+    "failed:not_eligible_work_auth",
+    "failed:not_eligible_salary",
+    "failed:not_a_job_application",
+    "failed:unsafe_permissions",
+    "failed:unsafe_verification",
+})
+
+
+def _assisted_retry_is_terminal(status: str | None) -> bool:
+    """Accept only final outcomes whose launcher meaning is explicit and bounded."""
+    return (status or "").strip().lower() in _ASSISTED_RETRY_TERMINAL_STATUSES
+
+
 def _should_launch_chrome_headless() -> bool:
     return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
 
 
-def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | None = None):
+def make_apply_fn(
+    model: str,
+    agent: str,
+    slot: int = 0,
+    fleet_worker_id: str | None = None,
+    *,
+    controlled: bool = False,
+):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
 
     Note on chrome API:
       - launch_chrome(worker_id, port=None, ...) -> subprocess.Popen
         (port defaults to BASE_CDP_PORT + worker_id; returns the process, NOT the port)
-      - cleanup_worker(worker_id, process) -> None  (process is the Popen returned above)
+      - cleanup_worker(worker_id, process) -> bool  (process is the Popen returned above)
     """
     from applypilot.apply import launcher, chrome
+    from applypilot.apply.browser_preflight import check_browser_readiness, clear_readiness_cache
     from applypilot.apply.chrome import BASE_CDP_PORT
+    from applypilot.apply.lifecycle_fault import (
+        enforce_no_lifecycle_faults,
+        require_browser_cleanup,
+    )
     from applypilot.apply.container_worker import _real_cost
 
     def apply_fn(job: dict) -> dict:
@@ -215,11 +247,66 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
         previous_fleet_worker_id = os.environ.get("FLEET_WORKER_ID")
         if fleet_worker_id:
             os.environ["FLEET_WORKER_ID"] = str(fleet_worker_id)
-        proc = chrome.launch_chrome(
-            worker_id,
-            headless=_should_launch_chrome_headless(),
-        )  # returns Popen; port is implicit BASE_CDP_PORT+slot
+        proc = None
+        out = None
         try:
+            enforce_no_lifecycle_faults()
+            launch_kwargs = {"headless": _should_launch_chrome_headless()}
+            if controlled:
+                launch_kwargs["kill_existing"] = False
+            if job.get("session_required"):
+                from applypilot.apply import tenant_sessions
+
+                session = tenant_sessions.select_session(
+                    job.get("target_host") or job.get("application_url") or job.get("url"),
+                    profile_id=job.get("tenant_profile_id"),
+                )
+                if session["state"] != "ready":
+                    out = {
+                        "run_status": "auth_required",
+                        "est_cost_usd": 0.0,
+                        "agent": agent,
+                        "agent_model": model,
+                        "application_tool_calls": 0,
+                        "session_preflight_failure": True,
+                        "result_metadata": {"tenant_session": {
+                            "host": session["host"],
+                            "profile_id": session["profile_id"],
+                            "state": session["state"],
+                            "reason": session.get("reason"),
+                        }},
+                    }
+                    return out
+                launch_kwargs["profile_dir"] = session["profile_dir"]
+            proc = chrome.launch_chrome(
+                worker_id,
+                **launch_kwargs,
+            )  # returns Popen; port is implicit BASE_CDP_PORT+slot
+            browser_readiness = check_browser_readiness(port)
+            if not browser_readiness["ready"]:
+                first_readiness = browser_readiness
+                require_browser_cleanup(chrome.cleanup_worker, worker_id, proc)
+                proc = None
+                clear_readiness_cache()
+                proc = chrome.launch_chrome(worker_id, **launch_kwargs)
+                browser_readiness = check_browser_readiness(port)
+            if not browser_readiness["ready"]:
+                out = {
+                    "run_status": f"failed:browser_preflight:{browser_readiness['reason']}",
+                    "est_cost_usd": 0.0,
+                    "agent": agent,
+                    "agent_model": model,
+                    "application_tool_calls": 0,
+                    "infrastructure_preflight_failure": True,
+                    "infrastructure_restart_attempted": True,
+                    "result_metadata": {
+                        "browser_preflight": browser_readiness,
+                        "browser_preflight_initial": first_readiness,
+                    },
+                }
+                return out
+            assisted_retry_count = 0
+            assisted_hint_kind = None
             prearmed_request_id = (
                 launcher._prearm_inbox_auth_request(job)
                 if launcher._should_prearm_inbox_auth(job)
@@ -231,10 +318,31 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 or _browser_tool_retryable(status)
                 or _prearmed_auth_retryable(status)
             ):
-                inbox_hint = launcher._consume_prearmed_inbox_auth_hint(prearmed_request_id)
+                total_timeout = max(
+                    0,
+                    int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT") or 300),
+                )
+                postrun_timeout = max(
+                    0,
+                    int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or 45),
+                )
+                wait_started = time.monotonic()
+                inbox_hint = launcher._consume_prearmed_inbox_auth_hint(
+                    prearmed_request_id,
+                    timeout_seconds=min(total_timeout, postrun_timeout),
+                )
                 if not inbox_hint and launcher._is_auth_required_result(status):
-                    inbox_hint = launcher._poll_inbox_auth_hint(job)
+                    elapsed = time.monotonic() - wait_started
+                    remaining = max(0, int(total_timeout - elapsed))
+                    inbox_hint = launcher._consume_prearmed_inbox_auth_hint(
+                        prearmed_request_id,
+                        timeout_seconds=remaining,
+                    )
                 if inbox_hint:
+                    assisted_retry_count = 1
+                    assisted_hint_kind = (
+                        "magic_link" if inbox_hint.startswith("magic_link=") else "code"
+                    )
                     status, _dur = launcher.run_job(
                         job,
                         port,
@@ -254,7 +362,25 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
                 "transcript_digest": stats.get("transcript_digest"),
                 "final_result_source": stats.get("final_result_source"),
+                "result_metadata": stats.get("result_metadata"),
+                "assisted_retry_count": assisted_retry_count,
+                "inbox_auth_prearmed": prearmed_request_id is not None,
+                "assisted_retry_terminal": (
+                    assisted_retry_count == 1
+                    and _assisted_retry_is_terminal(status)
+                ),
             }
+            result_metadata = dict(out.get("result_metadata") or {})
+            result_metadata["inbox_auth"] = {
+                "prearmed": prearmed_request_id is not None,
+                "assisted_retry_count": assisted_retry_count,
+                "hint_kind": assisted_hint_kind,
+                "parked_unsupported": (
+                    status in {"auth_required", "login_issue"}
+                    and assisted_retry_count == 0
+                ),
+            }
+            out["result_metadata"] = result_metadata
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
             # Chrome). This is needed for non-applied terminal statuses too: an
             # auth_required result on an external ATS is a job-level wall, not a
@@ -271,10 +397,16 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                     os.environ.pop("FLEET_WORKER_ID", None)
                 else:
                     os.environ["FLEET_WORKER_ID"] = previous_fleet_worker_id
-            try:
-                chrome.cleanup_worker(worker_id, proc)
-            except Exception:
-                pass
+            cleanup_result = (
+                require_browser_cleanup(chrome.cleanup_worker, worker_id, proc)
+                if proc is not None
+                else False
+            )
+            cleanup_ok = True if proc is None else (
+                cleanup_result is True if controlled else cleanup_result is not False
+            )
+            if out is not None:
+                out["browser_cleanup_ok"] = cleanup_ok
     return apply_fn
 
 
@@ -363,6 +495,9 @@ def _apply_timeout_override(dsn=None, *, conn=None) -> None:
 
 def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", machine_owner=None, slot=0):
     _setup_apply_env()
+    from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
+
+    enforce_no_lifecycle_faults()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).

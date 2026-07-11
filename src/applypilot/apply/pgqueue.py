@@ -8,7 +8,7 @@ re-pushes and nothing important is gone.
 
 Every function takes an OPEN psycopg connection so callers control transaction scope and the
 whole layer is trivially testable against a throwaway local Postgres. The production DSN comes
-from DATABASE_URL (Railway injects it for the worker; the home box uses the public URL).
+from APPLYPILOT_FLEET_DSN when set, otherwise DATABASE_URL (Railway injects it for the worker).
 
 Concurrency contract (the part that must never break):
   * lease_one  -> FOR UPDATE SKIP LOCKED: N workers each grab a DISTINCT row, never blocking.
@@ -35,7 +35,7 @@ _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding=
 # ---------------------------------------------------------------------------
 
 def get_dsn(dsn: str | None = None) -> str:
-    dsn = dsn or os.environ.get("DATABASE_URL") or os.environ.get("APPLYPILOT_FLEET_DSN")
+    dsn = dsn or os.environ.get("APPLYPILOT_FLEET_DSN") or os.environ.get("DATABASE_URL")
     if not dsn:
         raise RuntimeError(
             "No Postgres DSN: set DATABASE_URL (Railway) or APPLYPILOT_FLEET_DSN."

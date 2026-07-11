@@ -6,11 +6,15 @@ it must stop on max_attempts and on an already-met budget, and never raise.
 """
 from __future__ import annotations
 
+import pytest
+
 from applypilot.apply import supervisor as S
+from applypilot.apply import lifecycle_fault
 
 
 def test_supervise_stops_on_max_attempts_without_spawning(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(S, "_applied_count", lambda: 10)
     # If it tried to spawn, this would blow up -- it must NOT be reached.
     monkeypatch.setattr(S.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
@@ -23,6 +27,7 @@ def test_supervise_stops_on_max_attempts_without_spawning(tmp_path, monkeypatch,
 
 def test_supervise_stops_when_budget_already_met(tmp_path, monkeypatch):
     monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
     # baseline=10, then progress jumps to 200 -> est spend (190 * 1.5) >> budget -> stop,
     # without ever spawning a run.
     counts = iter([10, 200])
@@ -38,6 +43,7 @@ def test_supervise_stops_on_actual_cost_even_with_few_applies(tmp_path, monkeypa
     # actually spent (failed/expired launches cost too) -> stop on real cost, not the
     # 1*$1.5 applied-count estimate. Never spawns.
     monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(S, "_applied_count", lambda: 11)  # baseline+1
     costs = iter([0.0, 50.0])  # baseline snapshot, then current cumulative
     monkeypatch.setattr(S, "_apply_cost_total", lambda: next(costs, 50.0))
@@ -57,6 +63,77 @@ def test_apply_cost_total_sums_only_apply_agent_rows(tmp_path, monkeypatch):
     for stage, cost in [("apply_agent", 1.25), ("apply_agent", 0.75), ("scoring", 9.0)]:
         c.execute("INSERT INTO llm_usage (stage, est_cost_usd, created_at) VALUES (?, ?, 'now')",
                   (stage, cost))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     monkeypatch.setattr(S.config, "DB_PATH", db)
     assert abs(S._apply_cost_total() - 2.0) < 1e-9  # only the two apply_agent rows
+
+
+def test_fault_created_during_attempt_one_blocks_attempt_two(tmp_path, monkeypatch):
+    class Process:
+        pid = 501
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    spawns = []
+    monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setenv("APPLYPILOT_BACKUP_INTERVAL", "0")
+    monkeypatch.setattr(S, "_applied_count", lambda: 0)
+    monkeypatch.setattr(S, "_apply_cost_total", lambda: 0.0)
+    monkeypatch.setattr(S, "_require_orphan_cleanup", lambda *_args: None)
+    monkeypatch.setattr(
+        S,
+        "_capture_guarded_supervised_child",
+        lambda *_args: S.SupervisedProcessIdentity(
+            pid=501,
+            created_at=10.0,
+            executable="python.exe",
+            command="python -m applypilot.cli apply",
+            launched_at=10.0,
+        ),
+    )
+
+    def popen(*_args, **_kwargs):
+        spawns.append(1)
+        if len(spawns) == 1:
+            lifecycle_fault.persist_lifecycle_hard_fault(
+                "appeared during attempt one", pid=777
+            )
+        return Process()
+
+    monkeypatch.setattr(S.subprocess, "Popen", popen)
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="hard-fault"):
+        S.supervise(total_cost_usd=100, max_attempts=3, poll_seconds=0)
+
+    assert len(spawns) == 1
+
+
+def test_supervisor_checks_shared_fault_gate_immediately_before_spawn(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(S, "_applied_count", lambda: 0)
+    monkeypatch.setattr(S, "_apply_cost_total", lambda: 0.0)
+    monkeypatch.setattr(S, "_require_orphan_cleanup", lambda *_args: None)
+    monkeypatch.setattr(
+        S,
+        "enforce_no_lifecycle_faults",
+        lambda: calls.append("gate") or (_ for _ in ()).throw(
+            lifecycle_fault.LifecycleHardFault("operator reconciliation required")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        S.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault):
+        S.supervise(total_cost_usd=100, max_attempts=1)
+
+    assert calls

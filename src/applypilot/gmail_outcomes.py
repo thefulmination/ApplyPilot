@@ -27,6 +27,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+from applypilot.ats_domains import ATS_SENDER_DOMAINS
+
 log = logging.getLogger(__name__)
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -221,21 +223,7 @@ _ACK_BODY = [
 # subdomains ATS platforms actually send from (e.g. greenhouse-mail.io, teamtailor-mail
 # .com) -- the bare board domains (greenhouse.io) never appear as the From, so matching
 # and ATS detection used to miss every greenhouse/teamtailor confirmation.
-_ATS_DOMAINS: frozenset[str] = frozenset({
-    "greenhouse.io", "greenhouse-mail.io",
-    "lever.co", "hire.lever.co",
-    "workday.com", "myworkdayjobs.com", "myworkday.com",
-    "icims.com", "brassring.com",
-    "smartrecruiters.com", "smartrecruiters-mail.com",
-    "workable.com", "workablemail.com", "taleo.net",
-    "jobvite.com", "jobvite-mail.com", "recruitee.com",
-    "ashbyhq.com", "ashbyhq-mail.com", "ashby.email",
-    "successfactors.com", "applytojob.com",
-    "bamboohr.com", "rippling.com",
-    "eightfold.ai", "beamery.com", "paradox.ai", "fountain.com",
-    "dover.com", "dover.io", "teamtailor.com", "teamtailor-mail.com",
-    "pinpointhq.com", "comeet.co", "gem.com", "breezy.hr", "hiringthing.com",
-})
+_ATS_DOMAINS = ATS_SENDER_DOMAINS
 
 # Generic webmail domains that give no company signal
 _GENERIC_DOMAINS: frozenset[str] = frozenset({
@@ -921,7 +909,14 @@ def _get_text_body(payload: dict[str, Any]) -> str:
 
     if mime == "text/html" and data:
         raw = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
-        return re.sub(r"<[^>]+>", " ", raw)
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(raw, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor.get("href") or "").strip()
+            if href.lower().startswith(("http://", "https://")) and href not in anchor.get_text(" "):
+                anchor.append(f" {href} ")
+        return soup.get_text(" ")
 
     plain, html = "", ""
     for part in payload.get("parts", []):

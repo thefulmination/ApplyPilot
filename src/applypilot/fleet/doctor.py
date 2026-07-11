@@ -1472,7 +1472,8 @@ def sweep_expired(conn) -> dict:
 
         cur.execute(
             "UPDATE fleet_diagnoses SET status='expired', updated_at=now() "
-            "WHERE status IN ('auto_applied','open') AND expires_at IS NOT NULL AND expires_at <= now() "
+            "WHERE status IN ('auto_applied','open','recommended') "
+            "AND expires_at IS NOT NULL AND expires_at <= now() "
             "RETURNING id")
         diags = len(cur.fetchall())
 
@@ -1481,7 +1482,8 @@ def sweep_expired(conn) -> dict:
         for rec in recommends:
             cur.execute(
                 "SELECT 1 FROM fleet_diagnoses WHERE cluster_key=%s "
-                "AND status IN ('auto_applied','recommended','open') LIMIT 1", (rec["cluster_key"],))
+                "AND status IN ('auto_applied','recommended','open') "
+                "AND (expires_at IS NULL OR expires_at > now()) LIMIT 1", (rec["cluster_key"],))
             if cur.fetchone() is None:
                 _record_diagnosis(cur, rec, status="recommended", auto_action=None,
                                   how_to_reverse="Dismiss via the console (bookkeeping only).",

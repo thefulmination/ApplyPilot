@@ -189,6 +189,8 @@ class Broker:
             raise ValueError(f"unknown lane: {lane!r}")
         if not self._capabilities(worker).get(cap_flag):
             raise CapabilityError(f"worker {worker_id} lacks capability {cap_flag} for lane {lane}")
+        if not fleet_config.worker_version_matches(conn, worker_id):
+            return None
 
         reg_ip = worker.get("public_ip")  # registered egress -- the ONLY IP we trust
         kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}

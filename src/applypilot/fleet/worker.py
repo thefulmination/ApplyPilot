@@ -42,8 +42,10 @@ import re
 from typing import Any, Callable, Optional
 
 from applypilot.fleet import captcha as _captcha
+from applypilot.fleet import config as fleet_config
 from applypilot.fleet import governor
 from applypilot.fleet import queue
+from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
 
 # Roles a machine slot may carry (a machine may run several slots / roles -- §5).
 ROLE_APPLY = "apply"
@@ -222,6 +224,7 @@ class WorkerLoop:
         owner_ip: Optional[str] = None,
         compute_fns: Optional[dict] = None,
         log_tail_fn: Optional[Callable[[], Optional[str]]] = None,
+        liveness_fn: Optional[Callable[..., tuple[str, str]]] = None,
     ) -> None:
         if role not in (ROLE_APPLY, ROLE_COMPUTE, ROLE_DISCOVERY, ROLE_LINKEDIN):
             raise ValueError(f"unknown role: {role!r}")
@@ -249,6 +252,11 @@ class WorkerLoop:
         self._last_error: Optional[str] = None
         self._events: collections.deque = collections.deque(maxlen=40)
         self._log_tail_fn = log_tail_fn
+        if liveness_fn is None:
+            from applypilot.apply.liveness import probe_url
+
+            liveness_fn = probe_url
+        self.liveness_fn = liveness_fn
         self._started_at = _dt.datetime.now(_dt.timezone.utc)
         self.current_agent: Optional[str] = None
         self.current_model: Optional[str] = None
@@ -384,6 +392,21 @@ class WorkerLoop:
             if self._paused:
                 self._beat(conn, state="paused")
                 return {"action": "paused"}
+            version_status = fleet_config.version_status_for_worker(
+                conn,
+                self.worker_id,
+                sw_version=self.sw_version,
+            )
+            if not version_status["matches"]:
+                expected = version_status["expected_version"]
+                actual = version_status["sw_version"]
+                self._record_event(f"version mismatch: running {actual or '(unreported)'} expected {expected}")
+                self._beat(conn, state="version_mismatch")
+                return {
+                    "action": "version_mismatch",
+                    "expected_version": expected,
+                    "sw_version": actual,
+                }
             if self.role == ROLE_COMPUTE:
                 return self._tick_compute(conn)
             if self.role == ROLE_DISCOVERY:
@@ -454,10 +477,37 @@ class WorkerLoop:
 
     # -- APPLY: governed, dedup-gated, approval-gated, captcha-aware (§5/§7) ---
     def _tick_apply(self, conn) -> dict:
+        enforce_no_lifecycle_faults()
+        liveness_result = None
+        check = queue.claim_liveness_check(conn, self.worker_id)
+        if check is not None:
+            target_url = check.get("application_url") or check["url"]
+            try:
+                status, reason = self.liveness_fn(
+                    target_url,
+                    meta={"company": check.get("company"), "title": check.get("title")},
+                )
+            except Exception as exc:
+                status, reason = "uncertain", f"error:{type(exc).__name__}"
+            queue.write_liveness_result(
+                conn,
+                self.worker_id,
+                check["url"],
+                status=status,
+                reason=reason,
+            )
+            liveness_result = {
+                "action": "liveness_checked",
+                "url": check["url"],
+                "liveness_status": status,
+                "liveness_reason": reason,
+            }
+            self._record_event(f"liveness {status} {check['url']} ({reason})")
+
         job = queue.lease_apply(conn, self.worker_id, home_ip=self.home_ip)
         if job is None:
             self._beat(conn, state="idle")
-            return {"action": "idle"}
+            return liveness_result or {"action": "idle"}
         url = job["url"]
         target_host = job.get("target_host")
         self._record_event(f"leased apply {url} host={target_host}")
@@ -478,6 +528,7 @@ class WorkerLoop:
             queue.write_apply_result(
                 conn, self.worker_id, url, status="applied", apply_status="applied",
                 target_host=target_host, home_ip=self.home_ip, outcome="success",
+                machine_owner=self.machine_owner,
             )
             self._record_event(f"wrote apply applied {url} ({kind})")
             self._beat(conn, state="idle")
@@ -500,7 +551,7 @@ class WorkerLoop:
             queue.write_apply_result(
                 conn, self.worker_id, url, status="blocked", apply_status="failed",
                 apply_error=f"captcha:{kind}", target_host=target_host, home_ip=self.home_ip,
-                outcome="block",
+                outcome="block", machine_owner=self.machine_owner,
             )
             self._record_event(f"wrote apply blocked {url} (captcha:{kind})")
             self._beat(conn, state="idle")
@@ -528,6 +579,7 @@ class WorkerLoop:
     def _tick_linkedin(self, conn) -> dict:
         # Pre-checks (belts; the lease SQL is the real enforcement). Session pre-flight +
         # halt pre-check; the interlock is held by the entrypoint for the worker's life.
+        enforce_no_lifecycle_faults()
         job = queue.lease_linkedin(conn, self.worker_id, public_ip=self.public_ip, owner_ip=self.owner_ip)
         if job is None:
             self._beat(conn, state="idle")
@@ -597,6 +649,38 @@ class WorkerLoop:
         agent = res.get("agent")   # which apply agent ran -> attributes the spend (agent_budget)
         agent_model = res.get("agent_model") or res.get("model")
         duration_ms = res.get("apply_duration_ms") or res.get("duration_ms")
+        result_evidence = {
+            "application_tool_calls": res.get("application_tool_calls"),
+            "job_log_path": res.get("job_log_path"),
+            "transcript_digest": res.get("transcript_digest"),
+            "final_result_source": res.get("final_result_source"),
+            "result_metadata": res.get("result_metadata"),
+        }
+        if res.get("infrastructure_preflight_failure") and not res.get("application_tool_calls"):
+            parked = queue.park_infrastructure_failure(
+                conn,
+                self.worker_id,
+                url,
+                apply_error=run_status,
+            )
+            self._record_event(f"parked browser preflight failure {url} ({run_status})")
+            self._beat(conn, state="infrastructure_pending")
+            return {
+                "action": "infrastructure_parked",
+                "url": url,
+                "reason": run_status,
+                "failure_count": (parked or {}).get("infrastructure_failure_count"),
+            }
+        if run_status == "failed:no_result_line" and res.get("application_tool_calls") == 0:
+            queue.requeue_apply(
+                conn,
+                self.worker_id,
+                url,
+                apply_error="failed:zero_tool_no_result",
+            )
+            self._record_event(f"requeued zero-tool no-result {url}")
+            self._beat(conn, state="idle")
+            return {"action": "zero_tool_requeue", "url": url}
         # Agent usage/session-limit wall (turn-1, page never touched -> launcher returns
         # failed:usage_limit): RE-QUEUE, never park. This lease provably did nothing, so
         # re-queuing cannot double-submit; crash_unconfirmed would strand it permanently.
@@ -611,7 +695,8 @@ class WorkerLoop:
             queue.write_apply_result(conn, self.worker_id, url, status="applied", apply_status="applied",
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
                                      outcome="success", agent=agent, agent_model=agent_model,
-                                     apply_duration_ms=duration_ms)
+                                     apply_duration_ms=duration_ms, machine_owner=self.machine_owner,
+                                     **result_evidence)
             self._record_event(f"wrote apply applied {url}")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
@@ -626,7 +711,8 @@ class WorkerLoop:
                                      apply_status="crash_unconfirmed", apply_error=run_status[:200],
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
                                      agent=agent, agent_model=agent_model,
-                                     apply_duration_ms=duration_ms)
+                                     apply_duration_ms=duration_ms, machine_owner=self.machine_owner,
+                                     **result_evidence)
             self._record_event(f"wrote apply crash_unconfirmed {url} ({run_status})")
             self._beat(conn, state="idle")
             return {"action": "crash_unconfirmed", "url": url}
@@ -634,7 +720,8 @@ class WorkerLoop:
                                  apply_error=(run_status or "unknown")[:200],
                                  target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
                                  agent=agent, agent_model=agent_model,
-                                 apply_duration_ms=duration_ms)
+                                 apply_duration_ms=duration_ms, machine_owner=self.machine_owner,
+                                 **result_evidence)
         self._record_event(f"wrote apply failed {url} ({run_status or 'unknown'})")
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}
