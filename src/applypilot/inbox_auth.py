@@ -1145,40 +1145,27 @@ def claim_auth_match(
     connection: sqlite3.Connection | None = None,
     now: datetime | None = None,
 ) -> bool:
-    """Atomically claim a mailbox message and resolve its challenge.
+    """Deprecated read-only check for an existing challenge/message link.
 
-    This atomic claim transaction is the only supported resolution write path;
-    ``claim_unique_auth_match`` uses the same transactional helper.
+    Callers cannot use this compatibility API to create a resolution. New
+    resolutions require ``claim_unique_auth_match`` with the complete bounded
+    scan snapshot.
     """
     conn = connection or get_connection()
-    now_text = _as_utc(now).isoformat()
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        outcome = _claim_auth_match_in_transaction(
-            conn,
-            challenge_id,
-            message_id=message_id,
-            now_text=now_text,
-            thread_id=thread_id,
-            sender=sender,
-            subject=subject,
-            event_type=event_type,
-            confidence=confidence,
-            matched_job_url=matched_job_url,
-            matched_company=matched_company,
-            matched_method=matched_method,
-            snippet=snippet,
-            received_at=received_at,
-        )
-        if outcome in {"claimed", "expired"}:
-            conn.commit()
-        else:
-            conn.rollback()
-        return outcome in {"claimed", "idempotent"}
-    except Exception:
-        conn.rollback()
-        raise
+    row = conn.execute(
+        """
+        SELECT challenge.status, event.message_id
+          FROM auth_challenges AS challenge
+          LEFT JOIN inbox_events AS event ON event.id=challenge.inbox_event_id
+         WHERE challenge.id=?
+        """,
+        (challenge_id,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and row[0] == "resolved"
+        and row[1] in external_message_id_lookup_keys(message_id)
+    )
 
 
 def claim_unique_auth_match(
@@ -1189,7 +1176,7 @@ def claim_unique_auth_match(
     skew_seconds: int = 60,
     connection: sqlite3.Connection | None = None,
 ) -> AuthEmailMatch | None:
-    """Atomically claim this challenge's globally unique local assignment."""
+    """Resolve only a globally unique assignment from a complete scan snapshot."""
     conn = connection or get_connection()
     reference = _as_utc(now)
     now_text = reference.isoformat()

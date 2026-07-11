@@ -2566,9 +2566,6 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         )
         if not match:
             return None
-        if inbox_auth.claim_unique_auth_match(challenge_id, [match]) is None:
-            return None
-
         return _format_inbox_auth_hint(match)
     except Exception:
         logger.debug("Inbox auth polling failed", exc_info=True)

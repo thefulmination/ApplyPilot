@@ -13,12 +13,26 @@ from applypilot import database
 from applypilot import inbox_auth
 
 
-def _process_claim(db_path: str, challenge_id: int, message_id: str, queue) -> None:
+def _process_claim(
+    db_path: str,
+    challenge_id: int,
+    message_id: str,
+    received_at: str,
+    queue,
+) -> None:
     conn = database.get_connection(db_path)
     try:
-        queue.put(inbox_auth.claim_auth_match(
-            challenge_id, message_id=message_id, event_type="auth_code", connection=conn
-        ))
+        reference = datetime.fromisoformat(received_at)
+        match = _match(message_id, reference)
+        queue.put(
+            inbox_auth.claim_unique_auth_match(
+                challenge_id,
+                [match],
+                now=reference,
+                connection=conn,
+            )
+            is not None
+        )
     finally:
         conn.close()
 
@@ -29,19 +43,31 @@ def _process_die_with_write_lock(db_path: str) -> None:
     os._exit(17)
 
 
-def _match(message_id: str, received_at: datetime, *, provider="greenhouse.io", value="123456"):
+def _match(
+    message_id: str,
+    received_at: datetime,
+    *,
+    provider="greenhouse.io",
+    value="123456",
+    kind="code",
+    thread_id=None,
+    sender=None,
+    subject="Verify",
+    snippet="verification",
+    confidence="high",
+):
     from email.utils import format_datetime
 
     candidate = inbox_auth.VerificationCandidate(
-        kind="code", value=value, confidence="high", reasons=("test",)
+        kind=kind, value=value, confidence=confidence, reasons=("test",)
     )
     return inbox_auth.AuthEmailMatch(
         message_id=message_id,
-        thread_id=message_id,
-        sender=f"no-reply@{provider}",
-        subject="Verify",
+        thread_id=message_id if thread_id is None else thread_id,
+        sender=f"no-reply@{provider}" if sender is None else sender,
+        subject=subject,
         received_at=format_datetime(received_at),
-        snippet="verification",
+        snippet=snippet,
         candidate=candidate,
         reasons=candidate.reasons,
     )
@@ -330,11 +356,10 @@ def test_legacy_resolve_only_confirms_existing_safe_link(tmp_path, monkeypatch) 
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
     challenge_id = _seed_job_and_challenge(conn, job_url="legacy-idempotent")
-    assert inbox_auth.claim_auth_match(
-        challenge_id,
-        message_id="safely-claimed-message",
-        sender="alerts@greenhouse.io",
-        matched_method="code",
+    now = datetime.now(timezone.utc)
+    match = _match("safely-claimed-message", now, sender="alerts@greenhouse.io")
+    assert inbox_auth.claim_unique_auth_match(
+        challenge_id, [match], now=now
     )
     linked_event_id = conn.execute(
         "SELECT inbox_event_id FROM auth_challenges WHERE id=?", (challenge_id,)
@@ -352,39 +377,115 @@ def test_legacy_resolve_only_confirms_existing_safe_link(tmp_path, monkeypatch) 
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: ReadOnlyProbe())
     assert inbox_auth.resolve_auth_challenge(challenge_id, linked_event_id) is True
     assert inbox_auth.resolve_auth_challenge(challenge_id, other_event_id) is False
+    assert inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id="safely-claimed-message",
+        connection=ReadOnlyProbe(),
+    ) is True
+    assert inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id="different-message",
+        connection=ReadOnlyProbe(),
+    ) is False
     assert conn.total_changes == changes_before
 
 
-def test_claim_auth_match_prevents_sequential_message_reuse(tmp_path, monkeypatch) -> None:
+def test_direct_claim_cannot_resolve_stale_cross_provider_magic_link(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="unsafe-direct")
+    changes_before = conn.total_changes
+
+    assert not inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id="stale-workday-link",
+        sender="alerts@workday.com",
+        matched_method="magic_link",
+        received_at="2020-01-01T00:00:00+00:00",
+    )
+    assert conn.total_changes == changes_before
+    row = conn.execute(
+        "SELECT status, resolved_at, inbox_event_id FROM auth_challenges WHERE id=?",
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == ("pending", None, None)
+
+
+@pytest.mark.parametrize(
+    ("kind", "provider", "received_offset"),
+    [
+        ("magic_link", "greenhouse.io", 0),
+        ("code", "workday.com", 0),
+        ("code", "greenhouse.io", -61),
+        ("code", "greenhouse.io", 61),
+    ],
+    ids=("wrong-kind", "wrong-provider", "pre-request", "future"),
+)
+def test_snapshot_claim_rejects_ineligible_candidate(
+    tmp_path, monkeypatch, kind, provider, received_offset
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url=f"ineligible-{kind}-{provider}")
+    now = datetime.now(timezone.utc)
+    _set_challenge_window(conn, challenge_id, now, now + timedelta(minutes=10))
+    value = (
+        f"https://{provider}/verify?token=wrong-kind"
+        if kind == "magic_link"
+        else "123456"
+    )
+    match = _match(
+        "ineligible-message",
+        now + timedelta(seconds=received_offset),
+        provider=provider,
+        value=value,
+        kind=kind,
+    )
+
+    assert inbox_auth.claim_unique_auth_match(
+        challenge_id, [match], now=now, skew_seconds=60
+    ) is None
+    row = conn.execute(
+        "SELECT status, inbox_event_id FROM auth_challenges WHERE id=?",
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == ("pending", None)
+
+
+def test_snapshot_claim_prevents_sequential_message_reuse(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "applypilot.db"
     conn = database.init_db(db_path)
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
     first = _seed_job_and_challenge(conn, job_url="first")
-    second = _seed_job_and_challenge(conn, job_url="second")
+    now = datetime.now(timezone.utc)
+    match = _match("shared", now)
 
-    assert inbox_auth.claim_auth_match(first, message_id="shared", event_type="auth_code")
-    assert inbox_auth.claim_auth_match(first, message_id="shared", event_type="auth_code")
-    assert not inbox_auth.claim_auth_match(second, message_id="shared", event_type="auth_code")
+    assert inbox_auth.claim_unique_auth_match(first, [match], now=now) == match
+    assert inbox_auth.claim_unique_auth_match(first, [match], now=now) == match
+    second = _seed_job_and_challenge(conn, job_url="second")
+    assert inbox_auth.claim_unique_auth_match(second, [match], now=now) is None
     assert inbox_auth.claimed_auth_message_ids({"shared", "unused"}) == {"shared"}
 
 
-def test_claim_auth_match_minimizes_sensitive_auth_metadata(tmp_path, monkeypatch) -> None:
+def test_snapshot_claim_minimizes_sensitive_auth_metadata(tmp_path, monkeypatch) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
     challenge_id = _seed_job_and_challenge(conn, job_url="privacy-claim")
     code = "445566"
     magic_link = "https://boards.greenhouse.io/verify?token=claim-secret"
-
-    assert inbox_auth.claim_auth_match(
-        challenge_id,
-        message_id="privacy-claim-message",
+    now = datetime.now(timezone.utc)
+    match = _match(
+        "privacy-claim-message",
+        now,
         thread_id="thread-safe",
         sender=f"Code {code} <no-reply@greenhouse.io>",
         subject=f"Use code {code}",
-        event_type="auth_code",
-        confidence="high",
         snippet=f"Use {code} or {magic_link}",
     )
+
+    assert inbox_auth.claim_unique_auth_match(challenge_id, [match], now=now) == match
 
     row = conn.execute(
         """
@@ -405,33 +506,29 @@ def test_claim_auth_match_minimizes_sensitive_auth_metadata(tmp_path, monkeypatc
     assert "Use code" not in serialized
 
 
-def test_claim_auth_match_rejects_unsafe_persistence_sender_domain(
+def test_snapshot_claim_fails_closed_on_unsafe_sender_domain(
     tmp_path, monkeypatch
 ) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
     challenge_id = _seed_job_and_challenge(conn, job_url="unsafe-sender-claim")
-
-    assert inbox_auth.claim_auth_match(
-        challenge_id,
-        message_id="unsafe-sender-message",
+    now = datetime.now(timezone.utc)
+    match = _match(
+        "unsafe-sender-message",
+        now,
         sender="code 445566 | https://example.com/verify?token=claim-secret",
-        event_type="auth_code",
     )
 
+    assert inbox_auth.claim_unique_auth_match(challenge_id, [match], now=now) is None
     row = conn.execute(
-        """
-        SELECT event.sender, event.sender_domain, event.subject, event.snippet
-          FROM auth_challenges AS challenge
-          JOIN inbox_events AS event ON event.id=challenge.inbox_event_id
-         WHERE challenge.id=?
-        """,
+        "SELECT status, inbox_event_id FROM auth_challenges WHERE id=?",
         (challenge_id,),
     ).fetchone()
-    assert tuple(row) == (None, None, None, None)
+    assert tuple(row) == ("pending", None)
+    assert conn.execute("SELECT COUNT(*) FROM inbox_events").fetchone()[0] == 0
 
 
-def test_claim_auth_match_hashes_id_and_minimizes_all_external_text(
+def test_snapshot_claim_hashes_id_and_minimizes_all_external_text(
     tmp_path, monkeypatch
 ) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
@@ -440,21 +537,18 @@ def test_claim_auth_match_hashes_id_and_minimizes_all_external_text(
     code = "552211"
     link = "https://evil.example/verify?token=claim-all-fields"
     raw_message_id = f"claim-{code}-{link}"
-
-    assert inbox_auth.claim_auth_match(
-        challenge_id,
-        message_id=raw_message_id,
+    now = datetime.now(timezone.utc)
+    match = _match(
+        raw_message_id,
+        now,
         thread_id=f"thread-{code}-{link}",
         sender=f"Code {code} <alerts@{code}.greenhouse.io>",
         subject=f"subject-{code}-{link}",
-        event_type=f"event-{code}-{link}",
-        confidence=f"confidence-{code}-{link}",
-        matched_job_url=f"job-{code}-{link}",
-        matched_company=f"company-{code}-{link}",
-        matched_method=f"method-{code}-{link}",
         snippet=f"snippet-{code}-{link}",
-        received_at=f"received-{code}-{link}",
+        value=code,
     )
+
+    assert inbox_auth.claim_unique_auth_match(challenge_id, [match], now=now) == match
 
     row = conn.execute(
         """
@@ -478,7 +572,9 @@ def test_claim_auth_match_hashes_id_and_minimizes_all_external_text(
     assert row["sender_domain"] == "greenhouse.io"
 
 
-def test_claim_auth_match_is_atomic_across_concurrent_connections(tmp_path, monkeypatch) -> None:
+def test_snapshot_claim_is_atomic_across_concurrent_connections(
+    tmp_path, monkeypatch
+) -> None:
     db_path = tmp_path / "applypilot.db"
     setup = database.init_db(db_path)
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: setup)
@@ -486,15 +582,22 @@ def test_claim_auth_match_is_atomic_across_concurrent_connections(tmp_path, monk
         _seed_job_and_challenge(setup, job_url="race-1"),
         _seed_job_and_challenge(setup, job_url="race-2"),
     ]
+    setup.execute(
+        "UPDATE auth_challenges SET provider='workday.com' WHERE id=?",
+        (challenge_ids[1],),
+    )
+    setup.commit()
+    now = datetime.now(timezone.utc)
+    snapshot = [_match("race-message", now)]
 
     def claim(challenge_id: int) -> bool:
         conn = database.get_connection(db_path)
-        return inbox_auth.claim_auth_match(
+        return inbox_auth.claim_unique_auth_match(
             challenge_id,
-            message_id="race-message",
-            event_type="auth_code",
+            snapshot,
+            now=now,
             connection=conn,
-        )
+        ) is not None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(claim, challenge_ids))
@@ -507,7 +610,7 @@ def test_claim_auth_match_is_atomic_across_concurrent_connections(tmp_path, monk
     assert sum(row["inbox_event_id"] is not None for row in rows) == 1
 
 
-def test_claim_auth_match_rolls_back_when_resolution_persistence_fails(
+def test_snapshot_claim_rolls_back_when_resolution_persistence_fails(
     tmp_path, monkeypatch
 ) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
@@ -521,18 +624,18 @@ def test_claim_auth_match_rolls_back_when_resolution_persistence_fails(
         """
     )
     conn.commit()
+    now = datetime.now(timezone.utc)
+    match = _match("must-not-survive", now)
 
     with pytest.raises(sqlite3.IntegrityError, match="resolution failed"):
-        inbox_auth.claim_auth_match(
-            challenge_id, message_id="must-not-survive", event_type="auth_code"
-        )
+        inbox_auth.claim_unique_auth_match(challenge_id, [match], now=now)
 
     assert conn.execute(
         "SELECT COUNT(*) FROM inbox_events WHERE message_id='must-not-survive'"
     ).fetchone()[0] == 0
 
 
-def test_claim_auth_match_cannot_resolve_expired_challenge(tmp_path, monkeypatch) -> None:
+def test_snapshot_claim_cannot_resolve_expired_challenge(tmp_path, monkeypatch) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
     challenge_id = _seed_job_and_challenge(conn, job_url="expired")
@@ -543,9 +646,8 @@ def test_claim_auth_match_cannot_resolve_expired_challenge(tmp_path, monkeypatch
     )
     conn.commit()
 
-    assert not inbox_auth.claim_auth_match(
-        challenge_id, message_id="too-late", event_type="auth_code", now=now
-    )
+    match = _match("too-late", now)
+    assert inbox_auth.claim_unique_auth_match(challenge_id, [match], now=now) is None
     row = conn.execute(
         "SELECT status, inbox_event_id FROM auth_challenges WHERE id=?", (challenge_id,)
     ).fetchone()
@@ -622,7 +724,7 @@ def test_local_assignment_separates_different_providers(tmp_path, monkeypatch) -
     assert inbox_auth.claim_unique_auth_match(workday, matches, now=now).message_id == "wd"
 
 
-def test_claim_auth_match_is_atomic_across_spawned_processes(tmp_path, monkeypatch) -> None:
+def test_snapshot_claim_is_atomic_across_spawned_processes(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "applypilot.db"
     conn = database.init_db(db_path)
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
@@ -630,10 +732,19 @@ def test_claim_auth_match_is_atomic_across_spawned_processes(tmp_path, monkeypat
         _seed_job_and_challenge(conn, job_url="process-1"),
         _seed_job_and_challenge(conn, job_url="process-2"),
     ]
+    conn.execute(
+        "UPDATE auth_challenges SET provider='workday.com' WHERE id=?",
+        (challenges[1],),
+    )
+    conn.commit()
+    received_at = datetime.now(timezone.utc).isoformat()
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
     processes = [
-        ctx.Process(target=_process_claim, args=(str(db_path), challenge, "process-message", queue))
+        ctx.Process(
+            target=_process_claim,
+            args=(str(db_path), challenge, "process-message", received_at, queue),
+        )
         for challenge in challenges
     ]
     for process in processes:
