@@ -233,9 +233,10 @@ Do not synthesize a database answer: the controlled end-to-end check must prove
 the mailbox path.
 
 1. Confirm the schema, process count, heartbeat, and `X-GM-RAW` canary above.
-2. Choose an unused Chrome slot from 0 through 9. The command defaults to slot 9
-   and fails before launch if its debugging port is already in use; set
-   `APPLYPILOT_OTP_E2E_SLOT` beforehand to select another dedicated slot.
+2. Choose an unused Chrome slot from 0 through 9. The command defaults to slot 9;
+   set `APPLYPILOT_OTP_E2E_SLOT` beforehand to select another dedicated slot.
+   The production browser launcher reserves the slot and port across processes
+   and refuses an occupied controlled slot without terminating its owner.
 3. Generate a GUID-suffixed non-secret worker label and capture the start time.
 4. Run one headed application through the production fleet worker implementation
    with relay auth enabled. The worker
@@ -288,9 +289,6 @@ the mailbox path.
         if ($TestPort -gt 65535) {
             throw "The controlled-cycle Chrome port is outside the valid TCP range."
         }
-        if (Get-NetTCPConnection -State Listen -LocalPort $TestPort -ErrorAction SilentlyContinue) {
-            throw "The controlled-cycle Chrome slot is already in use; choose another slot."
-        }
         $env:FLEET_WORKER_ID = $TestWorkerId
         $env:APPLYPILOT_INBOX_AUTH = "1"
         $env:APPLYPILOT_INBOX_AUTH_MODE = "relay"
@@ -332,6 +330,7 @@ apply_fn = apply_worker_main.make_apply_fn(
     "codex",
     slot=slot,
     fleet_worker_id=worker_id,
+    controlled=True,
 )
 try:
     with open(os.devnull, "w", encoding="utf-8") as sink:
@@ -379,6 +378,7 @@ for key in (
 print(f"inbox_auth_prearmed={'yes' if result['inbox_auth_prearmed'] else 'no'}")
 print(f"assisted_retry_count={result['assisted_retry_count']}")
 print(f"assisted_retry_terminal={'yes' if result['assisted_retry_terminal'] else 'no'}")
+print(f"browser_cleanup_ok={'yes' if result['browser_cleanup_ok'] else 'no'}")
 print(f"deadman_otp_alerts={otp_alert_count}")
 
 accepted = (
@@ -389,12 +389,38 @@ accepted = (
     and result["inbox_auth_prearmed"] is True
     and result["assisted_retry_count"] == 1
     and result["assisted_retry_terminal"] is True
+    and result["browser_cleanup_ok"] is True
     and mail_source_ok is True
     and otp_alert_count == 0
 )
 if not accepted:
     raise SystemExit(1)
 '@ | .\.conda-env\python.exe -
+        $ControlledCycleExit = $LASTEXITCODE
+
+        $PortReleased = @(
+            Get-NetTCPConnection -State Listen -LocalPort $TestPort `
+                -ErrorAction SilentlyContinue
+        ).Count -eq 0
+        $ControlledBrowserCount = @(
+            Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+                $_.CommandLine -and
+                $_.CommandLine.IndexOf(
+                    "--remote-debugging-port=$TestPort",
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            }
+        ).Count
+        $BrowserAbsent = $ControlledBrowserCount -eq 0
+        Write-Output (
+            "controlled_port_released=" + $(if ($PortReleased) { "yes" } else { "no" })
+        )
+        Write-Output (
+            "controlled_browser_absent=" + $(if ($BrowserAbsent) { "yes" } else { "no" })
+        )
+        if ($ControlledCycleExit -ne 0 -or -not $PortReleased -or -not $BrowserAbsent) {
+            throw "Controlled email-auth acceptance failed."
+        }
     }
     finally {
         foreach ($Name in $EnvironmentNames) {
@@ -429,7 +455,10 @@ matched_message_id_retained=yes
 inbox_auth_prearmed=yes
 assisted_retry_count=1
 assisted_retry_terminal=yes
+browser_cleanup_ok=yes
 deadman_otp_alerts=0
+controlled_port_released=yes
+controlled_browser_absent=yes
 ```
 
 If a controlled message cannot be delivered, that is an external blocker. Report

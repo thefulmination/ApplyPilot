@@ -5,13 +5,16 @@ worker profile setup/cloning, and cross-platform process cleanup.
 """
 
 import json
+import hashlib
 import logging
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from applypilot import config
@@ -38,6 +41,7 @@ LINKEDIN_LOGIN_CDP_PORT = 9333
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+_browser_reservations: dict[int, "_BrowserReservation"] = {}
 
 # Windows Job Object handles per worker. Each launched Chrome is assigned to a job with
 # KILL_ON_JOB_CLOSE, so the whole browser tree dies when THIS python process dies for ANY
@@ -46,6 +50,120 @@ _chrome_lock = threading.Lock()
 # and locking worker profiles. Keeping the handle referenced here holds the job open; the
 # OS closes it on process exit, which fires the kill.
 _job_handles: dict[int, int] = {}
+
+
+class BrowserSlotOccupiedError(RuntimeError):
+    """The requested browser profile or CDP port is reserved or already occupied."""
+
+
+class _BrowserReservation:
+    def __init__(self, handles, *, port: int, profile_dir: Path) -> None:
+        self._handles = handles
+        self.port = port
+        self.profile_dir = profile_dir
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        for handle in reversed(self._handles):
+            try:
+                handle.seek(0)
+                if platform.system() == "Windows":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                logger.debug("Browser reservation unlock failed", exc_info=True)
+            finally:
+                handle.close()
+        self._handles.clear()
+
+
+def _browser_lock_dir() -> Path:
+    configured = os.environ.get("APPLYPILOT_BROWSER_LOCK_DIR")
+    path = Path(configured) if configured else Path(config.APP_DIR) / "browser-locks"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _worker_profile_dir(worker_id: int, browser: str | None) -> Path:
+    suffix = _browser_profile_suffix(browser)
+    return config.CHROME_WORKER_DIR / f"worker-{worker_id}{suffix}"
+
+
+def _try_lock_reservation_file(path: Path):
+    handle = open(path, "a+b", buffering=0)
+    try:
+        if path.stat().st_size == 0:
+            handle.write(b"\0")
+        handle.seek(0)
+        if platform.system() == "Windows":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({
+            "pid": os.getpid(),
+            "owner": uuid.uuid4().hex,
+            "acquired_at": time.time(),
+        }).encode("ascii"))
+        handle.flush()
+        handle.seek(0)
+        return handle
+    except (OSError, BlockingIOError):
+        handle.close()
+        raise BrowserSlotOccupiedError("browser slot or port is already reserved") from None
+
+
+def _acquire_browser_reservation(
+    worker_id: int,
+    port: int,
+    profile_dir: Path,
+) -> _BrowserReservation:
+    """Atomically reserve both the machine CDP port and the profile slot."""
+    profile_key = hashlib.sha256(
+        os.path.normcase(str(profile_dir.resolve())).encode("utf-8")
+    ).hexdigest()[:32]
+    paths = sorted((
+        _browser_lock_dir() / f"port-{port}.lock",
+        _browser_lock_dir() / f"profile-{profile_key}.lock",
+        _browser_lock_dir() / f"slot-{worker_id}.lock",
+    ))
+    handles = []
+    try:
+        for path in paths:
+            handles.append(_try_lock_reservation_file(path))
+    except Exception:
+        _BrowserReservation(handles, port=port, profile_dir=profile_dir).release()
+        raise
+    return _BrowserReservation(handles, port=port, profile_dir=profile_dir)
+
+
+def _port_is_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _profile_appears_occupied(profile_dir: Path) -> bool:
+    return any((profile_dir / name).exists() for name in (
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +367,7 @@ def setup_worker_profile(worker_id: int, browser: str | None = "chrome") -> Path
         Path to the worker's user-data directory.
     """
     suffix = _browser_profile_suffix(browser)
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}{suffix}"
+    profile_dir = _worker_profile_dir(worker_id, browser)
     if (profile_dir / "Default").exists():
         return profile_dir  # Already initialized
 
@@ -508,7 +626,8 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False, browser: str | None = None) -> subprocess.Popen:
+                  headless: bool = False, browser: str | None = None,
+                  kill_existing: bool = True) -> subprocess.Popen:
     """Launch a Chromium-family browser with remote debugging for a worker.
 
     Args:
@@ -518,6 +637,8 @@ def launch_chrome(worker_id: int, port: int | None = None,
         browser: Browser name (chrome/edge/...) for per-worker browser assignment.
             Edge is Chromium too, so the same CDP flags apply. None -> default
             (get_chrome_path / CHROME_PATH).
+        kill_existing: Preserve legacy zombie cleanup when True. When False,
+            refuse any occupied slot/profile/port without terminating its owner.
 
     Returns:
         subprocess.Popen handle for the browser process.
@@ -525,61 +646,78 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id, browser)
+    profile_dir = _worker_profile_dir(worker_id, browser)
+    reservation = _acquire_browser_reservation(worker_id, port, profile_dir)
+    try:
+        with _chrome_lock:
+            tracked = _chrome_procs.get(worker_id)
+        if not kill_existing and (
+            (tracked is not None and tracked.poll() is None)
+            or _port_is_listening(port)
+            or _profile_appears_occupied(profile_dir)
+        ):
+            raise BrowserSlotOccupiedError("browser slot, profile, or port is occupied")
 
-    # Kill any zombie browser from a previous run on this port
-    _kill_on_port(port)
+        profile_dir = setup_worker_profile(worker_id, browser)
 
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
+        # Legacy production cleanup is permitted only after this caller owns both locks.
+        if kill_existing:
+            _kill_on_port(port)
 
-    chrome_exe = config.resolve_browser_path(browser)
+        # Patch preferences to suppress restore nag
+        _suppress_restore_nag(profile_dir)
 
-    cmd = [
-        chrome_exe,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--profile-directory=Default",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--window-size=1024,768",
-        "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
-        "--hide-crash-restore-bubble",
-        "--noerrdialogs",
-        "--password-store=basic",
-        "--disable-save-password-bubble",
-        "--disable-popup-blocking",
-        # Block dangerous permissions at browser level
-        "--use-fake-device-for-media-stream",
-        "--use-fake-ui-for-media-stream",
-        "--deny-permission-prompts",
-        "--disable-notifications",
-    ]
-    if headless:
-        cmd.append("--headless=new")
-    import os as _os
-    _no_sandbox = _os.environ.get("APPLYPILOT_CHROME_NO_SANDBOX", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
-    if platform.system() == "Linux" or _no_sandbox:
-        # Cloud containers run as root with a tiny /dev/shm -- Chromium refuses to start
-        # without these. Also REQUIRED on a Windows worker whose browser lives in a
-        # restricted path the Chrome sandbox's locked-down token cannot read (its own
-        # exe -> "Sandbox cannot access executable ... Access is denied"); such a box sets
-        # APPLYPILOT_CHROME_NO_SANDBOX=1 (e.g. an install under C:\ApplyPilot). The home
-        # box leaves it unset and keeps the sandbox.
-        cmd += ["--no-sandbox", "--disable-dev-shm-usage"]
+        chrome_exe = config.resolve_browser_path(browser)
 
-    # On Unix, start in a new process group so we can kill the whole tree
-    kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if platform.system() != "Windows":
-        import os
-        kwargs["preexec_fn"] = os.setsid
+        cmd = [
+            chrome_exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1024,768",
+            "--disable-session-crashed-bubble",
+            "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+            "--hide-crash-restore-bubble",
+            "--noerrdialogs",
+            "--password-store=basic",
+            "--disable-save-password-bubble",
+            "--disable-popup-blocking",
+            # Block dangerous permissions at browser level
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream",
+            "--deny-permission-prompts",
+            "--disable-notifications",
+        ]
+        if headless:
+            cmd.append("--headless=new")
+        import os as _os
+        _no_sandbox = _os.environ.get("APPLYPILOT_CHROME_NO_SANDBOX", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if platform.system() == "Linux" or _no_sandbox:
+            # Cloud containers run as root with a tiny /dev/shm -- Chromium refuses to start
+            # without these. Also REQUIRED on a Windows worker whose browser lives in a
+            # restricted path the Chrome sandbox's locked-down token cannot read (its own
+            # exe -> "Sandbox cannot access executable ... Access is denied"); such a box sets
+            # APPLYPILOT_CHROME_NO_SANDBOX=1 (e.g. an install under C:\ApplyPilot). The home
+            # box leaves it unset and keeps the sandbox.
+            cmd += ["--no-sandbox", "--disable-dev-shm-usage"]
 
-    proc = subprocess.Popen(cmd, **kwargs)
+        # On Unix, start in a new process group so we can kill the whole tree
+        kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if platform.system() != "Windows":
+            import os
+            kwargs["preexec_fn"] = os.setsid
+
+        proc = subprocess.Popen(cmd, **kwargs)
+    except Exception:
+        reservation.release()
+        raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
+        _browser_reservations[id(proc)] = reservation
     # Assign IMMEDIATELY (before Chrome forks much) so the tree dies with us even on a
     # hard external kill -- no lingering orphan to lock the profile.
     _assign_kill_on_close_job(worker_id, proc.pid)
@@ -611,7 +749,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
     return proc
 
 
-def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
+def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
     """Kill a worker's Chrome instance and remove it from tracking.
 
     Args:
@@ -621,9 +759,30 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     if process and process.poll() is None:
         _kill_process_tree(process.pid)
     _close_job(worker_id)
+    deadline = time.time() + max(
+        0.0,
+        float(os.environ.get("APPLYPILOT_CHROME_CLEANUP_TIMEOUT") or 10),
+    )
+    while process and process.poll() is None and time.time() < deadline:
+        time.sleep(0.1)
+
     with _chrome_lock:
-        _chrome_procs.pop(worker_id, None)
-    logger.info("[worker-%d] Chrome cleaned up", worker_id)
+        reservation = _browser_reservations.get(id(process)) if process is not None else None
+    port = reservation.port if reservation is not None else BASE_CDP_PORT + worker_id
+    process_gone = process is None or process.poll() is not None
+    cleanup_ok = process_gone and not _port_is_listening(port)
+    if cleanup_ok:
+        with _chrome_lock:
+            if _chrome_procs.get(worker_id) is process:
+                _chrome_procs.pop(worker_id, None)
+            if process is not None:
+                _browser_reservations.pop(id(process), None)
+        if reservation is not None:
+            reservation.release()
+        logger.info("[worker-%d] Chrome cleaned up", worker_id)
+    else:
+        logger.error("[worker-%d] Chrome cleanup could not prove process and port release", worker_id)
+    return cleanup_ok
 
 
 def kill_all_chrome() -> None:
@@ -636,9 +795,7 @@ def kill_all_chrome() -> None:
         _chrome_procs.clear()
 
     for wid, proc in procs.items():
-        if proc.poll() is None:
-            _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+        cleanup_worker(wid, proc)
 
     # Sweep base port in case of zombies
     _kill_on_port(BASE_CDP_PORT)
@@ -674,9 +831,7 @@ def cleanup_on_exit() -> None:
         _chrome_procs.clear()
 
     for wid, proc in procs.items():
-        if proc.poll() is None:
-            _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+        cleanup_worker(wid, proc)
 
     # Sweep base port for any orphan
     _kill_on_port(BASE_CDP_PORT)

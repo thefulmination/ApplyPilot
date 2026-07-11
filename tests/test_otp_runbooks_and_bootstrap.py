@@ -71,7 +71,10 @@ def test_otp_relay_controlled_cycle_lists_exact_approved_evidence():
         "inbox_auth_prearmed=yes",
         "assisted_retry_count=1",
         "assisted_retry_terminal=yes",
+        "browser_cleanup_ok=yes",
         "deadman_otp_alerts=0",
+        "controlled_port_released=yes",
+        "controlled_browser_absent=yes",
     ):
         assert fact in runbook
 
@@ -139,6 +142,17 @@ def test_otp_relay_controlled_cycle_uses_production_prearm_and_automatic_evidenc
     assert "APPLYPILOT_OTP_E2E_SLOT" in controlled
     assert '"9400"' in controlled
     assert "APPLYPILOT_BASE_CDP_PORT" in controlled
+    assert "controlled=True" in controlled
+    assert 'result["browser_cleanup_ok"]' in controlled
+    assert 'print(f"browser_cleanup_ok={' in controlled
+    assert "Get-NetTCPConnection" in controlled
+    assert '"controlled_port_released="' in controlled
+    assert '"controlled_browser_absent="' in controlled
+    assert "Write-Output $_.CommandLine" not in controlled
+    assert "The controlled-cycle Chrome slot is already in use" not in controlled
+    assert controlled.index("Get-NetTCPConnection") > controlled.index(
+        ".\\.conda-env\\python.exe -"
+    )
     assert 'result["assisted_retry_count"]' in controlled
     assert 'result["assisted_retry_terminal"]' in controlled
     assert 'result["inbox_auth_prearmed"]' in controlled

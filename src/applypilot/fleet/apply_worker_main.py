@@ -214,14 +214,21 @@ def _should_launch_chrome_headless() -> bool:
     return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
 
 
-def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | None = None):
+def make_apply_fn(
+    model: str,
+    agent: str,
+    slot: int = 0,
+    fleet_worker_id: str | None = None,
+    *,
+    controlled: bool = False,
+):
     """Return apply_fn(job) -> {"run_status", "est_cost_usd"} wrapping launcher.run_job.
     Imports launcher LAZILY (after _setup_apply_env).
 
     Note on chrome API:
       - launch_chrome(worker_id, port=None, ...) -> subprocess.Popen
         (port defaults to BASE_CDP_PORT + worker_id; returns the process, NOT the port)
-      - cleanup_worker(worker_id, process) -> None  (process is the Popen returned above)
+      - cleanup_worker(worker_id, process) -> bool  (process is the Popen returned above)
     """
     from applypilot.apply import launcher, chrome
     from applypilot.apply.chrome import BASE_CDP_PORT
@@ -235,11 +242,16 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
         previous_fleet_worker_id = os.environ.get("FLEET_WORKER_ID")
         if fleet_worker_id:
             os.environ["FLEET_WORKER_ID"] = str(fleet_worker_id)
-        proc = chrome.launch_chrome(
-            worker_id,
-            headless=_should_launch_chrome_headless(),
-        )  # returns Popen; port is implicit BASE_CDP_PORT+slot
+        proc = None
+        out = None
         try:
+            launch_kwargs = {"headless": _should_launch_chrome_headless()}
+            if controlled:
+                launch_kwargs["kill_existing"] = False
+            proc = chrome.launch_chrome(
+                worker_id,
+                **launch_kwargs,
+            )  # returns Popen; port is implicit BASE_CDP_PORT+slot
             assisted_retry_count = 0
             prearmed_request_id = (
                 launcher._prearm_inbox_auth_request(job)
@@ -317,9 +329,14 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 else:
                     os.environ["FLEET_WORKER_ID"] = previous_fleet_worker_id
             try:
-                chrome.cleanup_worker(worker_id, proc)
+                cleanup_result = chrome.cleanup_worker(worker_id, proc) if proc is not None else False
+                cleanup_ok = cleanup_result is True if controlled else cleanup_result is not False
             except Exception:
-                pass
+                if controlled:
+                    raise
+                cleanup_ok = False
+            if out is not None:
+                out["browser_cleanup_ok"] = cleanup_ok
     return apply_fn
 
 
