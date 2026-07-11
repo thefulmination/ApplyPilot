@@ -619,9 +619,18 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
             matched_method        TEXT,
             snippet               TEXT,
             created_at            TEXT NOT NULL,
+            storage_version       INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(matched_job_url) REFERENCES jobs(url)
         )
     """)
+    inbox_event_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(inbox_events)").fetchall()
+    }
+    if "storage_version" not in inbox_event_columns:
+        conn.execute(
+            "ALTER TABLE inbox_events "
+            "ADD COLUMN storage_version INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS auth_challenges (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,

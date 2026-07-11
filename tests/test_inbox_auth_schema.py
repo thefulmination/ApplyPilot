@@ -19,6 +19,10 @@ def test_init_db_creates_inbox_auth_tables(tmp_path: Path) -> None:
         ).fetchall()
     }
     assert {"inbox_events", "auth_challenges"} <= tables
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(inbox_events)").fetchall()
+    }
+    assert "storage_version" in columns
 
 
 def test_inbox_events_message_id_is_unique(tmp_path: Path) -> None:
@@ -140,8 +144,10 @@ def test_inbox_event_scrub_migration_hashes_merges_and_preserves_fk_links(
     ).lastrowid
     digest_event = conn.execute(
         """
-        INSERT INTO inbox_events (message_id, event_type, confidence, created_at)
-        VALUES (?, 'auth_event', 'high', ?)
+        INSERT INTO inbox_events (
+            message_id, event_type, confidence, created_at, storage_version
+        )
+        VALUES (?, 'auth_event', 'high', ?, 1)
         """,
         (digest, now),
     ).lastrowid
@@ -178,6 +184,7 @@ def test_inbox_event_scrub_migration_hashes_merges_and_preserves_fk_links(
     assert event["matched_company"] is None
     assert event["matched_method"] is None
     assert event["snippet"] is None
+    assert event["storage_version"] == 1
     serialized = "|".join("" if value is None else str(value) for value in event)
     assert "884422" not in serialized
     assert "evil.example" not in serialized

@@ -44,26 +44,71 @@ def test_redactor_removes_full_hint_and_credential_echoes():
     assert launcher.INBOX_AUTH_REDACTION in redacted
 
 
+def test_magic_link_redactor_removes_standalone_encoded_fragment_and_path_tokens():
+    encoded_once = "encoded%2Ftoken-ABC123456"
+    encoded_twice = "encoded%252Ftoken-ABC123456"
+    decoded = "encoded/token-ABC123456"
+    fragment_token = "fragmentToken987654"
+    path_token = "pathTokenABC987654321"
+    hint = (
+        "magic_link=https://boards.greenhouse.io/verify/"
+        f"{path_token}?token={encoded_twice}&redirect=continue"
+        f"#state={fragment_token}"
+    )
+    text = (
+        f"{encoded_once} {encoded_twice} {decoded} "
+        f"{fragment_token} {path_token} continue true"
+    )
+
+    redacted = launcher._redact_inbox_auth_secrets(text, hint)
+
+    for secret in (
+        encoded_once,
+        encoded_twice,
+        decoded,
+        fragment_token,
+        path_token,
+    ):
+        assert secret not in redacted
+    assert "continue true" in redacted
+    assert redacted.count(launcher.INBOX_AUTH_REDACTION) >= 5
+
+
 def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result(
     tmp_path, monkeypatch
 ):
-    secret = "https://boards.greenhouse.io/verify?token=super-secret"
+    standalone_token = "standaloneTokenABC987654"
+    encoded_token = "encoded%252Ftoken-XYZ987654"
+    decoded_token = "encoded/token-XYZ987654"
+    secret = (
+        "https://boards.greenhouse.io/verify/pathTokenABC123456"
+        f"?token={encoded_token}#state={standalone_token}"
+    )
     hint = f"magic_link={secret}"
     events = [
         {
             "type": "assistant",
             "message": {
                 "content": [
-                    {"type": "text", "text": f"Opened {secret}"},
+                    {
+                        "type": "text",
+                        "text": f"Used {standalone_token} and {decoded_token}",
+                    },
                     {
                         "type": "tool_use",
                         "name": "mcp__playwright__browser_navigate",
-                        "input": {"url": secret},
+                        "input": {
+                            "url": f"https://tool.invalid/use/{encoded_token}"
+                        },
                     },
                 ]
             },
         },
-        {"type": "result", "result": f"Used {secret}\nRESULT:APPLIED", "usage": {}},
+        {
+            "type": "result",
+            "result": f"Used {standalone_token} {encoded_token}\nRESULT:APPLIED",
+            "usage": {},
+        },
     ]
     state_updates = []
 
@@ -95,10 +140,15 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     job_log = job_logs[0].read_text(encoding="utf-8")
     stats = launcher._last_run_stats[7]
     for persisted in (worker_log, job_log, stats["transcript"]):
-        assert secret not in persisted
+        for sensitive in (secret, standalone_token, encoded_token, decoded_token):
+            assert sensitive not in persisted
         assert launcher.INBOX_AUTH_REDACTION in persisted
     tool_actions = [update.get("last_action", "") for update in state_updates]
-    assert all(secret not in action for action in tool_actions)
+    assert all(
+        sensitive not in action
+        for action in tool_actions
+        for sensitive in (secret, standalone_token, encoded_token, decoded_token)
+    )
     assert any(launcher.INBOX_AUTH_REDACTION in action for action in tool_actions)
     assert stats["transcript_digest"] == (
         "sha256:" + hashlib.sha256(job_log.encode("utf-8")).hexdigest()

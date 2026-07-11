@@ -18,7 +18,9 @@ from applypilot.auth_event_storage import (
     canonical_utc_timestamp,
     closed_confidence,
     closed_match_method,
-    opaque_message_id,
+    external_message_id_digest,
+    external_message_id_lookup_keys,
+    STORAGE_VERSION,
 )
 from applypilot.database import get_connection
 
@@ -737,6 +739,7 @@ def create_auth_challenge(
     provider: str,
     challenge_type: str = "email_code",
     ttl_seconds: int = 300,
+    now: datetime | None = None,
 ) -> int:
     """Create or reuse an active auth challenge and return its row id.
 
@@ -744,46 +747,72 @@ def create_auth_challenge(
     return the existing row id so repeated retries do not create duplicates.
     """
     conn = get_connection()
-    now = datetime.now(timezone.utc)
-    expires = now + timedelta(seconds=ttl_seconds)
+    reference = _as_utc(now)
+    now_text = reference.isoformat()
+    expires_text = (reference + timedelta(seconds=ttl_seconds)).isoformat()
 
-    existing = conn.execute(
-        """
-        SELECT id FROM auth_challenges
-        WHERE job_url = ?
-          AND application_url = ?
-          AND provider = ?
-          AND challenge_type = ?
-          AND status IN (?, ?)
-        ORDER BY requested_at DESC
-        LIMIT 1
-        """,
-        (job_url, application_url, provider, challenge_type, *ACTIVE_CHALLENGE_STATUSES),
-    ).fetchone()
-    if existing is not None:
-        return int(existing[0])
-
-    cursor = conn.execute(
-        """
-        INSERT INTO auth_challenges (
-            job_url, application_url, provider, challenge_type, status,
-            requested_at, expires_at, created_at, updated_at
+    if conn.in_transaction:
+        conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE auth_challenges
+               SET status='expired', resolved_at=NULL,
+                   last_error=COALESCE(last_error, 'expired'), updated_at=?
+             WHERE status IN ('pending', 'watching')
+               AND julianday(expires_at) <= julianday(?)
+            """,
+            (now_text, now_text),
         )
-        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-        """,
-        (
-            job_url,
-            application_url,
-            provider,
-            challenge_type,
-            now.isoformat(),
-            expires.isoformat(),
-            now.isoformat(),
-            now.isoformat(),
-        ),
-    )
-    conn.commit()
-    return int(cursor.lastrowid)
+        existing = conn.execute(
+            """
+            SELECT id FROM auth_challenges
+             WHERE job_url=?
+               AND application_url=?
+               AND provider=?
+               AND challenge_type=?
+               AND status IN (?, ?)
+               AND julianday(expires_at) > julianday(?)
+             ORDER BY requested_at DESC, id DESC
+             LIMIT 1
+            """,
+            (
+                job_url,
+                application_url,
+                provider,
+                challenge_type,
+                *ACTIVE_CHALLENGE_STATUSES,
+                now_text,
+            ),
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            return int(existing[0])
+
+        cursor = conn.execute(
+            """
+            INSERT INTO auth_challenges (
+                job_url, application_url, provider, challenge_type, status,
+                requested_at, expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                job_url,
+                application_url,
+                provider,
+                challenge_type,
+                now_text,
+                expires_text,
+                now_text,
+                now_text,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def list_auth_challenges(
@@ -898,17 +927,29 @@ def record_inbox_event(
     """
     conn = get_connection()
     created_at = now_utc()
-    persisted_message_id = opaque_message_id(message_id)
+    persisted_message_id = external_message_id_digest(message_id)
+    lookup_keys = external_message_id_lookup_keys(message_id)
 
     try:
+        existing = conn.execute(
+            """
+            SELECT id FROM inbox_events
+             WHERE message_id IN (?, ?)
+             ORDER BY CASE message_id WHEN ? THEN 0 ELSE 1 END
+             LIMIT 1
+            """,
+            (*lookup_keys, persisted_message_id),
+        ).fetchone()
+        if existing is not None:
+            return int(existing[0])
         cursor = conn.execute(
             """
             INSERT INTO inbox_events (
                 message_id, thread_id, sender, sender_domain, subject,
                 received_at, event_type, confidence, matched_job_url,
-                matched_company, matched_method, snippet, created_at
+                matched_company, matched_method, snippet, created_at, storage_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 persisted_message_id,
@@ -924,14 +965,15 @@ def record_inbox_event(
                 closed_match_method(matched_method),
                 None,
                 created_at,
+                STORAGE_VERSION,
             ),
         )
         conn.commit()
         return int(cursor.lastrowid)
     except sqlite3.IntegrityError:
         row = conn.execute(
-            "SELECT id FROM inbox_events WHERE message_id = ?",
-            (persisted_message_id,),
+            "SELECT id FROM inbox_events WHERE message_id IN (?, ?) LIMIT 1",
+            lookup_keys,
         ).fetchone()
         if row is None:
             raise
@@ -961,7 +1003,8 @@ def claimed_auth_message_ids(
     claimed: set[str] = set()
     digest_to_raw: dict[str, set[str]] = {}
     for candidate in candidate_message_ids:
-        digest_to_raw.setdefault(opaque_message_id(candidate), set()).add(candidate)
+        for digest in external_message_id_lookup_keys(candidate):
+            digest_to_raw.setdefault(digest, set()).add(candidate)
     candidates = sorted(digest_to_raw)
     for offset in range(0, len(candidates), 900):
         chunk = candidates[offset:offset + 900]
@@ -999,7 +1042,8 @@ def _claim_auth_match_in_transaction(
     snippet: str | None = None,
     received_at: str | None = None,
 ) -> str:
-    persisted_message_id = opaque_message_id(message_id)
+    persisted_message_id = external_message_id_digest(message_id)
+    lookup_keys = external_message_id_lookup_keys(message_id)
     existing = conn.execute(
         """
         SELECT challenge.status, challenge.requested_at, challenge.expires_at,
@@ -1013,7 +1057,7 @@ def _claim_auth_match_in_transaction(
     if existing is None:
         return "rejected"
     if existing[0] == "resolved":
-        return "idempotent" if existing[3] == persisted_message_id else "rejected"
+        return "idempotent" if existing[3] in lookup_keys else "rejected"
     if existing[0] not in ACTIVE_CHALLENGE_STATUSES:
         return "rejected"
     requested_at = _parse_utc_timestamp(existing[1])
@@ -1033,24 +1077,37 @@ def _claim_auth_match_in_transaction(
             return "expired"
         return "rejected"
 
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO inbox_events (
-            message_id, thread_id, sender, sender_domain, subject,
-            received_at, event_type, confidence, matched_job_url,
-            matched_company, matched_method, snippet, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            persisted_message_id, None, None, canonical_ats_sender_domain(sender), None,
-            canonical_utc_timestamp(received_at), "auth_event",
-            closed_confidence(confidence), None, None,
-            closed_match_method(matched_method), None, now_text,
-        ),
-    )
     event_row = conn.execute(
-        "SELECT id FROM inbox_events WHERE message_id = ?", (persisted_message_id,)
+        """
+        SELECT id FROM inbox_events
+         WHERE message_id IN (?, ?)
+         ORDER BY CASE message_id WHEN ? THEN 0 ELSE 1 END
+         LIMIT 1
+        """,
+        (*lookup_keys, persisted_message_id),
     ).fetchone()
+    if event_row is None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO inbox_events (
+                message_id, thread_id, sender, sender_domain, subject,
+                received_at, event_type, confidence, matched_job_url,
+                matched_company, matched_method, snippet, created_at, storage_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                persisted_message_id, None, None,
+                canonical_ats_sender_domain(sender), None,
+                canonical_utc_timestamp(received_at), "auth_event",
+                closed_confidence(confidence), None, None,
+                closed_match_method(matched_method), None, now_text,
+                STORAGE_VERSION,
+            ),
+        )
+        event_row = conn.execute(
+            "SELECT id FROM inbox_events WHERE message_id = ?",
+            (persisted_message_id,),
+        ).fetchone()
     if event_row is None:
         raise sqlite3.IntegrityError("inbox event was not persisted")
     event_id = int(event_row[0])
@@ -1160,7 +1217,7 @@ def claim_unique_auth_match(
                 (
                     candidate
                     for raw_id, candidate in candidates.items()
-                    if opaque_message_id(raw_id) == str(target[1])
+                    if str(target[1]) in external_message_id_lookup_keys(raw_id)
                 ),
                 None,
             )

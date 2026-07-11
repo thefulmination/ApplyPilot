@@ -621,7 +621,107 @@ def test_claimed_message_lookup_is_bounded_to_candidate_ids():
         {"candidate-a", "candidate-b"}, connection=_Conn()
     ) == set()
     assert " IN (" in observed["query"]
-    assert observed["params"] == sorted(
+    primary = [
         "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
         for value in ("candidate-a", "candidate-b")
+    ]
+    expected = primary + [
+        "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+        for value in primary
+    ]
+    assert observed["params"] == sorted(expected)
+
+
+def test_create_challenge_does_not_reuse_expired_active_row(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, discovered_at) "
+        "VALUES ('expiry-reuse', 'T', 'S', ?)",
+        (now.isoformat(),),
     )
+    conn.commit()
+
+    first = inbox_auth.create_auth_challenge(
+        job_url="expiry-reuse",
+        application_url="https://greenhouse.io/expiry-reuse",
+        provider="greenhouse.io",
+        ttl_seconds=60,
+        now=now,
+    )
+    second = inbox_auth.create_auth_challenge(
+        job_url="expiry-reuse",
+        application_url="https://greenhouse.io/expiry-reuse",
+        provider="greenhouse.io",
+        ttl_seconds=60,
+        now=now + timedelta(seconds=61),
+    )
+
+    assert second != first
+    rows = conn.execute(
+        "SELECT id, status FROM auth_challenges ORDER BY id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (first, "expired"),
+        (second, "pending"),
+    ]
+
+
+def test_external_sha256_shaped_message_id_is_always_rehashed(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    external_id = "sha256:731942" + ("a" * 58)
+    expected = "sha256:" + hashlib.sha256(external_id.encode("utf-8")).hexdigest()
+
+    first = inbox_auth.record_inbox_event(
+        message_id=external_id,
+        sender="alerts@greenhouse.io",
+    )
+    second = inbox_auth.record_inbox_event(
+        message_id=external_id,
+        sender="alerts@greenhouse.io",
+    )
+    database.ensure_inbox_auth_tables(conn)
+    database.ensure_inbox_auth_tables(conn)
+
+    assert first == second
+    stored = conn.execute(
+        "SELECT message_id FROM inbox_events WHERE id=?", (first,)
+    ).fetchone()[0]
+    assert stored == expected
+    assert stored != external_id
+    assert "731942" not in stored
+
+
+def test_record_lookup_reuses_once_rehashed_legacy_digest(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    raw_message_id = "legacy-original-message"
+    old_digest = "sha256:" + hashlib.sha256(
+        raw_message_id.encode("utf-8")
+    ).hexdigest()
+    event_id = conn.execute(
+        """
+        INSERT INTO inbox_events (
+            message_id, event_type, confidence, created_at, storage_version
+        ) VALUES (?, 'auth_event', 'high', ?, 0)
+        """,
+        (old_digest, datetime.now(timezone.utc).isoformat()),
+    ).lastrowid
+    conn.commit()
+    database.ensure_inbox_auth_tables(conn)
+
+    reused = inbox_auth.record_inbox_event(
+        message_id=raw_message_id,
+        sender="alerts@greenhouse.io",
+    )
+
+    assert reused == event_id
+    assert conn.execute("SELECT COUNT(*) FROM inbox_events").fetchone()[0] == 1

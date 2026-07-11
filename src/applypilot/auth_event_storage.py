@@ -10,6 +10,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 from applypilot.ats_domains import ATS_SENDER_DOMAINS
 
 MESSAGE_ID_PREFIX = "sha256:"
+STORAGE_VERSION = 1
 _OPAQUE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DOMAIN_RE = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -21,11 +22,21 @@ _MATCH_METHODS = frozenset({"code", "magic_link"})
 _CONFIDENCE = frozenset({"low", "medium", "high"})
 
 
-def opaque_message_id(value: str) -> str:
+def external_message_id_digest(value: str) -> str:
     raw = str(value)
-    if _OPAQUE_ID_RE.fullmatch(raw.lower()):
-        return raw.lower()
     return MESSAGE_ID_PREFIX + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def external_message_id_lookup_keys(value: str) -> tuple[str, str]:
+    primary = external_message_id_digest(value)
+    return primary, external_message_id_digest(primary)
+
+
+def migration_message_id(value: str, storage_version: int) -> str:
+    raw = str(value)
+    if storage_version >= STORAGE_VERSION and _OPAQUE_ID_RE.fullmatch(raw.lower()):
+        return raw.lower()
+    return external_message_id_digest(raw)
 
 
 def _strict_sender_domain(sender: str | None) -> str | None:
@@ -97,7 +108,10 @@ def scrub_inbox_events(conn, *, migration_now: str) -> None:
     rows = conn.execute("SELECT * FROM inbox_events ORDER BY id").fetchall()
     groups: dict[str, list] = {}
     for row in rows:
-        groups.setdefault(opaque_message_id(row["message_id"]), []).append(row)
+        groups.setdefault(
+            migration_message_id(row["message_id"], int(row["storage_version"] or 0)),
+            [],
+        ).append(row)
 
     for digest, group in groups.items():
         survivor = next(
@@ -199,7 +213,7 @@ def scrub_inbox_events(conn, *, migration_now: str) -> None:
                SET message_id=?, thread_id=NULL, sender=NULL, sender_domain=?,
                    subject=NULL, received_at=?, event_type='auth_event', confidence=?,
                    matched_job_url=NULL, matched_company=NULL, matched_method=?,
-                   snippet=NULL, created_at=?
+                   snippet=NULL, created_at=?, storage_version=?
              WHERE id=?
             """,
             (
@@ -209,6 +223,7 @@ def scrub_inbox_events(conn, *, migration_now: str) -> None:
                 confidence,
                 matched_method,
                 created_at,
+                STORAGE_VERSION,
                 survivor["id"],
             ),
         )

@@ -21,6 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from rich.console import Console
 from rich.live import Live
@@ -181,19 +182,87 @@ _agent_procs: dict[int, subprocess.Popen] = {}
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
 INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
+_COMMON_AUTH_VALUES = frozenset(
+    {"", "0", "1", "false", "true", "yes", "no", "continue", "verify", "login"}
+)
+_SENSITIVE_QUERY_KEYS = frozenset(
+    {"auth", "code", "key", "otp", "secret", "state", "t", "token", "verification"}
+)
+
+
+def _decoded_variants(value: str) -> set[str]:
+    variants = set()
+    current = value
+    for _ in range(4):
+        if current in variants:
+            break
+        variants.add(current)
+        current = unquote(current)
+    return variants
+
+
+def _specific_auth_value(value: str, *, minimum: int) -> bool:
+    stripped = value.strip()
+    return (
+        len(stripped) >= minimum
+        and stripped.lower() not in _COMMON_AUTH_VALUES
+        and not any(character.isspace() for character in stripped)
+    )
+
+
+def _token_like_path_segment(value: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9._~%+-]+", value):
+        return False
+    has_alpha = any(character.isalpha() for character in value)
+    has_digit = any(character.isdigit() for character in value)
+    return len(value) >= (12 if has_alpha and has_digit else 16)
+
+
+def _magic_link_secrets(url: str) -> set[str]:
+    secrets = set(_decoded_variants(url))
+    parsed = urlsplit(url)
+    for segment in parsed.path.split("/"):
+        for variant in _decoded_variants(segment):
+            if _token_like_path_segment(variant):
+                secrets.add(variant)
+
+    for raw_component in (parsed.query, parsed.fragment):
+        if not raw_component:
+            continue
+        for pair in raw_component.split("&"):
+            raw_key, separator, raw_value = pair.partition("=")
+            if not separator:
+                for variant in _decoded_variants(pair):
+                    if _specific_auth_value(variant, minimum=12):
+                        secrets.add(variant)
+                continue
+            key = unquote(raw_key).strip().lower()
+            minimum = 6 if key in _SENSITIVE_QUERY_KEYS else 12
+            for variant in _decoded_variants(raw_value):
+                if _specific_auth_value(variant, minimum=minimum):
+                    secrets.add(variant)
+        for key, value in parse_qsl(raw_component, keep_blank_values=True):
+            minimum = 6 if key.strip().lower() in _SENSITIVE_QUERY_KEYS else 12
+            for variant in _decoded_variants(value):
+                if _specific_auth_value(variant, minimum=minimum):
+                    secrets.add(variant)
+    return secrets
 
 
 def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
     """Remove prompt-only inbox credentials before text reaches durable sinks."""
     if not text or not hint:
         return text
-    secrets = [hint]
+    secrets = {hint}
     for line in hint.splitlines():
         key, separator, value = line.partition("=")
         if separator and key.strip().lower() in {"code", "magic_link"} and value:
-            secrets.append(value.strip())
+            credential = value.strip()
+            secrets.add(credential)
+            if key.strip().lower() == "magic_link":
+                secrets.update(_magic_link_secrets(credential))
     redacted = text
-    for secret in sorted(set(secrets), key=len, reverse=True):
+    for secret in sorted(secrets, key=len, reverse=True):
         if secret:
             redacted = redacted.replace(secret, INBOX_AUTH_REDACTION)
     return redacted
