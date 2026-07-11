@@ -25,6 +25,24 @@ from applypilot.fleet import queue
 from applypilot.fleet import sync
 
 
+@pytest.fixture(autouse=True)
+def _register_canonical_pg_policy(request):
+    if "fleet_db" not in request.fixturenames:
+        yield
+        return
+    dsn = request.getfixturevalue("fleet_db")
+    with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES ('canonical-linkedin-active-test','linkedin','active')"
+        )
+        cur.execute(
+            "UPDATE fleet_config SET linkedin_policy_version='canonical-linkedin-active-test' WHERE id=1"
+        )
+        conn.commit()
+    yield
+
+
 _JOBS_DDL = """
 CREATE TABLE jobs (
     url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
@@ -35,7 +53,19 @@ CREATE TABLE jobs (
     fit_gap_category TEXT, recommended_action TEXT, audit_flags TEXT,
     linkedin_resolve_status TEXT, linkedin_resolved_at TEXT,
     linkedin_resolve_error TEXT,
-    linkedin_unresolved_kind TEXT, linkedin_next_action TEXT
+    linkedin_unresolved_kind TEXT, linkedin_next_action TEXT,
+    canonical_decision_id TEXT
+);
+CREATE TABLE decision_policy_versions (
+    policy_version TEXT PRIMARY KEY, lane TEXT NOT NULL, status TEXT NOT NULL,
+    config_json TEXT, created_at TEXT NOT NULL, UNIQUE(policy_version, lane)
+);
+CREATE TABLE job_decisions (
+    decision_id TEXT PRIMARY KEY, job_url TEXT NOT NULL, policy_version TEXT NOT NULL,
+    lane TEXT NOT NULL, qualification_score REAL, preference_score REAL,
+    outcome_score REAL, final_score REAL, qualification_verdict TEXT NOT NULL,
+    action TEXT NOT NULL, confidence REAL, input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL, expires_at TEXT
 );
 """
 
@@ -53,6 +83,12 @@ def _iso(days_ago: int) -> str:
 
 def _add_li(conn, url, **kw):
     """Insert a LinkedIn job (effective host linkedin.com) with sane defaults."""
+    canonical = kw.pop("canonical", True)
+    action = kw.pop("canonical_action", "apply")
+    verdict = kw.pop("canonical_verdict", "qualified")
+    status = kw.pop("canonical_policy_status", "active")
+    lane = kw.pop("canonical_policy_lane", "linkedin")
+    expires_at = kw.pop("canonical_expires_at", None)
     cols = {"url": url, "application_url": url, "company": "Acme", "title": "Chief of Staff",
             "audit_score": 9.0, "liveness_status": "uncertain", "discovered_at": _iso(1),
             "full_description": "x" * 600, "linkedin_resolve_status": "easy_apply",
@@ -60,6 +96,21 @@ def _add_li(conn, url, **kw):
     cols.update(kw)
     conn.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                  list(cols.values()))
+    if canonical:
+        now = datetime.now(timezone.utc)
+        policy = f"canonical-{lane}-{status}-test"
+        decision_id = f"decision-{abs(hash(url))}"
+        conn.execute(
+            "INSERT OR IGNORE INTO decision_policy_versions VALUES (?,?,?,?,?)",
+            (policy, lane, status, '{"qualificationFloor":7}', now.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO job_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (decision_id, url, policy, lane, 9.0, 8.0, 8.0, 9.0, verdict, action,
+             0.9, f"hash-{decision_id}", now.isoformat(),
+             expires_at or (now + timedelta(days=1)).isoformat()),
+        )
+        conn.execute("UPDATE jobs SET canonical_decision_id=? WHERE url=?", (decision_id, url))
     conn.commit()
 
 
@@ -67,42 +118,6 @@ def _pushed_urls(pg) -> set[str]:
     with pg.cursor() as cur:
         cur.execute("SELECT url FROM linkedin_queue")
         return {r["url"] for r in cur.fetchall()}
-
-
-# --- baseline ---------------------------------------------------------------
-
-def test_push_linkedin_jobs_carries_unresolved_metadata(fleet_db):
-    with pgqueue.connect(fleet_db) as pg:
-        n = queue.push_linkedin_jobs(
-            pg,
-            [
-                {
-                    "url": "https://linkedin.com/jobs/unresolved",
-                    "company": "Acme",
-                    "title": "Role",
-                    "application_url": "https://linkedin.com/jobs/unresolved",
-                    "score": 9.0,
-                    "linkedin_resolve_status": "unresolved",
-                    "linkedin_resolved_at": "2026-07-07T12:00:00",
-                    "linkedin_resolve_error": "no_primary_apply_button",
-                    "linkedin_unresolved_kind": "apply_button_missing",
-                    "linkedin_next_action": "run_ats_reconstruction",
-                }
-            ],
-        )
-        assert n == 1
-        with pg.cursor() as cur:
-            cur.execute(
-                """
-                SELECT linkedin_unresolved_kind, linkedin_next_action
-                  FROM linkedin_queue
-                 WHERE url = 'https://linkedin.com/jobs/unresolved'
-                """
-            )
-            row = cur.fetchone()
-
-    assert row["linkedin_unresolved_kind"] == "apply_button_missing"
-    assert row["linkedin_next_action"] == "run_ats_reconstruction"
 
 
 def test_push_linkedin_pushes_clean_eligible(fleet_db, tmp_path):
@@ -114,7 +129,7 @@ def test_push_linkedin_pushes_clean_eligible(fleet_db, tmp_path):
         assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/1"}
 
 
-def test_push_linkedin_can_include_advisory_research_score(fleet_db, tmp_path):
+def test_push_linkedin_ignores_advisory_score_when_canonical_apply_exists(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     url = "https://www.linkedin.com/jobs/view/research-scored"
     _add_li(
@@ -132,12 +147,6 @@ def test_push_linkedin_can_include_advisory_research_score(fleet_db, tmp_path):
             sqlite_conn=sq,
             pg_conn=pg,
             score_floor=7,
-        ) == 0
-        assert sync.push_linkedin_eligible(
-            sqlite_conn=sq,
-            pg_conn=pg,
-            score_floor=7,
-            include_research=True,
         ) == 1
         assert _pushed_urls(pg) == {url}
 
@@ -202,15 +211,18 @@ def test_push_linkedin_excludes_thin_description(fleet_db, tmp_path):
         assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/ok"}
 
 
-def test_push_linkedin_filters_off_lane_by_default(fleet_db, tmp_path):
+def test_push_linkedin_does_not_use_legacy_title_lane_filter(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_li(sq, "https://www.linkedin.com/jobs/view/onlane", title="Chief of Staff")
     _add_li(sq, "https://www.linkedin.com/jobs/view/offlane",
             title="Enterprise Account Executive")
     with pgqueue.connect(fleet_db) as pg:
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
-        assert n == 1
-        assert _pushed_urls(pg) == {"https://www.linkedin.com/jobs/view/onlane"}
+        assert n == 2
+        assert _pushed_urls(pg) == {
+            "https://www.linkedin.com/jobs/view/onlane",
+            "https://www.linkedin.com/jobs/view/offlane",
+        }
 
 
 def test_push_linkedin_keeps_human_decision_off_lane_rows(fleet_db, tmp_path):
@@ -336,24 +348,13 @@ def test_push_linkedin_uses_url_when_application_url_null(fleet_db, tmp_path):
     # Common from scraping: the linkedin link is the primary `url`, application_url is NULL.
     # Eligibility matches (effective host = url), but linkedin_queue.application_url is NOT NULL,
     # so the push must stage the EFFECTIVE url, not the raw NULL.
-    sq.execute(
-        "INSERT INTO jobs "
-        "(url, application_url, company, title, audit_score, discovered_at, full_description, "
-        "linkedin_resolve_status, linkedin_resolved_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (
-            "https://www.linkedin.com/jobs/view/999",
-            None,
-            "Acme",
-            "COS",
-            9.0,
-            _iso(1),
-            "x" * 600,
-            "easy_apply",
-            _iso(0),
-        ),
+    _add_li(
+        sq,
+        "https://www.linkedin.com/jobs/view/999",
+        application_url=None,
+        company="Acme",
+        title="COS",
     )
-    sq.commit()
     with pgqueue.connect(fleet_db) as pg:
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg, score_floor=7)
         assert n == 1
@@ -362,7 +363,71 @@ def test_push_linkedin_uses_url_when_application_url_null(fleet_db, tmp_path):
             assert cur.fetchone()["application_url"] == "https://www.linkedin.com/jobs/view/999"
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"canonical": False},
+        {"canonical_action": "review"},
+        {"canonical_action": "reject"},
+        {"canonical_verdict": "unqualified"},
+        {"canonical_policy_status": "draft"},
+        {"canonical_policy_lane": "ats"},
+        {"canonical_expires_at": "2020-01-01T00:00:00+00:00"},
+    ],
+)
+def test_push_linkedin_rejects_non_authoritative_canonical_rows(
+    fleet_db, tmp_path, kwargs
+):
+    sq = _home_sqlite(tmp_path)
+    _add_li(sq, "https://www.linkedin.com/jobs/view/rejected", **kwargs)
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg) == 0
+
+
 # --- Issue 3: unscored backlog is countable, not silently lost --------------
+
+def test_push_linkedin_jobs_carries_unresolved_metadata(fleet_db):
+    now = datetime.now(timezone.utc)
+    with pgqueue.connect(fleet_db) as pg:
+        n = queue.push_linkedin_jobs(
+            pg,
+            [{
+                "url": "https://linkedin.com/jobs/unresolved",
+                "company": "Acme",
+                "title": "Role",
+                "application_url": "https://linkedin.com/jobs/unresolved",
+                "score": 9.0,
+                "linkedin_resolve_status": "unresolved",
+                "linkedin_resolved_at": "2026-07-07T12:00:00",
+                "linkedin_resolve_error": "no_primary_apply_button",
+                "linkedin_unresolved_kind": "apply_button_missing",
+                "linkedin_next_action": "run_ats_reconstruction",
+                "decision_id": "decision-unresolved",
+                "policy_version": "canonical-linkedin-active-test",
+                "decision_action": "apply",
+                "qualification_verdict": "qualified",
+                "qualification_score": 9.0,
+                "qualification_floor": 7.0,
+                "preference_score": 8.0,
+                "outcome_score": 8.0,
+                "final_score": 9.0,
+                "decision_confidence": 0.9,
+                "decision_created_at": now,
+                "decision_expires_at": now + timedelta(days=1),
+                "input_hash": "hash-unresolved",
+            }],
+        )
+        assert n == 1
+        with pg.cursor() as cur:
+            cur.execute("""
+                SELECT linkedin_unresolved_kind, linkedin_next_action
+                  FROM linkedin_queue
+                 WHERE url = 'https://linkedin.com/jobs/unresolved'
+            """)
+            row = cur.fetchone()
+    assert row["linkedin_unresolved_kind"] == "apply_button_missing"
+    assert row["linkedin_next_action"] == "run_ats_reconstruction"
+
 
 def test_count_linkedin_unscored(tmp_path):
     sq = _home_sqlite(tmp_path)

@@ -88,6 +88,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
             pass
 
     conn = sqlite3.connect(path, timeout=60)
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     # Tolerate write contention from parallel stages/workers and OneDrive sync
     # locking the DB file: wait up to 60s for the writer lock instead of failing
@@ -226,6 +227,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     ensure_research_tables(conn)
     ensure_desc_quality_tables(conn)
     ensure_outcome_tables(conn)
+    ensure_canonical_decision_tables(conn)
     ensure_tenant_tables(conn)
 
     return conn
@@ -298,6 +300,13 @@ _ALL_COLUMNS: dict[str, str] = {
     "decision_verdict": "TEXT",
     "external_decision_score": "REAL",
     "decision_at": "TEXT",
+    # Canonical decision cache. These fields have no apply-eligible defaults;
+    # job_decisions remains the authoritative immutable record.
+    "canonical_decision_id": "TEXT",
+    "canonical_policy_version": "TEXT",
+    "canonical_action": "TEXT",
+    "canonical_score": "REAL",
+    "canonical_decided_at": "TEXT",
     # Fit diagnosis / gap analysis
     "fit_gap_category": "TEXT",
     "fit_gap_severity": "TEXT",
@@ -740,17 +749,19 @@ def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS email_event_reviews (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id          TEXT NOT NULL,
-            review_action       TEXT NOT NULL,
-            reviewed_by         TEXT,
-            reviewed_at         TEXT NOT NULL,
-            corrected_job_url   TEXT,
-            corrected_stage     TEXT,
-            corrected_outcome   TEXT,
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id           TEXT NOT NULL,
+            review_action        TEXT NOT NULL,
+            reviewed_by          TEXT,
+            reviewed_at          TEXT NOT NULL,
+            corrected_job_url    TEXT,
+            corrected_stage      TEXT,
+            corrected_outcome    TEXT,
             corrected_confidence TEXT,
-            resolution          TEXT NOT NULL,
-            note                TEXT,
+            resolution           TEXT NOT NULL CHECK(
+                resolution IN ('trusted','needs_review','ignored','corrected')
+            ),
+            note                 TEXT,
             FOREIGN KEY(message_id) REFERENCES email_events(message_id)
         )
     """)
@@ -764,6 +775,190 @@ def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
     )
 
     conn.commit()
+
+
+def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> None:
+    """Create additive policy, immutable decision, and reviewed-outcome tables."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_policy_versions (
+            policy_version       TEXT PRIMARY KEY,
+            lane                 TEXT NOT NULL CHECK(lane IN ('ats', 'linkedin')),
+            status               TEXT NOT NULL CHECK(status IN ('draft', 'validated', 'canary', 'active', 'retired')),
+            qualification_model  TEXT,
+            preference_model     TEXT,
+            outcome_model        TEXT,
+            kg_version           TEXT,
+            label_snapshot       TEXT,
+            pairwise_snapshot    TEXT,
+            outcome_snapshot     TEXT,
+            config_json          TEXT,
+            metrics_json         TEXT,
+            created_at           TEXT NOT NULL,
+            validated_at         TEXT,
+            activated_at         TEXT,
+            retired_at           TEXT,
+            UNIQUE(policy_version, lane)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS job_decisions (
+            decision_id            TEXT PRIMARY KEY,
+            job_url                TEXT NOT NULL,
+            policy_version         TEXT NOT NULL,
+            lane                   TEXT NOT NULL CHECK(lane IN ('ats', 'linkedin')),
+            qualification_score    REAL,
+            preference_score       REAL,
+            outcome_score          REAL,
+            final_score            REAL,
+            qualification_verdict  TEXT NOT NULL CHECK(
+                qualification_verdict IN ('qualified', 'unqualified', 'uncertain')
+            ),
+            action                 TEXT NOT NULL CHECK(action IN ('apply', 'review', 'reject')),
+            confidence             REAL,
+            uncertainty_json       TEXT,
+            blockers_json          TEXT,
+            requirements_json      TEXT,
+            evidence_node_ids_json TEXT,
+            title_signals_json      TEXT,
+            explanation            TEXT,
+            input_hash             TEXT NOT NULL,
+            created_at             TEXT NOT NULL,
+            expires_at             TEXT,
+            UNIQUE(job_url, policy_version, input_hash),
+            FOREIGN KEY(job_url) REFERENCES jobs(url),
+            FOREIGN KEY(policy_version, lane)
+                REFERENCES decision_policy_versions(policy_version, lane)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reviewed_outcomes (
+            event_id          TEXT NOT NULL,
+            job_url           TEXT NOT NULL,
+            attribution_json  TEXT,
+            review_status     TEXT NOT NULL CHECK(
+                review_status IN ('accepted', 'rejected', 'needs_review')
+            ),
+            normalized_stage  TEXT,
+            weight            REAL,
+            reviewer          TEXT,
+            reason            TEXT,
+            created_at        TEXT NOT NULL,
+            reviewed_at       TEXT,
+            updated_at        TEXT,
+            PRIMARY KEY(event_id, job_url),
+            FOREIGN KEY(event_id) REFERENCES email_events(message_id),
+            FOREIGN KEY(job_url) REFERENCES jobs(url)
+        )
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_decision_policy_versions_status_lane
+        ON decision_policy_versions(status, lane)
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_policy_versions_version_lane
+        ON decision_policy_versions(policy_version, lane)
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_policy_versions_active_lane
+        ON decision_policy_versions(lane) WHERE status = 'active'
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_decisions_job
+        ON job_decisions(job_url, created_at)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_decisions_policy
+        ON job_decisions(policy_version)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_decisions_action
+        ON job_decisions(action)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_decisions_expires
+        ON job_decisions(expires_at)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_reviewed_outcomes_job
+        ON reviewed_outcomes(job_url)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_reviewed_outcomes_status
+        ON reviewed_outcomes(review_status)
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_job_decisions_policy_lane_insert
+        BEFORE INSERT ON job_decisions
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM decision_policy_versions
+            WHERE policy_version = NEW.policy_version
+              AND lane = NEW.lane
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'decision policy lane mismatch');
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_job_decisions_policy_lane_update
+        BEFORE UPDATE OF policy_version, lane ON job_decisions
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM decision_policy_versions
+            WHERE policy_version = NEW.policy_version
+              AND lane = NEW.lane
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'decision policy lane mismatch');
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_decision_policy_versions_lane_update
+        BEFORE UPDATE OF lane ON decision_policy_versions
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1
+            FROM job_decisions
+            WHERE policy_version = OLD.policy_version
+              AND lane <> NEW.lane
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'policy lane has decisions');
+        END
+    """)
+    conn.commit()
+
+    violations: list[str] = []
+    for table in ("job_decisions", "reviewed_outcomes"):
+        for row in conn.execute(f"PRAGMA foreign_key_check({table})").fetchall():
+            violations.append(
+                f"foreign key violation: {row[0]} rowid={row[1]} "
+                f"references {row[2]} (fk={row[3]})"
+            )
+
+    lane_mismatches = conn.execute("""
+        SELECT d.decision_id, d.policy_version, d.lane, p.lane
+        FROM job_decisions d
+        JOIN decision_policy_versions p ON p.policy_version = d.policy_version
+        WHERE d.lane <> p.lane
+        ORDER BY d.decision_id
+    """).fetchall()
+    for row in lane_mismatches:
+        violations.append(
+            f"lane mismatch: decision_id={row[0]} policy_version={row[1]} "
+            f"decision_lane={row[2]} policy_lane={row[3]}"
+        )
+
+    if violations:
+        raise RuntimeError(
+            "Canonical decision schema integrity check failed: " + "; ".join(violations)
+        )
 
 
 def ensure_tenant_tables(conn: sqlite3.Connection | None = None) -> None:

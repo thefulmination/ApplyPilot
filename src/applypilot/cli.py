@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import json
 from collections import defaultdict
@@ -44,6 +45,8 @@ outcomes_learn_app = typer.Typer(
 app.add_typer(outcomes_learn_app)
 console = Console()
 log = logging.getLogger(__name__)
+canonical_app = typer.Typer(help="Canonical decision policy lifecycle and reviewed feedback.")
+app.add_typer(canonical_app, name="canonical")
 
 # Valid pipeline stages (in execution order)
 VALID_STAGES = ("discover", "enrich", "score", "audit", "diagnose", "tailor", "cover", "pdf")
@@ -100,6 +103,230 @@ def _site_rows_for_status(
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+
+def _canonical_connection():
+    from applypilot.config import ensure_dirs, load_env
+    from applypilot.database import init_db
+
+    load_env()
+    ensure_dirs()
+    return init_db(os.environ.get("APPLYPILOT_DB_PATH"))
+
+
+def _canonical_policy(conn, policy_version: str):
+    row = conn.execute(
+        "SELECT * FROM decision_policy_versions WHERE policy_version=?",
+        (policy_version,),
+    ).fetchone()
+    if row is None:
+        raise typer.BadParameter(f"unknown policy: {policy_version}")
+    return row
+
+
+@canonical_app.command("status")
+def canonical_status(
+    dsn: Optional[str] = typer.Option(None, "--dsn", envvar="FLEET_PG_DSN"),
+) -> None:
+    """Report policy state and fail-closed projection/queue counts by lane."""
+    conn = _canonical_connection()
+    result: dict[str, object] = {"lanes": {}}
+    for lane in ("ats", "linkedin"):
+        active = conn.execute(
+            "SELECT policy_version,status,metrics_json FROM decision_policy_versions "
+            "WHERE lane=? AND status IN ('canary','active') ORDER BY status='active' DESC, policy_version",
+            (lane,),
+        ).fetchall()
+        missing = conn.execute(
+            "SELECT COUNT(*) FROM jobs j WHERE "
+            + ("COALESCE(j.application_url,j.url) NOT LIKE '%linkedin.com%'" if lane == "ats" else "COALESCE(j.application_url,j.url) LIKE '%linkedin.com%'")
+            + " AND j.canonical_decision_id IS NULL"
+        ).fetchone()[0]
+        mismatch = conn.execute(
+            "SELECT COUNT(*) FROM jobs j JOIN job_decisions d ON d.decision_id=j.canonical_decision_id "
+            "WHERE d.lane=? AND (d.policy_version<>j.canonical_policy_version "
+            "OR j.canonical_policy_version IS NULL)",
+            (lane,),
+        ).fetchone()[0]
+        result["lanes"][lane] = {
+            "policies": [dict(row) for row in active],
+            "missing_projection": missing,
+            "mismatched_projection": mismatch,
+        }
+    if dsn:
+        from applypilot.apply import pgqueue
+        try:
+            with pgqueue.connect(dsn) as pg, pg.cursor() as cur:
+                cur.execute("SELECT ats_policy_version,linkedin_policy_version FROM fleet_config WHERE id=1")
+                cfg = dict(cur.fetchone())
+                for lane, table in (("ats", "apply_queue"), ("linkedin", "linkedin_queue")):
+                    cur.execute(
+                        f"SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE decision_id IS NULL) AS missing, "
+                        f"COUNT(*) FILTER (WHERE policy_version<>%s) AS mismatched FROM {table} WHERE status='queued'",
+                        (cfg[f"{lane}_policy_version"],),
+                    )
+                    result["lanes"][lane]["queue"] = dict(cur.fetchone())
+                    result["lanes"][lane]["fleet_policy_version"] = cfg[f"{lane}_policy_version"]
+        except Exception as exc:
+            result["fleet_error"] = str(exc)
+    console.print_json(data=result)
+
+
+@canonical_app.command("validate")
+def canonical_validate(policy_version: str = typer.Argument(...)) -> None:
+    """Validate a draft only when every locked replay gate passes."""
+    from applypilot import canonical_decisions
+
+    conn = _canonical_connection()
+    canonical_decisions.validate_policy(conn, policy_version)
+    console.print(f"validated {policy_version}")
+
+
+def _stage_pg_policy(pg, *, policy_version: str, lane: str) -> None:
+    table = "apply_queue" if lane == "ats" else "linkedin_queue"
+    with pg.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) VALUES (%s,%s,'validated') "
+            "ON CONFLICT (policy_version) DO UPDATE SET status='validated' "
+            "WHERE fleet_decision_policies.lane=EXCLUDED.lane",
+            (policy_version, lane),
+        )
+        cur.execute(
+            f"UPDATE fleet_config SET {lane}_policy_version=%s, updated_at=now() WHERE id=1",
+            (policy_version,),
+        )
+        cur.execute(
+            f"UPDATE {table} SET status='failed', apply_status='skipped', "
+            "apply_error='canonical_policy_replaced', updated_at=now() "
+            "WHERE status='queued' AND policy_version IS DISTINCT FROM %s",
+            (policy_version,),
+        )
+    pg.commit()
+
+
+@canonical_app.command("promote")
+def canonical_promote(
+    policy_version: str = typer.Argument(...),
+    lane: str = typer.Option(..., "--lane", help="Explicitly select ats or linkedin."),
+    dsn: str = typer.Option(..., "--dsn", envvar="FLEET_PG_DSN"),
+) -> None:
+    """Promote replay-validated policy; never clears an operator lane pause."""
+    from applypilot import canonical_decisions
+    from applypilot.apply import pgqueue
+
+    if lane not in {"ats", "linkedin"}:
+        raise typer.BadParameter("--lane must be ats or linkedin")
+    conn = _canonical_connection()
+    policy = _canonical_policy(conn, policy_version)
+    if policy["lane"] != lane:
+        raise typer.BadParameter(f"policy belongs to {policy['lane']}, not {lane}")
+    recovering_active = policy["status"] == "active"
+    if policy["status"] == "draft":
+        canonical_decisions.validate_policy(conn, policy_version)
+    elif policy["status"] not in {"validated", "active"}:
+        raise typer.BadParameter("policy must be draft, validated, or an active recovery")
+
+    try:
+        with pgqueue.connect(dsn) as pg:
+            _stage_pg_policy(pg, policy_version=policy_version, lane=lane)
+    except Exception as exc:
+        console.print(f"[red]Postgres staging failed; {policy_version} remains validated: {exc}[/red]")
+        raise typer.Exit(2) from exc
+
+    if not recovering_active:
+        canonical_decisions.activate_policy(conn, policy_version, lane=lane)
+    try:
+        with pgqueue.connect(dsn) as pg, pg.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_decision_policies SET status='retired',retired_at=now() "
+                "WHERE lane=%s AND status='active' AND policy_version<>%s",
+                (lane, policy_version),
+            )
+            cur.execute(
+                "UPDATE fleet_decision_policies SET status='active',activated_at=now(),retired_at=NULL "
+                "WHERE policy_version=%s AND lane=%s",
+                (policy_version, lane),
+            )
+            pg.commit()
+    except Exception as exc:
+        console.print(
+            f"[red]SQLite activated but Postgres remained non-active and fail-closed: {exc}[/red]"
+        )
+        raise typer.Exit(3) from exc
+    console.print(f"promoted {policy_version} for {lane}; operator lane pause unchanged")
+
+
+@canonical_app.command("retire")
+def canonical_retire(
+    policy_version: str = typer.Argument(...),
+    dsn: str = typer.Option(..., "--dsn", envvar="FLEET_PG_DSN"),
+) -> None:
+    """Retire one policy, invalidate its queued work, and pause only its lane."""
+    from applypilot import canonical_decisions
+    from applypilot.apply import pgqueue
+
+    conn = _canonical_connection()
+    policy = _canonical_policy(conn, policy_version)
+    lane = policy["lane"]
+    table = "apply_queue" if lane == "ats" else "linkedin_queue"
+    try:
+        with pgqueue.connect(dsn) as pg, pg.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_decision_policies SET status='retired',retired_at=COALESCE(retired_at,now()) "
+                "WHERE policy_version=%s AND lane=%s",
+                (policy_version, lane),
+            )
+            if lane == "ats":
+                cur.execute(
+                    "UPDATE fleet_config SET ats_policy_version=NULL,ats_paused=TRUE,"
+                    "ats_pause_source='canonical_policy_retired',updated_at=now() "
+                    "WHERE id=1 AND ats_policy_version=%s",
+                    (policy_version,),
+                )
+            else:
+                cur.execute(
+                    "UPDATE fleet_config SET linkedin_policy_version=NULL,linkedin_canary_enabled=TRUE,"
+                    "linkedin_canary_remaining=0,updated_at=now() "
+                    "WHERE id=1 AND linkedin_policy_version=%s",
+                    (policy_version,),
+                )
+            cur.execute(
+                f"UPDATE {table} SET status='failed',apply_status='skipped',"
+                "apply_error='canonical_policy_retired',updated_at=now() "
+                "WHERE status='queued' AND policy_version=%s",
+                (policy_version,),
+            )
+            pg.commit()
+    except Exception as exc:
+        console.print(f"[red]Postgres retirement failed; SQLite policy unchanged: {exc}[/red]")
+        raise typer.Exit(2) from exc
+    canonical_decisions.retire_policy(conn, policy_version)
+    console.print(f"retired {policy_version}; {lane} paused and queued rows invalidated")
+
+
+@canonical_app.command("backfill")
+def canonical_backfill(path: Path = typer.Argument(..., exists=True, file_okay=False)) -> None:
+    from applypilot.canonical_backfill import backfill_research_artifacts
+
+    report = backfill_research_artifacts(_canonical_connection(), path)
+    console.print_json(data=report)
+
+
+@canonical_app.command("outcome-review")
+def canonical_outcome_review(
+    message_id: str = typer.Argument(...),
+    resolution: str = typer.Option(..., "--resolution"),
+    job_url: Optional[str] = typer.Option(None, "--job-url"),
+    stage: Optional[str] = typer.Option(None, "--stage"),
+    note: Optional[str] = typer.Option(None, "--note"),
+) -> None:
+    from applypilot.outcome_review import record_review
+
+    row = record_review(
+        _canonical_connection(), message_id, resolution=resolution,
+        corrected_job_url=job_url, corrected_stage=stage, note=note,
+    )
+    console.print_json(data=row)
 
 @app.callback()
 def main(
@@ -2382,12 +2609,7 @@ def import_decisions_command(
     scale: str = typer.Option("auto", "--scale", help="Score scale of the input: auto, ten (1-10), unit (0-1), or percent (0-100)."),
     source: str = typer.Option("brainstorm", "--source", help="Tag written to decision_source when a record omits one."),
 ) -> None:
-    """Import a curated apply list from the recommendation engine.
-
-    Approved jobs become authoritative for the apply gate (their verdict is
-    written into audit_score and they skip ApplyPilot's own audit). The LLM
-    fit_score is kept as a benchmark alongside external_decision_score.
-    """
+    """Import legacy recommendations as review/migration evidence only."""
     _bootstrap()
 
     from applypilot.import_decisions import import_decisions
@@ -2425,10 +2647,8 @@ def import_decisions_command(
         )
     enrich_hint = " enrich" if r.get("inserted") else ""
     console.print(
-        f"\n[dim]Run 'applypilot run{enrich_hint} tailor cover pdf' then 'applypilot apply' "
-        "to apply to the approved jobs"
-        + (" (newly-inserted jobs need enrich first to fetch their description).[/dim]\n"
-           if r.get("inserted") else ".[/dim]\n")
+        f"\n[dim]Imported for review{enrich_hint}; this command does not authorize applications. "
+        "Run canonical scoring, replay, validation, and explicit promotion.[/dim]\n"
     )
 
 

@@ -10,6 +10,7 @@ Uses the shared ``fleet_db`` fixture (disposable local Postgres, v3 schema appli
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -18,6 +19,32 @@ psycopg = pytest.importorskip("psycopg")
 from applypilot.apply import pgqueue
 from applypilot.fleet import queue as fleet_queue
 from applypilot.fleet import sync
+
+
+@pytest.fixture(autouse=True)
+def _enable_test_adapters(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_GREENHOUSE_ADAPTER", "1")
+    monkeypatch.setenv("APPLYPILOT_LEVER_BOUNDED_PATH", "1")
+    monkeypatch.setenv("APPLYPILOT_ASHBY_ADAPTER", "1")
+
+
+@pytest.fixture(autouse=True)
+def _register_canonical_pg_policies(request):
+    if "fleet_db" not in request.fixturenames:
+        yield
+        return
+    dsn = request.getfixturevalue("fleet_db")
+    with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
+        for lane in ("ats", "linkedin"):
+            policy = f"canonical-{lane}-active-test"
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                "VALUES (%s,%s,'active')",
+                (policy, lane),
+            )
+            cur.execute(f"UPDATE fleet_config SET {lane}_policy_version=%s WHERE id=1", (policy,))
+        conn.commit()
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +64,19 @@ CREATE TABLE jobs (
     recommended_action TEXT, audit_flags TEXT,
     linkedin_resolve_status TEXT, linkedin_resolved_at TEXT,
     linkedin_resolve_error TEXT,
-    linkedin_unresolved_kind TEXT, linkedin_next_action TEXT
+    linkedin_unresolved_kind TEXT, linkedin_next_action TEXT,
+    canonical_decision_id TEXT
+);
+CREATE TABLE decision_policy_versions (
+    policy_version TEXT PRIMARY KEY, lane TEXT NOT NULL, status TEXT NOT NULL,
+    config_json TEXT, created_at TEXT NOT NULL, UNIQUE(policy_version, lane)
+);
+CREATE TABLE job_decisions (
+    decision_id TEXT PRIMARY KEY, job_url TEXT NOT NULL, policy_version TEXT NOT NULL,
+    lane TEXT NOT NULL, qualification_score REAL, preference_score REAL,
+    outcome_score REAL, final_score REAL, qualification_verdict TEXT NOT NULL,
+    action TEXT NOT NULL, confidence REAL, input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL, expires_at TEXT
 );
 """
 
@@ -50,11 +89,35 @@ def _home_sqlite(tmp_path):
 
 
 def _add_job(conn, url, **kw):
+    canonical = kw.pop("canonical", True)
+    action = kw.pop("canonical_action", None)
+    verdict = kw.pop("canonical_verdict", "qualified")
+    policy_status = kw.pop("canonical_policy_status", "active")
+    policy_lane = kw.pop("canonical_policy_lane", None)
+    expires_at = kw.pop("canonical_expires_at", None)
     cols = {"url": url, "application_url": url, "audit_score": 8.0,
             "liveness_status": "live", "full_description": "x" * 600}
     cols.update(kw)
     conn.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                  list(cols.values()))
+    if canonical:
+        lane = policy_lane or ("linkedin" if "linkedin.com" in (cols.get("application_url") or url) else "ats")
+        policy = f"canonical-{lane}-{policy_status}-test"
+        now = datetime.now(timezone.utc)
+        score = float(cols.get("audit_score") or cols.get("fit_score") or cols.get("research_fit_score") or 8.0)
+        decision_action = action or ("apply" if score >= 7 else "review")
+        decision_id = f"decision-{abs(hash(url))}"
+        conn.execute(
+            "INSERT OR IGNORE INTO decision_policy_versions VALUES (?,?,?,?,?)",
+            (policy, lane, policy_status, '{"qualificationFloor":7}', now.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO job_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (decision_id, url, policy, lane, 9.0, 8.0, 8.0, score, verdict,
+             decision_action, 0.9, f"hash-{decision_id}", now.isoformat(),
+             expires_at or (now + timedelta(days=1)).isoformat()),
+        )
+        conn.execute("UPDATE jobs SET canonical_decision_id=? WHERE url=?", (decision_id, url))
     conn.commit()
 
 
@@ -211,49 +274,27 @@ def test_push_apply_eligible_retires_queued_rows_marked_dead_in_home_db(fleet_db
     assert rows["https://boards.greenhouse.io/dead/jobs/mapped-by-appurl"]["apply_status"] == "failed"
     assert rows["https://boards.greenhouse.io/dead/jobs/mapped-by-appurl"]["apply_error"] == "expired"
 
-    assert rows["https://boards.greenhouse.io/alive/jobs/1"]["status"] == "queued"
     assert rows["https://boards.greenhouse.io/other/jobs/1"]["status"] == "queued"
-def test_push_apply_eligible_can_opt_into_research_scores(fleet_db, tmp_path):
+
+
+def test_push_apply_eligible_rejects_score_only_rows(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://boards.greenhouse.io/research/jobs/1",
              company="Research Co", title="Strategy Lead",
-             audit_score=None, fit_score=None, research_fit_score=8.0)
+             audit_score=None, fit_score=None, research_fit_score=8.0, canonical=False)
 
     with pgqueue.connect(fleet_db) as pg:
         assert sync.push_apply_eligible(
             sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A"
         ) == 0
         assert sync.push_apply_eligible(
-            sqlite_conn=sq, pg_conn=pg, score_floor=7, approved_batch="batch-A",
-            include_research=True,
-        ) == 1
+            sqlite_conn=sq, pg_conn=pg, score_floor=0, approved_batch="batch-A",
+        ) == 0
         with pg.cursor() as cur:
             cur.execute("SELECT url, score FROM apply_queue")
             rows = cur.fetchall()
 
-    assert len(rows) == 1
-    assert rows[0]["url"].endswith("/research/jobs/1")
-    assert float(rows[0]["score"]) == 8.0
-
-
-def test_push_apply_eligible_accepts_decimal_score_floor(fleet_db, tmp_path):
-    sq = _home_sqlite(tmp_path)
-    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/58",
-             company="Acme Inc", title="Chief of Staff", audit_score=5.8)
-    _add_job(sq, "https://boards.greenhouse.io/acme/jobs/57",
-             company="Acme Inc", title="BizOps Analyst", audit_score=5.7)
-
-    with pgqueue.connect(fleet_db) as pg:
-        n = sync.push_apply_eligible(
-            sqlite_conn=sq, pg_conn=pg, score_floor=5.8, approved_batch="batch-A", limit=None
-        )
-        assert n == 1
-        with pg.cursor() as cur:
-            cur.execute("SELECT url, score FROM apply_queue ORDER BY url")
-            rows = cur.fetchall()
-
-    assert [r["url"] for r in rows] == ["https://boards.greenhouse.io/acme/jobs/58"]
-    assert float(rows[0]["score"]) == 5.8
+    assert rows == []
 
 
 def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):
@@ -277,7 +318,7 @@ def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path)
     assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
 
 
-def test_push_apply_eligible_filters_off_lane_by_default(fleet_db, tmp_path):
+def test_push_apply_eligible_does_not_use_legacy_title_lane_filter(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://boards.greenhouse.io/acme/jobs/1",
              company="Acme Inc", title="Chief of Staff")
@@ -287,12 +328,71 @@ def test_push_apply_eligible_filters_off_lane_by_default(fleet_db, tmp_path):
     with pgqueue.connect(fleet_db) as pg:
         n = sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg,
                                      score_floor=7, approved_batch="batch-A", limit=None)
-        assert n == 1
+        assert n == 2
         with pg.cursor() as cur:
             cur.execute("SELECT url FROM apply_queue")
             urls = {r["url"] for r in cur.fetchall()}
 
-    assert urls == {"https://boards.greenhouse.io/acme/jobs/1"}
+    assert urls == {
+        "https://boards.greenhouse.io/acme/jobs/1",
+        "https://boards.greenhouse.io/sales/jobs/2",
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs"),
+    [
+        {"canonical_action": "review"},
+        {"canonical_action": "reject"},
+        {"canonical_verdict": "unqualified"},
+        {"canonical_verdict": "uncertain"},
+        {"canonical_policy_status": "draft"},
+        {"canonical_policy_status": "validated"},
+        {"canonical_policy_status": "retired"},
+        {"canonical_policy_lane": "linkedin"},
+        {"canonical_expires_at": "2020-01-01T00:00:00+00:00"},
+    ],
+)
+def test_push_apply_eligible_rejects_non_authoritative_canonical_rows(
+    fleet_db, tmp_path, kwargs
+):
+    sq = _home_sqlite(tmp_path)
+    _add_job(
+        sq,
+        "https://boards.greenhouse.io/acme/jobs/rejected",
+        company="Acme",
+        title="Chief of Staff",
+        **kwargs,
+    )
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg) == 0
+
+
+def test_push_apply_selector_carries_complete_canonical_provenance(
+    fleet_db, tmp_path, monkeypatch
+):
+    sq = _home_sqlite(tmp_path)
+    _add_job(sq, "https://jobs.lever.co/acme/authority", company="Acme", title="COS")
+    captured = []
+
+    def capture(_pg, rows, **_kwargs):
+        captured.extend(rows)
+        return len(rows)
+
+    monkeypatch.setattr(sync._queue, "push_apply_jobs", capture)
+    with pgqueue.connect(fleet_db) as pg:
+        assert sync.push_apply_eligible(sqlite_conn=sq, pg_conn=pg) == 1
+
+    row = captured[0]
+    required = {
+        "decision_id", "policy_version", "decision_action", "qualification_verdict",
+        "qualification_score", "qualification_floor", "preference_score", "outcome_score",
+        "final_score", "decision_confidence", "decision_created_at",
+        "decision_expires_at", "input_hash",
+    }
+    assert required <= row.keys()
+    assert row["decision_action"] == "apply"
+    assert row["qualification_verdict"] == "qualified"
 
 
 def test_push_apply_eligible_keeps_human_decision_off_lane_rows(fleet_db, tmp_path):
@@ -357,10 +457,10 @@ def test_push_linkedin_eligible_skips_company_blocklist_matches(fleet_db, tmp_pa
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://www.linkedin.com/jobs/view/acme",
              company="Acme", title="Chief of Staff", audit_score=9.0,
-             linkedin_resolve_status="easy_apply", linkedin_resolved_at="2026-07-06T12:00:00")
+             linkedin_resolve_status="easy_apply", linkedin_resolved_at=datetime.now(timezone.utc).isoformat())
     _add_job(sq, "https://www.linkedin.com/jobs/view/openai",
              company="OpenAI", title="Strategy", audit_score=10.0,
-             linkedin_resolve_status="easy_apply", linkedin_resolved_at="2026-07-06T12:00:00")
+             linkedin_resolve_status="easy_apply", linkedin_resolved_at=datetime.now(timezone.utc).isoformat())
 
     with pgqueue.connect(fleet_db) as pg:
         n = sync.push_linkedin_eligible(sqlite_conn=sq, pg_conn=pg,
@@ -382,7 +482,7 @@ def test_push_linkedin_eligible_carries_resolver_metadata(fleet_db, tmp_path):
         title="Chief of Staff",
         audit_score=9.0,
         linkedin_resolve_status="easy_apply",
-        linkedin_resolved_at="2026-07-06T12:00:00",
+        linkedin_resolved_at=datetime.now(timezone.utc).isoformat(),
         linkedin_resolve_error="no_primary_apply_button",
         linkedin_unresolved_kind="apply_button_missing",
         linkedin_next_action="run_ats_reconstruction",

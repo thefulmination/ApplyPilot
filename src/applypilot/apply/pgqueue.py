@@ -20,12 +20,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 import psycopg
 from psycopg.rows import dict_row
-
-from applypilot import config
 
 _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding="utf-8")
 
@@ -104,26 +102,12 @@ def lease_one(
     ttl_seconds: int = 1200,
     politeness_seconds: int = 90,
 ) -> dict[str, Any] | None:
-    """Atomically lease the top-score queued job whose apply_domain is outside the jittered
-    politeness window. Bumps `attempts` AT lease time (so a row that has been handed to a worker
-    is visibly attempt>=1). NOTE: attempts does NOT distinguish a never-launched lease from one
-    that crashed mid-submit -- both stay at 1 -- so reclaim must park ALL expired leases
-    conservatively rather than requeue on attempts (see reclaim_stale_leases). Returns the leased
-    row dict, or None if nothing is leasable.
-
-    politeness_seconds=0 disables host throttling (used by tests for determinism)."""
-    blocked_names, blocked_pats = config.load_blocked_companies()
-    with conn.cursor() as cur:
-        cur.execute(
-            _LEASE_SQL,
-            {
-                "worker": worker_id, "ttl": ttl_seconds, "politeness": politeness_seconds,
-                "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
-            },
-        )
-        row = cur.fetchone()
-    conn.commit()
-    return row
+    """Retired score-only lease API; use ``fleet.queue.lease_apply``."""
+    del conn, worker_id, ttl_seconds, politeness_seconds
+    raise RuntimeError(
+        "legacy score-only lease_one is disabled; use fleet.queue.lease_apply "
+        "with an active canonical ATS policy"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -404,16 +388,12 @@ WHERE apply_queue.status = 'queued';   -- only refresh+requeue still-pending row
 
 
 def push_jobs(conn: psycopg.Connection, rows: Iterable[dict[str, Any]]) -> int:
-    """Idempotently UPSERT offsite-eligible jobs by url (spec S3b). Re-runnable; never disturbs
-    a leased/terminal row. `rows` need keys: url, company, title, application_url, score,
-    apply_domain. Returns the number of rows submitted."""
-    rows = list(rows)
-    if not rows:
-        return 0
-    with conn.cursor() as cur:
-        cur.executemany(_PUSH_SQL, rows)
-    conn.commit()
-    return len(rows)
+    """Retired score-only push API; use ``fleet.queue.push_apply_jobs``."""
+    del conn, rows
+    raise RuntimeError(
+        "legacy score-only push_jobs is disabled; use fleet.queue.push_apply_jobs "
+        "with canonical decision provenance"
+    )
 
 
 # PULL works for both lanes: linkedin_queue is schema-identical to apply_queue

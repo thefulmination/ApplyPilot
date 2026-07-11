@@ -23,6 +23,30 @@ DEFAULT_ACTION_FOR_RESOLUTION = {
     "corrected": "change_stage",
 }
 TRUSTED_STATES = {"trusted", "corrected"}
+_RECOMMENDATION_SENDERS = (
+    "match.indeed.com",
+    "jobalerts-noreply@linkedin.com",
+    "jobs-listings@linkedin.com",
+    "alerts@ziprecruiter.com",
+)
+_RECOMMENDATION_SUBJECTS = (
+    "new jobs",
+    "job alert",
+    "jobs for you",
+    "recommended jobs",
+    "top job picks",
+)
+
+
+def classify_review_candidate(*, sender: str | None, subject: str | None) -> str:
+    """Reject recommendation/newsletter mail before any title/company matching."""
+    sender_text = (sender or "").strip().lower()
+    subject_text = (subject or "").strip().lower()
+    if any(token in sender_text for token in _RECOMMENDATION_SENDERS):
+        return "rejected"
+    if any(token in subject_text for token in _RECOMMENDATION_SUBJECTS):
+        return "rejected"
+    return "needs_review"
 
 
 def _now_iso() -> str:
@@ -134,10 +158,6 @@ def _apply_review(event: dict[str, Any], review: dict[str, Any] | None) -> dict[
         if review.get("corrected_confidence"):
             resolved["confidence"] = review["corrected_confidence"]
         trust_state = review["resolution"]
-    elif event.get("match_status") == "needs_review":
-        trust_state = "needs_review"
-    elif event.get("job_url"):
-        trust_state = "trusted"
     else:
         trust_state = "needs_review"
 

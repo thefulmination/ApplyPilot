@@ -15,7 +15,6 @@ import socket
 import subprocess
 import tempfile
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -24,6 +23,27 @@ psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
 from applypilot.apply import fleet_sync
+
+
+@pytest.fixture(autouse=True)
+def _retire_score_only_queue_tests(request):
+    """The v1 lease/push suite is superseded by test_fleet_v3_governor_queue."""
+    allowed = {
+        "test_ensure_schema_is_idempotent",
+        "test_legacy_score_only_queue_apis_are_disabled",
+    }
+    if request.node.name not in allowed:
+        pytest.skip("legacy score-only queue retired; canonical v3 queue owns these invariants")
+
+
+def test_legacy_score_only_queue_apis_are_disabled(db):
+    with pgqueue.connect(db) as conn:
+        with pytest.raises(RuntimeError, match="canonical"):
+            pgqueue.push_jobs(conn, [])
+        with pytest.raises(RuntimeError, match="canonical"):
+            pgqueue.lease_one(conn, "worker")
+        with pytest.raises(RuntimeError, match="canonical"):
+            fleet_sync.push_offsite_jobs(pg_conn=conn)
 
 
 # ---------------------------------------------------------------------------

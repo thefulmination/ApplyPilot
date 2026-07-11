@@ -43,34 +43,74 @@ from applypilot.discovery.jobspy import store_jobspy_results
 # APPLY -- PUSH
 # ===========================================================================
 
-# Eligibility mirrors fleet_sync._PUSH_SELECT (the offsite-apply predicate, S2/S9.3):
-#   not a dedup duplicate; score floor on COALESCE(audit_score, fit_score); not dead;
-#   not already applied/in-flight; a real http(s) offsite (non-LinkedIn) target.
-#   The research score lane stays opt-in for apply staging via ``include_research``.
+# Canonical decisions are the only apply authorization. Legacy score columns remain
+# useful for analysis/compute work, but are deliberately absent from this selector.
 # crash_unconfirmed / no_confirmation are EXCLUDED (v1 parity): a posting that may
 # already have been submitted under the user's name must never be re-pushed/re-applied.
-_PUSH_APPLY_SELECT = """
-SELECT url, company, title, application_url, {location_expr}, full_description,
-       CAST({score_expr} AS REAL) AS score
-FROM jobs
-WHERE duplicate_of_url IS NULL
-  AND {score_expr} >= ?
-  AND COALESCE(liveness_status, '') != 'dead'
-  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
-  AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
-  AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
-  AND COALESCE(apply_attempts, 0) < {max_apply_attempts}
-  AND application_url LIKE 'http%'
-  AND application_url NOT LIKE '%linkedin.com%'
+_CANONICAL_PROVENANCE_SELECT = """
+SELECT j.url, j.company, j.title, {application_url} AS application_url,
+       {location_expr}, j.full_description,
+       CAST(d.final_score AS REAL) AS score,
+       d.decision_id, d.policy_version, d.action AS decision_action,
+       d.qualification_verdict, CAST(d.qualification_score AS REAL) AS qualification_score,
+       CAST(json_extract(p.config_json, '$.qualificationFloor') AS REAL) AS qualification_floor,
+       CAST(d.preference_score AS REAL) AS preference_score,
+       CAST(d.outcome_score AS REAL) AS outcome_score,
+       CAST(d.final_score AS REAL) AS final_score,
+       CAST(d.confidence AS REAL) AS decision_confidence,
+       d.created_at AS decision_created_at, d.expires_at AS decision_expires_at,
+       d.input_hash,
+       j.linkedin_resolve_status, j.linkedin_resolved_at, j.linkedin_resolve_error,
+       j.linkedin_unresolved_kind, j.linkedin_next_action
+FROM jobs j
+JOIN job_decisions d ON d.decision_id = j.canonical_decision_id
+JOIN decision_policy_versions p ON p.policy_version = d.policy_version
+WHERE j.duplicate_of_url IS NULL
+  AND d.lane = ?
+  AND p.lane = d.lane
+  AND p.status IN ('canary', 'active')
+  AND d.action = 'apply'
+  AND d.qualification_verdict = 'qualified'
+  AND d.final_score IS NOT NULL
+  AND d.qualification_score IS NOT NULL
+  AND d.preference_score IS NOT NULL
+  AND d.outcome_score IS NOT NULL
+  AND d.confidence IS NOT NULL
+  AND d.input_hash IS NOT NULL AND TRIM(d.input_hash) != ''
+  AND d.created_at IS NOT NULL
+  AND d.expires_at IS NOT NULL AND julianday(d.expires_at) > julianday(?)
+  AND json_type(p.config_json, '$.qualificationFloor') IN ('integer', 'real')
+  AND d.qualification_score >= CAST(json_extract(p.config_json, '$.qualificationFloor') AS REAL)
+  AND COALESCE(j.liveness_status, '') != 'dead'
+  AND LENGTH(COALESCE(j.full_description,'')) >= {thin_description_chars}
+  AND (j.apply_status IS NULL OR j.apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
+  AND COALESCE(j.apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
+  {attempts_predicate}
+  {shape_predicate}
   {company_blocklist}
-ORDER BY score DESC
+  {recency}
+ORDER BY d.final_score DESC, j.url ASC
+"""
+
+_PUSH_APPLY_SHAPE = """
+  AND j.application_url LIKE 'http%'
+  AND j.application_url NOT LIKE '%linkedin.com%'
+"""
+
+_PUSH_LINKEDIN_SHAPE = """
+  AND TRIM(COALESCE(j.company, '')) != ''
+  AND TRIM(COALESCE(j.title, '')) != ''
+  AND (CASE WHEN j.application_url LIKE 'http%' THEN j.application_url ELSE j.url END) LIKE '%linkedin.com%'
+  AND COALESCE(j.linkedin_resolve_status, '') IN ({fresh_statuses})
+  AND j.linkedin_resolved_at IS NOT NULL
+  {resolve_recency}
 """
 
 # Extra clause appended when the home brain has an ``applications`` ledger table --
 # excludes URLs already in the ledger so the fleet never re-pushes a job the home
 # runner already applied to via a different lane.
 _PUSH_APPLY_LEDGER_CROSS_CHECK = (
-    "  AND COALESCE(application_url, url) NOT IN (\n"
+    "  AND COALESCE(j.application_url, j.url) NOT IN (\n"
     "      SELECT COALESCE(NULLIF(application_url,''), job_url) FROM applications WHERE status = 'applied')\n"
 )
 
@@ -119,6 +159,21 @@ def _jobs_column_exists(sqlite_conn: sqlite3.Connection, column: str) -> bool:
     return any(row[1] == column for row in sqlite_conn.execute("PRAGMA table_info(jobs)").fetchall())
 
 
+def _canonical_projection_available(sqlite_conn: sqlite3.Connection) -> bool:
+    """Fail closed while an older brain is waiting for its canonical migration."""
+    tables = {
+        row[0]
+        for row in sqlite_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('job_decisions','decision_policy_versions')"
+        ).fetchall()
+    }
+    if tables != {"job_decisions", "decision_policy_versions"}:
+        return False
+    job_columns = {row[1] for row in sqlite_conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    return "canonical_decision_id" in job_columns
+
+
 def _company_blocklist_sql() -> tuple[str, list[str]]:
     names, patterns = config.load_blocked_companies()
     clauses: list[str] = []
@@ -136,36 +191,31 @@ def _company_blocklist_sql() -> tuple[str, list[str]]:
     return "  AND " + "\n  AND ".join(clauses), params
 
 
-def _lane_filter_sql() -> tuple[str, list[str]]:
-    off_needles, on_tags = config.load_lane_filter()
-    params: list[str] = []
-    lane_parts = [
-        "COALESCE(fit_gap_category, '') != 'wrong_role_lane'",
-        "COALESCE(recommended_action, '') != 'ignore'",
-    ]
-    if off_needles:
-        tnorm = "LOWER(' ' || COALESCE(title, '') || ' ')"
-        title_or = " OR ".join(f"{tnorm} LIKE ?" for _ in off_needles)
-        params.extend(f"%{needle}%" for needle in off_needles)
-        flag_guard = ""
-        if on_tags:
-            flag_guard = " AND " + " AND ".join(
-                "COALESCE(audit_flags, '') NOT LIKE ?" for _ in on_tags
-            )
-            params.extend(f'%"{tag}"%' for tag in on_tags)
-        lane_parts.append(f"NOT (({title_or}){flag_guard})")
-    return (
-        "\n  AND (decision_source IS NOT NULL OR ("
-        + " AND ".join(lane_parts)
-        + "))",
-        params,
-    )
-
-
 def _inject_before_order_by(sql: str, clause: str) -> str:
     if not clause:
         return sql
-    return sql.replace("ORDER BY score DESC", clause + "\nORDER BY score DESC")
+    return sql.replace("ORDER BY d.final_score DESC", clause + "\nORDER BY d.final_score DESC")
+
+
+def _canonical_provenance(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        key: row[key]
+        for key in (
+            "decision_id",
+            "policy_version",
+            "decision_action",
+            "qualification_verdict",
+            "qualification_score",
+            "qualification_floor",
+            "preference_score",
+            "outcome_score",
+            "final_score",
+            "decision_confidence",
+            "decision_created_at",
+            "decision_expires_at",
+            "input_hash",
+        )
+    }
 
 
 def backfill_applied_set(sqlite_conn: sqlite3.Connection, pg_conn: Any) -> int:
@@ -253,7 +303,6 @@ def push_apply_eligible(
     score_floor: float = 7.0,
     approved_batch: str | None = None,
     limit: int | None = None,
-    include_research: bool = False,
     lane_filter: bool = True,
 ) -> int:
     """Push approved offsite-eligible jobs from the brain into ``apply_queue`` (idempotent).
@@ -265,6 +314,8 @@ def push_apply_eligible(
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
     try:
+        if not _canonical_projection_available(sq):
+            return 0
         backfill_applied_set(sq, pg)
         dead_urls, dead_app_urls = _dead_urls(sq)
         if dead_urls or dead_app_urls:
@@ -281,20 +332,21 @@ def push_apply_eligible(
         except (FileNotFoundError, ValueError, OSError):
             profile = {}
         work_authorization = profile.get("work_authorization", {}) if isinstance(profile, dict) else {}
-        # Build the eligibility SQL; append the ledger cross-check when the home brain
-        # has an applications table (the check is a no-op on minimal test fixtures).
+        # score_floor and lane_filter remain accepted for CLI compatibility, but neither
+        # authorizes work. The immutable canonical action and policy lane do that.
+        del score_floor, lane_filter
         company_blocklist, company_params = _company_blocklist_sql()
-        score_expr = (
-            "COALESCE(audit_score, fit_score, research_fit_score)"
-            if include_research
-            else "COALESCE(audit_score, fit_score)"
-        )
-        base_sql = _PUSH_APPLY_SELECT.format(
-            score_expr=score_expr,
-            location_expr="location" if _jobs_column_exists(sq, "location") else "NULL AS location",
+        base_sql = _CANONICAL_PROVENANCE_SELECT.format(
+            application_url="j.application_url",
+            shape_predicate=_PUSH_APPLY_SHAPE,
+            location_expr="j.location AS location" if _jobs_column_exists(sq, "location") else "NULL AS location",
             company_blocklist=company_blocklist,
+            recency="",
             thin_description_chars=THIN_DESCRIPTION_CHARS,
-            max_apply_attempts=config.DEFAULTS["max_apply_attempts"],
+            attempts_predicate=(
+                f"AND COALESCE(j.apply_attempts, 0) < {int(config.DEFAULTS['max_apply_attempts'])}"
+                if _jobs_column_exists(sq, "apply_attempts") else ""
+            ),
         )
         if _applications_table_exists(sq):
             # Inject the cross-check before the ORDER BY clause.
@@ -302,13 +354,7 @@ def push_apply_eligible(
                 base_sql,
                 _PUSH_APPLY_LEDGER_CROSS_CHECK.rstrip("\n"),
             )
-        lane_params: list[str] = []
-        if lane_filter:
-            lane_sql, lane_params = _lane_filter_sql()
-            base_sql = _inject_before_order_by(base_sql, lane_sql)
-        # Push the limit into SQL so we fetch only the top-N (not the whole eligible
-        # set on a 70k+ job brain); keep the Python break as belt-and-suspenders.
-        sql, params = base_sql, [score_floor] + company_params + lane_params
+        sql, params = base_sql, ["ats", datetime.now(timezone.utc).isoformat()] + company_params
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -329,6 +375,7 @@ def push_apply_eligible(
                 "eligibility_status": eligibility_status,
                 "eligibility_reason": eligibility_reason,
                 **route_policy,
+                **_canonical_provenance(r),
             })
             if limit and len(out) >= limit:
                 break
@@ -476,7 +523,7 @@ def _pull_results(
 # LINKEDIN -- PUSH
 # ===========================================================================
 
-# Eligibility mirrors _PUSH_APPLY_SELECT but with the INVERSE effective-host predicate:
+# Eligibility uses the same canonical authority with the inverse effective-host predicate:
 # only postings whose effective apply URL (application_url if http, else url) contains
 # 'linkedin.com'. Stages UNAPPROVED (approval is a separate gated step via the LinkedIn
 # canary gate). crash_unconfirmed is excluded (same rule as the offsite lane).
@@ -487,31 +534,6 @@ def _pull_results(
 # and never phantom-applies) remains the real gate. company AND title are REQUIRED: a
 # posting with neither is unapplyable AND collapses onto the (company,title) dedup_key, so
 # hundreds of them would silently share a single leasable slot.
-_PUSH_LINKEDIN_SELECT = """
-SELECT url, company, title,
-       CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END AS application_url,
-       CAST({score_expr} AS REAL) AS score,
-       linkedin_resolve_status, linkedin_resolved_at, linkedin_resolve_error,
-       linkedin_unresolved_kind, linkedin_next_action
-FROM jobs
-WHERE duplicate_of_url IS NULL
-  AND {score_expr} >= ?
-  AND COALESCE(liveness_status, '') != 'dead'
-  AND COALESCE(linkedin_resolve_status, '') IN ({fresh_statuses})
-  AND linkedin_resolved_at IS NOT NULL
-  {resolve_recency}
-  AND LENGTH(COALESCE(full_description,'')) >= {thin_description_chars}
-  AND (apply_status IS NULL OR apply_status NOT IN ('applied', 'in_progress', 'crash_unconfirmed'))
-  AND COALESCE(apply_error, '') NOT IN ('no_confirmation', 'crash_unconfirmed')
-  AND TRIM(COALESCE(company, '')) != ''
-  AND TRIM(COALESCE(title, '')) != ''
-  AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) LIKE '%linkedin.com%'
-  {company_blocklist}
-  {recency}
-ORDER BY score DESC
-"""
-
-
 def push_linkedin_eligible(
     *,
     sqlite_conn=None,
@@ -522,7 +544,6 @@ def push_linkedin_eligible(
     limit=None,
     lane_filter: bool = True,
     max_resolved_age_days: int | None = _queue.LINKEDIN_FRESH_MAX_AGE_DAYS,
-    include_research: bool = False,
 ) -> int:
     """Push LinkedIn-eligible jobs from the brain into ``linkedin_queue`` (idempotent).
 
@@ -541,6 +562,8 @@ def push_linkedin_eligible(
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
     try:
+        if not _canonical_projection_available(sq):
+            return 0
         dead_urls, dead_app_urls = _dead_urls(sq)
         if dead_urls or dead_app_urls:
             _queue.retire_queued_dead_jobs(
@@ -558,40 +581,38 @@ def push_linkedin_eligible(
                 table="linkedin_queue",
             )
         out = []
-        params = [score_floor]
-        params.extend(_queue.LINKEDIN_FRESH_STATUSES)
+        del score_floor, lane_filter
         resolve_recency_params: list[str] = []
         resolve_recency = ""
         if max_resolved_age_days and int(max_resolved_age_days) > 0:
-            resolve_recency = "AND julianday(linkedin_resolved_at) >= julianday('now', ?)"
+            resolve_recency = "AND julianday(j.linkedin_resolved_at) >= julianday('now', ?)"
             resolve_recency_params.append(f"-{int(max_resolved_age_days)} days")
         recency_params: list[str] = []
         recency = ""
         if max_age_days and int(max_age_days) > 0:
-            recency = "AND discovered_at IS NOT NULL AND julianday(discovered_at) >= julianday('now', ?)"
+            recency = "AND j.discovered_at IS NOT NULL AND julianday(j.discovered_at) >= julianday('now', ?)"
             recency_params.append(f"-{int(max_age_days)} days")
         company_blocklist, company_params = _company_blocklist_sql()
-        score_expr = (
-            "COALESCE(audit_score, fit_score, research_fit_score)"
-            if include_research
-            else "COALESCE(audit_score, fit_score)"
-        )
-        sql = _PUSH_LINKEDIN_SELECT.format(
-            score_expr=score_expr,
+        sql = _CANONICAL_PROVENANCE_SELECT.format(
+            application_url="CASE WHEN j.application_url LIKE 'http%' THEN j.application_url ELSE j.url END",
+            shape_predicate=_PUSH_LINKEDIN_SHAPE.format(
+                fresh_statuses=",".join("?" for _ in _queue.LINKEDIN_FRESH_STATUSES),
+                resolve_recency=resolve_recency,
+            ),
+            location_expr="j.location AS location" if _jobs_column_exists(sq, "location") else "NULL AS location",
             company_blocklist=company_blocklist,
-            fresh_statuses=",".join("?" for _ in _queue.LINKEDIN_FRESH_STATUSES),
-            resolve_recency=resolve_recency,
             recency=recency,
             thin_description_chars=THIN_DESCRIPTION_CHARS,
+            attempts_predicate=(
+                f"AND COALESCE(j.apply_attempts, 0) < {int(config.DEFAULTS['max_apply_attempts'])}"
+                if _jobs_column_exists(sq, "apply_attempts") else ""
+            ),
         )
-        lane_params: list[str] = []
-        if lane_filter:
-            lane_sql, lane_params = _lane_filter_sql()
-            sql = _inject_before_order_by(sql, lane_sql)
+        params = ["linkedin", datetime.now(timezone.utc).isoformat()]
+        params.extend(_queue.LINKEDIN_FRESH_STATUSES)
         params.extend(resolve_recency_params)
         params.extend(company_params)
         params.extend(recency_params)
-        params.extend(lane_params)
         if limit:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -605,6 +626,7 @@ def push_linkedin_eligible(
                 "linkedin_resolve_error": r["linkedin_resolve_error"],
                 "linkedin_unresolved_kind": r["linkedin_unresolved_kind"],
                 "linkedin_next_action": r["linkedin_next_action"],
+                **_canonical_provenance(r),
             })
             if limit and len(out) >= limit:
                 break

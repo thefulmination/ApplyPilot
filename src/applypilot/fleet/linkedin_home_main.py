@@ -130,7 +130,8 @@ def _print_status(conn) -> None:
         cur.execute("SELECT status, count(*) AS n FROM linkedin_queue GROUP BY status")
         depth = {r["status"]: r["n"] for r in cur.fetchall()}
         cur.execute(
-            "SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1"
+            "SELECT linkedin_apply_mode,linkedin_canary_enabled,linkedin_canary_remaining,spend_cap_usd,"
+            "linkedin_policy_version FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone()
         cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM linkedin_queue")
@@ -152,6 +153,7 @@ def _print_status(conn) -> None:
         "linkedin_apply_mode": cfg["linkedin_apply_mode"],
         "linkedin_canary_enabled": cfg["linkedin_canary_enabled"],
         "linkedin_canary_remaining": cfg["linkedin_canary_remaining"],
+        "linkedin_policy_version": cfg["linkedin_policy_version"],
         "spend_cap_usd": float(cfg["spend_cap_usd"] or 0),
         "linkedin_spend": spend,
         "halted_until": halted_until,

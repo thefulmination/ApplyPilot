@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -16,18 +17,157 @@ from applypilot.fleet import governor
 from applypilot.fleet import queue
 
 
+def _activate_policy(conn, lane):
+    policy = f"test-{lane}-policy"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy, lane),
+        )
+        cur.execute(
+            f"UPDATE fleet_config SET {lane}_policy_version=%s WHERE id=1",
+            (policy,),
+        )
+    conn.commit()
+    return policy
+
+
+def _canonical(url, score, policy):
+    now = datetime.now(timezone.utc)
+    return {
+        "decision_id": f"decision-{url}", "policy_version": policy,
+        "decision_action": "apply", "qualification_verdict": "qualified",
+        "qualification_score": 9.0, "qualification_floor": 7.0,
+        "preference_score": 8.0, "outcome_score": 8.0, "final_score": float(score),
+        "decision_confidence": 0.9, "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1), "input_hash": f"hash-{url}",
+    }
+
+
 def _seed_apply(conn, url, *, host, score=8.0, company="Co", title="Role", approved="b1", dedup_key=None):
+    policy = _activate_policy(conn, "ats")
     queue.push_apply_jobs(conn, [{
         "url": url, "company": company, "title": title,
         "application_url": f"https://{host}/jobs/x", "score": score,
         "target_host": host, "dedup_key": dedup_key,
+        **_canonical(url, score, policy),
     }], approved_batch=approved)
+
+
+def _seed_linkedin(conn, url, *, score=9.0, company="Co", title="Role", approved="b1"):
+    policy = _activate_policy(conn, "linkedin")
+    queue.push_linkedin_jobs(conn, [{
+        "url": url, "company": company, "title": title,
+        "application_url": f"https://linkedin.com/jobs/{url}", "score": score,
+        "linkedin_resolve_status": "easy_apply",
+        "linkedin_resolved_at": datetime.now(timezone.utc),
+        "linkedin_resolve_error": None,
+        "linkedin_unresolved_kind": None, "linkedin_next_action": None,
+        **_canonical(url, score, policy),
+    }], approved_batch=approved)
+
+
+def test_queue_pushes_require_complete_canonical_provenance(fleet_db):
+    row = {
+        "url": "missing", "company": "Co", "title": "Role",
+        "application_url": "https://example.com/apply", "score": 9.0,
+        "target_host": "example.com", "linkedin_unresolved_kind": None,
+        "linkedin_next_action": None,
+    }
+    with pgqueue.connect(fleet_db) as conn:
+        with pytest.raises(ValueError, match="canonical decision provenance"):
+            queue.push_apply_jobs(conn, [row])
+        with pytest.raises(ValueError, match="canonical decision provenance"):
+            queue.push_linkedin_jobs(conn, [row])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["legacy", "wrong_policy", "review", "unqualified", "expired", "below_floor", "below_threshold"],
+)
+def test_apply_lease_fails_closed_on_invalid_canonical_authority(fleet_db, mutation):
+    with pgqueue.connect(fleet_db) as conn:
+        if mutation == "legacy":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO apply_queue (url,application_url,score,status,lane,approved_batch,apply_domain) "
+                    "VALUES ('legacy','https://example.com',9,'queued','ats','b1','example.com')"
+                )
+            conn.commit()
+        else:
+            _seed_apply(conn, "guarded", host="example.com", score=9)
+            with conn.cursor() as cur:
+                if mutation == "wrong_policy":
+                    cur.execute(
+                        "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                        "VALUES ('other-ats','ats','canary')"
+                    )
+                    cur.execute("UPDATE fleet_config SET ats_policy_version='other-ats' WHERE id=1")
+                elif mutation == "review":
+                    cur.execute("UPDATE apply_queue SET decision_action='review' WHERE url='guarded'")
+                elif mutation == "unqualified":
+                    cur.execute("UPDATE apply_queue SET qualification_verdict='unqualified' WHERE url='guarded'")
+                elif mutation == "expired":
+                    cur.execute(
+                        "UPDATE apply_queue SET decision_created_at=now()-interval '2 days', "
+                        "decision_expires_at=now()-interval '1 day' WHERE url='guarded'"
+                    )
+                elif mutation == "below_floor":
+                    cur.execute("UPDATE apply_queue SET qualification_score=6 WHERE url='guarded'")
+                elif mutation == "below_threshold":
+                    cur.execute("UPDATE fleet_config SET approval_threshold=9.5 WHERE id=1")
+            conn.commit()
+        assert queue.lease_apply(conn, "w", home_ip="1.1.1.1") is None
+
+
+@pytest.mark.parametrize("mutation", ["legacy", "wrong_policy", "review", "expired", "below_floor"])
+def test_linkedin_lease_fails_closed_on_invalid_canonical_authority(fleet_db, mutation):
+    with pgqueue.connect(fleet_db) as conn:
+        if mutation == "legacy":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO linkedin_queue (url,application_url,score,status,lane,approved_batch) "
+                    "VALUES ('legacy-li','https://linkedin.com/jobs/1',9,'queued','linkedin','b1')"
+                )
+            conn.commit()
+        else:
+            _seed_linkedin(conn, "guarded-li")
+            with conn.cursor() as cur:
+                if mutation == "wrong_policy":
+                    cur.execute(
+                        "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                        "VALUES ('other-linkedin','linkedin','canary')"
+                    )
+                    cur.execute(
+                        "UPDATE fleet_config SET linkedin_policy_version='other-linkedin' WHERE id=1"
+                    )
+                elif mutation == "review":
+                    cur.execute(
+                        "UPDATE linkedin_queue SET decision_action='review' WHERE url='guarded-li'"
+                    )
+                elif mutation == "expired":
+                    cur.execute(
+                        "UPDATE linkedin_queue SET decision_created_at=now()-interval '2 days', "
+                        "decision_expires_at=now()-interval '1 day' WHERE url='guarded-li'"
+                    )
+                elif mutation == "below_floor":
+                    cur.execute(
+                        "UPDATE linkedin_queue SET qualification_score=6 WHERE url='guarded-li'"
+                    )
+            conn.commit()
+        assert queue.lease_linkedin(
+            conn, "w", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        ) is None
 
 
 # ---- approval gate (R11) -------------------------------------------------------
 
 def test_lease_requires_approval(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET approval_threshold=7 WHERE id=1")
+        conn.commit()
         _seed_apply(conn, "u1", host="greenhouse.io", approved=None)  # not approved
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
         assert queue.approve_jobs(conn, ["u1"], "batchA") == 1
@@ -99,6 +239,7 @@ def test_repush_apply_job_clears_stale_approval_when_score_drops_below_threshold
             "application_url": "https://greenhouse.io/jobs/x",
             "score": 5.0,
             "target_host": "greenhouse.io",
+            **_canonical("score-drift-v2", 5.0, "test-ats-policy"),
         }], approved_batch=None)
 
         with conn.cursor() as cur:
@@ -116,12 +257,8 @@ def test_lease_linkedin_enforces_approval_threshold_even_when_approved(fleet_db)
                 "UPDATE fleet_config SET approval_threshold=7, "
                 "linkedin_apply_mode='canary', linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL WHERE id=1"
             )
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                "VALUES ('li-low', 'Co', 'Role', 'https://linkedin.com/jobs/low', 6.9, 'linkedin', 'batch-low')"
-            )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
         conn.commit()
+        _seed_linkedin(conn, "li-low", score=6.9, approved="batch-low")
 
         assert queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1") is None
 
@@ -129,12 +266,8 @@ def test_lease_linkedin_enforces_approval_threshold_even_when_approved(fleet_db)
 def test_lease_linkedin_requires_positive_canary_capacity(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        _seed_linkedin(conn, "li-canary-required", score=9, approved="batch-ok")
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                "VALUES ('li-canary-required', 'Co', 'Role', 'https://linkedin.com/jobs/canary', 9, 'linkedin', 'batch-ok')"
-            )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
             cur.execute(
                 "UPDATE fleet_config SET linkedin_apply_mode='canary', "
                 "linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL WHERE id=1"
@@ -161,12 +294,8 @@ def test_ats_canary_exhaustion_does_not_globally_pause_linkedin(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "ats-one", host="greenhouse.io", score=9, approved="ats-batch")
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        _seed_linkedin(conn, "li-after-ats", score=9, approved="li-batch")
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch, dedup_key) "
-                "VALUES ('li-after-ats', 'Co', 'Role', 'https://linkedin.com/jobs/after-ats', 9, 'linkedin', 'li-batch', 'li-after-ats')"
-            )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
             cur.execute(
                 "UPDATE fleet_config SET paused=FALSE, ats_paused=FALSE, "
                 "ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=1, "
@@ -192,12 +321,8 @@ def test_linkedin_canary_exhaustion_does_not_block_ats(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "ats-after-li", host="greenhouse.io", score=9, approved="ats-batch")
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        _seed_linkedin(conn, "li-one", score=9, approved="li-batch")
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch, dedup_key) "
-                "VALUES ('li-one', 'Co', 'Role', 'https://linkedin.com/jobs/one', 9, 'linkedin', 'li-batch', 'li-one')"
-            )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
             cur.execute(
                 "UPDATE fleet_config SET paused=FALSE, ats_paused=FALSE, "
                 "ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=1, "
@@ -245,17 +370,8 @@ def test_lease_apply_skips_company_blocklist_match(fleet_db):
 def test_lease_linkedin_skips_company_blocklist_match(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                "VALUES ('li-openai', 'OpenAI', 'Role', 'https://linkedin.com/jobs/openai', 10, 'linkedin', 'b1')"
-            )
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                "VALUES ('li-acme', 'Acme', 'Role', 'https://linkedin.com/jobs/acme', 9, 'linkedin', 'b1')"
-            )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
-        conn.commit()
+        _seed_linkedin(conn, "li-openai", score=10, company="OpenAI")
+        _seed_linkedin(conn, "li-acme", score=9, company="Acme")
 
         leased = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1")
 
@@ -704,13 +820,8 @@ def test_search_recurs_after_completion(fleet_db):
 def test_linkedin_owner_ip_and_mutex(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=300)
-        with conn.cursor() as cur:
-            for i in range(2):
-                cur.execute("INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                            "VALUES (%s,'Co','Role','https://linkedin.com/jobs/%s', %s, 'linkedin', 'b1')",
-                            (f"li{i}", i, 9 - i))
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
-        conn.commit()
+        for i in range(2):
+            _seed_linkedin(conn, f"li{i}", score=9 - i)
         # wrong IP -> refused
         assert queue.lease_linkedin(conn, "w1", public_ip="3.3.3.3", owner_ip="1.1.1.1") is None
         # owner IP -> leases one
@@ -759,15 +870,8 @@ def test_linkedin_lease_serializes_under_concurrency(fleet_db):
     # record_outcome between them, must NOT both get a live LinkedIn session.
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=300)
-        with conn.cursor() as cur:
-            for i in range(4):
-                cur.execute(
-                    "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                    "VALUES (%s,'Co','Role','https://linkedin.com/jobs/%s',%s,'linkedin','b1')",
-                    (f"li{i}", i, 9 - i),
-                )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
-        conn.commit()
+        for i in range(4):
+            _seed_linkedin(conn, f"li{i}", score=9 - i)
 
     leased: list[str] = []
     lock = threading.Lock()
@@ -790,13 +894,7 @@ def test_linkedin_lease_serializes_under_concurrency(fleet_db):
 def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch) "
-                "VALUES ('li-x','Co','Role','https://linkedin.com/jobs/x',9,'linkedin','b1')",
-            )
-            cur.execute("UPDATE linkedin_queue SET linkedin_resolve_status='easy_apply', linkedin_resolved_at=now() WHERE linkedin_resolve_status IS NULL")
-        conn.commit()
+        _seed_linkedin(conn, "li-x", score=9)
         a = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1")
         assert a and a["url"] == "li-x"
         # cap reserved at lease time -> count_24h already 1

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook covers the **LinkedIn apply lane** (`lane='ats'` in `linkedin_queue`)
+This runbook covers the **LinkedIn apply lane** (`lane='linkedin'` in `linkedin_queue`)
 of the residential fleet.  LinkedIn is the single catastrophe-class destination: a
 ban is unrecoverable, so the lane carries additional safety layers beyond the offsite
 ATS lane (Lane A):
