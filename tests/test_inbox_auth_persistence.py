@@ -88,6 +88,36 @@ def test_record_inbox_event_is_idempotent(tmp_path, monkeypatch) -> None:
     assert conn.execute("SELECT COUNT(*) FROM inbox_events").fetchone()[0] == 1
 
 
+def test_record_inbox_event_minimizes_sensitive_auth_metadata(tmp_path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    code = "839214"
+    magic_link = "https://boards.greenhouse.io/verify?token=raw-secret"
+
+    event_id = inbox_auth.record_inbox_event(
+        message_id="privacy-record",
+        thread_id="thread-safe",
+        sender=f"Verification {code} <no-reply@greenhouse.io>",
+        subject=f"Your verification code is {code}",
+        event_type="auth_code",
+        confidence="high",
+        snippet=f"Enter {code} or open {magic_link}",
+    )
+
+    row = conn.execute(
+        "SELECT sender, sender_domain, subject, snippet FROM inbox_events WHERE id=?",
+        (event_id,),
+    ).fetchone()
+    assert row["sender"] is None
+    assert row["sender_domain"] == "greenhouse.io"
+    assert row["subject"] is None
+    assert row["snippet"] is None
+    serialized = "|".join("" if value is None else str(value) for value in row)
+    assert code not in serialized
+    assert magic_link not in serialized
+    assert "Your verification code" not in serialized
+
+
 def test_expire_stale_challenges(tmp_path, monkeypatch) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
@@ -156,6 +186,43 @@ def test_claim_auth_match_prevents_sequential_message_reuse(tmp_path, monkeypatc
     assert inbox_auth.claim_auth_match(first, message_id="shared", event_type="auth_code")
     assert not inbox_auth.claim_auth_match(second, message_id="shared", event_type="auth_code")
     assert inbox_auth.claimed_auth_message_ids({"shared", "unused"}) == {"shared"}
+
+
+def test_claim_auth_match_minimizes_sensitive_auth_metadata(tmp_path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="privacy-claim")
+    code = "445566"
+    magic_link = "https://boards.greenhouse.io/verify?token=claim-secret"
+
+    assert inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id="privacy-claim-message",
+        thread_id="thread-safe",
+        sender=f"Code {code} <no-reply@greenhouse.io>",
+        subject=f"Use code {code}",
+        event_type="auth_code",
+        confidence="high",
+        snippet=f"Use {code} or {magic_link}",
+    )
+
+    row = conn.execute(
+        """
+        SELECT event.sender, event.sender_domain, event.subject, event.snippet
+          FROM auth_challenges AS challenge
+          JOIN inbox_events AS event ON event.id=challenge.inbox_event_id
+         WHERE challenge.id=?
+        """,
+        (challenge_id,),
+    ).fetchone()
+    assert row["sender"] is None
+    assert row["sender_domain"] == "greenhouse.io"
+    assert row["subject"] is None
+    assert row["snippet"] is None
+    serialized = "|".join("" if value is None else str(value) for value in row)
+    assert code not in serialized
+    assert magic_link not in serialized
+    assert "Use code" not in serialized
 
 
 def test_claim_auth_match_is_atomic_across_concurrent_connections(tmp_path, monkeypatch) -> None:

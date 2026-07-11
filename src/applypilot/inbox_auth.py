@@ -906,16 +906,16 @@ def record_inbox_event(
             (
                 message_id,
                 thread_id,
-                sender,
+                None,
                 normalized_sender_domain,
-                subject,
+                None,
                 received_at or now_utc(),
                 event_type,
                 confidence,
                 matched_job_url,
                 matched_company,
                 matched_method,
-                snippet,
+                None,
                 created_at,
             ),
         )
@@ -1030,9 +1030,9 @@ def _claim_auth_match_in_transaction(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            message_id, thread_id, sender, sender_domain(sender or ""), subject,
+            message_id, thread_id, None, sender_domain(sender or ""), None,
             received_at or now_text, event_type, confidence, matched_job_url,
-            matched_company, matched_method, snippet, now_text,
+            matched_company, matched_method, None, now_text,
         ),
     )
     event_row = conn.execute(
