@@ -29,6 +29,18 @@ def _reservation_contender(lock_dir, ready, release, launch_count, results) -> N
     reservation.release()
 
 
+def _reservation_owner(lock_dir, slot, port, profile, ready, release) -> None:
+    import os
+
+    os.environ["APPLYPILOT_BROWSER_LOCK_DIR"] = lock_dir
+    from applypilot.apply import chrome
+
+    reservation = chrome._acquire_browser_reservation(slot, port, Path(profile))
+    ready.set()
+    release.wait(10)
+    reservation.release()
+
+
 def test_two_processes_contend_and_only_owner_reaches_launch_path(tmp_path: Path) -> None:
     ctx = multiprocessing.get_context("spawn")
     ready = ctx.Event()
@@ -179,3 +191,133 @@ def test_failed_cleanup_returns_false_and_keeps_reservation(tmp_path: Path, monk
     process.alive = False
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     assert chrome.cleanup_worker(8, process) is True
+
+
+def test_linkedin_login_cannot_kill_another_process_port_owner(tmp_path: Path, monkeypatch) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    release = ctx.Event()
+    lock_dir = str(tmp_path / "locks")
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", lock_dir)
+    owner = ctx.Process(
+        target=_reservation_owner,
+        args=(
+            lock_dir,
+            0,
+            chrome.LINKEDIN_LOGIN_CDP_PORT,
+            str(tmp_path / "owner-profile"),
+            ready,
+            release,
+        ),
+    )
+    owner.start()
+    assert ready.wait(10)
+
+    killed = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "login-profiles")
+    monkeypatch.setattr(chrome, "_kill_on_port", lambda port: killed.append(port))
+    monkeypatch.setattr(
+        chrome.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not launch")),
+    )
+    try:
+        with pytest.raises(chrome.BrowserSlotOccupiedError):
+            chrome.linkedin_login(timeout_seconds=0)
+        assert killed == []
+    finally:
+        release.set()
+        owner.join(10)
+        assert owner.exitcode == 0
+
+
+def test_cleanup_on_exit_does_not_kill_or_release_another_process_owner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    release = ctx.Event()
+    lock_dir = str(tmp_path / "locks")
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", lock_dir)
+    profile = tmp_path / "owner-profile"
+    owner = ctx.Process(
+        target=_reservation_owner,
+        args=(lock_dir, 0, chrome.BASE_CDP_PORT, str(profile), ready, release),
+    )
+    owner.start()
+    assert ready.wait(10)
+
+    killed = []
+    monkeypatch.setattr(chrome, "_chrome_procs", {})
+    monkeypatch.setattr(chrome, "_browser_reservations", {})
+    monkeypatch.setattr(chrome, "_kill_on_port", lambda port: killed.append(port))
+    try:
+        chrome.cleanup_on_exit()
+        assert killed == []
+        with pytest.raises(chrome.BrowserSlotOccupiedError):
+            chrome._acquire_browser_reservation(0, chrome.BASE_CDP_PORT, profile)
+    finally:
+        release.set()
+        owner.join(10)
+        assert owner.exitcode == 0
+
+
+def test_linkedin_login_launch_failure_releases_reservation(tmp_path: Path, monkeypatch) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
+    monkeypatch.setattr(
+        chrome.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("launch failed")),
+    )
+
+    with pytest.raises(OSError, match="launch failed"):
+        chrome.linkedin_login(timeout_seconds=0)
+
+    seed = config.CHROME_WORKER_DIR / chrome.SEED_PROFILE_NAME
+    reservation = chrome._acquire_browser_reservation(
+        chrome.LINKEDIN_LOGIN_SLOT,
+        chrome.LINKEDIN_LOGIN_CDP_PORT,
+        seed,
+    )
+    reservation.release()
+
+
+def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monkeypatch) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    process = _FakeProcess()
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("APPLYPILOT_CHROME_CLEANUP_TIMEOUT", "0")
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda worker_id, pid: None)
+    monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile: True)
+    monkeypatch.setattr(chrome, "_close_browser_cdp", lambda port: setattr(process, "alive", False) or True)
+    monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
+
+    ok, seed = chrome.linkedin_login(timeout_seconds=1, poll_seconds=0)
+
+    assert ok is True
+    assert seed == config.CHROME_WORKER_DIR / chrome.SEED_PROFILE_NAME
+    reservation = chrome._acquire_browser_reservation(
+        chrome.LINKEDIN_LOGIN_SLOT,
+        chrome.LINKEDIN_LOGIN_CDP_PORT,
+        seed,
+    )
+    reservation.release()

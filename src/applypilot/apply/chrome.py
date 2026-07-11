@@ -37,6 +37,7 @@ except (TypeError, ValueError):
 # workers' ports so it never collides with a live run.
 SEED_PROFILE_NAME = "linkedin-seed"
 LINKEDIN_LOGIN_CDP_PORT = 9333
+LINKEDIN_LOGIN_SLOT = -1
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
@@ -164,6 +165,32 @@ def _profile_appears_occupied(profile_dir: Path) -> bool:
         "SingletonSocket",
         "SingletonCookie",
     ))
+
+
+def _reserve_browser_launch(
+    worker_id: int,
+    port: int,
+    profile_dir: Path,
+    *,
+    kill_existing: bool,
+) -> _BrowserReservation:
+    """Own slot/profile/port before either refusing or performing legacy cleanup."""
+    reservation = _acquire_browser_reservation(worker_id, port, profile_dir)
+    try:
+        with _chrome_lock:
+            tracked = _chrome_procs.get(worker_id)
+        if not kill_existing and (
+            (tracked is not None and tracked.poll() is None)
+            or _port_is_listening(port)
+            or _profile_appears_occupied(profile_dir)
+        ):
+            raise BrowserSlotOccupiedError("browser slot, profile, or port is occupied")
+        if kill_existing:
+            _kill_on_port(port)
+        return reservation
+    except Exception:
+        reservation.release()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -533,32 +560,45 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
 
     Returns (bool ok, Path seed_dir)."""
     seed = config.CHROME_WORKER_DIR / SEED_PROFILE_NAME
-    seed.mkdir(parents=True, exist_ok=True)
-    _kill_on_port(LINKEDIN_LOGIN_CDP_PORT)
-    chrome_exe = config.resolve_browser_path(browser)
-    cmd = [
-        chrome_exe,
-        f"--remote-debugging-port={LINKEDIN_LOGIN_CDP_PORT}",
-        f"--user-data-dir={seed}",
-        "--profile-directory=Default",
-        "--no-first-run", "--no-default-browser-check",
-        "--window-size=1180,920",
-        "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", "--noerrdialogs",
-        "https://www.linkedin.com/login",
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.time() + timeout_seconds
+    reservation = _reserve_browser_launch(
+        LINKEDIN_LOGIN_SLOT,
+        LINKEDIN_LOGIN_CDP_PORT,
+        seed,
+        kill_existing=False,
+    )
+    try:
+        seed.mkdir(parents=True, exist_ok=True)
+        chrome_exe = config.resolve_browser_path(browser)
+        cmd = [
+            chrome_exe,
+            f"--remote-debugging-port={LINKEDIN_LOGIN_CDP_PORT}",
+            f"--user-data-dir={seed}",
+            "--profile-directory=Default",
+            "--no-first-run", "--no-default-browser-check",
+            "--window-size=1180,920",
+            "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", "--noerrdialogs",
+            "https://www.linkedin.com/login",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        reservation.release()
+        raise
+    with _chrome_lock:
+        _chrome_procs[LINKEDIN_LOGIN_SLOT] = proc
+        _browser_reservations[id(proc)] = reservation
+    _assign_kill_on_close_job(LINKEDIN_LOGIN_SLOT, proc.pid)
+    deadline = time.monotonic() + timeout_seconds
     ok = False
 
     def _wait_for_persisted_session(until: float) -> bool:
-        while time.time() < until:
+        while time.monotonic() < until:
             if has_linkedin_session(seed):
                 return True
             time.sleep(max(poll_seconds, 0.25))
         return has_linkedin_session(seed)
 
     try:
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if proc.poll() is not None:  # user closed the window -> file check (close flushes)
                 ok = has_linkedin_session(seed)
                 break
@@ -568,7 +608,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             if _has_linkedin_session_cdp(LINKEDIN_LOGIN_CDP_PORT):
                 # CDP can see the in-memory cookie before Chrome has persisted it. Workers
                 # clone the disk profile, so require the persisted cookie before success.
-                flush_deadline = min(deadline, time.time() + 20.0)
+                flush_deadline = min(deadline, time.monotonic() + 20.0)
                 ok = _wait_for_persisted_session(flush_deadline)
                 if not ok:
                     _close_browser_cdp(LINKEDIN_LOGIN_CDP_PORT)
@@ -576,7 +616,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                         proc.wait(timeout=15)
                     except (AttributeError, subprocess.TimeoutExpired, OSError):
                         pass
-                    ok = _wait_for_persisted_session(min(deadline, time.time() + 5.0))
+                    ok = _wait_for_persisted_session(min(deadline, time.monotonic() + 5.0))
                 break
             time.sleep(poll_seconds)
         else:
@@ -591,6 +631,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                 pass
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
+        cleanup_worker(LINKEDIN_LOGIN_SLOT, proc)
     return ok, seed
 
 
@@ -647,22 +688,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         port = BASE_CDP_PORT + worker_id
 
     profile_dir = _worker_profile_dir(worker_id, browser)
-    reservation = _acquire_browser_reservation(worker_id, port, profile_dir)
+    reservation = _reserve_browser_launch(
+        worker_id,
+        port,
+        profile_dir,
+        kill_existing=kill_existing,
+    )
     try:
-        with _chrome_lock:
-            tracked = _chrome_procs.get(worker_id)
-        if not kill_existing and (
-            (tracked is not None and tracked.poll() is None)
-            or _port_is_listening(port)
-            or _profile_appears_occupied(profile_dir)
-        ):
-            raise BrowserSlotOccupiedError("browser slot, profile, or port is occupied")
-
         profile_dir = setup_worker_profile(worker_id, browser)
-
-        # Legacy production cleanup is permitted only after this caller owns both locks.
-        if kill_existing:
-            _kill_on_port(port)
 
         # Patch preferences to suppress restore nag
         _suppress_restore_nag(profile_dir)
@@ -759,11 +792,11 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
     if process and process.poll() is None:
         _kill_process_tree(process.pid)
     _close_job(worker_id)
-    deadline = time.time() + max(
+    deadline = time.monotonic() + max(
         0.0,
         float(os.environ.get("APPLYPILOT_CHROME_CLEANUP_TIMEOUT") or 10),
     )
-    while process and process.poll() is None and time.time() < deadline:
+    while process and process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.1)
 
     with _chrome_lock:
@@ -797,8 +830,6 @@ def kill_all_chrome() -> None:
     for wid, proc in procs.items():
         cleanup_worker(wid, proc)
 
-    # Sweep base port in case of zombies
-    _kill_on_port(BASE_CDP_PORT)
     _close_all_jobs()
 
 
@@ -822,7 +853,7 @@ def reset_worker_dir(worker_id: int) -> Path:
 
 
 def cleanup_on_exit() -> None:
-    """Atexit handler: kill all Chrome processes and sweep CDP ports.
+    """Atexit handler: clean only browsers owned and tracked by this process.
 
     Register this with atexit.register() at application startup.
     """
@@ -833,6 +864,4 @@ def cleanup_on_exit() -> None:
     for wid, proc in procs.items():
         cleanup_worker(wid, proc)
 
-    # Sweep base port for any orphan
-    _kill_on_port(BASE_CDP_PORT)
     _close_all_jobs()
