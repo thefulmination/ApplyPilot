@@ -19,6 +19,19 @@ ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS target_host    TEXT;   -- effec
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS lane           TEXT NOT NULL DEFAULT 'ats';
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS dedup_key      TEXT;   -- (company, normalized_role) -- R9
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS approved_batch TEXT;   -- owner approval token -- R11
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS decision_id TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS policy_version TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS decision_action TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS qualification_verdict TEXT;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS qualification_score REAL;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS qualification_floor REAL;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS preference_score REAL;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS outcome_score REAL;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS final_score REAL;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS decision_confidence REAL;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS decision_created_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS decision_expires_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS input_hash TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_apply_queue_dedup ON apply_queue (dedup_key);
 CREATE INDEX IF NOT EXISTS idx_apply_queue_approved
@@ -43,6 +56,12 @@ ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_apply_mode     TEXT N
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_canary_enabled  BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_canary_remaining INTEGER;
 ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS daily_apply_target       INTEGER;        -- optional operator target; NULL = unconfigured
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS ats_policy_version TEXT;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_policy_version TEXT;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS ats_policy_lane TEXT
+    GENERATED ALWAYS AS ('ats'::text) STORED;
+ALTER TABLE fleet_config ADD COLUMN IF NOT EXISTS linkedin_policy_lane TEXT
+    GENERATED ALWAYS AS ('linkedin'::text) STORED;
 
 UPDATE fleet_config SET ats_apply_mode='stopped'
 WHERE ats_apply_mode IS NULL OR ats_apply_mode NOT IN ('stopped', 'canary', 'steady');
@@ -150,6 +169,26 @@ CREATE INDEX IF NOT EXISTS idx_search_reclaim ON search_tasks (lease_expires_at)
 -- Same shape as apply_queue (separate lane).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS linkedin_queue (LIKE apply_queue INCLUDING DEFAULTS INCLUDING INDEXES);
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS worker_home_ip TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS target_host TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT 'linkedin';
+ALTER TABLE linkedin_queue ALTER COLUMN lane SET DEFAULT 'linkedin';
+UPDATE linkedin_queue SET lane='linkedin' WHERE lane IS DISTINCT FROM 'linkedin';
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS dedup_key TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS approved_batch TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS decision_id TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS policy_version TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS decision_action TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS qualification_verdict TEXT;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS qualification_score REAL;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS qualification_floor REAL;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS preference_score REAL;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS outcome_score REAL;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS final_score REAL;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS decision_confidence REAL;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS decision_created_at TIMESTAMPTZ;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS decision_expires_at TIMESTAMPTZ;
+ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS input_hash TEXT;
 -- apply-time channel recorder (zero LinkedIn scraping): how the apply actually happened.
 --   apply_channel: 'easy_apply' (stayed on linkedin.com) | 'external' (redirected to an ATS)
 --   apply_external_host: the ATS base host when external (e.g. 'ashbyhq.com', 'greenhouse.io')
@@ -160,6 +199,54 @@ ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolved_at TIMESTA
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_resolve_error TEXT;
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_unresolved_kind TEXT;
 ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_next_action TEXT;
+
+DO $$
+DECLARE
+    queue_name TEXT;
+BEGIN
+    FOREACH queue_name IN ARRAY ARRAY['apply_queue', 'linkedin_queue'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_decision_action_ck') THEN
+            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (decision_action IS NULL OR decision_action IN (''apply'', ''review'', ''reject'')) NOT VALID', queue_name, queue_name || '_decision_action_ck');
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_qualification_verdict_ck') THEN
+            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (qualification_verdict IS NULL OR qualification_verdict IN (''qualified'', ''unqualified'', ''uncertain'')) NOT VALID', queue_name, queue_name || '_qualification_verdict_ck');
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_confidence_ck') THEN
+            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (decision_confidence IS NULL OR decision_confidence BETWEEN 0 AND 1) NOT VALID', queue_name, queue_name || '_confidence_ck');
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_expiry_ck') THEN
+            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (decision_expires_at IS NULL OR decision_created_at IS NULL OR decision_expires_at > decision_created_at) NOT VALID', queue_name, queue_name || '_expiry_ck');
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_policy_lane_fk') THEN
+            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (policy_version, lane) REFERENCES fleet_decision_policies(policy_version, lane) NOT VALID', queue_name, queue_name || '_policy_lane_fk');
+        END IF;
+    END LOOP;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'apply_queue_lane_ck') THEN
+        ALTER TABLE apply_queue ADD CONSTRAINT apply_queue_lane_ck
+            CHECK (policy_version IS NULL OR lane = 'ats') NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'linkedin_queue_lane_ck') THEN
+        ALTER TABLE linkedin_queue ADD CONSTRAINT linkedin_queue_lane_ck
+            CHECK (policy_version IS NULL OR lane = 'linkedin') NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fleet_config_ats_policy_fk') THEN
+        ALTER TABLE fleet_config ADD CONSTRAINT fleet_config_ats_policy_fk
+            FOREIGN KEY (ats_policy_version, ats_policy_lane)
+            REFERENCES fleet_decision_policies(policy_version, lane) NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fleet_config_linkedin_policy_fk') THEN
+        ALTER TABLE fleet_config ADD CONSTRAINT fleet_config_linkedin_policy_fk
+            FOREIGN KEY (linkedin_policy_version, linkedin_policy_lane)
+            REFERENCES fleet_decision_policies(policy_version, lane) NOT VALID;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_apply_queue_canonical_lease
+    ON apply_queue (policy_version, decision_action, decision_expires_at, score DESC)
+    WHERE status = 'queued' AND decision_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_linkedin_queue_canonical_lease
+    ON linkedin_queue (policy_version, decision_action, decision_expires_at, score DESC)
+    WHERE status = 'queued' AND decision_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- rate_governor: outcome-aware + adaptive circuit-breaker (R6, R1, RF2).

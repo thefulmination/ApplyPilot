@@ -18,8 +18,8 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import schema as fleet_schema
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import schema as fleet_schema  # noqa: E402
 
 # Tables truncated between tests (in addition to apply_queue / fleet_config).
 _V3_TABLES = [
@@ -122,6 +122,8 @@ def fleet_db(fleet_pg):
                         "doctor_systemic_streak=0, "
                         # DeadMan (autonomous-apply Tasks 1-4) -- reset per test.
                         "deadman_alert=NULL, deadman_alert_at=NULL, deadman_hot_streak=0 "
+                        ", ats_policy_version=NULL, linkedin_policy_version=NULL "
                         "WHERE id=1;")
+            cur.execute("DELETE FROM fleet_decision_policies;")
         conn.commit()
     return fleet_pg

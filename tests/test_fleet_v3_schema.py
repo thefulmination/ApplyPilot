@@ -3,14 +3,26 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import schema as fleet_schema
+import pytest
+
+psycopg = pytest.importorskip("psycopg")
+
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import schema as fleet_schema  # noqa: E402
 
 EXPECTED_TABLES = {
     "apply_queue", "fleet_config", "fleet_assets",  # base
     "compute_queue", "search_tasks", "linkedin_queue", "rate_governor", "llm_usage",
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "autotriage_actions",
+    "fleet_decision_policies",
+}
+
+CANONICAL_QUEUE_COLUMNS = {
+    "decision_id", "policy_version", "decision_action", "qualification_verdict",
+    "qualification_score", "qualification_floor", "preference_score", "outcome_score",
+    "final_score", "decision_confidence", "decision_created_at",
+    "decision_expires_at", "input_hash",
 }
 
 
@@ -105,6 +117,14 @@ def test_apply_queue_v3_columns(fleet_db):
         cols = {r["column_name"] for r in cur.fetchall()}
     for c in ("worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch"):
         assert c in cols, f"apply_queue missing {c}"
+    assert CANONICAL_QUEUE_COLUMNS <= cols
+
+
+def test_linkedin_queue_has_canonical_provenance(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='linkedin_queue'")
+        cols = {r["column_name"] for r in cur.fetchall()}
+    assert CANONICAL_QUEUE_COLUMNS <= cols
 
 
 def test_linkedin_queue_freshness_columns(fleet_db):
@@ -129,8 +149,94 @@ def test_fleet_config_v3_columns(fleet_db):
               "cost_cap_daily_usd", "cost_cap_total_usd", "pinned_worker_version",
               "canary_enabled", "canary_remaining", "ats_apply_mode",
               "linkedin_canary_enabled", "linkedin_canary_remaining",
-              "linkedin_apply_mode", "daily_apply_target"):
+              "linkedin_apply_mode", "daily_apply_target", "ats_policy_version",
+              "linkedin_policy_version"):
         assert c in cols, f"fleet_config missing {c}"
+
+
+def test_policy_registry_enforces_lane_status_and_one_active_policy(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+            "VALUES ('ats-v1', 'ats', 'active')"
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+                "VALUES ('ats-v2', 'ats', 'active')"
+            )
+        conn.rollback()
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+                "VALUES ('bad', 'email', 'active')"
+            )
+
+
+def test_fleet_config_policy_foreign_keys_are_lane_specific(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+            "VALUES ('linkedin-v1', 'linkedin', 'active')"
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            cur.execute("UPDATE fleet_config SET ats_policy_version='linkedin-v1' WHERE id=1")
+
+
+def test_queue_provenance_constraints_and_policy_foreign_key(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+            "VALUES ('ats-v1', 'ats', 'active')"
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, application_url, score, policy_version) "
+                "VALUES ('u1', 'https://example.test/apply', 1, 'missing')"
+            )
+        conn.rollback()
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, application_url, score, decision_action) "
+                "VALUES ('u2', 'https://example.test/apply', 1, 'maybe')"
+            )
+
+
+def test_existing_linkedin_queue_is_explicitly_upgraded(fleet_pg):
+    with pgqueue.connect(fleet_pg) as conn:
+        pgqueue.ensure_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS linkedin_queue")
+            cur.execute(
+                "CREATE TABLE linkedin_queue ("
+                "url TEXT PRIMARY KEY, application_url TEXT NOT NULL, score REAL NOT NULL, "
+                "status apply_queue_status NOT NULL DEFAULT 'queued')"
+            )
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score) "
+                "VALUES ('legacy', 'https://linkedin.com/jobs/view/1', 1)"
+            )
+        conn.commit()
+
+        fleet_schema.ensure_schema_v3(conn)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='linkedin_queue'")
+            cols = {r["column_name"] for r in cur.fetchall()}
+            cur.execute("SELECT lane, decision_id FROM linkedin_queue WHERE url='legacy'")
+            legacy = cur.fetchone()
+        conn.commit()
+
+        # Restore the shared session database to the normal full table shape.
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE linkedin_queue")
+        conn.commit()
+        fleet_schema.ensure_schema_v3(conn)
+
+    assert CANONICAL_QUEUE_COLUMNS <= cols
+    assert legacy == {"lane": "linkedin", "decision_id": None}
 
 
 def test_autotriage_actions_schema(fleet_db):

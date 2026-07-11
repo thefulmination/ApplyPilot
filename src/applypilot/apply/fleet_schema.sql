@@ -22,14 +22,43 @@ EXCEPTION
     WHEN duplicate_object THEN NULL;
 END $$;
 
+CREATE TABLE IF NOT EXISTS fleet_decision_policies (
+    policy_version TEXT PRIMARY KEY,
+    lane           TEXT NOT NULL CHECK (lane IN ('ats', 'linkedin')),
+    status         TEXT NOT NULL CHECK (status IN ('draft', 'validated', 'canary', 'active', 'retired')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    activated_at   TIMESTAMPTZ,
+    retired_at     TIMESTAMPTZ,
+    UNIQUE (policy_version, lane)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_fleet_decision_policy_active_lane
+    ON fleet_decision_policies (lane) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_fleet_decision_policy_lane_status
+    ON fleet_decision_policies (lane, status);
+
 CREATE TABLE IF NOT EXISTS apply_queue (
     -- ---- identity / job columns (pushed from home) ------------------------
     url                     TEXT        PRIMARY KEY,          -- = jobs.url (cross-system key + idempotency anchor)
     company                 TEXT,
     title                   TEXT,
     application_url         TEXT        NOT NULL,             -- offsite ATS form target
-    score                   REAL        NOT NULL,             -- COALESCE(audit_score, fit_score); REAL, not INT (tie-break fidelity)
+    score                   REAL        NOT NULL,             -- canonical final-score ordering copy; never independent authority
     apply_domain            TEXT,                             -- effective apply host (politeness key)
+
+    -- ---- immutable canonical decision provenance ------------------------
+    decision_id             TEXT,
+    policy_version          TEXT,
+    decision_action         TEXT CHECK (decision_action IN ('apply', 'review', 'reject')),
+    qualification_verdict   TEXT CHECK (qualification_verdict IN ('qualified', 'unqualified', 'uncertain')),
+    qualification_score     REAL,
+    qualification_floor     REAL,
+    preference_score        REAL,
+    outcome_score           REAL,
+    final_score             REAL,
+    decision_confidence     REAL CHECK (decision_confidence BETWEEN 0 AND 1),
+    decision_created_at     TIMESTAMPTZ,
+    decision_expires_at     TIMESTAMPTZ,
+    input_hash              TEXT,
 
     -- ---- queue / lease state ---------------------------------------------
     status                  apply_queue_status NOT NULL DEFAULT 'queued',
@@ -79,6 +108,14 @@ CREATE TABLE IF NOT EXISTS fleet_config (
     id              INTEGER       PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     spend_cap_usd   NUMERIC(10,2) NOT NULL DEFAULT 0,        -- 0 = no cap; halt when SUM(est_cost_usd) >= this
     paused          BOOLEAN       NOT NULL DEFAULT FALSE,    -- global kill switch
+    ats_policy_version      TEXT,
+    ats_policy_lane         TEXT GENERATED ALWAYS AS ('ats'::text) STORED,
+    linkedin_policy_version TEXT,
+    linkedin_policy_lane    TEXT GENERATED ALWAYS AS ('linkedin'::text) STORED,
+    CONSTRAINT fleet_config_ats_policy_fk FOREIGN KEY (ats_policy_version, ats_policy_lane)
+        REFERENCES fleet_decision_policies(policy_version, lane),
+    CONSTRAINT fleet_config_linkedin_policy_fk FOREIGN KEY (linkedin_policy_version, linkedin_policy_lane)
+        REFERENCES fleet_decision_policies(policy_version, lane),
     updated_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
