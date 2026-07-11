@@ -6,6 +6,7 @@ import pytest
 from psycopg.pq import TransactionStatus
 
 from applypilot import auth_matching
+from applypilot import mail_source
 from applypilot.apply import pgqueue
 from applypilot.fleet import otp_relay, schema as fleet_schema
 
@@ -380,6 +381,41 @@ def test_answer_pending_request_snapshot_overflow_fails_before_scan(
             verifier.commit()
 
     assert scan_called is False
+
+
+def test_answer_pending_candidate_overflow_returns_zero_and_releases_lock(
+    fleet_db, monkeypatch,
+):
+    def overflow(**_kwargs):
+        raise mail_source.MailSourceOverflowError("candidate overflow")
+
+    monkeypatch.setattr(
+        otp_relay.inbox_auth,
+        "scan_gmail_for_auth_codes",
+        overflow,
+    )
+
+    with _fresh(fleet_db) as conn:
+        request_id = _pending(conn, worker_id="candidate-overflow")
+        assert otp_relay.answer_pending(conn, _FakeGmail([])) == 0
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert otp_relay.poll_for_code(
+            conn,
+            request_id,
+            timeout_seconds=0,
+        ) is None
+        with _fresh(fleet_db) as verifier:
+            with verifier.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_try_advisory_lock(%s) AS acquired",
+                    (otp_relay._responder_lock_key(),),
+                )
+                assert cur.fetchone()["acquired"] is True
+                cur.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (otp_relay._responder_lock_key(),),
+                )
+            verifier.commit()
 
 
 def test_answer_pending_returns_without_scan_when_responder_lock_is_held(

@@ -359,21 +359,26 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
         validate_max_messages(max_messages, cap=None), _MAX_RESPONDER_ITEMS
     )
 
-    if gmail_service is None:
-        from applypilot.mail_source import get_mail_source
+    from applypilot.mail_source import MailSourceOverflowError
 
-        since_days = max(1, (window_minutes + 1439) // 1440)
-        msgs = get_mail_source().fetch(
-            since_days=since_days,
-            max_messages=scan_max_messages,
-            gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
-        )
-        matches = inbox_auth.scan_gmail_for_auth_codes(
-            messages=msgs, minutes=window_minutes, max_messages=scan_max_messages)
-    else:
-        matches = inbox_auth.scan_gmail_for_auth_codes(
-            service=gmail_service, minutes=window_minutes,
-            max_messages=scan_max_messages)
+    try:
+        if gmail_service is None:
+            from applypilot.mail_source import get_auth_mail_source
+
+            since_days = max(1, (window_minutes + 1439) // 1440)
+            msgs = get_auth_mail_source().fetch(
+                since_days=since_days,
+                max_messages=scan_max_messages,
+                gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
+            )
+            matches = inbox_auth.scan_gmail_for_auth_codes(
+                messages=msgs, minutes=window_minutes, max_messages=scan_max_messages)
+        else:
+            matches = inbox_auth.scan_gmail_for_auth_codes(
+                service=gmail_service, minutes=window_minutes,
+                max_messages=scan_max_messages)
+    except MailSourceOverflowError:
+        return 0
     matches = inbox_auth.eligible_auth_matches(
         list(itertools.islice(matches, _MAX_RESPONDER_ITEMS)),
         reference_time=_dt.datetime.now(_dt.timezone.utc),

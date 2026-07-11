@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import html
+import itertools
 import re
 import sqlite3
 import time
@@ -622,7 +623,11 @@ def scan_gmail_for_auth_codes(
       iterated directly through the frozen parser.
     - `service`: legacy Gmail-API service object -- back-compat path.
     """
-    from applypilot.mail_source import validate_max_messages
+    from applypilot.mail_source import (
+        GmailApiAuthMailSource,
+        MailSourceOverflowError,
+        validate_max_messages,
+    )
 
     budget = validate_max_messages(max_messages)
     if budget <= 0:
@@ -630,18 +635,21 @@ def scan_gmail_for_auth_codes(
 
     window_minutes = max(1, int(minutes))
     if messages is None:
-        from applypilot.mail_source import GmailApiMailSource
-
         max_older_days = max(1, (window_minutes + 1439) // 1440)
-        messages = GmailApiMailSource(build_service=lambda: service).fetch(
+        messages = GmailApiAuthMailSource(build_service=lambda: service).fetch(
             since_days=max_older_days,
             max_messages=budget,
             gmail_raw_query=AUTH_GMAIL_RAW_QUERY,
         )
+    snapshot = list(itertools.islice(iter(messages), budget + 1))
+    if len(snapshot) > budget:
+        raise MailSourceOverflowError(
+            f"mail candidate snapshot exceeds max_messages={budget}"
+        )
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     matches: list[AuthEmailMatch] = []
-    for message in messages[:budget]:
+    for message in snapshot:
         if not _received_at_in_window(message.date, cutoff=cutoff):
             continue
         matches.extend(
@@ -672,7 +680,7 @@ def watch_gmail_for_auth_code(
     claim_match: Callable[[AuthEmailMatch], bool] | None = None,
     claim_matches: Callable[[list[AuthEmailMatch]], AuthEmailMatch | None] | None = None,
 ) -> AuthEmailMatch | None:
-    from applypilot.mail_source import validate_max_messages
+    from applypilot.mail_source import MailSourceOverflowError, validate_max_messages
 
     budget = validate_max_messages(max_messages)
     if budget <= 0:
@@ -684,10 +692,10 @@ def watch_gmail_for_auth_code(
     while time.monotonic() < deadline:
         try:
             if service is None:
-                from applypilot.mail_source import get_mail_source
+                from applypilot.mail_source import get_auth_mail_source
 
                 since_days = max(1, (minutes + 1439) // 1440)
-                msgs = get_mail_source().fetch(
+                msgs = get_auth_mail_source().fetch(
                     since_days=since_days,
                     max_messages=budget,
                     gmail_raw_query=AUTH_GMAIL_RAW_QUERY,
@@ -727,6 +735,8 @@ def watch_gmail_for_auth_code(
                     return match
                 excluded.add(match.message_id)
             errors = 0
+        except MailSourceOverflowError:
+            return None
         except Exception:
             errors += 1
             if errors >= max_errors:

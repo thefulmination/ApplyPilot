@@ -65,6 +65,10 @@ class MailSourceError(Exception):
     """Raised when the IMAP connection/login/fetch fails."""
 
 
+class MailSourceOverflowError(MailSourceError):
+    """Raised when a bounded candidate snapshot is known to be incomplete."""
+
+
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -239,7 +243,11 @@ class ImapMailSource:
                 _ensure_ok(status, "search", data)
                 ids = _extract_search_ids(data)
 
-            newest_ids = ids[-budget:]
+            if len(ids) > budget:
+                raise MailSourceOverflowError(
+                    f"mail candidate snapshot exceeds max_messages={budget}"
+                )
+            newest_ids = ids
 
             messages: list[MailMessage] = []
             scanned_bytes = 0
@@ -259,17 +267,22 @@ class ImapMailSource:
                 if scanned_bytes + message_size > self._max_scan_bytes:
                     break
 
+                remaining_scan_bytes = self._max_scan_bytes - scanned_bytes
+                retrieval_limit = min(
+                    self._max_message_bytes,
+                    remaining_scan_bytes,
+                )
+                partial_query = f"(BODY.PEEK[]<0.{retrieval_limit + 1}>)"
                 if gmail_raw_query:
-                    status, fetch_data = imap.uid("FETCH", uid, "(RFC822)")
+                    status, fetch_data = imap.uid("FETCH", uid, partial_query)
                     _ensure_ok(status, f"uid fetch for message {uid}", fetch_data)
                 else:
-                    status, fetch_data = imap.fetch(uid, "(RFC822)")
+                    status, fetch_data = imap.fetch(uid, partial_query)
                     _ensure_ok(status, f"fetch for message {uid}", fetch_data)
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
                     scanned_bytes = self._max_scan_bytes
                     raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")
-                remaining_scan_bytes = self._max_scan_bytes - scanned_bytes
                 actual_size = len(raw)
                 scanned_bytes += actual_size
                 if actual_size > remaining_scan_bytes:
@@ -287,10 +300,9 @@ class ImapMailSource:
 
 
 def _extract_raw_bytes(fetch_data) -> bytes | None:
-    """Pull the raw RFC822 bytes out of an imaplib fetch() response.
+    """Pull raw message bytes out of an imaplib fetch response.
 
-    imaplib's fetch response is typically shaped like:
-        [(b'1 (RFC822 {1234}', b'<raw message bytes>'), b')']
+    Both RFC822.SIZE and bounded BODY.PEEK responses use tuple payloads.
     """
     if not fetch_data:
         return None
@@ -409,6 +421,76 @@ def _gmail_actual_payload_bytes(message: dict[str, Any], *, limit: int) -> int |
     return total
 
 
+def _gmail_query(*, since_days: int, gmail_raw_query: str | None) -> str:
+    query = f"newer_than:{since_days}d"
+    if gmail_raw_query:
+        query = f"{query} ({gmail_raw_query})"
+    return query
+
+
+def _gmail_candidate_refs(service, *, query: str, budget: int) -> list[dict[str, Any]]:
+    """Fetch a complete bounded candidate snapshot or raise on MAX+1."""
+    target = budget + 1
+    refs: list[dict[str, Any]] = []
+    page_token = None
+    while len(refs) < target:
+        page_size = min(500, target - len(refs))
+        list_kwargs = {
+            "userId": "me",
+            "q": query,
+            "maxResults": page_size,
+        }
+        if page_token is not None:
+            list_kwargs["pageToken"] = page_token
+        response = service.users().messages().list(**list_kwargs).execute()
+        if not isinstance(response, dict):
+            raise MailSourceError("Gmail candidate list returned malformed response")
+        page_refs = response.get("messages", [])
+        if not isinstance(page_refs, list) or any(
+            not isinstance(ref, dict) or not isinstance(ref.get("id"), str)
+            for ref in page_refs
+        ):
+            raise MailSourceError("Gmail candidate list returned malformed messages")
+        remaining = target - len(refs)
+        refs.extend(page_refs[:remaining])
+        if len(page_refs) > remaining or len(refs) > budget:
+            raise MailSourceOverflowError(
+                f"mail candidate snapshot exceeds max_messages={budget}"
+            )
+        page_token = response.get("nextPageToken")
+        if not page_token or not page_refs:
+            break
+    return refs
+
+
+def _gmail_auth_metadata_bytes(message: dict[str, Any], *, limit: int) -> int | None:
+    if not isinstance(message, dict) or limit < 0:
+        return None
+    total = 0
+    for field in ("id", "threadId", "snippet"):
+        value = message.get(field, "")
+        if not isinstance(value, str):
+            return None
+        total += len(value.encode("utf-8"))
+    payload = message.get("payload", {})
+    if not isinstance(payload, dict):
+        return None
+    headers = payload.get("headers", [])
+    if not isinstance(headers, list):
+        return None
+    for header in headers:
+        if not isinstance(header, dict):
+            return None
+        name = header.get("name")
+        value = header.get("value")
+        if not isinstance(name, str) or not isinstance(value, str):
+            return None
+        total += len(name.encode("utf-8")) + len(value.encode("utf-8"))
+        if total > limit:
+            return limit + 1
+    return total
+
+
 class GmailApiMailSource:
     """Backward-compat Gmail read access via the OAuth-backed Gmail API.
 
@@ -454,31 +536,11 @@ class GmailApiMailSource:
         from applypilot.gmail_outcomes import _get_text_body
 
         service = self._build_service()
-        query = f"newer_than:{since_days}d"
-        if gmail_raw_query:
-            query = f"{query} ({gmail_raw_query})"
-
-        refs = []
-        page_token = None
-        while len(refs) < budget:
-            page_size = min(500, budget - len(refs))
-            list_kwargs = {
-                "userId": "me",
-                "q": query,
-                "maxResults": page_size,
-            }
-            if page_token is not None:
-                list_kwargs["pageToken"] = page_token
-            resp = service.users().messages().list(**list_kwargs).execute()
-            page_refs = resp.get("messages", [])
-            if not page_refs:
-                break
-            refs.extend(page_refs[: budget - len(refs)])
-            if len(refs) >= budget:
-                break
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+        query = _gmail_query(
+            since_days=since_days,
+            gmail_raw_query=gmail_raw_query,
+        )
+        refs = _gmail_candidate_refs(service, query=query, budget=budget)
 
         messages: list[MailMessage] = []
         scanned_bytes = 0
@@ -537,6 +599,82 @@ class GmailApiMailSource:
         return messages
 
 
+class GmailApiAuthMailSource(GmailApiMailSource):
+    """Gmail auth reader restricted to provider-bounded metadata and snippet."""
+
+    def fetch(
+        self,
+        *,
+        since_days: int,
+        max_messages: int | str,
+        gmail_raw_query: str | None = None,
+    ) -> list[MailMessage]:
+        budget = validate_max_messages(max_messages)
+        if budget <= 0:
+            return []
+
+        service = self._build_service()
+        query = _gmail_query(
+            since_days=since_days,
+            gmail_raw_query=gmail_raw_query,
+        )
+        refs = _gmail_candidate_refs(service, query=query, budget=budget)
+        messages: list[MailMessage] = []
+        scanned_bytes = 0
+        for ref in refs:
+            if scanned_bytes >= self._max_scan_bytes:
+                break
+            message = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=ref["id"],
+                    format="metadata",
+                    metadataHeaders=["Subject", "From", "Date", "Message-ID"],
+                    fields=(
+                        "id,threadId,sizeEstimate,snippet,"
+                        "payload(headers(name,value))"
+                    ),
+                )
+                .execute()
+            )
+            remaining_scan_bytes = self._max_scan_bytes - scanned_bytes
+            actual_size = _gmail_auth_metadata_bytes(
+                message,
+                limit=remaining_scan_bytes,
+            )
+            if actual_size is None:
+                scanned_bytes = self._max_scan_bytes
+                break
+            scanned_bytes += actual_size
+            if actual_size > remaining_scan_bytes:
+                break
+            if actual_size > self._max_message_bytes:
+                continue
+            size_estimate = message.get("sizeEstimate")
+            if (
+                isinstance(size_estimate, bool)
+                or not isinstance(size_estimate, int)
+                or size_estimate < 0
+                or size_estimate > self._max_message_bytes
+            ):
+                continue
+            payload = message.get("payload", {})
+            headers = _gmail_headers(payload)
+            messages.append(
+                MailMessage(
+                    id=ref["id"],
+                    thread_id=message.get("threadId") or ref.get("threadId", ref["id"]),
+                    subject=headers.get("subject", ""),
+                    sender=headers.get("from", ""),
+                    date=headers.get("date", ""),
+                    body=message.get("snippet", ""),
+                )
+            )
+        return messages
+
+
 def get_mail_source() -> MailSource:
     """Pick the mail source backend: IMAP (permanent, app-password-backed) when
     configured, else the legacy OAuth-backed Gmail API path."""
@@ -546,3 +684,18 @@ def get_mail_source() -> MailSource:
     if creds:
         return ImapMailSource(creds[0], creds[1])
     return GmailApiMailSource()
+
+
+def get_auth_mail_source() -> MailSource:
+    """Return an auth-safe source; Gmail API fallback never retrieves bodies."""
+    source = get_mail_source()
+    if isinstance(source, GmailApiMailSource) and not isinstance(
+        source,
+        GmailApiAuthMailSource,
+    ):
+        return GmailApiAuthMailSource(
+            build_service=source._build_service,
+            max_message_bytes=source._max_message_bytes,
+            max_scan_bytes=source._max_scan_bytes,
+        )
+    return source

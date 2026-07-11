@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import datetime as dt
 
+import pytest
+
 from applypilot import inbox_auth
+from applypilot import mail_source
 
 
 class _FakeRequest:
@@ -19,6 +22,7 @@ class _FakeMessages:
         self._message_batches = message_batches
         self._message_payloads = message_payloads
         self._list_calls = 0
+        self.get_calls = []
 
     def list(self, userId, q, maxResults, pageToken=None):
         index = min(self._list_calls, len(self._message_batches) - 1)
@@ -28,11 +32,31 @@ class _FakeMessages:
             return _FakeRequest(batch)
         return _FakeRequest({"messages": batch})
 
-    def get(self, userId, id, format, fields=None):  # noqa: A002
+    def get(  # noqa: A002
+        self,
+        userId,
+        id,
+        format,
+        fields=None,
+        metadataHeaders=None,
+    ):
+        self.get_calls.append((id, format, fields, metadataHeaders))
         payload = self._message_payloads[id]
         if format == "metadata":
+            message_payload = payload.get("payload", {})
+            snippet = payload.get("snippet")
+            if snippet is None:
+                encoded = message_payload.get("body", {}).get("data", "")
+                padding = "=" * (-len(encoded) % 4)
+                snippet = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
             return _FakeRequest(
-                {"id": id, "threadId": id, "sizeEstimate": len(repr(payload))}
+                {
+                    "id": id,
+                    "threadId": id,
+                    "sizeEstimate": len(repr(payload)),
+                    "snippet": snippet,
+                    "payload": {"headers": message_payload.get("headers", [])},
+                }
             )
         return _FakeRequest(payload)
 
@@ -331,6 +355,29 @@ def test_scan_gmail_for_auth_codes_service_path_follows_next_page_token():
     assert [match.message_id for match in matches] == ["hit"]
 
 
+def test_explicit_gmail_service_candidate_overflow_fails_before_get():
+    pages = [
+        {
+            "messages": [{"id": str(index)} for index in range(500)],
+            "nextPageToken": "page-2",
+        },
+        {
+            "messages": [{"id": str(index)} for index in range(500, 1000)],
+            "nextPageToken": "page-3",
+        },
+        {"messages": [{"id": "1000"}]},
+    ]
+    service = _FakeService(pages, {})
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        inbox_auth.scan_gmail_for_auth_codes(
+            service=service,
+            max_messages=1000,
+        )
+
+    assert service.users().messages().get_calls == []
+
+
 def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():
     payload = _make_payload(
         subject="Your Greenhouse verification code",
@@ -347,6 +394,88 @@ def test_scan_gmail_for_auth_codes_returns_only_high_confidence_matches():
     assert matches[0].message_id == "m1"
     assert matches[0].candidate.kind == "code"
     assert matches[0].candidate.value == "839214"
+
+
+def test_explicit_gmail_auth_scan_uses_metadata_and_bounded_snippet_only():
+    payload = _make_payload(
+        subject="Verify your email",
+        sender="no-reply@greenhouse.io",
+        body="body must not be fetched",
+    )
+    service = _build_service(
+        [{"id": "metadata-code", "threadId": "thread"}],
+        {
+            "metadata-code": {
+                "snippet": "Use verification code 246810 to continue.",
+                "payload": payload,
+            }
+        },
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        max_messages=1,
+    )
+
+    assert [match.candidate.value for match in matches] == ["246810"]
+    calls = service.users().messages().get_calls
+    assert calls and all(call[1] == "metadata" for call in calls)
+    assert all(call[1] not in {"full", "raw"} for call in calls)
+
+
+def test_explicit_gmail_auth_scan_finds_code_in_metadata_subject():
+    payload = _make_payload(
+        subject="Your verification code is 135790",
+        sender="no-reply@greenhouse.io",
+        body="body must not be fetched",
+    )
+    service = _build_service(
+        [{"id": "subject-code", "threadId": "thread"}],
+        {
+            "subject-code": {
+                "snippet": "Open this message to continue.",
+                "payload": payload,
+            }
+        },
+    )
+
+    matches = inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        max_messages=1,
+    )
+
+    assert [match.candidate.value for match in matches] == ["135790"]
+    assert all(
+        call[1] == "metadata"
+        for call in service.users().messages().get_calls
+    )
+
+
+def test_explicit_gmail_auth_scan_does_not_use_magic_link_hidden_in_body():
+    hidden_link = "https://boards.greenhouse.io/verify?token=hidden-secret"
+    payload = _make_payload(
+        subject="Verify your email",
+        sender="no-reply@greenhouse.io",
+        body=f"Continue with {hidden_link}",
+    )
+    service = _build_service(
+        [{"id": "body-only-link", "threadId": "thread"}],
+        {
+            "body-only-link": {
+                "snippet": "Open the message to continue.",
+                "payload": payload,
+            }
+        },
+    )
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        service=service,
+        max_messages=1,
+    ) == []
+    assert all(
+        call[1] == "metadata"
+        for call in service.users().messages().get_calls
+    )
 
 
 def test_scan_gmail_for_auth_codes_service_path_drops_codes_outside_minutes_window():

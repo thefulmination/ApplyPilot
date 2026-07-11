@@ -7,6 +7,7 @@ import json
 import pytest
 
 from applypilot import config
+from applypilot import mail_source
 from applypilot.mail_source import ImapMailSource, MailSourceError, _normalize
 
 
@@ -159,7 +160,11 @@ class FakeImap:
             return "NO", [None]
         if "RFC822.SIZE" in parts:
             return "OK", [(b"1 (RFC822.SIZE %d)" % len(raw), b"")]
-        return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+        match = __import__("re").search(r"BODY\.PEEK\[\]<0\.(\d+)>", parts)
+        if match is None:
+            raise AssertionError(f"unbounded body fetch: {parts}")
+        count = int(match.group(1))
+        return "OK", [(b"1 (BODY[])", raw[:count]), b")"]
 
     def uid(self, command, *args):
         self.uid_calls.append((command, *args))
@@ -174,7 +179,11 @@ class FakeImap:
                 return "NO", [None]
             if "RFC822.SIZE" in parts:
                 return "OK", [(b"1 (RFC822.SIZE %d)" % len(raw), b"")]
-            return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+            match = __import__("re").search(r"BODY\.PEEK\[\]<0\.(\d+)>", parts)
+            if match is None:
+                raise AssertionError(f"unbounded body fetch: {parts}")
+            count = int(match.group(1))
+            return "OK", [(b"1 (BODY[])", raw[:count]), b")"]
         return "NO", [b"unsupported uid command"]
 
     def logout(self):
@@ -190,14 +199,18 @@ class UnderstatedSizeImap(FakeImap):
             return "NO", [None]
         if "RFC822.SIZE" in parts:
             return "OK", [(b"1 (RFC822.SIZE 1)", b"")]
-        return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+        match = __import__("re").search(r"BODY\.PEEK\[\]<0\.(\d+)>", parts)
+        if match is None:
+            raise AssertionError(f"unbounded body fetch: {parts}")
+        count = int(match.group(1))
+        return "OK", [(b"1 (BODY[])", raw[:count]), b")"]
 
 
 # ---------------------------------------------------------------------------
 # ImapMailSource.fetch tests
 # ---------------------------------------------------------------------------
 
-def test_fetch_returns_newest_n_messages_within_window():
+def test_fetch_returns_complete_bounded_message_snapshot():
     ids = [b"1", b"2", b"3", b"4"]
     messages_by_id = {
         b"1": _encoded_word_subject_raw(),
@@ -208,11 +221,10 @@ def test_fetch_returns_newest_n_messages_within_window():
     fake = FakeImap(search_ids=ids, messages_by_id=messages_by_id)
     source = ImapMailSource("me@example.com", "app password", imap=fake)
 
-    result = source.fetch(since_days=7, max_messages=2)
+    result = source.fetch(since_days=7, max_messages=4)
 
-    assert len(result) == 2
-    # newest-N = last 2 ids in search order: "3", "4"
-    assert [m.id for m in result] == ["3", "4"]
+    assert len(result) == 4
+    assert [m.id for m in result] == ["1", "2", "3", "4"]
     assert fake.selected == ("INBOX", True)
     assert fake.logged_out is True
 
@@ -229,6 +241,75 @@ def test_fetch_respects_max_messages_cap_when_fewer_available():
     result = source.fetch(since_days=7, max_messages=10)
 
     assert len(result) == 2
+
+
+def test_imap_candidate_overflow_fails_before_any_message_fetch():
+    ids = [str(index).encode() for index in range(1001)]
+    fake = FakeImap(
+        search_ids=ids,
+        messages_by_id={message_id: b"Subject: Verify\r\n\r\n123456" for message_id in ids},
+    )
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        ImapMailSource("me@example.com", "password", imap=fake).fetch(
+            since_days=7,
+            max_messages=1000,
+        )
+
+    assert fake.fetch_calls == []
+
+
+def test_imap_exact_candidate_bound_remains_bounded():
+    ids = [str(index).encode() for index in range(1000)]
+    fake = FakeImap(
+        search_ids=ids,
+        messages_by_id={message_id: b"XX" for message_id in ids},
+    )
+
+    result = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=1,
+        max_scan_bytes=1000,
+    ).fetch(since_days=7, max_messages=1000)
+
+    assert result == []
+    assert len(fake.fetch_calls) == 1000
+    assert all(call[1] == "(RFC822.SIZE)" for call in fake.fetch_calls)
+
+
+def test_imap_body_fetch_uses_one_byte_sentinel_partial_range():
+    raw = b"Subject: Verify\r\n\r\n123456"
+
+    class PartialOnlyImap(FakeImap):
+        def fetch(self, uid, parts):
+            self.fetch_calls.append((uid, parts))
+            if parts == "(RFC822.SIZE)":
+                return "OK", [(b"1 (RFC822.SIZE 1)", b"")]
+            if "RFC822" in parts:
+                raise AssertionError("unbounded RFC822 fetch issued")
+            match = __import__("re").search(r"BODY\.PEEK\[\]<0\.(\d+)>", parts)
+            assert match is not None
+            count = int(match.group(1))
+            return "OK", [(b"1 (BODY[])", raw[:count]), b")"]
+
+    fake = PartialOnlyImap(search_ids=[b"1"], messages_by_id={b"1": raw})
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=len(raw),
+        max_scan_bytes=len(raw),
+    )
+
+    result = source.fetch(since_days=7, max_messages=1)
+
+    assert [message.id for message in result] == ["1"]
+    assert fake.fetch_calls[-1] == (
+        "1",
+        f"(BODY.PEEK[]<0.{len(raw) + 1}>)",
+    )
 
 
 def test_imap_skips_oversize_message_without_full_fetch():
@@ -262,7 +343,7 @@ def test_imap_accepts_exact_message_byte_boundary():
     assert [message.id for message in result] == ["1"]
     assert fake.fetch_calls == [
         ("1", "(RFC822.SIZE)"),
-        ("1", "(RFC822)"),
+        ("1", f"(BODY.PEEK[]<0.{len(raw) + 1}>)"),
     ]
 
 
@@ -283,7 +364,10 @@ def test_imap_aggregate_cap_stops_further_full_fetches():
     result = source.fetch(since_days=7, max_messages=3)
 
     assert [message.id for message in result] == ["1", "2"]
-    assert ("3", "(RFC822)") not in fake.fetch_calls
+    assert not any(
+        uid == "3" and "BODY.PEEK" in parts
+        for uid, parts in fake.fetch_calls
+    )
 
 
 def test_imap_understated_oversize_sequence_charges_aggregate_budget():
@@ -306,9 +390,8 @@ def test_imap_understated_oversize_sequence_charges_aggregate_budget():
     )
 
     assert source.fetch(since_days=7, max_messages=4) == []
-    assert [call for call in fake.fetch_calls if call[1] == "(RFC822)"] == [
-        ("1", "(RFC822)")
-    ]
+    body_calls = [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]]
+    assert body_calls == [("1", "(BODY.PEEK[]<0.51>)")]
 
 
 def test_imap_understated_actual_bytes_accept_exact_aggregate_boundary():
@@ -331,18 +414,18 @@ def test_imap_understated_actual_bytes_accept_exact_aggregate_boundary():
     result = source.fetch(since_days=7, max_messages=3)
 
     assert [message.id for message in result] == ["1", "2"]
-    assert [call for call in fake.fetch_calls if call[1] == "(RFC822)"] == [
-        ("1", "(RFC822)"),
-        ("2", "(RFC822)"),
+    assert [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]] == [
+        ("1", "(BODY.PEEK[]<0.31>)"),
+        ("2", "(BODY.PEEK[]<0.21>)"),
     ]
 
 
 def test_imap_malformed_full_fetch_fails_closed_before_later_downloads():
     class MalformedFullImap(UnderstatedSizeImap):
         def fetch(self, uid, parts):
-            if parts == "(RFC822)" and uid == "1":
+            if "BODY.PEEK" in parts and uid == "1":
                 self.fetch_calls.append((uid, parts))
-                return "OK", [(b"1 (RFC822 {100}", "not-bytes"), b")"]
+                return "OK", [(b"1 (BODY[])", "not-bytes"), b")"]
             return super().fetch(uid, parts)
 
     fake = MalformedFullImap(
@@ -360,8 +443,8 @@ def test_imap_malformed_full_fetch_fails_closed_before_later_downloads():
     with pytest.raises(MailSourceError, match="no RFC822 payload"):
         source.fetch(since_days=7, max_messages=2)
 
-    assert [call for call in fake.fetch_calls if call[1] == "(RFC822)"] == [
-        ("1", "(RFC822)")
+    assert [call for call in fake.fetch_calls if "BODY.PEEK" in call[1]] == [
+        ("1", "(BODY.PEEK[]<0.101>)")
     ]
 
 

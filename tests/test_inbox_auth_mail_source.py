@@ -8,6 +8,7 @@ import datetime as dt
 import pytest
 
 from applypilot import inbox_auth
+from applypilot import mail_source
 from applypilot.fleet import otp_relay
 from applypilot.mail_source import MailMessage
 
@@ -37,6 +38,47 @@ def test_scan_gmail_for_auth_codes_messages_path_extracts_code():
     assert match.thread_id == "t1"
     assert match.candidate.kind == "code"
     assert match.candidate.value == "123456"
+
+
+def test_message_list_candidate_overflow_fails_closed():
+    now = dt.datetime.now(dt.timezone.utc)
+    messages = [
+        MailMessage(
+            id=str(index),
+            thread_id=str(index),
+            subject="Verify your email",
+            sender="no-reply@greenhouse.io",
+            date=_rfc(now),
+            body="Use verification code 123456 to continue.",
+        )
+        for index in range(1001)
+    ]
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        inbox_auth.scan_gmail_for_auth_codes(
+            messages=messages,
+            max_messages=1000,
+        )
+
+
+def test_message_list_exact_candidate_bound_remains_bounded():
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)
+    messages = [
+        MailMessage(
+            id=str(index),
+            thread_id=str(index),
+            subject="Unrelated",
+            sender="news@example.com",
+            date=_rfc(old),
+            body="newsletter",
+        )
+        for index in range(1000)
+    ]
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        messages=messages,
+        max_messages=1000,
+    ) == []
 
 
 def test_scan_nonpositive_message_budget_does_not_touch_message_list():
@@ -73,6 +115,29 @@ def test_watch_nonpositive_budget_does_not_resolve_mail_source(monkeypatch):
 
     assert inbox_auth.watch_gmail_for_auth_code(max_messages=0) is None
     assert inbox_auth.watch_gmail_for_auth_code(max_messages=-1) is None
+
+
+def test_watcher_candidate_overflow_returns_no_hint_without_retry(monkeypatch):
+    calls = 0
+
+    class _OverflowSource:
+        def fetch(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise mail_source.MailSourceOverflowError("candidate overflow")
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source",
+        lambda **_kwargs: _OverflowSource(),
+    )
+
+    assert inbox_auth.watch_gmail_for_auth_code(
+        timeout_seconds=1,
+        poll_seconds=0,
+        max_errors=3,
+        max_messages=1000,
+    ) is None
+    assert calls == 1
 
 
 @pytest.mark.parametrize("budget", [True, 1.5, float("nan"), float("inf"), "1.5", "nan", ""])
@@ -123,23 +188,30 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
         def list(self, userId, q, maxResults):
             return _FakeRequest({"messages": [{"id": "m2", "threadId": "t2"}]})
 
-        def get(self, userId, id, format, fields=None):  # noqa: A002
-            import base64
-
-            if format == "metadata":
-                return _FakeRequest({"id": id, "threadId": "t2", "sizeEstimate": 100})
-
-            encoded = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii").rstrip("=")
-            payload = {
-                "headers": [
-                    {"name": "Subject", "value": subject},
-                    {"name": "From", "value": sender},
-                    {"name": "Date", "value": _rfc(now)},
-                ],
-                "mimeType": "text/plain",
-                "body": {"data": encoded},
-            }
-            return _FakeRequest({"payload": payload})
+        def get(  # noqa: A002
+            self,
+            userId,
+            id,
+            format,
+            fields=None,
+            metadataHeaders=None,
+        ):
+            assert format == "metadata"
+            return _FakeRequest(
+                {
+                    "id": id,
+                    "threadId": "t2",
+                    "sizeEstimate": 100,
+                    "snippet": body,
+                    "payload": {
+                        "headers": [
+                            {"name": "Subject", "value": subject},
+                            {"name": "From", "value": sender},
+                            {"name": "Date", "value": _rfc(now)},
+                        ]
+                    },
+                }
+            )
 
     class _FakeUsers:
         def messages(self):
