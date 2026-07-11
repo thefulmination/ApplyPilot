@@ -16,6 +16,26 @@ from applypilot.fleet import agent_budget
 from applypilot.fleet import queue
 
 
+def _authorize_apply(conn, url: str, score: float = 9.0) -> None:
+    policy = "test-ats-policy"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'ats','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy,),
+        )
+        cur.execute("UPDATE fleet_config SET ats_policy_version=%s WHERE id=1", (policy,))
+        cur.execute(
+            "UPDATE apply_queue SET decision_id=%s, policy_version=%s, decision_action='apply', "
+            "qualification_verdict='qualified', qualification_score=9, qualification_floor=7, "
+            "preference_score=8, outcome_score=8, final_score=%s, decision_confidence=.9, "
+            "decision_created_at=now(), decision_expires_at=now()+interval '1 day', input_hash=%s "
+            "WHERE url=%s",
+            (f"decision-{url}", policy, score, f"hash-{url}", url),
+        )
+    conn.commit()
+
+
 def _now_utc():
     # DB and test share UTC wall clock; generous margins make skew irrelevant.
     return datetime.now(timezone.utc)
@@ -97,6 +117,7 @@ def test_write_apply_result_attributes_agent_to_llm_usage(fleet_db):
                 "approved_batch, dedup_key, apply_domain) "
                 "VALUES ('ja','http://x/y','9','queued','ats','b1','dk-ja','acme.com')")
         conn.commit()
+        _authorize_apply(conn, "ja")
     with pgqueue.connect(fleet_db) as conn:
         queue.lease_apply(conn, "w-attr", home_ip="1.1.1.1")
     with pgqueue.connect(fleet_db) as conn:
@@ -119,6 +140,7 @@ def test_worker_passthrough_forwards_agent_from_result(fleet_db):
                 "approved_batch, dedup_key, apply_domain) "
                 "VALUES ('jz','http://x/y','9','queued','ats','b1','dk-jz','acme-z.com')")
         conn.commit()
+        _authorize_apply(conn, "jz")
     loop = WorkerLoop(
         lambda: pgqueue.connect(fleet_db), "w-fwd", home_ip="1.1.1.1", role="apply",
         apply_fn=lambda job: {"run_status": "applied", "est_cost_usd": 0.7, "agent": "deepseek"},

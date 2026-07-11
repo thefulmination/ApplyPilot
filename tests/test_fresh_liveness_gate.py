@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
 
 
 def _seed_required(conn, url: str, *, score: float = 9.0):
+    policy = "test-ats-policy"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'ats','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy,),
+        )
+        cur.execute("UPDATE fleet_config SET ats_policy_version=%s WHERE id=1", (policy,))
+    conn.commit()
+    now = datetime.now(timezone.utc)
     queue.push_apply_jobs(
         conn,
         [{
@@ -15,6 +27,19 @@ def _seed_required(conn, url: str, *, score: float = 9.0):
             "application_url": url,
             "score": score,
             "target_host": "acme.wd5.myworkdayjobs.com",
+            "decision_id": f"decision-{url}",
+            "policy_version": policy,
+            "decision_action": "apply",
+            "qualification_verdict": "qualified",
+            "qualification_score": 9.0,
+            "qualification_floor": 7.0,
+            "preference_score": 8.0,
+            "outcome_score": 8.0,
+            "final_score": score,
+            "decision_confidence": 0.9,
+            "decision_created_at": now,
+            "decision_expires_at": now + timedelta(days=1),
+            "input_hash": f"hash-{url}",
         }],
         approved_batch="batch-live",
         require_liveness=True,

@@ -30,6 +30,7 @@ Seeding notes:
 from __future__ import annotations
 
 import datetime as _dt
+from datetime import timedelta, timezone
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import linkedin_home_main as hm
@@ -37,6 +38,30 @@ from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
 
 _OWNER_IP = "1.1.1.1"
+
+
+def _canonical(url: str, score: float) -> dict:
+    now = _dt.datetime.now(timezone.utc)
+    return {
+        "decision_id": f"decision-{url}", "policy_version": "test-linkedin-policy",
+        "decision_action": "apply", "qualification_verdict": "qualified",
+        "qualification_score": 9.0, "qualification_floor": 7.0,
+        "preference_score": 8.0, "outcome_score": 8.0, "final_score": score,
+        "decision_confidence": 0.9, "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1), "input_hash": f"hash-{url}",
+    }
+
+
+def _activate_linkedin_policy(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES ('test-linkedin-policy','linkedin','active')"
+        )
+        cur.execute(
+            "UPDATE fleet_config SET linkedin_policy_version='test-linkedin-policy' WHERE id=1"
+        )
+    conn.commit()
 
 
 def _make_loop(fleet_db, worker_id: str, apply_fn):
@@ -58,13 +83,16 @@ def test_linkedin_canary_then_halt(fleet_db):
     # Exactly 1 must be 'applied'; the other 2 get idle.
     # -----------------------------------------------------------------------
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _activate_linkedin_policy(conn)
         for i in range(3):
-            cur.execute(
-                "INSERT INTO linkedin_queue "
-                "(url, application_url, score, status, lane, dedup_key, linkedin_resolve_status, linkedin_resolved_at) "
-                "VALUES (%s,%s,%s,'queued','ats',%s,'easy_apply',now())",
-                (f"e{i}", f"https://linkedin.com/jobs/{i}", 9 - i * 0.01, f"dke{i}"),
-            )
+            score = 9 - i * 0.01
+            queue.push_linkedin_jobs(conn, [{
+                "url": f"e{i}", "application_url": f"https://linkedin.com/jobs/{i}",
+                "company": "Acme", "title": "Role", "score": score, "dedup_key": f"dke{i}",
+                "linkedin_resolve_status": "easy_apply",
+                "linkedin_resolved_at": _dt.datetime.now(timezone.utc),
+                **_canonical(f"e{i}", score),
+            }])
         # Seed the account governor with min_gap=0 so min-gap never caps first.
         cur.execute(
             "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds) "
@@ -144,12 +172,13 @@ def test_linkedin_canary_then_halt(fleet_db):
     # The halt is the only blocker (min_gap=0, canary>0, fresh row approved).
     # -----------------------------------------------------------------------
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO linkedin_queue "
-            "(url, application_url, score, status, lane, dedup_key, linkedin_resolve_status, linkedin_resolved_at) "
-            "VALUES (%s,%s,%s,'queued','ats',%s,'easy_apply',now())",
-            ("e99", "https://linkedin.com/jobs/99", 9.0, "dke99"),
-        )
+        queue.push_linkedin_jobs(conn, [{
+            "url": "e99", "application_url": "https://linkedin.com/jobs/99",
+            "company": "Acme", "title": "Role", "score": 9.0, "dedup_key": "dke99",
+            "linkedin_resolve_status": "easy_apply",
+            "linkedin_resolved_at": _dt.datetime.now(timezone.utc),
+            **_canonical("e99", 9.0),
+        }])
         conn.commit()
         hm.set_linkedin_canary(conn, 5)       # plenty of canary headroom
         hm.approve(conn, all_pushed=True)      # approve the fresh row

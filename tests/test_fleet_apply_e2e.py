@@ -13,22 +13,43 @@ Seed note (host-gap avoidance):
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as hm
+from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
+
+
+def _canonical(url: str, score: float) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "decision_id": f"decision-{url}", "policy_version": "test-ats-policy",
+        "decision_action": "apply", "qualification_verdict": "qualified",
+        "qualification_score": 9.0, "qualification_floor": 7.0,
+        "preference_score": 8.0, "outcome_score": 8.0, "final_score": score,
+        "decision_confidence": 0.9, "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1), "input_hash": f"hash-{url}",
+    }
 
 
 def test_canary_go_live_path(fleet_db):
     # ---- seed 5 approveable offsite rows (one distinct host each) ---------------
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES ('test-ats-policy','ats','active')"
+        )
+        cur.execute("UPDATE fleet_config SET ats_policy_version='test-ats-policy' WHERE id=1")
         for i in range(5):
-            cur.execute(
-                "INSERT INTO apply_queue "
-                "(url, application_url, score, status, lane, apply_domain, dedup_key) "
-                "VALUES (%s,%s,%s,'queued','ats',%s,%s)",
-                (f"e{i}", f"http://acme{i}.com/{i}", 9.0 - i * 0.01,
-                 f"acme{i}.com", f"dke{i}"),
-            )
+            score = 9.0 - i * 0.01
+            row = {
+                "url": f"e{i}", "application_url": f"http://acme{i}.com/{i}",
+                "company": "Acme", "title": "Role", "score": score,
+                "target_host": f"acme{i}.com", "dedup_key": f"dke{i}",
+                **_canonical(f"e{i}", score),
+            }
+            queue.push_apply_jobs(conn, [row])
         conn.commit()
 
         # ---- arm canary K=2 and approve all queued rows -------------------------
@@ -54,11 +75,13 @@ def test_canary_go_live_path(fleet_db):
         "check that the canary decrement+pause is atomic in queue.lease_apply"
     )
 
-    # ---- fleet_config auto-paused for operator review ---------------------------
+    # ---- ATS lane stopped for operator review without pausing LinkedIn ----------
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT paused FROM fleet_config WHERE id=1")
-        row = cur.fetchone()
-        assert row["paused"] is True, (
-            "fleet_config.paused must be TRUE after the canary budget is exhausted "
-            "(the auto-pause gate in the lease CTE)"
+        cur.execute(
+            "SELECT paused, ats_apply_mode, canary_remaining "
+            "FROM fleet_config WHERE id=1"
         )
+        row = cur.fetchone()
+        assert row["ats_apply_mode"] == "stopped"
+        assert row["canary_remaining"] == 0
+        assert row["paused"] is False, "ATS exhaustion must not halt the LinkedIn lane"

@@ -18,6 +18,7 @@ contract against a REAL disposable Postgres (the ``fleet_db`` fixture):
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -33,6 +34,28 @@ FRIEND_IP = "198.51.100.4"
 _ALL_CAPS = {"can_ats": True, "can_compute": True, "can_discover": True, "can_linkedin": True}
 
 
+def _canonical(conn, lane: str, url: str, score: float = 9.0) -> dict:
+    policy = f"test-{lane}-policy"
+    config_column = "ats_policy_version" if lane == "ats" else "linkedin_policy_version"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy, lane),
+        )
+        cur.execute(f"UPDATE fleet_config SET {config_column}=%s WHERE id=1", (policy,))
+    conn.commit()
+    now = datetime.now(timezone.utc)
+    return {
+        "decision_id": f"decision-{url}", "policy_version": policy,
+        "decision_action": "apply", "qualification_verdict": "qualified",
+        "qualification_score": 9.0, "qualification_floor": 7.0,
+        "preference_score": 8.0, "outcome_score": 8.0, "final_score": score,
+        "decision_confidence": 0.9, "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1), "input_hash": f"hash-{url}",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Seed helpers (mirror the pgqueue/queue test patterns)
 # ---------------------------------------------------------------------------
@@ -41,6 +64,7 @@ def _seed_apply(conn, *, approved=True):
         "url": "https://jobs.example.com/ats1", "company": "Acme", "title": "Chief of Staff",
         "application_url": "https://boards.greenhouse.io/acme/jobs/1", "score": 9.0,
         "target_host": "boards.greenhouse.io",
+        **_canonical(conn, "ats", "https://jobs.example.com/ats1"),
     }]
     queue.push_apply_jobs(conn, rows, approved_batch="b1" if approved else None)
     return rows
@@ -61,13 +85,14 @@ def _seed_search(conn):
 
 
 def _seed_linkedin(conn):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO linkedin_queue "
-            "(url, application_url, score, status, approved_batch, linkedin_resolve_status, linkedin_resolved_at) "
-            "VALUES ('https://www.linkedin.com/jobs/view/1','https://www.linkedin.com/jobs/view/1',9.0,'queued','b1','easy_apply',now())"
-        )
-    conn.commit()
+    url = "https://www.linkedin.com/jobs/view/1"
+    queue.push_linkedin_jobs(conn, [{
+        "url": url, "company": "Acme", "title": "Role",
+        "application_url": url, "score": 9.0,
+        "linkedin_resolve_status": "easy_apply",
+        "linkedin_resolved_at": datetime.now(timezone.utc),
+        **_canonical(conn, "linkedin", url),
+    }], approved_batch="b1")
 
 
 # ---------------------------------------------------------------------------

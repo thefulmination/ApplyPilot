@@ -13,6 +13,27 @@ from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
 
 
+def _authorize(conn, table: str, lane: str, url: str) -> None:
+    policy = f"test-{lane}-policy"
+    config_column = "ats_policy_version" if lane == "ats" else "linkedin_policy_version"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy, lane),
+        )
+        cur.execute(f"UPDATE fleet_config SET {config_column}=%s WHERE id=1", (policy,))
+        cur.execute(
+            f"UPDATE {table} SET decision_id=%s, policy_version=%s, decision_action='apply', "
+            "qualification_verdict='qualified', qualification_score=9, qualification_floor=7, "
+            "preference_score=8, outcome_score=8, final_score=score, decision_confidence=.9, "
+            "decision_created_at=now(), decision_expires_at=now()+interval '1 day', input_hash=%s "
+            "WHERE url=%s",
+            (f"decision-{url}", policy, f"hash-{url}", url),
+        )
+    conn.commit()
+
+
 def _seed_queued(conn, url, domain):
     with conn.cursor() as cur:
         cur.execute(
@@ -22,6 +43,7 @@ def _seed_queued(conn, url, domain):
             (url, "dk-" + url, domain),
         )
     conn.commit()
+    _authorize(conn, "apply_queue", "ats", url)
 
 
 def _seed_linkedin_queued(conn, url):
@@ -32,10 +54,11 @@ def _seed_linkedin_queued(conn, url):
         cur.execute(
             "INSERT INTO linkedin_queue (url, company, title, application_url, score, "
             "status, lane, approved_batch, dedup_key, linkedin_resolve_status, linkedin_resolved_at) "
-            "VALUES (%s,'Acme','Role',%s,'9','queued','ats','b1',%s,'easy_apply',now())",
+            "VALUES (%s,'Acme','Role',%s,'9','queued','linkedin','b1',%s,'easy_apply',now())",
             (url, url, "dk-" + url),
         )
     conn.commit()
+    _authorize(conn, "linkedin_queue", "linkedin", url)
 
 
 def test_requeue_apply_returns_leased_job_to_queued(fleet_db):

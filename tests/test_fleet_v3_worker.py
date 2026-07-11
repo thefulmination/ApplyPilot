@@ -9,6 +9,8 @@ all injected fakes; no real Chromium / API spend.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from applypilot.apply import pgqueue
@@ -16,6 +18,41 @@ from applypilot.fleet import captcha
 from applypilot.fleet import config as fleet_config
 from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
+
+
+def _canonical(conn, lane: str, url: str, score: float = 9.0) -> dict:
+    policy = f"test-{lane}-policy"
+    config_column = "ats_policy_version" if lane == "ats" else "linkedin_policy_version"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy, lane),
+        )
+        cur.execute(f"UPDATE fleet_config SET {config_column}=%s WHERE id=1", (policy,))
+    conn.commit()
+    now = datetime.now(timezone.utc)
+    return {
+        "decision_id": f"decision-{url}", "policy_version": policy,
+        "decision_action": "apply", "qualification_verdict": "qualified",
+        "qualification_score": 9.0, "qualification_floor": 7.0,
+        "preference_score": 8.0, "outcome_score": 8.0, "final_score": score,
+        "decision_confidence": 0.9, "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1), "input_hash": f"hash-{url}",
+    }
+
+
+def _authorize_existing(conn, table: str, lane: str, url: str) -> None:
+    provenance = _canonical(conn, lane, url)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {table} SET decision_id=%s, policy_version=%s, decision_action=%s, "
+            "qualification_verdict=%s, qualification_score=%s, qualification_floor=%s, "
+            "preference_score=%s, outcome_score=%s, final_score=%s, decision_confidence=%s, "
+            "decision_created_at=%s, decision_expires_at=%s, input_hash=%s WHERE url=%s",
+            tuple(provenance.values()) + (url,),
+        )
+    conn.commit()
 
 
 # ===========================================================================
@@ -252,6 +289,7 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
     queue.push_apply_jobs(conn, [{
         "url": url, "company": "Acme", "title": "Chief of Staff",
         "application_url": f"https://{host}/jobs/1", "score": 9.0, "target_host": host,
+        **_canonical(conn, "ats", url),
     }], approved_batch="batchA")
 
 
@@ -617,6 +655,7 @@ def test_tick_apply_status_passthrough(fleet_db):
             cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
                         "VALUES (%s,'http://acme.com/x','9','queued','ats','b1',%s,%s)", (url, "dk-"+url, domain))
         conn.commit()
+        _authorize_existing(conn, "apply_queue", "ats", url)
 
     # applied -> applied + applied_set
     with pgqueue.connect(fleet_db) as conn:
@@ -676,10 +715,11 @@ def test_tick_linkedin_routes(fleet_db):
                 "INSERT INTO linkedin_queue "
                 "(url, application_url, score, status, lane, approved_batch, dedup_key, "
                 "linkedin_resolve_status, linkedin_resolved_at) "
-                "VALUES (%s,'https://linkedin.com/jobs/x','9','queued','ats','b1',%s,'easy_apply',now())",
+                "VALUES (%s,'https://linkedin.com/jobs/x','9','queued','linkedin','b1',%s,'easy_apply',now())",
                 (url, "dk-" + url),
             )
         conn.commit()
+        _authorize_existing(conn, "linkedin_queue", "linkedin", url)
 
     # Pre-seed the governor with min_gap_seconds=0 so back-to-back sub-cases can all lease.
     with pgqueue.connect(fleet_db) as conn:
