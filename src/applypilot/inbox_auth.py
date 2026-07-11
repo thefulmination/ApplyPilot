@@ -202,6 +202,46 @@ def sender_domain(sender: str) -> str:
     return _normalize_domain(value)
 
 
+_PERSISTENCE_DOMAIN_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
+    re.IGNORECASE,
+)
+_PERSISTENCE_LOCAL_RE = re.compile(
+    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+\Z",
+    re.IGNORECASE,
+)
+
+
+def persistence_sender_domain(sender: str | None) -> str | None:
+    """Extract only a strict DNS domain for durable auth-event metadata."""
+    raw = (sender or "").strip()
+    if not raw:
+        return None
+    if _PERSISTENCE_DOMAIN_RE.fullmatch(raw):
+        return raw.lower()
+
+    _, address = parseaddr(raw)
+    if not address or address.count("@") != 1:
+        return None
+    if "<" in raw or ">" in raw:
+        if raw.count("<") != 1 or raw.count(">") != 1 or not raw.endswith(">"):
+            return None
+        if raw[raw.index("<") + 1:-1] != address:
+            return None
+    elif raw != address:
+        return None
+
+    local, domain = address.rsplit("@", 1)
+    if not _PERSISTENCE_LOCAL_RE.fullmatch(local):
+        return None
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return None
+    if not _PERSISTENCE_DOMAIN_RE.fullmatch(domain):
+        return None
+    return domain.lower()
+
+
 def url_domain(url: str) -> str:
     parsed = urlparse(url.strip())
     return _normalize_domain(parsed.hostname or "")
@@ -891,7 +931,7 @@ def record_inbox_event(
     """
     conn = get_connection()
     created_at = now_utc()
-    normalized_sender_domain = sender_domain(sender or "")
+    normalized_sender_domain = persistence_sender_domain(sender)
 
     try:
         cursor = conn.execute(
@@ -1030,7 +1070,7 @@ def _claim_auth_match_in_transaction(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            message_id, thread_id, None, sender_domain(sender or ""), None,
+            message_id, thread_id, None, persistence_sender_domain(sender), None,
             received_at or now_text, event_type, confidence, matched_job_url,
             matched_company, matched_method, None, now_text,
         ),

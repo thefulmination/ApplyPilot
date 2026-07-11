@@ -118,6 +118,55 @@ def test_record_inbox_event_minimizes_sensitive_auth_metadata(tmp_path, monkeypa
     assert "Your verification code" not in serialized
 
 
+@pytest.mark.parametrize(
+    "malformed_sender",
+    [
+        "Verification code 839214",
+        "https://boards.greenhouse.io/verify?token=sender-secret",
+        "839214 | no-reply @ greenhouse.io",
+        "code=839214; magic=https://example.com/verify?token=x",
+        "not-an-address",
+    ],
+)
+def test_record_inbox_event_rejects_unsafe_persistence_sender_domain(
+    tmp_path, monkeypatch, malformed_sender
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+
+    event_id = inbox_auth.record_inbox_event(
+        message_id=f"malformed-{abs(hash(malformed_sender))}",
+        sender=malformed_sender,
+        event_type="auth_code",
+        confidence="high",
+    )
+
+    row = conn.execute(
+        "SELECT sender, sender_domain, subject, snippet FROM inbox_events WHERE id=?",
+        (event_id,),
+    ).fetchone()
+    assert tuple(row) == (None, None, None, None)
+    serialized = "|".join("" if value is None else str(value) for value in row)
+    assert "839214" not in serialized
+    assert "http" not in serialized
+
+
+def test_record_inbox_event_preserves_valid_bare_sender_domain(tmp_path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+
+    event_id = inbox_auth.record_inbox_event(
+        message_id="valid-bare-domain",
+        sender="greenhouse.io",
+        event_type="auth_code",
+        confidence="high",
+    )
+
+    assert conn.execute(
+        "SELECT sender_domain FROM inbox_events WHERE id=?", (event_id,)
+    ).fetchone()[0] == "greenhouse.io"
+
+
 def test_expire_stale_challenges(tmp_path, monkeypatch) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
@@ -223,6 +272,32 @@ def test_claim_auth_match_minimizes_sensitive_auth_metadata(tmp_path, monkeypatc
     assert code not in serialized
     assert magic_link not in serialized
     assert "Use code" not in serialized
+
+
+def test_claim_auth_match_rejects_unsafe_persistence_sender_domain(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="unsafe-sender-claim")
+
+    assert inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id="unsafe-sender-message",
+        sender="code 445566 | https://example.com/verify?token=claim-secret",
+        event_type="auth_code",
+    )
+
+    row = conn.execute(
+        """
+        SELECT event.sender, event.sender_domain, event.subject, event.snippet
+          FROM auth_challenges AS challenge
+          JOIN inbox_events AS event ON event.id=challenge.inbox_event_id
+         WHERE challenge.id=?
+        """,
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == (None, None, None, None)
 
 
 def test_claim_auth_match_is_atomic_across_concurrent_connections(tmp_path, monkeypatch) -> None:
