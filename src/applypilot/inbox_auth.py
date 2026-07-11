@@ -13,6 +13,13 @@ from urllib.parse import urlparse
 
 from applypilot.ats_domains import ATS_SENDER_DOMAINS, PROVIDER_DOMAIN_GROUPS
 from applypilot.auth_matching import unique_assignments
+from applypilot.auth_event_storage import (
+    canonical_ats_sender_domain,
+    canonical_utc_timestamp,
+    closed_confidence,
+    closed_match_method,
+    opaque_message_id,
+)
 from applypilot.database import get_connection
 
 Confidence = Literal["low", "medium", "high"]
@@ -200,46 +207,6 @@ def sender_domain(sender: str) -> str:
     if "@" in value:
         value = value.rsplit("@", 1)[1]
     return _normalize_domain(value)
-
-
-_PERSISTENCE_DOMAIN_RE = re.compile(
-    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
-    re.IGNORECASE,
-)
-_PERSISTENCE_LOCAL_RE = re.compile(
-    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+\Z",
-    re.IGNORECASE,
-)
-
-
-def persistence_sender_domain(sender: str | None) -> str | None:
-    """Extract only a strict DNS domain for durable auth-event metadata."""
-    raw = (sender or "").strip()
-    if not raw:
-        return None
-    if _PERSISTENCE_DOMAIN_RE.fullmatch(raw):
-        return raw.lower()
-
-    _, address = parseaddr(raw)
-    if not address or address.count("@") != 1:
-        return None
-    if "<" in raw or ">" in raw:
-        if raw.count("<") != 1 or raw.count(">") != 1 or not raw.endswith(">"):
-            return None
-        if raw[raw.index("<") + 1:-1] != address:
-            return None
-    elif raw != address:
-        return None
-
-    local, domain = address.rsplit("@", 1)
-    if not _PERSISTENCE_LOCAL_RE.fullmatch(local):
-        return None
-    if local.startswith(".") or local.endswith(".") or ".." in local:
-        return None
-    if not _PERSISTENCE_DOMAIN_RE.fullmatch(domain):
-        return None
-    return domain.lower()
 
 
 def url_domain(url: str) -> str:
@@ -931,7 +898,7 @@ def record_inbox_event(
     """
     conn = get_connection()
     created_at = now_utc()
-    normalized_sender_domain = persistence_sender_domain(sender)
+    persisted_message_id = opaque_message_id(message_id)
 
     try:
         cursor = conn.execute(
@@ -944,17 +911,17 @@ def record_inbox_event(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                message_id,
-                thread_id,
+                persisted_message_id,
                 None,
-                normalized_sender_domain,
                 None,
-                received_at or now_utc(),
-                event_type,
-                confidence,
-                matched_job_url,
-                matched_company,
-                matched_method,
+                canonical_ats_sender_domain(sender),
+                None,
+                canonical_utc_timestamp(received_at),
+                "auth_event",
+                closed_confidence(confidence),
+                None,
+                None,
+                closed_match_method(matched_method),
                 None,
                 created_at,
             ),
@@ -964,7 +931,7 @@ def record_inbox_event(
     except sqlite3.IntegrityError:
         row = conn.execute(
             "SELECT id FROM inbox_events WHERE message_id = ?",
-            (message_id,),
+            (persisted_message_id,),
         ).fetchone()
         if row is None:
             raise
@@ -992,7 +959,10 @@ def claimed_auth_message_ids(
         raise ValueError("candidate_message_ids must contain <= 1000 values")
     conn = connection or get_connection()
     claimed: set[str] = set()
-    candidates = sorted(candidate_message_ids)
+    digest_to_raw: dict[str, set[str]] = {}
+    for candidate in candidate_message_ids:
+        digest_to_raw.setdefault(opaque_message_id(candidate), set()).add(candidate)
+    candidates = sorted(digest_to_raw)
     for offset in range(0, len(candidates), 900):
         chunk = candidates[offset:offset + 900]
         if not chunk:
@@ -1007,7 +977,8 @@ def claimed_auth_message_ids(
             """,
             chunk,
         ).fetchall()
-        claimed.update(str(row[0]) for row in rows)
+        for row in rows:
+            claimed.update(digest_to_raw.get(str(row[0]), set()))
     return claimed
 
 
@@ -1028,6 +999,7 @@ def _claim_auth_match_in_transaction(
     snippet: str | None = None,
     received_at: str | None = None,
 ) -> str:
+    persisted_message_id = opaque_message_id(message_id)
     existing = conn.execute(
         """
         SELECT challenge.status, challenge.requested_at, challenge.expires_at,
@@ -1041,7 +1013,7 @@ def _claim_auth_match_in_transaction(
     if existing is None:
         return "rejected"
     if existing[0] == "resolved":
-        return "idempotent" if existing[3] == message_id else "rejected"
+        return "idempotent" if existing[3] == persisted_message_id else "rejected"
     if existing[0] not in ACTIVE_CHALLENGE_STATUSES:
         return "rejected"
     requested_at = _parse_utc_timestamp(existing[1])
@@ -1070,13 +1042,14 @@ def _claim_auth_match_in_transaction(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            message_id, thread_id, None, persistence_sender_domain(sender), None,
-            received_at or now_text, event_type, confidence, matched_job_url,
-            matched_company, matched_method, None, now_text,
+            persisted_message_id, None, None, canonical_ats_sender_domain(sender), None,
+            canonical_utc_timestamp(received_at), "auth_event",
+            closed_confidence(confidence), None, None,
+            closed_match_method(matched_method), None, now_text,
         ),
     )
     event_row = conn.execute(
-        "SELECT id FROM inbox_events WHERE message_id = ?", (message_id,)
+        "SELECT id FROM inbox_events WHERE message_id = ?", (persisted_message_id,)
     ).fetchone()
     if event_row is None:
         raise sqlite3.IntegrityError("inbox event was not persisted")
@@ -1183,7 +1156,14 @@ def claim_unique_auth_match(
             (challenge_id,),
         ).fetchone()
         if target is not None and target[0] == "resolved":
-            selected = candidates.get(str(target[1]))
+            selected = next(
+                (
+                    candidate
+                    for raw_id, candidate in candidates.items()
+                    if opaque_message_id(raw_id) == str(target[1])
+                ),
+                None,
+            )
             conn.rollback()
             return selected[0] if selected is not None else None
         conn.execute(

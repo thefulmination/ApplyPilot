@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import multiprocessing
 import os
 import sqlite3
@@ -167,6 +168,78 @@ def test_record_inbox_event_preserves_valid_bare_sender_domain(tmp_path, monkeyp
     ).fetchone()[0] == "greenhouse.io"
 
 
+def test_record_inbox_event_minimizes_every_external_text_field(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    code = "731942"
+    link = "https://evil.example/verify?token=all-fields-secret"
+    raw_message_id = f"message-{code}-{link}"
+
+    event_id = inbox_auth.record_inbox_event(
+        message_id=raw_message_id,
+        thread_id=f"thread-{code}-{link}",
+        sender=f"Code {code} <alerts@{code}.greenhouse.io>",
+        subject=f"Subject {code} {link}",
+        event_type=f"event-{code}-{link}",
+        confidence=f"confidence-{code}-{link}",
+        matched_job_url=f"job-{code}-{link}",
+        matched_company=f"company-{code}-{link}",
+        matched_method=f"method-{code}-{link}",
+        snippet=f"snippet-{code}-{link}",
+        received_at=f"received-{code}-{link}",
+    )
+
+    row = conn.execute("SELECT * FROM inbox_events WHERE id=?", (event_id,)).fetchone()
+    text_columns = [
+        info[1]
+        for info in conn.execute("PRAGMA table_info(inbox_events)").fetchall()
+        if str(info[2]).upper() == "TEXT"
+    ]
+    serialized = "|".join("" if row[column] is None else str(row[column]) for column in text_columns)
+    assert code not in serialized
+    assert link not in serialized
+    assert "evil.example" not in serialized
+    assert row["message_id"] == "sha256:" + hashlib.sha256(
+        raw_message_id.encode("utf-8")
+    ).hexdigest()
+    assert row["thread_id"] is None
+    assert row["sender"] is None
+    assert row["sender_domain"] == "greenhouse.io"
+    assert row["subject"] is None
+    assert row["received_at"] is None
+    assert row["event_type"] == "auth_event"
+    assert row["confidence"] == "low"
+    assert row["matched_job_url"] is None
+    assert row["matched_company"] is None
+    assert row["matched_method"] is None
+    assert row["snippet"] is None
+
+
+def test_record_inbox_event_keeps_only_closed_method_and_canonical_timestamp(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+
+    event_id = inbox_auth.record_inbox_event(
+        message_id="canonical-fields",
+        sender="alerts@tenant.greenhouse-mail.io",
+        received_at="Fri, 10 Jul 2026 08:30:00 -0400",
+        matched_method="magic_link",
+    )
+    row = conn.execute(
+        "SELECT sender_domain, received_at, matched_method FROM inbox_events WHERE id=?",
+        (event_id,),
+    ).fetchone()
+    assert tuple(row) == (
+        "greenhouse-mail.io",
+        "2026-07-10T12:30:00+00:00",
+        "magic_link",
+    )
+
+
 def test_expire_stale_challenges(tmp_path, monkeypatch) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
@@ -298,6 +371,53 @@ def test_claim_auth_match_rejects_unsafe_persistence_sender_domain(
         (challenge_id,),
     ).fetchone()
     assert tuple(row) == (None, None, None, None)
+
+
+def test_claim_auth_match_hashes_id_and_minimizes_all_external_text(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="all-fields-claim")
+    code = "552211"
+    link = "https://evil.example/verify?token=claim-all-fields"
+    raw_message_id = f"claim-{code}-{link}"
+
+    assert inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id=raw_message_id,
+        thread_id=f"thread-{code}-{link}",
+        sender=f"Code {code} <alerts@{code}.greenhouse.io>",
+        subject=f"subject-{code}-{link}",
+        event_type=f"event-{code}-{link}",
+        confidence=f"confidence-{code}-{link}",
+        matched_job_url=f"job-{code}-{link}",
+        matched_company=f"company-{code}-{link}",
+        matched_method=f"method-{code}-{link}",
+        snippet=f"snippet-{code}-{link}",
+        received_at=f"received-{code}-{link}",
+    )
+
+    row = conn.execute(
+        """
+        SELECT event.* FROM auth_challenges AS challenge
+        JOIN inbox_events AS event ON event.id=challenge.inbox_event_id
+        WHERE challenge.id=?
+        """,
+        (challenge_id,),
+    ).fetchone()
+    text_columns = [
+        info[1]
+        for info in conn.execute("PRAGMA table_info(inbox_events)").fetchall()
+        if str(info[2]).upper() == "TEXT"
+    ]
+    serialized = "|".join("" if row[column] is None else str(row[column]) for column in text_columns)
+    assert code not in serialized
+    assert link not in serialized
+    assert row["message_id"] == "sha256:" + hashlib.sha256(
+        raw_message_id.encode("utf-8")
+    ).hexdigest()
+    assert row["sender_domain"] == "greenhouse.io"
 
 
 def test_claim_auth_match_is_atomic_across_concurrent_connections(tmp_path, monkeypatch) -> None:
@@ -501,4 +621,7 @@ def test_claimed_message_lookup_is_bounded_to_candidate_ids():
         {"candidate-a", "candidate-b"}, connection=_Conn()
     ) == set()
     assert " IN (" in observed["query"]
-    assert observed["params"] == ["candidate-a", "candidate-b"]
+    assert observed["params"] == sorted(
+        "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+        for value in ("candidate-a", "candidate-b")
+    )
