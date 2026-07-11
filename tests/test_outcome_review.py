@@ -95,7 +95,7 @@ def test_review_queue_includes_needs_review_rows(tmp_path):
     from applypilot.outcome_review import list_review_queue
 
     rows = list_review_queue(conn)
-    assert [row["message_id"] for row in rows] == ["m1", "m2", "m3"]
+    assert [row["message_id"] for row in rows] == ["m3"]
 
 
 def test_recommendation_mail_is_rejected_before_matching():

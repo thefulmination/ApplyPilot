@@ -558,8 +558,7 @@ def ensure_application_tables(conn: sqlite3.Connection | None = None) -> None:
             contact_url           TEXT,
             notes                 TEXT,
             created_at            TEXT NOT NULL,
-            updated_at            TEXT NOT NULL,
-            FOREIGN KEY(job_url) REFERENCES jobs(url)
+            updated_at            TEXT NOT NULL
         )
     """)
     conn.execute("""
@@ -570,10 +569,10 @@ def ensure_application_tables(conn: sqlite3.Connection | None = None) -> None:
             event_type            TEXT NOT NULL,
             channel               TEXT,
             happened_at           TEXT NOT NULL,
-            notes                 TEXT,
-            FOREIGN KEY(job_url) REFERENCES jobs(url)
+            notes                 TEXT
         )
     """)
+    _remove_application_job_foreign_keys(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_applied_at ON applications(applied_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_followup ON applications(next_follow_up_at)")
@@ -608,6 +607,55 @@ def ensure_application_tables(conn: sqlite3.Connection | None = None) -> None:
             VALUES (?, 'applied', 'backfill', 'legacy', ?, 'Backfilled from jobs.applied_at')
         """, (row["url"], applied_at))
     conn.commit()
+
+
+def _remove_application_job_foreign_keys(conn: sqlite3.Connection) -> None:
+    """Keep the durable application ledger independent from the mutable jobs catalog."""
+    table_specs = {
+        "applications": (
+            "id,job_url,title,company,source,source_url,application_url,status,channel,"
+            "applied_at,last_status_at,next_follow_up_at,resume_path,cover_letter_path,"
+            "contact_name,contact_email,contact_url,notes,created_at,updated_at",
+            """
+            CREATE TABLE applications_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_url TEXT NOT NULL UNIQUE,
+                title TEXT, company TEXT, source TEXT, source_url TEXT,
+                application_url TEXT,
+                status TEXT NOT NULL DEFAULT 'shortlisted',
+                channel TEXT, applied_at TEXT, last_status_at TEXT,
+                next_follow_up_at TEXT, resume_path TEXT, cover_letter_path TEXT,
+                contact_name TEXT, contact_email TEXT, contact_url TEXT, notes TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+            """,
+        ),
+        "application_events": (
+            "id,job_url,status,event_type,channel,happened_at,notes",
+            """
+            CREATE TABLE application_events_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                channel TEXT,
+                happened_at TEXT NOT NULL,
+                notes TEXT
+            )
+            """,
+        ),
+    }
+    for table, (columns, create_sql) in table_specs.items():
+        if not conn.execute(f"PRAGMA foreign_key_list({table})").fetchall():
+            continue
+        replacement = f"{table}_new"
+        conn.execute(f"DROP TABLE IF EXISTS {replacement}")
+        conn.execute(create_sql)
+        conn.execute(
+            f"INSERT INTO {replacement} ({columns}) SELECT {columns} FROM {table}"
+        )
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {replacement} RENAME TO {table}")
 
 
 def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:

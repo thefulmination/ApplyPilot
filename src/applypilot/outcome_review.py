@@ -158,6 +158,10 @@ def _apply_review(event: dict[str, Any], review: dict[str, Any] | None) -> dict[
         if review.get("corrected_confidence"):
             resolved["confidence"] = review["corrected_confidence"]
         trust_state = review["resolution"]
+    elif event.get("match_status") == "needs_review":
+        trust_state = "needs_review"
+    elif event.get("job_url"):
+        trust_state = "trusted"
     else:
         trust_state = "needs_review"
 

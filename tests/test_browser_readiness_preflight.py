@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-from applypilot.apply import browser_preflight, pgqueue
+from datetime import datetime, timedelta, timezone
+
+from applypilot.apply import browser_preflight, lifecycle_fault, pgqueue
+from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
+
+
+def _isolate_lifecycle_faults(monkeypatch, tmp_path):
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
 
 
 def test_browser_readiness_runs_all_zero_model_checks(monkeypatch):
@@ -54,17 +61,34 @@ def test_browser_readiness_stops_before_mcp_when_cdp_fails(monkeypatch):
     }
 
 
-def test_worker_requeues_untouched_browser_preflight_failure(fleet_db):
+def test_worker_requeues_untouched_browser_preflight_failure(fleet_db, monkeypatch, tmp_path):
+    _isolate_lifecycle_faults(monkeypatch, tmp_path)
     url = "https://example.com/jobs/browser-down"
     with pgqueue.connect(fleet_db) as conn:
+        policy = "browser-ats-policy"
+        now = datetime.now(timezone.utc)
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO apply_queue "
-                "(url, application_url, score, status, lane, approved_batch, target_host) "
-                "VALUES (%s,%s,9.0,'queued','ats','batch-browser','example.com')",
-                (url, url),
+                "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                "VALUES (%s,'ats','active')",
+                (policy,),
+            )
+            cur.execute(
+                "UPDATE fleet_config SET ats_policy_version=%s,ats_apply_mode='steady',"
+                "paused=FALSE,ats_paused=FALSE WHERE id=1",
+                (policy,),
             )
         conn.commit()
+        queue.push_apply_jobs(conn, [{
+            "url": url, "company": "Acme", "title": "Role",
+            "application_url": url, "score": 9.0, "target_host": "example.com",
+            "decision_id": "decision-browser", "policy_version": policy,
+            "decision_action": "apply", "qualification_verdict": "qualified",
+            "qualification_score": 9.0, "qualification_floor": 7.0,
+            "preference_score": 8.0, "outcome_score": 8.0, "final_score": 9.0,
+            "decision_confidence": 0.9, "decision_created_at": now,
+            "decision_expires_at": now + timedelta(days=1), "input_hash": "hash-browser",
+        }], approved_batch="batch-browser")
 
     loop = WorkerLoop(
         lambda: pgqueue.connect(fleet_db),
@@ -102,7 +126,8 @@ def test_worker_requeues_untouched_browser_preflight_failure(fleet_db):
     assert events == 0
 
 
-def test_apply_fn_restarts_browser_once_before_reporting_failure(monkeypatch):
+def test_apply_fn_restarts_browser_once_before_reporting_failure(monkeypatch, tmp_path):
+    _isolate_lifecycle_faults(monkeypatch, tmp_path)
     from applypilot.apply import chrome, launcher
     from applypilot.fleet import apply_worker_main
 

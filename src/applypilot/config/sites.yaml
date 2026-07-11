@@ -102,8 +102,6 @@ auth_gated:
     - "workdayjobs.com"
     - "taleo.net"
     - "successfactors.com"
-    - "greenhouse.io"
-    - "boards.greenhouse.io"
     - "icims.com"
     - "brassring.com"
     - "adp.com"

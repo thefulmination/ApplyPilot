@@ -1,8 +1,35 @@
 """Tests for apply-readiness state surfaced by /api/status."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import console_app, queue
+
+
+def _canonical(conn, url: str, score: float) -> dict:
+    policy = "console-ats-policy"
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'ats','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy,),
+        )
+        cur.execute(
+            "UPDATE fleet_config SET ats_policy_version=%s,ats_apply_mode='steady',"
+            "paused=FALSE,ats_paused=FALSE WHERE id=1",
+            (policy,),
+        )
+    conn.commit()
+    return {
+        "decision_id": f"decision-{url}", "policy_version": policy,
+        "decision_action": "apply", "qualification_verdict": "qualified",
+        "qualification_score": 9.0, "qualification_floor": 7.0,
+        "preference_score": 8.0, "outcome_score": 8.0, "final_score": score,
+        "decision_confidence": 0.9, "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1), "input_hash": f"hash-{url}",
+    }
 
 
 def test_apply_state_ready_when_leaseable_jobs_exist(fleet_db, monkeypatch) -> None:
@@ -17,6 +44,7 @@ def test_apply_state_ready_when_leaseable_jobs_exist(fleet_db, monkeypatch) -> N
                 "application_url": "https://boards.greenhouse.io/acme/jobs/1/apply",
                 "score": 9.0,
                 "target_host": "boards.greenhouse.io",
+                **_canonical(conn, "https://boards.greenhouse.io/acme/jobs/1", 9.0),
             }],
             approved_batch="batch-1",
         )
@@ -43,6 +71,7 @@ def test_apply_state_reports_dedup_blocked_when_all_approved_rows_blocked(fleet_
                 "application_url": "https://boards.greenhouse.io/acme/jobs/2/apply",
                 "score": 8.8,
                 "target_host": "boards.greenhouse.io",
+                **_canonical(conn, "https://boards.greenhouse.io/acme/jobs/2", 8.8),
             }],
             approved_batch="batch-2",
         )
@@ -123,6 +152,7 @@ def test_apply_state_reflects_spend_cap_reached(fleet_db, monkeypatch) -> None:
                 "application_url": "https://boards.greenhouse.io/acme/jobs/4/apply",
                 "score": 9.0,
                 "target_host": "boards.greenhouse.io",
+                **_canonical(conn, "https://boards.greenhouse.io/acme/jobs/4", 9.0),
             }],
             approved_batch="batch-2",
         )

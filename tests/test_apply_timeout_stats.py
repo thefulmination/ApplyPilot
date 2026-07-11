@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from applypilot.apply import launcher
+from applypilot.apply import lifecycle_fault
 
 
 class _FakeStdin:
@@ -48,6 +50,7 @@ def _job() -> dict:
 
 
 def test_timeout_records_last_run_stats(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
     monkeypatch.setattr(launcher.config, "APP_DIR", tmp_path)
     monkeypatch.setattr(launcher, "AGENT_TIMEOUT_SECONDS", 0)
@@ -57,7 +60,12 @@ def test_timeout_records_last_run_stats(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **k: _FakeProc())
     monkeypatch.setattr(launcher.threading, "Thread", _FakeThread)
-    monkeypatch.setattr(launcher, "_kill_process_tree", lambda pid: None)
+    monkeypatch.setattr(
+        launcher,
+        "_acquire_agent_child_guard",
+        lambda proc: SimpleNamespace(release=lambda: None),
+    )
+    monkeypatch.setattr(launcher, "_terminate_agent_child", lambda *args: None)
     monkeypatch.setattr(launcher, "add_event", lambda *a, **k: None)
     monkeypatch.setattr(launcher, "update_state", lambda *a, **k: None)
     monkeypatch.setattr(launcher, "_last_run_stats", {}, raising=False)
