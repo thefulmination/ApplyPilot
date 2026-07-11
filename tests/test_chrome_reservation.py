@@ -162,6 +162,7 @@ def test_successful_cleanup_releases_process_port_and_reservation(tmp_path: Path
     profile = tmp_path / "profile-6"
     reservation = chrome._acquire_browser_reservation(6, 9406, profile)
     process = _FakeProcess()
+    chrome._chrome_procs[6] = process
     chrome._browser_reservations[id(process)] = reservation
     monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: setattr(process, "alive", False))
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
@@ -180,6 +181,7 @@ def test_failed_cleanup_returns_false_and_keeps_reservation(tmp_path: Path, monk
     profile = tmp_path / "profile-8"
     reservation = chrome._acquire_browser_reservation(8, 9408, profile)
     process = _FakeProcess()
+    chrome._chrome_procs[8] = process
     chrome._browser_reservations[id(process)] = reservation
     monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: None)
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: True)
@@ -191,6 +193,49 @@ def test_failed_cleanup_returns_false_and_keeps_reservation(tmp_path: Path, monk
     process.alive = False
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     assert chrome.cleanup_worker(8, process) is True
+
+
+def test_cleanup_worker_does_not_kill_foreign_process(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("APPLYPILOT_CHROME_CLEANUP_TIMEOUT", "0")
+    owner = _FakeProcess(111)
+    foreign = _FakeProcess(222)
+    reservation = chrome._acquire_browser_reservation(0, 9400, tmp_path / "profile-0")
+    chrome._chrome_procs[0] = owner
+    chrome._browser_reservations[id(owner)] = reservation
+    killed = []
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_close_job", lambda worker_id: killed.append(f"job:{worker_id}"))
+
+    assert chrome.cleanup_worker(0, foreign) is False
+    assert killed == []
+
+    owner.alive = False
+    monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
+    assert chrome.cleanup_worker(0, owner) is True
+
+
+def test_cleanup_worker_wrong_worker_id_leaves_owner_untouched(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("APPLYPILOT_CHROME_CLEANUP_TIMEOUT", "0")
+    owner = _FakeProcess(333)
+    reservation = chrome._acquire_browser_reservation(0, 9400, tmp_path / "profile-0")
+    chrome._chrome_procs[0] = owner
+    chrome._browser_reservations[id(owner)] = reservation
+    killed = []
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_close_job", lambda worker_id: killed.append(f"job:{worker_id}"))
+
+    assert chrome.cleanup_worker(1, owner) is False
+    assert killed == []
+
+    owner.alive = False
+    monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
+    assert chrome.cleanup_worker(0, owner) is True
 
 
 def test_linkedin_login_cannot_kill_another_process_port_owner(tmp_path: Path, monkeypatch) -> None:

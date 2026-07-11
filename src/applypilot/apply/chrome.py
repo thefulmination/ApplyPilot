@@ -58,8 +58,9 @@ class BrowserSlotOccupiedError(RuntimeError):
 
 
 class _BrowserReservation:
-    def __init__(self, handles, *, port: int, profile_dir: Path) -> None:
+    def __init__(self, handles, *, worker_id: int, port: int, profile_dir: Path) -> None:
         self._handles = handles
+        self.worker_id = worker_id
         self.port = port
         self.profile_dir = profile_dir
         self._released = False
@@ -146,9 +147,19 @@ def _acquire_browser_reservation(
         for path in paths:
             handles.append(_try_lock_reservation_file(path))
     except Exception:
-        _BrowserReservation(handles, port=port, profile_dir=profile_dir).release()
+        _BrowserReservation(
+            handles,
+            worker_id=worker_id,
+            port=port,
+            profile_dir=profile_dir,
+        ).release()
         raise
-    return _BrowserReservation(handles, port=port, profile_dir=profile_dir)
+    return _BrowserReservation(
+        handles,
+        worker_id=worker_id,
+        port=port,
+        profile_dir=profile_dir,
+    )
 
 
 def _port_is_listening(port: int) -> bool:
@@ -191,6 +202,22 @@ def _reserve_browser_launch(
     except Exception:
         reservation.release()
         raise
+
+
+def cleanup_orphaned_browser(worker_id: int, port: int, profile_dir: Path) -> bool:
+    """Clean an unreserved browser orphan while holding slot/profile/port ownership."""
+    try:
+        reservation = _acquire_browser_reservation(worker_id, port, profile_dir)
+    except BrowserSlotOccupiedError:
+        return False
+    try:
+        _kill_on_port(port)
+        return not _port_is_listening(port)
+    except Exception:
+        logger.debug("Orphan browser cleanup failed for slot %s", worker_id, exc_info=True)
+        return False
+    finally:
+        reservation.release()
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +816,21 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
         worker_id: Numeric worker identifier.
         process: The Popen handle returned by launch_chrome.
     """
-    if process and process.poll() is None:
+    with _chrome_lock:
+        registered = _chrome_procs.get(worker_id)
+        reservation = _browser_reservations.get(id(process)) if process is not None else None
+        owned = (
+            process is not None
+            and registered is process
+            and reservation is not None
+            and reservation.worker_id == worker_id
+            and not reservation._released
+        )
+    if not owned:
+        logger.error("[worker-%s] Refusing cleanup for an unowned browser process", worker_id)
+        return False
+
+    if process.poll() is None:
         _kill_process_tree(process.pid)
     _close_job(worker_id)
     deadline = time.monotonic() + max(
@@ -799,19 +840,15 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
     while process and process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.1)
 
-    with _chrome_lock:
-        reservation = _browser_reservations.get(id(process)) if process is not None else None
-    port = reservation.port if reservation is not None else BASE_CDP_PORT + worker_id
-    process_gone = process is None or process.poll() is not None
+    port = reservation.port
+    process_gone = process.poll() is not None
     cleanup_ok = process_gone and not _port_is_listening(port)
     if cleanup_ok:
         with _chrome_lock:
             if _chrome_procs.get(worker_id) is process:
                 _chrome_procs.pop(worker_id, None)
-            if process is not None:
-                _browser_reservations.pop(id(process), None)
-        if reservation is not None:
-            reservation.release()
+            _browser_reservations.pop(id(process), None)
+        reservation.release()
         logger.info("[worker-%d] Chrome cleaned up", worker_id)
     else:
         logger.error("[worker-%d] Chrome cleanup could not prove process and port release", worker_id)
@@ -825,7 +862,6 @@ def kill_all_chrome() -> None:
     """
     with _chrome_lock:
         procs = dict(_chrome_procs)
-        _chrome_procs.clear()
 
     for wid, proc in procs.items():
         cleanup_worker(wid, proc)
@@ -859,7 +895,6 @@ def cleanup_on_exit() -> None:
     """
     with _chrome_lock:
         procs = dict(_chrome_procs)
-        _chrome_procs.clear()
 
     for wid, proc in procs.items():
         cleanup_worker(wid, proc)

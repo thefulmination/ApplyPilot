@@ -25,10 +25,9 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from applypilot import config
-from applypilot.apply.chrome import _kill_on_port, BASE_CDP_PORT
+from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_orphaned_browser
 
 
 def _applied_count() -> int:
@@ -86,7 +85,13 @@ def _cleanup_orphans(log) -> None:
     Playwright-MCP node servers so a fresh agent can't be hijacked. A hard-killed run
     leaves these behind. Best-effort; never raises."""
     try:
-        _kill_on_port(BASE_CDP_PORT)
+        cleaned = cleanup_orphaned_browser(
+            0,
+            BASE_CDP_PORT,
+            config.CHROME_WORKER_DIR / "worker-0",
+        )
+        if not cleaned:
+            log("ORPHAN-CLEANUP: browser slot occupied or cleanup unconfirmed; left untouched")
     except Exception:
         pass
     # Kill orphaned Playwright MCP node servers (apply's browser automation). Matched by
@@ -187,23 +192,27 @@ def supervise(
     while True:
         elapsed_h = (time.monotonic() - start) / 3600.0
         if attempt >= max_attempts:
-            log(f"STOP: hit max_attempts={max_attempts}"); break
+            log(f"STOP: hit max_attempts={max_attempts}")
+            break
         if elapsed_h >= max_hours:
-            log(f"STOP: hit max_hours={max_hours:.1f}"); break
+            log(f"STOP: hit max_hours={max_hours:.1f}")
+            break
 
         applied_now = _applied_count()
         spent = session_spend(applied_now)
         if target_applied > 0:
             if applied_now >= target_applied:
                 log(f"STOP: applied target {target_applied} reached (applied={applied_now})")
-                write_done(f"target {target_applied} reached"); break
+                write_done(f"target {target_applied} reached")
+                break
             remaining = max(est_cost_per_apply, (target_applied - applied_now) * est_cost_per_apply)
         else:
             remaining = total_cost_usd - spent
             if remaining <= max(0.5, est_cost_per_apply):
                 log(f"STOP: budget ~${total_cost_usd:.0f} reached "
                     f"({applied_now - baseline} applies, spent ${spent:.2f})")
-                write_done("budget reached"); break
+                write_done("budget reached")
+                break
 
         attempt += 1
         _cleanup_orphans(log)
