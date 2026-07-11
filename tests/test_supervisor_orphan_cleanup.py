@@ -42,8 +42,8 @@ def test_reservation_contender_skips_before_process_enumeration_or_kill(monkeypa
     )
     monkeypatch.setattr(
         supervisor,
-        "_kill_auxiliary_process",
-        lambda pid: (_ for _ in ()).throw(AssertionError("must not kill")),
+        "terminate_verified_process",
+        lambda **identity: (_ for _ in ()).throw(AssertionError("must not kill")),
     )
 
     assert supervisor._cleanup_orphans(lambda message: None, owner=_owner()) is False
@@ -57,13 +57,17 @@ def test_only_owned_associated_auxiliary_is_cleaned(monkeypatch):
         supervisor,
         "_process_snapshot",
         lambda: [
-            {"pid": 101, "ppid": 100, "name": "python.exe", "command": "applypilot", "created": 11.0},
-            {"pid": 102, "ppid": 101, "name": "node.exe", "command": "node @playwright/mcp", "created": 12.0},
-            {"pid": 202, "ppid": 200, "name": "node.exe", "command": "node @playwright/mcp", "created": 12.0},
-            {"pid": 103, "ppid": 100, "name": "node.exe", "command": "node unrelated.js", "created": 12.0},
+            {"pid": 101, "ppid": 100, "name": "python.exe", "executable": "C:/Python/python.exe", "command": "applypilot", "created": 11.0},
+            {"pid": 102, "ppid": 101, "name": "node.exe", "executable": "C:/Node/node.exe", "command": "node @playwright/mcp", "created": 12.0},
+            {"pid": 202, "ppid": 200, "name": "node.exe", "executable": "C:/Node/node.exe", "command": "node @playwright/mcp", "created": 12.0},
+            {"pid": 103, "ppid": 100, "name": "node.exe", "executable": "C:/Node/node.exe", "command": "node unrelated.js", "created": 12.0},
         ],
     )
-    monkeypatch.setattr(supervisor, "_kill_auxiliary_process", lambda pid: killed.append(pid))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: killed.append(identity["pid"]) or True,
+    )
 
     assert supervisor._cleanup_orphans(lambda message: None, owner=_owner()) is True
     assert killed == [102]
@@ -80,7 +84,11 @@ def test_no_owner_pid_leaves_all_auxiliary_processes_untouched(monkeypatch):
         "_process_snapshot",
         lambda: [{"pid": 202, "ppid": 200, "name": "node.exe", "command": "node playwright"}],
     )
-    monkeypatch.setattr(supervisor, "_kill_auxiliary_process", lambda pid: killed.append(pid))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: killed.append(identity["pid"]) or True,
+    )
 
     assert supervisor._cleanup_orphans(lambda message: None, owner=None) is True
     assert killed == []
@@ -124,8 +132,8 @@ def test_public_browser_cleanup_ownership_releases_after_failure(tmp_path: Path,
     assert ownership is not None
     monkeypatch.setattr(
         chrome,
-        "_kill_on_port",
-        lambda port: (_ for _ in ()).throw(RuntimeError("kill failed")),
+        "_cleanup_reserved_listener",
+        lambda reservation: (_ for _ in ()).throw(RuntimeError("kill failed")),
     )
     try:
         try:
@@ -174,3 +182,103 @@ def test_valid_lifetime_descendants_are_cleaned_and_missing_timestamps_fail_clos
     ]
 
     assert supervisor._associated_auxiliary_pids(processes, owner=owner) == [102]
+
+
+def _cleanup_snapshots(
+    *, changed: bool = False, parent_changed: bool = False, disappeared: bool = False
+):
+    approved = [
+        {
+            "pid": 101,
+            "ppid": 100,
+            "name": "python.exe",
+            "executable": "C:/Python/python.exe",
+            "command": "python -m applypilot.cli apply",
+            "created": 11.0,
+        },
+        {
+            "pid": 102,
+            "ppid": 101,
+            "name": "node.exe",
+            "executable": "C:/Node/node.exe",
+            "command": "node @playwright/mcp",
+            "created": 12.0,
+        },
+    ]
+    if disappeared:
+        live = [approved[0]]
+    elif parent_changed:
+        live = [{**approved[0], "created": 31.0}, approved[1]]
+    elif changed:
+        live = [approved[0], {**approved[1], "created": 30.0, "command": "node unrelated.js"}]
+    else:
+        live = approved
+    return iter((approved, live))
+
+
+def test_auxiliary_identity_change_between_approval_and_kill_is_not_terminated(monkeypatch):
+    ownership = _Ownership()
+    snapshots = _cleanup_snapshots(changed=True)
+    terminated = []
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
+    assert terminated == []
+    assert ownership.release_calls == 1
+
+
+def test_auxiliary_parent_identity_change_before_kill_is_not_terminated(monkeypatch):
+    ownership = _Ownership()
+    snapshots = _cleanup_snapshots(parent_changed=True)
+    terminated = []
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
+    assert terminated == []
+    assert ownership.release_calls == 1
+
+
+def test_stable_auxiliary_identity_is_terminated_once(monkeypatch):
+    ownership = _Ownership()
+    snapshots = _cleanup_snapshots()
+    terminated = []
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is True
+    assert terminated == [
+        {"pid": 102, "created_at": 12.0, "executable": "C:/Node/node.exe"}
+    ]
+    assert ownership.release_calls == 1
+
+
+def test_auxiliary_disappearance_before_kill_is_safe_and_releases(monkeypatch):
+    ownership = _Ownership()
+    snapshots = _cleanup_snapshots(disappeared=True)
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **_identity: (_ for _ in ()).throw(AssertionError("must not terminate")),
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
+    assert ownership.release_calls == 1

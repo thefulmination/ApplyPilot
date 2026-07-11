@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -31,7 +30,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from applypilot import config
-from applypilot.apply.chrome import BASE_CDP_PORT, reserve_browser_cleanup
+from applypilot.apply.chrome import (
+    BASE_CDP_PORT,
+    reserve_browser_cleanup,
+    terminate_verified_process,
+)
 
 
 def _applied_count() -> int:
@@ -79,13 +82,25 @@ class SupervisedProcessIdentity:
     ended_at: float | None = None
 
 
+@dataclass(frozen=True)
+class AuxiliaryProcessIdentity:
+    pid: int
+    created_at: float
+    executable: str
+    command: str
+    parent_pid: int
+    parent_created_at: float
+    parent_executable: str
+    parent_command: str
+
+
 def _process_snapshot() -> list[dict]:
     """Return minimal process ancestry metadata; callers must hold browser ownership."""
     if sys.platform == "win32":
         script = (
             "Get-CimInstance Win32_Process | ForEach-Object {"
             "[pscustomobject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;"
-            "Name=$_.Name;CommandLine=$_.CommandLine;"
+            "Name=$_.Name;ExecutablePath=$_.ExecutablePath;CommandLine=$_.CommandLine;"
             "Created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()/1000}} | "
             "ConvertTo-Json -Compress"
         )
@@ -104,6 +119,7 @@ def _process_snapshot() -> list[dict]:
             "pid": int(row.get("ProcessId") or 0),
             "ppid": int(row.get("ParentProcessId") or 0),
             "name": str(row.get("Name") or ""),
+            "executable": str(row.get("ExecutablePath") or ""),
             "command": str(row.get("CommandLine") or ""),
             "created": float(row["Created"]) if row.get("Created") is not None else None,
         } for row in rows]
@@ -129,10 +145,18 @@ def _process_snapshot() -> list[dict]:
                 "pid": int(parts[0]),
                 "ppid": int(parts[1]),
                 "name": parts[7],
+                "executable": _process_executable(int(parts[0])),
                 "command": parts[8] if len(parts) == 9 else "",
                 "created": created,
             })
     return rows
+
+
+def _process_executable(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return ""
 
 
 def _owner_identity_is_valid(owner: SupervisedProcessIdentity) -> bool:
@@ -190,17 +214,80 @@ def _associated_auxiliary_pids(
     return sorted(set(eligible))
 
 
-def _kill_auxiliary_process(pid: int) -> None:
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
+def _associated_auxiliary_processes(
+    processes: list[dict],
+    owner: SupervisedProcessIdentity,
+) -> list[AuxiliaryProcessIdentity]:
+    rows = {int(row.get("pid") or 0): row for row in processes}
+    approved = []
+    for pid in _associated_auxiliary_pids(processes, owner):
+        row = rows.get(pid)
+        parent = rows.get(int(row.get("ppid") or 0)) if row is not None else None
+        if row is None or parent is None:
+            continue
+        try:
+            created_at = float(row["created"])
+            parent_created_at = float(parent["created"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        executable = str(row.get("executable") or "")
+        command = str(row.get("command") or "")
+        parent_executable = str(parent.get("executable") or "")
+        parent_command = str(parent.get("command") or "")
+        if not executable or not command or not parent_executable or not parent_command:
+            continue
+        approved.append(
+            AuxiliaryProcessIdentity(
+                pid=pid,
+                created_at=created_at,
+                executable=executable,
+                command=command,
+                parent_pid=int(row.get("ppid") or 0),
+                parent_created_at=parent_created_at,
+                parent_executable=parent_executable,
+                parent_command=parent_command,
+            )
         )
-    else:
-        os.kill(pid, signal.SIGKILL)
+    return approved
+
+
+def _validate_and_kill_auxiliary(
+    approved: AuxiliaryProcessIdentity,
+    owner: SupervisedProcessIdentity,
+) -> bool:
+    if not _owner_identity_is_valid(owner):
+        return False
+    live_rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+    live = live_rows.get(approved.pid)
+    parent = live_rows.get(approved.parent_pid)
+    if live is None or parent is None:
+        return False
+    try:
+        identity_matches = (
+            int(live.get("pid") or 0) == approved.pid
+            and int(live.get("ppid") or 0) == approved.parent_pid
+            and abs(float(live["created"]) - approved.created_at) < 0.001
+            and os.path.normcase(str(live.get("executable") or ""))
+            == os.path.normcase(approved.executable)
+            and str(live.get("command") or "") == approved.command
+            and int(parent.get("pid") or 0) == approved.parent_pid
+            and abs(float(parent["created"]) - approved.parent_created_at) < 0.001
+            and os.path.normcase(str(parent.get("executable") or ""))
+            == os.path.normcase(approved.parent_executable)
+            and str(parent.get("command") or "") == approved.parent_command
+            and owner.launched_at <= float(live["created"]) <= float(owner.ended_at)
+            and owner.launched_at <= float(parent["created"]) <= float(owner.ended_at)
+            and re.search(_ORPHAN_PATTERN, approved.command, flags=re.IGNORECASE)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not identity_matches:
+        return False
+    return terminate_verified_process(
+        pid=approved.pid,
+        created_at=approved.created_at,
+        executable=approved.executable,
+    )
 
 
 def _capture_supervised_identity(
@@ -210,7 +297,7 @@ def _capture_supervised_identity(
     try:
         row = next(row for row in _process_snapshot() if int(row.get("pid") or 0) == pid)
         created = row.get("created")
-        executable = str(row.get("name") or "")
+        executable = str(row.get("executable") or "")
         command = str(row.get("command") or "")
         if created is None or not executable or "applypilot.cli" not in command or "apply" not in command:
             return None
@@ -245,9 +332,13 @@ def _cleanup_orphans(
         processes = _process_snapshot() if owner is not None else []
         browser_cleaned = ownership.cleanup_browser()
         auxiliaries_cleaned = True
-        for pid in _associated_auxiliary_pids(processes, owner) if owner is not None else []:
+        approved_auxiliaries = (
+            _associated_auxiliary_processes(processes, owner) if owner is not None else []
+        )
+        for approved in approved_auxiliaries:
             try:
-                _kill_auxiliary_process(pid)
+                if not _validate_and_kill_auxiliary(approved, owner):
+                    auxiliaries_cleaned = False
             except Exception:
                 auxiliaries_cleaned = False
         return browser_cleaned and auxiliaries_cleaned

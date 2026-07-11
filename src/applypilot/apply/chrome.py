@@ -342,6 +342,106 @@ def _browser_identity_matches(
     )
 
 
+def terminate_verified_process(*, pid: int, created_at: float, executable: str) -> bool:
+    """Terminate only the process instance identified by PID, start time, and image."""
+    if pid <= 0 or created_at <= 0 or not executable:
+        return False
+    if platform.system() != "Windows":
+        actual = _process_identity(pid)
+        if (
+            actual is None
+            or abs(actual.created_at - created_at) >= 0.001
+            or _normalized_path(actual.executable) != _normalized_path(executable)
+        ):
+            return False
+        try:
+            os.kill(pid, __import__("signal").SIGKILL)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    process_terminate = 0x0001
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(
+        process_terminate | process_query_limited_information,
+        False,
+        pid,
+    )
+    if not handle:
+        return False
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            return False
+        creation_ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        handle_created_at = (creation_ticks - 116_444_736_000_000_000) / 10_000_000
+        image_buffer = ctypes.create_unicode_buffer(32768)
+        image_length = wintypes.DWORD(len(image_buffer))
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, image_buffer, ctypes.byref(image_length)
+        ):
+            return False
+        if (
+            abs(handle_created_at - created_at) >= 0.001
+            or _normalized_path(image_buffer.value) != _normalized_path(executable)
+        ):
+            return False
+        return bool(kernel32.TerminateProcess(handle, 1))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _terminate_reserved_listener(
+    reservation: _BrowserReservation,
+    listener_pid: int,
+) -> bool:
+    if _listener_pids(reservation.port) != [listener_pid]:
+        return False
+    current = _process_identity(listener_pid)
+    if not _browser_identity_matches(reservation.browser_identity, current):
+        return False
+    return terminate_verified_process(
+        pid=current.pid,
+        created_at=current.created_at,
+        executable=current.executable,
+    )
+
+
 def _cleanup_reserved_listener(reservation: _BrowserReservation) -> bool:
     listeners = _listener_pids(reservation.port)
     if not listeners:
@@ -352,7 +452,8 @@ def _cleanup_reserved_listener(reservation: _BrowserReservation) -> bool:
     actual = _process_identity(listener_pid)
     if not _browser_identity_matches(reservation.browser_identity, actual):
         return False
-    _kill_process_tree(listener_pid)
+    if not _terminate_reserved_listener(reservation, listener_pid):
+        return False
     return not _listener_pids(reservation.port)
 
 
@@ -490,38 +591,6 @@ def _kill_process_tree(pid: int) -> None:
                     pass
     except Exception:
         logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
-
-
-def _kill_on_port(port: int) -> None:
-    """Kill any process listening on a specific port (zombie cleanup).
-
-    Uses netstat on Windows, lsof on macOS/Linux.
-    """
-    try:
-        if platform.system() == "Windows":
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit():
-                        _kill_process_tree(int(pid))
-        else:
-            # macOS / Linux
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for pid_str in result.stdout.strip().splitlines():
-                pid_str = pid_str.strip()
-                if pid_str.isdigit():
-                    _kill_process_tree(int(pid_str))
-    except FileNotFoundError:
-        logger.debug("Port-kill tool not found (netstat/lsof) for port %d", port)
-    except Exception:
-        logger.debug("Failed to kill process on port %d", port, exc_info=True)
 
 
 def _assign_kill_on_close_job(worker_id: int, process: subprocess.Popen) -> None:
