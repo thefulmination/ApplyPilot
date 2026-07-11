@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -216,6 +217,19 @@ _SENSITIVE_QUERY_KEY_COMPOUNDS = frozenset(
         "verifycode",
     }
 )
+_SENSITIVE_PATH_MARKERS = frozenset(
+    {
+        "auth",
+        "authenticate",
+        "code",
+        "magic-link",
+        "magic_link",
+        "otp",
+        "token",
+        "verification",
+        "verify",
+    }
+)
 MAX_INBOX_AUTH_HINT_BYTES = 64 * 1024
 _AUTH_SECRET_MATERIAL_MULTIPLIER = 128
 _MIN_AUTH_SECRET_MATERIAL_BYTES = 4096
@@ -243,6 +257,18 @@ def _percent_escape_case(value: str, *, upper: bool) -> str:
     return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
 
 
+def _progressive_percent_decode_layers(value: str) -> Iterator[str]:
+    current = value
+    while True:
+        yield current
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        if len(decoded) >= len(current):
+            raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+        current = decoded
+
+
 def _exact_secret_variants(value: str) -> tuple[str, ...]:
     """Return every exact decode layer and its relevant encoded forms."""
     if not value:
@@ -261,8 +287,7 @@ def _exact_secret_variants(value: str) -> tuple[str, ...]:
             raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
         variants[candidate] = None
 
-    current = value
-    while True:
+    for current in _progressive_percent_decode_layers(value):
         plus_spaced = current.replace("+", " ")
         plus_decoded = unquote_plus(current)
         for candidate in (current, plus_spaced, plus_decoded):
@@ -271,13 +296,6 @@ def _exact_secret_variants(value: str) -> tuple[str, ...]:
             add(_percent_escape_case(candidate, upper=False))
             add(quote(candidate, safe=""))
             add(quote_plus(candidate, safe=""))
-
-        decoded = unquote(current)
-        if decoded == current:
-            break
-        if len(decoded) >= len(current):
-            raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
-        current = decoded
     return tuple(variants)
 
 
@@ -343,43 +361,84 @@ def _magic_link_secrets(url: str) -> set[str]:
             secrets.add(variant)
 
     add_variants(url)
-    parsed = urlsplit(url)
+    for url_layer in _progressive_percent_decode_layers(url):
+        parsed = urlsplit(url_layer)
 
-    raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
-    if separator:
-        username, password_separator, password = raw_userinfo.partition(":")
-        add_variants(username)
-        if password_separator:
-            add_variants(password)
+        raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
+        if separator:
+            username, password_separator, password = raw_userinfo.partition(":")
+            add_variants(username)
+            if password_separator:
+                add_variants(password)
 
-    hostname = parsed.hostname or ""
-    canonical_domain = canonical_ats_sender_domain(hostname)
-    if canonical_domain and hostname.endswith(f".{canonical_domain}"):
-        prefix = hostname[: -(len(canonical_domain) + 1)]
-        for label in prefix.split("."):
-            if _token_like_subdomain_label(label):
-                add_variants(label)
+        hostname = parsed.hostname or ""
+        canonical_domain = canonical_ats_sender_domain(hostname)
+        if canonical_domain and hostname.endswith(f".{canonical_domain}"):
+            prefix = hostname[: -(len(canonical_domain) + 1)]
+            for label in prefix.split("."):
+                if _token_like_subdomain_label(label):
+                    add_variants(label)
 
-    for raw_component in (parsed.query, parsed.fragment):
-        if not raw_component:
-            continue
-        for pair in raw_component.split("&"):
-            raw_key, separator, raw_value = pair.partition("=")
-            if not separator:
-                variants = _exact_secret_variants(pair)
-                if any(
-                    _specific_auth_value(variant, minimum=12)
-                    for variant in variants
-                ):
-                    add_variants(pair)
+        for raw_component in (parsed.query, parsed.fragment):
+            if not raw_component:
                 continue
-            if _sensitive_query_key(raw_key):
-                add_variants(raw_value)
+            for pair in raw_component.split("&"):
+                raw_key, separator, raw_value = pair.partition("=")
+                if not separator:
+                    variants = _exact_secret_variants(pair)
+                    if any(
+                        _specific_auth_value(variant, minimum=12)
+                        for variant in variants
+                    ):
+                        add_variants(pair)
+                    continue
+                if _sensitive_query_key(raw_key):
+                    add_variants(raw_value)
 
-    for segment in parsed.path.split("/"):
-        variants = _exact_secret_variants(segment)
-        if any(_token_like_path_segment(variant) for variant in variants):
-            add_variants(segment)
+        expect_path_secret = False
+        for segment in parsed.path.split("/"):
+            if not segment:
+                continue
+            normalized = segment.strip().lower()
+            if expect_path_secret:
+                add_variants(segment)
+                expect_path_secret = False
+                continue
+            if normalized in _SENSITIVE_PATH_MARKERS:
+                expect_path_secret = True
+                continue
+            variants = _exact_secret_variants(segment)
+            if any(_token_like_path_segment(variant) for variant in variants):
+                add_variants(segment)
+    return secrets
+
+
+def _inbox_auth_hint_secrets(hint: str) -> set[str]:
+    secrets: set[str] = set()
+    material_bytes = 0
+    material_budget = _secret_material_budget(hint)
+
+    def add_many(values) -> None:
+        nonlocal material_bytes
+        for value in values:
+            if not value or value in secrets:
+                continue
+            material_bytes += len(value.encode("utf-8", errors="strict"))
+            if material_bytes > material_budget:
+                raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+            secrets.add(value)
+
+    add_many(_exact_secret_variants(hint))
+    for hint_layer in _progressive_percent_decode_layers(hint):
+        for line in hint_layer.splitlines():
+            key, separator, value = line.partition("=")
+            normalized_key = key.strip().lower()
+            if not separator or normalized_key not in {"code", "magic_link"}:
+                continue
+            credential = value.strip()
+            add_many(_exact_secret_variants(credential))
+            if normalized_key == "magic_link":
+                add_many(_magic_link_secrets(credential))
     return secrets
 
 
@@ -394,15 +453,12 @@ def _validate_inbox_auth_hint(hint: str | None) -> str | None:
         raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
     if hint_bytes > MAX_INBOX_AUTH_HINT_BYTES:
         raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
-    for line in hint.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip().lower() == "magic_link" and value:
-            try:
-                _magic_link_secrets(value.strip())
-            except _InboxAuthHintRejected:
-                raise
-            except (UnicodeError, ValueError) as exc:
-                raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    try:
+        _inbox_auth_hint_secrets(hint)
+    except _InboxAuthHintRejected:
+        raise
+    except (UnicodeError, ValueError) as exc:
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
     return hint
 
 
@@ -417,14 +473,7 @@ def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
     """Remove prompt-only inbox credentials before text reaches durable sinks."""
     if not text or not hint:
         return text
-    secrets = {hint}
-    for line in hint.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip().lower() in {"code", "magic_link"} and value:
-            credential = value.strip()
-            secrets.add(credential)
-            if key.strip().lower() == "magic_link":
-                secrets.update(_magic_link_secrets(credential))
+    secrets = _inbox_auth_hint_secrets(hint)
     redacted = text
     for secret in sorted(secrets, key=len, reverse=True):
         if secret:

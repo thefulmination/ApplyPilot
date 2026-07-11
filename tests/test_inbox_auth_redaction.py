@@ -145,6 +145,39 @@ def test_magic_link_redactor_collects_every_deep_percent_decode_layer():
     assert ordinary in redacted
 
 
+def test_magic_link_redactor_parses_structures_at_every_url_and_hint_layer():
+    benign_encoded_pairs = "".join(
+        quote(f"&note{i}=ordinary{i}", safe="") for i in range(55)
+    )
+    nested_url = "https://boards.greenhouse.io/verify?token=n7"
+    encoded_hint = quote(
+        f"magic_link={quote(nested_url, safe='')}",
+        safe="",
+    )
+    hints = (
+        "magic_link=https://boards.greenhouse.io/verify?token%3Dq7",
+        "magic_link=https://boards.greenhouse.io/verify%2Fp7",
+        "magic_link=https://u7%3Ap8%40boards.greenhouse.io/verify",
+        (
+            "magic_link=https://boards.greenhouse.io/verify?note=ordinary"
+            f"{benign_encoded_pairs}%26auth%3Dl7"
+        ),
+        "magic_link=https://boards.greenhouse.io/verify%3Ftoken%3Dt7",
+        "magic_link=https://boards.greenhouse.io/verify%23verify%3Df7",
+        encoded_hint,
+    )
+    credentials = ("q7", "p7", "u7", "p8", "l7", "t7", "f7", "n7")
+    ordinary = "ordinary text and greenhouse.io remain"
+
+    redacted = " ".join(credentials) + " " + ordinary
+    for hint in hints:
+        redacted = launcher._redact_inbox_auth_secrets(redacted, hint)
+
+    for credential in credentials:
+        assert credential not in redacted
+    assert ordinary in redacted
+
+
 def test_auth_hint_size_boundary_is_accepted():
     hint = "code=" + "a" * (launcher.MAX_INBOX_AUTH_HINT_BYTES - len("code="))
     prefix = "https://boards.greenhouse.io/verify?note="
@@ -184,10 +217,12 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     short_token = "x7"
     userinfo = "user+name"
     subdomain_token = "cred839214"
+    delimiter_token = "delimiterCredentialABC987"
     secret = (
         f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io/"
         "verify/pathTokenABC123456"
-        f"?token={encoded_token}&verify={short_token}#state={standalone_token}"
+        f"?token={encoded_token}&verify={short_token}"
+        f"%26auth%3D{delimiter_token}#state={standalone_token}"
     )
     hint = f"magic_link={secret}"
     events = [
@@ -199,7 +234,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                         "type": "text",
                         "text": (
                             f"Used {standalone_token}, {decoded_token}, {short_token}, "
-                            f"{userinfo}, and {subdomain_token}; quick stays ordinary"
+                            f"{userinfo}, {subdomain_token}, and {delimiter_token}; "
+                            "quick stays ordinary"
                         ),
                     },
                     {
@@ -208,7 +244,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                         "input": {
                             "url": (
                                 f"https://tool.invalid/use/{encoded_token}/"
-                                f"{userinfo}/{subdomain_token}/{short_token}"
+                                f"{userinfo}/{subdomain_token}/{short_token}/"
+                                f"{delimiter_token}"
                             )
                         },
                     },
@@ -219,7 +256,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             "type": "result",
             "result": (
                 f"Used {standalone_token} {encoded_token} {short_token} "
-                f"{userinfo} {subdomain_token}; quick stays ordinary\nRESULT:APPLIED"
+                f"{userinfo} {subdomain_token} {delimiter_token}; "
+                "quick stays ordinary\nRESULT:APPLIED"
             ),
             "usage": {},
         },
@@ -262,6 +300,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             short_token,
             userinfo,
             subdomain_token,
+            delimiter_token,
         ):
             assert sensitive not in persisted
         assert launcher.INBOX_AUTH_REDACTION in persisted
@@ -278,6 +317,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             short_token,
             userinfo,
             subdomain_token,
+            delimiter_token,
         )
     )
     assert any(launcher.INBOX_AUTH_REDACTION in action for action in tool_actions)
