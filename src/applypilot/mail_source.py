@@ -449,9 +449,15 @@ def _gmail_query(*, since_days: int, gmail_raw_query: str | None) -> str:
     return query
 
 
-def _gmail_candidate_refs(service, *, query: str, budget: int) -> list[dict[str, Any]]:
-    """Fetch a complete bounded candidate snapshot or raise on MAX+1."""
-    target = budget + 1
+def _gmail_candidate_refs(
+    service,
+    *,
+    query: str,
+    budget: int,
+    fail_on_overflow: bool,
+) -> list[dict[str, Any]]:
+    """Fetch auth MAX+1 or preserve the outcome reader's capped pagination."""
+    target = budget + 1 if fail_on_overflow else budget
     refs: list[dict[str, Any]] = []
     page_token = None
     while len(refs) < target:
@@ -474,7 +480,9 @@ def _gmail_candidate_refs(service, *, query: str, budget: int) -> list[dict[str,
             raise MailSourceError("Gmail candidate list returned malformed messages")
         remaining = target - len(refs)
         refs.extend(page_refs[:remaining])
-        if len(page_refs) > remaining or len(refs) > budget:
+        if fail_on_overflow and (
+            len(page_refs) > remaining or len(refs) > budget
+        ):
             raise MailSourceOverflowError(
                 f"mail candidate snapshot exceeds max_messages={budget}"
             )
@@ -561,7 +569,12 @@ class GmailApiMailSource:
             since_days=since_days,
             gmail_raw_query=gmail_raw_query,
         )
-        refs = _gmail_candidate_refs(service, query=query, budget=budget)
+        refs = _gmail_candidate_refs(
+            service,
+            query=query,
+            budget=budget,
+            fail_on_overflow=False,
+        )
 
         messages: list[MailMessage] = []
         scanned_bytes = 0
@@ -639,7 +652,12 @@ class GmailApiAuthMailSource(GmailApiMailSource):
             since_days=since_days,
             gmail_raw_query=gmail_raw_query,
         )
-        refs = _gmail_candidate_refs(service, query=query, budget=budget)
+        refs = _gmail_candidate_refs(
+            service,
+            query=query,
+            budget=budget,
+            fail_on_overflow=True,
+        )
         messages: list[MailMessage] = []
         scanned_bytes = 0
         for index, ref in enumerate(refs):

@@ -149,12 +149,12 @@ def test_gmail_api_mail_source_fetch_maps_payload_to_mail_message():
     assert msg.date == "Wed, 01 Jul 2026 10:00:00 -0000"
     assert msg.body == "Hello body text."
 
-    assert fake_service.messages_obj.list_calls == [("me", "newer_than:7d", 6, None)]
+    assert fake_service.messages_obj.list_calls == [("me", "newer_than:7d", 5, None)]
     assert fake_service.messages_obj.get_calls == [("me", "1", "full")]
     assert len(fake_service.messages_obj.metadata_calls) == 1
 
 
-def test_gmail_api_candidate_overflow_fails_before_message_get():
+def test_gmail_auth_candidate_overflow_fails_before_message_get():
     pages = [
         {
             "messages": [{"id": str(index)} for index in range(500)],
@@ -169,7 +169,7 @@ def test_gmail_api_candidate_overflow_fails_before_message_get():
     service = _FakeGmailService(pages, {})
 
     with pytest.raises(mail_source.MailSourceOverflowError):
-        GmailApiMailSource(build_service=lambda: service).fetch(
+        GmailApiAuthMailSource(build_service=lambda: service).fetch(
             since_days=7,
             max_messages=1000,
         )
@@ -671,7 +671,7 @@ def test_gmail_api_mail_source_fetch_uses_gmail_raw_query_when_provided():
 
     assert result == []
     assert fake_service.messages_obj.list_calls == [
-        ("me", 'newer_than:7d (verification OR "magic link")', 6, None)
+        ("me", 'newer_than:7d (verification OR "magic link")', 5, None)
     ]
 
 
@@ -717,17 +717,18 @@ def test_gmail_api_mail_source_rejects_budget_above_1000_before_api_calls():
     assert fake_service.messages_obj.list_calls == []
 
 
-def test_gmail_api_mail_source_paginates_to_exact_caller_budget():
+def test_gmail_outcome_caps_same_mailbox_that_overflows_auth_snapshot():
     first_page = [{"id": str(index), "threadId": f"t-{index}"} for index in range(500)]
     second_page = [
         {"id": str(index), "threadId": f"t-{index}"}
-        for index in range(500, 650)
+        for index in range(500, 700)
     ]
-    fake_service = _FakeGmailService(
-        [
-            {"messages": first_page, "nextPageToken": "page-2"},
-            {"messages": second_page},
-        ],
+    pages = [
+        {"messages": first_page, "nextPageToken": "page-2"},
+        {"messages": second_page, "nextPageToken": "page-3"},
+    ]
+    outcome_service = _FakeGmailService(
+        pages,
         lambda message_id: {
             "id": message_id,
             "threadId": f"t-{message_id}",
@@ -735,14 +736,26 @@ def test_gmail_api_mail_source_paginates_to_exact_caller_budget():
         },
     )
 
-    result = GmailApiMailSource(build_service=lambda: fake_service).fetch(
+    result = GmailApiMailSource(build_service=lambda: outcome_service).fetch(
         since_days=7,
         max_messages=650,
     )
 
     assert len(result) == 650
     assert [message.id for message in result[-2:]] == ["648", "649"]
-    assert fake_service.messages_obj.list_calls == [
+    assert outcome_service.messages_obj.list_calls == [
+        ("me", "newer_than:7d", 500, None),
+        ("me", "newer_than:7d", 150, "page-2"),
+    ]
+
+    auth_service = _FakeGmailService(pages, {})
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        GmailApiAuthMailSource(build_service=lambda: auth_service).fetch(
+            since_days=7,
+            max_messages=650,
+        )
+    assert auth_service.messages_obj.list_calls == [
         ("me", "newer_than:7d", 500, None),
         ("me", "newer_than:7d", 151, "page-2"),
     ]
+    assert auth_service.messages_obj.metadata_calls == []
