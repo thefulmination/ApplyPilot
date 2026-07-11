@@ -797,7 +797,7 @@ class _FakeImapMailSourceOK:
     def __init__(self, *args, **kwargs):
         pass
 
-    def fetch(self, *, since_days, max_messages):
+    def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
         return []
 
 
@@ -805,7 +805,7 @@ class _FakeImapMailSourceLoginFails:
     def __init__(self, *args, **kwargs):
         pass
 
-    def fetch(self, *, since_days, max_messages):
+    def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
         raise deadman_mail_source.MailSourceError("IMAP login failed")
 
 
@@ -813,7 +813,7 @@ class _FakeImapMailSourceUnknownError:
     def __init__(self, *args, **kwargs):
         pass
 
-    def fetch(self, *, since_days, max_messages):
+    def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
         raise OSError("network unreachable")
 
 
@@ -824,6 +824,26 @@ def test_mail_source_alive_true_when_app_password_login_succeeds(monkeypatch):
     monkeypatch.setattr(deadman, "ImapMailSource", _FakeImapMailSourceOK)
 
     assert deadman.mail_source_alive() is True
+
+
+def test_mail_source_alive_uses_the_relay_gmail_filter(monkeypatch):
+    observed = {}
+
+    class _CapturingImapMailSource:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch(self, **kwargs):
+            observed.update(kwargs)
+            return []
+
+    monkeypatch.setattr(
+        deadman.config, "load_gmail_app_password", lambda: ("a@b.com", "pw")
+    )
+    monkeypatch.setattr(deadman, "ImapMailSource", _CapturingImapMailSource)
+
+    assert deadman.mail_source_alive() is True
+    assert observed["gmail_raw_query"] == deadman.inbox_auth.AUTH_GMAIL_RAW_QUERY
 
 
 def test_mail_source_alive_false_when_app_password_login_raises_mail_source_error(monkeypatch):

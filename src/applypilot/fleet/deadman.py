@@ -22,7 +22,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from applypilot import config
+from applypilot import config, inbox_auth
 from applypilot.mail_source import ImapMailSource, MailSourceError
 
 # ---------------------------------------------------------------------------
@@ -385,7 +385,11 @@ def mail_source_alive() -> bool | None:
         return gmail_token_alive()
 
     try:
-        ImapMailSource(creds[0], creds[1]).fetch(since_days=1, max_messages=1)
+        ImapMailSource(creds[0], creds[1]).fetch(
+            since_days=1,
+            max_messages=1,
+            gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
+        )
         return True
     except MailSourceError:
         return False
