@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from applypilot.apply import supervisor
+
+
+def _enumeration(rows):
+    return supervisor.ProcessEnumeration(rows=rows, complete=True)
 
 
 class _Ownership:
@@ -52,6 +57,90 @@ def test_reservation_contender_skips_before_process_enumeration_or_kill(monkeypa
     assert supervisor._cleanup_orphans(lambda message: None, owner=_owner()) is False
 
 
+@pytest.mark.parametrize(
+    "effect",
+    [
+        subprocess.TimeoutExpired("powershell", 30),
+        OSError("powershell unavailable"),
+    ],
+)
+def test_windows_process_enumeration_exception_is_uncertain(effect, monkeypatch):
+    monkeypatch.setattr(supervisor.sys, "platform", "win32")
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(effect),
+    )
+
+    result = supervisor._process_snapshot()
+
+    assert result.complete is False
+    assert result.rows == []
+    assert result.reason == "windows_process_query_failed"
+
+
+def test_windows_invalid_json_enumeration_is_uncertain(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = "not-json"
+
+    monkeypatch.setattr(supervisor.sys, "platform", "win32")
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    result = supervisor._process_snapshot()
+
+    assert result.complete is False
+    assert result.reason == "windows_process_output_invalid"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "reason"),
+    [
+        (1, "", "posix_process_query_failed"),
+        (0, "malformed process row", "posix_process_output_invalid"),
+        (
+            0,
+            "10 1 invalid timestamp python python -m applypilot.cli apply\n",
+            "posix_process_output_invalid",
+        ),
+    ],
+)
+def test_posix_process_enumeration_failure_is_uncertain(
+    returncode, stdout, reason, monkeypatch
+):
+    class Result:
+        def __init__(self):
+            self.returncode = returncode
+            self.stdout = stdout
+
+    monkeypatch.setattr(supervisor.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    result = supervisor._process_snapshot()
+
+    assert result.complete is False
+    assert result.reason == reason
+
+
+def test_posix_local_time_conversion_failure_is_uncertain(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = "10 1 Sat Jul 11 12:34:56 2026 python python apply\n"
+
+    monkeypatch.setattr(supervisor.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(
+        supervisor,
+        "parse_ps_lstart_local",
+        lambda _value: (_ for _ in ()).throw(OSError("timezone conversion failed")),
+    )
+
+    result = supervisor._process_snapshot()
+
+    assert result.complete is False
+    assert result.reason == "posix_process_output_invalid"
+
+
 def test_only_owned_associated_auxiliary_is_cleaned(monkeypatch):
     ownership = _Ownership()
     killed = []
@@ -59,12 +148,12 @@ def test_only_owned_associated_auxiliary_is_cleaned(monkeypatch):
     monkeypatch.setattr(
         supervisor,
         "_process_snapshot",
-        lambda: [
+        lambda: _enumeration([
             {"pid": 101, "ppid": 100, "name": "python.exe", "executable": "C:/Python/python.exe", "command": "applypilot", "created": 11.0},
             {"pid": 102, "ppid": 101, "name": "node.exe", "executable": "C:/Node/node.exe", "command": "node @playwright/mcp", "created": 12.0},
             {"pid": 202, "ppid": 200, "name": "node.exe", "executable": "C:/Node/node.exe", "command": "node @playwright/mcp", "created": 12.0},
             {"pid": 103, "ppid": 100, "name": "node.exe", "executable": "C:/Node/node.exe", "command": "node unrelated.js", "created": 12.0},
-        ],
+        ]),
     )
     monkeypatch.setattr(
         supervisor,
@@ -85,7 +174,9 @@ def test_no_owner_pid_leaves_all_auxiliary_processes_untouched(monkeypatch):
     monkeypatch.setattr(
         supervisor,
         "_process_snapshot",
-        lambda: [{"pid": 202, "ppid": 200, "name": "node.exe", "command": "node playwright"}],
+        lambda: _enumeration([
+            {"pid": 202, "ppid": 200, "name": "node.exe", "command": "node playwright"}
+        ]),
     )
     monkeypatch.setattr(
         supervisor,
@@ -101,10 +192,96 @@ def test_no_owner_pid_leaves_all_auxiliary_processes_untouched(monkeypatch):
 def test_cleanup_failure_releases_ownership(monkeypatch):
     ownership = _Ownership(cleanup_error=RuntimeError("cleanup failed"))
     monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
 
     assert supervisor._cleanup_orphans(lambda message: None, owner=_owner()) is False
     assert ownership.release_calls == 1
+
+
+def test_incomplete_owned_descendant_candidate_fails_before_browser_cleanup(monkeypatch):
+    ownership = _Ownership()
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(
+        supervisor,
+        "_process_snapshot",
+        lambda: _enumeration(
+            [
+                {
+                    "pid": 101,
+                    "ppid": 100,
+                    "name": "python.exe",
+                    "executable": "C:/Python/python.exe",
+                    "command": "python -m applypilot.cli apply",
+                    "created": 11.0,
+                },
+                {
+                    "pid": 102,
+                    "ppid": 101,
+                    "name": "node.exe",
+                    "executable": "",
+                    "command": "node @playwright/mcp",
+                    "created": 12.0,
+                },
+            ]
+        ),
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
+    assert ownership.cleanup_calls == 0
+    assert ownership.release_calls == 1
+
+
+def test_incomplete_live_owner_identity_with_candidate_fails_closed(monkeypatch):
+    ownership = _Ownership()
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(
+        supervisor,
+        "_process_snapshot",
+        lambda: _enumeration(
+            [
+                {
+                    "pid": 100,
+                    "ppid": 1,
+                    "name": "python.exe",
+                    "executable": "",
+                    "command": "",
+                    "created": 10.0,
+                },
+                {
+                    "pid": 102,
+                    "ppid": 100,
+                    "name": "node.exe",
+                    "executable": "C:/Node/node.exe",
+                    "command": "node @playwright/mcp",
+                    "created": 12.0,
+                },
+            ]
+        ),
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
+    assert ownership.cleanup_calls == 0
+    assert ownership.release_calls == 1
+
+
+def test_posix_lstart_local_epoch_controls_owner_lifetime_match(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = (
+            "101 100 Sat Jul 11 12:34:56 2026 python python -m applypilot.cli apply\n"
+            "102 101 Sat Jul 11 12:35:00 2026 node node @playwright/mcp\n"
+        )
+
+    epochs = iter([11.0, 12.0])
+    monkeypatch.setattr(supervisor.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(supervisor, "parse_ps_lstart_local", lambda _value: next(epochs))
+    monkeypatch.setattr(supervisor, "_process_executable", lambda pid: f"/proc/{pid}/exe")
+
+    result = supervisor._process_snapshot()
+
+    assert result.complete is True
+    assert supervisor._associated_auxiliary_pids(result.rows, _owner()) == [102]
 
 
 def test_associated_auxiliary_requires_descendant_node_and_marker():
@@ -216,7 +393,7 @@ def _cleanup_snapshots(
         live = [approved[0], {**approved[1], "created": 30.0, "command": "node unrelated.js"}]
     else:
         live = approved
-    return iter((approved, approved, live))
+    return iter((_enumeration(approved), _enumeration(approved), _enumeration(live)))
 
 
 def _verified_termination_recorder(terminated):
@@ -327,7 +504,7 @@ def _supervised_child_identity() -> supervisor.SupervisedProcessIdentity:
 
 
 def _supervised_live_rows(*, child_created=12.0, parent_created=5.0):
-    return [
+    return _enumeration([
         {
             "pid": 50,
             "ppid": 1,
@@ -344,7 +521,7 @@ def _supervised_live_rows(*, child_created=12.0, parent_created=5.0):
             "command": "python -m applypilot.cli apply --continuous",
             "created": child_created,
         },
-    ]
+    ])
 
 
 def test_supervisor_child_identity_change_before_termination_is_refused(monkeypatch):
@@ -464,7 +641,7 @@ def test_orphan_cleanup_fault_persists_restart_interlock(tmp_path, monkeypatch):
         supervisor._enforce_hard_fault_gate()
 
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: False)
     with pytest.raises(RuntimeError, match="marker retained"):
         supervisor._enforce_hard_fault_gate()
@@ -574,7 +751,7 @@ def test_identityless_marker_retained_when_pid_live_or_uncertain(
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("guard unavailable", pid=501)
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: exists)
 
     with pytest.raises(RuntimeError, match="marker retained"):
@@ -589,7 +766,7 @@ def test_identityless_marker_clears_only_when_pid_definitively_absent(
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("guard unavailable", pid=501)
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: False)
 
     supervisor._enforce_hard_fault_gate()
@@ -601,7 +778,7 @@ def test_identityless_marker_retained_when_pid_status_query_raises(tmp_path, mon
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("guard unavailable", pid=501)
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(
         supervisor,
         "_process_exists",
@@ -632,7 +809,7 @@ def test_full_marker_retains_on_incomplete_or_same_start_identity_uncertainty(
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [current])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([current]))
 
     with pytest.raises(RuntimeError, match="marker retained"):
         supervisor._enforce_hard_fault_gate()
@@ -647,14 +824,14 @@ def test_full_marker_clears_when_creation_identity_proves_pid_reuse(tmp_path, mo
     monkeypatch.setattr(
         supervisor,
         "_process_snapshot",
-        lambda: [
+        lambda: _enumeration([
             {
                 "pid": 501,
                 "created": 99.0,
                 "executable": "C:/Python/python.exe",
                 "command": "python -m applypilot.cli apply --continuous",
             }
-        ],
+        ]),
     )
 
     supervisor._enforce_hard_fault_gate()
@@ -666,7 +843,7 @@ def test_explicit_reconciliation_clears_only_proven_gone_child(tmp_path, monkeyp
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
-    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(supervisor, "_process_exists", lambda pid: False)
 
     supervisor._enforce_hard_fault_gate()

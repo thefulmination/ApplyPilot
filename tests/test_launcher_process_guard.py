@@ -7,8 +7,8 @@ import sys
 import pytest
 
 from applypilot.apply import launcher
-from applypilot.apply.process_guard import SpawnedChildGuard
 from applypilot.apply import process_guard
+from applypilot.apply.process_guard import SpawnedChildGuard
 
 
 class _RunningProcess:
@@ -171,9 +171,10 @@ def test_real_child_emergency_cleanup_reaps_without_leak():
 
 @pytest.mark.parametrize("cleanup_proven", [True, False])
 def test_launcher_guard_acquisition_failure_never_continues(
-    cleanup_proven, monkeypatch
+    cleanup_proven, tmp_path, monkeypatch
 ):
     process = _RunningProcess()
+    monkeypatch.setattr(launcher.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(launcher.SpawnedChildGuard, "acquire", lambda _proc: None)
     monkeypatch.setattr(
         launcher,
@@ -181,5 +182,73 @@ def test_launcher_guard_acquisition_failure_never_continues(
         lambda proc: proc is process and cleanup_proven,
     )
 
-    with pytest.raises(RuntimeError, match="stable agent child guard"):
+    expected = RuntimeError if cleanup_proven else launcher.LifecycleHardFault
+    with pytest.raises(expected, match="stable agent child guard"):
         launcher._acquire_agent_child_guard(process)
+    assert (tmp_path / "keepalive.hard-fault.json").exists() is (not cleanup_proven)
+
+
+def test_local_lstart_parser_uses_local_wall_time_mktime(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        process_guard.time,
+        "mktime",
+        lambda fields: captured.append(fields) or 321.5,
+    )
+
+    epoch = process_guard.parse_ps_lstart_local("Sat Jul 11 12:34:56 2026")
+
+    assert epoch == 321.5
+    assert captured[0].tm_year == 2026
+    assert captured[0].tm_isdst == -1
+
+
+def test_launcher_uncertain_guard_cleanup_persists_interlock_and_escapes_job_result(
+    tmp_path, monkeypatch
+):
+    import io
+
+    from applypilot.apply import supervisor
+
+    class Process:
+        pid = 8123
+        stdin = io.StringIO()
+        stdout = iter(())
+
+        def poll(self):
+            return None
+
+    process = Process()
+    monkeypatch.setattr(launcher.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(launcher.config, "APP_DIR", tmp_path)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda _path: None)
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda _worker: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(launcher, "_make_mcp_config", lambda _port: {})
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **_kwargs: ["agent"])
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(launcher.SpawnedChildGuard, "acquire", lambda _proc: None)
+    monkeypatch.setattr(launcher, "emergency_cleanup_direct_child", lambda _proc: False)
+    monkeypatch.setattr(launcher, "add_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *_args, **_kwargs: None)
+
+    job = {
+        "url": "https://example.invalid/job/1",
+        "application_url": "https://example.invalid/job/1",
+        "title": "Test Role",
+        "site": "Example",
+        "fit_score": 8,
+        "tailored_resume_path": None,
+    }
+    with pytest.raises(launcher.LifecycleHardFault):
+        launcher._run_job_impl(job, port=9400, worker_id=0)
+
+    marker = tmp_path / "keepalive.hard-fault.json"
+    assert marker.exists()
+    monkeypatch.delenv("APPLYPILOT_RECONCILE_HARD_FAULT", raising=False)
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    with pytest.raises(RuntimeError, match="hard-fault marker present"):
+        supervisor._enforce_hard_fault_gate()

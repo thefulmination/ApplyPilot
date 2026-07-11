@@ -1410,11 +1410,15 @@ def test_darwin_identity_uses_libproc_executable_and_preserves_command_spaces(
         "darwin_process_executable",
         lambda pid: executable_paths[pid],
     )
+    local_epochs = iter([200.0, 190.0])
+    monkeypatch.setattr(chrome, "parse_ps_lstart_local", lambda _value: next(local_epochs))
 
     identity = chrome._darwin_process_identity(500)
 
     assert identity is not None
+    assert identity.created_at == 200.0
     assert identity.executable == executable_paths[500]
     assert identity.command.startswith('"/Applications/Google Chrome.app')
     assert identity.profile_dir == "/Users/test/ApplyPilot Worker 0"
     assert identity.parent_executable == executable_paths[50]
+    assert identity.parent_created_at == 190.0

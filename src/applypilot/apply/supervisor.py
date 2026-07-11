@@ -20,14 +20,12 @@ apply subprocess dies, so recovery is automatic instead of a 40-minute manual ca
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +41,12 @@ from applypilot.apply.process_guard import (
     SpawnedChildGuard,
     darwin_process_executable,
     emergency_cleanup_direct_child,
+    parse_ps_lstart_local,
+)
+from applypilot.apply.lifecycle_fault import (
+    identity_digest,
+    lifecycle_hard_fault_marker,
+    persist_lifecycle_hard_fault,
 )
 
 
@@ -107,7 +111,14 @@ class AuxiliaryProcessIdentity:
     parent_command: str
 
 
-def _process_snapshot() -> list[dict]:
+@dataclass(frozen=True)
+class ProcessEnumeration:
+    rows: list[dict]
+    complete: bool
+    reason: str = ""
+
+
+def _process_snapshot() -> ProcessEnumeration:
     """Return minimal process ancestry metadata; callers must hold browser ownership."""
     if sys.platform == "win32":
         script = (
@@ -117,52 +128,70 @@ def _process_snapshot() -> list[dict]:
             "Created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()/1000}} | "
             "ConvertTo-Json -Compress"
         )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            return ProcessEnumeration([], False, "windows_process_query_failed")
+        if result.returncode != 0 or not result.stdout.strip():
+            return ProcessEnumeration([], False, "windows_process_query_failed")
+        try:
+            raw = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return ProcessEnumeration([], False, "windows_process_output_invalid")
+        rows = raw if isinstance(raw, list) else [raw]
+        if not all(isinstance(row, dict) for row in rows):
+            return ProcessEnumeration([], False, "windows_process_output_invalid")
+        try:
+            parsed = [{
+                "pid": int(row.get("ProcessId") or 0),
+                "ppid": int(row.get("ParentProcessId") or 0),
+                "name": str(row.get("Name") or ""),
+                "executable": str(row.get("ExecutablePath") or ""),
+                "command": str(row.get("CommandLine") or ""),
+                "created": (
+                    float(row["Created"]) if row.get("Created") is not None else None
+                ),
+            } for row in rows]
+        except (TypeError, ValueError):
+            return ProcessEnumeration([], False, "windows_process_output_invalid")
+        return ProcessEnumeration(parsed, True)
+
+    try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
+            ["ps", "-eo", "pid=,ppid=,lstart=,comm=,args="],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        raw = json.loads(result.stdout)
-        rows = raw if isinstance(raw, list) else [raw]
-        return [{
-            "pid": int(row.get("ProcessId") or 0),
-            "ppid": int(row.get("ParentProcessId") or 0),
-            "name": str(row.get("Name") or ""),
-            "executable": str(row.get("ExecutablePath") or ""),
-            "command": str(row.get("CommandLine") or ""),
-            "created": float(row["Created"]) if row.get("Created") is not None else None,
-        } for row in rows]
-
-    result = subprocess.run(
-        ["ps", "-eo", "pid=,ppid=,lstart=,comm=,args="],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    except Exception:
+        return ProcessEnumeration([], False, "posix_process_query_failed")
+    if result.returncode != 0:
+        return ProcessEnumeration([], False, "posix_process_query_failed")
     rows = []
     for line in result.stdout.splitlines():
         parts = line.strip().split(None, 8)
-        if len(parts) >= 8 and parts[0].isdigit() and parts[1].isdigit():
-            try:
-                created = datetime.strptime(
-                    " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"
-                ).replace(tzinfo=timezone.utc).timestamp()
-            except ValueError:
-                created = None
-            rows.append({
-                "pid": int(parts[0]),
-                "ppid": int(parts[1]),
-                "name": parts[7],
-                "executable": _process_executable(int(parts[0])),
-                "command": parts[8] if len(parts) == 9 else "",
-                "created": created,
-            })
-    return rows
+        if len(parts) < 8 or not parts[0].isdigit() or not parts[1].isdigit():
+            return ProcessEnumeration([], False, "posix_process_output_invalid")
+        try:
+            created = parse_ps_lstart_local(" ".join(parts[2:7]))
+        except (OSError, OverflowError, ValueError):
+            return ProcessEnumeration([], False, "posix_process_output_invalid")
+        rows.append({
+            "pid": int(parts[0]),
+            "ppid": int(parts[1]),
+            "name": parts[7],
+            "executable": _process_executable(int(parts[0])),
+            "command": parts[8] if len(parts) == 9 else "",
+            "created": created,
+        })
+    return ProcessEnumeration(rows, True)
 
 
 def _process_executable(pid: int) -> str:
@@ -266,6 +295,64 @@ def _associated_auxiliary_processes(
     return approved
 
 
+def _has_incomplete_owned_auxiliary_candidate(
+    processes: list[dict],
+    owner: SupervisedProcessIdentity,
+    approved: list[AuxiliaryProcessIdentity],
+) -> bool:
+    rows = {int(row.get("pid") or 0): row for row in processes}
+    current_owner = rows.get(owner.pid)
+    if current_owner is not None:
+        try:
+            owner_created = float(current_owner["created"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        if abs(owner_created - owner.created_at) >= 0.001:
+            return False
+        owner_executable = str(current_owner.get("executable") or "")
+        owner_command = str(current_owner.get("command") or "")
+        if (
+            not owner_executable
+            or not owner_command
+            or os.path.normcase(owner_executable) != os.path.normcase(owner.executable)
+            or owner_command != owner.command
+        ):
+            return True
+
+    descendants = {owner.pid}
+    changed = True
+    while changed:
+        changed = False
+        for row in processes:
+            pid = int(row.get("pid") or 0)
+            ppid = int(row.get("ppid") or 0)
+            if pid and ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+
+    approved_pids = {candidate.pid for candidate in approved}
+    for row in processes:
+        pid = int(row.get("pid") or 0)
+        if pid == owner.pid or pid not in descendants:
+            continue
+        name = os.path.basename(str(row.get("name") or "")).lower()
+        command = str(row.get("command") or "")
+        marker = bool(re.search(_ORPHAN_PATTERN, command, flags=re.IGNORECASE))
+        potentially_auxiliary = marker or (name in {"node", "node.exe"} and not command)
+        if not potentially_auxiliary:
+            continue
+        created = row.get("created")
+        if created is not None:
+            try:
+                if not owner.launched_at <= float(created) <= float(owner.ended_at):
+                    continue
+            except (TypeError, ValueError):
+                return True
+        if pid not in approved_pids:
+            return True
+    return False
+
+
 def _validate_and_kill_auxiliary(
     approved: AuxiliaryProcessIdentity,
     owner: SupervisedProcessIdentity,
@@ -286,7 +373,10 @@ def _auxiliary_authority_is_current(
 ) -> bool:
     if not _owner_identity_is_valid(owner):
         return False
-    live_rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+    snapshot = _process_snapshot()
+    if not snapshot.complete:
+        return False
+    live_rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
     live = live_rows.get(approved.pid)
     parent = live_rows.get(approved.parent_pid)
     if live is None or parent is None:
@@ -318,7 +408,10 @@ def _capture_supervised_identity(
     launched_at: float,
 ) -> SupervisedProcessIdentity | None:
     try:
-        rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+        snapshot = _process_snapshot()
+        if not snapshot.complete:
+            return None
+        rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
         row = rows[pid]
         parent_pid = int(row.get("ppid") or 0)
         parent = rows[parent_pid]
@@ -385,11 +478,7 @@ def _capture_guarded_supervised_child(
 
 
 def _hard_fault_marker() -> Path:
-    return config.DB_PATH.parent / "keepalive.hard-fault.json"
-
-
-def _identity_digest(value: str) -> str:
-    return "sha256:" + hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    return lifecycle_hard_fault_marker()
 
 
 def _persist_hard_fault(
@@ -398,22 +487,13 @@ def _persist_hard_fault(
     *,
     pid: int | None = None,
 ) -> Path:
-    marker = _hard_fault_marker()
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "version": 1,
-        "reason": reason[:160],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "pid": int(identity.pid if identity is not None else (pid or 0)),
-        "created_at": float(identity.created_at if identity is not None else 0.0),
-        "executable_name": os.path.basename(identity.executable) if identity is not None else "",
-        "executable_sha256": _identity_digest(identity.executable) if identity is not None else "",
-        "command_sha256": _identity_digest(identity.command) if identity is not None else "",
-    }
-    temp = marker.with_name(f"{marker.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    temp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    os.replace(temp, marker)
-    return marker
+    return persist_lifecycle_hard_fault(
+        reason,
+        pid=identity.pid if identity is not None else int(pid or 0),
+        created_at=identity.created_at if identity is not None else 0.0,
+        executable=identity.executable if identity is not None else "",
+        command=identity.command if identity is not None else "",
+    )
 
 
 def _clear_hard_fault(marker: Path) -> None:
@@ -434,10 +514,10 @@ def _enforce_hard_fault_gate() -> None:
         raise RuntimeError("hard-fault marker is invalid and was not cleared") from exc
     if pid <= 0:
         raise RuntimeError("hard-fault marker has no reconcilable PID; marker retained")
-    try:
-        rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
-    except Exception as exc:
-        raise RuntimeError("hard-fault process query uncertain; marker retained") from exc
+    snapshot = _process_snapshot()
+    if not snapshot.complete:
+        raise RuntimeError("hard-fault process query uncertain; marker retained")
+    rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
     current = rows.get(pid)
     if current is None:
         try:
@@ -469,21 +549,26 @@ def _enforce_hard_fault_gate() -> None:
     if not executable or not command:
         raise RuntimeError("hard-fault live identity uncertain; marker retained")
     exact = (
-        _identity_digest(executable) == payload.get("executable_sha256")
-        and _identity_digest(command) == payload.get("command_sha256")
+        identity_digest(executable) == payload.get("executable_sha256")
+        and identity_digest(command) == payload.get("command_sha256")
     )
     if not exact:
         raise RuntimeError("hard-fault live identity mismatch uncertain; marker retained")
 
     def final_authority() -> bool:
-        live = {int(row.get("pid") or 0): row for row in _process_snapshot()}.get(pid)
+        live_snapshot = _process_snapshot()
+        if not live_snapshot.complete:
+            return False
+        live = {
+            int(row.get("pid") or 0): row for row in live_snapshot.rows
+        }.get(pid)
         return bool(
             live is not None
             and live.get("created") is not None
             and abs(float(live["created"]) - created_at) < 0.001
-            and _identity_digest(str(live.get("executable") or ""))
+            and identity_digest(str(live.get("executable") or ""))
             == payload.get("executable_sha256")
-            and _identity_digest(str(live.get("command") or ""))
+            and identity_digest(str(live.get("command") or ""))
             == payload.get("command_sha256")
         )
 
@@ -514,12 +599,21 @@ def _cleanup_orphans(
         log("ORPHAN-CLEANUP: browser slot occupied; left all processes untouched")
         return False
     try:
-        processes = _process_snapshot() if owner is not None else []
-        browser_cleaned = ownership.cleanup_browser()
-        auxiliaries_cleaned = True
+        snapshot = _process_snapshot()
+        if not snapshot.complete:
+            log(f"ORPHAN-CLEANUP: process enumeration uncertain ({snapshot.reason})")
+            return False
+        processes = snapshot.rows
         approved_auxiliaries = (
             _associated_auxiliary_processes(processes, owner) if owner is not None else []
         )
+        if owner is not None and _has_incomplete_owned_auxiliary_candidate(
+            processes, owner, approved_auxiliaries
+        ):
+            log("ORPHAN-CLEANUP: owned auxiliary identity incomplete")
+            return False
+        browser_cleaned = ownership.cleanup_browser()
+        auxiliaries_cleaned = True
         for approved in approved_auxiliaries:
             try:
                 if not _validate_and_kill_auxiliary(approved, owner):
@@ -790,7 +884,10 @@ def _supervised_authority_is_current(expected: SupervisedProcessIdentity) -> boo
             or "apply" not in expected.command
         ):
             return False
-        rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+        snapshot = _process_snapshot()
+        if not snapshot.complete:
+            return False
+        rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
         child = rows.get(expected.pid)
         parent = rows.get(expected.parent_pid)
         if child is None or parent is None:

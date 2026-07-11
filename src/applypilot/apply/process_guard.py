@@ -6,7 +6,15 @@ import os
 import platform
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
+from datetime import datetime
+
+
+def parse_ps_lstart_local(value: str) -> float:
+    """Convert ps(1) local wall time to epoch using host timezone and DST rules."""
+    parsed = datetime.strptime(value, "%a %b %d %H:%M:%S %Y")
+    return float(time.mktime(parsed.timetuple()))
 
 
 def darwin_process_executable(pid: int) -> str:

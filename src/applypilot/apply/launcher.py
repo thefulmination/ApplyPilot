@@ -44,6 +44,10 @@ from applypilot.apply.process_guard import (
     SpawnedChildGuard,
     emergency_cleanup_direct_child,
 )
+from applypilot.apply.lifecycle_fault import (
+    LifecycleHardFault,
+    persist_lifecycle_hard_fault,
+)
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
     render_full, get_totals,
@@ -540,8 +544,15 @@ def _acquire_agent_child_guard(process: subprocess.Popen) -> SpawnedChildGuard:
     if guard is not None:
         return guard
     cleaned = emergency_cleanup_direct_child(process)
-    outcome = "reaped" if cleaned else "cleanup uncertain"
-    raise RuntimeError(f"stable agent child guard unavailable; direct child {outcome}")
+    if not cleaned:
+        persist_lifecycle_hard_fault(
+            "agent spawn guard unavailable cleanup uncertain",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(
+            "stable agent child guard unavailable; direct child cleanup uncertain"
+        )
+    raise RuntimeError("stable agent child guard unavailable; direct child reaped")
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)

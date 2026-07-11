@@ -18,11 +18,13 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 from applypilot import config
-from applypilot.apply.process_guard import darwin_process_executable
+from applypilot.apply.process_guard import (
+    darwin_process_executable,
+    parse_ps_lstart_local,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -416,9 +418,7 @@ def _darwin_process_identity(pid: int) -> BrowserProcessIdentity | None:
         parts = result.stdout.strip().split(None, 6)
         if result.returncode != 0 or len(parts) != 7:
             return None
-        created = datetime.strptime(
-            " ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"
-        ).replace(tzinfo=timezone.utc).timestamp()
+        created = parse_ps_lstart_local(" ".join(parts[1:6]))
         executable = darwin_process_executable(process_id)
         command = parts[6]
         if not executable or not command:
