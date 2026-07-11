@@ -157,6 +157,8 @@ def test_local_mode_passes_request_context_and_busy_inbox_default(monkeypatch):
     assert seen["provider_domain"] == "boards.greenhouse.io"
     assert seen["not_before"] >= before
     assert seen["not_before"].tzinfo is timezone.utc
+    assert callable(seen["claim_matches"])
+    assert "excluded_message_ids" not in seen
 
 
 def test_local_mode_returns_hint_only_after_durable_claim(monkeypatch):
@@ -177,10 +179,8 @@ def test_local_mode_returns_hint_only_after_durable_claim(monkeypatch):
         ), reasons=("verification_language",),
     )
     monkeypatch.setattr(launcher.inbox_auth, "watch_gmail_for_auth_code", lambda **_kw: match)
-    monkeypatch.setattr(launcher.inbox_auth, "record_inbox_event", lambda **_kw: 9)
-    monkeypatch.setattr(launcher.inbox_auth, "resolve_auth_challenge", lambda **_kw: True)
     monkeypatch.setattr(
-        launcher.inbox_auth, "claim_auth_match",
+        launcher.inbox_auth, "claim_unique_auth_match",
         lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("disk full")),
     )
 

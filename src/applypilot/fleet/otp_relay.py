@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 import psycopg
 
 from applypilot import inbox_auth
+from applypilot.auth_matching import unique_assignments as _global_unique_assignments
+from applypilot.mail_source import validate_max_messages
 
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
 _DEFAULT_SCAN_MAX_MESSAGES = 1000
@@ -233,58 +235,29 @@ def _eligible_for_request(request, match, received_at, skew_seconds: int) -> boo
 
 
 def _unique_assignments(pending, parsed, used_ids, skew_seconds: int):
-    remaining_requests = {
-        request["id"]: request for request in pending[:_MAX_RESPONDER_ITEMS]
-    }
-    remaining_messages = {}
+    remaining_messages = []
+    seen_message_ids = set()
     for match, received_at in parsed:
-        if match.message_id and match.message_id not in used_ids:
-            remaining_messages.setdefault(match.message_id, (match, received_at))
+        if (
+            match.message_id
+            and match.message_id not in used_ids
+            and match.message_id not in seen_message_ids
+        ):
+            seen_message_ids.add(match.message_id)
+            remaining_messages.append((match, received_at))
             if len(remaining_messages) == _MAX_RESPONDER_ITEMS:
                 break
-
-    request_edges = {}
-    message_edges = {message_id: [] for message_id in remaining_messages}
-    for request_id, request in remaining_requests.items():
-        eligible_ids = []
-        for message_id, (match, received_at) in remaining_messages.items():
-            if _eligible_for_request(request, match, received_at, skew_seconds):
-                eligible_ids.append(message_id)
-                message_edges[message_id].append(request_id)
-        request_edges[request_id] = eligible_ids
-
-    assigned_by_request = {}
-    seen_requests = set()
-    for start_request_id in remaining_requests:
-        if start_request_id in seen_requests or not request_edges[start_request_id]:
-            continue
-        component_requests = set()
-        component_messages = set()
-        request_queue = [start_request_id]
-        while request_queue:
-            request_id = request_queue.pop()
-            if request_id in component_requests:
-                continue
-            component_requests.add(request_id)
-            seen_requests.add(request_id)
-            for message_id in request_edges[request_id]:
-                if message_id in component_messages:
-                    continue
-                component_messages.add(message_id)
-                request_queue.extend(message_edges[message_id])
-
-        if len(component_requests) != len(component_messages):
-            continue
-        matching = _perfect_component_matching(component_requests, request_edges)
-        if matching is None or not _matching_is_unique(matching, request_edges):
-            continue
-        assigned_by_request.update(matching)
-
-    return [
-        (request, remaining_messages[assigned_by_request[request["id"]]][0])
-        for request in pending[:_MAX_RESPONDER_ITEMS]
-        if request["id"] in assigned_by_request
-    ]
+    assignments = _global_unique_assignments(
+        pending,
+        remaining_messages,
+        request_id=lambda request: request["id"],
+        message_id=lambda item: item[0].message_id,
+        eligible=lambda request, item: _eligible_for_request(
+            request, item[0], item[1], skew_seconds
+        ),
+        max_items=_MAX_RESPONDER_ITEMS,
+    )
+    return [(request, item[0]) for request, item in assignments]
 
 
 def _perfect_component_matching(component_requests, request_edges):
@@ -408,6 +381,7 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
                    max_messages: int = _DEFAULT_SCAN_MAX_MESSAGES, skew_seconds: int = 60,
                    answered_ttl_seconds: int | None = None) -> int:
     """Serialize mailbox scans and answer only unambiguous pending requests."""
+    requested_max_messages = validate_max_messages(max_messages, cap=None)
     lock_key = _responder_lock_key()
     acquired = False
     try:
@@ -424,7 +398,7 @@ def answer_pending(conn, gmail_service=None, *, window_minutes: int = 15,
             conn,
             gmail_service,
             window_minutes=window_minutes,
-            max_messages=max_messages,
+            max_messages=requested_max_messages,
             skew_seconds=skew_seconds,
             answered_ttl_seconds=answered_ttl_seconds,
         )
@@ -472,7 +446,9 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
     if not pending:
         return 0
     answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
-    scan_max_messages = min(max_messages, _MAX_RESPONDER_ITEMS)
+    scan_max_messages = min(
+        validate_max_messages(max_messages, cap=None), _MAX_RESPONDER_ITEMS
+    )
 
     if gmail_service is None:
         from applypilot.mail_source import get_mail_source

@@ -94,6 +94,10 @@ def test_auth_claim_index_migration_repairs_legacy_duplicate_links(tmp_path: Pat
         "SELECT inbox_event_id FROM auth_challenges ORDER BY id"
     ).fetchall()
     assert [row[0] for row in links] == [event_id, None]
+    repaired = conn.execute(
+        "SELECT status, resolved_at, last_error FROM auth_challenges ORDER BY id"
+    ).fetchall()[1]
+    assert tuple(repaired) == ("failed", None, "message_claim_conflict")
     assert {
         row[1] for row in conn.execute("PRAGMA index_list(auth_challenges)")
     } >= {"idx_auth_challenges_inbox_event_unique"}

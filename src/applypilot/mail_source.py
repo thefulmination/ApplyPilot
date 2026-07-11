@@ -19,6 +19,25 @@ from email.header import decode_header
 from email.message import Message
 from typing import Any, Protocol
 
+MAX_MAIL_MESSAGES = 1000
+
+
+def validate_max_messages(
+    value: int | str, *, cap: int | None = MAX_MAIL_MESSAGES
+) -> int:
+    """Accept only integral integer/string budgets within the backend safety cap."""
+    if isinstance(value, bool):
+        raise TypeError("max_messages must be an integer, not bool")
+    if isinstance(value, int):
+        budget = value
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        budget = int(value.strip())
+    else:
+        raise ValueError("max_messages must be an integer or integer string")
+    if cap is not None and budget > cap:
+        raise ValueError(f"max_messages must be <= {cap}")
+    return budget
+
 
 @dataclass
 class MailMessage:
@@ -151,10 +170,10 @@ class ImapMailSource:
         self,
         *,
         since_days: int,
-        max_messages: int,
+        max_messages: int | str,
         gmail_raw_query: str | None = None,
     ) -> list[MailMessage]:
-        budget = int(max_messages)
+        budget = validate_max_messages(max_messages)
         if budget <= 0:
             return []
 
@@ -253,7 +272,7 @@ class MailSource(Protocol):
         self,
         *,
         since_days: int,
-        max_messages: int,
+        max_messages: int | str,
         gmail_raw_query: str | None = None,
     ) -> list[MailMessage]:
         ...
@@ -285,14 +304,14 @@ class GmailApiMailSource:
         self,
         *,
         since_days: int,
-        max_messages: int,
+        max_messages: int | str,
         gmail_raw_query: str | None = None,
     ) -> list[MailMessage]:
-        from applypilot.gmail_outcomes import _get_text_body
-
-        budget = int(max_messages)
+        budget = validate_max_messages(max_messages)
         if budget <= 0:
             return []
+
+        from applypilot.gmail_outcomes import _get_text_body
 
         service = self._build_service()
         query = f"newer_than:{since_days}d"

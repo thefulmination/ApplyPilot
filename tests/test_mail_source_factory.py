@@ -1,5 +1,7 @@
 """Tests for the mail-source backend factory (no network -- fake Gmail service)."""
 
+import pytest
+
 from applypilot import config
 from applypilot.mail_source import GmailApiMailSource, ImapMailSource, get_mail_source
 
@@ -151,6 +153,29 @@ def test_gmail_api_mail_source_nonpositive_budget_skips_api_calls():
     assert source.fetch(since_days=7, max_messages=-1) == []
     assert fake_service.messages_obj.list_calls == []
     assert fake_service.messages_obj.get_calls == []
+
+
+@pytest.mark.parametrize("budget", [True, 1.5, float("nan"), float("inf"), "1.5", "nan", ""])
+def test_gmail_api_mail_source_rejects_malformed_budget_before_api_calls(budget):
+    fake_service = _FakeGmailService({"messages": [{"id": "1"}]}, {})
+    source = GmailApiMailSource(build_service=lambda: fake_service)
+
+    with pytest.raises((TypeError, ValueError), match="max_messages"):
+        source.fetch(since_days=7, max_messages=budget)
+
+    assert fake_service.messages_obj.list_calls == []
+    assert fake_service.messages_obj.get_calls == []
+
+
+def test_gmail_api_mail_source_rejects_budget_above_1000_before_api_calls():
+    fake_service = _FakeGmailService({"messages": [{"id": "1"}]}, {})
+
+    with pytest.raises(ValueError, match="1000"):
+        GmailApiMailSource(build_service=lambda: fake_service).fetch(
+            since_days=7, max_messages=1001
+        )
+
+    assert fake_service.messages_obj.list_calls == []
 
 
 def test_gmail_api_mail_source_paginates_to_exact_caller_budget():

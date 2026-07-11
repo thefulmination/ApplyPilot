@@ -651,9 +651,14 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
         ("idx_auth_challenges_inbox_event_unique",),
     ).fetchone()
     if claim_index_exists is None:
+        migration_now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
             UPDATE auth_challenges
-               SET inbox_event_id = NULL
+               SET status = 'failed',
+                   resolved_at = NULL,
+                   inbox_event_id = NULL,
+                   last_error = 'message_claim_conflict',
+                   updated_at = ?
              WHERE inbox_event_id IS NOT NULL
                AND id NOT IN (
                    SELECT MIN(id)
@@ -661,7 +666,7 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
                     WHERE inbox_event_id IS NOT NULL
                     GROUP BY inbox_event_id
                )
-        """)
+        """, (migration_now,))
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_challenges_inbox_event_unique
         ON auth_challenges(inbox_event_id)

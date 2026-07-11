@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from applypilot import inbox_auth
 from applypilot.fleet import otp_relay
 from applypilot.mail_source import MailMessage
@@ -71,6 +73,29 @@ def test_watch_nonpositive_budget_does_not_resolve_mail_source(monkeypatch):
 
     assert inbox_auth.watch_gmail_for_auth_code(max_messages=0) is None
     assert inbox_auth.watch_gmail_for_auth_code(max_messages=-1) is None
+
+
+@pytest.mark.parametrize("budget", [True, 1.5, float("nan"), float("inf"), "1.5", "nan", ""])
+def test_scanners_reject_malformed_budget_without_touching_inputs(budget):
+    class _MustNotTouch:
+        def __getitem__(self, key):
+            raise AssertionError(key)
+
+    with pytest.raises((TypeError, ValueError), match="max_messages"):
+        inbox_auth.scan_gmail_for_auth_codes(messages=_MustNotTouch(), max_messages=budget)
+    with pytest.raises((TypeError, ValueError), match="max_messages"):
+        inbox_auth.scan_gmail_for_auth_codes(service=_MustNotTouch(), max_messages=budget)
+
+
+def test_scanners_reject_budget_above_1000_without_touching_inputs():
+    class _MustNotTouch:
+        def __getitem__(self, key):
+            raise AssertionError(key)
+
+    with pytest.raises(ValueError, match="1000"):
+        inbox_auth.scan_gmail_for_auth_codes(messages=_MustNotTouch(), max_messages=1001)
+    with pytest.raises(ValueError, match="1000"):
+        inbox_auth.scan_gmail_for_auth_codes(service=_MustNotTouch(), max_messages=1001)
 
 
 def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():

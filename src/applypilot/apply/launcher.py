@@ -180,6 +180,23 @@ _agent_procs: dict[int, subprocess.Popen] = {}
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
+INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
+
+
+def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
+    """Remove prompt-only inbox credentials before text reaches durable sinks."""
+    if not text or not hint:
+        return text
+    secrets = [hint]
+    for line in hint.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().lower() in {"code", "magic_link"} and value:
+            secrets.append(value.strip())
+    redacted = text
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            redacted = redacted.replace(secret, INBOX_AUTH_REDACTION)
+    return redacted
 _agent_lock = threading.Lock()
 
 # Register cleanup on exit
@@ -1600,6 +1617,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         worker_id=worker_id,
         inbox_auth_hint=inbox_auth_hint,
     )
+    def redact_persistent(text) -> str:
+        return _redact_inbox_auth_secrets(str(text), inbox_auth_hint)
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
@@ -1691,7 +1710,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                 if bt == "text":
                                     text_parts.append(block["text"])
                                     _note_terminal_result(block["text"])
-                                    lf.write(block["text"] + "\n")
+                                    lf.write(redact_persistent(block["text"]) + "\n")
                                 elif bt == "tool_use":
                                     name = (
                                         block.get("name", "")
@@ -1702,9 +1721,13 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         application_tool_calls[0] += 1
                                     inp = block.get("input", {})
                                     if "url" in inp:
-                                        desc = f"{name} {inp['url'][:60]}"
+                                        safe_url = redact_persistent(inp["url"])
+                                        desc = f"{name} {safe_url[:60]}"
                                     elif "ref" in inp:
-                                        desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
+                                        detail = redact_persistent(
+                                            inp.get("element", inp.get("text", ""))
+                                        )
+                                        desc = f"{name} {detail}"[:50]
                                     elif "fields" in inp:
                                         desc = f"{name} ({len(inp['fields'])} fields)"
                                     elif "paths" in inp:
@@ -1712,12 +1735,19 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     else:
                                         desc = name
 
+                                    desc = redact_persistent(desc)
+
                                     lf.write(f"  >> {desc}\n")
                                     ws = get_state(worker_id)
                                     cur_actions = ws.actions if ws else 0
+                                    last_action = (
+                                        INBOX_AUTH_REDACTION
+                                        if INBOX_AUTH_REDACTION in desc
+                                        else desc[:35]
+                                    )
                                     update_state(worker_id,
                                                  actions=cur_actions + 1,
-                                                 last_action=desc[:35])
+                                                 last_action=last_action)
                         elif msg_type == "result":
                             stats_holder.update({
                                 "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
@@ -1742,17 +1772,23 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     _note_terminal_result(text)
                                     final_result_text.clear()
                                     final_result_text.append(text)
-                                    lf.write(text + "\n")
+                                    lf.write(redact_persistent(text) + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
                                 name = item.get("name") or item.get("tool_name") or item_type
                                 if _tool_call_touches_application(str(name)):
                                     application_tool_calls[0] += 1
-                                lf.write(f"  >> {name}\n")
+                                safe_name = redact_persistent(str(name))
+                                lf.write(f"  >> {safe_name}\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
+                                last_action = (
+                                    INBOX_AUTH_REDACTION
+                                    if INBOX_AUTH_REDACTION in safe_name
+                                    else safe_name[:35]
+                                )
                                 update_state(worker_id,
                                              actions=cur_actions + 1,
-                                             last_action=str(name)[:35])
+                                             last_action=last_action)
                         elif msg_type == "turn.completed":
                             usage = msg.get("usage", {})
                             stats_holder.update({
@@ -1771,11 +1807,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             # into a logged, diagnosable reason.
                             err = msg.get("message") or msg.get("error") or line
                             text_parts.append(str(err))
-                            lf.write(str(err) + "\n")
+                            lf.write(redact_persistent(str(err)) + "\n")
                     except json.JSONDecodeError:
                         text_parts.append(line)
                         _note_terminal_result(line)
-                        lf.write(line + "\n")
+                        lf.write(redact_persistent(line) + "\n")
 
         # Start reading BEFORE writing the prompt so a large prompt can't deadlock
         # against a full stdout pipe.
@@ -1831,6 +1867,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         proc = None
 
         output = "\n".join(text_parts)
+        persisted_output = redact_persistent(output)
         # Prefer the agent's FINAL result message for the RESULT code; only fall
         # back to scanning the full transcript when the final message has none.
         # This stops a page that merely contains the literal text
@@ -1845,14 +1882,16 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
+        job_log.write_text(persisted_output, encoding="utf-8")
         run_stats = dict(stats) if stats else {}
-        run_stats["transcript"] = output[-20000:]
+        run_stats["transcript"] = persisted_output[-20000:]
         run_stats["job_log"] = str(job_log)
         run_stats["job_log_path"] = str(job_log)
         run_stats["application_tool_calls"] = application_tool_calls[0]
         run_stats["transcript_digest"] = (
-            "sha256:" + hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
+            "sha256:" + hashlib.sha256(
+                persisted_output.encode("utf-8", errors="replace")
+            ).hexdigest()
         )
         run_stats["final_result_source"] = "final_message" if final_text and "RESULT:" in final_text else "transcript"
         _last_run_stats[worker_id] = run_stats
@@ -1910,6 +1949,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                         else "unknown"
                     )
                     reason = _clean_reason(reason)
+                    reason = redact_persistent(reason)
                     PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue", "auth_required"}
                     if reason in PROMOTE_TO_STATUS:
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
@@ -1942,9 +1982,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         return "failed:timeout", duration_ms
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
-        add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        safe_error = _redact_inbox_auth_secrets(str(e), inbox_auth_hint)
+        add_event(f"[W{worker_id}] ERROR: {safe_error[:40]}")
+        update_state(worker_id, status="failed", last_action=f"ERROR: {safe_error[:25]}")
+        return f"failed:{safe_error[:100]}", duration_ms
     finally:
         with _agent_lock:
             _agent_procs.pop(worker_id, None)
@@ -2173,14 +2214,8 @@ def _relay_inbox_auth_hint(job: dict) -> str | None:
 
 def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
     if match.candidate.kind == "magic_link":
-        return f"magic_link={match.candidate.value}\nreason={'; '.join(match.reasons)}"
-    return (
-        f"code={match.candidate.value}\n"
-        f"sender={match.sender}\n"
-        f"subject={match.subject}\n"
-        f"received_at={match.received_at or 'unknown'}\n"
-        f"reason={'; '.join(match.reasons)}"
-    )
+        return f"magic_link={match.candidate.value}"
+    return f"code={match.candidate.value}"
 
 
 def _poll_inbox_auth_hint(job: dict) -> str | None:
@@ -2202,7 +2237,11 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
         max_errors = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_ERRORS", "3"))
         minutes = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MINUTES", "15"))
-        max_messages = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "1000"))
+        from applypilot.mail_source import validate_max_messages
+
+        max_messages = validate_max_messages(
+            os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "1000")
+        )
         challenge_type = os.environ.get("APPLYPILOT_INBOX_AUTH_CHALLENGE_TYPE", "email_code").strip().lower()
         if challenge_type not in {"email_code", "magic_link"}:
             logger.debug(
@@ -2221,20 +2260,10 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         inbox_auth.mark_auth_challenge_attempt(challenge_id, "polling")
         inbox_auth.expire_stale_challenges()
 
-        def claim_match(match: inbox_auth.AuthEmailMatch) -> bool:
-            return inbox_auth.claim_auth_match(
+        def claim_matches(matches: list[inbox_auth.AuthEmailMatch]):
+            return inbox_auth.claim_unique_auth_match(
                 challenge_id,
-                message_id=match.message_id,
-                thread_id=match.thread_id,
-                sender=match.sender,
-                subject=match.subject,
-                event_type="auth_code",
-                confidence=match.candidate.confidence,
-                matched_job_url=job["url"],
-                matched_company=job.get("company"),
-                matched_method=match.candidate.kind,
-                snippet=match.snippet,
-                received_at=match.received_at,
+                matches,
             )
 
         match = inbox_auth.watch_gmail_for_auth_code(
@@ -2245,12 +2274,11 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
             max_messages=max_messages,
             not_before=challenge_started_at,
             provider_domain=provider,
-            excluded_message_ids=inbox_auth.claimed_auth_message_ids(),
-            claim_match=claim_match,
+            claim_matches=claim_matches,
         )
         if not match:
             return None
-        if not claim_match(match):
+        if inbox_auth.claim_unique_auth_match(challenge_id, [match]) is None:
             return None
 
         return _format_inbox_auth_hint(match)

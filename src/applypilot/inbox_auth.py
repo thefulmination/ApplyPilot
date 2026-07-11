@@ -12,6 +12,7 @@ from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 
 from applypilot.ats_domains import ATS_SENDER_DOMAINS, PROVIDER_DOMAIN_GROUPS
+from applypilot.auth_matching import unique_assignments
 from applypilot.database import get_connection
 
 Confidence = Literal["low", "medium", "high"]
@@ -601,7 +602,7 @@ def scan_gmail_for_auth_codes(
     service=None,
     messages=None,
     minutes: int = 10,
-    max_messages: int = 25,
+    max_messages: int | str = 25,
 ) -> list[AuthEmailMatch]:
     """Scan for high-confidence auth codes/magic links.
 
@@ -610,7 +611,9 @@ def scan_gmail_for_auth_codes(
       iterated directly through the frozen parser.
     - `service`: legacy Gmail-API service object -- back-compat path.
     """
-    budget = int(max_messages)
+    from applypilot.mail_source import validate_max_messages
+
+    budget = validate_max_messages(max_messages)
     if budget <= 0:
         return []
 
@@ -650,14 +653,17 @@ def watch_gmail_for_auth_code(
     poll_seconds: int = 5,
     max_errors: int = 3,
     minutes: int = 10,
-    max_messages: int = 25,
+    max_messages: int | str = 25,
     not_before: datetime | None = None,
     provider_domain: str | None = None,
     skew_seconds: int = 60,
     excluded_message_ids: set[str] | None = None,
     claim_match: Callable[[AuthEmailMatch], bool] | None = None,
+    claim_matches: Callable[[list[AuthEmailMatch]], AuthEmailMatch | None] | None = None,
 ) -> AuthEmailMatch | None:
-    budget = int(max_messages)
+    from applypilot.mail_source import validate_max_messages
+
+    budget = validate_max_messages(max_messages)
     if budget <= 0:
         return None
 
@@ -688,8 +694,8 @@ def watch_gmail_for_auth_code(
                 )
             matches = eligible_auth_matches(
                 matches,
-                not_before=not_before,
-                provider_domain=provider_domain,
+                not_before=None if claim_matches else not_before,
+                provider_domain=None if claim_matches else provider_domain,
                 skew_seconds=skew_seconds,
                 excluded_message_ids=excluded,
             )
@@ -698,6 +704,13 @@ def watch_gmail_for_auth_code(
                 or datetime.min.replace(tzinfo=timezone.utc),
                 reverse=True,
             )
+            if claim_matches is not None:
+                claimed = claim_matches(matches)
+                if claimed is not None:
+                    return claimed
+                errors = 0
+                time.sleep(max(0.0, poll_seconds))
+                continue
             for match in matches:
                 if claim_match is None or claim_match(match):
                     return match
@@ -918,18 +931,131 @@ def record_inbox_event(
         return int(row[0])
 
 
-def claimed_auth_message_ids() -> set[str]:
-    """Return message IDs already durably attached to an auth challenge."""
-    conn = get_connection()
-    rows = conn.execute(
+def _as_utc(value: datetime | None = None) -> datetime:
+    result = value or datetime.now(timezone.utc)
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
+def claimed_auth_message_ids(
+    candidate_message_ids: set[str],
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> set[str]:
+    """Return claimed IDs from a bounded current candidate set."""
+    if len(candidate_message_ids) > 1000:
+        raise ValueError("candidate_message_ids must contain <= 1000 values")
+    conn = connection or get_connection()
+    claimed: set[str] = set()
+    candidates = sorted(candidate_message_ids)
+    for offset in range(0, len(candidates), 900):
+        chunk = candidates[offset:offset + 900]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT event.message_id
+              FROM auth_challenges AS challenge
+              JOIN inbox_events AS event ON event.id = challenge.inbox_event_id
+             WHERE event.message_id IN ({placeholders})
+            """,
+            chunk,
+        ).fetchall()
+        claimed.update(str(row[0]) for row in rows)
+    return claimed
+
+
+def _claim_auth_match_in_transaction(
+    conn: sqlite3.Connection,
+    challenge_id: int,
+    *,
+    message_id: str,
+    now_text: str,
+    thread_id: str | None = None,
+    sender: str | None = None,
+    subject: str | None = None,
+    event_type: str = "auth_code",
+    confidence: Confidence = "low",
+    matched_job_url: str | None = None,
+    matched_company: str | None = None,
+    matched_method: str | None = None,
+    snippet: str | None = None,
+    received_at: str | None = None,
+) -> str:
+    existing = conn.execute(
         """
-        SELECT event.message_id
+        SELECT challenge.status, challenge.requested_at, challenge.expires_at,
+               event.message_id
           FROM auth_challenges AS challenge
-          JOIN inbox_events AS event ON event.id = challenge.inbox_event_id
-         WHERE challenge.inbox_event_id IS NOT NULL
+          LEFT JOIN inbox_events AS event ON event.id = challenge.inbox_event_id
+         WHERE challenge.id = ?
+        """,
+        (challenge_id,),
+    ).fetchone()
+    if existing is None:
+        return "rejected"
+    if existing[0] == "resolved":
+        return "idempotent" if existing[3] == message_id else "rejected"
+    if existing[0] not in ACTIVE_CHALLENGE_STATUSES:
+        return "rejected"
+    requested_at = _parse_utc_timestamp(existing[1])
+    expires_at = _parse_utc_timestamp(existing[2])
+    reference = _parse_utc_timestamp(now_text)
+    if expires_at <= reference or requested_at > reference:
+        if expires_at <= reference:
+            conn.execute(
+                """
+                UPDATE auth_challenges
+                   SET status='expired', resolved_at=NULL,
+                       last_error=COALESCE(last_error, 'expired'), updated_at=?
+                 WHERE id=? AND status IN ('pending', 'watching')
+                """,
+                (now_text, challenge_id),
+            )
+            return "expired"
+        return "rejected"
+
+    conn.execute(
         """
-    ).fetchall()
-    return {str(row[0]) for row in rows}
+        INSERT OR IGNORE INTO inbox_events (
+            message_id, thread_id, sender, sender_domain, subject,
+            received_at, event_type, confidence, matched_job_url,
+            matched_company, matched_method, snippet, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            message_id, thread_id, sender, sender_domain(sender or ""), subject,
+            received_at or now_text, event_type, confidence, matched_job_url,
+            matched_company, matched_method, snippet, now_text,
+        ),
+    )
+    event_row = conn.execute(
+        "SELECT id FROM inbox_events WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    if event_row is None:
+        raise sqlite3.IntegrityError("inbox event was not persisted")
+    event_id = int(event_row[0])
+    cursor = conn.execute(
+        """
+        UPDATE auth_challenges
+           SET status='resolved', resolved_at=?, inbox_event_id=?, updated_at=?,
+               last_error=NULL
+         WHERE id=? AND status IN ('pending', 'watching')
+           AND julianday(requested_at) <= julianday(?)
+           AND julianday(expires_at) > julianday(?)
+           AND NOT EXISTS (
+               SELECT 1 FROM auth_challenges WHERE inbox_event_id=?
+           )
+        """,
+        (now_text, event_id, now_text, challenge_id, now_text, now_text, event_id),
+    )
+    return "claimed" if int(cursor.rowcount or 0) == 1 else "rejected"
 
 
 def claim_auth_match(
@@ -947,87 +1073,157 @@ def claim_auth_match(
     snippet: str | None = None,
     received_at: str | None = None,
     connection: sqlite3.Connection | None = None,
+    now: datetime | None = None,
 ) -> bool:
     """Commit one mailbox-message claim and challenge resolution atomically."""
     conn = connection or get_connection()
-    now = now_utc()
+    now_text = _as_utc(now).isoformat()
 
     try:
         conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute(
+        outcome = _claim_auth_match_in_transaction(
+            conn,
+            challenge_id,
+            message_id=message_id,
+            now_text=now_text,
+            thread_id=thread_id,
+            sender=sender,
+            subject=subject,
+            event_type=event_type,
+            confidence=confidence,
+            matched_job_url=matched_job_url,
+            matched_company=matched_company,
+            matched_method=matched_method,
+            snippet=snippet,
+            received_at=received_at,
+        )
+        if outcome in {"claimed", "expired"}:
+            conn.commit()
+        else:
+            conn.rollback()
+        return outcome in {"claimed", "idempotent"}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def claim_unique_auth_match(
+    challenge_id: int,
+    matches: list[AuthEmailMatch],
+    *,
+    now: datetime | None = None,
+    skew_seconds: int = 60,
+    connection: sqlite3.Connection | None = None,
+) -> AuthEmailMatch | None:
+    """Atomically claim this challenge's globally unique local assignment."""
+    conn = connection or get_connection()
+    reference = _as_utc(now)
+    now_text = reference.isoformat()
+    candidates: dict[str, tuple[AuthEmailMatch, datetime]] = {}
+    overflow = False
+    for match in matches:
+        received = _received_at_dt(match.received_at)
+        if match.message_id and received is not None:
+            candidates.setdefault(match.message_id, (match, received))
+        if len(candidates) > 1000:
+            overflow = True
+            break
+    if not candidates or overflow:
+        return None
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        target = conn.execute(
             """
             SELECT challenge.status, event.message_id
               FROM auth_challenges AS challenge
-              LEFT JOIN inbox_events AS event ON event.id = challenge.inbox_event_id
-             WHERE challenge.id = ?
+              LEFT JOIN inbox_events AS event ON event.id=challenge.inbox_event_id
+             WHERE challenge.id=?
             """,
             (challenge_id,),
         ).fetchone()
-        if existing is None:
+        if target is not None and target[0] == "resolved":
+            selected = candidates.get(str(target[1]))
             conn.rollback()
-            return False
-        if existing[0] == "resolved":
-            same_message = existing[1] == message_id
-            conn.rollback()
-            return same_message
-        if existing[0] not in ACTIVE_CHALLENGE_STATUSES:
-            conn.rollback()
-            return False
-
+            return selected[0] if selected is not None else None
         conn.execute(
             """
-            INSERT OR IGNORE INTO inbox_events (
-                message_id, thread_id, sender, sender_domain, subject,
-                received_at, event_type, confidence, matched_job_url,
-                matched_company, matched_method, snippet, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                message_id,
-                thread_id,
-                sender,
-                sender_domain(sender or ""),
-                subject,
-                received_at or now,
-                event_type,
-                confidence,
-                matched_job_url,
-                matched_company,
-                matched_method,
-                snippet,
-                now,
-            ),
-        )
-        event_row = conn.execute(
-            "SELECT id FROM inbox_events WHERE message_id = ?",
-            (message_id,),
-        ).fetchone()
-        if event_row is None:
-            raise sqlite3.IntegrityError("inbox event was not persisted")
-        event_id = int(event_row[0])
-
-        cursor = conn.execute(
-            """
             UPDATE auth_challenges
-               SET status = 'resolved',
-                   resolved_at = ?,
-                   inbox_event_id = ?,
-                   updated_at = ?,
-                   last_error = NULL
-             WHERE id = ?
-               AND status IN ('pending', 'watching')
-               AND NOT EXISTS (
-                   SELECT 1 FROM auth_challenges WHERE inbox_event_id = ?
-               )
+               SET status='expired', resolved_at=NULL,
+                   last_error=COALESCE(last_error, 'expired'), updated_at=?
+             WHERE status IN ('pending', 'watching')
+               AND julianday(expires_at) <= julianday(?)
             """,
-            (now, event_id, now, challenge_id, event_id),
+            (now_text, now_text),
         )
-        if int(cursor.rowcount or 0) != 1:
+        active = conn.execute(
+            """
+            SELECT id, job_url, provider, challenge_type, requested_at, expires_at
+              FROM auth_challenges
+             WHERE status IN ('pending', 'watching')
+               AND julianday(requested_at) <= julianday(?)
+               AND julianday(expires_at) > julianday(?)
+             ORDER BY requested_at, id
+             LIMIT 1001
+            """,
+            (now_text, now_text),
+        ).fetchall()
+        if len(active) > 1000:
+            conn.commit()
+            return None
+        requests = [dict(row) for row in active]
+        used = claimed_auth_message_ids(set(candidates), connection=conn)
+        available = [item for identifier, item in candidates.items() if identifier not in used]
+
+        def eligible(request, item):
+            match, received = item
+            requested = _parse_utc_timestamp(request["requested_at"])
+            expected_kind = (
+                "magic_link" if request["challenge_type"] == "magic_link" else "code"
+            )
+            return (
+                received >= requested - timedelta(seconds=max(0, skew_seconds))
+                and received <= reference + timedelta(seconds=max(0, skew_seconds))
+                and match.candidate.kind == expected_kind
+                and match_belongs_to_provider(match, request.get("provider"))
+            )
+
+        assignments = unique_assignments(
+            requests,
+            available,
+            request_id=lambda request: request["id"],
+            message_id=lambda item: item[0].message_id,
+            eligible=eligible,
+            max_items=1000,
+        )
+        selected = next(
+            (item[0] for request, item in assignments if request["id"] == challenge_id),
+            None,
+        )
+        if selected is None:
+            conn.commit()
+            return None
+        request = next(request for request in requests if request["id"] == challenge_id)
+        outcome = _claim_auth_match_in_transaction(
+            conn,
+            challenge_id,
+            message_id=selected.message_id,
+            now_text=now_text,
+            thread_id=selected.thread_id,
+            sender=selected.sender,
+            subject=selected.subject,
+            event_type="auth_code",
+            confidence=selected.candidate.confidence,
+            matched_job_url=request["job_url"],
+            matched_method=selected.candidate.kind,
+            snippet=selected.snippet,
+            received_at=selected.received_at,
+        )
+        if outcome != "claimed":
             conn.rollback()
-            return False
+            return None
         conn.commit()
-        return True
+        return selected
     except Exception:
         conn.rollback()
         raise

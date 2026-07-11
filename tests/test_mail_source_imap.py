@@ -224,6 +224,29 @@ def test_fetch_nonpositive_budget_does_no_imap_work():
     assert fake.logged_out is False
 
 
+@pytest.mark.parametrize("budget", [True, 1.5, float("nan"), float("inf"), "1.5", "nan", ""])
+def test_imap_rejects_malformed_budget_before_backend_work(budget):
+    fake = FakeImap(search_ids=[b"1"], messages_by_id={b"1": _base64_plain_raw()})
+
+    with pytest.raises((TypeError, ValueError), match="max_messages"):
+        ImapMailSource("me@example.com", "password", imap=fake).fetch(
+            since_days=7, max_messages=budget
+        )
+
+    assert fake.login_calls == []
+
+
+def test_imap_rejects_budget_above_1000_before_backend_work():
+    fake = FakeImap(search_ids=[], messages_by_id={})
+
+    with pytest.raises(ValueError, match="1000"):
+        ImapMailSource("me@example.com", "password", imap=fake).fetch(
+            since_days=7, max_messages=1001
+        )
+
+    assert fake.login_calls == []
+
+
 def test_fetch_uses_gmail_raw_uid_search_when_query_provided():
     ids = [b"1", b"2", b"3", b"4"]
     gmraw_ids = [b"2", b"4"]
