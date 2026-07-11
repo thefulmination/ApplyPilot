@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -422,10 +423,11 @@ def test_supervisor_claim_transition_at_final_handle_boundary_is_refused(monkeyp
 
 @pytest.mark.parametrize("reason", ["budget stop", "stall restart"])
 def test_supervisor_termination_failure_is_hard_fault_for_stop_and_restart(
-    reason, monkeypatch
+    reason, tmp_path, monkeypatch
 ):
     process = _SupervisedProcess()
     logs = []
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(supervisor, "_terminate_process", lambda proc, identity: False)
 
     with pytest.raises(RuntimeError, match="child may still be live"):
@@ -444,3 +446,144 @@ def test_supervisor_refuses_restart_when_orphan_cleanup_is_unproven(monkeypatch)
         supervisor._require_orphan_cleanup(logs.append, _owner())
 
     assert logs == ["HARD-FAULT: orphan cleanup could not be proven; refusing next launch"]
+
+
+class _Guard:
+    def __init__(self, cleanup: bool):
+        self.cleanup = cleanup
+        self.terminate_calls = 0
+        self.release_calls = 0
+
+    def terminate_and_reap(self):
+        self.terminate_calls += 1
+        return self.cleanup
+
+    def release(self):
+        self.release_calls += 1
+
+
+def test_guarded_supervisor_capture_none_reaps_and_does_not_mark_when_proven(
+    tmp_path, monkeypatch
+):
+    process = _SupervisedProcess()
+    guard = _Guard(True)
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(supervisor.SpawnedChildGuard, "acquire", lambda proc: guard)
+    monkeypatch.setattr(supervisor, "_capture_supervised_identity", lambda pid, launched: None)
+
+    with pytest.raises(RuntimeError, match="identity capture failed"):
+        supervisor._capture_guarded_supervised_child(process, 10.0)
+
+    assert guard.terminate_calls == 1
+    assert not supervisor._hard_fault_marker().exists()
+
+
+def test_guarded_supervisor_capture_exception_marks_when_cleanup_uncertain(
+    tmp_path, monkeypatch
+):
+    process = _SupervisedProcess()
+    guard = _Guard(False)
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(supervisor.SpawnedChildGuard, "acquire", lambda proc: guard)
+    monkeypatch.setattr(
+        supervisor,
+        "_capture_supervised_identity",
+        lambda pid, launched: (_ for _ in ()).throw(OSError("capture failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="identity capture raised"):
+        supervisor._capture_guarded_supervised_child(process, 10.0)
+
+    assert guard.terminate_calls == 1
+    assert supervisor._hard_fault_marker().exists()
+
+
+def test_hard_fault_marker_is_atomic_and_privacy_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("stall timeout", _supervised_child_identity())
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert payload["pid"] == 501
+    assert payload["reason"] == "stall timeout"
+    assert payload["executable_name"] == "python.exe"
+    assert payload["executable_sha256"].startswith("sha256:")
+    assert payload["command_sha256"].startswith("sha256:")
+    assert "command" not in payload
+    assert "C:/Python" not in marker.read_text(encoding="utf-8")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_hard_fault_gate_refuses_without_explicit_reconciliation(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
+
+    with pytest.raises(RuntimeError, match="hard-fault marker present"):
+        supervisor._enforce_hard_fault_gate()
+
+    assert marker.exists()
+
+
+def test_explicit_reconciliation_clears_only_proven_gone_child(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_exists", lambda pid: False)
+
+    supervisor._enforce_hard_fault_gate()
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("termination_proven", [True, False])
+def test_explicit_reconciliation_clears_exact_live_child_only_after_proven_termination(
+    termination_proven, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", _supervised_live_rows)
+    calls = []
+
+    def terminate(**claim):
+        calls.append(claim["pid"])
+        assert claim["final_authority"]() is True
+        return termination_proven
+
+    monkeypatch.setattr(supervisor, "terminate_verified_process", terminate)
+
+    if termination_proven:
+        supervisor._enforce_hard_fault_gate()
+        assert not marker.exists()
+    else:
+        with pytest.raises(RuntimeError, match="marker retained"):
+            supervisor._enforce_hard_fault_gate()
+        assert marker.exists()
+    assert calls == [501]
+
+
+def test_darwin_executable_capture_uses_libproc(monkeypatch):
+    import ctypes
+
+    class ProcPidPath:
+        def __call__(self, pid, buffer, size):
+            value = b"/Applications/Python.app/Contents/MacOS/Python"
+            ctypes.memmove(buffer, value + b"\0", len(value) + 1)
+            return len(value)
+
+    class LibProc:
+        proc_pidpath = ProcPidPath()
+
+    monkeypatch.setattr(supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: LibProc())
+
+    assert supervisor._process_executable(123).endswith("/MacOS/Python")
+
+
+def test_darwin_executable_capture_fails_closed_without_proc_pidpath(monkeypatch):
+    import ctypes
+
+    monkeypatch.setattr(supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: object())
+
+    assert supervisor._process_executable(123) == ""

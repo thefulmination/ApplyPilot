@@ -12,6 +12,7 @@ import platform
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1426,7 +1427,14 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             ok = has_linkedin_session(seed)
     finally:
         # Cleanup uses only the verified stable process handle; CDP stays read-only.
-        cleanup_worker(LINKEDIN_LOGIN_SLOT, proc)
+        if not cleanup_worker(LINKEDIN_LOGIN_SLOT, proc):
+            cleanup_error = RuntimeError(
+                "LinkedIn login browser cleanup could not be proven"
+            )
+            active_error = sys.exc_info()[1]
+            if active_error is not None:
+                raise cleanup_error from active_error
+            raise cleanup_error
     return ok, seed
 
 

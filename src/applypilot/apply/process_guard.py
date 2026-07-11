@@ -1,0 +1,90 @@
+"""Stable ownership for subprocesses spawned directly by ApplyPilot."""
+
+from __future__ import annotations
+
+import os
+import platform
+import signal
+import subprocess
+from dataclasses import dataclass
+
+
+@dataclass
+class SpawnedChildGuard:
+    process: subprocess.Popen
+    kind: str
+    handle: int
+    released: bool = False
+
+    @classmethod
+    def acquire(cls, process: subprocess.Popen) -> "SpawnedChildGuard | None":
+        if process.poll() is not None:
+            return cls(process, "completed", 0)
+        system = platform.system()
+        if system == "Windows":
+            try:
+                handle = int(process._handle)
+            except (AttributeError, TypeError, ValueError):
+                return None
+            return cls(process, "windows", handle) if handle else None
+        if system == "Linux":
+            opener = getattr(os, "pidfd_open", None)
+            if opener is None:
+                return None
+            try:
+                return cls(process, "pidfd", opener(process.pid, 0))
+            except (OSError, ValueError):
+                return None
+        if system == "Darwin":
+            return cls(process, "darwin-child", 0)
+        return None
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        if self.kind == "pidfd":
+            try:
+                os.close(self.handle)
+            except OSError:
+                pass
+
+    def terminate_and_reap(self, timeout: float = 20) -> bool:
+        if self.released:
+            return self.process.poll() is not None
+        try:
+            if self.process.poll() is None:
+                if self.kind == "windows":
+                    if not _terminate_windows_handle(self.handle, self.process.pid):
+                        return False
+                elif self.kind == "pidfd":
+                    sender = getattr(signal, "pidfd_send_signal", None)
+                    if sender is None:
+                        return False
+                    sender(self.handle, getattr(signal, "SIGKILL", 9))
+                elif self.kind == "darwin-child":
+                    self.process.kill()
+                elif self.kind == "completed":
+                    pass
+                else:
+                    return False
+            self.process.wait(timeout=timeout)
+            return self.process.poll() is not None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        finally:
+            self.release()
+
+
+def _terminate_windows_handle(handle: int, expected_pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessId.restype = wintypes.DWORD
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    if int(kernel32.GetProcessId(handle) or 0) != expected_pid:
+        return False
+    return bool(kernel32.TerminateProcess(handle, 1))

@@ -37,9 +37,10 @@ from applypilot.apply import prompt as prompt_mod
 from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
+    reset_worker_dir, cleanup_on_exit,
     BASE_CDP_PORT,
 )
+from applypilot.apply.process_guard import SpawnedChildGuard
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
     render_full, get_totals,
@@ -180,6 +181,7 @@ _stop_event = threading.Event()
 
 # Track active apply-agent processes for skip (Ctrl+C) handling
 _agent_procs: dict[int, subprocess.Popen] = {}
+_agent_guards: dict[int, SpawnedChildGuard] = {}
 # Last apply-agent run stats per worker (cost_usd / tokens). run_job records cost to the
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
@@ -501,6 +503,33 @@ def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
             redacted = _replace_exact_secret(redacted, secret)
     return redacted
 _agent_lock = threading.Lock()
+
+
+def _terminate_agent_child(
+    worker_id: int,
+    process: subprocess.Popen,
+    guard: SpawnedChildGuard | None,
+    reason: str,
+) -> bool:
+    if process.poll() is not None:
+        if guard is not None:
+            guard.release()
+        return True
+    if guard is None:
+        logger.error(
+            "[W%s] agent cleanup refused without stable child guard (%s)",
+            worker_id,
+            reason,
+        )
+        return False
+    cleaned = guard.terminate_and_reap()
+    if not cleaned:
+        logger.error(
+            "[W%s] agent child termination could not be proven (%s)",
+            worker_id,
+            reason,
+        )
+    return cleaned
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -1968,6 +1997,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     start = time.time()
     stats: dict = {}
     proc = None
+    guard = None
 
     try:
         proc = subprocess.Popen(
@@ -1981,8 +2011,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
+        guard = SpawnedChildGuard.acquire(proc)
+        if guard is None:
+            raise RuntimeError("stable agent child guard unavailable")
         with _agent_lock:
             _agent_procs[worker_id] = proc
+            _agent_guards[worker_id] = guard
 
         text_parts: list[str] = []
         final_result_text: list[str] = []  # text from the final 'result' message
@@ -2152,11 +2186,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             if terminal_result_seen.wait(timeout=min(1.0, remaining)):
                 reader.join(timeout=float(os.environ.get("APPLYPILOT_TERMINAL_RESULT_GRACE_SECONDS") or 5))
                 if reader.is_alive():
-                    _kill_process_tree(proc.pid)
+                    _terminate_agent_child(worker_id, proc, guard, "terminal-result-grace")
                     reader.join(timeout=15)
                 break
         if reader.is_alive():
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "reader-timeout")
             reader.join(timeout=15)
             elapsed = int(time.time() - start)
             add_event(f"[W{worker_id}] TIMEOUT/hung ({elapsed}s)")
@@ -2166,13 +2200,15 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "wait-timeout")
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
         returncode = proc.returncode
         stats = stats_holder
+        guard.release()
+        guard = None
         proc = None
 
         output = "\n".join(text_parts)
@@ -2298,8 +2334,9 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     finally:
         with _agent_lock:
             _agent_procs.pop(worker_id, None)
+            _agent_guards.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "finally")
 
 
 # ---------------------------------------------------------------------------
@@ -3421,14 +3458,18 @@ def main(limit: int = 1, target_url: str | None = None,
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
                     if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+                        _terminate_agent_child(
+                            wid, cproc, _agent_guards.get(wid), "sigint-skip"
+                        )
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
                     if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+                        _terminate_agent_child(
+                            wid, cproc, _agent_guards.get(wid), "sigint-stop"
+                        )
             kill_all_chrome()
             raise KeyboardInterrupt
 

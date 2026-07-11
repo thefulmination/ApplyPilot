@@ -17,6 +17,7 @@ $logDir = Join-Path $ProjectRoot ".applypilot\logs"
 $keepLog = Join-Path $logDir "keepalive.log"
 $superOut = Join-Path $logDir "supervisor_stdout.out"
 $doneMarker = "C:\Users\JStal\AppData\Local\ApplyPilot\keepalive.done"
+$hardFaultMarker = "C:\Users\JStal\AppData\Local\ApplyPilot\keepalive.hard-fault.json"
 $TargetApplied = 0   # 0 = BUDGET mode: --max-cost-usd is the real stop (target mode ignores it)
 
 function Log($m) { Add-Content -Path $keepLog -Value ("{0}  {1}" -f ((Get-Date).ToUniversalTime().ToString("o")), $m) }
@@ -26,6 +27,16 @@ if (Test-Path $doneMarker) {
     Log "DONE marker present -- removing keep-alive task"
     schtasks /delete /tn "ApplyPilotKeepAlive" /f | Out-Null
     exit 0
+}
+
+# Uncertain child ownership is durable. Never relaunch beside that child unless an
+# operator explicitly requests the Python supervisor's identity-safe reconciliation.
+if (Test-Path $hardFaultMarker) {
+    if ($env:APPLYPILOT_RECONCILE_HARD_FAULT -ne "1") {
+        Log "HARD-FAULT marker present -- refusing supervisor relaunch"
+        exit 3
+    }
+    Log "HARD-FAULT marker present -- explicit reconciliation requested"
 }
 
 # Supervisor already running? (IgnoreNew should prevent a second instance; double-check

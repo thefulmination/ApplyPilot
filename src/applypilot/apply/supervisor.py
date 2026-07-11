@@ -20,21 +20,26 @@ apply subprocess dies, so recovery is automatic instead of a 40-minute manual ca
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from applypilot import config
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
+    _process_exists,
     reserve_browser_cleanup,
     terminate_verified_process,
 )
+from applypilot.apply.process_guard import SpawnedChildGuard
 
 
 def _applied_count() -> int:
@@ -157,9 +162,27 @@ def _process_snapshot() -> list[dict]:
 
 
 def _process_executable(pid: int) -> str:
+    if sys.platform == "darwin":
+        return _darwin_process_executable(pid)
     try:
         return os.readlink(f"/proc/{pid}/exe")
     except OSError:
+        return ""
+
+
+def _darwin_process_executable(pid: int) -> str:
+    try:
+        import ctypes
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libproc.proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        length = int(libproc.proc_pidpath(int(pid), buffer, len(buffer)))
+        if length <= 0:
+            return ""
+        return buffer.value.decode("utf-8", errors="strict")
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
         return ""
 
 
@@ -341,6 +364,125 @@ def _capture_supervised_identity(
         return None
 
 
+def _capture_guarded_supervised_child(
+    process: subprocess.Popen,
+    launched_at: float,
+) -> SupervisedProcessIdentity:
+    guard = SpawnedChildGuard.acquire(process)
+    if guard is None:
+        _persist_hard_fault("supervisor spawn guard unavailable", pid=process.pid)
+        raise RuntimeError("supervisor child has no stable spawn guard")
+    try:
+        identity = _capture_supervised_identity(process.pid, launched_at)
+    except Exception as exc:
+        cleaned = guard.terminate_and_reap()
+        if not cleaned:
+            _persist_hard_fault(
+                "supervisor identity capture exception cleanup uncertain", pid=process.pid
+            )
+        raise RuntimeError("supervisor child identity capture raised") from exc
+    if identity is None:
+        cleaned = guard.terminate_and_reap()
+        if not cleaned:
+            _persist_hard_fault(
+                "supervisor identity capture missing cleanup uncertain", pid=process.pid
+            )
+        raise RuntimeError("supervisor child identity capture failed")
+    guard.release()
+    return identity
+
+
+def _hard_fault_marker() -> Path:
+    return config.DB_PATH.parent / "keepalive.hard-fault.json"
+
+
+def _identity_digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _persist_hard_fault(
+    reason: str,
+    identity: SupervisedProcessIdentity | None = None,
+    *,
+    pid: int | None = None,
+) -> Path:
+    marker = _hard_fault_marker()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "reason": reason[:160],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pid": int(identity.pid if identity is not None else (pid or 0)),
+        "created_at": float(identity.created_at if identity is not None else 0.0),
+        "executable_name": os.path.basename(identity.executable) if identity is not None else "",
+        "executable_sha256": _identity_digest(identity.executable) if identity is not None else "",
+        "command_sha256": _identity_digest(identity.command) if identity is not None else "",
+    }
+    temp = marker.with_name(f"{marker.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(temp, marker)
+    return marker
+
+
+def _clear_hard_fault(marker: Path) -> None:
+    marker.unlink(missing_ok=True)
+
+
+def _enforce_hard_fault_gate() -> None:
+    marker = _hard_fault_marker()
+    if not marker.exists():
+        return
+    if os.environ.get("APPLYPILOT_RECONCILE_HARD_FAULT", "").strip() != "1":
+        raise RuntimeError(f"hard-fault marker present: {marker}")
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        pid = int(payload["pid"])
+        created_at = float(payload["created_at"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError("hard-fault marker is invalid and was not cleared") from exc
+    rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+    current = rows.get(pid)
+    if current is None:
+        exists = _process_exists(pid)
+        if exists is False:
+            _clear_hard_fault(marker)
+            return
+        raise RuntimeError("hard-fault reconciliation uncertain; marker retained")
+    current_created = current.get("created")
+    executable = str(current.get("executable") or "")
+    command = str(current.get("command") or "")
+    exact = (
+        current_created is not None
+        and abs(float(current_created) - created_at) < 0.001
+        and _identity_digest(executable) == payload.get("executable_sha256")
+        and _identity_digest(command) == payload.get("command_sha256")
+    )
+    if not exact:
+        _clear_hard_fault(marker)
+        return
+
+    def final_authority() -> bool:
+        live = {int(row.get("pid") or 0): row for row in _process_snapshot()}.get(pid)
+        return bool(
+            live is not None
+            and live.get("created") is not None
+            and abs(float(live["created"]) - created_at) < 0.001
+            and _identity_digest(str(live.get("executable") or ""))
+            == payload.get("executable_sha256")
+            and _identity_digest(str(live.get("command") or ""))
+            == payload.get("command_sha256")
+        )
+
+    if not terminate_verified_process(
+        pid=pid,
+        created_at=created_at,
+        executable=executable,
+        final_authority=final_authority,
+    ):
+        raise RuntimeError("hard-fault exact-child termination was not proven; marker retained")
+    _clear_hard_fault(marker)
+
+
 def _cleanup_orphans(
     log,
     *,
@@ -399,6 +541,7 @@ def supervise(
     uses an absolute "stop when COUNT(applied) >= target" -- this composes across
     restarts (an outer keep-alive task can relaunch this and it picks up where it left
     off), and on reaching it writes a done-marker the task watches to stop relaunching."""
+    _enforce_hard_fault_gate()
     log_path = config.LOG_DIR / "supervisor.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     done_marker = config.DB_PATH.parent / "keepalive.done"
@@ -521,7 +664,7 @@ def supervise(
         launched_at = time.time()
         with open(out_path, "w", encoding="utf-8") as out:
             proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=child_env)
-        current_apply_identity = _capture_supervised_identity(proc.pid, launched_at)
+        current_apply_identity = _capture_guarded_supervised_child(proc, launched_at)
 
         last_applied = applied_now
         last_progress = time.monotonic()
@@ -605,6 +748,7 @@ def _require_termination(
     if _terminate_process(proc, expected):
         return
     message = f"HARD-FAULT: {reason} termination could not be proven; child may still be live"
+    _persist_hard_fault(reason, expected, pid=proc.pid)
     log(message)
     raise RuntimeError(message)
 
