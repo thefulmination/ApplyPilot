@@ -488,7 +488,7 @@ def supervise(
                 break
 
         attempt += 1
-        _cleanup_orphans(log, owner=previous_apply_identity)
+        _require_orphan_cleanup(log, previous_apply_identity)
         offsite_backup()  # periodic off-machine backup at each restart boundary
         # Reclaim any lease stranded by the previous crash so its job is retryable.
         try:
@@ -542,7 +542,7 @@ def supervise(
                    (session_spend(cur) >= total_cost_usd)
             if done:
                 log(f"STOP reached mid-attempt (applied={cur}) -- stopping run")
-                _terminate_process(proc, current_apply_identity)
+                _require_termination(proc, current_apply_identity, log, "budget stop")
                 write_done("target/budget reached mid-attempt")
                 offsite_backup(force=True)  # final off-machine backup on stop
                 log("SUPERVISOR done.")
@@ -556,7 +556,7 @@ def supervise(
             if quiet >= stall_minutes and stuck >= stall_minutes:
                 log(f"ATTEMPT {attempt} STALLED (no output {quiet:.0f}m, no apply {stuck:.0f}m) "
                     f"-- killing to restart")
-                _terminate_process(proc, current_apply_identity)
+                _require_termination(proc, current_apply_identity, log, "stall restart")
                 break
 
         if current_apply_identity is not None:
@@ -587,12 +587,34 @@ def _terminate_process(
                 and proc.poll() is None
                 and _supervised_authority_is_current(expected)
             ),
+            direct_child=proc,
         ):
             return False
         proc.wait(timeout=20)
         return True
     except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
         return False
+
+
+def _require_termination(
+    proc: subprocess.Popen,
+    expected: SupervisedProcessIdentity | None,
+    log,
+    reason: str,
+) -> None:
+    if _terminate_process(proc, expected):
+        return
+    message = f"HARD-FAULT: {reason} termination could not be proven; child may still be live"
+    log(message)
+    raise RuntimeError(message)
+
+
+def _require_orphan_cleanup(log, owner: SupervisedProcessIdentity | None) -> None:
+    if _cleanup_orphans(log, owner=owner):
+        return
+    message = "HARD-FAULT: orphan cleanup could not be proven; refusing next launch"
+    log(message)
+    raise RuntimeError(message)
 
 
 def _supervised_authority_is_current(expected: SupervisedProcessIdentity) -> bool:

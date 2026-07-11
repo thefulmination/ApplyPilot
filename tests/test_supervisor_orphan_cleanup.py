@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from applypilot.apply import supervisor
 
 
@@ -219,6 +221,7 @@ def _cleanup_snapshots(
 def _verified_termination_recorder(terminated):
     def terminate(**identity):
         authority = identity.pop("final_authority")
+        identity.pop("direct_child", None)
         if authority() is not True:
             return False
         terminated.append(identity)
@@ -415,3 +418,29 @@ def test_supervisor_claim_transition_at_final_handle_boundary_is_refused(monkeyp
     assert supervisor._terminate_process(process, _supervised_child_identity()) is False
     assert terminated == []
     assert process.wait_calls == 0
+
+
+@pytest.mark.parametrize("reason", ["budget stop", "stall restart"])
+def test_supervisor_termination_failure_is_hard_fault_for_stop_and_restart(
+    reason, monkeypatch
+):
+    process = _SupervisedProcess()
+    logs = []
+    monkeypatch.setattr(supervisor, "_terminate_process", lambda proc, identity: False)
+
+    with pytest.raises(RuntimeError, match="child may still be live"):
+        supervisor._require_termination(process, _supervised_child_identity(), logs.append, reason)
+
+    assert logs == [
+        f"HARD-FAULT: {reason} termination could not be proven; child may still be live"
+    ]
+
+
+def test_supervisor_refuses_restart_when_orphan_cleanup_is_unproven(monkeypatch):
+    logs = []
+    monkeypatch.setattr(supervisor, "_cleanup_orphans", lambda log, owner=None: False)
+
+    with pytest.raises(RuntimeError, match="refusing next launch"):
+        supervisor._require_orphan_cleanup(logs.append, _owner())
+
+    assert logs == ["HARD-FAULT: orphan cleanup could not be proven; refusing next launch"]

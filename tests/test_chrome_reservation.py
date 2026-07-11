@@ -161,6 +161,13 @@ class _FakeProcess:
     def poll(self):
         return None if self.alive else 0
 
+    def kill(self):
+        self.alive = False
+
+    def wait(self, timeout=None):
+        self.alive = False
+        return 0
+
 
 def test_successful_cleanup_releases_process_port_and_reservation(tmp_path: Path, monkeypatch) -> None:
     from applypilot.apply import chrome
@@ -461,6 +468,12 @@ def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monke
     monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
     monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
     monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *args: True)
+    monkeypatch.setattr(
+        chrome,
+        "_acquire_spawn_guard",
+        lambda proc: chrome._SpawnGuard(proc, "windows", proc._handle),
+    )
+    monkeypatch.setattr(chrome, "_resume_windows_process", lambda handle: True)
     monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile: True)
     monkeypatch.setattr(
@@ -722,6 +735,7 @@ def test_owned_browser_identity_change_before_tree_kill_is_refused(
 
     def terminate(**identity):
         authority = identity.pop("final_authority")
+        identity.pop("direct_child", None)
         if authority() is not True:
             return False
         terminated.append(identity)
@@ -757,6 +771,7 @@ def test_owned_browser_stable_identity_tree_kills_once(tmp_path: Path, monkeypat
 
     def terminate(**identity):
         authority = identity.pop("final_authority")
+        identity.pop("direct_child", None)
         if authority() is not True:
             return False
         terminated.append(identity)
@@ -783,7 +798,7 @@ def test_owned_browser_stable_identity_tree_kills_once(tmp_path: Path, monkeypat
 
 
 @pytest.mark.parametrize("launcher", ["linkedin_login", "launch_chrome"])
-def test_browser_identity_capture_failure_never_attempts_kill(
+def test_browser_identity_capture_failure_terminates_and_reaps_spawn_guard(
     launcher: str, tmp_path: Path, monkeypatch
 ) -> None:
     from applypilot import config
@@ -799,13 +814,14 @@ def test_browser_identity_capture_failure_never_attempts_kill(
     monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(
         chrome,
-        "_record_launched_browser_identity",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("identity failed")),
+        "_acquire_spawn_guard",
+        lambda proc: chrome._SpawnGuard(proc, "windows", proc._handle),
     )
+    monkeypatch.setattr(chrome, "_terminate_windows_handle", lambda handle, pid: True)
     monkeypatch.setattr(
         chrome,
-        "_kill_process_tree",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not kill")),
+        "_record_launched_browser_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("identity failed")),
     )
     if launcher == "launch_chrome":
         monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile_root / "worker-0")
@@ -815,6 +831,80 @@ def test_browser_identity_capture_failure_never_attempts_kill(
             chrome.linkedin_login(timeout_seconds=0)
         else:
             chrome.launch_chrome(0, port=9400)
+    assert process.poll() == 0
+
+    profile = (
+        profile_root / chrome.SEED_PROFILE_NAME
+        if launcher == "linkedin_login"
+        else profile_root / "worker-0"
+    )
+    slot = chrome.LINKEDIN_LOGIN_SLOT if launcher == "linkedin_login" else 0
+    port = chrome.LINKEDIN_LOGIN_CDP_PORT if launcher == "linkedin_login" else 9400
+    reacquired = chrome._acquire_browser_reservation(slot, port, profile)
+    reacquired.release()
+
+
+@pytest.mark.parametrize("resume_ok", [True, False])
+def test_windows_launch_is_suspended_contained_then_resumed_or_reaped(
+    resume_ok: bool, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    events = []
+    process = _FakeProcess(500)
+    profile = tmp_path / "profiles" / "worker-0"
+    expected = _browser_identity(chrome, profile=str(profile))
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(config, "resolve_browser_path", lambda browser: expected.executable)
+    monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile)
+    monkeypatch.setattr(chrome, "_listener_pids", lambda port: [])
+
+    def popen(*_args, **kwargs):
+        assert kwargs["creationflags"] == getattr(chrome.subprocess, "CREATE_SUSPENDED", 4)
+        events.append("spawn-suspended")
+        return process
+
+    def acquire_guard(proc):
+        events.append("guard")
+        return chrome._SpawnGuard(proc, "windows", proc._handle)
+
+    def record(reservation, proc, executable, profile_dir, port):
+        events.append("identity")
+        reservation.record_browser_identity(expected)
+
+    def assign(worker_id, proc, identity, reservation):
+        events.append("contain")
+        return True
+
+    def resume(handle):
+        events.append("resume")
+        return resume_ok
+
+    monkeypatch.setattr(chrome.subprocess, "Popen", popen)
+    monkeypatch.setattr(chrome, "_acquire_spawn_guard", acquire_guard)
+    monkeypatch.setattr(chrome, "_record_launched_browser_identity", record)
+    monkeypatch.setattr(chrome, "_assign_kill_on_close_job", assign)
+    monkeypatch.setattr(chrome, "_resume_windows_process", resume)
+    monkeypatch.setattr(chrome, "_terminate_windows_handle", lambda handle, pid: True)
+    monkeypatch.setenv("APPLYPILOT_CDP_READY_TIMEOUT", "0")
+
+    if resume_ok:
+        launched = chrome.launch_chrome(0, port=9400)
+        assert launched is process
+        process.alive = False
+        monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
+        assert chrome.cleanup_worker(0, process) is True
+    else:
+        with pytest.raises(RuntimeError, match="could not be resumed"):
+            chrome.launch_chrome(0, port=9400)
+        assert process.poll() == 0
+        reacquired = chrome._acquire_browser_reservation(0, 9400, profile)
+        reacquired.release()
+
+    assert events == ["spawn-suspended", "guard", "identity", "contain", "resume"]
 
 
 def test_unix_verified_termination_refuses_pidfd_acquisition_failure(monkeypatch) -> None:
@@ -1147,3 +1237,137 @@ def test_reserved_listener_parent_mismatch_or_uncertainty_is_never_terminated(
         assert terminated == []
     finally:
         ownership.release()
+
+
+@pytest.mark.parametrize(
+    ("system", "parent_state"),
+    [("Windows", "gone"), ("Windows", "reused"), ("Linux", "gone"), ("Linux", "reused")],
+)
+def test_reparented_orphan_is_recoverable_only_when_original_parent_state_is_proven(
+    system, parent_state, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    expected = _browser_identity(chrome, profile=str(profile))
+    reparented = chrome.BrowserProcessIdentity(
+        **{
+            **expected.__dict__,
+            "parent_pid": 4,
+            "parent_created_at": 20.0,
+            "parent_executable": "C:/Windows/System32/services.exe",
+            "parent_command": "services.exe",
+        }
+    )
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    try:
+        with monkeypatch.context() as model:
+            model.setattr(chrome.platform, "system", lambda: system)
+            model.setattr(chrome, "_listener_pids", lambda port: [500])
+            model.setattr(chrome, "_process_identity", lambda pid: reparented)
+            model.setattr(chrome, "_original_parent_state", lambda identity: parent_state)
+            assert chrome._validated_reserved_listener(reservation, 500) == reparented
+    finally:
+        reservation.release()
+
+
+def test_reparented_orphan_parent_uncertainty_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    expected = _browser_identity(chrome, profile=str(profile))
+    reparented = chrome.BrowserProcessIdentity(
+        **{
+            **expected.__dict__,
+            "parent_pid": 4,
+            "parent_created_at": 20.0,
+            "parent_executable": "init",
+            "parent_command": "init",
+        }
+    )
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    monkeypatch.setattr(chrome, "_listener_pids", lambda port: [500])
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: reparented)
+    monkeypatch.setattr(chrome, "_original_parent_state", lambda identity: "uncertain")
+    try:
+        assert chrome._validated_reserved_listener(reservation, 500) is None
+    finally:
+        reservation.release()
+
+
+@pytest.mark.parametrize(
+    ("current_kind", "exists", "expected_state"),
+    [
+        ("matching", None, "matching"),
+        ("reused", None, "reused"),
+        ("missing", False, "gone"),
+        ("missing", None, "uncertain"),
+    ],
+)
+def test_original_parent_state_distinguishes_live_reused_gone_and_uncertain(
+    current_kind, exists, expected_state, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    child = _browser_identity(chrome)
+    matching_parent = _browser_identity(
+        chrome,
+        pid=child.parent_pid,
+        created=child.parent_created_at,
+        executable=child.parent_executable,
+    )
+    reused_parent = _browser_identity(
+        chrome,
+        pid=child.parent_pid,
+        created=child.parent_created_at + 30.0,
+        executable=child.parent_executable,
+    )
+    current = {
+        "matching": matching_parent,
+        "reused": reused_parent,
+        "missing": None,
+    }[current_kind]
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: current)
+    monkeypatch.setattr(chrome, "_process_exists", lambda pid: exists)
+
+    assert chrome._original_parent_state(child) == expected_state
+
+
+def test_darwin_direct_child_termination_uses_unreaped_popen_ownership(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(500)
+    identity = _browser_identity(chrome, executable="/Applications/Chrome")
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="/Applications/Chrome",
+        final_authority=lambda: True,
+        direct_child=process,
+    ) is True
+    assert process.poll() == 0
+
+
+def test_darwin_orphan_without_direct_child_authority_is_refused(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        chrome,
+        "_process_identity",
+        lambda pid: (_ for _ in ()).throw(AssertionError("must fail before PID lookup")),
+    )
+
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="/Applications/Chrome",
+        final_authority=lambda: True,
+    ) is False

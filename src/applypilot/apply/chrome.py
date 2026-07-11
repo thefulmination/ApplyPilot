@@ -17,6 +17,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from applypilot import config
@@ -78,6 +79,48 @@ class BrowserProcessIdentity:
     parent_created_at: float = 0.0
     parent_executable: str = ""
     parent_command: str = ""
+
+
+@dataclass
+class _SpawnGuard:
+    process: subprocess.Popen
+    kind: str
+    handle: int
+    _released: bool = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self.kind == "pidfd":
+            try:
+                os.close(self.handle)
+            except OSError:
+                pass
+
+    def terminate_and_reap(self) -> bool:
+        if self._released:
+            return False
+        try:
+            if self.process.poll() is None:
+                if self.kind == "windows":
+                    if not _terminate_windows_handle(self.handle, self.process.pid):
+                        return False
+                elif self.kind == "pidfd":
+                    sender = getattr(signal, "pidfd_send_signal", None)
+                    if sender is None:
+                        return False
+                    sender(self.handle, getattr(signal, "SIGKILL", 9))
+                elif self.kind == "darwin-child":
+                    self.process.kill()
+                else:
+                    return False
+            self.process.wait(timeout=20)
+            return self.process.poll() is not None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        finally:
+            self.release()
 
 
 class _BrowserReservation:
@@ -319,6 +362,9 @@ def _process_identity(pid: int) -> BrowserProcessIdentity | None:
                 parent_command=str(raw.get("ParentCommand") or ""),
             )
 
+        if platform.system() == "Darwin":
+            return _darwin_process_identity(pid)
+
         stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
         boot_line = next(
             line for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
@@ -354,6 +400,44 @@ def _process_identity(pid: int) -> BrowserProcessIdentity | None:
         )
     except (OSError, ValueError, KeyError, StopIteration, json.JSONDecodeError):
         return None
+
+
+def _darwin_process_identity(pid: int) -> BrowserProcessIdentity | None:
+    def row(process_id: int):
+        result = subprocess.run(
+            ["ps", "-p", str(process_id), "-o", "ppid=,lstart=,comm=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        parts = result.stdout.strip().split(None, 8)
+        if result.returncode != 0 or len(parts) < 8:
+            return None
+        created = datetime.strptime(
+            " ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"
+        ).replace(tzinfo=timezone.utc).timestamp()
+        command = parts[7] if len(parts) == 8 else f"{parts[7]} {parts[8]}"
+        return int(parts[0]), created, parts[6], command
+
+    current = row(pid)
+    if current is None:
+        return None
+    parent_pid, created, executable, command = current
+    parent = row(parent_pid)
+    profile, port = _browser_markers(command)
+    return BrowserProcessIdentity(
+        pid=pid,
+        created_at=created,
+        executable=executable,
+        command=command,
+        profile_dir=profile,
+        port=port,
+        parent_pid=parent_pid,
+        parent_created_at=parent[1] if parent else 0.0,
+        parent_executable=parent[2] if parent else "",
+        parent_command=parent[3] if parent else "",
+    )
 
 
 def _browser_markers(command: str) -> tuple[str, int]:
@@ -405,16 +489,104 @@ def _browser_parent_identity_matches(
     )
 
 
+def _original_parent_state(expected: BrowserProcessIdentity) -> str:
+    current = _process_identity(expected.parent_pid)
+    if current is not None:
+        if (
+            abs(current.created_at - expected.parent_created_at) < 0.001
+            and _normalized_path(current.executable)
+            == _normalized_path(expected.parent_executable)
+        ):
+            return "matching"
+        return "reused"
+    existence = _process_exists(expected.parent_pid)
+    return "gone" if existence is False else "uncertain"
+
+
+def _process_exists(pid: int) -> bool | None:
+    try:
+        system = platform.system()
+        if system == "Linux":
+            return Path(f"/proc/{pid}").exists()
+        if system == "Darwin":
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "pid="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return result.returncode == 0 and bool(result.stdout.strip())
+        if system == "Windows":
+            script = (
+                f"$p=Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\";"
+                "if($p){'yes'}else{'no'}"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip().lower() == "yes"
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _reserved_parent_authority_matches(
+    expected: BrowserProcessIdentity,
+    current: BrowserProcessIdentity,
+) -> bool:
+    if _browser_parent_identity_matches(expected, current):
+        return True
+    reparented = (
+        current.parent_pid > 0
+        and current.parent_pid != expected.parent_pid
+        and current.parent_created_at > 0
+        and bool(current.parent_executable)
+        and bool(current.parent_command)
+    )
+    return reparented and _original_parent_state(expected) in {"gone", "reused"}
+
+
 def terminate_verified_process(
     *,
     pid: int,
     created_at: float,
     executable: str,
     final_authority: Callable[[], bool] | None,
+    direct_child: subprocess.Popen | None = None,
 ) -> bool:
     """Terminate only the process instance identified by PID, start time, and image."""
     if pid <= 0 or created_at <= 0 or not executable or final_authority is None:
         return False
+    if platform.system() == "Darwin":
+        if (
+            direct_child is None
+            or direct_child.pid != pid
+            or direct_child.poll() is not None
+        ):
+            logger.error("Darwin cleanup refused without live direct-child authority")
+            return False
+        actual = _process_identity(pid)
+        if (
+            actual is None
+            or abs(actual.created_at - created_at) >= 0.001
+            or _normalized_path(actual.executable) != _normalized_path(executable)
+        ):
+            return False
+        try:
+            if final_authority() is not True:
+                return False
+            direct_child.kill()
+            return True
+        except (OSError, ValueError):
+            return False
+
     if platform.system() != "Windows":
         pidfd_open = getattr(os, "pidfd_open", None)
         pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
@@ -552,7 +724,7 @@ def _validated_reserved_listener(
     current = _process_identity(listener_pid)
     if not (
         _browser_identity_matches(expected, current)
-        and _browser_parent_identity_matches(expected, current)
+        and _reserved_parent_authority_matches(expected, current)
     ):
         return None
     return current
@@ -705,6 +877,7 @@ def _kill_process_tree(
         final_authority=lambda: _owned_browser_authority_is_current(
             process, expected, reservation
         ),
+        direct_child=process,
     )
 
 
@@ -738,6 +911,48 @@ def _popen_process_handle(process: subprocess.Popen) -> int:
         return int(process._handle)
     except (AttributeError, TypeError, ValueError):
         return 0
+
+
+def _acquire_spawn_guard(process: subprocess.Popen) -> _SpawnGuard | None:
+    system = platform.system()
+    if system == "Windows":
+        handle = _popen_process_handle(process)
+        return _SpawnGuard(process, "windows", handle) if handle else None
+    if system == "Linux":
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            return None
+        try:
+            return _SpawnGuard(process, "pidfd", opener(process.pid, 0))
+        except (OSError, ValueError):
+            return None
+    if system == "Darwin":
+        return _SpawnGuard(process, "darwin-child", 0)
+    return None
+
+
+def _terminate_windows_handle(handle: int, expected_pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessId.restype = wintypes.DWORD
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    if int(kernel32.GetProcessId(handle) or 0) != expected_pid:
+        return False
+    return bool(kernel32.TerminateProcess(handle, 1))
+
+
+def _resume_windows_process(handle: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = ctypes.c_long
+    return int(ntdll.NtResumeProcess(handle)) >= 0
 
 
 def _windows_handle_identity(handle: int) -> tuple[int, float, str] | None:
@@ -914,6 +1129,25 @@ def _close_windows_job_handle(handle: int) -> bool:
     except Exception:
         logger.debug("Closing browser job handle failed", exc_info=True)
         return False
+
+
+def _abort_spawn(
+    worker_id: int,
+    process: subprocess.Popen,
+    reservation: _BrowserReservation,
+    guard: _SpawnGuard,
+) -> bool:
+    terminated = guard.terminate_and_reap()
+    job_closed = _close_owned_job_handle(worker_id, process)
+    with _chrome_lock:
+        if _chrome_procs.get(worker_id) is process:
+            _chrome_procs.pop(worker_id, None)
+        _browser_reservations.pop(id(process), None)
+    if terminated and job_closed:
+        reservation.release(clear_identity=True)
+        return True
+    logger.error("[worker-%s] spawn abort could not prove child cleanup", worker_id)
+    return False
 
 
 def _close_owned_job_handle(worker_id: int, process: subprocess.Popen) -> bool:
@@ -1126,10 +1360,16 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             "--disable-session-crashed-bubble", "--hide-crash-restore-bubble", "--noerrdialogs",
             "https://www.linkedin.com/login",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if platform.system() == "Windows":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception:
         reservation.release()
         raise
+    guard = _acquire_spawn_guard(proc)
+    if guard is None:
+        raise RuntimeError("stable browser spawn guard unavailable; reservation retained")
     try:
         _record_launched_browser_identity(
             reservation,
@@ -1139,7 +1379,8 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             LINKEDIN_LOGIN_CDP_PORT,
         )
     except Exception:
-        reservation.release()
+        if guard.terminate_and_reap():
+            reservation.release(clear_identity=True)
         raise
     with _chrome_lock:
         _chrome_procs[LINKEDIN_LOGIN_SLOT] = proc
@@ -1150,8 +1391,12 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
         reservation.browser_identity,
         reservation,
     ):
-        cleanup_worker(LINKEDIN_LOGIN_SLOT, proc)
+        _abort_spawn(LINKEDIN_LOGIN_SLOT, proc, reservation, guard)
         raise RuntimeError("browser job assignment could not be verified")
+    if platform.system() == "Windows" and not _resume_windows_process(guard.handle):
+        _abort_spawn(LINKEDIN_LOGIN_SLOT, proc, reservation, guard)
+        raise RuntimeError("suspended browser could not be resumed")
+    guard.release()
     deadline = time.monotonic() + timeout_seconds
     ok = False
 
@@ -1290,7 +1535,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
         # On Unix, start in a new process group so we can kill the whole tree
         kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if platform.system() != "Windows":
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        else:
             import os
             kwargs["preexec_fn"] = os.setsid
 
@@ -1298,10 +1545,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
     except Exception:
         reservation.release()
         raise
+    guard = _acquire_spawn_guard(proc)
+    if guard is None:
+        raise RuntimeError("stable browser spawn guard unavailable; reservation retained")
     try:
         _record_launched_browser_identity(reservation, proc, chrome_exe, profile_dir, port)
     except Exception:
-        reservation.release()
+        if guard.terminate_and_reap():
+            reservation.release(clear_identity=True)
         raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
@@ -1311,8 +1562,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if not _assign_kill_on_close_job(
         worker_id, proc, reservation.browser_identity, reservation
     ):
-        cleanup_worker(worker_id, proc)
+        _abort_spawn(worker_id, proc, reservation, guard)
         raise RuntimeError("browser job assignment could not be verified")
+    if platform.system() == "Windows" and not _resume_windows_process(guard.handle):
+        _abort_spawn(worker_id, proc, reservation, guard)
+        raise RuntimeError("suspended browser could not be resumed")
+    guard.release()
 
     # Poll the CDP endpoint instead of a blind sleep(3): return as soon as Chrome's
     # debug port actually accepts connections (usually <1s when warm), and cap the

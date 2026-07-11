@@ -68,9 +68,13 @@ class TestLinkedInLoginPersistence:
         class FakeProc:
             pid = 12345
             alive = True
+            _handle = 9001
 
             def poll(self):
                 return None if self.alive else 0
+
+            def wait(self, timeout=None):
+                return 0 if not self.alive else None
 
         proc = FakeProc()
         monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
@@ -88,13 +92,26 @@ class TestLinkedInLoginPersistence:
             ),
             profile_dir=str(seed),
             port=chrome.LINKEDIN_LOGIN_CDP_PORT,
+            parent_pid=50,
+            parent_created_at=5.0,
+            parent_executable="python.exe",
+            parent_command="python applypilot-worker.py",
         )
-        monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda worker_id, pid: None)
-        monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: setattr(proc, "alive", False))
+        monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *args: True)
+        monkeypatch.setattr(
+            chrome,
+            "_acquire_spawn_guard",
+            lambda process: chrome._SpawnGuard(process, "windows", process._handle),
+        )
+        monkeypatch.setattr(chrome, "_resume_windows_process", lambda handle: True)
+        monkeypatch.setattr(
+            chrome,
+            "_kill_process_tree",
+            lambda process, expected, reservation: setattr(proc, "alive", False) or True,
+        )
         monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
         monkeypatch.setattr(chrome.subprocess, "Popen", lambda *args, **kwargs: proc)
         monkeypatch.setattr(chrome, "_has_linkedin_session_cdp", lambda port: True)
-        monkeypatch.setattr(chrome, "_close_browser_cdp", lambda port: False)
         monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
         monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile_dir: False)
         times = [0.0, 0.0, 11.0]
