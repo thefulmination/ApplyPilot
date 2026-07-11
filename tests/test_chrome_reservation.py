@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import multiprocessing
 import signal
+import subprocess
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+from applypilot.apply import lifecycle_fault
+
+
+@pytest.fixture(autouse=True)
+def _isolate_lifecycle_faults(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
 
 
 def _reservation_contender(lock_dir, ready, release, launch_count, results) -> None:
@@ -93,6 +101,43 @@ def test_launch_reservation_failure_happens_before_zombie_kill(monkeypatch) -> N
         chrome.launch_chrome(3, port=9403)
 
     assert killed == []
+
+
+@pytest.mark.parametrize("launcher", ["launch_chrome", "linkedin_login"])
+def test_fault_created_during_setup_blocks_final_popen(
+    launcher: str, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(chrome, "_listener_pids", lambda _port: [])
+
+    def resolve(_browser):
+        lifecycle_fault.persist_lifecycle_hard_fault("setup race", pid=0)
+        return "chrome.exe"
+
+    monkeypatch.setattr(config, "resolve_browser_path", resolve)
+    if launcher == "launch_chrome":
+        monkeypatch.setattr(
+            chrome,
+            "setup_worker_profile",
+            lambda *_args: tmp_path / "profiles" / "worker-0",
+        )
+    monkeypatch.setattr(
+        chrome.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
+        if launcher == "linkedin_login":
+            chrome.linkedin_login(timeout_seconds=0)
+        else:
+            chrome.launch_chrome(0, port=9400)
+
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
 
 
 def test_refuse_occupied_port_never_kills_or_launches(tmp_path: Path, monkeypatch) -> None:
@@ -306,7 +351,9 @@ def test_cleanup_worker_foreign_handle_record_leaves_process_untouched(tmp_path:
     reservation.release()
 
 
-def test_cleanup_on_exit_closes_only_successful_owned_handles(tmp_path: Path, monkeypatch) -> None:
+def test_cleanup_on_exit_closes_successful_owners_and_faults_failed_owner(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
     from applypilot.apply import chrome
 
     monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
@@ -335,16 +382,66 @@ def test_cleanup_on_exit_closes_only_successful_owned_handles(tmp_path: Path, mo
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: port == 9501)
     monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
-    chrome.cleanup_on_exit()
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="browser cleanup"):
+        chrome.cleanup_on_exit()
 
     assert closed == [9010]
     assert id(successful) not in chrome._job_handles
     assert chrome._job_handles[id(failing)].handle == 9020
     assert chrome._chrome_procs[1] is failing
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
+    assert "CRITICAL" in caplog.text
 
     failing.alive = False
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     assert chrome.cleanup_worker(1, failing) is True
+
+
+@pytest.mark.parametrize("mode", ["false", "exception"])
+def test_kill_all_chrome_persists_and_propagates_cleanup_uncertainty(
+    mode: str, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(903)
+    monkeypatch.setattr(chrome, "_chrome_procs", {3: process})
+    if mode == "false":
+        monkeypatch.setattr(chrome, "cleanup_worker", lambda *_args: False)
+    else:
+        monkeypatch.setattr(
+            chrome,
+            "cleanup_worker",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+        )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="browser cleanup"):
+        chrome.kill_all_chrome()
+
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
+
+
+@pytest.mark.parametrize("mode", ["false", "exception"])
+def test_cleanup_on_exit_logs_critical_and_persists_uncertainty(
+    mode: str, monkeypatch, caplog
+) -> None:
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(904)
+    monkeypatch.setattr(chrome, "_chrome_procs", {4: process})
+    if mode == "false":
+        monkeypatch.setattr(chrome, "cleanup_worker", lambda *_args: False)
+    else:
+        monkeypatch.setattr(
+            chrome,
+            "cleanup_worker",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+        )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="browser cleanup"):
+        chrome.cleanup_on_exit()
+
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
+    assert "CRITICAL" in caplog.text
 
 
 def test_linkedin_login_cannot_kill_another_process_port_owner(tmp_path: Path, monkeypatch) -> None:
@@ -826,12 +923,13 @@ def test_browser_identity_capture_failure_terminates_and_reaps_spawn_guard(
     if launcher == "launch_chrome":
         monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile_root / "worker-0")
 
-    with pytest.raises(RuntimeError, match="identity failed"):
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="identity capture"):
         if launcher == "linkedin_login":
             chrome.linkedin_login(timeout_seconds=0)
         else:
             chrome.launch_chrome(0, port=9400)
     assert process.poll() == 0
+    assert lifecycle_fault.lifecycle_hard_fault_paths() == []
 
     profile = (
         profile_root / chrome.SEED_PROFILE_NAME
@@ -842,6 +940,187 @@ def test_browser_identity_capture_failure_terminates_and_reaps_spawn_guard(
     port = chrome.LINKEDIN_LOGIN_CDP_PORT if launcher == "linkedin_login" else 9400
     reacquired = chrome._acquire_browser_reservation(slot, port, profile)
     reacquired.release()
+
+
+@pytest.mark.parametrize("launcher", ["linkedin_login", "launch_chrome"])
+@pytest.mark.parametrize("cleanup_mode", ["proven", "false", "exception"])
+@pytest.mark.parametrize("guard_mode", ["none", "exception"])
+def test_guard_acquisition_failure_uses_exact_direct_child_cleanup(
+    launcher: str,
+    cleanup_mode: str,
+    guard_mode: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(510)
+    profile_root = tmp_path / "profiles"
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", profile_root)
+    monkeypatch.setattr(config, "resolve_browser_path", lambda _browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "_listener_pids", lambda _port: [])
+    monkeypatch.setattr(chrome, "_chrome_procs", {})
+    monkeypatch.setattr(chrome, "_browser_reservations", {})
+    monkeypatch.setattr(chrome, "_job_handles", {})
+    monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    if guard_mode == "none":
+        monkeypatch.setattr(chrome, "_acquire_spawn_guard", lambda _process: None)
+    else:
+        monkeypatch.setattr(
+            chrome,
+            "_acquire_spawn_guard",
+            lambda _process: (_ for _ in ()).throw(RuntimeError("guard failed")),
+        )
+
+    def emergency(_process):
+        if cleanup_mode == "exception":
+            raise RuntimeError("emergency cleanup failed")
+        if cleanup_mode == "proven":
+            process.alive = False
+            return True
+        return False
+
+    monkeypatch.setattr(chrome, "emergency_cleanup_direct_child", emergency, raising=False)
+    if launcher == "launch_chrome":
+        monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile_root / "worker-0")
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="spawn guard"):
+        if launcher == "linkedin_login":
+            chrome.linkedin_login(timeout_seconds=0)
+        else:
+            chrome.launch_chrome(0, port=9400)
+
+    assert process.alive is (cleanup_mode != "proven")
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == (
+        0 if cleanup_mode == "proven" else 1
+    )
+
+
+def test_guard_acquisition_failure_reaps_real_direct_child(tmp_path: Path, monkeypatch) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    profile = tmp_path / "profiles" / "worker-0"
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(config, "resolve_browser_path", lambda _browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile)
+    monkeypatch.setattr(chrome, "_listener_pids", lambda _port: [])
+    monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(chrome, "_acquire_spawn_guard", lambda _process: None)
+    try:
+        with pytest.raises(lifecycle_fault.LifecycleHardFault, match="spawn guard"):
+            chrome.launch_chrome(0, port=9400)
+
+        assert child.poll() is not None
+        assert lifecycle_fault.lifecycle_hard_fault_paths() == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+@pytest.mark.parametrize("launcher", ["linkedin_login", "launch_chrome"])
+@pytest.mark.parametrize("cleanup_mode", ["false", "exception"])
+def test_identity_capture_unproven_cleanup_persists_fault(
+    launcher: str, cleanup_mode: str, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(520)
+    profile_root = tmp_path / "profiles"
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", profile_root)
+    monkeypatch.setattr(config, "resolve_browser_path", lambda _browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "_listener_pids", lambda _port: [])
+    monkeypatch.setattr(chrome, "_chrome_procs", {})
+    monkeypatch.setattr(chrome, "_browser_reservations", {})
+    monkeypatch.setattr(chrome, "_job_handles", {})
+    monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        chrome,
+        "_acquire_spawn_guard",
+        lambda proc: chrome._SpawnGuard(proc, "windows", proc._handle),
+    )
+    if cleanup_mode == "false":
+        monkeypatch.setattr(chrome, "_terminate_windows_handle", lambda *_args: False)
+    else:
+        class RaisingGuard:
+            handle = process._handle
+
+            def terminate_and_reap(self):
+                raise RuntimeError("identity cleanup failed")
+
+        monkeypatch.setattr(chrome, "_acquire_spawn_guard", lambda _proc: RaisingGuard())
+    monkeypatch.setattr(
+        chrome,
+        "_record_launched_browser_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("identity failed")),
+    )
+    if launcher == "launch_chrome":
+        monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile_root / "worker-0")
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="identity capture"):
+        if launcher == "linkedin_login":
+            chrome.linkedin_login(timeout_seconds=0)
+        else:
+            chrome.launch_chrome(0, port=9400)
+
+    assert process.alive is True
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
+
+
+@pytest.mark.parametrize("launcher", ["linkedin_login", "launch_chrome"])
+@pytest.mark.parametrize("abort_mode", ["false", "exception"])
+def test_abort_spawn_uncertainty_persists_and_escapes(
+    launcher: str, abort_mode: str, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(530)
+    profile_root = tmp_path / "profiles"
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", profile_root)
+    monkeypatch.setattr(config, "resolve_browser_path", lambda _browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "_listener_pids", lambda _port: [])
+    monkeypatch.setattr(chrome, "_chrome_procs", {})
+    monkeypatch.setattr(chrome, "_browser_reservations", {})
+    monkeypatch.setattr(chrome, "_job_handles", {})
+    monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        chrome,
+        "_acquire_spawn_guard",
+        lambda proc: chrome._SpawnGuard(proc, "windows", proc._handle),
+    )
+    monkeypatch.setattr(chrome, "_record_launched_browser_identity", lambda *_args: None)
+    monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *_args: False)
+    if abort_mode == "false":
+        monkeypatch.setattr(chrome, "_abort_spawn", lambda *_args: False)
+    else:
+        monkeypatch.setattr(
+            chrome,
+            "_abort_spawn",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("abort failed")),
+        )
+    if launcher == "launch_chrome":
+        monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile_root / "worker-0")
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="spawn abort"):
+        if launcher == "linkedin_login":
+            chrome.linkedin_login(timeout_seconds=0)
+        else:
+            chrome.launch_chrome(0, port=9400)
+
+    assert process.alive is True
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
 
 
 @pytest.mark.parametrize("resume_ok", [True, False])
@@ -898,7 +1177,7 @@ def test_windows_launch_is_suspended_contained_then_resumed_or_reaped(
         monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
         assert chrome.cleanup_worker(0, process) is True
     else:
-        with pytest.raises(RuntimeError, match="could not be resumed"):
+        with pytest.raises(lifecycle_fault.LifecycleHardFault, match="could not be resumed"):
             chrome.launch_chrome(0, port=9400)
         assert process.poll() == 0
         reacquired = chrome._acquire_browser_reservation(0, 9400, profile)

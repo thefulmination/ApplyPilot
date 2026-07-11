@@ -20,6 +20,9 @@ from applypilot.apply import lifecycle_fault
 @pytest.fixture(autouse=True)
 def _isolate_lifecycle_faults(tmp_path, monkeypatch):
     monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(chrome, "_chrome_procs", {})
+    monkeypatch.setattr(chrome, "_browser_reservations", {})
+    monkeypatch.setattr(chrome, "_job_handles", {})
 
 
 def _make_cookies(profile_dir: Path, cookies: list[tuple[str, str]]) -> None:

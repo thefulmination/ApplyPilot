@@ -21,11 +21,14 @@ from pathlib import Path
 
 from applypilot import config
 from applypilot.apply.lifecycle_fault import (
+    LifecycleHardFault,
     enforce_no_lifecycle_faults,
+    persist_lifecycle_hard_fault,
     require_browser_cleanup,
 )
 from applypilot.apply.process_guard import (
     darwin_process_executable,
+    emergency_cleanup_direct_child,
     parse_ps_lstart_local,
 )
 
@@ -1158,6 +1161,74 @@ def _abort_spawn(
     return False
 
 
+def _raise_spawn_guard_failure(
+    process: subprocess.Popen,
+    reservation: _BrowserReservation,
+    cause: BaseException | None = None,
+) -> None:
+    try:
+        cleaned = emergency_cleanup_direct_child(process)
+    except BaseException:
+        cleaned = False
+    if cleaned:
+        reservation.release(clear_identity=True)
+    else:
+        persist_lifecycle_hard_fault(
+            "browser spawn guard cleanup unproven",
+            pid=process.pid,
+        )
+    if cause is not None:
+        raise LifecycleHardFault("browser spawn guard acquisition failed") from cause
+    raise LifecycleHardFault("browser spawn guard acquisition failed")
+
+
+def _raise_identity_capture_failure(
+    process: subprocess.Popen,
+    reservation: _BrowserReservation,
+    guard: _SpawnGuard,
+    cause: BaseException,
+) -> None:
+    try:
+        cleaned = guard.terminate_and_reap()
+    except BaseException:
+        cleaned = False
+    if cleaned:
+        reservation.release(clear_identity=True)
+    else:
+        persist_lifecycle_hard_fault(
+            "browser identity capture cleanup unproven",
+            pid=process.pid,
+        )
+    raise LifecycleHardFault("browser identity capture failed") from cause
+
+
+def _abort_spawn_or_hard_fault(
+    worker_id: int,
+    process: subprocess.Popen,
+    reservation: _BrowserReservation,
+    guard: _SpawnGuard,
+    reason: str,
+    cause: BaseException | None = None,
+) -> None:
+    try:
+        cleaned = _abort_spawn(worker_id, process, reservation, guard)
+    except BaseException as exc:
+        persist_lifecycle_hard_fault(
+            "browser spawn abort exception",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault("browser spawn abort could not be proven") from exc
+    if not cleaned:
+        persist_lifecycle_hard_fault(
+            "browser spawn abort cleanup unproven",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault("browser spawn abort could not be proven")
+    if cause is not None:
+        raise LifecycleHardFault(reason) from cause
+    raise LifecycleHardFault(reason)
+
+
 def _close_owned_job_handle(worker_id: int, process: subprocess.Popen) -> bool:
     key = id(process)
     record = _job_handles.get(key)
@@ -1372,13 +1443,20 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
         popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if platform.system() == "Windows":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        enforce_no_lifecycle_faults()
         proc = subprocess.Popen(cmd, **popen_kwargs)
+    except LifecycleHardFault:
+        reservation.release()
+        raise
     except Exception:
         reservation.release()
         raise
-    guard = _acquire_spawn_guard(proc)
+    try:
+        guard = _acquire_spawn_guard(proc)
+    except BaseException as exc:
+        _raise_spawn_guard_failure(proc, reservation, exc)
     if guard is None:
-        raise RuntimeError("stable browser spawn guard unavailable; reservation retained")
+        _raise_spawn_guard_failure(proc, reservation)
     try:
         _record_launched_browser_identity(
             reservation,
@@ -1387,24 +1465,55 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             seed,
             LINKEDIN_LOGIN_CDP_PORT,
         )
-    except Exception:
-        if guard.terminate_and_reap():
-            reservation.release(clear_identity=True)
-        raise
+    except BaseException as exc:
+        _raise_identity_capture_failure(proc, reservation, guard, exc)
     with _chrome_lock:
         _chrome_procs[LINKEDIN_LOGIN_SLOT] = proc
         _browser_reservations[id(proc)] = reservation
-    if not _assign_kill_on_close_job(
-        LINKEDIN_LOGIN_SLOT,
-        proc,
-        reservation.browser_identity,
-        reservation,
-    ):
-        _abort_spawn(LINKEDIN_LOGIN_SLOT, proc, reservation, guard)
-        raise RuntimeError("browser job assignment could not be verified")
-    if platform.system() == "Windows" and not _resume_windows_process(guard.handle):
-        _abort_spawn(LINKEDIN_LOGIN_SLOT, proc, reservation, guard)
-        raise RuntimeError("suspended browser could not be resumed")
+    try:
+        assigned = _assign_kill_on_close_job(
+            LINKEDIN_LOGIN_SLOT,
+            proc,
+            reservation.browser_identity,
+            reservation,
+        )
+    except BaseException as exc:
+        _abort_spawn_or_hard_fault(
+            LINKEDIN_LOGIN_SLOT,
+            proc,
+            reservation,
+            guard,
+            "browser job assignment could not be verified",
+            exc,
+        )
+    if not assigned:
+        _abort_spawn_or_hard_fault(
+            LINKEDIN_LOGIN_SLOT,
+            proc,
+            reservation,
+            guard,
+            "browser job assignment could not be verified",
+        )
+    if platform.system() == "Windows":
+        try:
+            resumed = _resume_windows_process(guard.handle)
+        except BaseException as exc:
+            _abort_spawn_or_hard_fault(
+                LINKEDIN_LOGIN_SLOT,
+                proc,
+                reservation,
+                guard,
+                "suspended browser could not be resumed",
+                exc,
+            )
+        if not resumed:
+            _abort_spawn_or_hard_fault(
+                LINKEDIN_LOGIN_SLOT,
+                proc,
+                reservation,
+                guard,
+                "suspended browser could not be resumed",
+            )
     guard.release()
     deadline = time.monotonic() + timeout_seconds
     ok = False
@@ -1551,32 +1660,70 @@ def launch_chrome(worker_id: int, port: int | None = None,
             import os
             kwargs["preexec_fn"] = os.setsid
 
+        enforce_no_lifecycle_faults()
         proc = subprocess.Popen(cmd, **kwargs)
+    except LifecycleHardFault:
+        reservation.release()
+        raise
     except Exception:
         reservation.release()
         raise
-    guard = _acquire_spawn_guard(proc)
+    try:
+        guard = _acquire_spawn_guard(proc)
+    except BaseException as exc:
+        _raise_spawn_guard_failure(proc, reservation, exc)
     if guard is None:
-        raise RuntimeError("stable browser spawn guard unavailable; reservation retained")
+        _raise_spawn_guard_failure(proc, reservation)
     try:
         _record_launched_browser_identity(reservation, proc, chrome_exe, profile_dir, port)
-    except Exception:
-        if guard.terminate_and_reap():
-            reservation.release(clear_identity=True)
-        raise
+    except BaseException as exc:
+        _raise_identity_capture_failure(proc, reservation, guard, exc)
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
         _browser_reservations[id(proc)] = reservation
     # Assign IMMEDIATELY (before Chrome forks much) so the tree dies with us even on a
     # hard external kill -- no lingering orphan to lock the profile.
-    if not _assign_kill_on_close_job(
-        worker_id, proc, reservation.browser_identity, reservation
-    ):
-        _abort_spawn(worker_id, proc, reservation, guard)
-        raise RuntimeError("browser job assignment could not be verified")
-    if platform.system() == "Windows" and not _resume_windows_process(guard.handle):
-        _abort_spawn(worker_id, proc, reservation, guard)
-        raise RuntimeError("suspended browser could not be resumed")
+    try:
+        assigned = _assign_kill_on_close_job(
+            worker_id, proc, reservation.browser_identity, reservation
+        )
+    except BaseException as exc:
+        _abort_spawn_or_hard_fault(
+            worker_id,
+            proc,
+            reservation,
+            guard,
+            "browser job assignment could not be verified",
+            exc,
+        )
+    if not assigned:
+        _abort_spawn_or_hard_fault(
+            worker_id,
+            proc,
+            reservation,
+            guard,
+            "browser job assignment could not be verified",
+        )
+    if platform.system() == "Windows":
+        try:
+            resumed = _resume_windows_process(guard.handle)
+        except BaseException as exc:
+            _abort_spawn_or_hard_fault(
+                worker_id,
+                proc,
+                reservation,
+                guard,
+                "suspended browser could not be resumed",
+                exc,
+            )
+        if not resumed:
+            _abort_spawn_or_hard_fault(
+                worker_id,
+                proc,
+                reservation,
+                guard,
+                "suspended browser could not be resumed",
+            )
     guard.release()
 
     # Poll the CDP endpoint instead of a blind sleep(3): return as soon as Chrome's
@@ -1677,8 +1824,15 @@ def kill_all_chrome() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
 
+    hard_fault = None
     for wid, proc in procs.items():
-        cleanup_worker(wid, proc)
+        try:
+            require_browser_cleanup(cleanup_worker, wid, proc)
+        except LifecycleHardFault as exc:
+            if hard_fault is None:
+                hard_fault = exc
+    if hard_fault is not None:
+        raise hard_fault
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -1708,5 +1862,17 @@ def cleanup_on_exit() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
 
+    hard_fault = None
     for wid, proc in procs.items():
-        cleanup_worker(wid, proc)
+        try:
+            require_browser_cleanup(cleanup_worker, wid, proc)
+        except LifecycleHardFault as exc:
+            logger.critical(
+                "[worker-%s] browser cleanup hard fault persisted during process exit",
+                wid,
+                exc_info=True,
+            )
+            if hard_fault is None:
+                hard_fault = exc
+    if hard_fault is not None:
+        raise hard_fault
