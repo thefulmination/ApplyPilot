@@ -1145,7 +1145,11 @@ def claim_auth_match(
     connection: sqlite3.Connection | None = None,
     now: datetime | None = None,
 ) -> bool:
-    """Commit one mailbox-message claim and challenge resolution atomically."""
+    """Atomically claim a mailbox message and resolve its challenge.
+
+    This atomic claim transaction is the only supported resolution write path;
+    ``claim_unique_auth_match`` uses the same transactional helper.
+    """
     conn = connection or get_connection()
     now_text = _as_utc(now).isoformat()
 
@@ -1307,23 +1311,25 @@ def claim_unique_auth_match(
 
 
 def resolve_auth_challenge(challenge_id: int, inbox_event_id: int) -> bool:
-    """Resolve a challenge only if it's still awaiting completion."""
+    """Confirm a resolution previously written by the safe atomic claim path.
+
+    This legacy compatibility API is intentionally read-only and cannot link an
+    event or change challenge lifecycle state.
+    """
     conn = get_connection()
-    now = now_utc()
-    cursor = conn.execute(
+    row = conn.execute(
         """
-        UPDATE auth_challenges
-           SET status = 'resolved',
-               resolved_at = ?,
-               inbox_event_id = ?,
-               updated_at = ?,
-               last_error = NULL
-         WHERE id = ? AND status IN ('pending', 'watching')
+        SELECT 1
+          FROM auth_challenges AS challenge
+          JOIN inbox_events AS event ON event.id = challenge.inbox_event_id
+         WHERE challenge.id = ?
+           AND challenge.status = 'resolved'
+           AND challenge.inbox_event_id = ?
+         LIMIT 1
         """,
-        (now, inbox_event_id, now, challenge_id),
-    )
-    conn.commit()
-    return int(cursor.rowcount or 0) == 1
+        (challenge_id, inbox_event_id),
+    ).fetchone()
+    return row is not None
 
 
 def expire_stale_challenges() -> int:

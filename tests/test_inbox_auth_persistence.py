@@ -274,27 +274,85 @@ def test_expire_stale_challenges(tmp_path, monkeypatch) -> None:
     assert status == "expired"
 
 
-def test_resolve_challenge_requires_pending_or_watching(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "event_kwargs",
+    [
+        {},
+        {"sender": "alerts@workday.com"},
+        {"sender": "alerts@greenhouse.io", "received_at": "2020-01-01T00:00:00+00:00"},
+        {"sender": "alerts@greenhouse.io", "matched_method": "magic_link"},
+    ],
+    ids=("arbitrary", "wrong-provider", "wrong-time", "wrong-kind"),
+)
+def test_legacy_resolve_cannot_link_active_challenge(
+    tmp_path, monkeypatch, event_kwargs
+) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("INSERT INTO jobs (url, title, site, discovered_at) VALUES ('u', 'T', 'S', ?)", (now,))
-    challenge_id = inbox_auth.create_auth_challenge(
-        job_url="u",
-        application_url="u",
-        provider="greenhouse",
-        challenge_type="email_code",
-    )
+    challenge_id = _seed_job_and_challenge(conn, job_url="legacy-active")
     event_id = inbox_auth.record_inbox_event(
-        message_id="msg-2",
-        sender="no-reply@greenhouse.io",
-        subject="Code",
-        event_type="auth_code",
-        confidence="high",
+        message_id=f"legacy-event-{event_kwargs}",
+        **event_kwargs,
     )
+    changes_before = conn.total_changes
 
-    assert inbox_auth.resolve_auth_challenge(challenge_id, event_id) is True
     assert inbox_auth.resolve_auth_challenge(challenge_id, event_id) is False
+    assert conn.total_changes == changes_before
+    row = conn.execute(
+        "SELECT status, resolved_at, inbox_event_id FROM auth_challenges WHERE id=?",
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == ("pending", None, None)
+
+
+def test_legacy_resolve_cannot_link_expired_challenge(tmp_path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="legacy-expired")
+    event_id = inbox_auth.record_inbox_event(message_id="legacy-expired-event")
+    conn.execute(
+        "UPDATE auth_challenges SET status='expired', last_error='expired' WHERE id=?",
+        (challenge_id,),
+    )
+    conn.commit()
+    changes_before = conn.total_changes
+
+    assert inbox_auth.resolve_auth_challenge(challenge_id, event_id) is False
+    assert conn.total_changes == changes_before
+    row = conn.execute(
+        "SELECT status, resolved_at, inbox_event_id FROM auth_challenges WHERE id=?",
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == ("expired", None, None)
+
+
+def test_legacy_resolve_only_confirms_existing_safe_link(tmp_path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="legacy-idempotent")
+    assert inbox_auth.claim_auth_match(
+        challenge_id,
+        message_id="safely-claimed-message",
+        sender="alerts@greenhouse.io",
+        matched_method="code",
+    )
+    linked_event_id = conn.execute(
+        "SELECT inbox_event_id FROM auth_challenges WHERE id=?", (challenge_id,)
+    ).fetchone()[0]
+    other_event_id = inbox_auth.record_inbox_event(message_id="different-message")
+    changes_before = conn.total_changes
+
+    class ReadOnlyProbe:
+        def execute(self, *args, **kwargs):
+            return conn.execute(*args, **kwargs)
+
+        def commit(self):
+            raise AssertionError("legacy compatibility check attempted a commit")
+
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: ReadOnlyProbe())
+    assert inbox_auth.resolve_auth_challenge(challenge_id, linked_event_id) is True
+    assert inbox_auth.resolve_auth_challenge(challenge_id, other_event_id) is False
+    assert conn.total_changes == changes_before
 
 
 def test_claim_auth_match_prevents_sequential_message_reuse(tmp_path, monkeypatch) -> None:
