@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import multiprocessing
+import signal
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -459,7 +462,11 @@ def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monke
     monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda worker_id, pid: None)
     monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile: True)
-    monkeypatch.setattr(chrome, "_close_browser_cdp", lambda port: setattr(process, "alive", False) or True)
+    monkeypatch.setattr(
+        chrome,
+        "_close_browser_cdp",
+        lambda process, expected, reservation: setattr(process, "alive", False) or True,
+    )
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     seed = config.CHROME_WORKER_DIR / chrome.SEED_PROFILE_NAME
     login_identity = chrome.BrowserProcessIdentity(
@@ -491,19 +498,29 @@ def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monke
     reservation.release()
 
 
-def _browser_identity(chrome, *, pid=500, created=10.0, profile="C:/applypilot/worker-0", port=9400):
+def _browser_identity(
+    chrome,
+    *,
+    pid=500,
+    created=10.0,
+    profile="C:/applypilot/worker-0",
+    port=9400,
+    parent_pid=50,
+    parent_created=5.0,
+    executable="C:/Program Files/Google/Chrome/Application/chrome.exe",
+):
     return chrome.BrowserProcessIdentity(
         pid=pid,
         created_at=created,
-        executable="C:/Program Files/Google/Chrome/Application/chrome.exe",
+        executable=executable,
         command=(
             f'chrome.exe --remote-debugging-port={port} '
             f'--user-data-dir="{profile}"'
         ),
         profile_dir=profile,
         port=port,
-        parent_pid=50,
-        parent_created_at=5.0,
+        parent_pid=parent_pid,
+        parent_created_at=parent_created,
         parent_executable="C:/Python/python.exe",
         parent_command="python applypilot-worker.py",
     )
@@ -769,3 +786,184 @@ def test_browser_identity_capture_failure_never_attempts_kill(
             chrome.linkedin_login(timeout_seconds=0)
         else:
             chrome.launch_chrome(0, port=9400)
+
+
+def test_unix_verified_termination_refuses_pidfd_acquisition_failure(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        chrome.os,
+        "pidfd_open",
+        lambda pid, flags=0: (_ for _ in ()).throw(OSError("unavailable")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chrome,
+        "_process_identity",
+        lambda pid: (_ for _ in ()).throw(AssertionError("must not verify without pidfd")),
+    )
+
+    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is False
+
+
+def test_unix_verified_termination_refuses_identity_transition_and_closes_fd(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    closed = []
+    signaled = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(chrome.os, "pidfd_open", lambda pid, flags=0: 41, raising=False)
+    monkeypatch.setattr(chrome.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(
+        chrome,
+        "_process_identity",
+        lambda pid: _browser_identity(chrome, pid=pid, created=30.0),
+    )
+    monkeypatch.setattr(
+        chrome.signal,
+        "pidfd_send_signal",
+        lambda fd, sig: signaled.append((fd, sig)),
+        raising=False,
+    )
+
+    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is False
+    assert signaled == []
+    assert closed == [41]
+
+
+def test_unix_verified_termination_signals_stable_pidfd_and_closes_fd(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    identity = _browser_identity(chrome, executable="chrome")
+    closed = []
+    signaled = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(chrome.os, "pidfd_open", lambda pid, flags=0: 42, raising=False)
+    monkeypatch.setattr(chrome.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+    monkeypatch.setattr(
+        chrome.signal,
+        "pidfd_send_signal",
+        lambda fd, sig: signaled.append((fd, sig)),
+        raising=False,
+    )
+
+    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is True
+    assert signaled == [(42, getattr(signal, "SIGKILL", 9))]
+    assert closed == [42]
+
+
+def test_unix_verified_termination_signal_failure_still_closes_fd(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    identity = _browser_identity(chrome, executable="chrome")
+    closed = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(chrome.os, "pidfd_open", lambda pid, flags=0: 43, raising=False)
+    monkeypatch.setattr(chrome.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+    monkeypatch.setattr(
+        chrome.signal,
+        "pidfd_send_signal",
+        lambda fd, sig: (_ for _ in ()).throw(OSError("signal failed")),
+        raising=False,
+    )
+
+    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is False
+    assert closed == [43]
+
+
+class _CdpBrowser:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _install_fake_playwright(monkeypatch, browser: _CdpBrowser) -> None:
+    class PlaywrightContext:
+        def __enter__(self):
+            chromium = types.SimpleNamespace(connect_over_cdp=lambda *_args, **_kwargs: browser)
+            return types.SimpleNamespace(chromium=chromium)
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "playwright.sync_api",
+        types.SimpleNamespace(sync_playwright=lambda: PlaywrightContext()),
+    )
+
+
+def test_cdp_close_refuses_replacement_listener_transition(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    process = _FakeProcess(500)
+    expected = _browser_identity(chrome, profile=str(profile))
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    listeners = iter(([500], [700]))
+    browser = _CdpBrowser()
+    monkeypatch.setattr(chrome, "_listener_pids", lambda port: next(listeners))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
+    _install_fake_playwright(monkeypatch, browser)
+    try:
+        assert chrome._close_browser_cdp(process, expected, reservation) is False
+        assert browser.close_calls == 0
+    finally:
+        reservation.release()
+
+
+def test_cdp_close_stable_owned_listener_closes_once(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    process = _FakeProcess(500)
+    expected = _browser_identity(chrome, profile=str(profile))
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    browser = _CdpBrowser()
+    monkeypatch.setattr(chrome, "_listener_pids", lambda port: [500])
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
+    _install_fake_playwright(monkeypatch, browser)
+    try:
+        assert chrome._close_browser_cdp(process, expected, reservation) is True
+        assert browser.close_calls == 1
+    finally:
+        reservation.release()
+
+
+@pytest.mark.parametrize(
+    "parent_change",
+    ({"parent_created": 30.0}, {"parent_pid": 0}),
+)
+def test_reserved_listener_parent_mismatch_or_uncertainty_is_never_terminated(
+    parent_change, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    expected = _browser_identity(chrome, profile=str(profile))
+    changed_parent = _browser_identity(chrome, profile=str(profile), **parent_change)
+    ownership = chrome.reserve_browser_cleanup(0, 9400, profile)
+    ownership.record_browser_identity(expected)
+    terminated = []
+    monkeypatch.setattr(chrome, "_listener_pids", lambda port: [500])
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: changed_parent)
+    monkeypatch.setattr(
+        chrome,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+    try:
+        assert ownership.cleanup_browser() is False
+        assert terminated == []
+    finally:
+        ownership.release()

@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import platform
+import signal
 import shutil
 import subprocess
 import threading
@@ -383,23 +384,56 @@ def _browser_identity_matches(
     )
 
 
+def _browser_parent_identity_matches(
+    expected: BrowserProcessIdentity | None,
+    actual: BrowserProcessIdentity | None,
+) -> bool:
+    if expected is None or actual is None:
+        return False
+    return (
+        expected.parent_pid > 0
+        and actual.parent_pid == expected.parent_pid
+        and expected.parent_created_at > 0
+        and abs(actual.parent_created_at - expected.parent_created_at) < 0.001
+        and bool(expected.parent_executable)
+        and bool(actual.parent_executable)
+        and _normalized_path(actual.parent_executable)
+        == _normalized_path(expected.parent_executable)
+        and bool(expected.parent_command)
+        and actual.parent_command == expected.parent_command
+    )
+
+
 def terminate_verified_process(*, pid: int, created_at: float, executable: str) -> bool:
     """Terminate only the process instance identified by PID, start time, and image."""
     if pid <= 0 or created_at <= 0 or not executable:
         return False
     if platform.system() != "Windows":
-        actual = _process_identity(pid)
-        if (
-            actual is None
-            or abs(actual.created_at - created_at) >= 0.001
-            or _normalized_path(actual.executable) != _normalized_path(executable)
-        ):
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        if pidfd_open is None or pidfd_send_signal is None:
             return False
         try:
-            os.kill(pid, __import__("signal").SIGKILL)
-            return True
-        except (ProcessLookupError, PermissionError, OSError):
+            pidfd = pidfd_open(pid, 0)
+        except (OSError, ValueError):
             return False
+        try:
+            actual = _process_identity(pid)
+            if (
+                actual is None
+                or abs(actual.created_at - created_at) >= 0.001
+                or _normalized_path(actual.executable) != _normalized_path(executable)
+            ):
+                return False
+            pidfd_send_signal(pidfd, getattr(signal, "SIGKILL", 9))
+            return True
+        except (OSError, ValueError):
+            return False
+        finally:
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
 
     import ctypes
     from ctypes import wintypes
@@ -471,16 +505,37 @@ def _terminate_reserved_listener(
     reservation: _BrowserReservation,
     listener_pid: int,
 ) -> bool:
-    if _listener_pids(reservation.port) != [listener_pid]:
-        return False
-    current = _process_identity(listener_pid)
-    if not _browser_identity_matches(reservation.browser_identity, current):
+    current = _validated_reserved_listener(reservation, listener_pid)
+    if current is None:
         return False
     return terminate_verified_process(
         pid=current.pid,
         created_at=current.created_at,
         executable=current.executable,
     )
+
+
+def _validated_reserved_listener(
+    reservation: _BrowserReservation,
+    listener_pid: int,
+) -> BrowserProcessIdentity | None:
+    expected = reservation.browser_identity
+    if (
+        reservation._released
+        or expected is None
+        or expected.pid != listener_pid
+        or expected.port != reservation.port
+        or _normalized_path(expected.profile_dir) != _normalized_path(reservation.profile_dir)
+        or _listener_pids(reservation.port) != [listener_pid]
+    ):
+        return None
+    current = _process_identity(listener_pid)
+    if not (
+        _browser_identity_matches(expected, current)
+        and _browser_parent_identity_matches(expected, current)
+    ):
+        return None
+    return current
 
 
 def _cleanup_reserved_listener(reservation: _BrowserReservation) -> bool:
@@ -490,8 +545,7 @@ def _cleanup_reserved_listener(reservation: _BrowserReservation) -> bool:
     if len(listeners) != 1:
         return False
     listener_pid = listeners[0]
-    actual = _process_identity(listener_pid)
-    if not _browser_identity_matches(reservation.browser_identity, actual):
+    if _validated_reserved_listener(reservation, listener_pid) is None:
         return False
     if not _terminate_reserved_listener(reservation, listener_pid):
         return False
@@ -623,14 +677,9 @@ def _kill_process_tree(
     ):
         return False
     current = _process_identity(process.pid)
-    if not _browser_identity_matches(expected, current):
-        return False
-    if (
-        current.parent_pid != expected.parent_pid
-        or abs(current.parent_created_at - expected.parent_created_at) >= 0.001
-        or _normalized_path(current.parent_executable)
-        != _normalized_path(expected.parent_executable)
-        or current.parent_command != expected.parent_command
+    if not (
+        _browser_identity_matches(expected, current)
+        and _browser_parent_identity_matches(expected, current)
     ):
         return False
     return terminate_verified_process(
@@ -924,19 +973,34 @@ def _has_linkedin_session_cdp(port: int) -> bool:
     return False
 
 
-def _close_browser_cdp(port: int) -> bool:
-    """Ask the login Chrome to close cleanly so profile data is flushed to disk."""
+def _close_browser_cdp(
+    process: subprocess.Popen,
+    expected: BrowserProcessIdentity | None,
+    reservation: _BrowserReservation,
+) -> bool:
+    """Close only the CDP browser bound to the captured reservation authority."""
+    if (
+        expected is None
+        or process.pid != expected.pid
+        or reservation.browser_identity != expected
+        or _validated_reserved_listener(reservation, expected.pid) is None
+    ):
+        return False
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
         return False
     try:
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=5000)
+            browser = p.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{expected.port}", timeout=5000
+            )
+            if _validated_reserved_listener(reservation, expected.pid) is None:
+                return False
             browser.close()
             return True
     except Exception:
-        logger.debug("CDP browser close failed on port %d", port, exc_info=True)
+        logger.debug("CDP browser close failed on owned slot", exc_info=True)
         return False
 
 
@@ -1011,7 +1075,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                 flush_deadline = min(deadline, time.monotonic() + 20.0)
                 ok = _wait_for_persisted_session(flush_deadline)
                 if not ok:
-                    _close_browser_cdp(LINKEDIN_LOGIN_CDP_PORT)
+                    _close_browser_cdp(proc, reservation.browser_identity, reservation)
                     try:
                         proc.wait(timeout=15)
                     except (AttributeError, subprocess.TimeoutExpired, OSError):
@@ -1024,7 +1088,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     finally:
         # Close the seed Chrome so the profile is unlocked for workers to clone.
         if proc.poll() is None:
-            _close_browser_cdp(LINKEDIN_LOGIN_CDP_PORT)
+            _close_browser_cdp(proc, reservation.browser_identity, reservation)
             try:
                 proc.wait(timeout=15)
             except (AttributeError, subprocess.TimeoutExpired, OSError):
