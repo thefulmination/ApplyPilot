@@ -24,6 +24,24 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import queue, sync
 
 
+@pytest.fixture(autouse=True)
+def _register_canonical_pg_policy(request):
+    if "fleet_db" not in request.fixturenames:
+        yield
+        return
+    dsn = request.getfixturevalue("fleet_db")
+    with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES ('canonical-linkedin-active-test','linkedin','active')"
+        )
+        cur.execute(
+            "UPDATE fleet_config SET linkedin_policy_version='canonical-linkedin-active-test' WHERE id=1"
+        )
+        conn.commit()
+    yield
+
+
 _JOBS_DDL = """
 CREATE TABLE jobs (
     url TEXT PRIMARY KEY, company TEXT, title TEXT, application_url TEXT,
@@ -253,6 +271,7 @@ def test_push_linkedin_rejects_non_authoritative_canonical_rows(
 # --- Issue 3: unscored backlog is countable, not silently lost --------------
 
 def test_push_linkedin_jobs_carries_unresolved_metadata(fleet_db):
+    now = datetime.now(timezone.utc)
     with pgqueue.connect(fleet_db) as pg:
         n = queue.push_linkedin_jobs(
             pg,
@@ -267,6 +286,19 @@ def test_push_linkedin_jobs_carries_unresolved_metadata(fleet_db):
                 "linkedin_resolve_error": "no_primary_apply_button",
                 "linkedin_unresolved_kind": "apply_button_missing",
                 "linkedin_next_action": "run_ats_reconstruction",
+                "decision_id": "decision-unresolved",
+                "policy_version": "canonical-linkedin-active-test",
+                "decision_action": "apply",
+                "qualification_verdict": "qualified",
+                "qualification_score": 9.0,
+                "qualification_floor": 7.0,
+                "preference_score": 8.0,
+                "outcome_score": 8.0,
+                "final_score": 9.0,
+                "decision_confidence": 0.9,
+                "decision_created_at": now,
+                "decision_expires_at": now + timedelta(days=1),
+                "input_hash": "hash-unresolved",
             }],
         )
         assert n == 1

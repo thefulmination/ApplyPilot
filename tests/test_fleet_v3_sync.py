@@ -21,6 +21,25 @@ from applypilot.fleet import queue as fleet_queue
 from applypilot.fleet import sync
 
 
+@pytest.fixture(autouse=True)
+def _register_canonical_pg_policies(request):
+    if "fleet_db" not in request.fixturenames:
+        yield
+        return
+    dsn = request.getfixturevalue("fleet_db")
+    with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
+        for lane in ("ats", "linkedin"):
+            policy = f"canonical-{lane}-active-test"
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                "VALUES (%s,%s,'active')",
+                (policy, lane),
+            )
+            cur.execute(f"UPDATE fleet_config SET {lane}_policy_version=%s WHERE id=1", (policy,))
+        conn.commit()
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Temp SQLite brain (minimal jobs table) -- mirrors the fleet_sync test DDL,
 # plus the advisory research_* columns the compute pull writes.

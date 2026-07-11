@@ -264,6 +264,13 @@ def _run_crash_diag(config, launcher, pgqueue, launch_chrome, cleanup_worker,
 
 
 def main() -> int:
+    raise RuntimeError(
+        "apply.container_worker is retired because it uses the legacy score-only queue; "
+        "run applypilot-fleet-apply with the canonical v3 queue instead"
+    )
+
+
+def _retired_main() -> int:
     _setup_env()
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)

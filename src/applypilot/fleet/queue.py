@@ -12,10 +12,45 @@ import json
 import math
 import numbers
 import urllib.parse as _urlparse
+from collections.abc import Mapping
 
 from applypilot import config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
+
+CANONICAL_QUEUE_FIELDS = frozenset({
+    "decision_id", "policy_version", "decision_action", "qualification_verdict",
+    "qualification_score", "qualification_floor", "preference_score", "outcome_score",
+    "final_score", "decision_confidence", "decision_created_at", "decision_expires_at",
+    "input_hash",
+})
+
+
+def _validate_canonical_queue_row(row: Mapping[str, object]) -> None:
+    missing = sorted(CANONICAL_QUEUE_FIELDS - row.keys())
+    nulls = sorted(key for key in CANONICAL_QUEUE_FIELDS if key in row and row[key] is None)
+    if missing or nulls:
+        raise ValueError(
+            f"canonical decision provenance required: missing={missing}, null={nulls}"
+        )
+    if row["decision_action"] != "apply" or row["qualification_verdict"] != "qualified":
+        raise ValueError("canonical apply/qualified decision provenance required")
+    for key in (
+        "qualification_score", "qualification_floor", "preference_score", "outcome_score",
+        "final_score", "decision_confidence",
+    ):
+        value = row[key]
+        if not isinstance(value, numbers.Real) or isinstance(value, bool) or not math.isfinite(value):
+            raise ValueError(f"canonical provenance {key} must be finite")
+    if row["qualification_score"] < row["qualification_floor"]:
+        raise ValueError("canonical qualification score is below its policy floor")
+    if not 0 <= row["decision_confidence"] <= 1:
+        raise ValueError("canonical decision confidence must be between 0 and 1")
+    if row.get("score") != row["final_score"]:
+        raise ValueError("queue score must equal canonical final_score")
+    for key in ("decision_id", "policy_version", "input_hash"):
+        if not isinstance(row[key], str) or not row[key].strip():
+            raise ValueError(f"canonical provenance {key} must be nonblank")
 
 # ---------------------------------------------------------------------------
 # APPLY lease -- governed, approval-gated, dedup-guarded (R6, R9, R11).
@@ -32,7 +67,8 @@ from applypilot.fleet import governor
 #     TRUE; it never clears it, so a cost-pause or manual pause is preserved.
 # ---------------------------------------------------------------------------
 _LEASE_APPLY = """
-WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
+WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_cap_usd,
+                    ats_policy_version, approval_threshold FROM fleet_config WHERE id=1 FOR UPDATE),
      home AS (SELECT count_24h, daily_cap, breaker_state, breaker_until FROM rate_governor WHERE scope_key = %(home_scope)s),
      glob AS (SELECT count_24h, daily_cap FROM rate_governor WHERE scope_key = 'global'),
      next_job AS (
@@ -43,6 +79,19 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_
        LEFT JOIN glob ON TRUE
        LEFT JOIN cfg ON TRUE
        WHERE q.status = 'queued' AND q.lane = 'ats' AND q.approved_batch IS NOT NULL
+         AND q.decision_id IS NOT NULL
+         AND q.policy_version = cfg.ats_policy_version
+         AND q.decision_action = 'apply'
+         AND q.qualification_verdict = 'qualified'
+         AND q.qualification_score >= q.qualification_floor
+         AND q.decision_expires_at > now()
+         AND q.score = q.final_score
+         AND (cfg.approval_threshold IS NULL OR q.final_score >= cfg.approval_threshold)
+         AND EXISTS (
+           SELECT 1 FROM fleet_decision_policies p
+           WHERE p.policy_version = q.policy_version AND p.lane = 'ats'
+             AND p.status IN ('canary', 'active')
+         )
          AND NOT COALESCE(cfg.paused, FALSE)
          -- H1: the Fleet Doctor's lane-pause writes ats_paused (NEVER the shared paused flag),
          -- honored here on the ATS lane only. _LEASE_LINKEDIN never reads ats_paused, so a
@@ -266,6 +315,7 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, commit=True) -> int:
     title, application_url, score, and target_host (or apply_domain)."""
     prepared = []
     for r in rows:
+        _validate_canonical_queue_row(r)
         host = r.get("target_host") or r.get("apply_domain")
         dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
         prepared.append((r, host, dk))
@@ -282,11 +332,20 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, commit=True) -> int:
             if dk in applied_keys:
                 continue
             cur.execute(
-                "INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, target_host, lane, dedup_key, approved_batch) "
-                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,%(host)s,%(host)s,'ats',%(dk)s,%(batch)s) "
+                "INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, target_host, lane, dedup_key, approved_batch, "
+                "decision_id, policy_version, decision_action, qualification_verdict, qualification_score, qualification_floor, "
+                "preference_score, outcome_score, final_score, decision_confidence, decision_created_at, decision_expires_at, input_hash) "
+                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,%(host)s,%(host)s,'ats',%(dk)s,%(batch)s, "
+                "%(decision_id)s,%(policy_version)s,%(decision_action)s,%(qualification_verdict)s,%(qualification_score)s,%(qualification_floor)s, "
+                "%(preference_score)s,%(outcome_score)s,%(final_score)s,%(decision_confidence)s,%(decision_created_at)s,%(decision_expires_at)s,%(input_hash)s) "
                 "ON CONFLICT (url) DO UPDATE SET company=EXCLUDED.company, title=EXCLUDED.title, "
                 "application_url=EXCLUDED.application_url, score=EXCLUDED.score, target_host=EXCLUDED.target_host, "
-                "dedup_key=EXCLUDED.dedup_key, "
+                "dedup_key=EXCLUDED.dedup_key, decision_id=EXCLUDED.decision_id, policy_version=EXCLUDED.policy_version, "
+                "decision_action=EXCLUDED.decision_action, qualification_verdict=EXCLUDED.qualification_verdict, "
+                "qualification_score=EXCLUDED.qualification_score, qualification_floor=EXCLUDED.qualification_floor, "
+                "preference_score=EXCLUDED.preference_score, outcome_score=EXCLUDED.outcome_score, final_score=EXCLUDED.final_score, "
+                "decision_confidence=EXCLUDED.decision_confidence, decision_created_at=EXCLUDED.decision_created_at, "
+                "decision_expires_at=EXCLUDED.decision_expires_at, input_hash=EXCLUDED.input_hash, "
                 "approved_batch=COALESCE(EXCLUDED.approved_batch, apply_queue.approved_batch), updated_at=now() "
                 "WHERE apply_queue.status='queued'",
                 {**r, "host": host, "dk": dk, "batch": approved_batch},
@@ -532,7 +591,8 @@ def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, err
 # as the ttl, so the next claim cannot race in before the current one expires.
 # ---------------------------------------------------------------------------
 _LEASE_LINKEDIN = """
-WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM fleet_config WHERE id=1 FOR UPDATE),
+WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining,
+                    linkedin_policy_version, approval_threshold FROM fleet_config WHERE id=1 FOR UPDATE),
      acct AS (
        SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state, breaker_until, halted_until
        FROM rate_governor WHERE scope_key = 'account:linkedin' FOR UPDATE
@@ -540,6 +600,19 @@ WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM flee
      next AS (
        SELECT q.url FROM linkedin_queue q LEFT JOIN acct a ON TRUE LEFT JOIN cfg ON TRUE
        WHERE q.status='queued' AND q.approved_batch IS NOT NULL
+         AND q.decision_id IS NOT NULL
+         AND q.policy_version = cfg.linkedin_policy_version
+         AND q.decision_action = 'apply'
+         AND q.qualification_verdict = 'qualified'
+         AND q.qualification_score >= q.qualification_floor
+         AND q.decision_expires_at > now()
+         AND q.score = q.final_score
+         AND (cfg.approval_threshold IS NULL OR q.final_score >= cfg.approval_threshold)
+         AND EXISTS (
+           SELECT 1 FROM fleet_decision_policies p
+           WHERE p.policy_version = q.policy_version AND p.lane = 'linkedin'
+             AND p.status IN ('canary', 'active')
+         )
          AND (NOT COALESCE(cfg.linkedin_canary_enabled, FALSE) OR cfg.linkedin_canary_remaining > 0)
          AND (a.halted_until IS NULL OR a.halted_until < now())
          AND (a.count_24h IS NULL OR a.count_24h < a.daily_cap)
@@ -785,13 +858,23 @@ def push_linkedin_jobs(conn, rows, *, approved_batch=None, commit=True) -> int:
     n = 0
     with conn.cursor() as cur:
         for r in rows:
+            _validate_canonical_queue_row(r)
             dk = r.get("dedup_key") or _dedup.dedup_key(r.get("company"), r.get("title"))
             cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, dedup_key, approved_batch, linkedin_unresolved_kind, linkedin_next_action) "
-                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,'ats',%(dk)s,%(batch)s,%(linkedin_unresolved_kind)s,%(linkedin_next_action)s) "
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, dedup_key, approved_batch, linkedin_unresolved_kind, linkedin_next_action, "
+                "decision_id, policy_version, decision_action, qualification_verdict, qualification_score, qualification_floor, "
+                "preference_score, outcome_score, final_score, decision_confidence, decision_created_at, decision_expires_at, input_hash) "
+                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,'linkedin',%(dk)s,%(batch)s,%(linkedin_unresolved_kind)s,%(linkedin_next_action)s, "
+                "%(decision_id)s,%(policy_version)s,%(decision_action)s,%(qualification_verdict)s,%(qualification_score)s,%(qualification_floor)s, "
+                "%(preference_score)s,%(outcome_score)s,%(final_score)s,%(decision_confidence)s,%(decision_created_at)s,%(decision_expires_at)s,%(input_hash)s) "
                 "ON CONFLICT (url) DO UPDATE SET company=EXCLUDED.company, title=EXCLUDED.title, "
                 "application_url=EXCLUDED.application_url, score=EXCLUDED.score, "
-                "dedup_key=EXCLUDED.dedup_key, "
+                "dedup_key=EXCLUDED.dedup_key, decision_id=EXCLUDED.decision_id, policy_version=EXCLUDED.policy_version, "
+                "decision_action=EXCLUDED.decision_action, qualification_verdict=EXCLUDED.qualification_verdict, "
+                "qualification_score=EXCLUDED.qualification_score, qualification_floor=EXCLUDED.qualification_floor, "
+                "preference_score=EXCLUDED.preference_score, outcome_score=EXCLUDED.outcome_score, final_score=EXCLUDED.final_score, "
+                "decision_confidence=EXCLUDED.decision_confidence, decision_created_at=EXCLUDED.decision_created_at, "
+                "decision_expires_at=EXCLUDED.decision_expires_at, input_hash=EXCLUDED.input_hash, "
                 "linkedin_unresolved_kind=EXCLUDED.linkedin_unresolved_kind, "
                 "linkedin_next_action=EXCLUDED.linkedin_next_action, "
                 "approved_batch=COALESCE(EXCLUDED.approved_batch, linkedin_queue.approved_batch), updated_at=now() "

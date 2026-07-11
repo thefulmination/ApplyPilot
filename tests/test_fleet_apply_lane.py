@@ -1,16 +1,40 @@
 # tests/test_fleet_apply_lane.py
 import concurrent.futures as cf
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from applypilot.apply import pgqueue
 
 
-def _seed_approved_apply_rows(conn, n, *, batch="b1"):
+def _activate_policy(conn, lane="ats"):
+    policy = f"test-{lane}-policy"
     with conn.cursor() as cur:
-        for i in range(n):
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy, lane),
+        )
+        cur.execute(
+            f"UPDATE fleet_config SET {lane}_policy_version=%s, approval_threshold=0 WHERE id=1",
+            (policy,),
+        )
+    conn.commit()
+    return policy
+
+
+def _seed_approved_apply_rows(conn, n, *, batch="b1", start=0):
+    policy = _activate_policy(conn)
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        for i in range(start, start + n):
             cur.execute(
-                "INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
-                "VALUES (%s,%s,%s,'queued','ats',%s,%s,'acme.com')",
-                (f"u{i}", f"http://acme.com/{i}", 9.0 - i*0.01, batch, f"dk{i}"))
+                "INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain, "
+                "decision_id,policy_version,decision_action,qualification_verdict,qualification_score,qualification_floor,"
+                "preference_score,outcome_score,final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash) "
+                "VALUES (%s,%s,%s,'queued','ats',%s,%s,'acme.com',%s,%s,'apply','qualified',9,7,8,8,%s,.9,%s,%s,%s)",
+                (f"u{i}", f"http://acme.com/{i}", 9.0 - i*0.01, batch, f"dk{i}",
+                 f"d{i}", policy, 9.0 - i*0.01, now, now + timedelta(days=1), f"h{i}"))
         conn.commit()
 
 
@@ -84,8 +108,7 @@ def test_lease_blocked_when_spend_cap_breached(fleet_db):
         _seed_approved_apply_rows(conn, 1)
         cur.execute("UPDATE apply_queue SET est_cost_usd = 5.0 WHERE url='u0'")  # already-spent row
         # add a second leasable row so the SUM (5.0) is what blocks, not an empty queue
-        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain) "
-                    "VALUES ('u1','http://acme.com/1','8','queued','ats','b1','dk1','acme.com')")
+        _seed_approved_apply_rows(conn, 1, start=1)
         cur.execute("UPDATE fleet_config SET spend_cap_usd = 1.0 WHERE id=1")
         conn.commit()
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None  # 5.0 >= 1.0 cap
@@ -174,16 +197,12 @@ def test_run_apply_reresolves_timeout_override_mid_flight(fleet_db, monkeypatch)
     assert int(launcher.AGENT_TIMEOUT_SECONDS) == 720  # next job sees the raised value
 
 
-def test_lease_one_requires_approval(fleet_db):
+def test_legacy_lease_one_is_disabled(fleet_db):
     from applypilot.apply import pgqueue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
                     "VALUES ('uone','http://x','9','queued','ats','x.com')")  # approved_batch NULL
         conn.commit()
     with pgqueue.connect(fleet_db) as conn:
-        assert pgqueue.lease_one(conn, "w1", politeness_seconds=0) is None  # not leasable: unapproved
-    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("UPDATE apply_queue SET approved_batch='b1' WHERE url='uone'")
-        conn.commit()
-    with pgqueue.connect(fleet_db) as conn:
-        assert pgqueue.lease_one(conn, "w1", politeness_seconds=0) is not None  # now leasable
+        with pytest.raises(RuntimeError, match="canonical"):
+            pgqueue.lease_one(conn, "w1", politeness_seconds=0)

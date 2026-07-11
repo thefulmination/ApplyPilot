@@ -1,14 +1,32 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 from applypilot.apply import pgqueue
 
 
 def _seed_li(conn, n, *, batch="b1", approved=True):
+    policy = "test-linkedin-policy"
+    now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'linkedin','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy,),
+        )
+        cur.execute(
+            "UPDATE fleet_config SET linkedin_policy_version=%s, approval_threshold=0 WHERE id=1",
+            (policy,),
+        )
         for i in range(n):
-            cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key) "
-                        "VALUES (%s,%s,%s,'queued','ats',%s,%s)",
-                        (f"li{i}", f"https://linkedin.com/jobs/{i}", 9.0-i*0.01, batch if approved else None, f"dk{i}"))
+            score = 9.0 - i * 0.01
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key, "
+                "decision_id,policy_version,decision_action,qualification_verdict,qualification_score,qualification_floor,"
+                "preference_score,outcome_score,final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash) "
+                "VALUES (%s,%s,%s,'queued','linkedin',%s,%s,%s,%s,'apply','qualified',9,7,8,8,%s,.9,%s,%s,%s)",
+                (f"li{i}", f"https://linkedin.com/jobs/{i}", score, batch if approved else None,
+                 f"dk{i}", f"li-d{i}", policy, score, now, now + timedelta(days=1), f"li-h{i}"),
+            )
         conn.commit()
 
 

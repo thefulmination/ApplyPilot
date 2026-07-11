@@ -87,7 +87,21 @@ def push_offsite_jobs(
     score_floor: int = 7,
     limit: int | None = None,
 ) -> int:
-    """Push offsite-eligible jobs into the fleet queue (idempotent). Returns count pushed."""
+    """Retired score-only push path; canonical v3 sync is the only authority."""
+    del sqlite_conn, pg_conn, score_floor, limit
+    raise RuntimeError(
+        "apply.fleet_sync.push_offsite_jobs is disabled; use "
+        "fleet.sync.push_apply_eligible with canonical decisions"
+    )
+
+
+def _retired_push_offsite_jobs(
+    *,
+    sqlite_conn: sqlite3.Connection | None = None,
+    pg_conn: Any | None = None,
+    score_floor: int = 7,
+    limit: int | None = None,
+) -> int:
     own_sq, own_pg = sqlite_conn is None, pg_conn is None
     sq = sqlite_conn or _home_conn()
     pg = pg_conn or pgqueue.connect()
