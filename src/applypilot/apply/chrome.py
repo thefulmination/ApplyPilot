@@ -72,6 +72,10 @@ class BrowserProcessIdentity:
     command: str
     profile_dir: str
     port: int
+    parent_pid: int = 0
+    parent_created_at: float = 0.0
+    parent_executable: str = ""
+    parent_command: str = ""
 
 
 class _BrowserReservation:
@@ -155,6 +159,10 @@ def _load_browser_identity(path: Path) -> BrowserProcessIdentity | None:
             command=str(raw["command"]),
             profile_dir=str(raw["profile_dir"]),
             port=int(raw["port"]),
+            parent_pid=int(raw.get("parent_pid") or 0),
+            parent_created_at=float(raw.get("parent_created_at") or 0.0),
+            parent_executable=str(raw.get("parent_executable") or ""),
+            parent_command=str(raw.get("parent_command") or ""),
         )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
@@ -272,9 +280,17 @@ def _process_identity(pid: int) -> BrowserProcessIdentity | None:
         if platform.system() == "Windows":
             script = (
                 f"$p=Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\";"
+                "$parent=if($p){Get-CimInstance Win32_Process -Filter "
+                "\"ProcessId=$($p.ParentProcessId)\"};"
                 "if($p){[pscustomobject]@{Pid=$p.ProcessId;"
                 "Created=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()/1000;"
-                "Executable=$p.ExecutablePath;Command=$p.CommandLine}|ConvertTo-Json -Compress}"
+                "Executable=$p.ExecutablePath;Command=$p.CommandLine;"
+                "ParentPid=$p.ParentProcessId;"
+                "ParentCreated=$(if($parent){"
+                "([DateTimeOffset]$parent.CreationDate).ToUnixTimeMilliseconds()/1000}else{0});"
+                "ParentExecutable=$(if($parent){$parent.ExecutablePath}else{''});"
+                "ParentCommand=$(if($parent){$parent.CommandLine}else{''})}"
+                "|ConvertTo-Json -Compress}"
             )
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", script],
@@ -295,6 +311,10 @@ def _process_identity(pid: int) -> BrowserProcessIdentity | None:
                 command=command,
                 profile_dir=profile,
                 port=port,
+                parent_pid=int(raw.get("ParentPid") or 0),
+                parent_created_at=float(raw.get("ParentCreated") or 0.0),
+                parent_executable=str(raw.get("ParentExecutable") or ""),
+                parent_command=str(raw.get("ParentCommand") or ""),
             )
 
         stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
@@ -308,7 +328,28 @@ def _process_identity(pid: int) -> BrowserProcessIdentity | None:
             "utf-8", "replace"
         ).strip()
         profile, port = _browser_markers(command)
-        return BrowserProcessIdentity(pid, created, executable, command, profile, port)
+        parent_pid = int(stat_fields[3])
+        parent_stat = Path(f"/proc/{parent_pid}/stat").read_text(encoding="utf-8").split()
+        parent_created = (
+            float(boot_line.split()[1])
+            + float(parent_stat[21]) / os.sysconf("SC_CLK_TCK")
+        )
+        parent_executable = os.readlink(f"/proc/{parent_pid}/exe")
+        parent_command = Path(f"/proc/{parent_pid}/cmdline").read_bytes().replace(
+            b"\0", b" "
+        ).decode("utf-8", "replace").strip()
+        return BrowserProcessIdentity(
+            pid,
+            created,
+            executable,
+            command,
+            profile,
+            port,
+            parent_pid,
+            parent_created,
+            parent_executable,
+            parent_command,
+        )
     except (OSError, ValueError, KeyError, StopIteration, json.JSONDecodeError):
         return None
 
@@ -561,36 +602,42 @@ def cleanup_orphaned_browser(worker_id: int, port: int, profile_dir: Path) -> bo
 # Cross-platform process helpers
 # ---------------------------------------------------------------------------
 
-def _kill_process_tree(pid: int) -> None:
-    """Kill a process and all its children.
-
-    On Windows, Chrome spawns 10+ child processes (GPU, renderer, etc.),
-    so taskkill /T is needed to kill the entire tree. On Unix, os.killpg
-    handles the process group.
-    """
-    import signal as _signal
-
-    try:
-        if platform.system() == "Windows":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
-        else:
-            # Unix: kill entire process group
-            import os
-            try:
-                os.killpg(os.getpgid(pid), _signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                # Process already gone or owned by another user
-                try:
-                    os.kill(pid, _signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-    except Exception:
-        logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
+def _kill_process_tree(
+    process: subprocess.Popen,
+    expected: BrowserProcessIdentity | None,
+    reservation: _BrowserReservation | None,
+) -> bool:
+    """Terminate only the browser instance bound to an owned reservation claim."""
+    if (
+        expected is None
+        or reservation is None
+        or reservation._released
+        or process.pid != expected.pid
+        or reservation.browser_identity != expected
+        or expected.parent_pid <= 0
+        or expected.parent_created_at <= 0
+        or not expected.parent_executable
+        or not expected.parent_command
+        or expected.port != reservation.port
+        or _normalized_path(expected.profile_dir) != _normalized_path(reservation.profile_dir)
+    ):
+        return False
+    current = _process_identity(process.pid)
+    if not _browser_identity_matches(expected, current):
+        return False
+    if (
+        current.parent_pid != expected.parent_pid
+        or abs(current.parent_created_at - expected.parent_created_at) >= 0.001
+        or _normalized_path(current.parent_executable)
+        != _normalized_path(expected.parent_executable)
+        or current.parent_command != expected.parent_command
+    ):
+        return False
+    return terminate_verified_process(
+        pid=expected.pid,
+        created_at=expected.created_at,
+        executable=expected.executable,
+    )
 
 
 def _assign_kill_on_close_job(worker_id: int, process: subprocess.Popen) -> None:
@@ -934,7 +981,6 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             LINKEDIN_LOGIN_CDP_PORT,
         )
     except Exception:
-        _kill_process_tree(proc.pid)
         reservation.release()
         raise
     with _chrome_lock:
@@ -983,8 +1029,6 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                 proc.wait(timeout=15)
             except (AttributeError, subprocess.TimeoutExpired, OSError):
                 pass
-        if proc.poll() is None:
-            _kill_process_tree(proc.pid)
         cleanup_worker(LINKEDIN_LOGIN_SLOT, proc)
     return ok, seed
 
@@ -1105,7 +1149,6 @@ def launch_chrome(worker_id: int, port: int | None = None,
     try:
         _record_launched_browser_identity(reservation, proc, chrome_exe, profile_dir, port)
     except Exception:
-        _kill_process_tree(proc.pid)
         reservation.release()
         raise
     with _chrome_lock:
@@ -1178,7 +1221,9 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
         if not _browser_identity_matches(reservation.browser_identity, current_identity):
             logger.error("[worker-%s] Refusing cleanup after browser identity mismatch", worker_id)
             return False
-        _kill_process_tree(process.pid)
+        if not _kill_process_tree(process, reservation.browser_identity, reservation):
+            logger.error("[worker-%s] Refusing cleanup after browser identity mismatch", worker_id)
+            return False
     deadline = time.monotonic() + max(
         0.0,
         float(os.environ.get("APPLYPILOT_CHROME_CLEANUP_TIMEOUT") or 10),

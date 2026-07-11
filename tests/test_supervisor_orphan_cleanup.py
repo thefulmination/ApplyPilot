@@ -282,3 +282,107 @@ def test_auxiliary_disappearance_before_kill_is_safe_and_releases(monkeypatch):
 
     assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
     assert ownership.release_calls == 1
+
+
+class _SupervisedProcess:
+    pid = 501
+
+    def __init__(self) -> None:
+        self.wait_calls = 0
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout):
+        self.wait_calls += 1
+
+
+def _supervised_child_identity() -> supervisor.SupervisedProcessIdentity:
+    return supervisor.SupervisedProcessIdentity(
+        pid=501,
+        created_at=12.0,
+        executable="C:/Python/python.exe",
+        command="python -m applypilot.cli apply --continuous",
+        launched_at=11.0,
+        parent_pid=50,
+        parent_created_at=5.0,
+        parent_executable="C:/Python/python.exe",
+        parent_command="python -m applypilot.cli supervise-apply",
+    )
+
+
+def _supervised_live_rows(*, child_created=12.0, parent_created=5.0):
+    return [
+        {
+            "pid": 50,
+            "ppid": 1,
+            "name": "python.exe",
+            "executable": "C:/Python/python.exe",
+            "command": "python -m applypilot.cli supervise-apply",
+            "created": parent_created,
+        },
+        {
+            "pid": 501,
+            "ppid": 50,
+            "name": "python.exe",
+            "executable": "C:/Python/python.exe",
+            "command": "python -m applypilot.cli apply --continuous",
+            "created": child_created,
+        },
+    ]
+
+
+def test_supervisor_child_identity_change_before_termination_is_refused(monkeypatch):
+    process = _SupervisedProcess()
+    terminated = []
+    monkeypatch.setattr(supervisor.os, "getpid", lambda: 50)
+    monkeypatch.setattr(
+        supervisor, "_process_snapshot", lambda: _supervised_live_rows(child_created=30.0)
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+    monkeypatch.setattr(supervisor.time, "time", lambda: 20.0)
+
+    assert supervisor._terminate_process(process, _supervised_child_identity()) is False
+    assert terminated == []
+    assert process.wait_calls == 0
+
+
+def test_supervisor_parent_identity_change_before_termination_is_refused(monkeypatch):
+    process = _SupervisedProcess()
+    terminated = []
+    monkeypatch.setattr(supervisor.os, "getpid", lambda: 50)
+    monkeypatch.setattr(
+        supervisor, "_process_snapshot", lambda: _supervised_live_rows(parent_created=30.0)
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+    monkeypatch.setattr(supervisor.time, "time", lambda: 20.0)
+
+    assert supervisor._terminate_process(process, _supervised_child_identity()) is False
+    assert terminated == []
+
+
+def test_supervisor_stable_child_identity_terminates_once(monkeypatch):
+    process = _SupervisedProcess()
+    terminated = []
+    monkeypatch.setattr(supervisor.os, "getpid", lambda: 50)
+    monkeypatch.setattr(supervisor, "_process_snapshot", _supervised_live_rows)
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+    monkeypatch.setattr(supervisor.time, "time", lambda: 20.0)
+
+    assert supervisor._terminate_process(process, _supervised_child_identity()) is True
+    assert terminated == [
+        {"pid": 501, "created_at": 12.0, "executable": "C:/Python/python.exe"}
+    ]
+    assert process.wait_calls == 1

@@ -178,7 +178,11 @@ def test_successful_cleanup_releases_process_port_and_reservation(tmp_path: Path
     chrome._job_handles[id(process)] = chrome._OwnedJobHandle(6, process.pid, 606)
     closed = []
     monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: setattr(process, "alive", False))
+    monkeypatch.setattr(
+        chrome,
+        "_kill_process_tree",
+        lambda process, expected, reservation: setattr(process, "alive", False) or True,
+    )
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
 
@@ -201,7 +205,7 @@ def test_failed_cleanup_returns_false_and_keeps_reservation(tmp_path: Path, monk
     process = _FakeProcess()
     chrome._chrome_procs[8] = process
     chrome._browser_reservations[id(process)] = reservation
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: None)
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: False)
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: True)
 
     assert chrome.cleanup_worker(8, process) is False
@@ -226,7 +230,7 @@ def test_cleanup_worker_does_not_kill_foreign_process(tmp_path: Path, monkeypatc
     chrome._job_handles[id(owner)] = chrome._OwnedJobHandle(0, owner.pid, 700)
     killed = []
     closed = []
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: killed.append(args) or True)
     monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
     assert chrome.cleanup_worker(0, foreign) is False
@@ -252,7 +256,7 @@ def test_cleanup_worker_wrong_worker_id_leaves_owner_untouched(tmp_path: Path, m
     chrome._job_handles[id(owner)] = chrome._OwnedJobHandle(0, owner.pid, 800)
     killed = []
     closed = []
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: killed.append(args) or True)
     monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
     assert chrome.cleanup_worker(1, owner) is False
@@ -277,7 +281,7 @@ def test_cleanup_worker_foreign_handle_record_leaves_process_untouched(tmp_path:
     chrome._job_handles[id(owner)] = chrome._OwnedJobHandle(9, owner.pid, 900)
     killed = []
     closed = []
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: killed.append(args) or True)
     monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
     assert chrome.cleanup_worker(0, owner) is False
@@ -316,7 +320,7 @@ def test_cleanup_on_exit_closes_only_successful_owned_handles(tmp_path: Path, mo
         },
     )
     closed = []
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: None)
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: False)
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: port == 9501)
     monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
@@ -468,6 +472,10 @@ def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monke
         ),
         profile_dir=str(seed),
         port=chrome.LINKEDIN_LOGIN_CDP_PORT,
+        parent_pid=50,
+        parent_created_at=5.0,
+        parent_executable="C:/Python/python.exe",
+        parent_command="python applypilot-worker.py",
     )
     monkeypatch.setattr(chrome, "_process_identity", lambda pid: login_identity)
 
@@ -494,6 +502,10 @@ def _browser_identity(chrome, *, pid=500, created=10.0, profile="C:/applypilot/w
         ),
         profile_dir=profile,
         port=port,
+        parent_pid=50,
+        parent_created_at=5.0,
+        parent_executable="C:/Python/python.exe",
+        parent_command="python applypilot-worker.py",
     )
 
 
@@ -511,7 +523,7 @@ def test_foreign_listener_on_reserved_port_is_not_killed(tmp_path: Path, monkeyp
         "_process_identity",
         lambda pid: _browser_identity(chrome, pid=700, profile="C:/foreign"),
     )
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: killed.append(args) or True)
     try:
         assert ownership.cleanup_browser() is False
         assert killed == []
@@ -533,7 +545,7 @@ def test_reused_listener_pid_with_different_creation_is_not_killed(tmp_path: Pat
         "_process_identity",
         lambda pid: _browser_identity(chrome, created=20.0, profile=str(profile)),
     )
-    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda *args: killed.append(args) or True)
     try:
         assert ownership.cleanup_browser() is False
         assert killed == []
@@ -667,3 +679,93 @@ def test_stale_applypilot_profile_orphan_is_recoverable_but_stale_foreign_is_not
         assert killed == [500]
     finally:
         refused.release()
+
+
+def test_owned_browser_identity_change_before_tree_kill_is_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    process = _FakeProcess(500)
+    expected = _browser_identity(chrome, profile=str(profile))
+    changed = _browser_identity(chrome, created=30.0, profile=str(profile))
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    terminated = []
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: changed)
+    monkeypatch.setattr(
+        chrome,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+    try:
+        assert chrome._kill_process_tree(process, expected, reservation) is False
+        assert terminated == []
+    finally:
+        reservation.release()
+
+
+def test_owned_browser_stable_identity_tree_kills_once(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    profile = tmp_path / "worker-0"
+    process = _FakeProcess(500)
+    expected = _browser_identity(chrome, profile=str(profile))
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    terminated = []
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
+    monkeypatch.setattr(
+        chrome,
+        "terminate_verified_process",
+        lambda **identity: terminated.append(identity) or True,
+    )
+    try:
+        assert chrome._kill_process_tree(process, expected, reservation) is True
+        assert terminated == [
+            {
+                "pid": 500,
+                "created_at": 10.0,
+                "executable": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+            }
+        ]
+    finally:
+        reservation.release()
+
+
+@pytest.mark.parametrize("launcher", ["linkedin_login", "launch_chrome"])
+def test_browser_identity_capture_failure_never_attempts_kill(
+    launcher: str, tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot import config
+    from applypilot.apply import chrome
+
+    process = _FakeProcess(500)
+    profile_root = tmp_path / "profiles"
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(config, "CHROME_WORKER_DIR", profile_root)
+    monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
+    monkeypatch.setattr(chrome, "_listener_pids", lambda port: [])
+    monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        chrome,
+        "_record_launched_browser_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("identity failed")),
+    )
+    monkeypatch.setattr(
+        chrome,
+        "_kill_process_tree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not kill")),
+    )
+    if launcher == "launch_chrome":
+        monkeypatch.setattr(chrome, "setup_worker_profile", lambda *_args: profile_root / "worker-0")
+
+    with pytest.raises(RuntimeError, match="identity failed"):
+        if launcher == "linkedin_login":
+            chrome.linkedin_login(timeout_seconds=0)
+        else:
+            chrome.launch_chrome(0, port=9400)

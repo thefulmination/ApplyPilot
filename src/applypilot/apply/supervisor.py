@@ -80,6 +80,10 @@ class SupervisedProcessIdentity:
     command: str
     launched_at: float
     ended_at: float | None = None
+    parent_pid: int = 0
+    parent_created_at: float = 0.0
+    parent_executable: str = ""
+    parent_command: str = ""
 
 
 @dataclass(frozen=True)
@@ -295,11 +299,24 @@ def _capture_supervised_identity(
     launched_at: float,
 ) -> SupervisedProcessIdentity | None:
     try:
-        row = next(row for row in _process_snapshot() if int(row.get("pid") or 0) == pid)
+        rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+        row = rows[pid]
+        parent_pid = int(row.get("ppid") or 0)
+        parent = rows[parent_pid]
         created = row.get("created")
+        parent_created = parent.get("created")
         executable = str(row.get("executable") or "")
         command = str(row.get("command") or "")
-        if created is None or not executable or "applypilot.cli" not in command or "apply" not in command:
+        parent_executable = str(parent.get("executable") or "")
+        parent_command = str(parent.get("command") or "")
+        if (
+            created is None
+            or parent_created is None
+            or not executable
+            or not parent_executable
+            or "applypilot.cli" not in command
+            or "apply" not in command
+        ):
             return None
         return SupervisedProcessIdentity(
             pid=pid,
@@ -307,8 +324,12 @@ def _capture_supervised_identity(
             executable=executable,
             command=command,
             launched_at=launched_at,
+            parent_pid=parent_pid,
+            parent_created_at=float(parent_created),
+            parent_executable=parent_executable,
+            parent_command=parent_command,
         )
-    except (StopIteration, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -513,7 +534,7 @@ def supervise(
                    (session_spend(cur) >= total_cost_usd)
             if done:
                 log(f"STOP reached mid-attempt (applied={cur}) -- stopping run")
-                _kill_tree(proc)
+                _terminate_process(proc, current_apply_identity)
                 write_done("target/budget reached mid-attempt")
                 offsite_backup(force=True)  # final off-machine backup on stop
                 log("SUPERVISOR done.")
@@ -527,7 +548,7 @@ def supervise(
             if quiet >= stall_minutes and stuck >= stall_minutes:
                 log(f"ATTEMPT {attempt} STALLED (no output {quiet:.0f}m, no apply {stuck:.0f}m) "
                     f"-- killing to restart")
-                _kill_tree(proc)
+                _terminate_process(proc, current_apply_identity)
                 break
 
         if current_apply_identity is not None:
@@ -539,17 +560,50 @@ def supervise(
         f"over {attempt} attempt(s), {elapsed_h:.1f}h.")
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """Kill the apply subprocess and its children (Chrome/agent/MCP)."""
-    if proc.poll() is not None:
-        return
+def _terminate_process(
+    proc: subprocess.Popen,
+    expected: SupervisedProcessIdentity | None,
+) -> bool:
+    """Terminate the exact supervised child captured at spawn, never a bare PID."""
+    if expected is None or proc.pid != expected.pid or proc.poll() is not None:
+        return False
     try:
-        import platform
-        if platform.system() == "Windows":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        else:
-            proc.kill()
+        now = time.time()
+        if (
+            expected.launched_at <= 0
+            or now < expected.launched_at
+            or expected.parent_pid != os.getpid()
+            or expected.parent_created_at <= 0
+            or not expected.parent_executable
+            or not expected.parent_command
+            or "applypilot.cli" not in expected.command
+            or "apply" not in expected.command
+        ):
+            return False
+        rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+        child = rows.get(expected.pid)
+        parent = rows.get(expected.parent_pid)
+        if child is None or parent is None:
+            return False
+        matches = (
+            int(child.get("ppid") or 0) == expected.parent_pid
+            and abs(float(child["created"]) - expected.created_at) < 0.001
+            and os.path.normcase(str(child.get("executable") or ""))
+            == os.path.normcase(expected.executable)
+            and str(child.get("command") or "") == expected.command
+            and abs(float(parent["created"]) - expected.parent_created_at) < 0.001
+            and os.path.normcase(str(parent.get("executable") or ""))
+            == os.path.normcase(expected.parent_executable)
+            and str(parent.get("command") or "") == expected.parent_command
+            and expected.launched_at <= float(child["created"]) <= now
+        )
+        if not matches or not terminate_verified_process(
+            pid=expected.pid,
+            created_at=expected.created_at,
+            executable=expected.executable,
+        ):
+            return False
         proc.wait(timeout=20)
-    except Exception:
-        pass
+        return True
+    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+        return False
