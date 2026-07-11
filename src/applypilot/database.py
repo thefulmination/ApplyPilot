@@ -700,6 +700,33 @@ def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
         if col not in ee_existing:
             conn.execute(f"ALTER TABLE email_events ADD COLUMN {col} TEXT")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_event_reviews (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id           TEXT NOT NULL,
+            review_action        TEXT NOT NULL,
+            reviewed_by          TEXT,
+            reviewed_at          TEXT NOT NULL,
+            corrected_job_url    TEXT,
+            corrected_stage      TEXT,
+            corrected_outcome    TEXT,
+            corrected_confidence TEXT,
+            resolution           TEXT NOT NULL CHECK(
+                resolution IN ('trusted','needs_review','ignored','corrected')
+            ),
+            note                 TEXT,
+            FOREIGN KEY(message_id) REFERENCES email_events(message_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_event_reviews_message_id "
+        "ON email_event_reviews(message_id, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_event_reviews_resolution "
+        "ON email_event_reviews(resolution)"
+    )
+
     conn.commit()
 
 
