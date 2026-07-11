@@ -323,12 +323,22 @@ def _specific_auth_value(value: str, *, minimum: int) -> bool:
 
 
 def _nontrivial_unknown_auth_value(value: str) -> bool:
-    decoded = value
+    literal = value
+    form_decoded = value
     while True:
-        next_value = unquote_plus(decoded)
-        if next_value == decoded:
-            return _specific_auth_value(decoded, minimum=4)
-        decoded = next_value
+        next_literal = unquote(literal)
+        if next_literal == literal:
+            break
+        literal = next_literal
+    while True:
+        next_form = unquote_plus(form_decoded)
+        if next_form == form_decoded:
+            break
+        form_decoded = next_form
+    return any(
+        _specific_auth_value(candidate, minimum=4)
+        for candidate in (literal, form_decoded)
+    )
 
 
 def _token_like_path_segment(value: str) -> bool:

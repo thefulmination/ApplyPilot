@@ -127,6 +127,35 @@ def test_magic_link_redactor_treats_nontrivial_unknown_values_as_secrets():
     assert ordinary in redacted
 
 
+def test_magic_link_redactor_preserves_literal_plus_and_form_decode_variants():
+    hint = (
+        "magic_link=https://boards.greenhouse.io/verify?ticket=Ab%2BcD9"
+        "&padding=YWJjZA%3D%3D&slash=Ab%2FcD9&custom=Ab-cD9_"
+    )
+    secrets = (
+        "Ab%2BcD9",
+        "Ab%2bcD9",
+        "Ab+cD9",
+        "Ab cD9",
+        "YWJjZA%3D%3D",
+        "YWJjZA%3d%3d",
+        "YWJjZA==",
+        "Ab%2FcD9",
+        "Ab%2fcD9",
+        "Ab/cD9",
+        "Ab-cD9_",
+    )
+    ordinary = "alpha+beta prose stays intact"
+
+    redacted = launcher._redact_inbox_auth_secrets(
+        " | ".join((*secrets, ordinary)), hint
+    )
+
+    for secret in secrets:
+        assert secret not in redacted
+    assert ordinary in redacted
+
+
 def test_magic_link_redactor_inspects_late_sensitive_query_pair():
     benign = "&".join(f"note{i}=ordinary{i}" for i in range(60))
     query_token = "lateQueryTokenABC987654"
