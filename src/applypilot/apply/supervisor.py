@@ -39,7 +39,11 @@ from applypilot.apply.chrome import (
     reserve_browser_cleanup,
     terminate_verified_process,
 )
-from applypilot.apply.process_guard import SpawnedChildGuard
+from applypilot.apply.process_guard import (
+    SpawnedChildGuard,
+    darwin_process_executable,
+    emergency_cleanup_direct_child,
+)
 
 
 def _applied_count() -> int:
@@ -163,26 +167,10 @@ def _process_snapshot() -> list[dict]:
 
 def _process_executable(pid: int) -> str:
     if sys.platform == "darwin":
-        return _darwin_process_executable(pid)
+        return darwin_process_executable(pid)
     try:
         return os.readlink(f"/proc/{pid}/exe")
     except OSError:
-        return ""
-
-
-def _darwin_process_executable(pid: int) -> str:
-    try:
-        import ctypes
-
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-        libproc.proc_pidpath.restype = ctypes.c_int
-        buffer = ctypes.create_string_buffer(4096)
-        length = int(libproc.proc_pidpath(int(pid), buffer, len(buffer)))
-        if length <= 0:
-            return ""
-        return buffer.value.decode("utf-8", errors="strict")
-    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
         return ""
 
 
@@ -370,7 +358,11 @@ def _capture_guarded_supervised_child(
 ) -> SupervisedProcessIdentity:
     guard = SpawnedChildGuard.acquire(process)
     if guard is None:
-        _persist_hard_fault("supervisor spawn guard unavailable", pid=process.pid)
+        cleaned = emergency_cleanup_direct_child(process)
+        if not cleaned:
+            _persist_hard_fault(
+                "supervisor spawn guard unavailable cleanup uncertain", pid=process.pid
+            )
         raise RuntimeError("supervisor child has no stable spawn guard")
     try:
         identity = _capture_supervised_identity(process.pid, launched_at)
@@ -440,26 +432,48 @@ def _enforce_hard_fault_gate() -> None:
         created_at = float(payload["created_at"])
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise RuntimeError("hard-fault marker is invalid and was not cleared") from exc
-    rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+    if pid <= 0:
+        raise RuntimeError("hard-fault marker has no reconcilable PID; marker retained")
+    try:
+        rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
+    except Exception as exc:
+        raise RuntimeError("hard-fault process query uncertain; marker retained") from exc
     current = rows.get(pid)
     if current is None:
-        exists = _process_exists(pid)
+        try:
+            exists = _process_exists(pid)
+        except Exception as exc:
+            raise RuntimeError("hard-fault PID status uncertain; marker retained") from exc
         if exists is False:
             _clear_hard_fault(marker)
             return
         raise RuntimeError("hard-fault reconciliation uncertain; marker retained")
-    current_created = current.get("created")
+    full_identity = bool(
+        created_at > 0
+        and str(payload.get("executable_sha256") or "").startswith("sha256:")
+        and str(payload.get("command_sha256") or "").startswith("sha256:")
+    )
+    if not full_identity:
+        raise RuntimeError("hard-fault marker lacks identity; live PID may remain; marker retained")
+    try:
+        current_created = float(current["created"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("hard-fault live identity uncertain; marker retained") from exc
+    if current_created <= 0:
+        raise RuntimeError("hard-fault live identity uncertain; marker retained")
+    if abs(current_created - created_at) >= 0.001:
+        _clear_hard_fault(marker)
+        return
     executable = str(current.get("executable") or "")
     command = str(current.get("command") or "")
+    if not executable or not command:
+        raise RuntimeError("hard-fault live identity uncertain; marker retained")
     exact = (
-        current_created is not None
-        and abs(float(current_created) - created_at) < 0.001
-        and _identity_digest(executable) == payload.get("executable_sha256")
+        _identity_digest(executable) == payload.get("executable_sha256")
         and _identity_digest(command) == payload.get("command_sha256")
     )
     if not exact:
-        _clear_hard_fault(marker)
-        return
+        raise RuntimeError("hard-fault live identity mismatch uncertain; marker retained")
 
     def final_authority() -> bool:
         live = {int(row.get("pid") or 0): row for row in _process_snapshot()}.get(pid)
@@ -757,6 +771,7 @@ def _require_orphan_cleanup(log, owner: SupervisedProcessIdentity | None) -> Non
     if _cleanup_orphans(log, owner=owner):
         return
     message = "HARD-FAULT: orphan cleanup could not be proven; refusing next launch"
+    _persist_hard_fault("orphan cleanup uncertain", pid=0)
     log(message)
     raise RuntimeError(message)
 

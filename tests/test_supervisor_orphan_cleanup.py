@@ -438,14 +438,37 @@ def test_supervisor_termination_failure_is_hard_fault_for_stop_and_restart(
     ]
 
 
-def test_supervisor_refuses_restart_when_orphan_cleanup_is_unproven(monkeypatch):
+def test_supervisor_refuses_restart_when_orphan_cleanup_is_unproven(
+    tmp_path, monkeypatch
+):
     logs = []
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(supervisor, "_cleanup_orphans", lambda log, owner=None: False)
 
     with pytest.raises(RuntimeError, match="refusing next launch"):
         supervisor._require_orphan_cleanup(logs.append, _owner())
 
     assert logs == ["HARD-FAULT: orphan cleanup could not be proven; refusing next launch"]
+
+
+def test_orphan_cleanup_fault_persists_restart_interlock(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(supervisor, "_cleanup_orphans", lambda log, owner=None: False)
+
+    with pytest.raises(RuntimeError, match="refusing next launch"):
+        supervisor._require_orphan_cleanup(lambda _message: None, _owner())
+
+    marker = supervisor._hard_fault_marker()
+    assert marker.exists()
+    with pytest.raises(RuntimeError, match="hard-fault marker present"):
+        supervisor._enforce_hard_fault_gate()
+
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: False)
+    with pytest.raises(RuntimeError, match="marker retained"):
+        supervisor._enforce_hard_fault_gate()
+    assert marker.exists()
 
 
 class _Guard:
@@ -498,6 +521,27 @@ def test_guarded_supervisor_capture_exception_marks_when_cleanup_uncertain(
     assert supervisor._hard_fault_marker().exists()
 
 
+@pytest.mark.parametrize("cleanup_proven", [True, False])
+def test_supervisor_guard_acquisition_failure_uses_direct_child_emergency_cleanup(
+    cleanup_proven, tmp_path, monkeypatch
+):
+    process = _SupervisedProcess()
+    cleanup_calls = []
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(supervisor.SpawnedChildGuard, "acquire", lambda _proc: None)
+    monkeypatch.setattr(
+        supervisor,
+        "emergency_cleanup_direct_child",
+        lambda proc: cleanup_calls.append(proc) or cleanup_proven,
+    )
+
+    with pytest.raises(RuntimeError, match="stable spawn guard"):
+        supervisor._capture_guarded_supervised_child(process, 10.0)
+
+    assert cleanup_calls == [process]
+    assert supervisor._hard_fault_marker().exists() is (not cleanup_proven)
+
+
 def test_hard_fault_marker_is_atomic_and_privacy_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("stall timeout", _supervised_child_identity())
@@ -521,6 +565,101 @@ def test_hard_fault_gate_refuses_without_explicit_reconciliation(tmp_path, monke
         supervisor._enforce_hard_fault_gate()
 
     assert marker.exists()
+
+
+@pytest.mark.parametrize("exists", [True, None])
+def test_identityless_marker_retained_when_pid_live_or_uncertain(
+    exists, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("guard unavailable", pid=501)
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: exists)
+
+    with pytest.raises(RuntimeError, match="marker retained"):
+        supervisor._enforce_hard_fault_gate()
+
+    assert marker.exists()
+
+
+def test_identityless_marker_clears_only_when_pid_definitively_absent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("guard unavailable", pid=501)
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: False)
+
+    supervisor._enforce_hard_fault_gate()
+
+    assert not marker.exists()
+
+
+def test_identityless_marker_retained_when_pid_status_query_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("guard unavailable", pid=501)
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [])
+    monkeypatch.setattr(
+        supervisor,
+        "_process_exists",
+        lambda _pid: (_ for _ in ()).throw(PermissionError("inaccessible")),
+    )
+
+    with pytest.raises(RuntimeError, match="marker retained"):
+        supervisor._enforce_hard_fault_gate()
+
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        {"pid": 501, "created": None, "executable": "", "command": ""},
+        {
+            "pid": 501,
+            "created": 12.0,
+            "executable": "C:/Different/python.exe",
+            "command": "query unavailable",
+        },
+    ],
+)
+def test_full_marker_retains_on_incomplete_or_same_start_identity_uncertainty(
+    current, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: [current])
+
+    with pytest.raises(RuntimeError, match="marker retained"):
+        supervisor._enforce_hard_fault_gate()
+
+    assert marker.exists()
+
+
+def test_full_marker_clears_when_creation_identity_proves_pid_reuse(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
+    marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
+    monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
+    monkeypatch.setattr(
+        supervisor,
+        "_process_snapshot",
+        lambda: [
+            {
+                "pid": 501,
+                "created": 99.0,
+                "executable": "C:/Python/python.exe",
+                "command": "python -m applypilot.cli apply --continuous",
+            }
+        ],
+    )
+
+    supervisor._enforce_hard_fault_gate()
+
+    assert not marker.exists()
 
 
 def test_explicit_reconciliation_clears_only_proven_gone_child(tmp_path, monkeypatch):

@@ -9,6 +9,50 @@ import subprocess
 from dataclasses import dataclass
 
 
+def darwin_process_executable(pid: int) -> str:
+    """Resolve a Darwin executable path without relying on whitespace parsing."""
+    try:
+        import ctypes
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libproc.proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        length = int(libproc.proc_pidpath(int(pid), buffer, len(buffer)))
+        if length <= 0:
+            return ""
+        return buffer.value.decode("utf-8", errors="strict")
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        return ""
+
+
+def emergency_cleanup_direct_child(
+    process: subprocess.Popen,
+    timeout: float = 20,
+) -> bool:
+    """Terminate and reap this parent's unreaped direct child after guard failure."""
+    try:
+        if platform.system() == "Windows":
+            try:
+                handle = int(process._handle)
+            except (AttributeError, TypeError, ValueError):
+                return False
+            terminated = bool(handle) and _terminate_windows_handle(handle, process.pid)
+            if not terminated:
+                # The stable Popen handle still proves which direct child wait() observes.
+                process.wait(timeout=timeout)
+                return True
+        else:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
 @dataclass
 class SpawnedChildGuard:
     process: subprocess.Popen

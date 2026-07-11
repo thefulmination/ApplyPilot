@@ -1371,3 +1371,50 @@ def test_darwin_orphan_without_direct_child_authority_is_refused(monkeypatch) ->
         executable="/Applications/Chrome",
         final_authority=lambda: True,
     ) is False
+
+
+def test_darwin_identity_uses_libproc_executable_and_preserves_command_spaces(
+    monkeypatch,
+) -> None:
+    from applypilot.apply import chrome
+
+    outputs = iter(
+        [
+            (
+                "50 Sat Jul 11 12:34:56 2026 "
+                '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" '
+                '--remote-debugging-port=9400 '
+                '--user-data-dir="/Users/test/ApplyPilot Worker 0"\n'
+            ),
+            "1 Sat Jul 11 12:30:00 2026 /usr/bin/python3 supervisor command\n",
+        ]
+    )
+
+    class Result:
+        returncode = 0
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    monkeypatch.setattr(
+        chrome.subprocess,
+        "run",
+        lambda *_args, **_kwargs: Result(next(outputs)),
+    )
+    executable_paths = {
+        500: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        50: "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+    }
+    monkeypatch.setattr(
+        chrome,
+        "darwin_process_executable",
+        lambda pid: executable_paths[pid],
+    )
+
+    identity = chrome._darwin_process_identity(500)
+
+    assert identity is not None
+    assert identity.executable == executable_paths[500]
+    assert identity.command.startswith('"/Applications/Google Chrome.app')
+    assert identity.profile_dir == "/Users/test/ApplyPilot Worker 0"
+    assert identity.parent_executable == executable_paths[50]

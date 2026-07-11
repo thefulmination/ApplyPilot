@@ -40,7 +40,10 @@ from applypilot.apply.chrome import (
     reset_worker_dir, cleanup_on_exit,
     BASE_CDP_PORT,
 )
-from applypilot.apply.process_guard import SpawnedChildGuard
+from applypilot.apply.process_guard import (
+    SpawnedChildGuard,
+    emergency_cleanup_direct_child,
+)
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
     render_full, get_totals,
@@ -530,6 +533,15 @@ def _terminate_agent_child(
             reason,
         )
     return cleaned
+
+
+def _acquire_agent_child_guard(process: subprocess.Popen) -> SpawnedChildGuard:
+    guard = SpawnedChildGuard.acquire(process)
+    if guard is not None:
+        return guard
+    cleaned = emergency_cleanup_direct_child(process)
+    outcome = "reaped" if cleaned else "cleanup uncertain"
+    raise RuntimeError(f"stable agent child guard unavailable; direct child {outcome}")
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -2011,9 +2023,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
-        guard = SpawnedChildGuard.acquire(proc)
-        if guard is None:
-            raise RuntimeError("stable agent child guard unavailable")
+        guard = _acquire_agent_child_guard(proc)
         with _agent_lock:
             _agent_procs[worker_id] = proc
             _agent_guards[worker_id] = guard

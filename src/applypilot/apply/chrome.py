@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from applypilot import config
+from applypilot.apply.process_guard import darwin_process_executable
 
 logger = logging.getLogger(__name__)
 
@@ -406,20 +407,23 @@ def _process_identity(pid: int) -> BrowserProcessIdentity | None:
 def _darwin_process_identity(pid: int) -> BrowserProcessIdentity | None:
     def row(process_id: int):
         result = subprocess.run(
-            ["ps", "-p", str(process_id), "-o", "ppid=,lstart=,comm=,command="],
+            ["ps", "-p", str(process_id), "-o", "ppid=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
         )
-        parts = result.stdout.strip().split(None, 8)
-        if result.returncode != 0 or len(parts) < 8:
+        parts = result.stdout.strip().split(None, 6)
+        if result.returncode != 0 or len(parts) != 7:
             return None
         created = datetime.strptime(
             " ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"
         ).replace(tzinfo=timezone.utc).timestamp()
-        command = parts[7] if len(parts) == 8 else f"{parts[7]} {parts[8]}"
-        return int(parts[0]), created, parts[6], command
+        executable = darwin_process_executable(process_id)
+        command = parts[6]
+        if not executable or not command:
+            return None
+        return int(parts[0]), created, executable, command
 
     current = row(pid)
     if current is None:
