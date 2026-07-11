@@ -51,9 +51,11 @@ def test_excludes_linkedin_by_default(monkeypatch, tmp_path):
     r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
     assert r["promoted"] == 1
     assert _src(conn, "https://www.linkedin.com/jobs/view/1") is None       # catastrophe lane untouched
-    gh = conn.execute("SELECT decision_source, audit_score FROM jobs WHERE url=?",
+    gh = conn.execute("SELECT decision_source, audit_score, external_decision_score FROM jobs WHERE url=?",
                       ("https://job-boards.greenhouse.io/x/jobs/2",)).fetchone()
-    assert gh["decision_source"] == "res_build" and gh["audit_score"] == 9.0
+    assert gh["decision_source"] == "res_build"
+    assert gh["external_decision_score"] == 9.0
+    assert gh["audit_score"] is None
 
 
 def test_excludes_linkedin_trailing_dot_fqdn(monkeypatch, tmp_path):
@@ -133,7 +135,7 @@ def test_promote_then_revert_restores_prior(monkeypatch, tmp_path):
     mod.promote(path, source="res_build", snapshot_path=snap)
     row = conn.execute("SELECT audit_score, decision_source FROM jobs WHERE url=?",
                       ("https://x.io/j",)).fetchone()
-    assert row["audit_score"] == 9.0 and row["decision_source"] == "res_build"
+    assert row["audit_score"] == 4.0 and row["decision_source"] == "res_build"
     assert mod.revert(snap) == 1
     row2 = conn.execute("SELECT audit_score, audit_label, decision_source FROM jobs WHERE url=?",
                        ("https://x.io/j",)).fetchone()
@@ -146,7 +148,11 @@ def test_revert_restores_null_prior(monkeypatch, tmp_path):
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
     snap = tmp_path / "snap.json"
     mod.promote(path, source="res_build", snapshot_path=snap)
-    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 9.0
+    promoted = conn.execute(
+        "SELECT audit_score, external_decision_score FROM jobs WHERE url=?", ("https://x.io/j",)
+    ).fetchone()
+    assert promoted["audit_score"] is None
+    assert promoted["external_decision_score"] == 9.0
     mod.revert(snap)
     row = conn.execute("SELECT audit_score, audit_label, decision_source FROM jobs WHERE url=?",
                       ("https://x.io/j",)).fetchone()
@@ -158,7 +164,11 @@ def test_scale_ten_preserves_decimal(monkeypatch, tmp_path):
     _insert_job(conn, "https://x.io/j", fit_score=5)
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9.9}])
     mod.promote(path, source="res_build", scale="ten", snapshot_path=tmp_path / "snap.json")
-    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.io/j",)).fetchone()["audit_score"] == 9.9
+    row = conn.execute(
+        "SELECT audit_score, external_decision_score FROM jobs WHERE url=?", ("https://x.io/j",)
+    ).fetchone()
+    assert row["audit_score"] is None
+    assert row["external_decision_score"] == 9.9
 
 
 def test_approval_never_demotes_prior_effective(monkeypatch, tmp_path):
@@ -179,9 +189,8 @@ def test_approval_never_demotes_prior_effective(monkeypatch, tmp_path):
     assert row["decision_source"] == "res_build"
 
 
-def test_approval_floors_gate_at_apply_threshold(monkeypatch, tmp_path):
-    # A kept job the ranker buries must become apply-eligible: the gate write is
-    # floored at the apply threshold even when the res_build score is below it.
+def test_approval_below_threshold_remains_non_authoritative(monkeypatch, tmp_path):
+    # Legacy review evidence is retained, but cannot raise the apply gate.
     conn, mod = _setup(monkeypatch, tmp_path)
     monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
     _insert_job(conn, "https://x.io/j", fit_score=3)
@@ -191,13 +200,11 @@ def test_approval_floors_gate_at_apply_threshold(monkeypatch, tmp_path):
     row = conn.execute(
         "SELECT audit_score, external_decision_score FROM jobs WHERE url=?",
         ("https://x.io/j",)).fetchone()
-    assert row["audit_score"] == 6.0
+    assert row["audit_score"] is None
     assert row["external_decision_score"] == 4.5
 
 
-def test_unit_scale_floor_and_benchmark_score(monkeypatch, tmp_path):
-    # unit-scale input: raw rescales to the ten band BEFORE flooring, so the floor
-    # can never be re-rescaled into a clamped 10 by the importer.
+def test_unit_scale_preserves_benchmark_without_authority(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
     monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
     _insert_job(conn, "https://x.io/j", fit_score=3)
@@ -206,7 +213,7 @@ def test_unit_scale_floor_and_benchmark_score(monkeypatch, tmp_path):
     row = conn.execute(
         "SELECT audit_score, external_decision_score FROM jobs WHERE url=?",
         ("https://x.io/j",)).fetchone()
-    assert row["audit_score"] == 6.0
+    assert row["audit_score"] is None
     assert row["external_decision_score"] == 4.5
 
 

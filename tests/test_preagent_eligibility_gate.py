@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import eligibility, queue
 
@@ -58,6 +60,15 @@ def test_unknown_location_is_not_falsely_rejected():
 def test_staging_terminates_ineligible_before_liveness_or_paid_lease(fleet_db):
     url = "https://example.com/jobs/foreign"
     with pgqueue.connect(fleet_db) as conn:
+        now = datetime.now(timezone.utc)
+        policy = "test-preagent-eligibility-policy"
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                "VALUES (%s,'ats','active')",
+                (policy,),
+            )
+            cur.execute("UPDATE fleet_config SET ats_policy_version=%s WHERE id=1", (policy,))
         queue.push_apply_jobs(
             conn,
             [{
@@ -67,9 +78,22 @@ def test_staging_terminates_ineligible_before_liveness_or_paid_lease(fleet_db):
                 "application_url": url,
                 "score": 9.0,
                 "target_host": "example.com",
-                "eligibility_status": "ineligible",
-                "eligibility_reason": "not_eligible_location:london",
-            }],
+                    "eligibility_status": "ineligible",
+                    "eligibility_reason": "not_eligible_location:london",
+                    "decision_id": "decision-preagent-ineligible",
+                    "policy_version": policy,
+                    "decision_action": "apply",
+                    "qualification_verdict": "qualified",
+                    "qualification_score": 9.0,
+                    "qualification_floor": 7.0,
+                    "preference_score": 8.0,
+                    "outcome_score": 8.0,
+                    "final_score": 9.0,
+                    "decision_confidence": 0.9,
+                    "decision_created_at": now,
+                    "decision_expires_at": now + timedelta(days=1),
+                    "input_hash": "hash-preagent-ineligible",
+                }],
             approved_batch="batch-e",
             require_liveness=True,
             require_eligibility=True,

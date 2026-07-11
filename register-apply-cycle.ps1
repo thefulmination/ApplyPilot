@@ -243,7 +243,7 @@ Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle
 `$fail = 0
 `$rc = Step 'verify-live' { Invoke-VerifyLive { & '$runApplyPilotPs1' verify-live --max-age-days 3 --limit 300 } }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: verify-live FAILED (continuing best-effort)' }
-`$rc = Step 'push' { & '$applyHomeExe' push --score-floor 5.8 --include-research }
+`$rc = Step 'push' { & '$applyHomeExe' push --score-floor 5.8 }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: push FAILED (continuing best-effort)' }
 `$rc = Step 'arm-canary' { & '$applyHomeExe' arm-canary-if-safe $CanaryK }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: arm-canary FAILED (continuing best-effort)' }

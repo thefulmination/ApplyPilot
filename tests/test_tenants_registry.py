@@ -131,6 +131,10 @@ def test_submits_today_counts_only_today(tmp_path, monkeypatch):
     def _insert_application(job_url, applied_at):
         now = "2026-07-03T00:00:00+00:00"
         conn.execute(
+            "INSERT INTO jobs (url, title, site, discovered_at) VALUES (?, 'Role', 'Test', ?)",
+            (job_url, now),
+        )
+        conn.execute(
             "INSERT INTO applications (job_url, status, applied_at, created_at, updated_at) "
             "VALUES (?, 'applied', ?, ?, ?)",
             (job_url, applied_at, now, now),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from applypilot.apply import pgqueue
 from applypilot.fleet import queue
 from applypilot.fleet.tenant_router import route_tenant
@@ -60,6 +62,16 @@ def test_unregistered_supported_host_can_route_deterministic():
 
 
 def _push(conn, url, *, route):
+    now = datetime.now(timezone.utc)
+    policy = "test-tenant-router-policy"
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'ats','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy,),
+        )
+        cur.execute("UPDATE fleet_config SET ats_policy_version=%s WHERE id=1", (policy,))
+    conn.commit()
     return queue.push_apply_jobs(
         conn,
         [{
@@ -72,6 +84,19 @@ def _push(conn, url, *, route):
             "routing_required": True,
             "execution_route": route,
             "host_policy": f"test_{route}",
+            "decision_id": f"decision-{route}",
+            "policy_version": policy,
+            "decision_action": "apply",
+            "qualification_verdict": "qualified",
+            "qualification_score": 9.0,
+            "qualification_floor": 7.0,
+            "preference_score": 8.0,
+            "outcome_score": 8.0,
+            "final_score": 9.0,
+            "decision_confidence": 0.9,
+            "decision_created_at": now,
+            "decision_expires_at": now + timedelta(days=1),
+            "input_hash": f"hash-{route}",
         }],
         approved_batch="route-batch",
     )
