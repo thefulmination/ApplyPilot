@@ -267,12 +267,15 @@ class ImapMailSource:
                     _ensure_ok(status, f"fetch for message {uid}", fetch_data)
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
+                    scanned_bytes = self._max_scan_bytes
                     raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")
-                if len(raw) > self._max_message_bytes:
-                    continue
-                if scanned_bytes + len(raw) > self._max_scan_bytes:
+                remaining_scan_bytes = self._max_scan_bytes - scanned_bytes
+                actual_size = len(raw)
+                scanned_bytes += actual_size
+                if actual_size > remaining_scan_bytes:
                     break
-                scanned_bytes += len(raw)
+                if actual_size > self._max_message_bytes:
+                    continue
                 messages.append(_normalize(uid, raw))
 
             return messages

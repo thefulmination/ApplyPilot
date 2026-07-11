@@ -181,6 +181,18 @@ class FakeImap:
         self.logged_out = True
 
 
+class UnderstatedSizeImap(FakeImap):
+    def fetch(self, uid, parts):
+        self.fetch_calls.append((uid, parts))
+        key = uid.encode() if isinstance(uid, str) else uid
+        raw = self._messages_by_id.get(key)
+        if raw is None:
+            return "NO", [None]
+        if "RFC822.SIZE" in parts:
+            return "OK", [(b"1 (RFC822.SIZE 1)", b"")]
+        return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
+
+
 # ---------------------------------------------------------------------------
 # ImapMailSource.fetch tests
 # ---------------------------------------------------------------------------
@@ -272,6 +284,104 @@ def test_imap_aggregate_cap_stops_further_full_fetches():
 
     assert [message.id for message in result] == ["1", "2"]
     assert ("3", "(RFC822)") not in fake.fetch_calls
+
+
+def test_imap_understated_oversize_sequence_charges_aggregate_budget():
+    raw = b"A" * 100
+    fake = UnderstatedSizeImap(
+        search_ids=[b"1", b"2", b"3", b"4"],
+        messages_by_id={
+            b"1": raw,
+            b"2": raw,
+            b"3": raw,
+            b"4": raw,
+        },
+    )
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=50,
+        max_scan_bytes=50,
+    )
+
+    assert source.fetch(since_days=7, max_messages=4) == []
+    assert [call for call in fake.fetch_calls if call[1] == "(RFC822)"] == [
+        ("1", "(RFC822)")
+    ]
+
+
+def test_imap_understated_actual_bytes_accept_exact_aggregate_boundary():
+    fake = UnderstatedSizeImap(
+        search_ids=[b"1", b"2", b"3"],
+        messages_by_id={
+            b"1": b"A" * 30,
+            b"2": b"B" * 20,
+            b"3": b"C" * 10,
+        },
+    )
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=30,
+        max_scan_bytes=50,
+    )
+
+    result = source.fetch(since_days=7, max_messages=3)
+
+    assert [message.id for message in result] == ["1", "2"]
+    assert [call for call in fake.fetch_calls if call[1] == "(RFC822)"] == [
+        ("1", "(RFC822)"),
+        ("2", "(RFC822)"),
+    ]
+
+
+def test_imap_malformed_full_fetch_fails_closed_before_later_downloads():
+    class MalformedFullImap(UnderstatedSizeImap):
+        def fetch(self, uid, parts):
+            if parts == "(RFC822)" and uid == "1":
+                self.fetch_calls.append((uid, parts))
+                return "OK", [(b"1 (RFC822 {100}", "not-bytes"), b")"]
+            return super().fetch(uid, parts)
+
+    fake = MalformedFullImap(
+        search_ids=[b"1", b"2"],
+        messages_by_id={b"1": b"A" * 100, b"2": b"B" * 20},
+    )
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=100,
+        max_scan_bytes=200,
+    )
+
+    with pytest.raises(MailSourceError, match="no RFC822 payload"):
+        source.fetch(since_days=7, max_messages=2)
+
+    assert [call for call in fake.fetch_calls if call[1] == "(RFC822)"] == [
+        ("1", "(RFC822)")
+    ]
+
+
+def test_imap_understated_normal_messages_remain_unchanged():
+    raw = _base64_plain_raw()
+    fake = UnderstatedSizeImap(
+        search_ids=[b"1", b"2"],
+        messages_by_id={b"1": raw, b"2": raw},
+    )
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=len(raw),
+        max_scan_bytes=len(raw) * 2,
+    )
+
+    result = source.fetch(since_days=7, max_messages=2)
+
+    assert [message.id for message in result] == ["1", "2"]
 
 
 def test_imap_malformed_size_metadata_fails_closed_without_full_fetch():
