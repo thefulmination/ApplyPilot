@@ -7,10 +7,15 @@ from pathlib import Path
 import pytest
 
 from applypilot.apply import supervisor
+from applypilot.apply import lifecycle_fault
 
 
 def _enumeration(rows):
     return supervisor.ProcessEnumeration(rows=rows, complete=True)
+
+
+def _fault_paths():
+    return lifecycle_fault.lifecycle_hard_fault_paths()
 
 
 class _Ownership:
@@ -91,6 +96,21 @@ def test_windows_invalid_json_enumeration_is_uncertain(monkeypatch):
 
     assert result.complete is False
     assert result.reason == "windows_process_output_invalid"
+
+
+def test_windows_nonempty_stderr_is_uncertain_even_with_valid_json(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = "[]"
+        stderr = "CIM warning"
+
+    monkeypatch.setattr(supervisor.sys, "platform", "win32")
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    result = supervisor._process_snapshot()
+
+    assert result.complete is False
+    assert result.reason == "windows_process_query_failed"
 
 
 @pytest.mark.parametrize(
@@ -255,6 +275,31 @@ def test_incomplete_live_owner_identity_with_candidate_fails_closed(monkeypatch)
                     "command": "node @playwright/mcp",
                     "created": 12.0,
                 },
+            ]
+        ),
+    )
+
+    assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
+    assert ownership.cleanup_calls == 0
+    assert ownership.release_calls == 1
+
+
+def test_blank_descendant_identity_is_relevant_from_ancestry_alone(monkeypatch):
+    ownership = _Ownership()
+    monkeypatch.setattr(supervisor, "reserve_browser_cleanup", lambda *_args: ownership)
+    monkeypatch.setattr(
+        supervisor,
+        "_process_snapshot",
+        lambda: _enumeration(
+            [
+                {
+                    "pid": 102,
+                    "ppid": 100,
+                    "name": "",
+                    "executable": "",
+                    "command": "",
+                    "created": None,
+                }
             ]
         ),
     )
@@ -635,17 +680,17 @@ def test_orphan_cleanup_fault_persists_restart_interlock(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="refusing next launch"):
         supervisor._require_orphan_cleanup(lambda _message: None, _owner())
 
-    marker = supervisor._hard_fault_marker()
-    assert marker.exists()
-    with pytest.raises(RuntimeError, match="hard-fault marker present"):
+    paths = _fault_paths()
+    assert len(paths) == 1
+    with pytest.raises(RuntimeError, match="hard-fault records present"):
         supervisor._enforce_hard_fault_gate()
 
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
     monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: False)
-    with pytest.raises(RuntimeError, match="marker retained"):
+    with pytest.raises(RuntimeError, match="fault retained"):
         supervisor._enforce_hard_fault_gate()
-    assert marker.exists()
+    assert paths[0].exists()
 
 
 class _Guard:
@@ -675,7 +720,7 @@ def test_guarded_supervisor_capture_none_reaps_and_does_not_mark_when_proven(
         supervisor._capture_guarded_supervised_child(process, 10.0)
 
     assert guard.terminate_calls == 1
-    assert not supervisor._hard_fault_marker().exists()
+    assert _fault_paths() == []
 
 
 def test_guarded_supervisor_capture_exception_marks_when_cleanup_uncertain(
@@ -695,7 +740,7 @@ def test_guarded_supervisor_capture_exception_marks_when_cleanup_uncertain(
         supervisor._capture_guarded_supervised_child(process, 10.0)
 
     assert guard.terminate_calls == 1
-    assert supervisor._hard_fault_marker().exists()
+    assert len(_fault_paths()) == 1
 
 
 @pytest.mark.parametrize("cleanup_proven", [True, False])
@@ -716,7 +761,7 @@ def test_supervisor_guard_acquisition_failure_uses_direct_child_emergency_cleanu
         supervisor._capture_guarded_supervised_child(process, 10.0)
 
     assert cleanup_calls == [process]
-    assert supervisor._hard_fault_marker().exists() is (not cleanup_proven)
+    assert bool(_fault_paths()) is (not cleanup_proven)
 
 
 def test_hard_fault_marker_is_atomic_and_privacy_safe(tmp_path, monkeypatch):
@@ -738,7 +783,7 @@ def test_hard_fault_gate_refuses_without_explicit_reconciliation(tmp_path, monke
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
 
-    with pytest.raises(RuntimeError, match="hard-fault marker present"):
+    with pytest.raises(RuntimeError, match="hard-fault records present"):
         supervisor._enforce_hard_fault_gate()
 
     assert marker.exists()
@@ -754,7 +799,7 @@ def test_identityless_marker_retained_when_pid_live_or_uncertain(
     monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([]))
     monkeypatch.setattr(supervisor, "_process_exists", lambda _pid: exists)
 
-    with pytest.raises(RuntimeError, match="marker retained"):
+    with pytest.raises(RuntimeError, match="fault retained"):
         supervisor._enforce_hard_fault_gate()
 
     assert marker.exists()
@@ -785,7 +830,7 @@ def test_identityless_marker_retained_when_pid_status_query_raises(tmp_path, mon
         lambda _pid: (_ for _ in ()).throw(PermissionError("inaccessible")),
     )
 
-    with pytest.raises(RuntimeError, match="marker retained"):
+    with pytest.raises(RuntimeError, match="fault retained"):
         supervisor._enforce_hard_fault_gate()
 
     assert marker.exists()
@@ -811,7 +856,7 @@ def test_full_marker_retains_on_incomplete_or_same_start_identity_uncertainty(
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
     monkeypatch.setattr(supervisor, "_process_snapshot", lambda: _enumeration([current]))
 
-    with pytest.raises(RuntimeError, match="marker retained"):
+    with pytest.raises(RuntimeError, match="fault retained"):
         supervisor._enforce_hard_fault_gate()
 
     assert marker.exists()
@@ -872,7 +917,7 @@ def test_explicit_reconciliation_clears_exact_live_child_only_after_proven_termi
         supervisor._enforce_hard_fault_gate()
         assert not marker.exists()
     else:
-        with pytest.raises(RuntimeError, match="marker retained"):
+        with pytest.raises(RuntimeError, match="fault retained"):
             supervisor._enforce_hard_fault_gate()
         assert marker.exists()
     assert calls == [501]

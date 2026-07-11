@@ -6,7 +6,10 @@ it must stop on max_attempts and on an already-met budget, and never raise.
 """
 from __future__ import annotations
 
+import pytest
+
 from applypilot.apply import supervisor as S
+from applypilot.apply import lifecycle_fault
 
 
 def test_supervise_stops_on_max_attempts_without_spawning(tmp_path, monkeypatch, capsys):
@@ -64,3 +67,46 @@ def test_apply_cost_total_sums_only_apply_agent_rows(tmp_path, monkeypatch):
     c.close()
     monkeypatch.setattr(S.config, "DB_PATH", db)
     assert abs(S._apply_cost_total() - 2.0) < 1e-9  # only the two apply_agent rows
+
+
+def test_fault_created_during_attempt_one_blocks_attempt_two(tmp_path, monkeypatch):
+    class Process:
+        pid = 501
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    spawns = []
+    monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setenv("APPLYPILOT_BACKUP_INTERVAL", "0")
+    monkeypatch.setattr(S, "_applied_count", lambda: 0)
+    monkeypatch.setattr(S, "_apply_cost_total", lambda: 0.0)
+    monkeypatch.setattr(S, "_require_orphan_cleanup", lambda *_args: None)
+    monkeypatch.setattr(
+        S,
+        "_capture_guarded_supervised_child",
+        lambda *_args: S.SupervisedProcessIdentity(
+            pid=501,
+            created_at=10.0,
+            executable="python.exe",
+            command="python -m applypilot.cli apply",
+            launched_at=10.0,
+        ),
+    )
+
+    def popen(*_args, **_kwargs):
+        spawns.append(1)
+        if len(spawns) == 1:
+            lifecycle_fault.persist_lifecycle_hard_fault(
+                "appeared during attempt one", pid=777
+            )
+        return Process()
+
+    monkeypatch.setattr(S.subprocess, "Popen", popen)
+
+    with pytest.raises(RuntimeError, match="hard-fault"):
+        S.supervise(total_cost_usd=100, max_attempts=3, poll_seconds=0)
+
+    assert len(spawns) == 1

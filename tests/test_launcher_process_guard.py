@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import json
 import subprocess
 import sys
 
 import pytest
 
 from applypilot.apply import launcher
+from applypilot.apply import lifecycle_fault
 from applypilot.apply import process_guard
 from applypilot.apply.process_guard import SpawnedChildGuard
 
@@ -27,6 +29,16 @@ class _RecordingGuard:
         return True
 
 
+class _UncertainGuard:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+
+    def terminate_and_reap(self):
+        if self.error is not None:
+            raise self.error
+        return False
+
+
 @pytest.mark.parametrize(
     "reason",
     [
@@ -43,6 +55,33 @@ def test_each_agent_cleanup_category_uses_stable_guard(reason):
 
     assert launcher._terminate_agent_child(4, _RunningProcess(), guard, reason) is True
     assert guard.calls == 1
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "terminal-result-grace",
+        "reader-timeout",
+        "wait-timeout",
+        "finally",
+        "sigint-skip",
+        "sigint-stop",
+    ],
+)
+@pytest.mark.parametrize("error", [None, RuntimeError("cleanup crashed")])
+def test_each_agent_cleanup_uncertainty_persists_and_raises(
+    reason, error, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(launcher.config, "DB_PATH", tmp_path / "applypilot.db")
+
+    with pytest.raises(launcher.LifecycleHardFault, match=reason):
+        launcher._terminate_agent_child(4, _RunningProcess(), _UncertainGuard(error), reason)
+
+    faults = list((tmp_path / "lifecycle-faults").glob("fault-*.json"))
+    assert len(faults) == 1
+    payload = json.loads(faults[0].read_text(encoding="utf-8"))
+    assert payload["pid"] == 7311
+    assert reason in payload["reason"]
 
 
 def test_launcher_has_no_chrome_reservation_cleanup_dependency():
@@ -185,7 +224,7 @@ def test_launcher_guard_acquisition_failure_never_continues(
     expected = RuntimeError if cleanup_proven else launcher.LifecycleHardFault
     with pytest.raises(expected, match="stable agent child guard"):
         launcher._acquire_agent_child_guard(process)
-    assert (tmp_path / "keepalive.hard-fault.json").exists() is (not cleanup_proven)
+    assert bool(lifecycle_fault.lifecycle_hard_fault_paths()) is (not cleanup_proven)
 
 
 def test_local_lstart_parser_uses_local_wall_time_mktime(monkeypatch):
@@ -246,9 +285,8 @@ def test_launcher_uncertain_guard_cleanup_persists_interlock_and_escapes_job_res
     with pytest.raises(launcher.LifecycleHardFault):
         launcher._run_job_impl(job, port=9400, worker_id=0)
 
-    marker = tmp_path / "keepalive.hard-fault.json"
-    assert marker.exists()
+    assert len(lifecycle_fault.lifecycle_hard_fault_paths()) >= 1
     monkeypatch.delenv("APPLYPILOT_RECONCILE_HARD_FAULT", raising=False)
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
-    with pytest.raises(RuntimeError, match="hard-fault marker present"):
+    with pytest.raises(RuntimeError, match="hard-fault records present"):
         supervisor._enforce_hard_fault_gate()

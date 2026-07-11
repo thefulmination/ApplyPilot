@@ -518,25 +518,27 @@ def _terminate_agent_child(
     guard: SpawnedChildGuard | None,
     reason: str,
 ) -> bool:
-    if process.poll() is not None:
-        if guard is not None:
-            guard.release()
-        return True
-    if guard is None:
-        logger.error(
-            "[W%s] agent cleanup refused without stable child guard (%s)",
-            worker_id,
-            reason,
+    try:
+        if process.poll() is not None:
+            if guard is not None:
+                guard.release()
+            return True
+        if guard is None:
+            raise RuntimeError("stable child guard missing")
+        cleaned = guard.terminate_and_reap()
+    except Exception as exc:
+        persist_lifecycle_hard_fault(
+            f"agent {reason} cleanup exception",
+            pid=process.pid,
         )
-        return False
-    cleaned = guard.terminate_and_reap()
+        raise LifecycleHardFault(f"agent {reason} cleanup could not be proven") from exc
     if not cleaned:
-        logger.error(
-            "[W%s] agent child termination could not be proven (%s)",
-            worker_id,
-            reason,
+        persist_lifecycle_hard_fault(
+            f"agent {reason} cleanup unproven",
+            pid=process.pid,
         )
-    return cleaned
+        raise LifecycleHardFault(f"agent {reason} cleanup could not be proven")
+    return True
 
 
 def _acquire_agent_child_guard(process: subprocess.Popen) -> SpawnedChildGuard:
@@ -2356,7 +2358,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         with _agent_lock:
             _agent_procs.pop(worker_id, None)
             _agent_guards.pop(worker_id, None)
-        if proc is not None and proc.poll() is None:
+        active_fault = isinstance(sys.exc_info()[1], LifecycleHardFault)
+        if proc is not None and not active_fault:
             _terminate_agent_child(worker_id, proc, guard, "finally")
 
 
@@ -3478,19 +3481,17 @@ def main(limit: int = 1, target_url: str | None = None,
             # Kill all active apply-agent processes to skip current jobs
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
-                    if cproc.poll() is None:
-                        _terminate_agent_child(
-                            wid, cproc, _agent_guards.get(wid), "sigint-skip"
-                        )
+                    _terminate_agent_child(
+                        wid, cproc, _agent_guards.get(wid), "sigint-skip"
+                    )
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
-                    if cproc.poll() is None:
-                        _terminate_agent_child(
-                            wid, cproc, _agent_guards.get(wid), "sigint-stop"
-                        )
+                    _terminate_agent_child(
+                        wid, cproc, _agent_guards.get(wid), "sigint-stop"
+                    )
             kill_all_chrome()
             raise KeyboardInterrupt
 

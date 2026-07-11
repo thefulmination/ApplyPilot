@@ -44,9 +44,13 @@ from applypilot.apply.process_guard import (
     parse_ps_lstart_local,
 )
 from applypilot.apply.lifecycle_fault import (
+    LoadedLifecycleFault,
     identity_digest,
-    lifecycle_hard_fault_marker,
+    legacy_lifecycle_hard_fault_marker,
+    lifecycle_hard_fault_paths,
+    load_lifecycle_hard_fault,
     persist_lifecycle_hard_fault,
+    remove_lifecycle_fault_if_unchanged,
 )
 
 
@@ -138,7 +142,11 @@ def _process_snapshot() -> ProcessEnumeration:
             )
         except Exception:
             return ProcessEnumeration([], False, "windows_process_query_failed")
-        if result.returncode != 0 or not result.stdout.strip():
+        if (
+            result.returncode != 0
+            or not result.stdout.strip()
+            or bool(str(getattr(result, "stderr", "") or "").strip())
+        ):
             return ProcessEnumeration([], False, "windows_process_query_failed")
         try:
             raw = json.loads(result.stdout)
@@ -336,9 +344,12 @@ def _has_incomplete_owned_auxiliary_candidate(
         if pid == owner.pid or pid not in descendants:
             continue
         name = os.path.basename(str(row.get("name") or "")).lower()
+        executable = str(row.get("executable") or "")
         command = str(row.get("command") or "")
+        if row.get("created") is None or not name or not executable or not command:
+            return True
         marker = bool(re.search(_ORPHAN_PATTERN, command, flags=re.IGNORECASE))
-        potentially_auxiliary = marker or (name in {"node", "node.exe"} and not command)
+        potentially_auxiliary = marker
         if not potentially_auxiliary:
             continue
         created = row.get("created")
@@ -478,7 +489,7 @@ def _capture_guarded_supervised_child(
 
 
 def _hard_fault_marker() -> Path:
-    return lifecycle_hard_fault_marker()
+    return legacy_lifecycle_hard_fault_marker()
 
 
 def _persist_hard_fault(
@@ -496,64 +507,61 @@ def _persist_hard_fault(
     )
 
 
-def _clear_hard_fault(marker: Path) -> None:
-    marker.unlink(missing_ok=True)
+def _remove_reconciled_fault(record: LoadedLifecycleFault) -> None:
+    if not remove_lifecycle_fault_if_unchanged(record.path, record.raw):
+        raise RuntimeError("hard-fault changed during reconciliation; faults retained")
 
 
-def _enforce_hard_fault_gate() -> None:
-    marker = _hard_fault_marker()
-    if not marker.exists():
-        return
-    if os.environ.get("APPLYPILOT_RECONCILE_HARD_FAULT", "").strip() != "1":
-        raise RuntimeError(f"hard-fault marker present: {marker}")
+def _reconcile_hard_fault(path: Path) -> None:
     try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
+        record = load_lifecycle_hard_fault(path)
+        payload = record.payload
         pid = int(payload["pid"])
-        created_at = float(payload["created_at"])
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        raise RuntimeError("hard-fault marker is invalid and was not cleared") from exc
+        created_at = float(payload.get("created_at") or 0.0)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError("hard-fault payload is invalid and was not cleared") from exc
     if pid <= 0:
-        raise RuntimeError("hard-fault marker has no reconcilable PID; marker retained")
+        raise RuntimeError("hard-fault has no reconcilable PID; fault retained")
     snapshot = _process_snapshot()
     if not snapshot.complete:
-        raise RuntimeError("hard-fault process query uncertain; marker retained")
+        raise RuntimeError("hard-fault process query uncertain; fault retained")
     rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
     current = rows.get(pid)
     if current is None:
         try:
             exists = _process_exists(pid)
         except Exception as exc:
-            raise RuntimeError("hard-fault PID status uncertain; marker retained") from exc
+            raise RuntimeError("hard-fault PID status uncertain; fault retained") from exc
         if exists is False:
-            _clear_hard_fault(marker)
+            _remove_reconciled_fault(record)
             return
-        raise RuntimeError("hard-fault reconciliation uncertain; marker retained")
+        raise RuntimeError("hard-fault reconciliation uncertain; fault retained")
     full_identity = bool(
         created_at > 0
         and str(payload.get("executable_sha256") or "").startswith("sha256:")
         and str(payload.get("command_sha256") or "").startswith("sha256:")
     )
     if not full_identity:
-        raise RuntimeError("hard-fault marker lacks identity; live PID may remain; marker retained")
+        raise RuntimeError("hard-fault lacks identity; live PID may remain; fault retained")
     try:
         current_created = float(current["created"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("hard-fault live identity uncertain; marker retained") from exc
+        raise RuntimeError("hard-fault live identity uncertain; fault retained") from exc
     if current_created <= 0:
-        raise RuntimeError("hard-fault live identity uncertain; marker retained")
+        raise RuntimeError("hard-fault live identity uncertain; fault retained")
     if abs(current_created - created_at) >= 0.001:
-        _clear_hard_fault(marker)
+        _remove_reconciled_fault(record)
         return
     executable = str(current.get("executable") or "")
     command = str(current.get("command") or "")
     if not executable or not command:
-        raise RuntimeError("hard-fault live identity uncertain; marker retained")
+        raise RuntimeError("hard-fault live identity uncertain; fault retained")
     exact = (
         identity_digest(executable) == payload.get("executable_sha256")
         and identity_digest(command) == payload.get("command_sha256")
     )
     if not exact:
-        raise RuntimeError("hard-fault live identity mismatch uncertain; marker retained")
+        raise RuntimeError("hard-fault live identity mismatch uncertain; fault retained")
 
     def final_authority() -> bool:
         live_snapshot = _process_snapshot()
@@ -578,8 +586,20 @@ def _enforce_hard_fault_gate() -> None:
         executable=executable,
         final_authority=final_authority,
     ):
-        raise RuntimeError("hard-fault exact-child termination was not proven; marker retained")
-    _clear_hard_fault(marker)
+        raise RuntimeError("hard-fault exact-child termination was not proven; fault retained")
+    _remove_reconciled_fault(record)
+
+
+def _enforce_hard_fault_gate() -> None:
+    paths = lifecycle_hard_fault_paths()
+    if not paths:
+        return
+    if os.environ.get("APPLYPILOT_RECONCILE_HARD_FAULT", "").strip() != "1":
+        raise RuntimeError(f"hard-fault records present: {len(paths)}")
+    for path in paths:
+        _reconcile_hard_fault(path)
+    if lifecycle_hard_fault_paths():
+        raise RuntimeError("hard-fault records appeared during reconciliation")
 
 
 def _cleanup_orphans(
@@ -771,6 +791,7 @@ def supervise(
         out_path = config.LOG_DIR / f"supervised_attempt_{attempt}.out"
         launched_at = time.time()
         with open(out_path, "w", encoding="utf-8") as out:
+            _enforce_hard_fault_gate()
             proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=child_env)
         current_apply_identity = _capture_guarded_supervised_child(proc, launched_at)
 

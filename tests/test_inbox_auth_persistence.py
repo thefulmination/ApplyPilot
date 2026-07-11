@@ -13,6 +13,13 @@ from applypilot import database
 from applypilot import inbox_auth
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ambient_inbox_database(tmp_path, monkeypatch):
+    isolated = tmp_path / "ambient-inbox-auth.db"
+    monkeypatch.setenv("APPLYPILOT_DB_PATH", str(isolated))
+    monkeypatch.setattr(database, "DB_PATH", isolated)
+
+
 def _process_claim(
     db_path: str,
     challenge_id: int,
@@ -420,6 +427,7 @@ def test_status_writer_rejects_non_operational_statuses(
     tmp_path, monkeypatch, status
 ) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
     challenge_id = _seed_job_and_challenge(conn, job_url=f"status-invalid-{status}")
     changes_before = conn.total_changes
     monkeypatch.setattr(
