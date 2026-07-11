@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from urllib.parse import quote
 
 from applypilot.apply import launcher
 
@@ -107,9 +108,71 @@ def test_magic_link_redactor_covers_bounded_exact_credential_variants():
         assert secret not in redacted
     assert ordinary in redacted
     assert "greenhouse.io" in redacted
-    variants = launcher._exact_secret_variants("%252525token+value")
-    assert len(variants) <= launcher._MAX_SECRET_VARIANTS
-    assert all(len(value) <= launcher._MAX_SECRET_VALUE_LENGTH for value in variants)
+
+
+def test_magic_link_redactor_inspects_late_sensitive_query_pair():
+    benign = "&".join(f"note{i}=ordinary{i}" for i in range(60))
+    query_token = "lateQueryTokenABC987654"
+    fragment_token = "lateFragmentTokenABC987654"
+    hint = (
+        f"magic_link=https://boards.greenhouse.io/verify?{benign}"
+        f"&token={query_token}#{benign}&verify={fragment_token}"
+    )
+    ordinary = "ordinary0 ordinary59 tokenization remains"
+
+    redacted = launcher._redact_inbox_auth_secrets(
+        f"{query_token} {fragment_token} {ordinary}", hint
+    )
+
+    assert query_token not in redacted
+    assert fragment_token not in redacted
+    assert ordinary in redacted
+
+
+def test_magic_link_redactor_collects_every_deep_percent_decode_layer():
+    layers = ["deep/tokenABC987654"]
+    for _ in range(32):
+        layers.append(quote(layers[-1], safe=""))
+    hint = f"magic_link=https://boards.greenhouse.io/verify?token={layers[-1]}"
+    ordinary = "ordinary output remains unchanged"
+
+    redacted = launcher._redact_inbox_auth_secrets(
+        " | ".join((*layers, ordinary)), hint
+    )
+
+    for layer in layers:
+        assert layer not in redacted
+    assert ordinary in redacted
+
+
+def test_auth_hint_size_boundary_is_accepted():
+    hint = "code=" + "a" * (launcher.MAX_INBOX_AUTH_HINT_BYTES - len("code="))
+    prefix = "https://boards.greenhouse.io/verify?note="
+    url = prefix + "a" * (launcher.MAX_INBOX_AUTH_HINT_BYTES - len(prefix))
+
+    assert launcher._validate_inbox_auth_hint(hint) == hint
+    assert url in launcher._magic_link_secrets(url)
+
+
+def test_oversize_auth_hint_fails_closed_before_agent_use(monkeypatch):
+    hint = "code=" + "a" * launcher.MAX_INBOX_AUTH_HINT_BYTES
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("oversize hint reached agent setup")
+
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", unexpected)
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", unexpected)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", unexpected)
+    monkeypatch.setattr(launcher, "reset_worker_dir", unexpected)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", unexpected)
+    monkeypatch.setattr(launcher.subprocess, "Popen", unexpected)
+
+    status, duration_ms = launcher._run_job_impl(
+        _job(), port=9001, worker_id=7, inbox_auth_hint=hint
+    )
+
+    assert status == "failed:inbox_auth_hint_too_large"
+    assert duration_ms == 0
 
 
 def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result(

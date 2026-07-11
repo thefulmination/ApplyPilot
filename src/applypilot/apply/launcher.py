@@ -216,10 +216,23 @@ _SENSITIVE_QUERY_KEY_COMPOUNDS = frozenset(
         "verifycode",
     }
 )
-_MAX_SECRET_VARIANTS = 24
-_MAX_MAGIC_LINK_COMPONENTS = 48
-_MAX_MAGIC_LINK_SECRETS = 256
-_MAX_SECRET_VALUE_LENGTH = 8192
+MAX_INBOX_AUTH_HINT_BYTES = 64 * 1024
+_AUTH_SECRET_MATERIAL_MULTIPLIER = 128
+_MIN_AUTH_SECRET_MATERIAL_BYTES = 4096
+
+
+class _InboxAuthHintRejected(ValueError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _secret_material_budget(value: str) -> int:
+    input_bytes = len(value.encode("utf-8", errors="strict"))
+    return max(
+        _MIN_AUTH_SECRET_MATERIAL_BYTES,
+        input_bytes * _AUTH_SECRET_MATERIAL_MULTIPLIER,
+    )
 
 
 def _percent_escape_case(value: str, *, upper: bool) -> str:
@@ -231,33 +244,40 @@ def _percent_escape_case(value: str, *, upper: bool) -> str:
 
 
 def _exact_secret_variants(value: str) -> tuple[str, ...]:
-    """Return a capped set of exact raw, decoded, and re-encoded values."""
-    if not value or len(value) > _MAX_SECRET_VALUE_LENGTH:
+    """Return every exact decode layer and its relevant encoded forms."""
+    if not value:
         return ()
-    variants: list[str] = []
-    pending = [value]
-    while pending and len(variants) < _MAX_SECRET_VARIANTS:
-        current = pending.pop(0)
-        if not current or current in variants:
-            continue
-        variants.append(current)
-        if len(variants) >= _MAX_SECRET_VARIANTS:
+    variants: dict[str, None] = {}
+    material_bytes = 0
+    material_budget = _secret_material_budget(value)
+
+    def add(candidate: str) -> None:
+        nonlocal material_bytes
+        if not candidate or candidate in variants:
+            return
+        candidate_bytes = len(candidate.encode("utf-8", errors="strict"))
+        material_bytes += candidate_bytes
+        if material_bytes > material_budget:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+        variants[candidate] = None
+
+    current = value
+    while True:
+        plus_spaced = current.replace("+", " ")
+        plus_decoded = unquote_plus(current)
+        for candidate in (current, plus_spaced, plus_decoded):
+            add(candidate)
+            add(_percent_escape_case(candidate, upper=True))
+            add(_percent_escape_case(candidate, upper=False))
+            add(quote(candidate, safe=""))
+            add(quote_plus(candidate, safe=""))
+
+        decoded = unquote(current)
+        if decoded == current:
             break
-        for candidate in (
-            unquote(current),
-            unquote_plus(current),
-            quote(current, safe=""),
-            quote_plus(current, safe=""),
-            _percent_escape_case(current, upper=True),
-            _percent_escape_case(current, upper=False),
-        ):
-            if (
-                candidate
-                and len(candidate) <= _MAX_SECRET_VALUE_LENGTH
-                and candidate not in variants
-                and candidate not in pending
-            ):
-                pending.append(candidate)
+        if len(decoded) >= len(current):
+            raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+        current = decoded
     return tuple(variants)
 
 
@@ -303,21 +323,23 @@ def _token_like_subdomain_label(value: str) -> bool:
 
 
 def _magic_link_secrets(url: str) -> set[str]:
+    url_bytes = len(url.encode("utf-8", errors="strict"))
+    if url_bytes > MAX_INBOX_AUTH_HINT_BYTES:
+        raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
     secrets: set[str] = set()
-    component_count = 0
+    material_bytes = 0
+    material_budget = _secret_material_budget(url)
 
     def add_variants(value: str) -> None:
-        nonlocal component_count
-        if (
-            not value
-            or component_count >= _MAX_MAGIC_LINK_COMPONENTS
-            or len(secrets) >= _MAX_MAGIC_LINK_SECRETS
-        ):
+        nonlocal material_bytes
+        if not value:
             return
-        component_count += 1
         for variant in _exact_secret_variants(value):
-            if len(secrets) >= _MAX_MAGIC_LINK_SECRETS:
-                break
+            if variant in secrets:
+                continue
+            material_bytes += len(variant.encode("utf-8", errors="strict"))
+            if material_bytes > material_budget:
+                raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
             secrets.add(variant)
 
     add_variants(url)
@@ -341,7 +363,7 @@ def _magic_link_secrets(url: str) -> set[str]:
     for raw_component in (parsed.query, parsed.fragment):
         if not raw_component:
             continue
-        for pair in raw_component.split("&")[:_MAX_MAGIC_LINK_COMPONENTS]:
+        for pair in raw_component.split("&"):
             raw_key, separator, raw_value = pair.partition("=")
             if not separator:
                 variants = _exact_secret_variants(pair)
@@ -354,11 +376,34 @@ def _magic_link_secrets(url: str) -> set[str]:
             if _sensitive_query_key(raw_key):
                 add_variants(raw_value)
 
-    for segment in parsed.path.split("/")[:_MAX_MAGIC_LINK_COMPONENTS]:
+    for segment in parsed.path.split("/"):
         variants = _exact_secret_variants(segment)
         if any(_token_like_path_segment(variant) for variant in variants):
             add_variants(segment)
     return secrets
+
+
+def _validate_inbox_auth_hint(hint: str | None) -> str | None:
+    if hint is None:
+        return None
+    if not isinstance(hint, str):
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid")
+    try:
+        hint_bytes = len(hint.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as exc:
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    if hint_bytes > MAX_INBOX_AUTH_HINT_BYTES:
+        raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
+    for line in hint.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().lower() == "magic_link" and value:
+            try:
+                _magic_link_secrets(value.strip())
+            except _InboxAuthHintRejected:
+                raise
+            except (UnicodeError, ValueError) as exc:
+                raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    return hint
 
 
 def _replace_exact_secret(text: str, secret: str) -> str:
@@ -1775,6 +1820,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
     wrapper, not the run itself)."""
+    try:
+        inbox_auth_hint = _validate_inbox_auth_hint(inbox_auth_hint)
+    except _InboxAuthHintRejected as exc:
+        logger.warning("Rejected inbox auth hint: %s", exc.reason)
+        return f"failed:{exc.reason}", 0
+
     # Read tailored resume text
     resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
