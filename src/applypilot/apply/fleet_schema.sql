@@ -48,14 +48,14 @@ CREATE TABLE IF NOT EXISTS apply_queue (
     -- ---- immutable canonical decision provenance ------------------------
     decision_id             TEXT,
     policy_version          TEXT,
-    decision_action         TEXT CHECK (decision_action IN ('apply', 'review', 'reject')),
-    qualification_verdict   TEXT CHECK (qualification_verdict IN ('qualified', 'unqualified', 'uncertain')),
+    decision_action         TEXT,
+    qualification_verdict   TEXT,
     qualification_score     REAL,
     qualification_floor     REAL,
     preference_score        REAL,
     outcome_score           REAL,
     final_score             REAL,
-    decision_confidence     REAL CHECK (decision_confidence BETWEEN 0 AND 1),
+    decision_confidence     REAL,
     decision_created_at     TIMESTAMPTZ,
     decision_expires_at     TIMESTAMPTZ,
     input_hash              TEXT,
@@ -80,7 +80,36 @@ CREATE TABLE IF NOT EXISTS apply_queue (
     -- ---- bookkeeping ------------------------------------------------------
     pushed_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    synced_to_home_at       TIMESTAMPTZ                       -- set by PULL; NULL = not yet ingested home
+    synced_to_home_at       TIMESTAMPTZ,                      -- set by PULL; NULL = not yet ingested home
+
+    CONSTRAINT apply_queue_canonical_provenance_ck CHECK (
+        (
+            decision_id IS NULL AND policy_version IS NULL AND decision_action IS NULL
+            AND qualification_verdict IS NULL AND qualification_score IS NULL
+            AND qualification_floor IS NULL AND preference_score IS NULL
+            AND outcome_score IS NULL AND final_score IS NULL
+            AND decision_confidence IS NULL AND decision_created_at IS NULL
+            AND decision_expires_at IS NULL AND input_hash IS NULL
+        ) OR (
+            decision_id IS NOT NULL AND btrim(decision_id) <> ''
+            AND policy_version IS NOT NULL AND btrim(policy_version) <> ''
+            AND decision_action IN ('apply', 'review', 'reject')
+            AND qualification_verdict IN ('qualified', 'uncertain', 'unqualified')
+            AND qualification_score IS NOT NULL AND qualification_floor IS NOT NULL
+            AND preference_score IS NOT NULL AND outcome_score IS NOT NULL
+            AND final_score IS NOT NULL AND decision_confidence IS NOT NULL
+            AND qualification_score > '-Infinity'::REAL AND qualification_score < 'Infinity'::REAL
+            AND qualification_floor > '-Infinity'::REAL AND qualification_floor < 'Infinity'::REAL
+            AND preference_score > '-Infinity'::REAL AND preference_score < 'Infinity'::REAL
+            AND outcome_score > '-Infinity'::REAL AND outcome_score < 'Infinity'::REAL
+            AND final_score > '-Infinity'::REAL AND final_score < 'Infinity'::REAL
+            AND score = final_score
+            AND decision_confidence >= 0 AND decision_confidence <= 1
+            AND decision_created_at IS NOT NULL AND decision_expires_at IS NOT NULL
+            AND decision_expires_at > decision_created_at
+            AND input_hash IS NOT NULL AND btrim(input_hash) <> ''
+        )
+    )
 );
 
 -- Lease query: WHERE status='queued' ORDER BY score DESC LIMIT 1.

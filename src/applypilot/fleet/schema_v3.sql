@@ -203,50 +203,167 @@ ALTER TABLE linkedin_queue ADD COLUMN IF NOT EXISTS linkedin_next_action TEXT;
 DO $$
 DECLARE
     queue_name TEXT;
+    target_oid OID;
+    schema_oid OID := (SELECT oid FROM pg_namespace WHERE nspname = current_schema());
 BEGIN
     FOREACH queue_name IN ARRAY ARRAY['apply_queue', 'linkedin_queue'] LOOP
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_decision_action_ck') THEN
-            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (decision_action IS NULL OR decision_action IN (''apply'', ''review'', ''reject'')) NOT VALID', queue_name, queue_name || '_decision_action_ck');
+        target_oid := to_regclass(format('%I.%I', current_schema(), queue_name));
+
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_decision_action_ck');
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_qualification_verdict_ck');
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_confidence_ck');
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_expiry_ck');
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_decision_action_check');
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_qualification_verdict_check');
+        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', queue_name, queue_name || '_decision_confidence_check');
+
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = queue_name || '_canonical_provenance_ck'
+              AND connamespace = schema_oid AND conrelid = target_oid
+        ) THEN
+            EXECUTE format($sql$
+                ALTER TABLE %I ADD CONSTRAINT %I CHECK (
+                    (
+                        decision_id IS NULL AND policy_version IS NULL AND decision_action IS NULL
+                        AND qualification_verdict IS NULL AND qualification_score IS NULL
+                        AND qualification_floor IS NULL AND preference_score IS NULL
+                        AND outcome_score IS NULL AND final_score IS NULL
+                        AND decision_confidence IS NULL AND decision_created_at IS NULL
+                        AND decision_expires_at IS NULL AND input_hash IS NULL
+                    ) OR (
+                        decision_id IS NOT NULL AND btrim(decision_id) <> ''
+                        AND policy_version IS NOT NULL AND btrim(policy_version) <> ''
+                        AND decision_action IN ('apply', 'review', 'reject')
+                        AND qualification_verdict IN ('qualified', 'uncertain', 'unqualified')
+                        AND qualification_score IS NOT NULL AND qualification_floor IS NOT NULL
+                        AND preference_score IS NOT NULL AND outcome_score IS NOT NULL
+                        AND final_score IS NOT NULL AND decision_confidence IS NOT NULL
+                        AND qualification_score > '-Infinity'::REAL AND qualification_score < 'Infinity'::REAL
+                        AND qualification_floor > '-Infinity'::REAL AND qualification_floor < 'Infinity'::REAL
+                        AND preference_score > '-Infinity'::REAL AND preference_score < 'Infinity'::REAL
+                        AND outcome_score > '-Infinity'::REAL AND outcome_score < 'Infinity'::REAL
+                        AND final_score > '-Infinity'::REAL AND final_score < 'Infinity'::REAL
+                        AND score = final_score
+                        AND decision_confidence >= 0 AND decision_confidence <= 1
+                        AND decision_created_at IS NOT NULL AND decision_expires_at IS NOT NULL
+                        AND decision_expires_at > decision_created_at
+                        AND input_hash IS NOT NULL AND btrim(input_hash) <> ''
+                    )
+                ) NOT VALID
+            $sql$, queue_name, queue_name || '_canonical_provenance_ck');
+            EXECUTE format('ALTER TABLE %I VALIDATE CONSTRAINT %I', queue_name, queue_name || '_canonical_provenance_ck');
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_qualification_verdict_ck') THEN
-            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (qualification_verdict IS NULL OR qualification_verdict IN (''qualified'', ''unqualified'', ''uncertain'')) NOT VALID', queue_name, queue_name || '_qualification_verdict_ck');
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_confidence_ck') THEN
-            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (decision_confidence IS NULL OR decision_confidence BETWEEN 0 AND 1) NOT VALID', queue_name, queue_name || '_confidence_ck');
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_expiry_ck') THEN
-            EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (decision_expires_at IS NULL OR decision_created_at IS NULL OR decision_expires_at > decision_created_at) NOT VALID', queue_name, queue_name || '_expiry_ck');
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = queue_name || '_policy_lane_fk') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = queue_name || '_policy_lane_fk'
+              AND connamespace = schema_oid AND conrelid = target_oid
+        ) THEN
             EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (policy_version, lane) REFERENCES fleet_decision_policies(policy_version, lane) NOT VALID', queue_name, queue_name || '_policy_lane_fk');
+            EXECUTE format('ALTER TABLE %I VALIDATE CONSTRAINT %I', queue_name, queue_name || '_policy_lane_fk');
         END IF;
     END LOOP;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'apply_queue_lane_ck') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'apply_queue_lane_ck' AND connamespace = schema_oid
+          AND conrelid = to_regclass(format('%I.apply_queue', current_schema()))
+    ) THEN
         ALTER TABLE apply_queue ADD CONSTRAINT apply_queue_lane_ck
             CHECK (policy_version IS NULL OR lane = 'ats') NOT VALID;
+        ALTER TABLE apply_queue VALIDATE CONSTRAINT apply_queue_lane_ck;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'linkedin_queue_lane_ck') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'linkedin_queue_lane_ck' AND connamespace = schema_oid
+          AND conrelid = to_regclass(format('%I.linkedin_queue', current_schema()))
+    ) THEN
         ALTER TABLE linkedin_queue ADD CONSTRAINT linkedin_queue_lane_ck
             CHECK (policy_version IS NULL OR lane = 'linkedin') NOT VALID;
+        ALTER TABLE linkedin_queue VALIDATE CONSTRAINT linkedin_queue_lane_ck;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fleet_config_ats_policy_fk') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fleet_config_ats_policy_fk' AND connamespace = schema_oid
+          AND conrelid = to_regclass(format('%I.fleet_config', current_schema()))
+    ) THEN
         ALTER TABLE fleet_config ADD CONSTRAINT fleet_config_ats_policy_fk
             FOREIGN KEY (ats_policy_version, ats_policy_lane)
             REFERENCES fleet_decision_policies(policy_version, lane) NOT VALID;
+        ALTER TABLE fleet_config VALIDATE CONSTRAINT fleet_config_ats_policy_fk;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fleet_config_linkedin_policy_fk') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fleet_config_linkedin_policy_fk' AND connamespace = schema_oid
+          AND conrelid = to_regclass(format('%I.fleet_config', current_schema()))
+    ) THEN
         ALTER TABLE fleet_config ADD CONSTRAINT fleet_config_linkedin_policy_fk
             FOREIGN KEY (linkedin_policy_version, linkedin_policy_lane)
             REFERENCES fleet_decision_policies(policy_version, lane) NOT VALID;
+        ALTER TABLE fleet_config VALIDATE CONSTRAINT fleet_config_linkedin_policy_fk;
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    index_predicate TEXT;
+BEGIN
+    SELECT pg_get_expr(i.indpred, i.indrelid)
+      INTO index_predicate
+    FROM pg_index i
+    JOIN pg_class idx ON idx.oid = i.indexrelid
+    JOIN pg_class rel ON rel.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = idx.relnamespace AND n.oid = rel.relnamespace
+    WHERE n.nspname = current_schema() AND rel.relname = 'apply_queue'
+      AND idx.relname = 'idx_apply_queue_canonical_lease';
+    IF index_predicate IS NOT NULL
+       AND NOT (
+           index_predicate LIKE '%policy_version IS NOT NULL%'
+           AND index_predicate LIKE '%qualification_score IS NOT NULL%'
+           AND index_predicate LIKE '%decision_created_at IS NOT NULL%'
+           AND index_predicate LIKE '%decision_expires_at IS NOT NULL%'
+           AND index_predicate LIKE '%input_hash IS NOT NULL%'
+       ) THEN
+        DROP INDEX idx_apply_queue_canonical_lease;
+    END IF;
+
+    SELECT pg_get_expr(i.indpred, i.indrelid)
+      INTO index_predicate
+    FROM pg_index i
+    JOIN pg_class idx ON idx.oid = i.indexrelid
+    JOIN pg_class rel ON rel.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = idx.relnamespace AND n.oid = rel.relnamespace
+    WHERE n.nspname = current_schema() AND rel.relname = 'linkedin_queue'
+      AND idx.relname = 'idx_linkedin_queue_canonical_lease';
+    IF index_predicate IS NOT NULL
+       AND NOT (
+           index_predicate LIKE '%policy_version IS NOT NULL%'
+           AND index_predicate LIKE '%qualification_score IS NOT NULL%'
+           AND index_predicate LIKE '%decision_created_at IS NOT NULL%'
+           AND index_predicate LIKE '%decision_expires_at IS NOT NULL%'
+           AND index_predicate LIKE '%input_hash IS NOT NULL%'
+       ) THEN
+        DROP INDEX idx_linkedin_queue_canonical_lease;
     END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_apply_queue_canonical_lease
     ON apply_queue (policy_version, decision_action, decision_expires_at, score DESC)
-    WHERE status = 'queued' AND decision_id IS NOT NULL;
+    WHERE status = 'queued' AND decision_id IS NOT NULL AND btrim(decision_id) <> ''
+      AND policy_version IS NOT NULL AND btrim(policy_version) <> ''
+      AND decision_action = 'apply' AND qualification_verdict = 'qualified'
+      AND qualification_score IS NOT NULL AND qualification_floor IS NOT NULL
+      AND preference_score IS NOT NULL AND outcome_score IS NOT NULL AND final_score IS NOT NULL
+      AND decision_confidence IS NOT NULL AND decision_created_at IS NOT NULL
+      AND decision_expires_at IS NOT NULL AND input_hash IS NOT NULL AND btrim(input_hash) <> '';
 CREATE INDEX IF NOT EXISTS idx_linkedin_queue_canonical_lease
     ON linkedin_queue (policy_version, decision_action, decision_expires_at, score DESC)
-    WHERE status = 'queued' AND decision_id IS NOT NULL;
+    WHERE status = 'queued' AND decision_id IS NOT NULL AND btrim(decision_id) <> ''
+      AND policy_version IS NOT NULL AND btrim(policy_version) <> ''
+      AND decision_action = 'apply' AND qualification_verdict = 'qualified'
+      AND qualification_score IS NOT NULL AND qualification_floor IS NOT NULL
+      AND preference_score IS NOT NULL AND outcome_score IS NOT NULL AND final_score IS NOT NULL
+      AND decision_confidence IS NOT NULL AND decision_created_at IS NOT NULL
+      AND decision_expires_at IS NOT NULL AND input_hash IS NOT NULL AND btrim(input_hash) <> '';
 
 -- ---------------------------------------------------------------------------
 -- rate_governor: outcome-aware + adaptive circuit-breaker (R6, R1, RF2).

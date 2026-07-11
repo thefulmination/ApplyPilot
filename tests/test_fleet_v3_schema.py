@@ -25,6 +25,68 @@ CANONICAL_QUEUE_COLUMNS = {
     "decision_expires_at", "input_hash",
 }
 
+CANONICAL_CONSTRAINT_SUFFIXES = {
+    "canonical_provenance_ck", "lane_ck", "policy_lane_fk",
+}
+
+
+def _canonical_row(*, table: str, url: str = "canonical", **overrides):
+    row = {
+        "url": url,
+        "application_url": "https://example.test/apply",
+        "score": 0.75,
+        "lane": "ats" if table == "apply_queue" else "linkedin",
+        "decision_id": "decision-1",
+        "policy_version": "policy-1",
+        "decision_action": "apply",
+        "qualification_verdict": "qualified",
+        "qualification_score": 0.8,
+        "qualification_floor": 0.7,
+        "preference_score": 0.6,
+        "outcome_score": 0.5,
+        "final_score": 0.75,
+        "decision_confidence": 0.9,
+        "decision_created_at": "2026-07-11T12:00:00Z",
+        "decision_expires_at": "2026-07-12T12:00:00Z",
+        "input_hash": "sha256:abc",
+    }
+    row.update(overrides)
+    return row
+
+
+def _insert_canonical(cur, table: str, row: dict) -> None:
+    columns = list(row)
+    cur.execute(
+        f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(columns))})",
+        [row[column] for column in columns],
+    )
+
+
+def _canonical_schema_objects(cur, table: str) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    cur.execute(
+        """
+        SELECT c.conname, pg_get_constraintdef(c.oid, true) AS definition
+        FROM pg_constraint c
+        JOIN pg_class rel ON rel.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = rel.relnamespace
+        WHERE n.nspname = current_schema() AND rel.relname = %s
+          AND (c.conname LIKE %s OR c.conname LIKE %s OR c.conname LIKE %s)
+        """,
+        (table, "%canonical_provenance_ck", "%lane_ck", "%policy_lane_fk"),
+    )
+    constraints = {(r["conname"], r["definition"]) for r in cur.fetchall()}
+    cur.execute(
+        """
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema() AND tablename = %s
+          AND indexname LIKE %s
+        """,
+        (table, "%canonical_lease"),
+    )
+    indexes = {(r["indexname"], r["indexdef"]) for r in cur.fetchall()}
+    return constraints, indexes
+
 
 def _tables(conn) -> set[str]:
     with conn.cursor() as cur:
@@ -46,6 +108,34 @@ def test_v3_schema_idempotent(fleet_db):
         fleet_schema.ensure_schema_v3(conn)
         got = _tables(conn)
     assert {"rate_governor", "search_tasks", "compute_queue"} <= got
+
+
+def test_constraint_lookup_ignores_same_name_on_other_schema(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("DROP SCHEMA IF EXISTS canonical_shadow CASCADE")
+        cur.execute("CREATE SCHEMA canonical_shadow")
+        cur.execute(
+            "CREATE TABLE canonical_shadow.apply_queue ("
+            "value INTEGER CONSTRAINT apply_queue_canonical_provenance_ck CHECK (value > 0))"
+        )
+        cur.execute("ALTER TABLE public.apply_queue DROP CONSTRAINT apply_queue_canonical_provenance_ck")
+        conn.commit()
+
+        fleet_schema.ensure_schema_v3(conn)
+
+        cur.execute(
+            """
+            SELECT count(*) AS count
+            FROM pg_constraint c
+            JOIN pg_class rel ON rel.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = rel.relnamespace
+            WHERE n.nspname = 'public' AND rel.relname = 'apply_queue'
+              AND c.conname = 'apply_queue_canonical_provenance_ck'
+            """
+        )
+        assert cur.fetchone()["count"] == 1
+        cur.execute("DROP SCHEMA canonical_shadow CASCADE")
+        conn.commit()
 
 
 def test_v3_schema_declares_dedup_repair_actions_once():
@@ -190,10 +280,10 @@ def test_queue_provenance_constraints_and_policy_foreign_key(fleet_db):
             "VALUES ('ats-v1', 'ats', 'active')"
         )
         with pytest.raises(psycopg.errors.ForeignKeyViolation):
-            cur.execute(
-                "INSERT INTO apply_queue "
-                "(url, application_url, score, policy_version) "
-                "VALUES ('u1', 'https://example.test/apply', 1, 'missing')"
+            _insert_canonical(
+                cur,
+                "apply_queue",
+                _canonical_row(table="apply_queue", policy_version="missing"),
             )
         conn.rollback()
         with pytest.raises(psycopg.errors.CheckViolation):
@@ -204,18 +294,71 @@ def test_queue_provenance_constraints_and_policy_foreign_key(fleet_db):
             )
 
 
-def test_existing_linkedin_queue_is_explicitly_upgraded(fleet_pg):
+@pytest.mark.parametrize("table", ["apply_queue", "linkedin_queue"])
+@pytest.mark.parametrize(
+    ("overrides", "case"),
+    [
+        ({"decision_id": "only", "policy_version": None, "decision_action": None,
+          "qualification_verdict": None, "qualification_score": None,
+          "qualification_floor": None, "preference_score": None, "outcome_score": None,
+          "final_score": None, "decision_confidence": None, "decision_created_at": None,
+          "decision_expires_at": None, "input_hash": None}, "decision-id-only"),
+        ({"decision_created_at": None}, "missing-created-at"),
+        ({"decision_expires_at": None}, "missing-expires-at"),
+        ({"outcome_score": None}, "missing-component-score"),
+        ({"decision_id": "  "}, "blank-decision-id"),
+        ({"policy_version": "  "}, "blank-policy-version"),
+        ({"input_hash": "  "}, "blank-hash"),
+        ({"decision_expires_at": "2026-07-10T12:00:00Z"}, "reversed-expiry"),
+        ({"qualification_score": float("nan")}, "nan-score"),
+        ({"decision_confidence": float("inf")}, "infinite-confidence"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_queue_rejects_incomplete_or_invalid_canonical_provenance(fleet_db, table, overrides, case):
+    del case
+    lane = "ats" if table == "apply_queue" else "linkedin"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+            "VALUES ('policy-1', %s, 'active')",
+            (lane,),
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            _insert_canonical(cur, table, _canonical_row(table=table, **overrides))
+
+
+@pytest.mark.parametrize("table", ["apply_queue", "linkedin_queue"])
+def test_queue_accepts_legacy_all_null_and_complete_canonical_rows(fleet_db, table):
+    lane = "ats" if table == "apply_queue" else "linkedin"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {table} (url, application_url, score) VALUES ('legacy', 'https://example.test', 1)"
+        )
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version, lane, status) "
+            "VALUES ('policy-1', %s, 'active')",
+            (lane,),
+        )
+        _insert_canonical(cur, table, _canonical_row(table=table))
+
+
+@pytest.mark.parametrize("table", ["apply_queue", "linkedin_queue"])
+def test_existing_queue_is_explicitly_upgraded_to_fresh_canonical_schema(fleet_pg, table):
+    lane = "ats" if table == "apply_queue" else "linkedin"
+    canonical_index = f"idx_{table}_canonical_lease"
     with pgqueue.connect(fleet_pg) as conn:
         pgqueue.ensure_schema(conn)
+        fleet_schema.ensure_schema_v3(conn)
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS linkedin_queue")
+            fresh_objects = _canonical_schema_objects(cur, table)
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE {table}")
+            cur.execute(f"DROP INDEX IF EXISTS idx_{table}_canonical_lease")
+            for column in CANONICAL_QUEUE_COLUMNS:
+                cur.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS {column} CASCADE")
             cur.execute(
-                "CREATE TABLE linkedin_queue ("
-                "url TEXT PRIMARY KEY, application_url TEXT NOT NULL, score REAL NOT NULL, "
-                "status apply_queue_status NOT NULL DEFAULT 'queued')"
-            )
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, application_url, score) "
+                f"INSERT INTO {table} (url, application_url, score) "
                 "VALUES ('legacy', 'https://linkedin.com/jobs/view/1', 1)"
             )
         conn.commit()
@@ -223,20 +366,28 @@ def test_existing_linkedin_queue_is_explicitly_upgraded(fleet_pg):
         fleet_schema.ensure_schema_v3(conn)
 
         with conn.cursor() as cur:
-            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='linkedin_queue'")
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name=%s",
+                (table,),
+            )
             cols = {r["column_name"] for r in cur.fetchall()}
-            cur.execute("SELECT lane, decision_id FROM linkedin_queue WHERE url='legacy'")
+            cur.execute(f"SELECT lane, decision_id FROM {table} WHERE url='legacy'")
             legacy = cur.fetchone()
+            upgraded_objects = _canonical_schema_objects(cur, table)
         conn.commit()
-
-        # Restore the shared session database to the normal full table shape.
-        with conn.cursor() as cur:
-            cur.execute("DROP TABLE linkedin_queue")
-        conn.commit()
-        fleet_schema.ensure_schema_v3(conn)
 
     assert CANONICAL_QUEUE_COLUMNS <= cols
-    assert legacy == {"lane": "linkedin", "decision_id": None}
+    assert legacy == {"lane": lane, "decision_id": None}
+    assert upgraded_objects == fresh_objects
+    constraint_names = {name for name, _ in upgraded_objects[0]}
+    assert constraint_names == {f"{table}_{suffix}" for suffix in CANONICAL_CONSTRAINT_SUFFIXES}
+    assert {name for name, _ in upgraded_objects[1]} == {canonical_index}
+    index_definition = next(iter(upgraded_objects[1]))[1]
+    for column in CANONICAL_QUEUE_COLUMNS:
+        assert column in index_definition
+    assert "decision_action = 'apply'" in index_definition
+    assert "qualification_verdict = 'qualified'" in index_definition
 
 
 def test_autotriage_actions_schema(fleet_db):
