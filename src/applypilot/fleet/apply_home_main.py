@@ -277,12 +277,17 @@ def _print_status(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT status, count(*) AS n FROM apply_queue GROUP BY status")
         depth = {r["status"]: r["n"] for r in cur.fetchall()}
-        cur.execute("SELECT paused, canary_enabled, canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1")
+        cur.execute(
+            "SELECT paused,ats_paused,canary_enabled,canary_remaining,spend_cap_usd,"
+            "ats_policy_version FROM fleet_config WHERE id=1"
+        )
         cfg = cur.fetchone()
         cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM apply_queue")
         spend = float(cur.fetchone()["s"])
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
         open_ch = cur.fetchone()["n"]
-    print({"queue": depth, "paused": cfg["paused"], "canary_remaining": cfg["canary_remaining"],
+    print({"queue": depth, "paused": cfg["paused"], "ats_paused": cfg["ats_paused"],
+           "ats_policy_version": cfg["ats_policy_version"],
+           "canary_remaining": cfg["canary_remaining"],
            "spend_cap_usd": float(cfg["spend_cap_usd"] or 0), "apply_spend": spend,
            "open_challenges": open_ch, "queue_diagnosis": queue_diagnosis.queue_diagnosis(conn)})

@@ -44,6 +44,10 @@ def test_only_explicit_accepted_outcomes_enter_model_input(tmp_path):
         "VALUES ('mail-a','2026-01-01T00:00:00Z','screen','2026-01-01T00:00:00Z',?)",
         (url,),
     )
+    conn.execute(
+        "INSERT INTO email_event_reviews (message_id,review_action,reviewed_at,resolution) "
+        "VALUES ('mail-a','confirm','2026-01-02T00:00:00Z','trusted')"
+    )
     (tmp_path / "outcomes.jsonl").write_text(
         json.dumps({
             "eventId": "mail-a", "jobUrl": url, "normalizedStage": "screen",

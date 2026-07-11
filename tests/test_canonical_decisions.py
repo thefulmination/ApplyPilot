@@ -68,13 +68,36 @@ def decision(
 
 
 def valid_metrics(**overrides) -> dict:
-    metrics = {
-        "hard_negative_false_positives": 0,
-        "queue_provenance_failures": 0,
-        "title_only_promotions": 0,
+    names = [
+        "zero-hard-negative-applies",
+        "zero-title-only-promotions",
+        "grounded-required-support",
+        "canonical-outperforms-legacy",
+    ]
+    aliases = {
+        "hard_negative_false_positives": "zero-hard-negative-applies",
+        "queue_provenance_failures": "grounded-required-support",
+        "title_only_promotions": "zero-title-only-promotions",
     }
-    metrics.update(overrides)
-    return metrics
+    failed = {aliases[key] for key, value in overrides.items() if value}
+    return {
+        "version": 4,
+        "evaluatorVersion": "canonical-replay-evaluator-v1",
+        "releaseGates": [
+            {
+                "name": name,
+                "locked": True,
+                "passed": name not in failed,
+                "failureCount": int(name in failed),
+            }
+            for name in names
+        ],
+        "releaseGate": {
+            "locked": True,
+            "passed": not failed,
+            "failedGateNames": sorted(failed),
+        },
+    }
 
 
 def prepare_policy(conn, version: str = "p1", lane: str = "ats") -> None:
@@ -337,6 +360,16 @@ def test_record_replay_metrics_uses_canonical_sorted_json(conn) -> None:
     assert json.loads(stored)["z"] == 1
 
 
+def test_record_replay_metrics_is_immutable(conn) -> None:
+    prepare_policy(conn)
+    metrics = {"z": 1, "a": {"y": 2, "x": 1}}
+    repo.record_replay_metrics(conn, "p1", metrics)
+    repo.record_replay_metrics(conn, "p1", metrics)
+
+    with pytest.raises(repo.ImmutableDecisionConflict):
+        repo.record_replay_metrics(conn, "p1", {"z": 2})
+
+
 @pytest.mark.parametrize(
     "metrics",
     [
@@ -415,7 +448,10 @@ def test_activate_policy_retires_prior_active_only_in_same_lane(conn) -> None:
 def test_activation_rechecks_release_metrics(conn) -> None:
     prepare_policy(conn)
     validate(conn)
-    repo.record_replay_metrics(conn, "p1", valid_metrics(title_only_promotions=1))
+    conn.execute(
+        "UPDATE decision_policy_versions SET metrics_json=? WHERE policy_version='p1'",
+        (json.dumps(valid_metrics(title_only_promotions=1)),),
+    )
 
     with pytest.raises(repo.PolicyValidationError):
         repo.activate_policy(conn, "p1", lane="ats")

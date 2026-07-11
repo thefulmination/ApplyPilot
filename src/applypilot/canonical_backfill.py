@@ -155,6 +155,8 @@ def _pairwise(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
 
 
 def _outcome(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
+    from applypilot.outcome_review import classify_review_candidate
+
     event_id = row.get("event_id") or row.get("eventId") or row.get("message_id")
     job_url = row.get("job_url") or row.get("jobUrl")
     if not event_id or not job_url:
@@ -163,8 +165,23 @@ def _outcome(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
         return False
     if conn.execute("SELECT 1 FROM jobs WHERE url=?", (job_url,)).fetchone() is None:
         return False
-    explicit = row.get("review_status") or row.get("reviewStatus")
-    review_status = explicit if explicit in {"accepted", "rejected", "needs_review"} else "needs_review"
+    latest_review = conn.execute(
+        "SELECT resolution FROM email_event_reviews WHERE message_id=? ORDER BY id DESC LIMIT 1",
+        (event_id,),
+    ).fetchone()
+    existing = conn.execute(
+        "SELECT review_status FROM reviewed_outcomes WHERE event_id=? AND job_url=?",
+        (event_id, job_url),
+    ).fetchone()
+    resolution = latest_review[0] if latest_review else None
+    if resolution in {"trusted", "corrected"} or (existing and existing[0] == "accepted"):
+        review_status = "accepted"
+    elif resolution == "ignored" or classify_review_candidate(
+        sender=row.get("sender"), subject=row.get("subject")
+    ) == "rejected":
+        review_status = "rejected"
+    else:
+        review_status = "needs_review"
     conn.execute(
         """
         INSERT INTO reviewed_outcomes (

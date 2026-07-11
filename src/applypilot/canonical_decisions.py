@@ -62,11 +62,12 @@ _DECISION_COLUMNS = (
 )
 
 _SAVEPOINT_IDS = itertools.count()
-_RELEASE_GATES = (
-    "hard_negative_false_positives",
-    "queue_provenance_failures",
-    "title_only_promotions",
-)
+_RELEASE_GATES = {
+    "zero-hard-negative-applies",
+    "zero-title-only-promotions",
+    "grounded-required-support",
+    "canonical-outperforms-legacy",
+}
 _APPLY_REQUIRED_COLUMNS = (
     "qualification_score",
     "preference_score",
@@ -430,15 +431,28 @@ def get_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any] |
 def record_replay_metrics(
     conn: sqlite3.Connection, policy_version: str, metrics: Mapping[str, Any]
 ) -> None:
-    """Store replay metrics using deterministic JSON serialization."""
+    """Store immutable replay metrics on a draft policy."""
     encoded = _canonical_json(metrics)
     with _transaction(conn):
-        cursor = conn.execute(
+        policy = _select_one(
+            conn,
+            "SELECT status, metrics_json FROM decision_policy_versions WHERE policy_version = ?",
+            (policy_version,),
+        )
+        if policy is None:
+            raise PolicyValidationError(f"unknown policy: {policy_version}")
+        if policy["metrics_json"] is not None:
+            if policy["metrics_json"] != encoded:
+                raise ImmutableDecisionConflict(
+                    f"immutable replay metrics differ for policy {policy_version!r}"
+                )
+            return
+        if policy["status"] != "draft":
+            raise PolicyValidationError("replay metrics can only be recorded on a draft policy")
+        conn.execute(
             "UPDATE decision_policy_versions SET metrics_json = ? WHERE policy_version = ?",
             (encoded, policy_version),
         )
-        if cursor.rowcount != 1:
-            raise PolicyValidationError(f"unknown policy: {policy_version}")
 
 
 def _check_release_gates(metrics_json: str | None) -> None:
@@ -450,7 +464,26 @@ def _check_release_gates(metrics_json: str | None) -> None:
         raise PolicyValidationError("replay metrics are invalid JSON") from exc
     if not isinstance(metrics, dict) or not metrics:
         raise PolicyValidationError("replay metrics must be a nonempty object")
-    failed = [gate for gate in _RELEASE_GATES if metrics.get(gate) != 0]
+    release_gate = metrics.get("releaseGate")
+    gates = metrics.get("releaseGates")
+    if not isinstance(release_gate, dict) or release_gate.get("locked") is not True:
+        raise PolicyValidationError("locked canonical replay gate summary is required")
+    if not isinstance(gates, list):
+        raise PolicyValidationError("locked canonical replay gates are required")
+    by_name = {
+        gate.get("name"): gate
+        for gate in gates
+        if isinstance(gate, dict) and isinstance(gate.get("name"), str)
+    }
+    missing = sorted(_RELEASE_GATES - by_name.keys())
+    if missing:
+        raise PolicyValidationError(f"release gates missing: {', '.join(missing)}")
+    failed = sorted(
+        name for name in _RELEASE_GATES
+        if by_name[name].get("locked") is not True or by_name[name].get("passed") is not True
+    )
+    if release_gate.get("passed") is not True:
+        failed = sorted(set(failed) | set(release_gate.get("failedGateNames") or []))
     if failed:
         raise PolicyValidationError(f"release gates failed: {', '.join(failed)}")
 

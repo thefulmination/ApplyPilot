@@ -1,12 +1,7 @@
-"""Import apply decisions from the external recommendation engine ("brainstorm").
+"""Import external recommendations as migration/review evidence only.
 
-brainstorm reviews ApplyPilot's exported jobs (jobs.jsonl, keyed by `url`) and
-decides which are worth applying to. This module ingests that curated apply list
-and makes brainstorm's verdict AUTHORITATIVE for ApplyPilot's apply gate -- it
-writes the decision into ``audit_score`` (which the gate prefers via
-``COALESCE(audit_score, fit_score)``) and tags the row with ``decision_source``
-so ApplyPilot's own audit stage skips it. ApplyPilot's LLM ``fit_score`` is left
-untouched as a benchmark datapoint to compare against ``external_decision_score``.
+This legacy format can populate external benchmark fields, but it never writes
+audit or canonical authority and can never authorize queue work.
 
 Matching key: the exact job ``url`` (ApplyPilot's PRIMARY KEY), round-tripped
 verbatim through the job export. URLs are never fuzzy-matched -- a non-match is
@@ -103,11 +98,7 @@ def _is_approved(rec: dict) -> tuple[bool, str]:
 
 _DECISION_UPDATE = """
     UPDATE jobs
-       SET audit_score = ?,
-           audit_label = 'approved_external',
-           audit_reason = ?,
-           audited_at = ?,
-           decision_source = ?,
+       SET decision_source = ?,
            decision_verdict = ?,
            external_decision_score = ?,
            decision_at = ?,
@@ -183,15 +174,13 @@ def import_decisions(
         if gate_override is not None:
             gate_score = gate_override
 
-        reason = str(_field(rec, "reason", "reasoning", "explanation", "notes") or "")[:2000]
         decided_at = _field(rec, "decided_at", "decidedAt", "decision_at") or now
         application_url = _field(rec, "application_url", "applicationUrl", "applyUrl")
         source = _field(rec, "source", "decision_source") or default_source
 
         cur = conn.execute(
             _DECISION_UPDATE,
-            (gate_score, reason, decided_at, source, verdict_l, external_score,
-             decided_at, application_url, url),
+            (source, verdict_l, external_score, decided_at, application_url, url),
         )
 
         if cur.rowcount > 0:
@@ -231,8 +220,7 @@ def import_decisions(
                 continue
             conn.execute(
                 _DECISION_UPDATE,
-                (gate_score, reason, decided_at, source, verdict_l, external_score,
-                 decided_at, application_url, url),
+                (source, verdict_l, external_score, decided_at, application_url, url),
             )
             counts["inserted"] += 1
 

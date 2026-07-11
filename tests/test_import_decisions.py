@@ -29,7 +29,7 @@ def _write(tmp_path, records, name="decisions.jsonl"):
     return path
 
 
-def test_approved_decision_becomes_authoritative_audit_score(monkeypatch, tmp_path):
+def test_approved_decision_is_review_evidence_not_audit_authority(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
     _insert_job(conn, "https://x.com/j1", fit_score=5)
     path = _write(tmp_path, [{"url": "https://x.com/j1", "verdict": "approve", "decision_score": 9, "reason": "great fit"}])
@@ -40,12 +40,12 @@ def test_approved_decision_becomes_authoritative_audit_score(monkeypatch, tmp_pa
     row = conn.execute(
         "SELECT audit_score, decision_source, decision_verdict, external_decision_score, fit_score, audit_label "
         "FROM jobs WHERE url = ?", ("https://x.com/j1",)).fetchone()
-    assert row["audit_score"] == 9.0          # gate value (brainstorm authoritative)
+    assert row["audit_score"] is None
     assert row["decision_source"] == "brainstorm"
     assert row["decision_verdict"] == "approve"
     assert row["external_decision_score"] == 9.0
     assert row["fit_score"] == 5              # ApplyPilot's benchmark left untouched
-    assert row["audit_label"] == "approved_external"
+    assert row["audit_label"] is None
 
 
 def test_non_approved_verdict_is_skipped(monkeypatch, tmp_path):
@@ -71,8 +71,8 @@ def test_score_rescaling(monkeypatch, tmp_path):
     mod.import_decisions(p_unit, scale="unit")
     mod.import_decisions(p_pct, scale="percent")
 
-    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.com/unit",)).fetchone()[0] == 9.0
-    assert conn.execute("SELECT audit_score FROM jobs WHERE url=?", ("https://x.com/pct",)).fetchone()[0] == 9.0
+    assert conn.execute("SELECT external_decision_score FROM jobs WHERE url=?", ("https://x.com/unit",)).fetchone()[0] == 9.0
+    assert conn.execute("SELECT external_decision_score FROM jobs WHERE url=?", ("https://x.com/pct",)).fetchone()[0] == 9.0
 
 
 def test_already_applied_not_reopened(monkeypatch, tmp_path):
@@ -97,7 +97,7 @@ def test_unknown_url_inserted_when_title_present(monkeypatch, tmp_path):
 
     assert r["inserted"] == 1
     row = conn.execute("SELECT audit_score, title, decision_source FROM jobs WHERE url=?", ("https://x.com/new",)).fetchone()
-    assert row["audit_score"] == 8.0 and row["title"] == "Staff Engineer" and row["decision_source"] == "brainstorm"
+    assert row["audit_score"] is None and row["title"] == "Staff Engineer" and row["decision_source"] == "brainstorm"
 
 
 def test_unknown_url_without_title_reported(monkeypatch, tmp_path):
