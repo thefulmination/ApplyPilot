@@ -154,6 +154,26 @@ def test_magic_link_redactor_removes_every_nonempty_structural_value():
     assert ordinary in redacted
 
 
+def test_magic_link_redactor_removes_ports_and_empty_valued_structural_keys():
+    encoded_port = "%31%32%33%34%35"
+    hint = (
+        "magic_link=https://boards.greenhouse.io%3A"
+        f"{encoded_port}/verify%3B%74icket%3D%3F%61bc%3D%23%78yz%3D"
+    )
+    secrets = ("12345", "ticket", "abc", "xyz")
+    encoded = (encoded_port, "%74icket", "%61bc", "%78yz")
+    ordinary = "unrelated labels and punctuation remain"
+
+    redacted = launcher._redact_inbox_auth_secrets(
+        " | ".join((*secrets, *encoded, ordinary)), hint
+    )
+
+    for secret in (*secrets, *encoded):
+        assert secret not in redacted
+    assert ordinary in redacted
+    assert "" not in launcher._magic_link_secrets(hint.removeprefix("magic_link="))
+
+
 def test_magic_link_redactor_preserves_literal_plus_and_form_decode_variants():
     hint = (
         "magic_link=https://boards.greenhouse.io/verify?ticket=Ab%2BcD9"
@@ -315,11 +335,13 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     subdomain_token = "cred839214"
     delimiter_token = "delimiterCredentialABC987"
     sink_short = "z1"
+    sink_key = "k1"
+    sink_port = "54321"
     secret = (
-        f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io/"
+        f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io:{sink_port}/"
         "verify/pathTokenABC123456"
         f"?token={encoded_token}&verify={short_token}"
-        f"%26custom%3D{delimiter_token}%26id%3D{sink_short}"
+        f"%26custom%3D{delimiter_token}%26id%3D{sink_short}%26{sink_key}%3D"
         f"#state={standalone_token}"
     )
     hint = f"magic_link={secret}"
@@ -333,7 +355,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                         "text": (
                             f"Used {standalone_token}, {decoded_token}, {short_token}, "
                             f"{userinfo}, {subdomain_token}, {delimiter_token}, "
-                            f"and {sink_short}; "
+                            f"{sink_short}, {sink_key}, and {sink_port}; "
                             "quick stays ordinary"
                         ),
                     },
@@ -344,7 +366,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                             "url": (
                                 f"https://tool.invalid/use/{encoded_token}/"
                                 f"{userinfo}/{subdomain_token}/{short_token}/"
-                                f"{delimiter_token}/{sink_short}"
+                                f"{delimiter_token}/{sink_short}/{sink_key}/{sink_port}"
                             )
                         },
                     },
@@ -355,7 +377,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             "type": "result",
             "result": (
                 f"Used {standalone_token} {encoded_token} {short_token} "
-                f"{userinfo} {subdomain_token} {delimiter_token} {sink_short}; "
+                f"{userinfo} {subdomain_token} {delimiter_token} {sink_short} "
+                f"{sink_key} {sink_port}; "
                 "quick stays ordinary\nRESULT:APPLIED"
             ),
             "usage": {},
@@ -401,6 +424,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             subdomain_token,
             delimiter_token,
             sink_short,
+            sink_key,
+            sink_port,
         ):
             assert sensitive not in persisted
         assert launcher.INBOX_AUTH_REDACTION in persisted
@@ -419,6 +444,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             subdomain_token,
             delimiter_token,
             sink_short,
+            sink_key,
+            sink_port,
         )
     )
     assert any(launcher.INBOX_AUTH_REDACTION in action for action in tool_actions)

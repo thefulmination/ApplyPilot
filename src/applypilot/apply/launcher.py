@@ -275,6 +275,27 @@ def _trusted_ats_host_suffix(hostname: str) -> str | None:
     return max(matches, key=lambda domain: (domain.count("."), len(domain))) if matches else None
 
 
+def _raw_url_port(netloc: str) -> str | None:
+    authority = netloc.rpartition("@")[2]
+    if authority.startswith("["):
+        bracket = authority.find("]")
+        if bracket < 0 or authority[bracket + 1:bracket + 2] != ":":
+            return None
+        return authority[bracket + 2:] or None
+    _host, separator, port = authority.rpartition(":")
+    return port if separator and port else None
+
+
+def _decode_url_structural_delimiters(value: str) -> str:
+    delimiters = frozenset(":/?#@;&=")
+
+    def replace(match: re.Match) -> str:
+        decoded = chr(int(match.group(1), 16))
+        return decoded if decoded in delimiters else match.group(0)
+
+    return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
+
+
 def _magic_link_secrets(url: str) -> set[str]:
     url_bytes = len(url.encode("utf-8", errors="strict"))
     if url_bytes > MAX_INBOX_AUTH_HINT_BYTES:
@@ -296,16 +317,22 @@ def _magic_link_secrets(url: str) -> set[str]:
             secrets.add(variant)
 
     def add_parameter_token(token: str) -> None:
-        _raw_key, separator, raw_value = token.partition("=")
+        raw_key, separator, raw_value = token.partition("=")
         if not separator:
             if token:
                 add_variants(token)
             return
+        if raw_key:
+            add_variants(raw_key)
         if raw_value:
             add_variants(raw_value)
 
     add_variants(url)
-    for url_layer in _progressive_percent_decode_layers(url):
+    parsed_layers: dict[str, None] = {}
+    for decoded_layer in _progressive_percent_decode_layers(url):
+        parsed_layers.setdefault(decoded_layer, None)
+        parsed_layers.setdefault(_decode_url_structural_delimiters(decoded_layer), None)
+    for url_layer in parsed_layers:
         parsed = urlsplit(url_layer)
 
         raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
@@ -314,6 +341,7 @@ def _magic_link_secrets(url: str) -> set[str]:
             add_variants(username)
             if password_separator:
                 add_variants(password)
+        add_variants(_raw_url_port(parsed.netloc) or "")
 
         hostname = parsed.hostname or ""
         trusted_suffix = _trusted_ats_host_suffix(hostname)
