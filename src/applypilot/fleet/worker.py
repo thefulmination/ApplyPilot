@@ -44,6 +44,7 @@ from typing import Any, Callable, Optional
 from applypilot.fleet import captcha as _captcha
 from applypilot.fleet import governor
 from applypilot.fleet import queue
+from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
 
 # Roles a machine slot may carry (a machine may run several slots / roles -- §5).
 ROLE_APPLY = "apply"
@@ -454,6 +455,7 @@ class WorkerLoop:
 
     # -- APPLY: governed, dedup-gated, approval-gated, captcha-aware (§5/§7) ---
     def _tick_apply(self, conn) -> dict:
+        enforce_no_lifecycle_faults()
         job = queue.lease_apply(conn, self.worker_id, home_ip=self.home_ip)
         if job is None:
             self._beat(conn, state="idle")
@@ -528,6 +530,7 @@ class WorkerLoop:
     def _tick_linkedin(self, conn) -> dict:
         # Pre-checks (belts; the lease SQL is the real enforcement). Session pre-flight +
         # halt pre-check; the interlock is held by the entrypoint for the worker's life.
+        enforce_no_lifecycle_faults()
         job = queue.lease_linkedin(conn, self.worker_id, public_ip=self.public_ip, owner_ip=self.owner_ip)
         if job is None:
             self._beat(conn, state="idle")

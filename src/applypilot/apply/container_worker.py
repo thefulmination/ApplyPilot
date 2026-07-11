@@ -221,6 +221,7 @@ def _run_crash_diag(config, launcher, pgqueue, launch_chrome, cleanup_worker,
     container when it applies fine locally. Default targets the Cursor Ashby job that returned
     no_result at $0; override with APPLYPILOT_DIAG_JOB_URL (comma-separated job urls)."""
     import pathlib
+    from applypilot.apply.lifecycle_fault import require_browser_cleanup
     urls = [u.strip() for u in os.environ.get(
         "APPLYPILOT_DIAG_JOB_URL",
         "https://www.linkedin.com/jobs/view/4422701219,https://www.indeed.com/viewjob?jk=3b98044c179cd985").split(",") if u.strip()]
@@ -232,7 +233,8 @@ def _run_crash_diag(config, launcher, pgqueue, launch_chrome, cleanup_worker,
         cur.execute("SELECT url, title, company, application_url, score FROM apply_queue WHERE url = %s", (url,))
         row = cur.fetchone()
         if not row:
-            _log(f"DIAG-CRASH job not found in queue: {url}"); continue
+            _log(f"DIAG-CRASH job not found in queue: {url}")
+            continue
         d = dict(row)
         for mdl in models:
             job = {
@@ -252,7 +254,7 @@ def _run_crash_diag(config, launcher, pgqueue, launch_chrome, cleanup_worker,
             except Exception as e:
                 _log(f"DIAG-CRASH [{mdl}] run_job EXC {type(e).__name__}: {str(e)[:300]}")
             finally:
-                cleanup_worker(worker_id, proc)
+                require_browser_cleanup(cleanup_worker, worker_id, proc)
             wl = pathlib.Path(config.LOG_DIR) / f"worker-{worker_id}.log"
             if wl.exists():
                 t = wl.read_text(errors="replace")
@@ -271,6 +273,7 @@ def main() -> int:
     from applypilot import config
     from applypilot.apply import launcher, pgqueue
     from applypilot.apply.chrome import launch_chrome, cleanup_worker
+    from applypilot.apply.lifecycle_fault import require_browser_cleanup
 
     # Create LOG_DIR + the other APPLYPILOT_DIR subdirs. The home box does this at CLI init
     # via ensure_dirs(); the worker bypasses the CLI, so without this the first apply crashes
@@ -304,13 +307,16 @@ def main() -> int:
     consecutive_usage_limit = 0
     while not _STOP["flag"]:
         if pgqueue.should_halt(pg):
-            _log("HALT: paused or spend cap reached -- exiting"); break
+            _log("HALT: paused or spend cap reached -- exiting")
+            break
         row = pgqueue.lease_one(pg, worker_id=str(worker_id), ttl_seconds=lease_ttl)
         if not row:
             idle_seconds += poll
             if idle_seconds >= idle_exit:
-                _log("queue empty -- exiting"); break
-            time.sleep(poll); continue
+                _log("queue empty -- exiting")
+                break
+            time.sleep(poll)
+            continue
         idle_seconds = 0.0
         job = _job_dict(row)
         _log(f"lease {row['url']} | {job['title'][:48]} @ {job.get('company')}")
@@ -341,7 +347,7 @@ def main() -> int:
         except Exception as e:  # never let one job kill the worker
             status = f"failed:worker_error:{type(e).__name__}:{str(e)[:80]}"
         finally:
-            cleanup_worker(worker_id, proc)
+            require_browser_cleanup(cleanup_worker, worker_id, proc)
 
         action = _handle_run_status(pg, worker_id, row["url"], status,
                                     cost=cost, dur_ms=dur_ms, model=model)

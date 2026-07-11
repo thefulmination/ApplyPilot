@@ -14,6 +14,12 @@ from pathlib import Path
 import pytest
 
 from applypilot.apply import chrome
+from applypilot.apply import lifecycle_fault
+
+
+@pytest.fixture(autouse=True)
+def _isolate_lifecycle_faults(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
 
 
 def _make_cookies(profile_dir: Path, cookies: list[tuple[str, str]]) -> None:
@@ -154,10 +160,14 @@ class TestLinkedInLoginPersistence:
         monkeypatch.setattr(chrome, "has_linkedin_session", lambda _profile: True)
         monkeypatch.setattr(chrome, "cleanup_worker", lambda *_args: False)
 
-        with pytest.raises(RuntimeError, match="cleanup could not be proven"):
+        with pytest.raises(
+            lifecycle_fault.LifecycleHardFault,
+            match="cleanup could not be proven",
+        ):
             chrome.linkedin_login(timeout_seconds=1, poll_seconds=0)
 
         assert seed.exists()
+        assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
 
     def test_cleanup_failure_preserves_login_error_as_cause(self, tmp_path, monkeypatch):
         from applypilot import config
@@ -191,7 +201,10 @@ class TestLinkedInLoginPersistence:
         )
         monkeypatch.setattr(chrome, "cleanup_worker", lambda *_args: False)
 
-        with pytest.raises(RuntimeError, match="cleanup could not be proven") as caught:
+        with pytest.raises(
+            lifecycle_fault.LifecycleHardFault,
+            match="cleanup could not be proven",
+        ) as caught:
             chrome.linkedin_login(timeout_seconds=1, poll_seconds=0)
 
         assert isinstance(caught.value.__cause__, ValueError)

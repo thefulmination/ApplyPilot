@@ -106,7 +106,34 @@ def test_fault_created_during_attempt_one_blocks_attempt_two(tmp_path, monkeypat
 
     monkeypatch.setattr(S.subprocess, "Popen", popen)
 
-    with pytest.raises(RuntimeError, match="hard-fault"):
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="hard-fault"):
         S.supervise(total_cost_usd=100, max_attempts=3, poll_seconds=0)
 
     assert len(spawns) == 1
+
+
+def test_supervisor_checks_shared_fault_gate_immediately_before_spawn(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(S.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(S.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(S, "_applied_count", lambda: 0)
+    monkeypatch.setattr(S, "_apply_cost_total", lambda: 0.0)
+    monkeypatch.setattr(S, "_require_orphan_cleanup", lambda *_args: None)
+    monkeypatch.setattr(
+        S,
+        "enforce_no_lifecycle_faults",
+        lambda: calls.append("gate") or (_ for _ in ()).throw(
+            lifecycle_fault.LifecycleHardFault("operator reconciliation required")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        S.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault):
+        S.supervise(total_cost_usd=100, max_attempts=1)
+
+    assert calls

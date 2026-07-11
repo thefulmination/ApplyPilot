@@ -46,7 +46,9 @@ from applypilot.apply.process_guard import (
 )
 from applypilot.apply.lifecycle_fault import (
     LifecycleHardFault,
+    enforce_no_lifecycle_faults,
     persist_lifecycle_hard_fault,
+    require_browser_cleanup,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
@@ -2025,6 +2027,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     guard = None
 
     try:
+        enforce_no_lifecycle_faults()
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -3191,6 +3194,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                         supervised=supervised,
                     )
 
+            cleanup_proc = chrome_proc
+            chrome_proc = None
+            require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
+
             # --auth-gated same-day halt: a challenge-class result means this
             # tenant hit a wall the agent can't solve unattended -- halt it
             # for the rest of the UTC day and keep applying to other hosts
@@ -3264,12 +3271,20 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 _update_host_breaker(job, ok=False, reason=reason, worker_id=worker_id)
 
         except KeyboardInterrupt:
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
             release_lock(job["url"])
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
             release_lock(job["url"])  # keeps the job retryable
@@ -3280,8 +3295,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             if _note_systemic_failure(job["url"]):
                 _trip_systemic_breaker(worker_id)
         finally:
-            if chrome_proc:
-                cleanup_worker(worker_id, chrome_proc)
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
 
         # Cost-budget guard: stop the whole run once accumulated apply cost hits
         # the cap (APPLYPILOT_APPLY_MAX_COST / --max-cost-usd; 0 = no cap). Read at

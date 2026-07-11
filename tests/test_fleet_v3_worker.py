@@ -306,6 +306,43 @@ def test_worker_apply_visible_captcha_parks_and_raises_challenge(fleet_db):
             "reclaim must leave a parked wall frozen, not re-queue it"
 
 
+def test_apply_lifecycle_hard_fault_escapes_without_normal_result(
+    fleet_db, tmp_path, monkeypatch
+):
+    from applypilot.apply import lifecycle_fault
+
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "cleanup-hard-fault", "cleanup.example")
+
+    def hard_fault(_job):
+        raise lifecycle_fault.LifecycleHardFault("browser cleanup could not be proven")
+
+    loop = WorkerLoop(
+        _factory(fleet_db),
+        "w-cleanup-hard-fault",
+        home_ip="5.5.5.5",
+        role="apply",
+        apply_fn=hard_fault,
+    )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="browser cleanup"):
+        loop.run_once()
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, apply_status FROM apply_queue WHERE url='cleanup-hard-fault'"
+        )
+        row = cur.fetchone()
+        assert row["status"] == "leased"
+        assert row["apply_status"] is None
+        cur.execute(
+            "SELECT count(*) AS n FROM apply_result_events "
+            "WHERE url='cleanup-hard-fault'"
+        )
+        assert cur.fetchone()["n"] == 0
+
+
 def test_worker_apply_clear_marks_applied(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_one_apply(conn, "a2")
@@ -482,6 +519,22 @@ def test_run_forever_records_scrubbed_crash(fleet_db, monkeypatch):
     assert len(loop._last_error) <= 4000
 
 
+def test_run_forever_does_not_swallow_lifecycle_hard_fault(fleet_db):
+    from applypilot.apply.lifecycle_fault import LifecycleHardFault
+
+    loop = WorkerLoop(
+        lambda: pgqueue.connect(fleet_db),
+        "w-hard-fault",
+        home_ip="9.9.9.9",
+        role="compute",
+        score_fn=lambda job: ({}, 0),
+    )
+    loop.run_once = lambda: (_ for _ in ()).throw(LifecycleHardFault("stop worker"))
+
+    with pytest.raises(LifecycleHardFault, match="stop worker"):
+        loop.run_forever(idle_sleep_seconds=0)
+
+
 # ===========================================================================
 # 5. WorkerLoop APPLY status-passthrough path (apply_fn returns dict).
 #    Prove crash != phantom-applied; captcha -> parked.
@@ -491,7 +544,6 @@ def test_tick_apply_status_passthrough(fleet_db):
     # The new contract: apply_fn returns {"run_status": ...}. Prove crash != phantom-applied.
     from applypilot.fleet.worker import WorkerLoop
     from applypilot.apply import pgqueue
-    from applypilot.fleet import queue
 
     def _seed(conn, url, domain="acme.com"):
         # use a distinct apply_domain per sub-case so the host-governor min-gap
@@ -508,8 +560,10 @@ def test_tick_apply_status_passthrough(fleet_db):
                       apply_fn=lambda job: {"run_status": "applied", "est_cost_usd": 0.01})
     assert loop.run_once()["action"] == "applied"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT status FROM apply_queue WHERE url='ja'"); assert cur.fetchone()["status"] == "applied"
-        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ja'"); assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT status FROM apply_queue WHERE url='ja'")
+        assert cur.fetchone()["status"] == "applied"
+        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ja'")
+        assert cur.fetchone()["n"] == 1
 
     # failed:no_result_line -> crash_unconfirmed, NOT applied
     with pgqueue.connect(fleet_db) as conn:
@@ -575,8 +629,10 @@ def test_tick_linkedin_routes(fleet_db):
                       apply_fn=lambda job: {"run_status": "applied", "est_cost_usd": 0.0})
     assert loop.run_once()["action"] == "applied"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT status FROM linkedin_queue WHERE url='ka'"); assert cur.fetchone()["status"] == "applied"
-        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ka'"); assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT status FROM linkedin_queue WHERE url='ka'")
+        assert cur.fetchone()["status"] == "applied"
+        cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ka'")
+        assert cur.fetchone()["n"] == 1
 
     # failed:no_result_line -> crash_unconfirmed (never phantom-applied)
     with pgqueue.connect(fleet_db) as conn:
@@ -586,7 +642,8 @@ def test_tick_linkedin_routes(fleet_db):
                        apply_fn=lambda job: {"run_status": "failed:no_result_line", "est_cost_usd": 0.0})
     assert loop2.run_once()["action"] == "crash_unconfirmed"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT status FROM linkedin_queue WHERE url='kc'"); assert cur.fetchone()["status"] == "crash_unconfirmed"
+        cur.execute("SELECT status FROM linkedin_queue WHERE url='kc'")
+        assert cur.fetchone()["status"] == "crash_unconfirmed"
 
     # captcha -> parked + halted_until set (one tx)
     with pgqueue.connect(fleet_db) as conn:

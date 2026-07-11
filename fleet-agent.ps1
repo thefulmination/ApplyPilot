@@ -41,6 +41,35 @@ if ($boxLabel -and ($boxLabel -ne $Label)) {
 $py = $null
 foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) { if (Test-Path $d) { $py = (Resolve-Path $d).Path; break } }
 if (-not $py) { throw "python not found (.conda-env or .venv) -- run the box setup first." }
+
+function Assert-NoLifecycleFaults {
+  $dbPath = if ($env:APPLYPILOT_DB_PATH) {
+    $env:APPLYPILOT_DB_PATH
+  } else {
+    Join-Path $env:LOCALAPPDATA "ApplyPilot\applypilot.db"
+  }
+  $faults = @()
+  $stateDirs = @(
+    (Split-Path -Parent ([IO.Path]::GetFullPath($dbPath))),
+    (Join-Path $env:LOCALAPPDATA "ApplyPilot"),
+    $env:TEMP
+  ) | Where-Object { $_ } | Select-Object -Unique
+  foreach ($stateDir in $stateDirs) {
+    $legacyFault = Join-Path $stateDir "keepalive.hard-fault.json"
+    $faultDir = Join-Path $stateDir "lifecycle-faults"
+    if (Test-Path -LiteralPath $legacyFault -PathType Leaf) {
+      $faults += Get-Item -LiteralPath $legacyFault
+    }
+    if (Test-Path -LiteralPath $faultDir -PathType Container) {
+      $faults += Get-ChildItem -LiteralPath $faultDir -Filter "fault-*.json" -File
+    }
+  }
+  if ($faults.Count -gt 0) {
+    throw "[fleet-agent:$Label] unresolved lifecycle hard-fault record(s); operator reconciliation is required before worker launch."
+  }
+}
+
+Assert-NoLifecycleFaults
 $applypilotCli = $null
 foreach ($d in @(".\.conda-env\Scripts", ".\.venv\Scripts")) {
   $cand = Join-Path $d "applypilot.exe"
@@ -269,6 +298,7 @@ while ($true) {
     $started = 0; $slot = 0
     while ($started -lt ($want - $have) -and $slot -le 20) {
       if ($running -notcontains $slot) {
+        Assert-NoLifecycleFaults
         # -File must be pre-quoted: Start-Process joins array args with spaces WITHOUT quoting,
         # so a repo path containing spaces (home's OneDrive checkout) otherwise truncates to
         # "-File C:\...\New" and the child exits before the launcher ever runs (m2/m4's

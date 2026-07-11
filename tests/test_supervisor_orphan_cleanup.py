@@ -682,7 +682,7 @@ def test_orphan_cleanup_fault_persists_restart_interlock(tmp_path, monkeypatch):
 
     paths = _fault_paths()
     assert len(paths) == 1
-    with pytest.raises(RuntimeError, match="hard-fault records present"):
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
         supervisor._enforce_hard_fault_gate()
 
     monkeypatch.setenv("APPLYPILOT_RECONCILE_HARD_FAULT", "1")
@@ -783,7 +783,7 @@ def test_hard_fault_gate_refuses_without_explicit_reconciliation(tmp_path, monke
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
     marker = supervisor._persist_hard_fault("uncertain", _supervised_child_identity())
 
-    with pytest.raises(RuntimeError, match="hard-fault records present"):
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
         supervisor._enforce_hard_fault_gate()
 
     assert marker.exists()

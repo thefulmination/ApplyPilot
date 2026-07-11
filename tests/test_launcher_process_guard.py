@@ -288,5 +288,39 @@ def test_launcher_uncertain_guard_cleanup_persists_interlock_and_escapes_job_res
     assert len(lifecycle_fault.lifecycle_hard_fault_paths()) >= 1
     monkeypatch.delenv("APPLYPILOT_RECONCILE_HARD_FAULT", raising=False)
     monkeypatch.setattr(supervisor.config, "DB_PATH", tmp_path / "applypilot.db")
-    with pytest.raises(RuntimeError, match="hard-fault records present"):
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
         supervisor._enforce_hard_fault_gate()
+
+
+def test_existing_fault_blocks_agent_spawn_without_adding_fault(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(launcher.config, "APP_DIR", tmp_path)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda _path: None)
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda _worker: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **_kwargs: "prompt")
+    monkeypatch.setattr(launcher, "_make_mcp_config", lambda _port: {})
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **_kwargs: ["agent"])
+    monkeypatch.setattr(launcher, "add_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spawned")),
+    )
+    fault = lifecycle_fault.persist_lifecycle_hard_fault("cleanup uncertain", pid=8123)
+    job = {
+        "url": "https://example.invalid/job/1",
+        "application_url": "https://example.invalid/job/1",
+        "title": "Test Role",
+        "site": "Example",
+        "fit_score": 8,
+        "tailored_resume_path": None,
+    }
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
+        launcher._run_job_impl(job, port=9400, worker_id=0)
+
+    assert lifecycle_fault.lifecycle_hard_fault_paths() == [fault]

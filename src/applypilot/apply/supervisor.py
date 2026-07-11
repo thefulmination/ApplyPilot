@@ -46,6 +46,7 @@ from applypilot.apply.process_guard import (
 from applypilot.apply.lifecycle_fault import (
     LoadedLifecycleFault,
     identity_digest,
+    enforce_no_lifecycle_faults,
     legacy_lifecycle_hard_fault_marker,
     lifecycle_hard_fault_paths,
     load_lifecycle_hard_fault,
@@ -593,13 +594,13 @@ def _reconcile_hard_fault(path: Path) -> None:
 def _enforce_hard_fault_gate() -> None:
     paths = lifecycle_hard_fault_paths()
     if not paths:
+        enforce_no_lifecycle_faults()
         return
     if os.environ.get("APPLYPILOT_RECONCILE_HARD_FAULT", "").strip() != "1":
-        raise RuntimeError(f"hard-fault records present: {len(paths)}")
+        enforce_no_lifecycle_faults()
     for path in paths:
         _reconcile_hard_fault(path)
-    if lifecycle_hard_fault_paths():
-        raise RuntimeError("hard-fault records appeared during reconciliation")
+    enforce_no_lifecycle_faults()
 
 
 def _cleanup_orphans(

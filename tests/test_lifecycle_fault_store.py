@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from applypilot.apply import lifecycle_fault
 
 
@@ -70,3 +72,38 @@ def test_replacement_race_preserves_replacement_fault(tmp_path, monkeypatch):
     remaining = lifecycle_fault.lifecycle_hard_fault_paths()
     assert len(remaining) == 1
     assert remaining[0].read_bytes() == replacement_bytes
+
+
+def test_enforce_no_lifecycle_faults_blocks_without_adding_faults(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
+    fault = lifecycle_fault.persist_lifecycle_hard_fault("cleanup uncertain", pid=101)
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
+        lifecycle_fault.enforce_no_lifecycle_faults()
+
+    assert lifecycle_fault.lifecycle_hard_fault_paths() == [fault]
+
+
+def test_enforce_no_lifecycle_faults_allows_clean_isolated_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
+
+    lifecycle_fault.enforce_no_lifecycle_faults()
+
+    assert lifecycle_fault.lifecycle_hard_fault_paths() == []
+
+
+def test_direct_chrome_launch_is_blocked_without_fault_accumulation(tmp_path, monkeypatch):
+    from applypilot.apply import chrome
+
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
+    fault = lifecycle_fault.persist_lifecycle_hard_fault("cleanup uncertain", pid=101)
+    monkeypatch.setattr(
+        chrome,
+        "_reserve_browser_launch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("reserved")),
+    )
+
+    with pytest.raises(lifecycle_fault.LifecycleHardFault, match="operator reconciliation"):
+        chrome.launch_chrome(0)
+
+    assert lifecycle_fault.lifecycle_hard_fault_paths() == [fault]

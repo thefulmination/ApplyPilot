@@ -21,6 +21,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_worker, launch_chrome
+from applypilot.apply.lifecycle_fault import require_browser_cleanup
 from applypilot.aggregator_resolver import (
     is_external_apply_url,
     next_action_for_unresolved_kind,
@@ -781,4 +782,4 @@ def _run_live_browser_batch(candidates: Sequence[Candidate], options: ResolverOp
             finally:
                 browser.close()
     finally:
-        cleanup_worker(options.worker_id, proc)
+        require_browser_cleanup(cleanup_worker, options.worker_id, proc)

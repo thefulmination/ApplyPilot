@@ -232,6 +232,10 @@ def make_apply_fn(
     """
     from applypilot.apply import launcher, chrome
     from applypilot.apply.chrome import BASE_CDP_PORT
+    from applypilot.apply.lifecycle_fault import (
+        enforce_no_lifecycle_faults,
+        require_browser_cleanup,
+    )
     from applypilot.apply.container_worker import _real_cost
 
     def apply_fn(job: dict) -> dict:
@@ -245,6 +249,7 @@ def make_apply_fn(
         proc = None
         out = None
         try:
+            enforce_no_lifecycle_faults()
             launch_kwargs = {"headless": _should_launch_chrome_headless()}
             if controlled:
                 launch_kwargs["kill_existing"] = False
@@ -328,13 +333,12 @@ def make_apply_fn(
                     os.environ.pop("FLEET_WORKER_ID", None)
                 else:
                     os.environ["FLEET_WORKER_ID"] = previous_fleet_worker_id
-            try:
-                cleanup_result = chrome.cleanup_worker(worker_id, proc) if proc is not None else False
-                cleanup_ok = cleanup_result is True if controlled else cleanup_result is not False
-            except Exception:
-                if controlled:
-                    raise
-                cleanup_ok = False
+            cleanup_result = (
+                require_browser_cleanup(chrome.cleanup_worker, worker_id, proc)
+                if proc is not None
+                else False
+            )
+            cleanup_ok = cleanup_result is True if controlled else cleanup_result is not False
             if out is not None:
                 out["browser_cleanup_ok"] = cleanup_ok
     return apply_fn
@@ -425,6 +429,9 @@ def _apply_timeout_override(dsn=None, *, conn=None) -> None:
 
 def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", machine_owner=None, slot=0):
     _setup_apply_env()
+    from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
+
+    enforce_no_lifecycle_faults()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).

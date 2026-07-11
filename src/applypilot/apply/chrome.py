@@ -12,7 +12,6 @@ import platform
 import signal
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -21,6 +20,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from applypilot import config
+from applypilot.apply.lifecycle_fault import (
+    enforce_no_lifecycle_faults,
+    require_browser_cleanup,
+)
 from applypilot.apply.process_guard import (
     darwin_process_executable,
     parse_ps_lstart_local,
@@ -1345,6 +1348,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     challenge) in the window. Apply workers then clone the seed and inherit the session.
 
     Returns (bool ok, Path seed_dir)."""
+    enforce_no_lifecycle_faults()
     seed = config.CHROME_WORKER_DIR / SEED_PROFILE_NAME
     reservation = _reserve_browser_launch(
         LINKEDIN_LOGIN_SLOT,
@@ -1431,14 +1435,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             ok = has_linkedin_session(seed)
     finally:
         # Cleanup uses only the verified stable process handle; CDP stays read-only.
-        if not cleanup_worker(LINKEDIN_LOGIN_SLOT, proc):
-            cleanup_error = RuntimeError(
-                "LinkedIn login browser cleanup could not be proven"
-            )
-            active_error = sys.exc_info()[1]
-            if active_error is not None:
-                raise cleanup_error from active_error
-            raise cleanup_error
+        require_browser_cleanup(cleanup_worker, LINKEDIN_LOGIN_SLOT, proc)
     return ok, seed
 
 
@@ -1491,6 +1488,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
     Returns:
         subprocess.Popen handle for the browser process.
     """
+    enforce_no_lifecycle_faults()
     if port is None:
         port = BASE_CDP_PORT + worker_id
 

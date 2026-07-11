@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from applypilot import config
 
@@ -42,6 +44,16 @@ def lifecycle_hard_fault_paths() -> list[Path]:
     if directory.is_dir():
         paths.extend(sorted(directory.glob("fault-*.json")))
     return paths
+
+
+def enforce_no_lifecycle_faults() -> None:
+    """Refuse a launch while any unresolved lifecycle fault exists."""
+    paths = lifecycle_hard_fault_paths()
+    if paths:
+        raise LifecycleHardFault(
+            f"{len(paths)} unresolved lifecycle hard-fault record(s); "
+            "operator reconciliation is required before launch"
+        )
 
 
 def identity_digest(value: str) -> str:
@@ -81,6 +93,27 @@ def persist_lifecycle_hard_fault(
     temp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     os.replace(temp, marker)
     return marker
+
+
+def require_browser_cleanup(
+    cleanup: Callable[[int, object], object],
+    worker_id: int,
+    process: object,
+) -> object:
+    """Run browser cleanup and interlock every uncertain result."""
+    pid = int(getattr(process, "pid", 0) or 0)
+    try:
+        result = cleanup(worker_id, process)
+    except Exception as exc:
+        persist_lifecycle_hard_fault("browser cleanup exception", pid=pid)
+        raise LifecycleHardFault("browser cleanup could not be proven") from exc
+    if result is False:
+        persist_lifecycle_hard_fault("browser cleanup unproven", pid=pid)
+        active_error = sys.exc_info()[1]
+        if active_error is not None:
+            raise LifecycleHardFault("browser cleanup could not be proven") from active_error
+        raise LifecycleHardFault("browser cleanup could not be proven")
+    return result
 
 
 def load_lifecycle_hard_fault(path: Path) -> LoadedLifecycleFault:
