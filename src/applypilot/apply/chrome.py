@@ -10,11 +10,11 @@ import logging
 import os
 import platform
 import shutil
-import socket
 import subprocess
 import threading
 import time
 import uuid
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from applypilot import config
@@ -64,17 +64,57 @@ class BrowserSlotOccupiedError(RuntimeError):
     """The requested browser profile or CDP port is reserved or already occupied."""
 
 
+@dataclass(frozen=True)
+class BrowserProcessIdentity:
+    pid: int
+    created_at: float
+    executable: str
+    command: str
+    profile_dir: str
+    port: int
+
+
 class _BrowserReservation:
-    def __init__(self, handles, *, worker_id: int, port: int, profile_dir: Path) -> None:
+    def __init__(
+        self,
+        handles,
+        *,
+        worker_id: int,
+        port: int,
+        profile_dir: Path,
+        metadata_path: Path,
+        browser_identity: BrowserProcessIdentity | None,
+    ) -> None:
         self._handles = handles
         self.worker_id = worker_id
         self.port = port
         self.profile_dir = profile_dir
+        self.metadata_path = metadata_path
+        self.browser_identity = browser_identity
         self._released = False
 
-    def release(self) -> None:
+    def record_browser_identity(self, identity: BrowserProcessIdentity) -> None:
+        if (
+            identity.port != self.port
+            or _normalized_path(identity.profile_dir) != _normalized_path(self.profile_dir)
+        ):
+            raise ValueError("browser identity does not match reservation")
+        temp = self.metadata_path.with_name(
+            f"{self.metadata_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        temp.write_text(json.dumps(asdict(identity), sort_keys=True), encoding="utf-8")
+        os.replace(temp, self.metadata_path)
+        self.browser_identity = identity
+
+    def release(self, *, clear_identity: bool = False) -> None:
         if self._released:
             return
+        if clear_identity:
+            try:
+                self.metadata_path.unlink(missing_ok=True)
+                self.browser_identity = None
+            except OSError:
+                logger.debug("Browser identity metadata cleanup failed", exc_info=True)
         self._released = True
         for handle in reversed(self._handles):
             try:
@@ -99,6 +139,25 @@ def _browser_lock_dir() -> Path:
     path = Path(configured) if configured else Path(config.APP_DIR) / "browser-locks"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _normalized_path(value) -> str:
+    return os.path.normcase(os.path.abspath(str(value))).replace("\\", "/")
+
+
+def _load_browser_identity(path: Path) -> BrowserProcessIdentity | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return BrowserProcessIdentity(
+            pid=int(raw["pid"]),
+            created_at=float(raw["created_at"]),
+            executable=str(raw["executable"]),
+            command=str(raw["command"]),
+            profile_dir=str(raw["profile_dir"]),
+            port=int(raw["port"]),
+        )
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
 
 
 def _worker_profile_dir(worker_id: int, browser: str | None) -> Path:
@@ -149,6 +208,7 @@ def _acquire_browser_reservation(
         _browser_lock_dir() / f"profile-{profile_key}.lock",
         _browser_lock_dir() / f"slot-{worker_id}.lock",
     ))
+    metadata_path = _browser_lock_dir() / f"identity-{worker_id}-{port}-{profile_key}.json"
     handles = []
     try:
         for path in paths:
@@ -159,6 +219,8 @@ def _acquire_browser_reservation(
             worker_id=worker_id,
             port=port,
             profile_dir=profile_dir,
+            metadata_path=metadata_path,
+            browser_identity=None,
         ).release()
         raise
     return _BrowserReservation(
@@ -166,15 +228,153 @@ def _acquire_browser_reservation(
         worker_id=worker_id,
         port=port,
         profile_dir=profile_dir,
+        metadata_path=metadata_path,
+        browser_identity=_load_browser_identity(metadata_path),
     )
 
 
 def _port_is_listening(port: int) -> bool:
+    return bool(_listener_pids(port))
+
+
+def _listener_pids(port: int) -> list[int]:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-            return True
-    except OSError:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            pids = set()
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 5 and fields[3].upper() == "LISTENING":
+                    local = fields[1].rsplit(":", 1)
+                    if len(local) == 2 and local[1] == str(port) and fields[-1].isdigit():
+                        pids.add(int(fields[-1]))
+            return sorted(pids)
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return sorted({int(value) for value in result.stdout.split() if value.isdigit()})
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def _process_identity(pid: int) -> BrowserProcessIdentity | None:
+    try:
+        if platform.system() == "Windows":
+            script = (
+                f"$p=Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\";"
+                "if($p){[pscustomobject]@{Pid=$p.ProcessId;"
+                "Created=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()/1000;"
+                "Executable=$p.ExecutablePath;Command=$p.CommandLine}|ConvertTo-Json -Compress}"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+            raw = json.loads(result.stdout)
+            command = str(raw.get("Command") or "")
+            profile, port = _browser_markers(command)
+            return BrowserProcessIdentity(
+                pid=int(raw["Pid"]),
+                created_at=float(raw["Created"]),
+                executable=str(raw.get("Executable") or ""),
+                command=command,
+                profile_dir=profile,
+                port=port,
+            )
+
+        stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        boot_line = next(
+            line for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        created = float(boot_line.split()[1]) + float(stat_fields[21]) / os.sysconf("SC_CLK_TCK")
+        executable = os.readlink(f"/proc/{pid}/exe")
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", "replace"
+        ).strip()
+        profile, port = _browser_markers(command)
+        return BrowserProcessIdentity(pid, created, executable, command, profile, port)
+    except (OSError, ValueError, KeyError, StopIteration, json.JSONDecodeError):
+        return None
+
+
+def _browser_markers(command: str) -> tuple[str, int]:
+    import re
+
+    port_match = re.search(r"--remote-debugging-port(?:=|\s+)(\d+)", command)
+    profile_match = re.search(
+        r'--user-data-dir(?:=|\s+)(?:"([^"]+)"|\'([^\']+)\'|(\S+))',
+        command,
+    )
+    profile = next((value for value in profile_match.groups() if value), "") if profile_match else ""
+    return profile, int(port_match.group(1)) if port_match else 0
+
+
+def _browser_identity_matches(
+    expected: BrowserProcessIdentity | None,
+    actual: BrowserProcessIdentity | None,
+) -> bool:
+    if expected is None or actual is None:
         return False
+    return (
+        actual.pid == expected.pid
+        and abs(actual.created_at - expected.created_at) < 0.001
+        and bool(actual.executable)
+        and _normalized_path(actual.executable) == _normalized_path(expected.executable)
+        and actual.port == expected.port
+        and actual.port > 0
+        and _normalized_path(actual.profile_dir) == _normalized_path(expected.profile_dir)
+    )
+
+
+def _cleanup_reserved_listener(reservation: _BrowserReservation) -> bool:
+    listeners = _listener_pids(reservation.port)
+    if not listeners:
+        return True
+    if len(listeners) != 1:
+        return False
+    listener_pid = listeners[0]
+    actual = _process_identity(listener_pid)
+    if not _browser_identity_matches(reservation.browser_identity, actual):
+        return False
+    _kill_process_tree(listener_pid)
+    return not _listener_pids(reservation.port)
+
+
+def _record_launched_browser_identity(
+    reservation: _BrowserReservation,
+    process: subprocess.Popen,
+    executable: str,
+    profile_dir: Path,
+    port: int,
+) -> None:
+    actual = _process_identity(process.pid)
+    expected = BrowserProcessIdentity(
+        pid=process.pid,
+        created_at=actual.created_at if actual is not None else 0.0,
+        executable=str(executable),
+        command=actual.command if actual is not None else "",
+        profile_dir=str(profile_dir),
+        port=port,
+    )
+    if not _browser_identity_matches(expected, actual):
+        raise RuntimeError("launched browser identity could not be verified")
+    reservation.record_browser_identity(actual)
 
 
 def _profile_appears_occupied(profile_dir: Path) -> bool:
@@ -204,7 +404,8 @@ def _reserve_browser_launch(
         ):
             raise BrowserSlotOccupiedError("browser slot, profile, or port is occupied")
         if kill_existing:
-            _kill_on_port(port)
+            if not _cleanup_reserved_listener(reservation):
+                raise BrowserSlotOccupiedError("reserved port listener identity is foreign or ambiguous")
         return reservation
     except Exception:
         reservation.release()
@@ -217,12 +418,14 @@ class BrowserCleanupOwnership:
     def __init__(self, reservation: _BrowserReservation) -> None:
         self._reservation = reservation
 
-    def cleanup_browser(self) -> bool:
-        _kill_on_port(self._reservation.port)
-        return not _port_is_listening(self._reservation.port)
+    def record_browser_identity(self, identity: BrowserProcessIdentity) -> None:
+        self._reservation.record_browser_identity(identity)
 
-    def release(self) -> None:
-        self._reservation.release()
+    def cleanup_browser(self) -> bool:
+        return _cleanup_reserved_listener(self._reservation)
+
+    def release(self, *, clear_identity: bool = False) -> None:
+        self._reservation.release(clear_identity=clear_identity)
 
 
 def reserve_browser_cleanup(
@@ -242,13 +445,15 @@ def cleanup_orphaned_browser(worker_id: int, port: int, profile_dir: Path) -> bo
     ownership = reserve_browser_cleanup(worker_id, port, profile_dir)
     if ownership is None:
         return False
+    cleaned = False
     try:
-        return ownership.cleanup_browser()
+        cleaned = ownership.cleanup_browser()
+        return cleaned
     except Exception:
         logger.debug("Orphan browser cleanup failed for slot %s", worker_id, exc_info=True)
         return False
     finally:
-        ownership.release()
+        ownership.release(clear_identity=cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +856,18 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     except Exception:
         reservation.release()
         raise
+    try:
+        _record_launched_browser_identity(
+            reservation,
+            proc,
+            chrome_exe,
+            seed,
+            LINKEDIN_LOGIN_CDP_PORT,
+        )
+    except Exception:
+        _kill_process_tree(proc.pid)
+        reservation.release()
+        raise
     with _chrome_lock:
         _chrome_procs[LINKEDIN_LOGIN_SLOT] = proc
         _browser_reservations[id(proc)] = reservation
@@ -816,6 +1033,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
     except Exception:
         reservation.release()
         raise
+    try:
+        _record_launched_browser_identity(reservation, proc, chrome_exe, profile_dir, port)
+    except Exception:
+        _kill_process_tree(proc.pid)
+        reservation.release()
+        raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
         _browser_reservations[id(proc)] = reservation
@@ -882,6 +1105,10 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
         return False
 
     if process.poll() is None:
+        current_identity = _process_identity(process.pid)
+        if not _browser_identity_matches(reservation.browser_identity, current_identity):
+            logger.error("[worker-%s] Refusing cleanup after browser identity mismatch", worker_id)
+            return False
         _kill_process_tree(process.pid)
     deadline = time.monotonic() + max(
         0.0,
@@ -900,7 +1127,7 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
             if _chrome_procs.get(worker_id) is process:
                 _chrome_procs.pop(worker_id, None)
             _browser_reservations.pop(id(process), None)
-        reservation.release()
+        reservation.release(clear_identity=True)
         logger.info("[worker-%d] Chrome cleaned up", worker_id)
     else:
         logger.error("[worker-%d] Chrome cleanup could not prove process and port release", worker_id)

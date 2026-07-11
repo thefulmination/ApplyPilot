@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from applypilot import config
@@ -68,12 +69,24 @@ def _apply_cost_total() -> float:
 _ORPHAN_PATTERN = "_npx|playwright|modelcontextprotocol|@playwright"
 
 
+@dataclass
+class SupervisedProcessIdentity:
+    pid: int
+    created_at: float
+    executable: str
+    command: str
+    launched_at: float
+    ended_at: float | None = None
+
+
 def _process_snapshot() -> list[dict]:
     """Return minimal process ancestry metadata; callers must hold browser ownership."""
     if sys.platform == "win32":
         script = (
-            "Get-CimInstance Win32_Process | "
-            "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+            "Get-CimInstance Win32_Process | ForEach-Object {"
+            "[pscustomobject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;"
+            "Name=$_.Name;CommandLine=$_.CommandLine;"
+            "Created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()/1000}} | "
             "ConvertTo-Json -Compress"
         )
         result = subprocess.run(
@@ -92,10 +105,11 @@ def _process_snapshot() -> list[dict]:
             "ppid": int(row.get("ParentProcessId") or 0),
             "name": str(row.get("Name") or ""),
             "command": str(row.get("CommandLine") or ""),
+            "created": float(row["Created"]) if row.get("Created") is not None else None,
         } for row in rows]
 
     result = subprocess.run(
-        ["ps", "-eo", "pid=,ppid=,comm=,args="],
+        ["ps", "-eo", "pid=,ppid=,lstart=,comm=,args="],
         capture_output=True,
         text=True,
         timeout=30,
@@ -103,26 +117,62 @@ def _process_snapshot() -> list[dict]:
     )
     rows = []
     for line in result.stdout.splitlines():
-        parts = line.strip().split(None, 3)
-        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+        parts = line.strip().split(None, 8)
+        if len(parts) >= 8 and parts[0].isdigit() and parts[1].isdigit():
+            try:
+                created = datetime.strptime(
+                    " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"
+                ).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                created = None
             rows.append({
                 "pid": int(parts[0]),
                 "ppid": int(parts[1]),
-                "name": parts[2],
-                "command": parts[3] if len(parts) == 4 else "",
+                "name": parts[7],
+                "command": parts[8] if len(parts) == 9 else "",
+                "created": created,
             })
     return rows
 
 
-def _associated_auxiliary_pids(processes: list[dict], owner_pid: int) -> list[int]:
-    descendants = {int(owner_pid)}
+def _owner_identity_is_valid(owner: SupervisedProcessIdentity) -> bool:
+    return bool(
+        owner.pid > 0
+        and owner.created_at > 0
+        and owner.launched_at > 0
+        and owner.ended_at is not None
+        and owner.ended_at >= owner.launched_at
+        and owner.executable
+        and "applypilot.cli" in owner.command
+        and "apply" in owner.command
+    )
+
+
+def _associated_auxiliary_pids(
+    processes: list[dict],
+    owner: SupervisedProcessIdentity,
+) -> list[int]:
+    if not _owner_identity_is_valid(owner):
+        return []
+    reused = [row for row in processes if int(row.get("pid") or 0) == owner.pid]
+    if reused:
+        created = reused[0].get("created")
+        if created is None or abs(float(created) - owner.created_at) >= 0.001:
+            return []
+
+    descendants = {owner.pid}
     changed = True
     while changed:
         changed = False
         for row in processes:
             pid = int(row.get("pid") or 0)
             ppid = int(row.get("ppid") or 0)
-            if pid and ppid in descendants and pid not in descendants:
+            created = row.get("created")
+            within_lifetime = (
+                created is not None
+                and owner.launched_at <= float(created) <= float(owner.ended_at)
+            )
+            if pid and ppid in descendants and pid not in descendants and within_lifetime:
                 descendants.add(pid)
                 changed = True
     eligible = []
@@ -132,7 +182,7 @@ def _associated_auxiliary_pids(processes: list[dict], owner_pid: int) -> list[in
         command = str(row.get("command") or "")
         if (
             pid in descendants
-            and pid != owner_pid
+            and pid != owner.pid
             and name in {"node", "node.exe"}
             and re.search(_ORPHAN_PATTERN, command, flags=re.IGNORECASE)
         ):
@@ -153,7 +203,33 @@ def _kill_auxiliary_process(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
-def _cleanup_orphans(log, *, owner_pid: int | None = None) -> bool:
+def _capture_supervised_identity(
+    pid: int,
+    launched_at: float,
+) -> SupervisedProcessIdentity | None:
+    try:
+        row = next(row for row in _process_snapshot() if int(row.get("pid") or 0) == pid)
+        created = row.get("created")
+        executable = str(row.get("name") or "")
+        command = str(row.get("command") or "")
+        if created is None or not executable or "applypilot.cli" not in command or "apply" not in command:
+            return None
+        return SupervisedProcessIdentity(
+            pid=pid,
+            created_at=float(created),
+            executable=executable,
+            command=command,
+            launched_at=launched_at,
+        )
+    except (StopIteration, TypeError, ValueError):
+        return None
+
+
+def _cleanup_orphans(
+    log,
+    *,
+    owner: SupervisedProcessIdentity | None = None,
+) -> bool:
     """Between attempts: free the CDP port (kill any leftover Chrome) and kill orphaned
     Playwright-MCP node servers so a fresh agent can't be hijacked. A hard-killed run
     leaves these behind. Best-effort; never raises."""
@@ -166,10 +242,10 @@ def _cleanup_orphans(log, *, owner_pid: int | None = None) -> bool:
         log("ORPHAN-CLEANUP: browser slot occupied; left all processes untouched")
         return False
     try:
-        processes = _process_snapshot() if owner_pid is not None else []
+        processes = _process_snapshot() if owner is not None else []
         browser_cleaned = ownership.cleanup_browser()
         auxiliaries_cleaned = True
-        for pid in _associated_auxiliary_pids(processes, owner_pid) if owner_pid is not None else []:
+        for pid in _associated_auxiliary_pids(processes, owner) if owner is not None else []:
             try:
                 _kill_auxiliary_process(pid)
             except Exception:
@@ -260,7 +336,7 @@ def supervise(
 
     start = time.monotonic()
     attempt = 0
-    previous_apply_pid: int | None = None
+    previous_apply_identity: SupervisedProcessIdentity | None = None
     log(f"SUPERVISOR start: total_budget=${total_cost_usd:.0f}, baseline_applied={baseline}, "
         f"baseline_cost=${max(0.0, baseline_cost):.2f}, stall={stall_minutes}m, "
         f"max_attempts={max_attempts}, max_hours={max_hours}, est_cost_per_apply=${est_cost_per_apply}")
@@ -292,7 +368,7 @@ def supervise(
                 break
 
         attempt += 1
-        _cleanup_orphans(log, owner_pid=previous_apply_pid)
+        _cleanup_orphans(log, owner=previous_apply_identity)
         offsite_backup()  # periodic off-machine backup at each restart boundary
         # Reclaim any lease stranded by the previous crash so its job is retryable.
         try:
@@ -322,9 +398,10 @@ def supervise(
         log(f"ATTEMPT {attempt}: launching apply (spent ${spent:.2f}, "
             f"per-attempt cap ${remaining:.2f}, applied={applied_now})")
         out_path = config.LOG_DIR / f"supervised_attempt_{attempt}.out"
+        launched_at = time.time()
         with open(out_path, "w", encoding="utf-8") as out:
             proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=child_env)
-        previous_apply_pid = proc.pid
+        current_apply_identity = _capture_supervised_identity(proc.pid, launched_at)
 
         last_applied = applied_now
         last_progress = time.monotonic()
@@ -361,6 +438,10 @@ def supervise(
                     f"-- killing to restart")
                 _kill_tree(proc)
                 break
+
+        if current_apply_identity is not None:
+            current_apply_identity.ended_at = time.time()
+        previous_apply_identity = current_apply_identity
 
     offsite_backup(force=True)  # final off-machine backup on stop
     log(f"SUPERVISOR done: {_applied_count() - baseline} applies this session "

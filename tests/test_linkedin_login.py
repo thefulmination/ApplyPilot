@@ -77,8 +77,21 @@ class TestLinkedInLoginPersistence:
         monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
         monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
         monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
+        seed = tmp_path / chrome.SEED_PROFILE_NAME
+        identity = chrome.BrowserProcessIdentity(
+            pid=proc.pid,
+            created_at=10.0,
+            executable="chrome.exe",
+            command=(
+                f"chrome.exe --remote-debugging-port={chrome.LINKEDIN_LOGIN_CDP_PORT} "
+                f'--user-data-dir="{seed}"'
+            ),
+            profile_dir=str(seed),
+            port=chrome.LINKEDIN_LOGIN_CDP_PORT,
+        )
         monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda worker_id, pid: None)
         monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: setattr(proc, "alive", False))
+        monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
         monkeypatch.setattr(chrome.subprocess, "Popen", lambda *args, **kwargs: proc)
         monkeypatch.setattr(chrome, "_has_linkedin_session_cdp", lambda port: True)
         monkeypatch.setattr(chrome, "_close_browser_cdp", lambda port: False)
