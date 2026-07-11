@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -404,9 +405,15 @@ def _browser_parent_identity_matches(
     )
 
 
-def terminate_verified_process(*, pid: int, created_at: float, executable: str) -> bool:
+def terminate_verified_process(
+    *,
+    pid: int,
+    created_at: float,
+    executable: str,
+    final_authority: Callable[[], bool] | None,
+) -> bool:
     """Terminate only the process instance identified by PID, start time, and image."""
-    if pid <= 0 or created_at <= 0 or not executable:
+    if pid <= 0 or created_at <= 0 or not executable or final_authority is None:
         return False
     if platform.system() != "Windows":
         pidfd_open = getattr(os, "pidfd_open", None)
@@ -424,6 +431,11 @@ def terminate_verified_process(*, pid: int, created_at: float, executable: str) 
                 or abs(actual.created_at - created_at) >= 0.001
                 or _normalized_path(actual.executable) != _normalized_path(executable)
             ):
+                return False
+            try:
+                if final_authority() is not True:
+                    return False
+            except Exception:
                 return False
             pidfd_send_signal(pidfd, getattr(signal, "SIGKILL", 9))
             return True
@@ -496,6 +508,11 @@ def terminate_verified_process(*, pid: int, created_at: float, executable: str) 
             or _normalized_path(image_buffer.value) != _normalized_path(executable)
         ):
             return False
+        try:
+            if final_authority() is not True:
+                return False
+        except Exception:
+            return False
         return bool(kernel32.TerminateProcess(handle, 1))
     finally:
         kernel32.CloseHandle(handle)
@@ -512,6 +529,9 @@ def _terminate_reserved_listener(
         pid=current.pid,
         created_at=current.created_at,
         executable=current.executable,
+        final_authority=lambda: (
+            _validated_reserved_listener(reservation, listener_pid) is not None
+        ),
     )
 
 
@@ -676,107 +696,212 @@ def _kill_process_tree(
         or _normalized_path(expected.profile_dir) != _normalized_path(reservation.profile_dir)
     ):
         return False
-    current = _process_identity(process.pid)
-    if not (
-        _browser_identity_matches(expected, current)
-        and _browser_parent_identity_matches(expected, current)
-    ):
+    if not _owned_browser_authority_is_current(process, expected, reservation):
         return False
     return terminate_verified_process(
         pid=expected.pid,
         created_at=expected.created_at,
         executable=expected.executable,
+        final_authority=lambda: _owned_browser_authority_is_current(
+            process, expected, reservation
+        ),
     )
 
 
-def _assign_kill_on_close_job(worker_id: int, process: subprocess.Popen) -> None:
-    """Windows: put the launched browser in a Job Object that auto-kills the whole tree
-    when this process dies for ANY reason -- crash, OOM, or an external taskkill of the
-    parent -- not just the graceful cleanup_worker path. Without this, a parent killed from
-    outside leaves an orphaned Chrome tree that lingers and locks the worker profile (the
-    exact failure that stranded worker-80). No-op on non-Windows (launch_chrome already
-    starts those in their own process group for group-kill).
+def _owned_browser_authority_is_current(
+    process: subprocess.Popen,
+    expected: BrowserProcessIdentity,
+    reservation: _BrowserReservation,
+) -> bool:
+    with _chrome_lock:
+        registered = _chrome_procs.get(reservation.worker_id)
+        registered_reservation = _browser_reservations.get(id(process))
+    if (
+        reservation._released
+        or process.pid != expected.pid
+        or reservation.browser_identity != expected
+        or registered is not process
+        or registered_reservation is not reservation
+        or expected.port != reservation.port
+        or _normalized_path(expected.profile_dir) != _normalized_path(reservation.profile_dir)
+    ):
+        return False
+    current = _process_identity(process.pid)
+    return bool(
+        _browser_identity_matches(expected, current)
+        and _browser_parent_identity_matches(expected, current)
+    )
 
-    Best-effort: any failure is swallowed so a browser launch never breaks over it.
-    """
-    if platform.system() != "Windows":
-        return
-    pid = process.pid
+
+def _popen_process_handle(process: subprocess.Popen) -> int:
     try:
-        import ctypes
-        from ctypes import wintypes
+        return int(process._handle)
+    except (AttributeError, TypeError, ValueError):
+        return 0
 
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-        JobObjectExtendedLimitInformation = 9
-        PROCESS_TERMINATE = 0x0001
-        PROCESS_SET_QUOTA = 0x0100
 
-        # restype/argtypes MUST be set: HANDLE is 64-bit on x64 and ctypes defaults to a
-        # 32-bit int return, which truncates the handle and silently breaks everything.
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateJobObjectW.restype = wintypes.HANDLE
-        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
-        k32.SetInformationJobObject.restype = wintypes.BOOL
-        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
-                                                wintypes.LPVOID, wintypes.DWORD]
-        k32.OpenProcess.restype = wintypes.HANDLE
-        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        k32.AssignProcessToJobObject.restype = wintypes.BOOL
-        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        k32.CloseHandle.restype = wintypes.BOOL
-        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+def _windows_handle_identity(handle: int) -> tuple[int, float, str] | None:
+    import ctypes
+    from ctypes import wintypes
 
-        class _BASIC(ctypes.Structure):
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
-                        ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", wintypes.DWORD),
-                        ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t),
-                        ("ActiveProcessLimit", wintypes.DWORD),
-                        ("Affinity", ctypes.c_void_p),
-                        ("PriorityClass", wintypes.DWORD),
-                        ("SchedulingClass", wintypes.DWORD)]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessId.restype = wintypes.DWORD
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    pid = int(kernel32.GetProcessId(handle) or 0)
+    creation = wintypes.FILETIME()
+    exit_time = wintypes.FILETIME()
+    kernel_time = wintypes.FILETIME()
+    user_time = wintypes.FILETIME()
+    if not pid or not kernel32.GetProcessTimes(
+        handle,
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel_time),
+        ctypes.byref(user_time),
+    ):
+        return None
+    image_buffer = ctypes.create_unicode_buffer(32768)
+    image_length = wintypes.DWORD(len(image_buffer))
+    if not kernel32.QueryFullProcessImageNameW(
+        handle, 0, image_buffer, ctypes.byref(image_length)
+    ):
+        return None
+    creation_ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    created_at = (creation_ticks - 116_444_736_000_000_000) / 10_000_000
+    return pid, created_at, image_buffer.value
 
-        class _IO(ctypes.Structure):
-            _fields_ = [("ReadOperationCount", ctypes.c_uint64),
-                        ("WriteOperationCount", ctypes.c_uint64),
-                        ("OtherOperationCount", ctypes.c_uint64),
-                        ("ReadTransferCount", ctypes.c_uint64),
-                        ("WriteTransferCount", ctypes.c_uint64),
-                        ("OtherTransferCount", ctypes.c_uint64)]
 
-        class _EXTENDED(ctypes.Structure):
-            _fields_ = [("BasicLimitInformation", _BASIC),
-                        ("IoInfo", _IO),
-                        ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t),
-                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+def _assign_exact_handle_to_kill_job(
+    process_handle: int,
+    final_authority: Callable[[], bool],
+) -> int | None:
+    import ctypes
+    from ctypes import wintypes
 
-        job = k32.CreateJobObjectW(None, None)
+    job_object_limit_kill_on_close = 0x00002000
+    job_object_extended_limit_information = 9
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    class _BASIC(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_void_p),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _EXTENDED(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC),
+            ("IoInfo", _IO),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _EXTENDED()
+    info.BasicLimitInformation.LimitFlags = job_object_limit_kill_on_close
+    if not kernel32.SetInformationJobObject(
+        job,
+        job_object_extended_limit_information,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        kernel32.CloseHandle(job)
+        return None
+    try:
+        if final_authority() is not True:
+            kernel32.CloseHandle(job)
+            return None
+    except Exception:
+        kernel32.CloseHandle(job)
+        return None
+    if not kernel32.AssignProcessToJobObject(job, process_handle):
+        kernel32.CloseHandle(job)
+        return None
+    return int(job)
+
+
+def _assign_kill_on_close_job(
+    worker_id: int,
+    process: subprocess.Popen,
+    expected: BrowserProcessIdentity | None,
+    reservation: _BrowserReservation | None,
+) -> bool:
+    """Assign the exact Popen handle to a kill-on-close job after full validation."""
+    if platform.system() != "Windows":
+        return True
+    if expected is None or reservation is None:
+        return False
+    try:
+        process_handle = _popen_process_handle(process)
+        handle_identity = _windows_handle_identity(process_handle) if process_handle else None
+        if (
+            handle_identity is None
+            or handle_identity[0] != expected.pid
+            or abs(handle_identity[1] - expected.created_at) >= 0.001
+            or _normalized_path(handle_identity[2]) != _normalized_path(expected.executable)
+            or not _owned_browser_authority_is_current(process, expected, reservation)
+        ):
+            return False
+        job = _assign_exact_handle_to_kill_job(
+            process_handle,
+            lambda: _owned_browser_authority_is_current(process, expected, reservation),
+        )
         if not job:
-            return
-        info = _EXTENDED()
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
-                                           ctypes.byref(info), ctypes.sizeof(info)):
-            k32.CloseHandle(job)
-            return
-        h_proc = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
-        if not h_proc:
-            k32.CloseHandle(job)
-            return
-        assigned = k32.AssignProcessToJobObject(job, h_proc)
-        k32.CloseHandle(h_proc)
-        if not assigned:
-            k32.CloseHandle(job)
-            return
-        # Hold the job handle open for this process's lifetime. Renderers Chrome spawns
-        # AFTER assignment inherit the job; the main process (port + profile-lock holder)
-        # is covered, which is what prevents the lingering-lock orphan.
-        _job_handles[id(process)] = _OwnedJobHandle(worker_id, pid, job)
+            return False
+        _job_handles[id(process)] = _OwnedJobHandle(worker_id, expected.pid, job)
+        return True
     except Exception:
         logger.debug("[worker-%d] job-object assignment failed", worker_id, exc_info=True)
+        return False
 
 
 def _close_windows_job_handle(handle: int) -> bool:
@@ -973,37 +1098,6 @@ def _has_linkedin_session_cdp(port: int) -> bool:
     return False
 
 
-def _close_browser_cdp(
-    process: subprocess.Popen,
-    expected: BrowserProcessIdentity | None,
-    reservation: _BrowserReservation,
-) -> bool:
-    """Close only the CDP browser bound to the captured reservation authority."""
-    if (
-        expected is None
-        or process.pid != expected.pid
-        or reservation.browser_identity != expected
-        or _validated_reserved_listener(reservation, expected.pid) is None
-    ):
-        return False
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        return False
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{expected.port}", timeout=5000
-            )
-            if _validated_reserved_listener(reservation, expected.pid) is None:
-                return False
-            browser.close()
-            return True
-    except Exception:
-        logger.debug("CDP browser close failed on owned slot", exc_info=True)
-        return False
-
-
 def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                    poll_seconds: float = 4.0):
     """Open a VISIBLE Chrome on the dedicated LinkedIn seed profile so the user logs in
@@ -1050,7 +1144,14 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     with _chrome_lock:
         _chrome_procs[LINKEDIN_LOGIN_SLOT] = proc
         _browser_reservations[id(proc)] = reservation
-    _assign_kill_on_close_job(LINKEDIN_LOGIN_SLOT, proc)
+    if not _assign_kill_on_close_job(
+        LINKEDIN_LOGIN_SLOT,
+        proc,
+        reservation.browser_identity,
+        reservation,
+    ):
+        cleanup_worker(LINKEDIN_LOGIN_SLOT, proc)
+        raise RuntimeError("browser job assignment could not be verified")
     deadline = time.monotonic() + timeout_seconds
     ok = False
 
@@ -1074,25 +1175,12 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
                 # clone the disk profile, so require the persisted cookie before success.
                 flush_deadline = min(deadline, time.monotonic() + 20.0)
                 ok = _wait_for_persisted_session(flush_deadline)
-                if not ok:
-                    _close_browser_cdp(proc, reservation.browser_identity, reservation)
-                    try:
-                        proc.wait(timeout=15)
-                    except (AttributeError, subprocess.TimeoutExpired, OSError):
-                        pass
-                    ok = _wait_for_persisted_session(min(deadline, time.monotonic() + 5.0))
                 break
             time.sleep(poll_seconds)
         else:
             ok = has_linkedin_session(seed)
     finally:
-        # Close the seed Chrome so the profile is unlocked for workers to clone.
-        if proc.poll() is None:
-            _close_browser_cdp(proc, reservation.browser_identity, reservation)
-            try:
-                proc.wait(timeout=15)
-            except (AttributeError, subprocess.TimeoutExpired, OSError):
-                pass
+        # Cleanup uses only the verified stable process handle; CDP stays read-only.
         cleanup_worker(LINKEDIN_LOGIN_SLOT, proc)
     return ok, seed
 
@@ -1220,7 +1308,11 @@ def launch_chrome(worker_id: int, port: int | None = None,
         _browser_reservations[id(proc)] = reservation
     # Assign IMMEDIATELY (before Chrome forks much) so the tree dies with us even on a
     # hard external kill -- no lingering orphan to lock the profile.
-    _assign_kill_on_close_job(worker_id, proc)
+    if not _assign_kill_on_close_job(
+        worker_id, proc, reservation.browser_identity, reservation
+    ):
+        cleanup_worker(worker_id, proc)
+        raise RuntimeError("browser job assignment could not be verified")
 
     # Poll the CDP endpoint instead of a blind sleep(3): return as soon as Chrome's
     # debug port actually accepts connections (usually <1s when warm), and cap the

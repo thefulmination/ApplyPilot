@@ -156,6 +156,7 @@ class _FakeProcess:
     def __init__(self, pid: int = 12345) -> None:
         self.pid = pid
         self.alive = True
+        self._handle = 9001
 
     def poll(self):
         return None if self.alive else 0
@@ -459,12 +460,12 @@ def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monke
     monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
     monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
     monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
-    monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda worker_id, pid: None)
+    monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *args: True)
     monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile: True)
     monkeypatch.setattr(
         chrome,
-        "_close_browser_cdp",
+        "_kill_process_tree",
         lambda process, expected, reservation: setattr(process, "alive", False) or True,
     )
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
@@ -639,6 +640,9 @@ def test_stable_listener_identity_is_terminated_once_at_boundary(
     monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
 
     def terminate(**process_identity):
+        authority = process_identity.pop("final_authority")
+        if authority() is not True:
+            return False
         terminated.append(process_identity)
         listening.clear()
         return True
@@ -710,17 +714,30 @@ def test_owned_browser_identity_change_before_tree_kill_is_refused(
     changed = _browser_identity(chrome, created=30.0, profile=str(profile))
     reservation = chrome._acquire_browser_reservation(0, 9400, profile)
     reservation.record_browser_identity(expected)
+    chrome._chrome_procs[0] = process
+    chrome._browser_reservations[id(process)] = reservation
     terminated = []
-    monkeypatch.setattr(chrome, "_process_identity", lambda pid: changed)
+    identities = iter((expected, changed))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: next(identities))
+
+    def terminate(**identity):
+        authority = identity.pop("final_authority")
+        if authority() is not True:
+            return False
+        terminated.append(identity)
+        return True
+
     monkeypatch.setattr(
         chrome,
         "terminate_verified_process",
-        lambda **identity: terminated.append(identity) or True,
+        terminate,
     )
     try:
         assert chrome._kill_process_tree(process, expected, reservation) is False
         assert terminated == []
     finally:
+        chrome._chrome_procs.pop(0, None)
+        chrome._browser_reservations.pop(id(process), None)
         reservation.release()
 
 
@@ -733,12 +750,22 @@ def test_owned_browser_stable_identity_tree_kills_once(tmp_path: Path, monkeypat
     expected = _browser_identity(chrome, profile=str(profile))
     reservation = chrome._acquire_browser_reservation(0, 9400, profile)
     reservation.record_browser_identity(expected)
+    chrome._chrome_procs[0] = process
+    chrome._browser_reservations[id(process)] = reservation
     terminated = []
     monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
+
+    def terminate(**identity):
+        authority = identity.pop("final_authority")
+        if authority() is not True:
+            return False
+        terminated.append(identity)
+        return True
+
     monkeypatch.setattr(
         chrome,
         "terminate_verified_process",
-        lambda **identity: terminated.append(identity) or True,
+        terminate,
     )
     try:
         assert chrome._kill_process_tree(process, expected, reservation) is True
@@ -750,6 +777,8 @@ def test_owned_browser_stable_identity_tree_kills_once(tmp_path: Path, monkeypat
             }
         ]
     finally:
+        chrome._chrome_procs.pop(0, None)
+        chrome._browser_reservations.pop(id(process), None)
         reservation.release()
 
 
@@ -804,7 +833,12 @@ def test_unix_verified_termination_refuses_pidfd_acquisition_failure(monkeypatch
         lambda pid: (_ for _ in ()).throw(AssertionError("must not verify without pidfd")),
     )
 
-    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is False
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="chrome",
+        final_authority=lambda: True,
+    ) is False
 
 
 def test_unix_verified_termination_refuses_identity_transition_and_closes_fd(monkeypatch) -> None:
@@ -827,7 +861,12 @@ def test_unix_verified_termination_refuses_identity_transition_and_closes_fd(mon
         raising=False,
     )
 
-    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is False
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="chrome",
+        final_authority=lambda: True,
+    ) is False
     assert signaled == []
     assert closed == [41]
 
@@ -849,7 +888,12 @@ def test_unix_verified_termination_signals_stable_pidfd_and_closes_fd(monkeypatc
         raising=False,
     )
 
-    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is True
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="chrome",
+        final_authority=lambda: True,
+    ) is True
     assert signaled == [(42, getattr(signal, "SIGKILL", 9))]
     assert closed == [42]
 
@@ -870,16 +914,183 @@ def test_unix_verified_termination_signal_failure_still_closes_fd(monkeypatch) -
         raising=False,
     )
 
-    assert chrome.terminate_verified_process(pid=500, created_at=10.0, executable="chrome") is False
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="chrome",
+        final_authority=lambda: True,
+    ) is False
     assert closed == [43]
+
+
+def test_final_authority_transition_after_pidfd_acquisition_refuses_signal(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    identity = _browser_identity(chrome, executable="chrome")
+    closed = []
+    signaled = []
+    authority_checks = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(chrome.os, "pidfd_open", lambda pid, flags=0: 44, raising=False)
+    monkeypatch.setattr(chrome.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+    monkeypatch.setattr(
+        chrome.signal,
+        "pidfd_send_signal",
+        lambda fd, sig: signaled.append((fd, sig)),
+        raising=False,
+    )
+
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="chrome",
+        final_authority=lambda: authority_checks.append("checked") or False,
+    ) is False
+    assert authority_checks == ["checked"]
+    assert signaled == []
+    assert closed == [44]
+
+
+def test_final_authority_error_after_pidfd_acquisition_fails_closed(monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    identity = _browser_identity(chrome, executable="chrome")
+    closed = []
+    signaled = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(chrome.os, "pidfd_open", lambda pid, flags=0: 45, raising=False)
+    monkeypatch.setattr(chrome.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+    monkeypatch.setattr(
+        chrome.signal,
+        "pidfd_send_signal",
+        lambda fd, sig: signaled.append((fd, sig)),
+        raising=False,
+    )
+
+    assert chrome.terminate_verified_process(
+        pid=500,
+        created_at=10.0,
+        executable="chrome",
+        final_authority=lambda: (_ for _ in ()).throw(RuntimeError("uncertain")),
+    ) is False
+    assert signaled == []
+    assert closed == [45]
+
+
+def _registered_job_assignment(tmp_path: Path, chrome):
+    profile = tmp_path / "worker-0"
+    process = _FakeProcess(500)
+    expected = _browser_identity(chrome, profile=str(profile))
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    reservation.record_browser_identity(expected)
+    chrome._chrome_procs[0] = process
+    chrome._browser_reservations[id(process)] = reservation
+    return process, expected, reservation
+
+
+def test_job_assignment_refuses_reused_pid_handle_identity(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    process, expected, reservation = _registered_job_assignment(tmp_path, chrome)
+    assigned = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(chrome, "_popen_process_handle", lambda proc: proc._handle)
+    monkeypatch.setattr(
+        chrome,
+        "_windows_handle_identity",
+        lambda handle: (700, expected.created_at, expected.executable),
+    )
+    monkeypatch.setattr(
+        chrome,
+        "_assign_exact_handle_to_kill_job",
+        lambda handle, authority: assigned.append(handle),
+    )
+    try:
+        assert chrome._assign_kill_on_close_job(0, process, expected, reservation) is False
+        assert assigned == []
+    finally:
+        chrome._chrome_procs.pop(0, None)
+        chrome._browser_reservations.pop(id(process), None)
+        reservation.release()
+
+
+def test_job_assignment_refuses_context_transition_before_assignment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    process, expected, reservation = _registered_job_assignment(tmp_path, chrome)
+    changed = _browser_identity(chrome, profile=str(reservation.profile_dir), parent_created=30.0)
+    assigned = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(chrome, "_popen_process_handle", lambda proc: proc._handle)
+    monkeypatch.setattr(
+        chrome,
+        "_windows_handle_identity",
+        lambda handle: (expected.pid, expected.created_at, expected.executable),
+    )
+    identities = iter((expected, changed))
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: next(identities))
+    monkeypatch.setattr(
+        chrome,
+        "_assign_exact_handle_to_kill_job",
+        lambda handle, authority: (assigned.append(handle) or 77) if authority() else None,
+    )
+    try:
+        assert chrome._assign_kill_on_close_job(0, process, expected, reservation) is False
+        assert assigned == []
+    finally:
+        chrome._chrome_procs.pop(0, None)
+        chrome._browser_reservations.pop(id(process), None)
+        reservation.release()
+
+
+def test_job_assignment_uses_stable_popen_handle_once(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    process, expected, reservation = _registered_job_assignment(tmp_path, chrome)
+    assigned = []
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(chrome, "_popen_process_handle", lambda proc: proc._handle)
+    monkeypatch.setattr(
+        chrome,
+        "_windows_handle_identity",
+        lambda handle: (expected.pid, expected.created_at, expected.executable),
+    )
+    monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
+    monkeypatch.setattr(
+        chrome,
+        "_assign_exact_handle_to_kill_job",
+        lambda handle, authority: (assigned.append(handle) or 77) if authority() else None,
+    )
+    try:
+        assert chrome._assign_kill_on_close_job(0, process, expected, reservation) is True
+        assert assigned == [9001]
+        assert chrome._job_handles[id(process)].handle == 77
+    finally:
+        chrome._job_handles.pop(id(process), None)
+        chrome._chrome_procs.pop(0, None)
+        chrome._browser_reservations.pop(id(process), None)
+        reservation.release()
 
 
 class _CdpBrowser:
     def __init__(self) -> None:
         self.close_calls = 0
 
+        def cookies():
+            return [{"name": "li_at", "domain": ".linkedin.com"}]
+
+        self.contexts = [types.SimpleNamespace(cookies=cookies)]
+
     def close(self) -> None:
         self.close_calls += 1
+        raise AssertionError("connected CDP browser must never be closed")
 
 
 def _install_fake_playwright(monkeypatch, browser: _CdpBrowser) -> None:
@@ -898,45 +1109,14 @@ def _install_fake_playwright(monkeypatch, browser: _CdpBrowser) -> None:
     )
 
 
-def test_cdp_close_refuses_replacement_listener_transition(tmp_path: Path, monkeypatch) -> None:
+def test_cdp_cookie_probe_never_closes_connected_browser(monkeypatch) -> None:
     from applypilot.apply import chrome
 
-    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
-    profile = tmp_path / "worker-0"
-    process = _FakeProcess(500)
-    expected = _browser_identity(chrome, profile=str(profile))
-    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
-    reservation.record_browser_identity(expected)
-    listeners = iter(([500], [700]))
     browser = _CdpBrowser()
-    monkeypatch.setattr(chrome, "_listener_pids", lambda port: next(listeners))
-    monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
     _install_fake_playwright(monkeypatch, browser)
-    try:
-        assert chrome._close_browser_cdp(process, expected, reservation) is False
-        assert browser.close_calls == 0
-    finally:
-        reservation.release()
 
-
-def test_cdp_close_stable_owned_listener_closes_once(tmp_path: Path, monkeypatch) -> None:
-    from applypilot.apply import chrome
-
-    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
-    profile = tmp_path / "worker-0"
-    process = _FakeProcess(500)
-    expected = _browser_identity(chrome, profile=str(profile))
-    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
-    reservation.record_browser_identity(expected)
-    browser = _CdpBrowser()
-    monkeypatch.setattr(chrome, "_listener_pids", lambda port: [500])
-    monkeypatch.setattr(chrome, "_process_identity", lambda pid: expected)
-    _install_fake_playwright(monkeypatch, browser)
-    try:
-        assert chrome._close_browser_cdp(process, expected, reservation) is True
-        assert browser.close_calls == 1
-    finally:
-        reservation.release()
+    assert chrome._has_linkedin_session_cdp(9400) is True
+    assert browser.close_calls == 0
 
 
 @pytest.mark.parametrize(

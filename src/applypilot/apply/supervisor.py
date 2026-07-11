@@ -259,6 +259,20 @@ def _validate_and_kill_auxiliary(
     approved: AuxiliaryProcessIdentity,
     owner: SupervisedProcessIdentity,
 ) -> bool:
+    if not _auxiliary_authority_is_current(approved, owner):
+        return False
+    return terminate_verified_process(
+        pid=approved.pid,
+        created_at=approved.created_at,
+        executable=approved.executable,
+        final_authority=lambda: _auxiliary_authority_is_current(approved, owner),
+    )
+
+
+def _auxiliary_authority_is_current(
+    approved: AuxiliaryProcessIdentity,
+    owner: SupervisedProcessIdentity,
+) -> bool:
     if not _owner_identity_is_valid(owner):
         return False
     live_rows = {int(row.get("pid") or 0): row for row in _process_snapshot()}
@@ -285,13 +299,7 @@ def _validate_and_kill_auxiliary(
         )
     except (KeyError, TypeError, ValueError):
         return False
-    if not identity_matches:
-        return False
-    return terminate_verified_process(
-        pid=approved.pid,
-        created_at=approved.created_at,
-        executable=approved.executable,
-    )
+    return bool(identity_matches)
 
 
 def _capture_supervised_identity(
@@ -568,6 +576,27 @@ def _terminate_process(
     if expected is None or proc.pid != expected.pid or proc.poll() is not None:
         return False
     try:
+        if not _supervised_authority_is_current(expected):
+            return False
+        if not terminate_verified_process(
+            pid=expected.pid,
+            created_at=expected.created_at,
+            executable=expected.executable,
+            final_authority=lambda: (
+                proc.pid == expected.pid
+                and proc.poll() is None
+                and _supervised_authority_is_current(expected)
+            ),
+        ):
+            return False
+        proc.wait(timeout=20)
+        return True
+    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def _supervised_authority_is_current(expected: SupervisedProcessIdentity) -> bool:
+    try:
         now = time.time()
         if (
             expected.launched_at <= 0
@@ -585,7 +614,7 @@ def _terminate_process(
         parent = rows.get(expected.parent_pid)
         if child is None or parent is None:
             return False
-        matches = (
+        return bool(
             int(child.get("ppid") or 0) == expected.parent_pid
             and abs(float(child["created"]) - expected.created_at) < 0.001
             and os.path.normcase(str(child.get("executable") or ""))
@@ -597,13 +626,5 @@ def _terminate_process(
             and str(parent.get("command") or "") == expected.parent_command
             and expected.launched_at <= float(child["created"]) <= now
         )
-        if not matches or not terminate_verified_process(
-            pid=expected.pid,
-            created_at=expected.created_at,
-            executable=expected.executable,
-        ):
-            return False
-        proc.wait(timeout=20)
-        return True
-    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+    except (KeyError, TypeError, ValueError, OSError):
         return False

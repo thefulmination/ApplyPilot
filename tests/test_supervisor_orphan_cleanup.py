@@ -213,7 +213,18 @@ def _cleanup_snapshots(
         live = [approved[0], {**approved[1], "created": 30.0, "command": "node unrelated.js"}]
     else:
         live = approved
-    return iter((approved, live))
+    return iter((approved, approved, live))
+
+
+def _verified_termination_recorder(terminated):
+    def terminate(**identity):
+        authority = identity.pop("final_authority")
+        if authority() is not True:
+            return False
+        terminated.append(identity)
+        return True
+
+    return terminate
 
 
 def test_auxiliary_identity_change_between_approval_and_kill_is_not_terminated(monkeypatch):
@@ -225,7 +236,7 @@ def test_auxiliary_identity_change_between_approval_and_kill_is_not_terminated(m
     monkeypatch.setattr(
         supervisor,
         "terminate_verified_process",
-        lambda **identity: terminated.append(identity) or True,
+        _verified_termination_recorder(terminated),
     )
 
     assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
@@ -242,7 +253,7 @@ def test_auxiliary_parent_identity_change_before_kill_is_not_terminated(monkeypa
     monkeypatch.setattr(
         supervisor,
         "terminate_verified_process",
-        lambda **identity: terminated.append(identity) or True,
+        _verified_termination_recorder(terminated),
     )
 
     assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
@@ -259,7 +270,7 @@ def test_stable_auxiliary_identity_is_terminated_once(monkeypatch):
     monkeypatch.setattr(
         supervisor,
         "terminate_verified_process",
-        lambda **identity: terminated.append(identity) or True,
+        _verified_termination_recorder(terminated),
     )
 
     assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is True
@@ -277,7 +288,7 @@ def test_auxiliary_disappearance_before_kill_is_safe_and_releases(monkeypatch):
     monkeypatch.setattr(
         supervisor,
         "terminate_verified_process",
-        lambda **_identity: (_ for _ in ()).throw(AssertionError("must not terminate")),
+        _verified_termination_recorder([]),
     )
 
     assert supervisor._cleanup_orphans(lambda _message: None, owner=_owner()) is False
@@ -377,7 +388,7 @@ def test_supervisor_stable_child_identity_terminates_once(monkeypatch):
     monkeypatch.setattr(
         supervisor,
         "terminate_verified_process",
-        lambda **identity: terminated.append(identity) or True,
+        _verified_termination_recorder(terminated),
     )
     monkeypatch.setattr(supervisor.time, "time", lambda: 20.0)
 
@@ -386,3 +397,21 @@ def test_supervisor_stable_child_identity_terminates_once(monkeypatch):
         {"pid": 501, "created_at": 12.0, "executable": "C:/Python/python.exe"}
     ]
     assert process.wait_calls == 1
+
+
+def test_supervisor_claim_transition_at_final_handle_boundary_is_refused(monkeypatch):
+    process = _SupervisedProcess()
+    terminated = []
+    snapshots = iter((_supervised_live_rows(), _supervised_live_rows(parent_created=30.0)))
+    monkeypatch.setattr(supervisor.os, "getpid", lambda: 50)
+    monkeypatch.setattr(supervisor, "_process_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        supervisor,
+        "terminate_verified_process",
+        _verified_termination_recorder(terminated),
+    )
+    monkeypatch.setattr(supervisor.time, "time", lambda: 20.0)
+
+    assert supervisor._terminate_process(process, _supervised_child_identity()) is False
+    assert terminated == []
+    assert process.wait_calls == 0
