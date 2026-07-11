@@ -857,32 +857,31 @@ def set_auth_challenge_status(
     status: str,
     last_error: str | None = None,
 ) -> bool:
-    """Update a challenge status and timestamps; return True when a row changes."""
+    """Move an active, unexpired challenge into the operational watching state.
+
+    Resolution is intentionally unavailable here; only the transactional global
+    snapshot claim path may complete a challenge.
+    """
+    if status != "watching":
+        return False
+
     now = now_utc()
     conn = get_connection()
-    if status == "resolved":
-        cursor = conn.execute(
-            """
-            UPDATE auth_challenges
-               SET status = ?,
-                   resolved_at = ?,
-                   last_error = ?,
-                   updated_at = ?
-             WHERE id = ?
-            """,
-            (status, now, last_error, now, challenge_id),
-        )
-    else:
-        cursor = conn.execute(
-            """
-            UPDATE auth_challenges
-               SET status = ?,
-                   last_error = ?,
-                   updated_at = ?
-             WHERE id = ?
-            """,
-            (status, last_error, now, challenge_id),
-        )
+    cursor = conn.execute(
+        """
+        UPDATE auth_challenges
+           SET status = 'watching',
+               last_error = ?,
+               updated_at = ?
+         WHERE id = ?
+           AND status IN ('pending', 'watching')
+           AND resolved_at IS NULL
+           AND inbox_event_id IS NULL
+           AND julianday(requested_at) <= julianday(?)
+           AND julianday(expires_at) > julianday(?)
+        """,
+        (last_error, now, challenge_id, now, now),
+    )
     conn.commit()
     return int(cursor.rowcount or 0) == 1
 

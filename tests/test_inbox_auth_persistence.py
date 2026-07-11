@@ -300,6 +300,95 @@ def test_expire_stale_challenges(tmp_path, monkeypatch) -> None:
     assert status == "expired"
 
 
+def test_status_writer_rejects_resolved_without_writing(tmp_path, monkeypatch) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="status-resolved")
+    changes_before = conn.total_changes
+
+    assert not inbox_auth.set_auth_challenge_status(challenge_id, "resolved")
+    assert conn.total_changes == changes_before
+    row = conn.execute(
+        "SELECT status, resolved_at, inbox_event_id FROM auth_challenges WHERE id=?",
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == ("pending", None, None)
+
+
+def test_status_writer_allows_watching_for_active_unexpired_challenge(
+    tmp_path, monkeypatch
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url="status-watching")
+
+    assert inbox_auth.set_auth_challenge_status(
+        challenge_id, "watching", last_error="polling"
+    )
+    row = conn.execute(
+        "SELECT status, resolved_at, inbox_event_id, last_error "
+        "FROM auth_challenges WHERE id=?",
+        (challenge_id,),
+    ).fetchone()
+    assert tuple(row) == ("watching", None, None, "polling")
+
+
+@pytest.mark.parametrize(
+    ("current_status", "requested_delta", "expires_delta"),
+    [
+        ("expired", -60, -1),
+        ("pending", -60, -1),
+        ("pending", 60, 120),
+    ],
+    ids=("expired-state", "expired-window", "future-request"),
+)
+def test_status_writer_cannot_revive_inactive_challenge(
+    tmp_path,
+    monkeypatch,
+    current_status,
+    requested_delta,
+    expires_delta,
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
+    challenge_id = _seed_job_and_challenge(conn, job_url=f"status-{current_status}")
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "UPDATE auth_challenges SET status=?, requested_at=?, expires_at=? WHERE id=?",
+        (
+            current_status,
+            (now + timedelta(seconds=requested_delta)).isoformat(),
+            (now + timedelta(seconds=expires_delta)).isoformat(),
+            challenge_id,
+        ),
+    )
+    conn.commit()
+    changes_before = conn.total_changes
+
+    assert not inbox_auth.set_auth_challenge_status(challenge_id, "watching")
+    assert conn.total_changes == changes_before
+    assert conn.execute(
+        "SELECT status FROM auth_challenges WHERE id=?", (challenge_id,)
+    ).fetchone()[0] == current_status
+
+
+@pytest.mark.parametrize("status", ["", "pending", "failed", "expired", "complete"])
+def test_status_writer_rejects_non_operational_statuses(
+    tmp_path, monkeypatch, status
+) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    challenge_id = _seed_job_and_challenge(conn, job_url=f"status-invalid-{status}")
+    changes_before = conn.total_changes
+    monkeypatch.setattr(
+        inbox_auth,
+        "get_connection",
+        lambda: (_ for _ in ()).throw(AssertionError("invalid status reached database")),
+    )
+
+    assert not inbox_auth.set_auth_challenge_status(challenge_id, status)
+    assert conn.total_changes == changes_before
+
+
 @pytest.mark.parametrize(
     "event_kwargs",
     [
