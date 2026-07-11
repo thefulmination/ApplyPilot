@@ -225,6 +225,161 @@ def test_gmail_api_aggregate_cap_stops_further_full_fetches():
     ]
 
 
+def test_gmail_api_understated_oversize_sequence_charges_aggregate_budget():
+    refs = [{"id": str(index)} for index in range(8)]
+    full = {
+        str(index): {
+            "id": str(index),
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "A" * 200},
+            },
+        }
+        for index in range(8)
+    }
+    service = _FakeGmailService(
+        {"messages": refs},
+        full,
+        metadata_result={
+            str(index): {"id": str(index), "sizeEstimate": 10}
+            for index in range(8)
+        },
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=100,
+        max_scan_bytes=200,
+    ).fetch(since_days=7, max_messages=8)
+
+    assert result == []
+    assert service.messages_obj.get_calls == [("me", "0", "full")]
+
+
+def test_gmail_api_oversize_discard_retains_exact_aggregate_charge():
+    refs = [{"id": str(index)} for index in range(3)]
+    full = {
+        "0": {
+            "id": "0",
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "A" * 20},
+            },
+        },
+        "1": {
+            "id": "1",
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "AAAA"},
+            },
+        },
+        "2": {
+            "id": "2",
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "AAAA"},
+            },
+        },
+    }
+    service = _FakeGmailService(
+        {"messages": refs},
+        full,
+        metadata_result={
+            str(index): {"id": str(index), "sizeEstimate": 10}
+            for index in range(3)
+        },
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=20,
+        max_scan_bytes=44,
+    ).fetch(since_days=7, max_messages=3)
+
+    assert [message.id for message in result] == ["1"]
+    assert service.messages_obj.get_calls == [
+        ("me", "0", "full"),
+        ("me", "1", "full"),
+    ]
+
+
+def test_gmail_api_malformed_full_payload_consumes_remaining_scan_budget():
+    service = _FakeGmailService(
+        {"messages": [{"id": "bad"}, {"id": "normal"}]},
+        {
+            "bad": {
+                "id": "bad",
+                "payload": {
+                    "headers": [],
+                    "mimeType": "multipart/mixed",
+                    "body": {},
+                    "parts": "not-a-list",
+                },
+            },
+            "normal": {
+                "id": "normal",
+                "payload": {
+                    "headers": [],
+                    "mimeType": "text/plain",
+                    "body": {"data": "AAAA"},
+                },
+            },
+        },
+        metadata_result={
+            "bad": {"id": "bad", "sizeEstimate": 10},
+            "normal": {"id": "normal", "sizeEstimate": 10},
+        },
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=100,
+        max_scan_bytes=200,
+    ).fetch(since_days=7, max_messages=2)
+
+    assert result == []
+    assert service.messages_obj.get_calls == [("me", "bad", "full")]
+
+
+def test_gmail_api_normal_sequence_uses_exact_actual_aggregate_bytes():
+    refs = [{"id": str(index)} for index in range(3)]
+    full = {
+        str(index): {
+            "id": str(index),
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "AAAA"},
+            },
+        }
+        for index in range(3)
+    }
+    service = _FakeGmailService(
+        {"messages": refs},
+        full,
+        metadata_result={
+            str(index): {"id": str(index), "sizeEstimate": 10}
+            for index in range(3)
+        },
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=14,
+        max_scan_bytes=28,
+    ).fetch(since_days=7, max_messages=3)
+
+    assert [message.id for message in result] == ["0", "1"]
+    assert service.messages_obj.get_calls == [
+        ("me", "0", "full"),
+        ("me", "1", "full"),
+    ]
+
+
 def test_gmail_api_rejects_understated_oversize_full_payload():
     full = {
         "id": "1",

@@ -507,14 +507,18 @@ class GmailApiMailSource:
                 .get(userId="me", id=ref["id"], format="full")
                 .execute()
             )
+            remaining_scan_bytes = self._max_scan_bytes - scanned_bytes
             actual_size = _gmail_actual_payload_bytes(
-                msg, limit=self._max_message_bytes
+                msg, limit=remaining_scan_bytes
             )
-            if actual_size is None or actual_size > self._max_message_bytes:
-                continue
-            if scanned_bytes + actual_size > self._max_scan_bytes:
+            if actual_size is None:
+                scanned_bytes = self._max_scan_bytes
                 break
             scanned_bytes += actual_size
+            if actual_size > remaining_scan_bytes:
+                break
+            if actual_size > self._max_message_bytes:
+                continue
             payload = msg.get("payload", {})
             headers = _gmail_headers(payload)
             messages.append(
