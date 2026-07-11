@@ -620,14 +620,14 @@ def _seed_linkedin_job(conn, url="li0", dk="lidk0"):
             (policy,),
         )
         cur.execute(
-            "UPDATE fleet_config SET linkedin_policy_version=%s WHERE id=1",
+            "UPDATE fleet_config SET linkedin_policy_version=%s,linkedin_apply_mode='steady' WHERE id=1",
             (policy,),
         )
         cur.execute(
             "INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key, "
-            "decision_id,policy_version,decision_action,qualification_verdict,qualification_score,qualification_floor,"
+            "linkedin_resolve_status,linkedin_resolved_at,decision_id,policy_version,decision_action,qualification_verdict,qualification_score,qualification_floor,"
             "preference_score,outcome_score,final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash) "
-            "VALUES (%s,%s,9.0,'queued','linkedin','b1',%s,%s,%s,'apply','qualified',9,0,8,8,9,.9,%s,%s,%s)",
+            "VALUES (%s,%s,9.0,'queued','linkedin','b1',%s,'easy_apply',now(),%s,%s,'apply','qualified',9,0,8,8,9,.9,%s,%s,%s)",
             (url, f"https://linkedin.com/jobs/{url}", dk, f"decision-{url}", policy,
              now, now + timedelta(days=1), f"hash-{url}"),
         )
