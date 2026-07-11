@@ -347,6 +347,65 @@ def _gmail_headers(payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _gmail_actual_payload_bytes(message: dict[str, Any], *, limit: int) -> int | None:
+    """Conservatively count a Gmail full response without decoding body data."""
+    if not isinstance(message, dict) or limit < 0:
+        return None
+    snippet = message.get("snippet", "")
+    payload = message.get("payload")
+    if not isinstance(snippet, str) or not isinstance(payload, dict):
+        return None
+    total = len(snippet.encode("utf-8"))
+    stack = [payload]
+    while stack:
+        part = stack.pop()
+        if not isinstance(part, dict):
+            return None
+        for field in ("mimeType", "filename", "partId"):
+            value = part.get(field, "")
+            if not isinstance(value, str):
+                return None
+            total += len(value.encode("utf-8"))
+
+        headers = part.get("headers", [])
+        if not isinstance(headers, list):
+            return None
+        for header in headers:
+            if not isinstance(header, dict):
+                return None
+            name = header.get("name")
+            value = header.get("value")
+            if not isinstance(name, str) or not isinstance(value, str):
+                return None
+            total += len(name.encode("utf-8")) + len(value.encode("utf-8"))
+
+        body = part.get("body", {})
+        if not isinstance(body, dict):
+            return None
+        data = body.get("data", "")
+        attachment_id = body.get("attachmentId", "")
+        declared_size = body.get("size", 0)
+        if (
+            not isinstance(data, str)
+            or not isinstance(attachment_id, str)
+            or isinstance(declared_size, bool)
+            or not isinstance(declared_size, int)
+            or declared_size < 0
+        ):
+            return None
+        encoded_size = len(data.encode("utf-8"))
+        total += max(encoded_size, declared_size)
+        total += len(attachment_id.encode("utf-8"))
+
+        parts = part.get("parts", [])
+        if not isinstance(parts, list):
+            return None
+        stack.extend(parts)
+        if total > limit:
+            return limit + 1
+    return total
+
+
 class GmailApiMailSource:
     """Backward-compat Gmail read access via the OAuth-backed Gmail API.
 
@@ -421,6 +480,8 @@ class GmailApiMailSource:
         messages: list[MailMessage] = []
         scanned_bytes = 0
         for ref in refs:
+            if scanned_bytes >= self._max_scan_bytes:
+                break
             metadata = (
                 service.users()
                 .messages()
@@ -440,15 +501,20 @@ class GmailApiMailSource:
                 or message_size > self._max_message_bytes
             ):
                 continue
-            if scanned_bytes + message_size > self._max_scan_bytes:
-                break
             msg = (
                 service.users()
                 .messages()
                 .get(userId="me", id=ref["id"], format="full")
                 .execute()
             )
-            scanned_bytes += message_size
+            actual_size = _gmail_actual_payload_bytes(
+                msg, limit=self._max_message_bytes
+            )
+            if actual_size is None or actual_size > self._max_message_bytes:
+                continue
+            if scanned_bytes + actual_size > self._max_scan_bytes:
+                break
+            scanned_bytes += actual_size
             payload = msg.get("payload", {})
             headers = _gmail_headers(payload)
             messages.append(

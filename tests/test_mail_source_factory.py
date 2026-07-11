@@ -166,17 +166,24 @@ def test_gmail_api_skips_oversize_message_without_full_fetch():
 
 
 def test_gmail_api_accepts_exact_byte_boundary():
-    full = {"id": "1", "payload": _gmail_payload_with_text_plain("secret")}
+    full = {
+        "id": "1",
+        "payload": {
+            "headers": [],
+            "mimeType": "text/plain",
+            "body": {"data": "AAAA"},
+        },
+    }
     service = _FakeGmailService(
         {"messages": [{"id": "1"}]},
         full,
-        metadata_result={"id": "1", "sizeEstimate": 100},
+        metadata_result={"id": "1", "sizeEstimate": 14},
     )
 
     result = GmailApiMailSource(
         build_service=lambda: service,
-        max_message_bytes=100,
-        max_scan_bytes=100,
+        max_message_bytes=14,
+        max_scan_bytes=14,
     ).fetch(since_days=7, max_messages=1)
 
     assert [message.id for message in result] == ["1"]
@@ -188,7 +195,11 @@ def test_gmail_api_aggregate_cap_stops_further_full_fetches():
     full = {
         str(index): {
             "id": str(index),
-            "payload": _gmail_payload_with_text_plain(f"secret-{index}"),
+            "payload": {
+                "headers": [],
+                "mimeType": "text/plain",
+                "body": {"data": "AAAA"},
+            },
         }
         for index in range(3)
     }
@@ -203,15 +214,89 @@ def test_gmail_api_aggregate_cap_stops_further_full_fetches():
 
     result = GmailApiMailSource(
         build_service=lambda: service,
-        max_message_bytes=10,
+        max_message_bytes=14,
         max_scan_bytes=20,
     ).fetch(since_days=7, max_messages=3)
 
-    assert [message.id for message in result] == ["0", "1"]
+    assert [message.id for message in result] == ["0"]
     assert service.messages_obj.get_calls == [
         ("me", "0", "full"),
         ("me", "1", "full"),
     ]
+
+
+def test_gmail_api_rejects_understated_oversize_full_payload():
+    full = {
+        "id": "1",
+        "payload": {
+            "headers": [],
+            "mimeType": "text/plain",
+            "body": {"data": "A" * 200},
+        },
+    }
+    service = _FakeGmailService(
+        {"messages": [{"id": "1"}]},
+        full,
+        metadata_result={"id": "1", "sizeEstimate": 10},
+    )
+
+    assert GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=100,
+        max_scan_bytes=200,
+    ).fetch(since_days=7, max_messages=1) == []
+
+
+def test_gmail_api_rejects_oversize_nested_attachment_payload():
+    full = {
+        "id": "1",
+        "snippet": "verify",
+        "payload": {
+            "headers": [],
+            "mimeType": "multipart/mixed",
+            "body": {},
+            "parts": [
+                {
+                    "headers": [],
+                    "mimeType": "application/pdf",
+                    "filename": "resume.pdf",
+                    "body": {"attachmentId": "att-1", "size": 500},
+                }
+            ],
+        },
+    }
+    service = _FakeGmailService(
+        {"messages": [{"id": "1"}]},
+        full,
+        metadata_result={"id": "1", "sizeEstimate": 10},
+    )
+
+    assert GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=200,
+        max_scan_bytes=400,
+    ).fetch(since_days=7, max_messages=1) == []
+
+
+def test_gmail_api_rejects_malformed_full_payload_before_parsing():
+    full = {
+        "id": "1",
+        "payload": {
+            "headers": [],
+            "mimeType": "multipart/mixed",
+            "body": {},
+            "parts": "not-a-list",
+        },
+    }
+    service = _FakeGmailService(
+        {"messages": [{"id": "1"}]},
+        full,
+        metadata_result={"id": "1", "sizeEstimate": 10},
+    )
+
+    assert GmailApiMailSource(build_service=lambda: service).fetch(
+        since_days=7, max_messages=1
+    ) == []
 
 
 @pytest.mark.parametrize("size", [None, "10", -1, True])

@@ -14,7 +14,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from applypilot.auth_event_storage import scrub_inbox_events
+from applypilot.auth_event_storage import (
+    OUTDATED_STORAGE_PREDICATE,
+    scrub_inbox_events,
+)
 from applypilot.config import DB_PATH
 
 MIN_GOOD_DESCRIPTION_CHARS = 200
@@ -653,6 +656,13 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_events_job_url ON inbox_events(matched_job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_events_received_at ON inbox_events(received_at)")
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_inbox_events_storage_outdated
+        ON inbox_events(id)
+        WHERE {OUTDATED_STORAGE_PREDICATE}
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_status ON auth_challenges(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_job_url ON auth_challenges(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)")

@@ -156,6 +156,29 @@ def test_magic_link_redactor_preserves_literal_plus_and_form_decode_variants():
     assert ordinary in redacted
 
 
+def test_magic_link_redactor_parses_query_and_path_matrix_parameters():
+    nested = quote(
+        "https://boards.greenhouse.io/path;custom=nested7?mode=ok;ticket=mixed8",
+        safe="/:?=.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    )
+    hints = (
+        "magic_link=https://boards.greenhouse.io/verify?mode=ok;token=semi7",
+        "magic_link=https://boards.greenhouse.io/verify%3Btoken%3Dencoded8",
+        "magic_link=https://boards.greenhouse.io/path;ticket=matrix9;standalone10",
+        f"magic_link={nested}",
+    )
+    secrets = ("semi7", "encoded8", "matrix9", "standalone10", "nested7", "mixed8")
+    ordinary = "status; ready: ordinary punctuation remains"
+
+    redacted = " | ".join((*secrets, ordinary))
+    for hint in hints:
+        redacted = launcher._redact_inbox_auth_secrets(redacted, hint)
+
+    for secret in secrets:
+        assert secret not in redacted
+    assert ordinary in redacted
+
+
 def test_magic_link_redactor_inspects_late_sensitive_query_pair():
     benign = "&".join(f"note{i}=ordinary{i}" for i in range(60))
     query_token = "lateQueryTokenABC987654"

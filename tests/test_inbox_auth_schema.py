@@ -249,3 +249,43 @@ def test_inbox_event_scrub_reads_and_updates_only_outdated_rows(tmp_path: Path) 
         statement.lstrip().upper().startswith("UPDATE INBOX_EVENTS")
         for statement in statements
     )
+
+
+def test_outdated_inbox_event_migration_uses_partial_index(tmp_path: Path) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    now = "2026-07-10T12:00:00+00:00"
+    conn.executemany(
+        """
+        INSERT INTO inbox_events (
+            message_id, event_type, confidence, created_at, storage_version
+        ) VALUES (?, 'auth_event', 'high', ?, 1)
+        """,
+        [(f"sha256:{index:064x}", now) for index in range(1000)],
+    )
+    conn.execute(
+        """
+        INSERT INTO inbox_events (
+            message_id, event_type, confidence, created_at, storage_version
+        ) VALUES ('legacy-indexed', 'auth_code', 'high', ?, 0)
+        """,
+        (now,),
+    )
+    conn.commit()
+    database.ensure_inbox_auth_tables(conn)
+
+    indexes = {
+        row[1] for row in conn.execute("PRAGMA index_list(inbox_events)").fetchall()
+    }
+    plan = conn.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT * FROM inbox_events
+         WHERE COALESCE(storage_version, 0) < 1
+         ORDER BY id
+        """
+    ).fetchall()
+
+    assert "idx_inbox_events_storage_outdated" in indexes
+    assert any(
+        "idx_inbox_events_storage_outdated" in str(row[3]) for row in plan
+    ), plan

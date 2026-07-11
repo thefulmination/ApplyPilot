@@ -379,6 +379,17 @@ def _magic_link_secrets(url: str) -> set[str]:
                 raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
             secrets.add(variant)
 
+    def add_parameter_token(token: str) -> None:
+        raw_key, separator, raw_value = token.partition("=")
+        if not separator:
+            if _nontrivial_unknown_auth_value(token):
+                add_variants(token)
+            return
+        if _sensitive_query_key(raw_key) or _nontrivial_unknown_auth_value(
+            raw_value
+        ):
+            add_variants(raw_value)
+
     add_variants(url)
     for url_layer in _progressive_percent_decode_layers(url):
         parsed = urlsplit(url_layer)
@@ -401,32 +412,27 @@ def _magic_link_secrets(url: str) -> set[str]:
         for raw_component in (parsed.query, parsed.fragment):
             if not raw_component:
                 continue
-            for pair in raw_component.split("&"):
-                raw_key, separator, raw_value = pair.partition("=")
-                if not separator:
-                    if _nontrivial_unknown_auth_value(pair):
-                        add_variants(pair)
-                    continue
-                if _sensitive_query_key(raw_key) or _nontrivial_unknown_auth_value(
-                    raw_value
-                ):
-                    add_variants(raw_value)
+            for token in re.split(r"[&;]", raw_component):
+                add_parameter_token(token)
 
         expect_path_secret = False
         for segment in parsed.path.split("/"):
             if not segment:
                 continue
-            normalized = segment.strip().lower()
+            path_value, *matrix_tokens = segment.split(";")
+            for token in matrix_tokens:
+                add_parameter_token(token)
+            normalized = path_value.strip().lower()
             if expect_path_secret:
-                add_variants(segment)
+                add_variants(path_value)
                 expect_path_secret = False
                 continue
             if normalized in _SENSITIVE_PATH_MARKERS:
                 expect_path_secret = True
                 continue
-            variants = _exact_secret_variants(segment)
+            variants = _exact_secret_variants(path_value)
             if any(_token_like_path_segment(variant) for variant in variants):
-                add_variants(segment)
+                add_variants(path_value)
     return secrets
 
 

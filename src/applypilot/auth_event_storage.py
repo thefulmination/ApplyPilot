@@ -11,6 +11,9 @@ from applypilot.ats_domains import ATS_SENDER_DOMAINS
 
 MESSAGE_ID_PREFIX = "sha256:"
 STORAGE_VERSION = 1
+OUTDATED_STORAGE_PREDICATE = (
+    f"COALESCE(storage_version, 0) < {STORAGE_VERSION}"
+)
 _OPAQUE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DOMAIN_RE = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
@@ -106,12 +109,11 @@ def closed_confidence(value: str | None) -> str:
 def scrub_inbox_events(conn, *, migration_now: str) -> None:
     """Idempotently minimize legacy rows while preserving integer references."""
     rows = conn.execute(
-        """
+        f"""
         SELECT * FROM inbox_events
-         WHERE COALESCE(storage_version, 0) < ?
+         WHERE {OUTDATED_STORAGE_PREDICATE}
          ORDER BY id
-        """,
-        (STORAGE_VERSION,),
+        """
     ).fetchall()
     if not rows:
         return
