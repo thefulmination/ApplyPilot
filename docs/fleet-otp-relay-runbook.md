@@ -233,8 +233,12 @@ Do not synthesize a database answer: the controlled end-to-end check must prove
 the mailbox path.
 
 1. Confirm the schema, process count, heartbeat, and `X-GM-RAW` canary above.
-2. Generate a GUID-suffixed non-secret worker label and capture the start time.
-3. Run one headed, supervised application with relay auth enabled. The worker
+2. Choose an unused Chrome slot from 0 through 9. The command defaults to slot 9
+   and fails before launch if its debugging port is already in use; set
+   `APPLYPILOT_OTP_E2E_SLOT` beforehand to select another dedicated slot.
+3. Generate a GUID-suffixed non-secret worker label and capture the start time.
+4. Run one headed application through the production fleet worker implementation
+   with relay auth enabled. The worker
    creates one request, waits for the responder answer, atomically consumes it,
    clears the secret value, and performs at most one assisted retry.
 
@@ -245,7 +249,9 @@ the mailbox path.
         "APPLYPILOT_INBOX_AUTH",
         "APPLYPILOT_INBOX_AUTH_MODE",
         "FLEET_PG_DSN",
-        "OTP_E2E_STARTED_AT"
+        "OTP_E2E_STARTED_AT",
+        "APPLYPILOT_OTP_E2E_SLOT",
+        "APPLYPILOT_OTP_E2E_URL"
     )
     $PreviousEnvironment = @{}
     foreach ($Name in $EnvironmentNames) {
@@ -259,68 +265,123 @@ the mailbox path.
     try {
         $ControlledUrl = Read-Host "Controlled application URL"
         $TestWorkerId = "otp-e2e-home-$([guid]::NewGuid().ToString('N'))"
+        $TestSlotText = if ($env:APPLYPILOT_OTP_E2E_SLOT) {
+            $env:APPLYPILOT_OTP_E2E_SLOT
+        } else {
+            "9"
+        }
+        $TestSlot = 0
+        if (-not [int]::TryParse($TestSlotText, [ref]$TestSlot) -or
+            $TestSlot -lt 0 -or $TestSlot -gt 9) {
+            throw "APPLYPILOT_OTP_E2E_SLOT must be an integer from 0 through 9."
+        }
+        $BasePortText = if ($env:APPLYPILOT_BASE_CDP_PORT) {
+            $env:APPLYPILOT_BASE_CDP_PORT
+        } else {
+            "9400"
+        }
+        $BasePort = 0
+        if (-not [int]::TryParse($BasePortText, [ref]$BasePort) -or $BasePort -lt 1) {
+            throw "APPLYPILOT_BASE_CDP_PORT must be a positive integer."
+        }
+        $TestPort = $BasePort + $TestSlot
+        if ($TestPort -gt 65535) {
+            throw "The controlled-cycle Chrome port is outside the valid TCP range."
+        }
+        if (Get-NetTCPConnection -State Listen -LocalPort $TestPort -ErrorAction SilentlyContinue) {
+            throw "The controlled-cycle Chrome slot is already in use; choose another slot."
+        }
         $env:FLEET_WORKER_ID = $TestWorkerId
         $env:APPLYPILOT_INBOX_AUTH = "1"
         $env:APPLYPILOT_INBOX_AUTH_MODE = "relay"
         $env:FLEET_PG_DSN = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
         $env:OTP_E2E_STARTED_AT = (Get-Date).ToUniversalTime().ToString("o")
-
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File ".\run-applypilot.ps1" apply --url $ControlledUrl `
-            --inbox-auth --workers 1
+        $env:APPLYPILOT_OTP_E2E_SLOT = [string]$TestSlot
+        $env:APPLYPILOT_OTP_E2E_URL = $ControlledUrl
 
         @'
 import datetime as dt
+import contextlib
 import os
 
+from applypilot.fleet import apply_worker_main
+
+apply_worker_main._setup_apply_env()
+
 from applypilot.apply import pgqueue
+from applypilot.fleet import deadman
 
 started = dt.datetime.fromisoformat(os.environ["OTP_E2E_STARTED_AT"].replace("Z", "+00:00"))
 worker_id = os.environ["FLEET_WORKER_ID"]
-dsn = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
-with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
-    cur.execute("""
-        SELECT
-          COUNT(*) = 1 AS request_created,
-          COALESCE(BOOL_OR(answered_at IS NOT NULL), false) AS responder_answered,
-          COALESCE(BOOL_OR(consumed_at IS NOT NULL), false) AS worker_consumed,
-          COALESCE(BOOL_OR(consumed_at IS NOT NULL AND code IS NULL), false) AS code_cleared,
-          COALESCE(BOOL_OR(consumed_at IS NOT NULL AND matched_message_id IS NOT NULL), false)
-            AS matched_message_id_retained
-        FROM otp_request
-        WHERE worker_id = %s AND requested_at >= %s
-    """, (worker_id, started))
-    facts = cur.fetchone()
+slot = int(os.environ["APPLYPILOT_OTP_E2E_SLOT"])
+job = {
+    "url": os.environ["APPLYPILOT_OTP_E2E_URL"],
+    "application_url": os.environ["APPLYPILOT_OTP_E2E_URL"],
+}
+
+apply_fn = apply_worker_main.make_apply_fn(
+    "sonnet",
+    "codex",
+    slot=slot,
+    fleet_worker_id=worker_id,
+)
+try:
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            result = apply_fn(job)
+
+            dsn = os.environ["FLEET_PG_DSN"]
+            with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      COUNT(*) = 1 AS request_created,
+                      COALESCE(BOOL_OR(answered_at IS NOT NULL), false) AS responder_answered,
+                      COALESCE(BOOL_OR(consumed_at IS NOT NULL), false) AS worker_consumed,
+                      COALESCE(BOOL_OR(consumed_at IS NOT NULL AND code IS NULL), false) AS code_cleared,
+                      COALESCE(BOOL_OR(
+                        consumed_at IS NOT NULL AND matched_message_id IS NOT NULL
+                      ), false) AS matched_message_id_retained
+                    FROM otp_request
+                    WHERE worker_id = %s AND requested_at >= %s
+                """, (worker_id, started))
+                facts = cur.fetchone()
+
+            with pgqueue.connect(dsn) as conn:
+                mail_source_ok = deadman.mail_source_alive()
+                alerts, _ = deadman.deadman_check(
+                    conn,
+                    now=dt.datetime.now(dt.timezone.utc),
+                    gmail_token_ok=mail_source_ok,
+                )
+            otp_alerts = [
+                alert for alert in alerts
+                if alert.kind in {"otp_relay_down", "otp_delivery_stalled"}
+            ]
+except Exception:
+    raise SystemExit(1) from None
+
 for key in (
     "request_created", "responder_answered", "worker_consumed",
     "code_cleared", "matched_message_id_retained",
 ):
     print(f"{key}={'yes' if bool(facts[key]) else 'no'}")
-'@ | .\.conda-env\python.exe -
-
-        $TerminalResult = Read-Host `
-            "Did exactly one assisted retry reach a terminal result? Enter yes or no"
-        $TerminalPassed = $TerminalResult.Trim().ToLowerInvariant() -eq "yes"
-        Write-Output (
-            "assisted_retry_terminal=" + $(if ($TerminalPassed) { "yes" } else { "no" })
-        )
-
-        @'
-import datetime as dt
-
-from applypilot.apply import pgqueue
-from applypilot.fleet import deadman
-
-dsn = "host=localhost port=5432 dbname=applypilot_fleet user=postgres connect_timeout=5"
-with pgqueue.connect(dsn) as conn:
-    mail_source_ok = deadman.mail_source_alive()
-    alerts, _ = deadman.deadman_check(
-        conn,
-        now=dt.datetime.now(dt.timezone.utc),
-        gmail_token_ok=mail_source_ok,
-    )
-otp_alerts = [a for a in alerts if a.kind in {"otp_relay_down", "otp_delivery_stalled"}]
+print(f"inbox_auth_prearmed={'yes' if result['inbox_auth_prearmed'] else 'no'}")
+print(f"assisted_retry_count={result['assisted_retry_count']}")
+print(f"assisted_retry_terminal={'yes' if result['assisted_retry_terminal'] else 'no'}")
 print(f"deadman_otp_alerts={len(otp_alerts)}")
+
+accepted = (
+    all(bool(facts[key]) for key in (
+        "request_created", "responder_answered", "worker_consumed",
+        "code_cleared", "matched_message_id_retained",
+    ))
+    and result["inbox_auth_prearmed"] is True
+    and result["assisted_retry_count"] == 1
+    and result["assisted_retry_terminal"] is True
+    and not otp_alerts
+)
+if not accepted:
+    raise SystemExit(1)
 '@ | .\.conda-env\python.exe -
     }
     finally {
@@ -336,14 +397,14 @@ print(f"deadman_otp_alerts={len(otp_alerts)}")
 }
 ```
 
-The outer script block keeps the URL, GUID worker ID, and timestamp local. Its
+The outer script block keeps the URL, GUID worker ID, slot, and timestamp local. Its
 `finally` restores prior environment values or removes newly introduced values,
-even if the apply command or a verification command fails. The apply wrapper runs
-in a child PowerShell process, so its own environment setup cannot remain active
-in the operator shell. Observe that exactly one assisted retry reaches a terminal
-result: submitted, or the expected bounded controlled failure. Do not infer this
-from a mailbox match alone and do not paste agent output if it contains prohibited
-material.
+even if the apply or verification fails. Python runs as a child process, so
+`_setup_apply_env()` cannot leave its environment changes in the operator shell.
+The result metadata automatically proves whether exactly one assisted retry
+reached a terminal result: submitted, or the expected bounded controlled failure.
+Do not infer this from a mailbox match alone and do not paste agent output if it
+contains prohibited material.
 
 Acceptance requires these exact non-secret facts:
 
@@ -353,6 +414,8 @@ responder_answered=yes
 worker_consumed=yes
 code_cleared=yes
 matched_message_id_retained=yes
+inbox_auth_prearmed=yes
+assisted_retry_count=1
 assisted_retry_terminal=yes
 deadman_otp_alerts=0
 ```

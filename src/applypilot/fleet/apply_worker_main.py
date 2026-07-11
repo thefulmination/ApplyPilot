@@ -190,6 +190,17 @@ def _prearmed_auth_retryable(status: str | None) -> bool:
     )
 
 
+def _assisted_retry_is_terminal(status: str | None, launcher) -> bool:
+    """Classify only the final assisted run, without exposing its result details."""
+    return bool(
+        status
+        and not launcher._is_auth_required_result(status)
+        and not launcher.is_usage_limit_result(status)
+        and not _browser_tool_retryable(status)
+        and not _prearmed_auth_retryable(status)
+    )
+
+
 def _should_launch_chrome_headless() -> bool:
     return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
 
@@ -220,6 +231,7 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
             headless=_should_launch_chrome_headless(),
         )  # returns Popen; port is implicit BASE_CDP_PORT+slot
         try:
+            assisted_retry_count = 0
             prearmed_request_id = (
                 launcher._prearm_inbox_auth_request(job)
                 if launcher._should_prearm_inbox_auth(job)
@@ -252,6 +264,7 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                         timeout_seconds=remaining,
                     )
                 if inbox_hint:
+                    assisted_retry_count = 1
                     status, _dur = launcher.run_job(
                         job,
                         port,
@@ -271,6 +284,12 @@ def make_apply_fn(model: str, agent: str, slot: int = 0, fleet_worker_id: str | 
                 "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
                 "transcript_digest": stats.get("transcript_digest"),
                 "final_result_source": stats.get("final_result_source"),
+                "assisted_retry_count": assisted_retry_count,
+                "inbox_auth_prearmed": prearmed_request_id is not None,
+                "assisted_retry_terminal": (
+                    assisted_retry_count == 1
+                    and _assisted_retry_is_terminal(status, launcher)
+                ),
             }
             # Record the apply channel from the STILL-OPEN tabs (the finally below kills
             # Chrome). This is needed for non-applied terminal statuses too: an

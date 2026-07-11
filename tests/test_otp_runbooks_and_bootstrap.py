@@ -68,6 +68,8 @@ def test_otp_relay_controlled_cycle_lists_exact_approved_evidence():
         "worker_consumed=yes",
         "code_cleared=yes",
         "matched_message_id_retained=yes",
+        "inbox_auth_prearmed=yes",
+        "assisted_retry_count=1",
         "assisted_retry_terminal=yes",
         "deadman_otp_alerts=0",
     ):
@@ -108,15 +110,46 @@ def test_otp_relay_controlled_cycle_is_unique_and_restores_environment():
     assert "$PreviousEnvironment" in controlled
     assert "[Environment]::SetEnvironmentVariable($Name" in controlled
     assert 'Remove-Item -LiteralPath "Env:$Name"' in controlled
-    assert "& powershell.exe" in controlled
+    assert ".\\.conda-env\\python.exe -" in controlled
     for name in (
         "FLEET_WORKER_ID",
         "APPLYPILOT_INBOX_AUTH",
         "APPLYPILOT_INBOX_AUTH_MODE",
         "FLEET_PG_DSN",
         "OTP_E2E_STARTED_AT",
+        "APPLYPILOT_OTP_E2E_SLOT",
+        "APPLYPILOT_OTP_E2E_URL",
     ):
         assert f'"{name}"' in controlled
+
+
+def test_otp_relay_controlled_cycle_uses_production_prearm_and_automatic_evidence():
+    runbook = _otp_runbook()
+    controlled = _section(
+        runbook,
+        "## Controlled end-to-end acceptance",
+        "Acceptance requires these exact non-secret facts:",
+    )
+
+    assert "from applypilot.fleet import apply_worker_main" in controlled
+    assert "apply_worker_main._setup_apply_env()" in controlled
+    assert "apply_worker_main.make_apply_fn(" in controlled
+    assert "fleet_worker_id=worker_id" in controlled
+    assert "(job)" in controlled
+    assert "APPLYPILOT_OTP_E2E_SLOT" in controlled
+    assert '"9400"' in controlled
+    assert "APPLYPILOT_BASE_CDP_PORT" in controlled
+    assert 'result["assisted_retry_count"]' in controlled
+    assert 'result["assisted_retry_terminal"]' in controlled
+    assert 'result["inbox_auth_prearmed"]' in controlled
+    assert "contextlib.redirect_stdout(sink)" in controlled
+    assert "contextlib.redirect_stderr(sink)" in controlled
+    assert "$TerminalResult" not in controlled
+    assert "Did exactly one assisted retry" not in controlled
+    assert "run-applypilot.ps1" not in controlled
+    assert "apply --url" not in controlled
+    assert "print(result" not in controlled
+    assert "run_status" not in controlled
 
 
 def test_otp_relay_runbook_powershell_and_embedded_python_parse():
