@@ -112,6 +112,7 @@ def test_fault_created_during_setup_blocks_final_popen(
 
     monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
     monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
     monkeypatch.setattr(chrome, "_listener_pids", lambda _port: [])
 
     def resolve(_browser):
@@ -596,6 +597,11 @@ def test_linkedin_login_normal_path_releases_owned_process(tmp_path: Path, monke
         parent_command="python applypilot-worker.py",
     )
     monkeypatch.setattr(chrome, "_process_identity", lambda pid: login_identity)
+    monkeypatch.setattr(
+        chrome,
+        "_windows_handle_identity",
+        lambda _handle: (process.pid, login_identity.created_at, login_identity.executable),
+    )
 
     ok, seed = chrome.linkedin_login(timeout_seconds=1, poll_seconds=0)
 
@@ -635,6 +641,44 @@ def _browser_identity(
         parent_executable="C:/Python/python.exe",
         parent_command="python applypilot-worker.py",
     )
+
+
+def test_suspended_windows_launch_uses_stable_handle_executable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from applypilot.apply import chrome
+
+    profile = tmp_path / "worker-0"
+    process = _FakeProcess(pid=500)
+    actual = _browser_identity(
+        chrome,
+        pid=process.pid,
+        profile=str(profile),
+        executable="",
+    )
+    reservation = chrome._acquire_browser_reservation(0, 9400, profile)
+    guard = chrome._SpawnGuard(process, "windows", process._handle)
+    expected_executable = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+    monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(chrome, "_process_identity", lambda _pid: actual)
+    monkeypatch.setattr(
+        chrome,
+        "_windows_handle_identity",
+        lambda _handle: (process.pid, actual.created_at, expected_executable),
+    )
+
+    chrome._record_launched_browser_identity(
+        reservation,
+        process,
+        expected_executable,
+        profile,
+        9400,
+        guard,
+    )
+
+    assert reservation.browser_identity is not None
+    assert reservation.browser_identity.executable == expected_executable
+    reservation.release()
 
 
 def test_foreign_listener_on_reserved_port_is_not_killed(tmp_path: Path, monkeypatch) -> None:
@@ -1150,7 +1194,7 @@ def test_windows_launch_is_suspended_contained_then_resumed_or_reaped(
         events.append("guard")
         return chrome._SpawnGuard(proc, "windows", proc._handle)
 
-    def record(reservation, proc, executable, profile_dir, port):
+    def record(reservation, proc, executable, profile_dir, port, guard):
         events.append("identity")
         reservation.record_browser_identity(expected)
 

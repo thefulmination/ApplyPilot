@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from applypilot import config
@@ -761,8 +761,16 @@ def _record_launched_browser_identity(
     executable: str,
     profile_dir: Path,
     port: int,
+    guard: _SpawnGuard | None = None,
 ) -> None:
     actual = _process_identity(process.pid)
+    if guard is not None and guard.kind == "windows":
+        handle_identity = (
+            _windows_handle_identity(guard.handle)
+            if guard is not None
+            else None
+        )
+        actual = _identity_with_windows_handle(actual, handle_identity, process.pid)
     expected = BrowserProcessIdentity(
         pid=process.pid,
         created_at=actual.created_at if actual is not None else 0.0,
@@ -896,6 +904,7 @@ def _owned_browser_authority_is_current(
     process: subprocess.Popen,
     expected: BrowserProcessIdentity,
     reservation: _BrowserReservation,
+    handle_identity: tuple[int, float, str] | None = None,
 ) -> bool:
     with _chrome_lock:
         registered = _chrome_procs.get(reservation.worker_id)
@@ -911,6 +920,8 @@ def _owned_browser_authority_is_current(
     ):
         return False
     current = _process_identity(process.pid)
+    if handle_identity is not None:
+        current = _identity_with_windows_handle(current, handle_identity, process.pid)
     return bool(
         _browser_identity_matches(expected, current)
         and _browser_parent_identity_matches(expected, current)
@@ -1010,6 +1021,26 @@ def _windows_handle_identity(handle: int) -> tuple[int, float, str] | None:
     creation_ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
     created_at = (creation_ticks - 116_444_736_000_000_000) / 10_000_000
     return pid, created_at, image_buffer.value
+
+
+def _identity_with_windows_handle(
+    actual: BrowserProcessIdentity | None,
+    handle_identity: tuple[int, float, str] | None,
+    expected_pid: int,
+) -> BrowserProcessIdentity | None:
+    if (
+        actual is None
+        or handle_identity is None
+        or handle_identity[0] != expected_pid
+        or abs(handle_identity[1] - actual.created_at) >= 0.001
+        or not handle_identity[2]
+    ):
+        return None
+    return replace(
+        actual,
+        created_at=handle_identity[1],
+        executable=handle_identity[2],
+    )
 
 
 def _assign_exact_handle_to_kill_job(
@@ -1114,12 +1145,16 @@ def _assign_kill_on_close_job(
             or handle_identity[0] != expected.pid
             or abs(handle_identity[1] - expected.created_at) >= 0.001
             or _normalized_path(handle_identity[2]) != _normalized_path(expected.executable)
-            or not _owned_browser_authority_is_current(process, expected, reservation)
+            or not _owned_browser_authority_is_current(
+                process, expected, reservation, handle_identity
+            )
         ):
             return False
         job = _assign_exact_handle_to_kill_job(
             process_handle,
-            lambda: _owned_browser_authority_is_current(process, expected, reservation),
+            lambda: _owned_browser_authority_is_current(
+                process, expected, reservation, handle_identity
+            ),
         )
         if not job:
             return False
@@ -1464,6 +1499,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
             chrome_exe,
             seed,
             LINKEDIN_LOGIN_CDP_PORT,
+            guard,
         )
     except BaseException as exc:
         _raise_identity_capture_failure(proc, reservation, guard, exc)
@@ -1675,7 +1711,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if guard is None:
         _raise_spawn_guard_failure(proc, reservation)
     try:
-        _record_launched_browser_identity(reservation, proc, chrome_exe, profile_dir, port)
+        _record_launched_browser_identity(
+            reservation, proc, chrome_exe, profile_dir, port, guard
+        )
     except BaseException as exc:
         _raise_identity_capture_failure(proc, reservation, guard, exc)
     with _chrome_lock:

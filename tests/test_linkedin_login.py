@@ -121,6 +121,11 @@ class TestLinkedInLoginPersistence:
             lambda process, expected, reservation: setattr(proc, "alive", False) or True,
         )
         monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+        monkeypatch.setattr(
+            chrome,
+            "_windows_handle_identity",
+            lambda _handle: (proc.pid, identity.created_at, identity.executable),
+        )
         monkeypatch.setattr(chrome.subprocess, "Popen", lambda *args, **kwargs: proc)
         monkeypatch.setattr(chrome, "_has_linkedin_session_cdp", lambda port: True)
         monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
