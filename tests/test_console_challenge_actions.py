@@ -10,6 +10,8 @@ Uses the shared ``fleet_db`` fixture (disposable local Postgres, v3 schema appli
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
@@ -19,24 +21,58 @@ from applypilot.fleet import console_app
 from applypilot.fleet import queue
 
 
+def _canonical(conn, url, score, lane):
+    policy = f"challenge-{lane}-policy"
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,%s,'active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy, lane),
+        )
+        cur.execute(
+            f"UPDATE fleet_config SET {lane}_policy_version=%s WHERE id=1",
+            (policy,),
+        )
+    conn.commit()
+    return {
+        "decision_id": f"decision-{lane}-{url}",
+        "policy_version": policy,
+        "decision_action": "apply",
+        "qualification_verdict": "qualified",
+        "qualification_score": 9.0,
+        "qualification_floor": 0.0,
+        "preference_score": 8.0,
+        "outcome_score": 8.0,
+        "final_score": float(score),
+        "decision_confidence": 0.9,
+        "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1),
+        "input_hash": f"hash-{lane}-{url}",
+    }
+
+
 def _seed_apply(conn, url, *, host, score=5.0, company="Co", title="Role", approved="b1"):
     queue.push_apply_jobs(conn, [{
         "url": url, "company": company, "title": title,
         "application_url": f"{url}/apply", "score": score,
         "target_host": host,
+        **_canonical(conn, url, score, "ats"),
     }], approved_batch=approved)
 
 
 def _seed_li(conn, url, *, score=9.0, company="Co", title="Role", batch="b1"):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO linkedin_queue "
-            "(url, company, title, application_url, score, status, lane, approved_batch, dedup_key, "
-            "linkedin_resolve_status, linkedin_resolved_at) "
-            "VALUES (%s,%s,%s,%s,%s,'queued','ats',%s,%s,'easy_apply',now())",
-            (url, company, title, url, score, batch, f"dk-{url}"),
-        )
-    conn.commit()
+    queue.push_linkedin_jobs(conn, [{
+        "url": url,
+        "company": company,
+        "title": title,
+        "application_url": url,
+        "score": score,
+        "dedup_key": f"dk-{url}",
+        "linkedin_resolve_status": "easy_apply",
+        "linkedin_resolved_at": datetime.now(timezone.utc),
+        **_canonical(conn, url, score, "linkedin"),
+    }], approved_batch=batch)
 
 
 def _park_apply(conn, url, *, worker="w1"):
