@@ -7,12 +7,14 @@ ones that gate the owner's safety/visibility, so they're exercised end-to-end.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import governor, heartbeat
+from applypilot.fleet import governor, heartbeat, queue
 
 
 # ---------------------------------------------------------------------------
@@ -322,11 +324,36 @@ def test_dashboard_snapshot_has_all_keys(fleet_db):
         governor.record_outcome(conn, [governor.host_scope("boards.greenhouse.io")],
                                 "captcha")
         # queues: seed one apply job (queued) + a compute task
-        pgqueue.push_jobs(conn, [{
+        policy = "heartbeat-ats-policy"
+        now = datetime.now(timezone.utc)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                "VALUES (%s,'ats','active')",
+                (policy,),
+            )
+            cur.execute(
+                "UPDATE fleet_config SET ats_policy_version=%s WHERE id=1",
+                (policy,),
+            )
+        queue.push_apply_jobs(conn, [{
             "url": "https://jobs.example.com/1", "company": "Acme", "title": "COS",
             "application_url": "https://boards.greenhouse.io/acme/jobs/1",
             "score": 8.0, "apply_domain": "boards.greenhouse.io",
-        }])
+            "decision_id": "decision-heartbeat-1",
+            "policy_version": policy,
+            "decision_action": "apply",
+            "qualification_verdict": "qualified",
+            "qualification_score": 9.0,
+            "qualification_floor": 7.0,
+            "preference_score": 8.0,
+            "outcome_score": 8.0,
+            "final_score": 8.0,
+            "decision_confidence": 0.9,
+            "decision_created_at": now,
+            "decision_expires_at": now + timedelta(days=1),
+            "input_hash": "hash-heartbeat-1",
+        }], approved_batch="heartbeat-batch")
         with conn.cursor() as cur:
             cur.execute("INSERT INTO compute_queue (url, task, status) "
                         "VALUES ('u/c', 'score', 'queued')")

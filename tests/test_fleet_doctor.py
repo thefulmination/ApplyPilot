@@ -5,6 +5,8 @@ the TTL sweep; and that non-auto-fixable clusters become recommendations (not au
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from applypilot.apply import pgqueue
@@ -36,6 +38,25 @@ def _seed_apply_failure(conn, *, url, host, worker_id="home-0", apply_error=None
             "worker_id=EXCLUDED.worker_id, updated_at=now()",
             (url, url, host, host, url, approved_batch, st, apply_error, apply_status, worker_id),
         )
+        if queued:
+            policy = "doctor-ats-policy"
+            now = datetime.now(timezone.utc)
+            cur.execute(
+                "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+                "VALUES (%s,'ats','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+                (policy,),
+            )
+            cur.execute(
+                "UPDATE fleet_config SET ats_policy_version=%s WHERE id=1",
+                (policy,),
+            )
+            cur.execute(
+                "UPDATE apply_queue SET decision_id=%s, policy_version=%s, decision_action='apply', "
+                "qualification_verdict='qualified', qualification_score=9, qualification_floor=0, "
+                "preference_score=8, outcome_score=8, final_score=score, decision_confidence=.9, "
+                "decision_created_at=%s, decision_expires_at=%s, input_hash=%s WHERE url=%s",
+                (f"decision-{url}", policy, now, now + timedelta(days=1), f"hash-{url}", url),
+            )
     conn.commit()
 
 
@@ -580,10 +601,26 @@ def test_recommendations_are_idempotent(fleet_db):
 # ===========================================================================
 
 def _seed_linkedin_job(conn, url="li0", dk="lidk0"):
+    policy = "doctor-linkedin-policy"
+    now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key) "
-            "VALUES (%s,%s,9.0,'queued','ats','b1',%s)", (url, f"https://linkedin.com/jobs/{url}", dk))
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'linkedin','active')",
+            (policy,),
+        )
+        cur.execute(
+            "UPDATE fleet_config SET linkedin_policy_version=%s WHERE id=1",
+            (policy,),
+        )
+        cur.execute(
+            "INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key, "
+            "decision_id,policy_version,decision_action,qualification_verdict,qualification_score,qualification_floor,"
+            "preference_score,outcome_score,final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash) "
+            "VALUES (%s,%s,9.0,'queued','linkedin','b1',%s,%s,%s,'apply','qualified',9,0,8,8,9,.9,%s,%s,%s)",
+            (url, f"https://linkedin.com/jobs/{url}", dk, f"decision-{url}", policy,
+             now, now + timedelta(days=1), f"hash-{url}"),
+        )
     conn.commit()
 
 

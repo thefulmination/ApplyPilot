@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 from http.server import ThreadingHTTPServer
 
@@ -11,6 +12,37 @@ import pytest
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import compute_context, console_app, heartbeat, queue
+
+
+def _push_ready_apply(conn, rows, *, approved_batch):
+    policy = "diagnosis-ats-policy"
+    now = datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES (%s,'ats','active') ON CONFLICT (policy_version) DO UPDATE SET status='active'",
+            (policy,),
+        )
+        cur.execute(
+            "UPDATE fleet_config SET ats_policy_version=%s WHERE id=1",
+            (policy,),
+        )
+    queue.push_apply_jobs(conn, [{
+        **row,
+        "decision_id": f"decision-{row['url']}",
+        "policy_version": policy,
+        "decision_action": "apply",
+        "qualification_verdict": "qualified",
+        "qualification_score": 9.0,
+        "qualification_floor": 7.0,
+        "preference_score": 8.0,
+        "outcome_score": 8.0,
+        "final_score": float(row["score"]),
+        "decision_confidence": 0.9,
+        "decision_created_at": now,
+        "decision_expires_at": now + timedelta(days=1),
+        "input_hash": f"hash-{row['url']}",
+    } for row in rows], approved_batch=approved_batch)
 
 
 def test_console_page_has_diagnosis_sections_and_js_renderer(live_server):
@@ -1002,7 +1034,7 @@ def test_diagnosis_recommends_start_apply_workers_when_jobs_are_ready_without_wo
 ) -> None:
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn:
-        queue.push_apply_jobs(
+        _push_ready_apply(
             conn,
             [{
                 "url": "https://boards.greenhouse.io/acme/jobs/diag-ready",
@@ -1026,7 +1058,7 @@ def test_diagnosis_recommends_browser_repair_when_ready_worker_has_browser_issue
 ) -> None:
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn:
-        queue.push_apply_jobs(
+        _push_ready_apply(
             conn,
             [{
                 "url": "https://boards.greenhouse.io/acme/jobs/diag-browser",
@@ -1057,7 +1089,7 @@ def test_diagnosis_does_not_recommend_backend_repair_for_captcha_only(
 ) -> None:
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn:
-        queue.push_apply_jobs(
+        _push_ready_apply(
             conn,
             [{
                 "url": "https://boards.greenhouse.io/acme/jobs/diag-captcha",
@@ -1097,7 +1129,7 @@ def test_diagnosis_includes_desired_machine_worker_gaps(monkeypatch, fleet_db) -
                 "VALUES ('m2', 2), ('m4', 1)"
             )
         heartbeat.beat(conn, "m2-0", machine_owner="m2", role="apply", state="idle")
-        queue.push_apply_jobs(
+        _push_ready_apply(
             conn,
             [{
                 "url": "https://boards.greenhouse.io/acme/jobs/diag-desired",
