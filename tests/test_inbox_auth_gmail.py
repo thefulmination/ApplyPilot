@@ -28,8 +28,13 @@ class _FakeMessages:
             return _FakeRequest(batch)
         return _FakeRequest({"messages": batch})
 
-    def get(self, userId, id, format):  # noqa: A002
-        return _FakeRequest(self._message_payloads[id])
+    def get(self, userId, id, format, fields=None):  # noqa: A002
+        payload = self._message_payloads[id]
+        if format == "metadata":
+            return _FakeRequest(
+                {"id": id, "threadId": id, "sizeEstimate": len(repr(payload))}
+            )
+        return _FakeRequest(payload)
 
 
 class _FakeUsers:

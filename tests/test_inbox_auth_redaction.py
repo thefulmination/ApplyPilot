@@ -110,6 +110,23 @@ def test_magic_link_redactor_covers_bounded_exact_credential_variants():
     assert "greenhouse.io" in redacted
 
 
+def test_magic_link_redactor_treats_nontrivial_unknown_values_as_secrets():
+    hint = (
+        "magic_link=https://boards.greenhouse.io/verify?ticket=tick7&session=sess8"
+        "&id=1234&custom=custom9&locale=x&redirect=continue#frag5"
+    )
+    secrets = ("tick7", "sess8", "1234", "custom9", "frag5")
+    ordinary = "x continue ordinary output remains"
+
+    redacted = launcher._redact_inbox_auth_secrets(
+        " ".join((*secrets, ordinary)), hint
+    )
+
+    for secret in secrets:
+        assert secret not in redacted
+    assert ordinary in redacted
+
+
 def test_magic_link_redactor_inspects_late_sensitive_query_pair():
     benign = "&".join(f"note{i}=ordinary{i}" for i in range(60))
     query_token = "lateQueryTokenABC987654"
@@ -118,7 +135,7 @@ def test_magic_link_redactor_inspects_late_sensitive_query_pair():
         f"magic_link=https://boards.greenhouse.io/verify?{benign}"
         f"&token={query_token}#{benign}&verify={fragment_token}"
     )
-    ordinary = "ordinary0 ordinary59 tokenization remains"
+    ordinary = "unrelated tokenization remains"
 
     redacted = launcher._redact_inbox_auth_secrets(
         f"{query_token} {fragment_token} {ordinary}", hint
@@ -167,7 +184,7 @@ def test_magic_link_redactor_parses_structures_at_every_url_and_hint_layer():
         encoded_hint,
     )
     credentials = ("q7", "p7", "u7", "p8", "l7", "t7", "f7", "n7")
-    ordinary = "ordinary text and greenhouse.io remain"
+    ordinary = "unrelated text and greenhouse.io remain"
 
     redacted = " ".join(credentials) + " " + ordinary
     for hint in hints:
@@ -222,7 +239,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
         f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io/"
         "verify/pathTokenABC123456"
         f"?token={encoded_token}&verify={short_token}"
-        f"%26auth%3D{delimiter_token}#state={standalone_token}"
+        f"%26custom%3D{delimiter_token}#state={standalone_token}"
     )
     hint = f"magic_link={secret}"
     events = [

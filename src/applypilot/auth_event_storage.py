@@ -105,13 +105,35 @@ def closed_confidence(value: str | None) -> str:
 
 def scrub_inbox_events(conn, *, migration_now: str) -> None:
     """Idempotently minimize legacy rows while preserving integer references."""
-    rows = conn.execute("SELECT * FROM inbox_events ORDER BY id").fetchall()
+    rows = conn.execute(
+        """
+        SELECT * FROM inbox_events
+         WHERE COALESCE(storage_version, 0) < ?
+         ORDER BY id
+        """,
+        (STORAGE_VERSION,),
+    ).fetchall()
+    if not rows:
+        return
     groups: dict[str, list] = {}
     for row in rows:
         groups.setdefault(
             migration_message_id(row["message_id"], int(row["storage_version"] or 0)),
             [],
         ).append(row)
+    digests = sorted(groups)
+    for offset in range(0, len(digests), 900):
+        chunk = digests[offset:offset + 900]
+        placeholders = ",".join("?" for _ in chunk)
+        current_rows = conn.execute(
+            f"""
+            SELECT * FROM inbox_events
+             WHERE storage_version >= ? AND message_id IN ({placeholders})
+            """,
+            (STORAGE_VERSION, *chunk),
+        ).fetchall()
+        for row in current_rows:
+            groups[str(row["message_id"]).lower()].append(row)
 
     for digest, group in groups.items():
         survivor = next(
@@ -207,23 +229,24 @@ def scrub_inbox_events(conn, *, migration_now: str) -> None:
             ),
             migration_now,
         )
-        conn.execute(
-            """
-            UPDATE inbox_events
-               SET message_id=?, thread_id=NULL, sender=NULL, sender_domain=?,
-                   subject=NULL, received_at=?, event_type='auth_event', confidence=?,
-                   matched_job_url=NULL, matched_company=NULL, matched_method=?,
-                   snippet=NULL, created_at=?, storage_version=?
-             WHERE id=?
-            """,
-            (
-                digest,
-                sender_domain,
-                received_at,
-                confidence,
-                matched_method,
-                created_at,
-                STORAGE_VERSION,
-                survivor["id"],
-            ),
-        )
+        if int(survivor["storage_version"] or 0) < STORAGE_VERSION:
+            conn.execute(
+                """
+                UPDATE inbox_events
+                   SET message_id=?, thread_id=NULL, sender=NULL, sender_domain=?,
+                       subject=NULL, received_at=?, event_type='auth_event', confidence=?,
+                       matched_job_url=NULL, matched_company=NULL, matched_method=?,
+                       snippet=NULL, created_at=?, storage_version=?
+                 WHERE id=?
+                """,
+                (
+                    digest,
+                    sender_domain,
+                    received_at,
+                    confidence,
+                    matched_method,
+                    created_at,
+                    STORAGE_VERSION,
+                    survivor["id"],
+                ),
+            )

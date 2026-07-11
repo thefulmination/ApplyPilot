@@ -322,6 +322,15 @@ def _specific_auth_value(value: str, *, minimum: int) -> bool:
     )
 
 
+def _nontrivial_unknown_auth_value(value: str) -> bool:
+    decoded = value
+    while True:
+        next_value = unquote_plus(decoded)
+        if next_value == decoded:
+            return _specific_auth_value(decoded, minimum=4)
+        decoded = next_value
+
+
 def _token_like_path_segment(value: str) -> bool:
     if not re.fullmatch(r"[A-Za-z0-9._~%+-]+", value):
         return False
@@ -385,14 +394,12 @@ def _magic_link_secrets(url: str) -> set[str]:
             for pair in raw_component.split("&"):
                 raw_key, separator, raw_value = pair.partition("=")
                 if not separator:
-                    variants = _exact_secret_variants(pair)
-                    if any(
-                        _specific_auth_value(variant, minimum=12)
-                        for variant in variants
-                    ):
+                    if _nontrivial_unknown_auth_value(pair):
                         add_variants(pair)
                     continue
-                if _sensitive_query_key(raw_key):
+                if _sensitive_query_key(raw_key) or _nontrivial_unknown_auth_value(
+                    raw_value
+                ):
                     add_variants(raw_value)
 
         expect_path_secret = False

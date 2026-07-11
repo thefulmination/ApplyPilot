@@ -20,6 +20,10 @@ from email.message import Message
 from typing import Any, Protocol
 
 MAX_MAIL_MESSAGES = 1000
+DEFAULT_MAX_MAIL_MESSAGE_BYTES = 1024 * 1024
+DEFAULT_MAX_MAIL_SCAN_BYTES = 8 * 1024 * 1024
+MAX_CONFIGURED_MAIL_MESSAGE_BYTES = 4 * 1024 * 1024
+MAX_CONFIGURED_MAIL_SCAN_BYTES = 32 * 1024 * 1024
 
 
 def validate_max_messages(
@@ -37,6 +41,14 @@ def validate_max_messages(
     if cap is not None and budget > cap:
         raise ValueError(f"max_messages must be <= {cap}")
     return budget
+
+
+def _validate_byte_limit(value, *, name: str, cap: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value <= 0 or value > cap:
+        raise ValueError(f"{name} must be between 1 and {cap}")
+    return value
 
 
 @dataclass
@@ -161,10 +173,28 @@ class ImapMailSource:
     """Read-only IMAP mail reader for a Gmail account, authenticated with an
     app password (never expires, unlike the OAuth token it replaces)."""
 
-    def __init__(self, email_addr: str, app_password: str, *, imap=None):
+    def __init__(
+        self,
+        email_addr: str,
+        app_password: str,
+        *,
+        imap=None,
+        max_message_bytes: int = DEFAULT_MAX_MAIL_MESSAGE_BYTES,
+        max_scan_bytes: int = DEFAULT_MAX_MAIL_SCAN_BYTES,
+    ):
         self._email_addr = email_addr
         self._app_password = (app_password or "").replace(" ", "")
         self._injected_imap = imap
+        self._max_message_bytes = _validate_byte_limit(
+            max_message_bytes,
+            name="max_message_bytes",
+            cap=MAX_CONFIGURED_MAIL_MESSAGE_BYTES,
+        )
+        self._max_scan_bytes = _validate_byte_limit(
+            max_scan_bytes,
+            name="max_scan_bytes",
+            cap=MAX_CONFIGURED_MAIL_SCAN_BYTES,
+        )
 
     def fetch(
         self,
@@ -212,8 +242,23 @@ class ImapMailSource:
             newest_ids = ids[-budget:]
 
             messages: list[MailMessage] = []
+            scanned_bytes = 0
             for msg_id in newest_ids:
                 uid = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+                if gmail_raw_query:
+                    status, size_data = imap.uid(
+                        "FETCH", uid, "(RFC822.SIZE)"
+                    )
+                    _ensure_ok(status, f"uid size fetch for message {uid}", size_data)
+                else:
+                    status, size_data = imap.fetch(uid, "(RFC822.SIZE)")
+                    _ensure_ok(status, f"size fetch for message {uid}", size_data)
+                message_size = _extract_imap_size(size_data)
+                if message_size is None or message_size > self._max_message_bytes:
+                    continue
+                if scanned_bytes + message_size > self._max_scan_bytes:
+                    break
+
                 if gmail_raw_query:
                     status, fetch_data = imap.uid("FETCH", uid, "(RFC822)")
                     _ensure_ok(status, f"uid fetch for message {uid}", fetch_data)
@@ -223,6 +268,11 @@ class ImapMailSource:
                 raw = _extract_raw_bytes(fetch_data)
                 if raw is None:
                     raise MailSourceError(f"IMAP fetch returned no RFC822 payload for message {uid}")
+                if len(raw) > self._max_message_bytes:
+                    continue
+                if scanned_bytes + len(raw) > self._max_scan_bytes:
+                    break
+                scanned_bytes += len(raw)
                 messages.append(_normalize(uid, raw))
 
             return messages
@@ -246,6 +296,18 @@ def _extract_raw_bytes(fetch_data) -> bytes | None:
             candidate = item[1]
             if isinstance(candidate, bytes):
                 return candidate
+    return None
+
+
+def _extract_imap_size(fetch_data) -> int | None:
+    for item in fetch_data or ():
+        values = item if isinstance(item, tuple) else (item,)
+        for value in values:
+            if not isinstance(value, bytes):
+                continue
+            match = re.search(rb"RFC822\.SIZE\s+(\d+)", value)
+            if match:
+                return int(match.group(1))
     return None
 
 
@@ -293,12 +355,28 @@ class GmailApiMailSource:
     7 days for unverified apps -- ImapMailSource is the permanent successor.
     """
 
-    def __init__(self, build_service=None):
+    def __init__(
+        self,
+        build_service=None,
+        *,
+        max_message_bytes: int = DEFAULT_MAX_MAIL_MESSAGE_BYTES,
+        max_scan_bytes: int = DEFAULT_MAX_MAIL_SCAN_BYTES,
+    ):
         if build_service is None:
             from applypilot.gmail_outcomes import build_gmail_service
 
             build_service = build_gmail_service
         self._build_service = build_service
+        self._max_message_bytes = _validate_byte_limit(
+            max_message_bytes,
+            name="max_message_bytes",
+            cap=MAX_CONFIGURED_MAIL_MESSAGE_BYTES,
+        )
+        self._max_scan_bytes = _validate_byte_limit(
+            max_scan_bytes,
+            name="max_scan_bytes",
+            cap=MAX_CONFIGURED_MAIL_SCAN_BYTES,
+        )
 
     def fetch(
         self,
@@ -341,13 +419,36 @@ class GmailApiMailSource:
                 break
 
         messages: list[MailMessage] = []
+        scanned_bytes = 0
         for ref in refs:
+            metadata = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=ref["id"],
+                    format="metadata",
+                    fields="id,threadId,sizeEstimate",
+                )
+                .execute()
+            )
+            message_size = metadata.get("sizeEstimate")
+            if (
+                isinstance(message_size, bool)
+                or not isinstance(message_size, int)
+                or message_size < 0
+                or message_size > self._max_message_bytes
+            ):
+                continue
+            if scanned_bytes + message_size > self._max_scan_bytes:
+                break
             msg = (
                 service.users()
                 .messages()
                 .get(userId="me", id=ref["id"], format="full")
                 .execute()
             )
+            scanned_bytes += message_size
             payload = msg.get("payload", {})
             headers = _gmail_headers(payload)
             messages.append(

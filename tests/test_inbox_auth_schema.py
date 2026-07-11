@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from applypilot import database
+from applypilot.auth_event_storage import STORAGE_VERSION, scrub_inbox_events
 
 
 def test_init_db_creates_inbox_auth_tables(tmp_path: Path) -> None:
@@ -175,9 +176,9 @@ def test_inbox_event_scrub_migration_hashes_merges_and_preserves_fk_links(
     assert event["message_id"] == digest
     assert event["thread_id"] is None
     assert event["sender"] is None
-    assert event["sender_domain"] == "greenhouse.io"
+    assert event["sender_domain"] is None
     assert event["subject"] is None
-    assert event["received_at"] == "2026-07-10T12:30:00+00:00"
+    assert event["received_at"] is None
     assert event["event_type"] == "auth_event"
     assert event["confidence"] in {"low", "medium", "high"}
     assert event["matched_job_url"] is None
@@ -196,3 +197,55 @@ def test_inbox_event_scrub_migration_hashes_merges_and_preserves_fk_links(
     assert len(linked) == 1 and linked[0]["inbox_event_id"] == digest_event
     assert len(conflicted) == 1
     assert tuple(conflicted[0]) == ("failed", None, None, "message_claim_conflict")
+
+
+def test_inbox_event_scrub_reads_and_updates_only_outdated_rows(tmp_path: Path) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    now = "2026-07-10T12:00:00+00:00"
+    conn.executemany(
+        """
+        INSERT INTO inbox_events (
+            message_id, event_type, confidence, created_at, storage_version
+        ) VALUES (?, 'auth_event', 'high', ?, ?)
+        """,
+        [(f"sha256:{index:064x}", now, STORAGE_VERSION) for index in range(400)],
+    )
+    legacy_id = conn.execute(
+        """
+        INSERT INTO inbox_events (
+            message_id, subject, event_type, confidence, created_at, storage_version
+        ) VALUES ('legacy-selective', 'legacy secret', 'auth_code', 'high', ?, 0)
+        """,
+        (now,),
+    ).lastrowid
+    conn.commit()
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    scrub_inbox_events(conn, migration_now=now)
+
+    conn.set_trace_callback(None)
+    event_selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+        and "FROM INBOX_EVENTS" in statement.upper()
+    ]
+    event_updates = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("UPDATE INBOX_EVENTS")
+    ]
+    assert event_selects
+    assert "COALESCE(STORAGE_VERSION, 0) <" in event_selects[0].upper()
+    assert len(event_updates) == 1
+    assert f"WHERE id={legacy_id}" in event_updates[0]
+
+    statements = []
+    conn.set_trace_callback(statements.append)
+    scrub_inbox_events(conn, migration_now=now)
+    conn.set_trace_callback(None)
+    assert not any(
+        statement.lstrip().upper().startswith("UPDATE INBOX_EVENTS")
+        for statement in statements
+    )

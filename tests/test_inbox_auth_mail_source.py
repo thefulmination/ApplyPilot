@@ -123,8 +123,11 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
         def list(self, userId, q, maxResults):
             return _FakeRequest({"messages": [{"id": "m2", "threadId": "t2"}]})
 
-        def get(self, userId, id, format):  # noqa: A002
+        def get(self, userId, id, format, fields=None):  # noqa: A002
             import base64
+
+            if format == "metadata":
+                return _FakeRequest({"id": id, "threadId": "t2", "sizeEstimate": 100})
 
             encoded = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii").rstrip("=")
             payload = {

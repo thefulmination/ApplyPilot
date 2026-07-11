@@ -137,6 +137,7 @@ class FakeImap:
         self.login_calls = []
         self.selected = None
         self.uid_calls = []
+        self.fetch_calls = []
 
     def login(self, email_addr, app_password):
         self.login_calls.append((email_addr, app_password))
@@ -151,10 +152,13 @@ class FakeImap:
         return "OK", [b" ".join(self._search_ids)]
 
     def fetch(self, uid, parts):
+        self.fetch_calls.append((uid, parts))
         key = uid.encode() if isinstance(uid, str) else uid
         raw = self._messages_by_id.get(key)
         if raw is None:
             return "NO", [None]
+        if "RFC822.SIZE" in parts:
+            return "OK", [(b"1 (RFC822.SIZE %d)" % len(raw), b"")]
         return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
 
     def uid(self, command, *args):
@@ -163,10 +167,13 @@ class FakeImap:
             return "OK", [b" ".join(self._gmraw_ids)]
         if command.upper() == "FETCH":
             uid = args[0]
+            parts = args[1]
             key = uid.encode() if isinstance(uid, str) else uid
             raw = self._messages_by_id.get(key)
             if raw is None:
                 return "NO", [None]
+            if "RFC822.SIZE" in parts:
+                return "OK", [(b"1 (RFC822.SIZE %d)" % len(raw), b"")]
             return "OK", [(b"1 (RFC822 {%d}" % len(raw), raw), b")"]
         return "NO", [b"unsupported uid command"]
 
@@ -210,6 +217,78 @@ def test_fetch_respects_max_messages_cap_when_fewer_available():
     result = source.fetch(since_days=7, max_messages=10)
 
     assert len(result) == 2
+
+
+def test_imap_skips_oversize_message_without_full_fetch():
+    raw = _base64_plain_raw()
+    fake = FakeImap(search_ids=[b"1"], messages_by_id={b"1": raw})
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=len(raw) - 1,
+        max_scan_bytes=len(raw) * 2,
+    )
+
+    assert source.fetch(since_days=7, max_messages=1) == []
+    assert fake.fetch_calls == [("1", "(RFC822.SIZE)")]
+
+
+def test_imap_accepts_exact_message_byte_boundary():
+    raw = _base64_plain_raw()
+    fake = FakeImap(search_ids=[b"1"], messages_by_id={b"1": raw})
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=len(raw),
+        max_scan_bytes=len(raw),
+    )
+
+    result = source.fetch(since_days=7, max_messages=1)
+
+    assert [message.id for message in result] == ["1"]
+    assert fake.fetch_calls == [
+        ("1", "(RFC822.SIZE)"),
+        ("1", "(RFC822)"),
+    ]
+
+
+def test_imap_aggregate_cap_stops_further_full_fetches():
+    raw = _base64_plain_raw()
+    fake = FakeImap(
+        search_ids=[b"1", b"2", b"3"],
+        messages_by_id={b"1": raw, b"2": raw, b"3": raw},
+    )
+    source = ImapMailSource(
+        "me@example.com",
+        "password",
+        imap=fake,
+        max_message_bytes=len(raw),
+        max_scan_bytes=len(raw) * 2,
+    )
+
+    result = source.fetch(since_days=7, max_messages=3)
+
+    assert [message.id for message in result] == ["1", "2"]
+    assert ("3", "(RFC822)") not in fake.fetch_calls
+
+
+def test_imap_malformed_size_metadata_fails_closed_without_full_fetch():
+    class MalformedSizeImap(FakeImap):
+        def fetch(self, uid, parts):
+            self.fetch_calls.append((uid, parts))
+            if "RFC822.SIZE" in parts:
+                return "OK", [(b"1 (RFC822.SIZE nope)", b"")]
+            raise AssertionError("full fetch must not occur")
+
+    fake = MalformedSizeImap(
+        search_ids=[b"1"], messages_by_id={b"1": _base64_plain_raw()}
+    )
+
+    assert ImapMailSource("me@example.com", "password", imap=fake).fetch(
+        since_days=7, max_messages=1
+    ) == []
 
 
 def test_fetch_nonpositive_budget_does_no_imap_work():

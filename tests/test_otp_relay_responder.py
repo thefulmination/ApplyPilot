@@ -5,6 +5,7 @@ import sys
 import pytest
 from psycopg.pq import TransactionStatus
 
+from applypilot import auth_matching
 from applypilot.apply import pgqueue
 from applypilot.fleet import otp_relay, schema as fleet_schema
 
@@ -213,12 +214,14 @@ def test_perfect_matching_handles_1000_item_augmenting_path_iteratively():
     original_recursion_limit = sys.getrecursionlimit()
     try:
         sys.setrecursionlimit(500)
-        matching = otp_relay._perfect_component_matching(range(size), request_edges)
+        matching = auth_matching.perfect_component_matching(range(size), request_edges)
     finally:
         sys.setrecursionlimit(original_recursion_limit)
 
     assert matching == {request_id: request_id for request_id in range(size)}
-    assert otp_relay._matching_is_unique(matching, request_edges) is True
+    assert auth_matching.matching_is_unique(matching, request_edges) is True
+    assert not hasattr(otp_relay, "_perfect_component_matching")
+    assert not hasattr(otp_relay, "_matching_is_unique")
 
 
 def test_answer_pending_finds_globally_unique_complete_matching(fleet_db, monkeypatch):

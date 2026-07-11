@@ -1,9 +1,16 @@
 """Tests for the mail-source backend factory (no network -- fake Gmail service)."""
 
+import json
+
 import pytest
 
 from applypilot import config
-from applypilot.mail_source import GmailApiMailSource, ImapMailSource, get_mail_source
+from applypilot.mail_source import (
+    MAX_CONFIGURED_MAIL_SCAN_BYTES,
+    GmailApiMailSource,
+    ImapMailSource,
+    get_mail_source,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +46,13 @@ class _Execable:
 
 
 class _FakeMessages:
-    def __init__(self, list_result, get_result):
+    def __init__(self, list_result, get_result, metadata_result=None):
         self._list_result = list_result
         self._get_result = get_result
+        self._metadata_result = metadata_result
         self.list_calls = []
         self.get_calls = []
+        self.metadata_calls = []
 
     def list(self, userId, q, maxResults, pageToken=None):
         self.list_calls.append((userId, q, maxResults, pageToken))
@@ -53,14 +62,30 @@ class _FakeMessages:
             result = self._list_result
         return _Execable(result)
 
-    def get(self, userId, id, format):
-        self.get_calls.append((userId, id, format))
+    def get(self, userId, id, format, fields=None):
         if callable(self._get_result):
             result = self._get_result(id)
         elif id in self._get_result:
             result = self._get_result[id]
         else:
             result = self._get_result
+        if format == "metadata":
+            self.metadata_calls.append((userId, id, format, fields))
+            if self._metadata_result is not None:
+                if callable(self._metadata_result):
+                    return _Execable(self._metadata_result(id))
+                per_message = self._metadata_result.get(id)
+                return _Execable(
+                    per_message if isinstance(per_message, dict) else self._metadata_result
+                )
+            return _Execable(
+                {
+                    "id": id,
+                    "threadId": result.get("threadId", id),
+                    "sizeEstimate": len(json.dumps(result).encode("utf-8")),
+                }
+            )
+        self.get_calls.append((userId, id, format))
         return _Execable(result)
 
 
@@ -73,8 +98,8 @@ class _FakeUsers:
 
 
 class _FakeGmailService:
-    def __init__(self, list_result, get_result):
-        self.messages_obj = _FakeMessages(list_result, get_result)
+    def __init__(self, list_result, get_result, metadata_result=None):
+        self.messages_obj = _FakeMessages(list_result, get_result, metadata_result)
 
     def users(self):
         return _FakeUsers(self.messages_obj)
@@ -118,6 +143,99 @@ def test_gmail_api_mail_source_fetch_maps_payload_to_mail_message():
 
     assert fake_service.messages_obj.list_calls == [("me", "newer_than:7d", 5, None)]
     assert fake_service.messages_obj.get_calls == [("me", "1", "full")]
+    assert len(fake_service.messages_obj.metadata_calls) == 1
+
+
+def test_gmail_api_skips_oversize_message_without_full_fetch():
+    full = {"id": "1", "payload": _gmail_payload_with_text_plain("secret")}
+    service = _FakeGmailService(
+        {"messages": [{"id": "1"}]},
+        full,
+        metadata_result={"id": "1", "sizeEstimate": 101},
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=100,
+        max_scan_bytes=200,
+    ).fetch(since_days=7, max_messages=1)
+
+    assert result == []
+    assert service.messages_obj.get_calls == []
+    assert len(service.messages_obj.metadata_calls) == 1
+
+
+def test_gmail_api_accepts_exact_byte_boundary():
+    full = {"id": "1", "payload": _gmail_payload_with_text_plain("secret")}
+    service = _FakeGmailService(
+        {"messages": [{"id": "1"}]},
+        full,
+        metadata_result={"id": "1", "sizeEstimate": 100},
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=100,
+        max_scan_bytes=100,
+    ).fetch(since_days=7, max_messages=1)
+
+    assert [message.id for message in result] == ["1"]
+    assert service.messages_obj.get_calls == [("me", "1", "full")]
+
+
+def test_gmail_api_aggregate_cap_stops_further_full_fetches():
+    refs = [{"id": str(index)} for index in range(3)]
+    full = {
+        str(index): {
+            "id": str(index),
+            "payload": _gmail_payload_with_text_plain(f"secret-{index}"),
+        }
+        for index in range(3)
+    }
+    service = _FakeGmailService(
+        {"messages": refs},
+        full,
+        metadata_result={
+            str(index): {"id": str(index), "sizeEstimate": 10}
+            for index in range(3)
+        },
+    )
+
+    result = GmailApiMailSource(
+        build_service=lambda: service,
+        max_message_bytes=10,
+        max_scan_bytes=20,
+    ).fetch(since_days=7, max_messages=3)
+
+    assert [message.id for message in result] == ["0", "1"]
+    assert service.messages_obj.get_calls == [
+        ("me", "0", "full"),
+        ("me", "1", "full"),
+    ]
+
+
+@pytest.mark.parametrize("size", [None, "10", -1, True])
+def test_gmail_api_malformed_size_fails_closed_without_full_fetch(size):
+    full = {"id": "1", "payload": _gmail_payload_with_text_plain("secret")}
+    metadata = {"id": "1"}
+    if size is not None:
+        metadata["sizeEstimate"] = size
+    service = _FakeGmailService(
+        {"messages": [{"id": "1"}]},
+        full,
+        metadata_result=metadata,
+    )
+
+    assert GmailApiMailSource(build_service=lambda: service).fetch(
+        since_days=7, max_messages=1
+    ) == []
+    assert service.messages_obj.get_calls == []
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, MAX_CONFIGURED_MAIL_SCAN_BYTES + 1])
+def test_mail_source_rejects_unbounded_or_malformed_byte_configuration(limit):
+    with pytest.raises((TypeError, ValueError), match="max_scan_bytes"):
+        GmailApiMailSource(max_scan_bytes=limit)
 
 
 def test_gmail_api_mail_source_fetch_uses_gmail_raw_query_when_provided():
