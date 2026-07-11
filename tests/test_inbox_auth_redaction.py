@@ -294,6 +294,43 @@ def test_magic_link_redactor_parses_structures_at_every_url_and_hint_layer():
     assert ordinary in redacted
 
 
+def test_magic_link_redactor_parses_fragment_routes_at_every_url_layer():
+    nested_url = (
+        "https://boards.greenhouse.io/#/verify/nested9;mx=m2?token=t2"
+    )
+    nested = quote(quote(nested_url, safe=""), safe="")
+    hints = (
+        "magic_link=https://boards.greenhouse.io/#/verify/fragSecret987",
+        "magic_link=https://boards.greenhouse.io/#/%76erify%2Ftoken",
+        (
+            "magic_link=https://boards.greenhouse.io/"
+            "#/apply;ticket=matrix7?auth=query8&empty="
+        ),
+        "magic_link=https://boards.greenhouse.io/#route%5Cback9",
+        f"magic_link={nested}",
+    )
+    secrets = (
+        "fragSecret987",
+        "token",
+        "matrix7",
+        "query8",
+        "back9",
+        "nested9",
+        "m2",
+        "t2",
+        "%76erify",
+    )
+    ordinary = "unrelated prose and boards.greenhouse.io remain"
+
+    redacted = " | ".join((*secrets, ordinary))
+    for hint in hints:
+        redacted = launcher._redact_inbox_auth_secrets(redacted, hint)
+
+    for secret in secrets:
+        assert secret not in redacted
+    assert ordinary in redacted
+
+
 def test_auth_hint_size_boundary_is_accepted():
     hint = "code=" + "a" * (launcher.MAX_INBOX_AUTH_HINT_BYTES - len("code="))
     prefix = "https://boards.greenhouse.io/verify?note="
@@ -337,12 +374,13 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     sink_short = "z1"
     sink_key = "k1"
     sink_port = "54321"
+    fragment_route = "fr1"
     secret = (
         f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io:{sink_port}/"
         "verify/pathTokenABC123456"
         f"?token={encoded_token}&verify={short_token}"
         f"%26custom%3D{delimiter_token}%26id%3D{sink_short}%26{sink_key}%3D"
-        f"#state={standalone_token}"
+        f"#/verify/{fragment_route}?state={standalone_token}"
     )
     hint = f"magic_link={secret}"
     events = [
@@ -355,7 +393,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                         "text": (
                             f"Used {standalone_token}, {decoded_token}, {short_token}, "
                             f"{userinfo}, {subdomain_token}, {delimiter_token}, "
-                            f"{sink_short}, {sink_key}, and {sink_port}; "
+                            f"{sink_short}, {sink_key}, {sink_port}, and "
+                            f"{fragment_route}; "
                             "quick stays ordinary"
                         ),
                     },
@@ -366,7 +405,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                             "url": (
                                 f"https://tool.invalid/use/{encoded_token}/"
                                 f"{userinfo}/{subdomain_token}/{short_token}/"
-                                f"{delimiter_token}/{sink_short}/{sink_key}/{sink_port}"
+                                f"{delimiter_token}/{sink_short}/{sink_key}/{sink_port}/"
+                                f"{fragment_route}"
                             )
                         },
                     },
@@ -378,7 +418,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             "result": (
                 f"Used {standalone_token} {encoded_token} {short_token} "
                 f"{userinfo} {subdomain_token} {delimiter_token} {sink_short} "
-                f"{sink_key} {sink_port}; "
+                f"{sink_key} {sink_port} {fragment_route}; "
                 "quick stays ordinary\nRESULT:APPLIED"
             ),
             "usage": {},
@@ -426,6 +466,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             sink_short,
             sink_key,
             sink_port,
+            fragment_route,
         ):
             assert sensitive not in persisted
         assert launcher.INBOX_AUTH_REDACTION in persisted
@@ -446,6 +487,7 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             sink_short,
             sink_key,
             sink_port,
+            fragment_route,
         )
     )
     assert any(launcher.INBOX_AUTH_REDACTION in action for action in tool_actions)

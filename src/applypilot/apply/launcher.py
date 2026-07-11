@@ -287,7 +287,7 @@ def _raw_url_port(netloc: str) -> str | None:
 
 
 def _decode_url_structural_delimiters(value: str) -> str:
-    delimiters = frozenset(":/?#@;&=")
+    delimiters = frozenset(":/?#@;&=\\")
 
     def replace(match: re.Match) -> str:
         decoded = chr(int(match.group(1), 16))
@@ -327,6 +327,20 @@ def _magic_link_secrets(url: str) -> set[str]:
         if raw_value:
             add_variants(raw_value)
 
+    def add_fragment_route(fragment: str) -> None:
+        route, query_separator, route_query = fragment.partition("?")
+        for segment in re.split(r"[/\\]", route):
+            if not segment:
+                continue
+            path_value, *matrix_tokens = segment.split(";")
+            if path_value:
+                add_variants(path_value)
+            for token in matrix_tokens:
+                add_parameter_token(token)
+        if query_separator:
+            for token in re.split(r"[&;]", route_query):
+                add_parameter_token(token)
+
     add_variants(url)
     parsed_layers: dict[str, None] = {}
     for decoded_layer in _progressive_percent_decode_layers(url):
@@ -356,6 +370,8 @@ def _magic_link_secrets(url: str) -> set[str]:
                 continue
             for token in re.split(r"[&;]", raw_component):
                 add_parameter_token(token)
+        if parsed.fragment:
+            add_fragment_route(parsed.fragment)
 
         expect_path_secret = False
         for segment in parsed.path.split("/"):
