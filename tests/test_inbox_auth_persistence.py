@@ -88,6 +88,49 @@ def _seed_job_and_challenge(conn, *, job_url: str) -> int:
     )
 
 
+def _seed_active_challenge_snapshot(
+    conn,
+    *,
+    count: int,
+    now: datetime,
+    other_provider: str = "greenhouse.io",
+) -> int:
+    job_url = f"snapshot-{count}-{other_provider}"
+    now_text = now.isoformat()
+    expires_text = (now + timedelta(minutes=10)).isoformat()
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, discovered_at) VALUES (?, 'T', 'S', ?)",
+        (job_url, now_text),
+    )
+    conn.executemany(
+        """
+        INSERT INTO auth_challenges (
+            job_url, application_url, provider, challenge_type, status,
+            requested_at, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'email_code', 'pending', ?, ?, ?, ?)
+        """,
+        [
+            (
+                job_url,
+                job_url,
+                "greenhouse.io" if index == 0 else other_provider,
+                now_text,
+                expires_text,
+                now_text,
+                now_text,
+            )
+            for index in range(count)
+        ],
+    )
+    conn.commit()
+    return int(
+        conn.execute(
+            "SELECT MIN(id) FROM auth_challenges WHERE job_url=?",
+            (job_url,),
+        ).fetchone()[0]
+    )
+
+
 def test_record_inbox_event_is_idempotent(tmp_path, monkeypatch) -> None:
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(inbox_auth, "get_connection", lambda: conn)
@@ -541,6 +584,53 @@ def test_snapshot_claim_rejects_ineligible_candidate(
         (challenge_id,),
     ).fetchone()
     assert tuple(row) == ("pending", None)
+
+
+def test_snapshot_claim_active_challenge_overflow_fails_closed(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    now = datetime.now(timezone.utc)
+    target = _seed_active_challenge_snapshot(conn, count=1001, now=now)
+    match = _match("overflow-message", now)
+    changes_before = conn.total_changes
+
+    assert inbox_auth.claim_unique_auth_match(
+        target,
+        [match],
+        now=now,
+        connection=conn,
+    ) is None
+
+    assert conn.total_changes == changes_before
+    assert conn.execute("SELECT COUNT(*) FROM inbox_events").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM auth_challenges WHERE status='pending'"
+    ).fetchone()[0] == 1001
+    assert conn.in_transaction is False
+    conn.execute("BEGIN IMMEDIATE")
+    conn.rollback()
+
+
+def test_snapshot_claim_accepts_exact_active_challenge_bound(tmp_path) -> None:
+    conn = database.init_db(tmp_path / "applypilot.db")
+    now = datetime.now(timezone.utc)
+    target = _seed_active_challenge_snapshot(
+        conn,
+        count=1000,
+        now=now,
+        other_provider="workday.com",
+    )
+    match = _match("bounded-message", now)
+
+    assert inbox_auth.claim_unique_auth_match(
+        target,
+        [match],
+        now=now,
+        connection=conn,
+    ) == match
+    assert conn.execute("SELECT COUNT(*) FROM inbox_events").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM auth_challenges WHERE status='resolved'"
+    ).fetchone()[0] == 1
 
 
 def test_snapshot_claim_prevents_sequential_message_reuse(tmp_path, monkeypatch) -> None:

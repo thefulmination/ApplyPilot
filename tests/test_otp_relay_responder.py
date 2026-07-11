@@ -313,7 +313,7 @@ def test_answer_pending_bounds_pending_and_candidate_matching_sets(
                 "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
                 "SELECT 'bounded-' || value, 'https://greenhouse.io/' || value, "
                 "       'greenhouse.io', now() + interval '5 minutes' "
-                "FROM generate_series(1, 1001) AS value"
+                "FROM generate_series(1, 1000) AS value"
             )
         conn.commit()
 
@@ -326,6 +326,60 @@ def test_answer_pending_bounds_pending_and_candidate_matching_sets(
         "pending": 1000,
         "parsed": 1000,
     }
+
+
+def test_answer_pending_request_snapshot_overflow_fails_before_scan(
+    fleet_db, monkeypatch,
+):
+    now = dt.datetime.now(dt.timezone.utc)
+    matches = [_Match("overflow-message", _rfc(now), "123456")]
+    scan_called = False
+
+    def fail_if_scanned(**_kwargs):
+        nonlocal scan_called
+        scan_called = True
+        raise AssertionError("overflowed request snapshot must not scan mailbox")
+
+    monkeypatch.setattr(
+        otp_relay.inbox_auth,
+        "scan_gmail_for_auth_codes",
+        fail_if_scanned,
+    )
+
+    with _fresh(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
+                "SELECT 'overflow-' || value, 'https://greenhouse.io/' || value, "
+                "       'greenhouse.io', now() + interval '5 minutes' "
+                "FROM generate_series(1, 1001) AS value"
+            )
+        conn.commit()
+
+        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS changed FROM otp_request "
+                "WHERE code IS NOT NULL OR answered_at IS NOT NULL "
+                "   OR matched_message_id IS NOT NULL"
+            )
+            assert cur.fetchone()["changed"] == 0
+        conn.commit()
+        with _fresh(fleet_db) as verifier:
+            with verifier.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_try_advisory_lock(%s) AS acquired",
+                    (otp_relay._responder_lock_key(),),
+                )
+                assert cur.fetchone()["acquired"] is True
+                cur.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (otp_relay._responder_lock_key(),),
+                )
+            verifier.commit()
+
+    assert scan_called is False
 
 
 def test_answer_pending_returns_without_scan_when_responder_lock_is_held(

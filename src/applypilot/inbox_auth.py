@@ -56,6 +56,8 @@ AUTH_GMAIL_RAW_QUERY = (
     'OR "confirm your email" OR "magic link"'
 )
 
+_MAX_AUTH_SNAPSHOT_ITEMS = 1000
+
 _CODE_RE = re.compile(r"(?<![A-Za-z0-9-])\d{4,8}(?![A-Za-z0-9-])")
 _ALNUM_CODE_RE = re.compile(
     r"(?<![A-Za-z0-9-])(?=[A-Za-z0-9]{6,12}(?![A-Za-z0-9-]))"
@@ -996,7 +998,7 @@ def claimed_auth_message_ids(
     connection: sqlite3.Connection | None = None,
 ) -> set[str]:
     """Return claimed IDs from a bounded current candidate set."""
-    if len(candidate_message_ids) > 1000:
+    if len(candidate_message_ids) > _MAX_AUTH_SNAPSHOT_ITEMS:
         raise ValueError("candidate_message_ids must contain <= 1000 values")
     conn = connection or get_connection()
     claimed: set[str] = set()
@@ -1185,7 +1187,7 @@ def claim_unique_auth_match(
         received = _received_at_dt(match.received_at)
         if match.message_id and received is not None:
             candidates.setdefault(match.message_id, (match, received))
-        if len(candidates) > 1000:
+        if len(candidates) > _MAX_AUTH_SNAPSHOT_ITEMS:
             overflow = True
             break
     if not candidates or overflow:
@@ -1231,11 +1233,11 @@ def claim_unique_auth_match(
                AND julianday(requested_at) <= julianday(?)
                AND julianday(expires_at) > julianday(?)
              ORDER BY requested_at, id
-             LIMIT 1001
+             LIMIT ?
             """,
-            (now_text, now_text),
+            (now_text, now_text, _MAX_AUTH_SNAPSHOT_ITEMS + 1),
         ).fetchall()
-        if len(active) > 1000:
+        if len(active) > _MAX_AUTH_SNAPSHOT_ITEMS:
             conn.commit()
             return None
         requests = [dict(row) for row in active]
@@ -1261,7 +1263,7 @@ def claim_unique_auth_match(
             request_id=lambda request: request["id"],
             message_id=lambda item: item[0].message_id,
             eligible=eligible,
-            max_items=1000,
+            max_items=_MAX_AUTH_SNAPSHOT_ITEMS,
         )
         selected = next(
             (item[0] for request, item in assignments if request["id"] == challenge_id),

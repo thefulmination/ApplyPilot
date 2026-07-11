@@ -347,11 +347,12 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
             "SELECT id, requested_at, sender_hint FROM otp_request "
             "WHERE code IS NULL AND consumed_at IS NULL "
             "      AND expires_at > now() "
-            "ORDER BY requested_at, id LIMIT 1000"
+            "ORDER BY requested_at, id LIMIT %s",
+            (_MAX_RESPONDER_ITEMS + 1,),
         )
         pending = cur.fetchall()
     conn.commit()
-    if not pending:
+    if not pending or len(pending) > _MAX_RESPONDER_ITEMS:
         return 0
     answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
     scan_max_messages = min(
