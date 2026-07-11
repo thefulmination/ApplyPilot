@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit
 
 from rich.console import Console
 from rich.live import Live
@@ -29,6 +29,7 @@ from rich.live import Live
 from applypilot import config
 from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
+from applypilot.auth_event_storage import canonical_ats_sender_domain
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
 from applypilot import inbox_auth
@@ -185,20 +186,93 @@ INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
 _COMMON_AUTH_VALUES = frozenset(
     {"", "0", "1", "false", "true", "yes", "no", "continue", "verify", "login"}
 )
-_SENSITIVE_QUERY_KEYS = frozenset(
-    {"auth", "code", "key", "otp", "secret", "state", "t", "token", "verification"}
+_SENSITIVE_QUERY_KEY_PARTS = frozenset(
+    {
+        "auth",
+        "authentication",
+        "authorization",
+        "code",
+        "key",
+        "otp",
+        "secret",
+        "state",
+        "t",
+        "token",
+        "verification",
+        "verifier",
+        "verify",
+    }
 )
+_SENSITIVE_QUERY_KEY_COMPOUNDS = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authcode",
+        "authtoken",
+        "magiclinktoken",
+        "otpcode",
+        "secretkey",
+        "verificationcode",
+        "verifycode",
+    }
+)
+_MAX_SECRET_VARIANTS = 24
+_MAX_MAGIC_LINK_COMPONENTS = 48
+_MAX_MAGIC_LINK_SECRETS = 256
+_MAX_SECRET_VALUE_LENGTH = 8192
 
 
-def _decoded_variants(value: str) -> set[str]:
-    variants = set()
-    current = value
-    for _ in range(4):
-        if current in variants:
+def _percent_escape_case(value: str, *, upper: bool) -> str:
+    def replace(match: re.Match) -> str:
+        digits = match.group(1)
+        return "%" + (digits.upper() if upper else digits.lower())
+
+    return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
+
+
+def _exact_secret_variants(value: str) -> tuple[str, ...]:
+    """Return a capped set of exact raw, decoded, and re-encoded values."""
+    if not value or len(value) > _MAX_SECRET_VALUE_LENGTH:
+        return ()
+    variants: list[str] = []
+    pending = [value]
+    while pending and len(variants) < _MAX_SECRET_VARIANTS:
+        current = pending.pop(0)
+        if not current or current in variants:
+            continue
+        variants.append(current)
+        if len(variants) >= _MAX_SECRET_VARIANTS:
             break
-        variants.add(current)
-        current = unquote(current)
-    return variants
+        for candidate in (
+            unquote(current),
+            unquote_plus(current),
+            quote(current, safe=""),
+            quote_plus(current, safe=""),
+            _percent_escape_case(current, upper=True),
+            _percent_escape_case(current, upper=False),
+        ):
+            if (
+                candidate
+                and len(candidate) <= _MAX_SECRET_VALUE_LENGTH
+                and candidate not in variants
+                and candidate not in pending
+            ):
+                pending.append(candidate)
+    return tuple(variants)
+
+
+def _sensitive_query_key(value: str) -> bool:
+    decoded = unquote_plus(value).strip()
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", decoded)
+    parts = {
+        part.lower()
+        for part in re.split(r"[^A-Za-z0-9]+", separated)
+        if part
+    }
+    compact = re.sub(r"[^a-z0-9]", "", decoded.lower())
+    return bool(parts & _SENSITIVE_QUERY_KEY_PARTS) or (
+        compact in _SENSITIVE_QUERY_KEY_COMPOUNDS
+    )
 
 
 def _specific_auth_value(value: str, *, minimum: int) -> bool:
@@ -218,35 +292,80 @@ def _token_like_path_segment(value: str) -> bool:
     return len(value) >= (12 if has_alpha and has_digit else 16)
 
 
+def _token_like_subdomain_label(value: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9-]+", value):
+        return False
+    has_alpha = any(character.isalpha() for character in value)
+    has_digit = any(character.isdigit() for character in value)
+    return (len(value) >= 6 and has_digit) or (
+        len(value) >= 16 and has_alpha
+    )
+
+
 def _magic_link_secrets(url: str) -> set[str]:
-    secrets = set(_decoded_variants(url))
+    secrets: set[str] = set()
+    component_count = 0
+
+    def add_variants(value: str) -> None:
+        nonlocal component_count
+        if (
+            not value
+            or component_count >= _MAX_MAGIC_LINK_COMPONENTS
+            or len(secrets) >= _MAX_MAGIC_LINK_SECRETS
+        ):
+            return
+        component_count += 1
+        for variant in _exact_secret_variants(value):
+            if len(secrets) >= _MAX_MAGIC_LINK_SECRETS:
+                break
+            secrets.add(variant)
+
+    add_variants(url)
     parsed = urlsplit(url)
-    for segment in parsed.path.split("/"):
-        for variant in _decoded_variants(segment):
-            if _token_like_path_segment(variant):
-                secrets.add(variant)
+
+    raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
+    if separator:
+        username, password_separator, password = raw_userinfo.partition(":")
+        add_variants(username)
+        if password_separator:
+            add_variants(password)
+
+    hostname = parsed.hostname or ""
+    canonical_domain = canonical_ats_sender_domain(hostname)
+    if canonical_domain and hostname.endswith(f".{canonical_domain}"):
+        prefix = hostname[: -(len(canonical_domain) + 1)]
+        for label in prefix.split("."):
+            if _token_like_subdomain_label(label):
+                add_variants(label)
 
     for raw_component in (parsed.query, parsed.fragment):
         if not raw_component:
             continue
-        for pair in raw_component.split("&"):
+        for pair in raw_component.split("&")[:_MAX_MAGIC_LINK_COMPONENTS]:
             raw_key, separator, raw_value = pair.partition("=")
             if not separator:
-                for variant in _decoded_variants(pair):
-                    if _specific_auth_value(variant, minimum=12):
-                        secrets.add(variant)
+                variants = _exact_secret_variants(pair)
+                if any(
+                    _specific_auth_value(variant, minimum=12)
+                    for variant in variants
+                ):
+                    add_variants(pair)
                 continue
-            key = unquote(raw_key).strip().lower()
-            minimum = 6 if key in _SENSITIVE_QUERY_KEYS else 12
-            for variant in _decoded_variants(raw_value):
-                if _specific_auth_value(variant, minimum=minimum):
-                    secrets.add(variant)
-        for key, value in parse_qsl(raw_component, keep_blank_values=True):
-            minimum = 6 if key.strip().lower() in _SENSITIVE_QUERY_KEYS else 12
-            for variant in _decoded_variants(value):
-                if _specific_auth_value(variant, minimum=minimum):
-                    secrets.add(variant)
+            if _sensitive_query_key(raw_key):
+                add_variants(raw_value)
+
+    for segment in parsed.path.split("/")[:_MAX_MAGIC_LINK_COMPONENTS]:
+        variants = _exact_secret_variants(segment)
+        if any(_token_like_path_segment(variant) for variant in variants):
+            add_variants(segment)
     return secrets
+
+
+def _replace_exact_secret(text: str, secret: str) -> str:
+    if len(secret) < 6 and secret.isalnum():
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(secret)}(?![A-Za-z0-9])"
+        return re.sub(pattern, INBOX_AUTH_REDACTION, text)
+    return text.replace(secret, INBOX_AUTH_REDACTION)
 
 
 def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
@@ -264,7 +383,7 @@ def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
     redacted = text
     for secret in sorted(secrets, key=len, reverse=True):
         if secret:
-            redacted = redacted.replace(secret, INBOX_AUTH_REDACTION)
+            redacted = _replace_exact_secret(redacted, secret)
     return redacted
 _agent_lock = threading.Lock()
 

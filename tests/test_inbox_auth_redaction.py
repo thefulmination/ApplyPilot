@@ -74,15 +74,57 @@ def test_magic_link_redactor_removes_standalone_encoded_fragment_and_path_tokens
     assert redacted.count(launcher.INBOX_AUTH_REDACTION) >= 5
 
 
+def test_magic_link_redactor_covers_bounded_exact_credential_variants():
+    hint = (
+        "magic_link=https://user%2Bname:p%40ss@cred839214.greenhouse.io/verify/"
+        "pathToken%2BABC987654?accessToken=x7&otp=9&note=ordinary%20text"
+        "#verificationCode=frag%2B42"
+    )
+    sensitive = (
+        "user%2Bname",
+        "user+name",
+        "user name",
+        "p%40ss",
+        "p@ss",
+        "cred839214",
+        "pathToken%2BABC987654",
+        "pathToken+ABC987654",
+        "pathToken ABC987654",
+        "x7",
+        "9",
+        "frag%2B42",
+        "frag%2b42",
+        "frag+42",
+        "frag 42",
+        "frag%2042",
+    )
+    ordinary = "quick tokenization greenhouse.io ordinary text"
+    text = " | ".join((*sensitive, ordinary))
+
+    redacted = launcher._redact_inbox_auth_secrets(text, hint)
+
+    for secret in sensitive:
+        assert secret not in redacted
+    assert ordinary in redacted
+    assert "greenhouse.io" in redacted
+    variants = launcher._exact_secret_variants("%252525token+value")
+    assert len(variants) <= launcher._MAX_SECRET_VARIANTS
+    assert all(len(value) <= launcher._MAX_SECRET_VALUE_LENGTH for value in variants)
+
+
 def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result(
     tmp_path, monkeypatch
 ):
     standalone_token = "standaloneTokenABC987654"
     encoded_token = "encoded%252Ftoken-XYZ987654"
     decoded_token = "encoded/token-XYZ987654"
+    short_token = "x7"
+    userinfo = "user+name"
+    subdomain_token = "cred839214"
     secret = (
-        "https://boards.greenhouse.io/verify/pathTokenABC123456"
-        f"?token={encoded_token}#state={standalone_token}"
+        f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io/"
+        "verify/pathTokenABC123456"
+        f"?token={encoded_token}&verify={short_token}#state={standalone_token}"
     )
     hint = f"magic_link={secret}"
     events = [
@@ -92,13 +134,19 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                 "content": [
                     {
                         "type": "text",
-                        "text": f"Used {standalone_token} and {decoded_token}",
+                        "text": (
+                            f"Used {standalone_token}, {decoded_token}, {short_token}, "
+                            f"{userinfo}, and {subdomain_token}; quick stays ordinary"
+                        ),
                     },
                     {
                         "type": "tool_use",
                         "name": "mcp__playwright__browser_navigate",
                         "input": {
-                            "url": f"https://tool.invalid/use/{encoded_token}"
+                            "url": (
+                                f"https://tool.invalid/use/{encoded_token}/"
+                                f"{userinfo}/{subdomain_token}/{short_token}"
+                            )
                         },
                     },
                 ]
@@ -106,7 +154,10 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
         },
         {
             "type": "result",
-            "result": f"Used {standalone_token} {encoded_token}\nRESULT:APPLIED",
+            "result": (
+                f"Used {standalone_token} {encoded_token} {short_token} "
+                f"{userinfo} {subdomain_token}; quick stays ordinary\nRESULT:APPLIED"
+            ),
             "usage": {},
         },
     ]
@@ -140,14 +191,31 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     job_log = job_logs[0].read_text(encoding="utf-8")
     stats = launcher._last_run_stats[7]
     for persisted in (worker_log, job_log, stats["transcript"]):
-        for sensitive in (secret, standalone_token, encoded_token, decoded_token):
+        for sensitive in (
+            secret,
+            standalone_token,
+            encoded_token,
+            decoded_token,
+            short_token,
+            userinfo,
+            subdomain_token,
+        ):
             assert sensitive not in persisted
         assert launcher.INBOX_AUTH_REDACTION in persisted
+        assert "quick stays ordinary" in persisted
     tool_actions = [update.get("last_action", "") for update in state_updates]
     assert all(
         sensitive not in action
         for action in tool_actions
-        for sensitive in (secret, standalone_token, encoded_token, decoded_token)
+        for sensitive in (
+            secret,
+            standalone_token,
+            encoded_token,
+            decoded_token,
+            short_token,
+            userinfo,
+            subdomain_token,
+        )
     )
     assert any(launcher.INBOX_AUTH_REDACTION in action for action in tool_actions)
     assert stats["transcript_digest"] == (
