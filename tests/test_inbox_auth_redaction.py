@@ -6,6 +6,8 @@ import json
 import re
 from urllib.parse import quote
 
+import pytest
+
 from applypilot.apply import launcher
 
 
@@ -331,6 +333,72 @@ def test_magic_link_redactor_parses_fragment_routes_at_every_url_layer():
     assert ordinary in redacted
 
 
+def test_magic_link_redactor_recursively_inspects_nested_structured_values():
+    inner_ticket = "innerTicket987"
+    json_token = "jsonToken654"
+    array_secret = "arraySecret321"
+    combo_secret = "comboSecret852"
+    relative_secret = "relativeSecret741"
+    inner_url = f"https://nested.invalid/callback?ticket={inner_ticket}"
+    payload = json.dumps(
+        {
+            "jsonKeyABC": json_token,
+            "nestedArray": [{"arrayKeyXYZ": array_secret}, 731],
+            "relative": f"/verify/{relative_secret}",
+        },
+        separators=(",", ":"),
+    )
+    combo = "next=" + quote(
+        json.dumps({"comboKey": combo_secret}, separators=(",", ":")),
+        safe="",
+    )
+    hint = (
+        "magic_link=https://boards.greenhouse.io/verify"
+        f"?redirect={quote(quote(inner_url, safe=''), safe='')}"
+        f"&payload={quote(payload, safe='')}"
+        f"&combo={quote(combo, safe='')}"
+    )
+    secrets = (
+        inner_ticket,
+        "ticket",
+        json_token,
+        "jsonKeyABC",
+        "nestedArray",
+        "arrayKeyXYZ",
+        array_secret,
+        "731",
+        relative_secret,
+        combo_secret,
+        "comboKey",
+    )
+    ordinary = "unrelated prose remains intact"
+
+    redacted = launcher._redact_inbox_auth_secrets(
+        " | ".join((*secrets, ordinary)), hint
+    )
+
+    for secret in secrets:
+        assert secret not in redacted
+    assert ordinary in redacted
+    assert "boards.greenhouse.io" not in launcher._magic_link_secrets(
+        hint.removeprefix("magic_link=")
+    )
+
+
+def test_magic_link_redactor_rejects_excessive_unique_decode_work(monkeypatch):
+    nested = "ticket=boundedSecret987"
+    for _ in range(512):
+        nested = quote(nested, safe="")
+    hint = f"magic_link=https://boards.greenhouse.io/verify?redirect={nested}"
+    monkeypatch.setattr(launcher, "_AUTH_SECRET_MATERIAL_MULTIPLIER", 1_000_000)
+
+    with pytest.raises(
+        launcher._InboxAuthHintRejected,
+        match="inbox_auth_hint_too_complex",
+    ):
+        launcher._validate_inbox_auth_hint(hint)
+
+
 def test_auth_hint_size_boundary_is_accepted():
     hint = "code=" + "a" * (launcher.MAX_INBOX_AUTH_HINT_BYTES - len("code="))
     prefix = "https://boards.greenhouse.io/verify?note="
@@ -375,11 +443,32 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     sink_key = "k1"
     sink_port = "54321"
     fragment_route = "fr1"
+    nested_ticket = "nestedTicket951"
+    nested_json_token = "nestedJsonToken753"
+    nested_array_token = "nestedArrayToken159"
+    nested_redirect = quote(
+        quote(
+            f"https://nested.invalid/callback?ticket={nested_ticket}",
+            safe="",
+        ),
+        safe="",
+    )
+    nested_payload = quote(
+        json.dumps(
+            {
+                "payloadKey": nested_json_token,
+                "items": [{"arrayKey": nested_array_token}],
+            },
+            separators=(",", ":"),
+        ),
+        safe="",
+    )
     secret = (
         f"https://user%2Bname:pass%4042@{subdomain_token}.greenhouse.io:{sink_port}/"
         "verify/pathTokenABC123456"
         f"?token={encoded_token}&verify={short_token}"
         f"%26custom%3D{delimiter_token}%26id%3D{sink_short}%26{sink_key}%3D"
+        f"&redirect={nested_redirect}&payload={nested_payload}"
         f"#/verify/{fragment_route}?state={standalone_token}"
     )
     hint = f"magic_link={secret}"
@@ -394,7 +483,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                             f"Used {standalone_token}, {decoded_token}, {short_token}, "
                             f"{userinfo}, {subdomain_token}, {delimiter_token}, "
                             f"{sink_short}, {sink_key}, {sink_port}, and "
-                            f"{fragment_route}; "
+                            f"{fragment_route}, {nested_ticket}, "
+                            f"{nested_json_token}, and {nested_array_token}; "
                             "quick stays ordinary"
                         ),
                     },
@@ -406,7 +496,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
                                 f"https://tool.invalid/use/{encoded_token}/"
                                 f"{userinfo}/{subdomain_token}/{short_token}/"
                                 f"{delimiter_token}/{sink_short}/{sink_key}/{sink_port}/"
-                                f"{fragment_route}"
+                                f"{fragment_route}/{nested_ticket}/{nested_json_token}/"
+                                f"{nested_array_token}"
                             )
                         },
                     },
@@ -418,7 +509,8 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             "result": (
                 f"Used {standalone_token} {encoded_token} {short_token} "
                 f"{userinfo} {subdomain_token} {delimiter_token} {sink_short} "
-                f"{sink_key} {sink_port} {fragment_route}; "
+                f"{sink_key} {sink_port} {fragment_route} {nested_ticket} "
+                f"{nested_json_token} {nested_array_token}; "
                 "quick stays ordinary\nRESULT:APPLIED"
             ),
             "usage": {},
@@ -467,6 +559,9 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             sink_key,
             sink_port,
             fragment_route,
+            nested_ticket,
+            nested_json_token,
+            nested_array_token,
         ):
             assert sensitive not in persisted
         assert launcher.INBOX_AUTH_REDACTION in persisted
@@ -488,6 +583,9 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
             sink_key,
             sink_port,
             fragment_route,
+            nested_ticket,
+            nested_json_token,
+            nested_array_token,
         )
     )
     assert any(launcher.INBOX_AUTH_REDACTION in action for action in tool_actions)

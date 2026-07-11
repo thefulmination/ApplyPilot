@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -184,22 +185,11 @@ _agent_procs: dict[int, subprocess.Popen] = {}
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
 INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
-_SENSITIVE_PATH_MARKERS = frozenset(
-    {
-        "auth",
-        "authenticate",
-        "code",
-        "magic-link",
-        "magic_link",
-        "otp",
-        "token",
-        "verification",
-        "verify",
-    }
-)
 MAX_INBOX_AUTH_HINT_BYTES = 64 * 1024
 _AUTH_SECRET_MATERIAL_MULTIPLIER = 128
 _MIN_AUTH_SECRET_MATERIAL_BYTES = 4096
+_AUTH_SECRET_WORK_MULTIPLIER = 64
+_MIN_AUTH_SECRET_WORK_BYTES = 4096
 
 
 class _InboxAuthHintRejected(ValueError):
@@ -301,14 +291,37 @@ def _magic_link_secrets(url: str) -> set[str]:
     if url_bytes > MAX_INBOX_AUTH_HINT_BYTES:
         raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
     secrets: set[str] = set()
+    derived: set[str] = set()
+    pending: deque[str] = deque()
     material_bytes = 0
     material_budget = _secret_material_budget(url)
+    work_bytes = 0
+    work_budget = max(
+        _MIN_AUTH_SECRET_WORK_BYTES,
+        url_bytes * _AUTH_SECRET_WORK_MULTIPLIER,
+    )
 
-    def add_variants(value: str) -> None:
+    def add_secret(value: str) -> None:
         nonlocal material_bytes
         if not value:
             return
-        for variant in _exact_secret_variants(value):
+        plus_spaced = value.replace("+", " ")
+        plus_decoded = unquote_plus(value)
+        candidates = (value, plus_spaced, plus_decoded)
+        variants = (
+            candidate_variant
+            for candidate in candidates
+            for candidate_variant in (
+                candidate,
+                _percent_escape_case(candidate, upper=True),
+                _percent_escape_case(candidate, upper=False),
+                quote(candidate, safe=""),
+                quote_plus(candidate, safe=""),
+            )
+        )
+        for variant in variants:
+            if not variant:
+                continue
             if variant in secrets:
                 continue
             material_bytes += len(variant.encode("utf-8", errors="strict"))
@@ -316,87 +329,115 @@ def _magic_link_secrets(url: str) -> set[str]:
                 raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
             secrets.add(variant)
 
-    def add_parameter_token(token: str) -> None:
+    def derive(value: str) -> None:
+        nonlocal work_bytes
+        if not value or value in derived:
+            return
+        work_bytes += len(value.encode("utf-8", errors="strict"))
+        if work_bytes > work_budget:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+        derived.add(value)
+        add_secret(value)
+        pending.append(value)
+
+    def derive_parameter(token: str) -> None:
         raw_key, separator, raw_value = token.partition("=")
         if not separator:
-            if token:
-                add_variants(token)
+            derive(token)
             return
-        if raw_key:
-            add_variants(raw_key)
-        if raw_value:
-            add_variants(raw_value)
+        derive(raw_key)
+        derive(raw_value)
 
-    def add_fragment_route(fragment: str) -> None:
-        route, query_separator, route_query = fragment.partition("?")
-        for segment in re.split(r"[/\\]", route):
-            if not segment:
-                continue
-            path_value, *matrix_tokens = segment.split(";")
-            if path_value:
-                add_variants(path_value)
-            for token in matrix_tokens:
-                add_parameter_token(token)
-        if query_separator:
-            for token in re.split(r"[&;]", route_query):
-                add_parameter_token(token)
+    def derive_json(value: str) -> None:
+        stripped = value.strip()
+        if not stripped.startswith(("{", "[")):
+            return
+        try:
+            parsed_json = json.loads(
+                stripped,
+                parse_int=str,
+                parse_float=str,
+                parse_constant=str,
+            )
+        except json.JSONDecodeError:
+            return
+        except RecursionError as exc:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex") from exc
 
-    add_variants(url)
-    parsed_layers: dict[str, None] = {}
-    for decoded_layer in _progressive_percent_decode_layers(url):
-        parsed_layers.setdefault(decoded_layer, None)
-        parsed_layers.setdefault(_decode_url_structural_delimiters(decoded_layer), None)
-    for url_layer in parsed_layers:
-        parsed = urlsplit(url_layer)
+        containers = [parsed_json]
+        while containers:
+            item = containers.pop()
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    derive(key)
+                    containers.append(child)
+            elif isinstance(item, list):
+                containers.extend(item)
+            elif isinstance(item, str):
+                derive(item)
+
+    derive(url)
+    while pending:
+        current = pending.popleft()
+        decoded = unquote(current)
+        if decoded != current:
+            if len(decoded) >= len(current):
+                raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+            derive(decoded)
+        form_decoded = unquote_plus(current)
+        if form_decoded != current:
+            derive(form_decoded)
+        derive(_decode_url_structural_delimiters(current))
+        derive_json(current)
+
+        parsed = urlsplit(current)
 
         raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
         if separator:
             username, password_separator, password = raw_userinfo.partition(":")
-            add_variants(username)
+            derive(username)
             if password_separator:
-                add_variants(password)
-        add_variants(_raw_url_port(parsed.netloc) or "")
+                derive(password)
+        derive(_raw_url_port(parsed.netloc) or "")
 
         hostname = parsed.hostname or ""
         trusted_suffix = _trusted_ats_host_suffix(hostname)
-        if trusted_suffix and hostname.endswith(f".{trusted_suffix}"):
+        if trusted_suffix and hostname == trusted_suffix:
+            secret_hostname = ""
+        elif trusted_suffix and hostname.endswith(f".{trusted_suffix}"):
             prefix = hostname[: -(len(trusted_suffix) + 1)]
-            for label in prefix.split("."):
-                if label:
-                    add_variants(label)
+            secret_hostname = prefix
+        else:
+            secret_hostname = hostname
+        for label in secret_hostname.split("."):
+            derive(label)
 
-        for raw_component in (parsed.query, parsed.fragment):
-            if not raw_component:
+        derive(parsed.query)
+        derive(parsed.fragment)
+        query_components = [parsed.query, parsed.fragment]
+        if not any((parsed.scheme, parsed.netloc, parsed.query, parsed.fragment)):
+            query_components.append(current)
+        for component in query_components:
+            if "=" not in component and not re.search(r"[&;]", component):
                 continue
-            for token in re.split(r"[&;]", raw_component):
-                add_parameter_token(token)
-        if parsed.fragment:
-            add_fragment_route(parsed.fragment)
+            for token in re.split(r"[&;]", component):
+                derive_parameter(token)
 
-        expect_path_secret = False
-        for segment in parsed.path.split("/"):
+        for segment in re.split(r"[/\\]", parsed.path):
             if not segment:
                 continue
             path_value, *matrix_tokens = segment.split(";")
+            derive(path_value)
             for token in matrix_tokens:
-                add_parameter_token(token)
-            normalized = path_value.strip().lower()
-            if expect_path_secret:
-                add_variants(path_value)
-                expect_path_secret = False
-                continue
-            if normalized in _SENSITIVE_PATH_MARKERS:
-                expect_path_secret = True
-                continue
-            if path_value:
-                add_variants(path_value)
+                derive_parameter(token)
     return secrets
 
 
 def _inbox_auth_hint_secrets(hint: str) -> set[str]:
     secrets: set[str] = set()
     material_bytes = 0
-    material_budget = _secret_material_budget(hint)
+    # Bound both whole-hint variants and the independently bounded credential graph.
+    material_budget = _secret_material_budget(hint) * 2
 
     def add_many(values) -> None:
         nonlocal material_bytes
