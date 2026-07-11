@@ -164,10 +164,16 @@ def test_successful_cleanup_releases_process_port_and_reservation(tmp_path: Path
     process = _FakeProcess()
     chrome._chrome_procs[6] = process
     chrome._browser_reservations[id(process)] = reservation
+    chrome._job_handles[id(process)] = chrome._OwnedJobHandle(6, process.pid, 606)
+    closed = []
+    monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
     monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: setattr(process, "alive", False))
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
 
     assert chrome.cleanup_worker(6, process) is True
+    assert closed == [606]
+    assert chrome.cleanup_worker(6, process) is False
+    assert closed == [606]
 
     reacquired = chrome._acquire_browser_reservation(6, 9406, profile)
     reacquired.release()
@@ -205,16 +211,21 @@ def test_cleanup_worker_does_not_kill_foreign_process(tmp_path: Path, monkeypatc
     reservation = chrome._acquire_browser_reservation(0, 9400, tmp_path / "profile-0")
     chrome._chrome_procs[0] = owner
     chrome._browser_reservations[id(owner)] = reservation
+    chrome._job_handles[id(owner)] = chrome._OwnedJobHandle(0, owner.pid, 700)
     killed = []
+    closed = []
     monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
-    monkeypatch.setattr(chrome, "_close_job", lambda worker_id: killed.append(f"job:{worker_id}"))
+    monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
     assert chrome.cleanup_worker(0, foreign) is False
     assert killed == []
+    assert closed == []
+    assert id(owner) in chrome._job_handles
 
     owner.alive = False
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     assert chrome.cleanup_worker(0, owner) is True
+    assert closed == [700]
 
 
 def test_cleanup_worker_wrong_worker_id_leaves_owner_untouched(tmp_path: Path, monkeypatch) -> None:
@@ -226,16 +237,87 @@ def test_cleanup_worker_wrong_worker_id_leaves_owner_untouched(tmp_path: Path, m
     reservation = chrome._acquire_browser_reservation(0, 9400, tmp_path / "profile-0")
     chrome._chrome_procs[0] = owner
     chrome._browser_reservations[id(owner)] = reservation
+    chrome._job_handles[id(owner)] = chrome._OwnedJobHandle(0, owner.pid, 800)
     killed = []
+    closed = []
     monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
-    monkeypatch.setattr(chrome, "_close_job", lambda worker_id: killed.append(f"job:{worker_id}"))
+    monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
 
     assert chrome.cleanup_worker(1, owner) is False
     assert killed == []
+    assert closed == []
+    assert id(owner) in chrome._job_handles
 
     owner.alive = False
     monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
     assert chrome.cleanup_worker(0, owner) is True
+    assert closed == [800]
+
+
+def test_cleanup_worker_foreign_handle_record_leaves_process_untouched(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    owner = _FakeProcess(444)
+    reservation = chrome._acquire_browser_reservation(0, 9400, tmp_path / "profile-0")
+    chrome._chrome_procs[0] = owner
+    chrome._browser_reservations[id(owner)] = reservation
+    chrome._job_handles[id(owner)] = chrome._OwnedJobHandle(9, owner.pid, 900)
+    killed = []
+    closed = []
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
+
+    assert chrome.cleanup_worker(0, owner) is False
+    assert killed == []
+    assert closed == []
+    assert chrome._job_handles[id(owner)].handle == 900
+
+    chrome._job_handles.pop(id(owner))
+    chrome._chrome_procs.pop(0)
+    chrome._browser_reservations.pop(id(owner))
+    reservation.release()
+
+
+def test_cleanup_on_exit_closes_only_successful_owned_handles(tmp_path: Path, monkeypatch) -> None:
+    from applypilot.apply import chrome
+
+    monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("APPLYPILOT_CHROME_CLEANUP_TIMEOUT", "0")
+    successful = _FakeProcess(901)
+    failing = _FakeProcess(902)
+    successful.alive = False
+    success_reservation = chrome._acquire_browser_reservation(0, 9500, tmp_path / "profile-0")
+    fail_reservation = chrome._acquire_browser_reservation(1, 9501, tmp_path / "profile-1")
+    monkeypatch.setattr(chrome, "_chrome_procs", {0: successful, 1: failing})
+    monkeypatch.setattr(
+        chrome,
+        "_browser_reservations",
+        {id(successful): success_reservation, id(failing): fail_reservation},
+    )
+    monkeypatch.setattr(
+        chrome,
+        "_job_handles",
+        {
+            id(successful): chrome._OwnedJobHandle(0, successful.pid, 9010),
+            id(failing): chrome._OwnedJobHandle(1, failing.pid, 9020),
+        },
+    )
+    closed = []
+    monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: None)
+    monkeypatch.setattr(chrome, "_port_is_listening", lambda port: port == 9501)
+    monkeypatch.setattr(chrome, "_close_windows_job_handle", lambda handle: closed.append(handle) or True)
+
+    chrome.cleanup_on_exit()
+
+    assert closed == [9010]
+    assert id(successful) not in chrome._job_handles
+    assert chrome._job_handles[id(failing)].handle == 9020
+    assert chrome._chrome_procs[1] is failing
+
+    failing.alive = False
+    monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
+    assert chrome.cleanup_worker(1, failing) is True
 
 
 def test_linkedin_login_cannot_kill_another_process_port_owner(tmp_path: Path, monkeypatch) -> None:

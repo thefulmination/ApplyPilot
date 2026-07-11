@@ -50,7 +50,14 @@ _browser_reservations: dict[int, "_BrowserReservation"] = {}
 # the graceful cleanup_worker path. This is what stops orphaned Chrome trees from lingering
 # and locking worker profiles. Keeping the handle referenced here holds the job open; the
 # OS closes it on process exit, which fires the kill.
-_job_handles: dict[int, int] = {}
+class _OwnedJobHandle:
+    def __init__(self, worker_id: int, pid: int, handle: int) -> None:
+        self.worker_id = worker_id
+        self.pid = pid
+        self.handle = handle
+
+
+_job_handles: dict[int, _OwnedJobHandle] = {}
 
 
 class BrowserSlotOccupiedError(RuntimeError):
@@ -288,7 +295,7 @@ def _kill_on_port(port: int) -> None:
         logger.debug("Failed to kill process on port %d", port, exc_info=True)
 
 
-def _assign_kill_on_close_job(worker_id: int, pid: int) -> None:
+def _assign_kill_on_close_job(worker_id: int, process: subprocess.Popen) -> None:
     """Windows: put the launched browser in a Job Object that auto-kills the whole tree
     when this process dies for ANY reason -- crash, OOM, or an external taskkill of the
     parent -- not just the graceful cleanup_worker path. Without this, a parent killed from
@@ -300,6 +307,7 @@ def _assign_kill_on_close_job(worker_id: int, pid: int) -> None:
     """
     if platform.system() != "Windows":
         return
+    pid = process.pid
     try:
         import ctypes
         from ctypes import wintypes
@@ -372,26 +380,35 @@ def _assign_kill_on_close_job(worker_id: int, pid: int) -> None:
         # Hold the job handle open for this process's lifetime. Renderers Chrome spawns
         # AFTER assignment inherit the job; the main process (port + profile-lock holder)
         # is covered, which is what prevents the lingering-lock orphan.
-        _job_handles[worker_id] = job
+        _job_handles[id(process)] = _OwnedJobHandle(worker_id, pid, job)
     except Exception:
         logger.debug("[worker-%d] job-object assignment failed", worker_id, exc_info=True)
 
 
-def _close_job(worker_id: int) -> None:
-    """Close a worker's job handle (fires KILL_ON_JOB_CLOSE if the tree is still alive)."""
-    job = _job_handles.pop(worker_id, None)
-    if job and platform.system() == "Windows":
-        try:
-            import ctypes
-            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
-        except Exception:
-            logger.debug("[worker-%d] closing job handle failed", worker_id, exc_info=True)
+def _close_windows_job_handle(handle: int) -> bool:
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+
+        return bool(ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle))
+    except Exception:
+        logger.debug("Closing browser job handle failed", exc_info=True)
+        return False
 
 
-def _close_all_jobs() -> None:
-    """Close every tracked job handle (shutdown sweep)."""
-    for wid in list(_job_handles.keys()):
-        _close_job(wid)
+def _close_owned_job_handle(worker_id: int, process: subprocess.Popen) -> bool:
+    key = id(process)
+    record = _job_handles.get(key)
+    if record is None:
+        return True
+    if record.worker_id != worker_id or record.pid != process.pid:
+        return False
+    if not _close_windows_job_handle(record.handle):
+        return False
+    if _job_handles.get(key) is record:
+        _job_handles.pop(key, None)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +630,7 @@ def linkedin_login(browser: str | None = "chrome", timeout_seconds: int = 420,
     with _chrome_lock:
         _chrome_procs[LINKEDIN_LOGIN_SLOT] = proc
         _browser_reservations[id(proc)] = reservation
-    _assign_kill_on_close_job(LINKEDIN_LOGIN_SLOT, proc.pid)
+    _assign_kill_on_close_job(LINKEDIN_LOGIN_SLOT, proc)
     deadline = time.monotonic() + timeout_seconds
     ok = False
 
@@ -780,7 +797,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         _browser_reservations[id(proc)] = reservation
     # Assign IMMEDIATELY (before Chrome forks much) so the tree dies with us even on a
     # hard external kill -- no lingering orphan to lock the profile.
-    _assign_kill_on_close_job(worker_id, proc.pid)
+    _assign_kill_on_close_job(worker_id, proc)
 
     # Poll the CDP endpoint instead of a blind sleep(3): return as soon as Chrome's
     # debug port actually accepts connections (usually <1s when warm), and cap the
@@ -819,12 +836,22 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
     with _chrome_lock:
         registered = _chrome_procs.get(worker_id)
         reservation = _browser_reservations.get(id(process)) if process is not None else None
+        job_record = _job_handles.get(id(process)) if process is not None else None
+        job_owned = (
+            job_record is None
+            or (
+                job_record.worker_id == worker_id
+                and process is not None
+                and job_record.pid == process.pid
+            )
+        )
         owned = (
             process is not None
             and registered is process
             and reservation is not None
             and reservation.worker_id == worker_id
             and not reservation._released
+            and job_owned
         )
     if not owned:
         logger.error("[worker-%s] Refusing cleanup for an unowned browser process", worker_id)
@@ -832,7 +859,6 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
 
     if process.poll() is None:
         _kill_process_tree(process.pid)
-    _close_job(worker_id)
     deadline = time.monotonic() + max(
         0.0,
         float(os.environ.get("APPLYPILOT_CHROME_CLEANUP_TIMEOUT") or 10),
@@ -843,6 +869,8 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> bool:
     port = reservation.port
     process_gone = process.poll() is not None
     cleanup_ok = process_gone and not _port_is_listening(port)
+    if cleanup_ok:
+        cleanup_ok = _close_owned_job_handle(worker_id, process)
     if cleanup_ok:
         with _chrome_lock:
             if _chrome_procs.get(worker_id) is process:
@@ -865,8 +893,6 @@ def kill_all_chrome() -> None:
 
     for wid, proc in procs.items():
         cleanup_worker(wid, proc)
-
-    _close_all_jobs()
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -898,5 +924,3 @@ def cleanup_on_exit() -> None:
 
     for wid, proc in procs.items():
         cleanup_worker(wid, proc)
-
-    _close_all_jobs()
