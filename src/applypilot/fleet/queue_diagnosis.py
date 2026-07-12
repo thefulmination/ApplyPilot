@@ -60,8 +60,11 @@ def queue_diagnosis(conn, *, overbroad_limit: int = 25) -> dict[str, Any]:
 
         cur.execute(
             """
-            SELECT COALESCE(NULLIF(q.host_policy, ''), NULLIF(q.apply_error, ''),
-                            NULLIF(q.apply_status, ''), 'blocked_without_reason') AS reason,
+            SELECT CASE
+                     WHEN q.execution_route = 'exception'
+                       THEN COALESCE(NULLIF(q.host_policy, ''), NULLIF(q.apply_error, ''))
+                     ELSE COALESCE(NULLIF(q.apply_error, ''), NULLIF(q.apply_status, ''))
+                   END AS reason,
                    COUNT(*) AS n
               FROM apply_queue q
              WHERE q.status='blocked'
@@ -70,7 +73,7 @@ def queue_diagnosis(conn, *, overbroad_limit: int = 25) -> dict[str, Any]:
             """
         )
         blocked_reasons = {
-            str(row["reason"]): int(row["n"] or 0)
+            str(row["reason"] or "blocked_without_reason"): int(row["n"] or 0)
             for row in cur.fetchall()
         }
 

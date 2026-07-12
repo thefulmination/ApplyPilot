@@ -70,9 +70,14 @@ def test_queue_diagnosis_exposes_blocked_reason_breakdown(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         _seed_apply_row(cur, url="unsupported", status="blocked", apply_error="exception_pending")
         cur.execute(
-            "UPDATE apply_queue SET host_policy='adapter_unsupported' WHERE url='unsupported'"
+            "UPDATE apply_queue SET host_policy='adapter_unsupported', execution_route='exception' "
+            "WHERE url='unsupported'"
         )
         _seed_apply_row(cur, url="expired", status="blocked", apply_error="expired")
+        cur.execute(
+            "UPDATE apply_queue SET host_policy='adapter_ready', execution_route='deterministic' "
+            "WHERE url='expired'"
+        )
         conn.commit()
 
     with pgqueue.connect(fleet_db) as conn:
