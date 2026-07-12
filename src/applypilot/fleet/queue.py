@@ -12,9 +12,11 @@ import json
 import math
 import numbers
 import os
+import time
 import urllib.parse as _urlparse
 from collections.abc import Mapping
 
+from psycopg.errors import DeadlockDetected
 from psycopg.types.json import Jsonb
 
 from applypilot import config
@@ -736,38 +738,59 @@ RETURNING s.task_id, s.query, s.board, s.location, s.params, s.cadence_seconds;
 """
 
 
+_SEARCH_DEADLOCK_RETRIES = 4
+
+
+def _run_search_transaction_with_retry(conn, operation):
+    """Retry transient PostgreSQL deadlocks in the recurring search path."""
+    for attempt in range(_SEARCH_DEADLOCK_RETRIES):
+        try:
+            return operation()
+        except DeadlockDetected:
+            conn.rollback()
+            if attempt == _SEARCH_DEADLOCK_RETRIES - 1:
+                raise
+            time.sleep(0.05 * (2**attempt))
+
+
 def lease_search(conn, worker_id, *, ttl_seconds=900):
-    with conn.cursor() as cur:
-        cur.execute(_LEASE_SEARCH, {"worker": worker_id, "ttl": ttl_seconds})
-        row = cur.fetchone()
-    conn.commit()
-    return dict(row) if row else None
+    def operation():
+        with conn.cursor() as cur:
+            cur.execute(_LEASE_SEARCH, {"worker": worker_id, "ttl": ttl_seconds})
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else None
+
+    return _run_search_transaction_with_retry(conn, operation)
 
 
 def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, error=None, cadence_seconds=None):
     """Mark the search done, record a scrape outcome on the board scope, and
     RE-SCHEDULE the task (status back to 'queued', next_due_at = now + cadence)."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE search_tasks SET status='queued', last_run_at=now(), result_count=%s, last_error=%s, "
-            "next_due_at = now() + make_interval(secs => COALESCE(%s, cadence_seconds)), updated_at=now() "
-            "WHERE task_id=%s AND lease_owner=%s",
-            (result_count, error, cadence_seconds, task_id, worker_id),
-        )
-        if cur.rowcount == 0:
-            conn.rollback()
-            return False
-        if board:
-            outcome = "block" if error == "blocked" else ("captcha" if error == "captcha" else "success")
-            col = governor._OUTCOME_COL[outcome]
-            # A3: stamp last_attempt_at on every board outcome so a never-succeeding board is spaced.
-            extra = (", count_24h = count_24h + 1, last_applied_at = now(), last_attempt_at = now()"
-                     if outcome == "success" else ", last_attempt_at = now()")
-            sk = governor.board_scope(board)
-            cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
-            cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at=now() WHERE scope_key=%s", (sk,))
-    conn.commit()
-    return True
+    def operation():
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE search_tasks SET status='queued', last_run_at=now(), result_count=%s, last_error=%s, "
+                "next_due_at = now() + make_interval(secs => COALESCE(%s, cadence_seconds)), updated_at=now() "
+                "WHERE task_id=%s AND lease_owner=%s",
+                (result_count, error, cadence_seconds, task_id, worker_id),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                return False
+            if board:
+                outcome = "block" if error == "blocked" else ("captcha" if error == "captcha" else "success")
+                col = governor._OUTCOME_COL[outcome]
+                # A3: stamp last_attempt_at on every board outcome so a never-succeeding board is spaced.
+                extra = (", count_24h = count_24h + 1, last_applied_at = now(), last_attempt_at = now()"
+                         if outcome == "success" else ", last_attempt_at = now()")
+                sk = governor.board_scope(board)
+                cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
+                cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at=now() WHERE scope_key=%s", (sk,))
+        conn.commit()
+        return True
+
+    return _run_search_transaction_with_retry(conn, operation)
 
 
 # ---------------------------------------------------------------------------

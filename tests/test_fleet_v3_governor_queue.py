@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from psycopg.errors import DeadlockDetected
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import config as fcfg
@@ -795,6 +796,48 @@ def test_repush_compute_job_preserves_existing_queue_position(fleet_db):
 
 
 # ---- recurring search scheduler (RF3) ------------------------------------------
+
+def test_search_transaction_retries_deadlock(monkeypatch):
+    class Connection:
+        rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = Connection()
+    calls = 0
+
+    def operation():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise DeadlockDetected("transient search deadlock")
+        return "completed"
+
+    monkeypatch.setattr(queue.time, "sleep", lambda _seconds: None)
+
+    assert queue._run_search_transaction_with_retry(conn, operation) == "completed"
+    assert calls == 3
+    assert conn.rollbacks == 2
+
+
+def test_search_transaction_reraises_exhausted_deadlock(monkeypatch):
+    class Connection:
+        rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = Connection()
+    monkeypatch.setattr(queue.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(DeadlockDetected):
+        queue._run_search_transaction_with_retry(
+            conn,
+            lambda: (_ for _ in ()).throw(DeadlockDetected("persistent search deadlock")),
+        )
+
+    assert conn.rollbacks == queue._SEARCH_DEADLOCK_RETRIES
 
 def test_search_recurs_after_completion(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
