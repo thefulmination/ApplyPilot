@@ -64,3 +64,21 @@ def test_queue_diagnosis_counts_base_leaseable_and_dedup_blocked_rows(fleet_db):
     assert result["dedup"]["blocked_sources"]["no_current_queue_source"] == 1
     assert result["dedup"]["overbroad_groups"][0]["dedup_key"] == "dk-board"
     assert result["dedup"]["overbroad_groups"][0]["queued_rows"] == 1
+
+
+def test_queue_diagnosis_exposes_blocked_reason_breakdown(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="unsupported", status="blocked", apply_error="exception_pending")
+        cur.execute(
+            "UPDATE apply_queue SET host_policy='adapter_unsupported' WHERE url='unsupported'"
+        )
+        _seed_apply_row(cur, url="expired", status="blocked", apply_error="expired")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        result = queue_diagnosis.queue_diagnosis(conn)
+
+    assert result["blocked"] == {
+        "total": 2,
+        "reasons": {"adapter_unsupported": 1, "expired": 1},
+    }

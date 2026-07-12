@@ -60,6 +60,22 @@ def queue_diagnosis(conn, *, overbroad_limit: int = 25) -> dict[str, Any]:
 
         cur.execute(
             """
+            SELECT COALESCE(NULLIF(q.host_policy, ''), NULLIF(q.apply_error, ''),
+                            NULLIF(q.apply_status, ''), 'blocked_without_reason') AS reason,
+                   COUNT(*) AS n
+              FROM apply_queue q
+             WHERE q.status='blocked'
+             GROUP BY 1
+             ORDER BY n DESC, reason
+            """
+        )
+        blocked_reasons = {
+            str(row["reason"]): int(row["n"] or 0)
+            for row in cur.fetchall()
+        }
+
+        cur.execute(
+            """
             SELECT
               COUNT(*) AS queued_dedup_blocked,
               COUNT(*) FILTER (
@@ -144,6 +160,10 @@ def queue_diagnosis(conn, *, overbroad_limit: int = 25) -> dict[str, Any]:
             "unapproved_ats": int(q["unapproved_ats"] or 0),
             "dedup_blocked": int(q["dedup_blocked"] or 0),
             "base_leaseable": int(q["base_leaseable"] or 0),
+        },
+        "blocked": {
+            "total": sum(blocked_reasons.values()),
+            "reasons": blocked_reasons,
         },
         "dedup": {
             "blocked_sources": {
