@@ -61,3 +61,33 @@ def test_only_explicit_accepted_outcomes_enter_model_input(tmp_path):
     assert len(rows) == 1
     assert rows[0]["event_id"] == "mail-a"
     assert json.loads(rows[0]["attribution_json"])["messageId"] == "mail-a"
+
+
+def test_pairwise_ab_artifact_resolves_item_ids_and_kg_schema_version(tmp_path):
+    conn = database.init_db(tmp_path / "brain.db")
+    urls = ("https://example.com/a", "https://example.com/b")
+    for url in urls:
+        conn.execute("INSERT INTO jobs (url,title) VALUES (?,?)", (url, "Role"))
+    for event_id, item_id, url in (("l-a", "item-a", urls[0]), ("l-b", "item-b", urls[1])):
+        conn.execute(
+            "INSERT INTO research_labels (id,item_id,job_url,raw_event_json) VALUES (?,?,?,?)",
+            (event_id, item_id, url, "{}"),
+        )
+    conn.commit()
+    (tmp_path / "pairwise.jsonl").write_text(
+        json.dumps({"id": "pw-1", "jobAItemId": "item-a", "jobBItemId": "item-b", "result": "b"}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "knowledge_graph.json").write_text(
+        json.dumps({"schemaVersion": "applypilot_knowledge_graph_v1", "generatedAt": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    report = backfill_research_artifacts(conn, tmp_path)
+
+    assert report["pairwise"]["written"] == 1
+    row = conn.execute(
+        "SELECT left_job_url,right_job_url,winner FROM research_pairwise_labels WHERE id='pw-1'"
+    ).fetchone()
+    assert tuple(row) == (urls[0], urls[1], "right")
+    assert report["kg"]["written"] == 1

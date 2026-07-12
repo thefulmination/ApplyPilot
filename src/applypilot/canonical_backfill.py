@@ -131,8 +131,29 @@ def _label(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
 
 def _pairwise(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     event_id = row.get("id")
-    winner = row.get("winner")
-    if not isinstance(event_id, str) or winner not in {"left", "right", "tie"}:
+    result = row.get("winner") or row.get("result")
+    winner = {"a": "left", "b": "right"}.get(result, result)
+    if not isinstance(event_id, str) or winner not in {"left", "right", "tie", "unclear"}:
+        return False
+    left_item_id = row.get("left_item_id") or row.get("leftItemId") or row.get("jobAItemId")
+    right_item_id = row.get("right_item_id") or row.get("rightItemId") or row.get("jobBItemId")
+    left_job_url = row.get("left_job_url") or row.get("leftJobUrl")
+    right_job_url = row.get("right_job_url") or row.get("rightJobUrl")
+    if not left_job_url and left_item_id:
+        match = conn.execute(
+            "SELECT job_url FROM research_labels WHERE item_id=? AND job_url IS NOT NULL "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (left_item_id,),
+        ).fetchone()
+        left_job_url = match[0] if match else None
+    if not right_job_url and right_item_id:
+        match = conn.execute(
+            "SELECT job_url FROM research_labels WHERE item_id=? AND job_url IS NOT NULL "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (right_item_id,),
+        ).fetchone()
+        right_job_url = match[0] if match else None
+    if not left_job_url or not right_job_url:
         return False
     conn.execute(
         """
@@ -143,10 +164,8 @@ def _pairwise(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
         ON CONFLICT(id) DO UPDATE SET raw_event_json=excluded.raw_event_json
         """,
         (
-            event_id, row.get("left_job_url") or row.get("leftJobUrl"),
-            row.get("right_job_url") or row.get("rightJobUrl"),
-            row.get("left_item_id") or row.get("leftItemId"),
-            row.get("right_item_id") or row.get("rightItemId"), winner, row.get("method"),
+            event_id, left_job_url, right_job_url, left_item_id, right_item_id,
+            winner, row.get("method"),
             row.get("source_project_id") or row.get("sourceProjectId"),
             row.get("created_at") or row.get("createdAt"), _canonical(row),
         ),
@@ -208,7 +227,10 @@ def _outcome(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
 
 
 def _kg(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
-    version = row.get("kg_version") or row.get("kgVersion") or row.get("version")
+    version = (
+        row.get("kg_version") or row.get("kgVersion") or row.get("version")
+        or row.get("schemaVersion")
+    )
     if not isinstance(version, str) or not version.strip():
         return False
     conn.execute(
