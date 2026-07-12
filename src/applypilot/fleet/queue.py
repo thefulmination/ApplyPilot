@@ -19,6 +19,9 @@ from collections.abc import Mapping
 from psycopg.errors import DeadlockDetected
 from psycopg.types.json import Jsonb
 
+from psycopg.errors import DeadlockDetected
+from psycopg.types.json import Jsonb
+
 from applypilot import config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
@@ -202,6 +205,139 @@ def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200,
             "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
         })
         row = cur.fetchone()
+        if row is not None:
+            # A worker can die after the lease is committed but before the terminal
+            # result writer runs. Keep a durable lifecycle marker so diagnostics can
+            # distinguish "leased, no terminal result" from an older row with no
+            # evidence at all. This is deliberately not a zero-tool result: a lease
+            # marker never proves that the application form was untouched.
+            cur.execute(
+                "INSERT INTO apply_result_events ("
+                "queue_name, url, worker_id, status, apply_status, target_host, "
+                "result_metadata, result_line, source"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    "apply_queue",
+                    row["url"],
+                    worker_id,
+                    "leased",
+                    "leased",
+                    row.get("target_host") or row.get("apply_domain"),
+                    Jsonb({"execution_evidence": "lease_started"}),
+                    "RESULT:lease_started",
+                    "worker_lease",
+                ),
+            )
+    conn.commit()
+    return dict(row) if row else None
+
+
+_CLAIM_LIVENESS_SQL = """
+WITH candidate AS (
+    SELECT q.url
+    FROM apply_queue q
+    JOIN fleet_config cfg ON cfg.id = 1
+    WHERE q.status = 'queued'
+      AND q.lane = 'ats'
+      AND q.approved_batch IS NOT NULL
+      AND q.score >= COALESCE(cfg.approval_threshold, 7)
+      AND COALESCE(q.liveness_required, FALSE)
+       AND (
+            q.liveness_checked_at IS NULL
+           OR (
+                q.liveness_status = 'uncertain'
+                AND q.liveness_checked_at < now() - make_interval(secs => CASE
+                    WHEN COALESCE(q.liveness_reason,'') LIKE '%%_invalid_payload'
+                      OR COALESCE(q.liveness_reason,'') LIKE '%%_id_mismatch'
+                      OR COALESCE(q.liveness_reason,'') IN (
+                          'redirect_login', 'redirect_home', 'empty_body',
+                          'thin_body', 'workday_unparsed'
+                      )
+                      OR COALESCE(q.liveness_consecutive_uncertain, 0) >= 6
+                    THEN %(structural_retry)s
+                    WHEN COALESCE(q.liveness_consecutive_uncertain, 0) >= 3
+                    THEN %(uncertain_retry)s
+                    WHEN COALESCE(q.liveness_reason,'') LIKE 'server_%%'
+                      OR COALESCE(q.liveness_reason,'') LIKE 'neterr:%%'
+                      OR COALESCE(q.liveness_reason,'') LIKE 'error:%%'
+                      OR COALESCE(q.liveness_reason,'') = 'blocked_429'
+                    THEN %(transient_retry)s
+                    ELSE %(uncertain_retry)s
+                END)
+           )
+           OR (
+                q.liveness_status IS DISTINCT FROM 'uncertain'
+                AND q.liveness_checked_at < now() - make_interval(secs => %(fresh)s)
+           )
+      )
+      AND (
+           q.liveness_check_owner IS NULL
+           OR q.liveness_check_expires_at < now()
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM apply_queue host_peer
+          WHERE host_peer.url <> q.url
+            AND COALESCE(q.target_host, q.apply_domain, '') <> ''
+            AND COALESCE(host_peer.target_host, host_peer.apply_domain, '') =
+                COALESCE(q.target_host, q.apply_domain, '')
+            AND (
+                (
+                    host_peer.liveness_check_owner IS NOT NULL
+                    AND host_peer.liveness_check_expires_at >= now()
+                )
+                OR (
+                    host_peer.liveness_status = 'uncertain'
+                    AND host_peer.liveness_checked_at >=
+                        now() - make_interval(secs => %(host_cooldown)s)
+                    AND (
+                        COALESCE(host_peer.liveness_reason,'') LIKE 'server_%%'
+                        OR COALESCE(host_peer.liveness_reason,'') LIKE 'neterr:%%'
+                        OR COALESCE(host_peer.liveness_reason,'') LIKE 'error:%%'
+                        OR COALESCE(host_peer.liveness_reason,'') = 'blocked_429'
+                        OR COALESCE(host_peer.liveness_reason,'') LIKE 'access_gate:%%'
+                    )
+                )
+            )
+      )
+    ORDER BY CASE
+               WHEN q.liveness_status = 'live' THEN 0
+               WHEN q.liveness_status IS NULL THEN 1
+               ELSE 2
+             END,
+             q.score DESC, q.url
+    LIMIT 1
+    FOR UPDATE OF q SKIP LOCKED
+)
+UPDATE apply_queue q
+SET liveness_check_owner = %(worker)s,
+    liveness_check_expires_at = now() + make_interval(secs => %(ttl)s),
+    updated_at = now()
+FROM candidate
+WHERE q.url = candidate.url
+RETURNING q.url, q.application_url, q.company, q.title,
+          COALESCE(q.target_host, q.apply_domain) AS target_host;
+"""
+
+
+def claim_liveness_check(conn, worker_id, *, ttl_seconds=120,
+                         fresh_seconds=LIVENESS_FRESH_SECONDS,
+                         uncertain_retry_seconds=LIVENESS_UNCERTAIN_RETRY_SECONDS,
+                         transient_retry_seconds=LIVENESS_TRANSIENT_RETRY_SECONDS,
+                         structural_retry_seconds=LIVENESS_STRUCTURAL_RETRY_SECONDS,
+                         host_cooldown_seconds=LIVENESS_HOST_COOLDOWN_SECONDS):
+    """Claim one stale required-liveness row without leasing an application."""
+    with conn.cursor() as cur:
+        cur.execute(_CLAIM_LIVENESS_SQL, {
+            "worker": worker_id,
+            "ttl": ttl_seconds,
+            "fresh": fresh_seconds,
+            "uncertain_retry": uncertain_retry_seconds,
+            "transient_retry": transient_retry_seconds,
+            "structural_retry": structural_retry_seconds,
+            "host_cooldown": host_cooldown_seconds,
+        })
+        row = cur.fetchone()
     conn.commit()
     return dict(row) if row else None
 
@@ -336,6 +472,29 @@ def _result_line(status, apply_status=None, apply_error=None) -> str:
     return f"RESULT:{token}"
 
 
+def resolve_superseded_challenges(cur, url, *, terminal_status, queue_name) -> int:
+    """Close open auth records after the queue row has conclusively moved on.
+
+    The caller must first complete its guarded queue transition in the same
+    transaction. Keeping this cursor-local prevents a stale lease owner from
+    resolving a challenge when its queue update did not land.
+    """
+    other_queue = {
+        "apply_queue": "linkedin_queue",
+        "linkedin_queue": "apply_queue",
+    }.get(queue_name)
+    if other_queue is None:
+        raise ValueError(f"unsupported queue_name: {queue_name}")
+    cur.execute(
+        "UPDATE auth_challenge SET resolved_at=now(), outcome=%s "
+        "WHERE url=%s AND resolved_at IS NULL "
+        f"AND NOT EXISTS (SELECT 1 FROM {other_queue} "
+        "                WHERE url=%s AND apply_status='challenge_pending')",
+        (f"superseded:{terminal_status}", url, url),
+    )
+    return cur.rowcount
+
+
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                         apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
                         agent=None, agent_model=None, apply_duration_ms=None, machine_owner=None,
@@ -373,6 +532,9 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         if cur.rowcount == 0:
             conn.rollback()
             return False
+        resolve_superseded_challenges(
+            cur, url, terminal_status=status, queue_name="apply_queue"
+        )
         if outcome is not None:
             col = governor._OUTCOME_COL[outcome]
             for sk in scopes:
@@ -398,6 +560,7 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 "apply_queue",
                 url,
                 worker_id,
+                machine_owner,
                 status,
                 apply_status,
                 apply_error,
@@ -504,15 +667,27 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, require_liveness=False,
         prepared.append((r, host, dk))
 
     applied_keys = set()
+    weak_applied_keys = set()
     with conn.cursor() as cur:
         keys = [dk for _, _, dk in prepared if dk]
         if keys:
-            cur.execute("SELECT dedup_key FROM applied_set WHERE dedup_key = ANY(%s)", (keys,))
-            applied_keys = {row["dedup_key"] for row in cur.fetchall()}
+            cur.execute(
+                "SELECT dedup_key, company, normalized_role, applied_url "
+                "FROM applied_set WHERE dedup_key = ANY(%s)",
+                (keys,),
+            )
+            applied_rows = cur.fetchall()
+            applied_keys = {row["dedup_key"] for row in applied_rows}
+            weak_applied_keys = {
+                row["dedup_key"] for row in applied_rows
+                if not any(row[field] for field in ("company", "normalized_role", "applied_url"))
+            }
 
         n = 0
+        dedup_skipped = 0
         for r, host, dk in prepared:
             if dk in applied_keys:
+                dedup_skipped += 1
                 continue
             cur.execute(
                 "INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, target_host, lane, dedup_key, approved_batch, liveness_required, eligibility_required, eligibility_status, eligibility_reason, eligibility_checked_at, session_required, tenant_profile_id, routing_required, execution_route, host_policy, status, apply_status, apply_error, decision_id, policy_version, decision_action, qualification_verdict, qualification_score, qualification_floor, preference_score, outcome_score, final_score, decision_confidence, decision_created_at, decision_expires_at, input_hash) "
@@ -555,6 +730,13 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, require_liveness=False,
             n += cur.rowcount
     if commit:
         conn.commit()
+    if diagnostics:
+        return {
+            "candidates": len(prepared),
+            "dedup_skipped": dedup_skipped,
+            "weak_dedup_skipped": len(weak_applied_keys & {dk for _, _, dk in prepared}),
+            "touched": n,
+        }
     return n
 
 
@@ -609,13 +791,18 @@ def resolve_challenge(conn, url, *, requeue=True, commit=True) -> bool:
         else:
             cur.execute(
                 "UPDATE apply_queue SET status='blocked', lease_owner=NULL, lease_expires_at=NULL, "
-                "apply_status='challenge_skipped', updated_at=now() "
+                "apply_status='challenge_skipped', apply_error='challenge_skipped', updated_at=now() "
                 "WHERE url=%s AND apply_status='challenge_pending'",
                 (url,),
             )
         n = cur.rowcount
-        cur.execute("UPDATE auth_challenge SET resolved_at=now(), outcome=%s WHERE url=%s AND resolved_at IS NULL",
-                    ("solved" if requeue else "skipped", url))
+        cur.execute(
+            "UPDATE auth_challenge SET resolved_at=now(), outcome=%s "
+            "WHERE url=%s AND resolved_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM linkedin_queue "
+            "                WHERE url=%s AND apply_status='challenge_pending')",
+            ("solved" if requeue else "skipped", url, url),
+        )
     if commit:
         conn.commit()
     return n > 0
@@ -979,7 +1166,12 @@ def requeue_linkedin(conn, worker_id, url, *, apply_error=None) -> bool:
 
 
 def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, apply_error=None,
-                          est_cost_usd=0, outcome=None, apply_channel=None, apply_external_host=None):
+                          est_cost_usd=0, outcome=None, apply_channel=None, apply_external_host=None,
+                          target_host=None, home_ip=None, agent=None, agent_model=None,
+                          apply_duration_ms=None, machine_owner=None,
+                          application_tool_calls=None, job_log_path=None,
+                          transcript_digest=None, final_result_source=None,
+                          result_metadata=None):
     """Close a LinkedIn lease (lease-owner guarded) in linkedin_queue -- NOT apply_queue --
     record the outcome on the account:linkedin governor, and UPSERT applied_set on a
     confirmed/possibly-submitted terminal. The cap (count_24h) + min-gap were already
@@ -990,15 +1182,20 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE linkedin_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "agent_model=%s, apply_duration_ms=%s, "
             "apply_channel=COALESCE(%s, apply_channel), apply_external_host=COALESCE(%s, apply_external_host), "
             "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
             "WHERE url=%s AND lease_owner=%s",
-            (status, apply_status, apply_error, est_cost_usd, apply_channel, apply_external_host,
+            (status, apply_status, apply_error, est_cost_usd, agent_model, apply_duration_ms,
+             apply_channel, apply_external_host,
              status, worker_id, url, worker_id),
         )
         if cur.rowcount == 0:
             conn.rollback()
             return False
+        resolve_superseded_challenges(
+            cur, url, terminal_status=status, queue_name="linkedin_queue"
+        )
         if outcome is not None:
             sk = governor.LINKEDIN_ACCOUNT
             col = governor._OUTCOME_COL[outcome]
@@ -1011,6 +1208,27 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
                 "SELECT dedup_key, company, application_url FROM linkedin_queue WHERE url=%s AND dedup_key IS NOT NULL "
                 "ON CONFLICT (dedup_key) DO NOTHING",
                 (url,),
+            )
+        cur.execute(
+            "INSERT INTO apply_result_events ("
+            "queue_name, url, worker_id, machine_owner, status, apply_status, apply_error, target_host, home_ip, "
+            "agent, agent_model, est_cost_usd, apply_duration_ms, application_tool_calls, "
+            "job_log_path, transcript_digest, final_result_source, result_metadata, result_line, source"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                "linkedin_queue", url, worker_id, machine_owner, status, apply_status, apply_error,
+                target_host, home_ip, agent, agent_model, est_cost_usd, apply_duration_ms,
+                application_tool_calls, job_log_path, transcript_digest, final_result_source,
+                Jsonb(result_metadata or {}),
+                _result_line(status, apply_status=apply_status, apply_error=apply_error),
+                "worker",
+            ),
+        )
+        if est_cost_usd is not None and float(est_cost_usd) > 0:
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id, machine_owner, task, model, provider, cost_usd) "
+                "VALUES (%s,%s,%s,%s,%s,%s)",
+                (worker_id, machine_owner, "apply_agent", agent_model, agent, est_cost_usd),
             )
     conn.commit()
     return True
@@ -1188,13 +1406,18 @@ def resolve_linkedin_challenge(conn, url, *, requeue=True, commit=True) -> bool:
         else:
             cur.execute(
                 "UPDATE linkedin_queue SET status='blocked', lease_owner=NULL, lease_expires_at=NULL, "
-                "apply_status='challenge_skipped', updated_at=now() "
+                "apply_status='challenge_skipped', apply_error='challenge_skipped', updated_at=now() "
                 "WHERE url=%s AND apply_status='challenge_pending'",
                 (url,),
             )
         n = cur.rowcount
-        cur.execute("UPDATE auth_challenge SET resolved_at=now(), outcome=%s WHERE url=%s AND resolved_at IS NULL",
-                    ("solved" if requeue else "skipped", url))
+        cur.execute(
+            "UPDATE auth_challenge SET resolved_at=now(), outcome=%s "
+            "WHERE url=%s AND resolved_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM apply_queue "
+            "                WHERE url=%s AND apply_status='challenge_pending')",
+            ("solved" if requeue else "skipped", url, url),
+        )
     if commit:
         conn.commit()
     return n > 0
@@ -1221,6 +1444,23 @@ def host_of(url: str | None) -> str:
     return host
 
 
+def challenge_metadata(row) -> dict:
+    """Return challenge display metadata with deterministic URL-host fallbacks."""
+    item = dict(row or {})
+    inferred_fields: list[str] = []
+    company = str(item.get("company") or "").strip()
+    title = str(item.get("title") or "").strip()
+    if not company:
+        company = host_of(item.get("application_url")) or host_of(item.get("url"))
+        if company:
+            inferred_fields.append("company")
+    item["company"] = company or None
+    item["title"] = title or None
+    item["metadata_inferred_fields"] = inferred_fields
+    item["metadata_complete"] = bool(company and title)
+    return item
+
+
 def _challenge_rows(conn, lane: str | None):
     """READ-ONLY: fetch the open auth_challenge rows + the lane's parked rows
     (apply_queue for lane='apply', linkedin_queue for lane='linkedin', BOTH for
@@ -1235,21 +1475,21 @@ def _challenge_rows(conn, lane: str | None):
         parked_linkedin = []
         if lane in (None, "apply"):
             cur.execute(
-                "SELECT url, company, title, score, updated_at "
+                "SELECT url, company, title, application_url, score, updated_at "
                 "FROM apply_queue WHERE apply_status='challenge_pending'")
             parked_apply = cur.fetchall()
         if lane in (None, "linkedin"):
             cur.execute(
-                "SELECT url, company, title, score, updated_at "
+                "SELECT url, company, title, application_url, score, updated_at "
                 "FROM linkedin_queue WHERE apply_status='challenge_pending'")
             parked_linkedin = cur.fetchall()
     conn.rollback()  # read-only
 
     parked_by_url: dict[str, tuple[str, dict]] = {}
     for r in parked_apply:
-        parked_by_url[r["url"]] = ("apply", r)
+        parked_by_url[r["url"]] = ("apply", challenge_metadata(r))
     for r in parked_linkedin:
-        parked_by_url[r["url"]] = ("linkedin", r)
+        parked_by_url[r["url"]] = ("linkedin", challenge_metadata(r))
 
     if lane is not None:
         # A lane-scoped view only ever shows open auth_challenge rows whose url is

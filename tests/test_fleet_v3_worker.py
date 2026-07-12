@@ -402,6 +402,78 @@ def test_worker_apply_clear_marks_applied(fleet_db):
         assert cur.fetchone()["n"] == 0  # no wall -> no challenge
         cur.execute("SELECT success_24h FROM rate_governor WHERE scope_key='global'")
         assert cur.fetchone()["success_24h"] == 1
+        cur.execute(
+            "SELECT application_tool_calls, final_result_source, result_metadata "
+            "FROM apply_result_events WHERE url='a2' ORDER BY id DESC LIMIT 1"
+        )
+        event = cur.fetchone()
+        assert event["application_tool_calls"] == 0
+        assert event["final_result_source"] == "legacy_html_classifier"
+        assert event["result_metadata"]["evidence_quality"] == "legacy_html_classifier"
+
+
+def test_worker_refuses_to_lease_when_source_version_is_stale(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "a-stale-version")
+        fleet_config.set_pinned_version(conn, "2.0.0")
+
+    calls = []
+    loop = WorkerLoop(
+        _factory(fleet_db), "w-stale", home_ip="6.6.6.6", role="apply",
+        apply_fn=lambda job: calls.append(job) or _CLEAR_HTML,
+        machine_owner="jon", on_owner_machine=True, sw_version="1.0.0",
+    )
+
+    res = loop.run_once()
+    assert res["action"] == "version_mismatch"
+    assert res["expected_version"] == "2.0.0"
+    assert res["sw_version"] == "1.0.0"
+    assert calls == []
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, lease_owner FROM apply_queue WHERE url='a-stale-version'")
+        q = cur.fetchone()
+        assert q["status"] == "queued"
+        assert q["lease_owner"] is None
+        cur.execute("SELECT state, sw_version FROM worker_heartbeat WHERE worker_id='w-stale'")
+        hb = cur.fetchone()
+        assert hb["state"] == "version_mismatch"
+        assert hb["sw_version"] == "1.0.0"
+
+
+def test_canary_source_version_only_unblocks_the_declared_worker(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "a-canary-version", host="canary.example")
+        fleet_config.set_pinned_version(
+            conn,
+            "1.0.0",
+            canary_version="2.0.0-rc1",
+            canary_worker_id="w-canary",
+        )
+
+    non_canary_calls = []
+    non_canary = WorkerLoop(
+        _factory(fleet_db), "w-other", home_ip="6.6.6.6", role="apply",
+        apply_fn=lambda job: non_canary_calls.append(job) or _CLEAR_HTML,
+        machine_owner="jon", on_owner_machine=True, sw_version="2.0.0-rc1",
+    )
+    assert non_canary.run_once()["action"] == "version_mismatch"
+    assert non_canary_calls == []
+
+    canary = WorkerLoop(
+        _factory(fleet_db), "w-canary", home_ip="6.6.6.6", role="apply",
+        apply_fn=lambda job: _CLEAR_HTML,
+        machine_owner="jon", on_owner_machine=True, sw_version="2.0.0-rc1",
+    )
+    res = canary.run_once()
+    assert res["action"] == "applied"
+    assert res["url"] == "a-canary-version"
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, worker_id FROM apply_queue WHERE url='a-canary-version'")
+        q = cur.fetchone()
+        assert q["status"] == "applied"
+        assert q["worker_id"] == "w-canary"
 
 
 def test_worker_refuses_to_lease_when_source_version_is_stale(fleet_db):
@@ -767,3 +839,49 @@ def test_tick_linkedin_routes(fleet_db):
         assert cur.fetchone()["halted_until"] is not None
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='kp' AND resolved_at IS NULL")
         assert cur.fetchone()["n"] == 1
+
+
+def test_linkedin_challenge_insert_failure_rolls_back_park_transaction(fleet_db, monkeypatch):
+    from applypilot.fleet import worker as worker_module
+
+    url = "linkedin-atomic-park"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO linkedin_queue "
+            "(url, application_url, score, status, lane, approved_batch, dedup_key, "
+            "linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES (%s,'https://linkedin.com/jobs/x',9,'queued','linkedin','b1',%s,'easy_apply',now())",
+            (url, "dk-" + url),
+        )
+        cur.execute(
+            "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
+            "VALUES ('account:linkedin',100,0,0) ON CONFLICT (scope_key) DO UPDATE "
+            "SET min_gap_seconds=0, base_min_gap_seconds=0, last_applied_at=NULL, daily_cap=100"
+        )
+        conn.commit()
+
+    def fail_challenge_insert(*args, **kwargs):
+        raise RuntimeError("simulated challenge insert failure")
+
+    monkeypatch.setattr(worker_module, "_insert_challenge", fail_challenge_insert)
+    loop = WorkerLoop(
+        lambda: pgqueue.connect(fleet_db), "linkedin-atomic-worker",
+        home_ip="1.1.1.1", role="linkedin", public_ip="1.1.1.1", owner_ip="1.1.1.1",
+        apply_fn=lambda job: {"run_status": "captcha", "est_cost_usd": 0.0},
+    )
+
+    with pytest.raises(RuntimeError, match="simulated challenge insert failure"):
+        loop.run_once()
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, apply_status, lease_expires_at < now() + interval '1 day' AS ordinary_lease "
+            "FROM linkedin_queue WHERE url=%s",
+            (url,),
+        )
+        row = cur.fetchone()
+        assert row["status"] == "leased"
+        assert row["apply_status"] is None
+        assert row["ordinary_lease"] is True
+        cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url=%s", (url,))
+        assert cur.fetchone()["n"] == 0

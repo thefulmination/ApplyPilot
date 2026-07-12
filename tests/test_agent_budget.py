@@ -129,10 +129,12 @@ def test_write_apply_result_attributes_agent_to_llm_usage(fleet_db):
         assert abs(agent_budget.rolling_spend(conn, "claude", window_seconds=3600) - 0.5) < 1e-6
 
 
-def test_worker_passthrough_forwards_agent_from_result(fleet_db):
+def test_worker_passthrough_forwards_agent_from_result(fleet_db, monkeypatch, tmp_path):
     # A real apply_fn reports which agent ran (make_apply_fn includes it); the worker
     # passthrough must forward it so the spend is attributed.
     from applypilot.fleet.worker import WorkerLoop
+    from applypilot import config
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "applypilot.db")
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
             cur.execute(

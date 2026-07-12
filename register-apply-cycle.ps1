@@ -241,16 +241,37 @@ Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle
 # the apply push+resume for a whole 4h cycle -- the steps are largely independent). Track the last
 # failure and exit non-zero at the end so Task Scheduler's Last-Result still surfaces it.
 `$fail = 0
+`$rc = Step 'readiness' { & '$applyHomeExe' readiness --strict }
+if (`$rc -eq 2) {
+  Add-Content -Path `$log -Value 'ApplyCycle: readiness blocked by safety gate (expected no-op); skipping verify-live/apply stages'
+  `$rc = Step 'pull' { & '$applyHomeExe' pull }
+  if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: pull FAILED (continuing best-effort)' }
+  Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle done (paused fail=' + `$fail + ') ===')
+  exit `$fail
+}
+if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: readiness probe FAILED; skipping apply stages' }
 `$rc = Step 'verify-live' { Invoke-VerifyLive { & '$runApplyPilotPs1' verify-live --max-age-days 3 --limit 300 } }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: verify-live FAILED (continuing best-effort)' }
 `$rc = Step 'push' { & '$applyHomeExe' push --score-floor 5.8 }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: push FAILED (continuing best-effort)' }
 `$rc = Step 'arm-canary' { & '$applyHomeExe' arm-canary-if-safe $CanaryK }
-if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: arm-canary FAILED (continuing best-effort)' }
-`$rc = Step 'approve' { & '$applyHomeExe' approve --all-pushed }
-if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: approve FAILED (continuing best-effort)' }
-`$rc = Step 'resume-if-safe' { & '$applyHomeExe' resume-if-safe }
-if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: resume-if-safe FAILED (continuing best-effort)' }
+`$canaryArmed = (`$rc -eq 0)
+if (-not `$canaryArmed) {
+  if (`$rc -eq 2) {
+    Add-Content -Path `$log -Value 'ApplyCycle: canary left disarmed by safety pause (expected no-op)'
+  } else {
+    `$fail = `$rc
+    Add-Content -Path `$log -Value 'ApplyCycle: arm-canary FAILED; skipping approve/resume'
+  }
+}
+if (`$canaryArmed) {
+  `$rc = Step 'approve' { & '$applyHomeExe' approve --all-pushed }
+  if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: approve FAILED; skipping resume' }
+  if (`$rc -eq 0) {
+    `$rc = Step 'resume-if-safe' { & '$applyHomeExe' resume-if-safe }
+    if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: resume-if-safe FAILED' }
+  }
+}
 `$rc = Step 'pull' { & '$applyHomeExe' pull }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: pull FAILED (continuing best-effort)' }
 Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle done (fail=' + `$fail + ') ===')

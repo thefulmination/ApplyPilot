@@ -1,6 +1,9 @@
 """v3 schema: loads cleanly against real Postgres, idempotent, all tables + columns present."""
 from __future__ import annotations
 
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -205,7 +208,10 @@ def test_apply_queue_v3_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='apply_queue'")
         cols = {r["column_name"] for r in cur.fetchall()}
-    for c in ("worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch"):
+    for c in (
+        "worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch",
+        "liveness_check_count", "liveness_consecutive_uncertain",
+    ):
         assert c in cols, f"apply_queue missing {c}"
     assert CANONICAL_QUEUE_COLUMNS <= cols
 

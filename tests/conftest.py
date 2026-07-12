@@ -33,6 +33,12 @@ _V3_TABLES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def isolate_local_runtime_state(tmp_path, monkeypatch):
+    """Keep durable lifecycle interlocks created by tests out of the live runtime."""
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "applypilot.db")
+
+
 def _find_pg_bin() -> Path | None:
     cands: list[Path] = []
     if os.environ.get("APPLYPILOT_PGTEST_BIN"):

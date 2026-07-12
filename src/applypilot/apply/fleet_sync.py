@@ -226,11 +226,13 @@ def _cli() -> int:
     pg = pgqueue.connect()
     try:
         if a.cmd == "migrate":
-            pgqueue.ensure_schema(pg); print("schema ensured (apply_queue + fleet_config)")
+            pgqueue.ensure_schema(pg)
+            print("schema ensured (apply_queue + fleet_config)")
         elif a.cmd == "set-cap":
             if a.cap is None:
                 ap.error("--cap is required for set-cap")
-            pgqueue.set_spend_cap(pg, a.cap); print(f"spend_cap_usd = ${a.cap:.2f}")
+            pgqueue.set_spend_cap(pg, a.cap)
+            print(f"spend_cap_usd = ${a.cap:.2f}")
         elif a.cmd == "push":
             n = push_offsite_jobs(pg_conn=pg, score_floor=a.score_floor, limit=a.limit)
             print(f"pushed {n} offsite-eligible jobs to the queue")
@@ -240,9 +242,11 @@ def _cli() -> int:
             for row in pgqueue.queue_stats(pg):
                 print(row)
         elif a.cmd == "pause":
-            pgqueue.set_paused(pg, True); print("fleet PAUSED (workers will drain + stop)")
+            pgqueue.set_paused(pg, True)
+            print("fleet PAUSED (workers will drain + stop)")
         elif a.cmd == "resume":
-            pgqueue.set_paused(pg, False); print("fleet resumed")
+            pgqueue.set_paused(pg, False)
+            print("fleet resumed")
         elif a.cmd == "upload-assets":
             import pathlib
             appdir = pathlib.Path(str(config.APP_DIR))

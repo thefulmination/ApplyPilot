@@ -27,7 +27,7 @@ def _ins(conn, url, title, *, audit=8.0, flags=None, gap=None, action=None, comp
         "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
         "fit_score, audit_score, audit_flags, fit_gap_category, recommended_action) VALUES "
         "(?, ?, 'X', ?, ?, 'x', 8, ?, ?, ?, ?)",
-        (url, title, company, "https://boards.greenhouse.io/acme/" + url[-3:], audit, flags, gap, action),
+        (url, title, company, "https://jobs.lever.co/acme/" + url[-3:], audit, flags, gap, action),
     )
     conn.commit()
 

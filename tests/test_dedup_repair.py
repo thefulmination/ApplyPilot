@@ -140,6 +140,7 @@ class _Conn:
 
 def test_dedup_repair_cli_json_dry_run(monkeypatch, capsys):
     monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn=None: _Conn())
+    monkeypatch.setattr(dedup_repair_main.fleet_schema, "ensure_schema_v3", lambda conn: None)
     monkeypatch.setattr(
         dedup_repair,
         "plan_repair",

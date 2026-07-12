@@ -286,6 +286,16 @@ def test_reclaim_parks_all_stale_leases_never_requeues(db):
         with conn.cursor() as cur:
             cur.execute("SELECT url, attempts FROM apply_queue WHERE url IN ('u/fresh','u/maybe')")
             assert all(r["attempts"] == 99 for r in cur.fetchall())
+            cur.execute(
+                "SELECT url, source, application_tool_calls, result_metadata "
+                "FROM apply_result_events WHERE url IN ('u/fresh','u/maybe') "
+                "ORDER BY url"
+            )
+            events = cur.fetchall()
+            assert [r["url"] for r in events] == ["u/fresh", "u/maybe"]
+            assert all(r["source"] == "watchdog" for r in events)
+            assert all(r["application_tool_calls"] is None for r in events)
+            assert all(r["result_metadata"]["reclaim_reason"] == "lease_expired" for r in events)
 
 
 def test_reclaim_never_requeues_crash_at_submit(db):

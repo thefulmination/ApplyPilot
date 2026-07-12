@@ -41,7 +41,8 @@ import os
 from pathlib import Path
 import time
 
-from applypilot.fleet import governor, heartbeat, queue
+from applypilot.fleet import governor, heartbeat
+from applypilot.fleet.failure_taxonomy import canonical_failure_group
 from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor before storing log text
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ _AGENT = "agent"
 _DEAD = "dead"
 _AUTH = "auth"
 _LOCATION = "location"
+_NON_ACTIONABLE = "non_actionable"
 
 _REASON_GROUPS: dict[str, tuple[str, ...]] = {
     _HARD_BLOCK: ("captcha", "blocked", "cloudflare_blocked", "site_blocked", "rate_limited"),
@@ -338,6 +340,29 @@ def _reason_group(token: str | None) -> str | None:
         for m in members:
             if t == m or (m == "rate_limited" and "rate_limited" in t):
                 return group
+    canonical = canonical_failure_group(t)
+    if canonical in {
+        "retired_unapproved", "duplicate_or_already_applied", "operator_skipped",
+        "remediation_history", "unclassified",
+    }:
+        return _NON_ACTIONABLE
+    if canonical == "unavailable":
+        return _DEAD
+    if canonical in {"rate_or_application_limit", "spam_or_abuse_filter"}:
+        return _HARD_BLOCK
+    if canonical == "timeout_or_stuck":
+        return _TIMEOUT
+    if canonical == "access_or_verification":
+        return _AUTH
+    if canonical in {"eligibility", "job_type_excluded", "form_or_profile_constraint"}:
+        return _LOCATION
+    if canonical in {
+        "agent_no_result", "browser_infrastructure", "submission_uncertain",
+        "page_or_content_failure", "budget_exhausted", "routing_or_policy",
+        "manual_review", "provider_usage_limit", "missing_required_material",
+        "not_an_application", "malformed_failure_reason",
+    }:
+        return _AGENT
     return None
 
 
@@ -383,6 +408,8 @@ def analyze(conn, *, window_minutes: int = 60) -> dict:
     for r in rows:
         token = r.get("apply_error") or r.get("apply_status")
         group = _reason_group(token)
+        if group == _NON_ACTIONABLE:
+            continue
         if group is None:
             # An unrecognized failure token is still surfaced as a generic cluster so a
             # human can SEE it (recommendation lane), but it never drives an auto-fix.
@@ -1758,6 +1785,9 @@ def main(argv=None) -> int:  # pragma: no cover - long-running / thin arg glue
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
     from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
     if args.once:
         with pgqueue.connect(args.dsn) as conn:
             summary = run_doctor(conn, window_minutes=args.window_minutes)

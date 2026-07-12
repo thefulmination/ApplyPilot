@@ -803,6 +803,8 @@ def indeed_resolve_apply_urls_command(
         console.print("  mode:       dry run")
     for status, count in sorted((summary.counts or {}).items()):
         console.print(f"  {status}: {count}")
+    for kind, count in sorted((summary.unresolved_kinds or {}).items()):
+        console.print(f"  unresolved.{kind}: {count}")
     for url in summary.sample_urls or []:
         console.print(f"  - {url}")
     console.print("[dim]Browser-click Indeed resolution is not enabled; unresolved rows include next-action metadata.[/dim]")
@@ -1037,10 +1039,14 @@ def apply_failures_command(
     AGENT = {"no_result_line", "timeout", "stuck", "suspicious_page", "unknown"}
 
     def category(r: str) -> str:
-        if r in RECOVERABLE: return "recoverable"
-        if r in DEAD: return "dead"
-        if r in BLOCKED: return "blocked"
-        if r in AGENT: return "agent"
+        if r in RECOVERABLE:
+            return "recoverable"
+        if r in DEAD:
+            return "dead"
+        if r in BLOCKED:
+            return "blocked"
+        if r in AGENT:
+            return "agent"
         return "other"
 
     conn = get_connection()

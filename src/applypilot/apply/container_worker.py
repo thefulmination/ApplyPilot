@@ -109,7 +109,7 @@ USAGE_LIMIT_MAX_STREAK = int(os.environ.get("APPLYPILOT_USAGE_LIMIT_MAX_STREAK")
 USAGE_LIMIT_COOLDOWN = float(os.environ.get("APPLYPILOT_USAGE_LIMIT_COOLDOWN") or 30)
 
 
-def _handle_run_status(pg, worker_id, url, status, *, cost, dur_ms, model) -> str:
+def _handle_run_status(pg, worker_id, url, status, *, cost, dur_ms, model, evidence=None) -> str:
     """Persist one run_job outcome and release the lease. Returns the action taken:
 
       'requeued' -- an agent usage/quota wall (provably never touched the page: a turn-1
@@ -128,9 +128,15 @@ def _handle_run_status(pg, worker_id, url, status, *, cost, dur_ms, model) -> st
         pgqueue.requeue_job(pg, str(worker_id), url, apply_error=(status or "")[:200])
         return "requeued"
     pg_status, apply_error = _map_status(status)
+    evidence = evidence or {}
     pgqueue.write_result(pg, str(worker_id), url, status=pg_status,
                          apply_status=status, apply_error=apply_error,
-                         est_cost_usd=cost, agent_model=model, apply_duration_ms=dur_ms)
+                         est_cost_usd=cost, agent_model=model, apply_duration_ms=dur_ms,
+                         application_tool_calls=evidence.get("application_tool_calls"),
+                         job_log_path=evidence.get("job_log_path"),
+                         transcript_digest=evidence.get("transcript_digest"),
+                         final_result_source=evidence.get("final_result_source"),
+                         result_metadata=evidence.get("result_metadata"))
     return "applied" if pg_status == "applied" else "other"
 
 
@@ -340,24 +346,37 @@ def _retired_main() -> int:
         if _ls == _DEAD:
             pgqueue.write_result(pg, str(worker_id), row["url"], status="failed",
                                  apply_status="expired", apply_error=f"preflight_{_lr}"[:200],
-                                 est_cost_usd=0.0, agent_model=model, apply_duration_ms=0)
+                                 est_cost_usd=0.0, agent_model=model, apply_duration_ms=0,
+                                 application_tool_calls=0,
+                                 final_result_source="browser_preflight",
+                                 result_metadata={"execution_evidence": "preflight", "probe": _lr})
             failed += 1
             _log(f"preflight DEAD skip ({_lr}) -- saved a launch | applied={applied} other={failed}")
             continue
 
         proc = launch_chrome(worker_id, port=port, headless=True)
         status, dur_ms, cost = "failed:worker_error", 0, 0.0
+        stats = {}
         try:
             status, dur_ms = launcher.run_job(job, port, worker_id=worker_id,
                                               model=model, agent=agent, dry_run=False)
-            cost = _real_cost(launcher._last_run_stats.get(worker_id, {}), model)
+            stats = launcher._last_run_stats.get(worker_id, {})
+            cost = _real_cost(stats, model)
         except Exception as e:  # never let one job kill the worker
             status = f"failed:worker_error:{type(e).__name__}:{str(e)[:80]}"
         finally:
             require_browser_cleanup(cleanup_worker, worker_id, proc)
 
-        action = _handle_run_status(pg, worker_id, row["url"], status,
-                                    cost=cost, dur_ms=dur_ms, model=model)
+        action = _handle_run_status(
+            pg, worker_id, row["url"], status, cost=cost, dur_ms=dur_ms, model=model,
+            evidence={
+                "application_tool_calls": stats.get("application_tool_calls"),
+                "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
+                "transcript_digest": stats.get("transcript_digest"),
+                "final_result_source": stats.get("final_result_source"),
+                "result_metadata": stats.get("result_metadata"),
+            },
+        )
 
         # Usage/quota wall (the agent never touched the page): re-queued, not parked. Back
         # off after a streak so a wall doesn't churn the whole queue at lease speed -- the

@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 import subprocess
+from functools import lru_cache as _lru_cache
 from pathlib import Path
 
 # User data directory — all user-specific files live here
@@ -349,9 +350,6 @@ def load_preference_profile() -> dict | None:
         )
         return None
     return data
-
-
-from functools import lru_cache as _lru_cache
 
 
 @_lru_cache(maxsize=1)

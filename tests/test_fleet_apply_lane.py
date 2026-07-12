@@ -56,6 +56,29 @@ def test_lease_blocked_when_paused(fleet_db):
         assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
 
 
+def test_lease_rejects_prior_browser_or_requeue_evidence(fleet_db):
+    """Review-only canary blockers must also hold at the real lease boundary."""
+    from applypilot.fleet import queue
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_approved_apply_rows(conn, 2)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE apply_queue SET apply_error='requeued_by_remediator:usage_limit' "
+                "WHERE url='u1'"
+            )
+            cur.execute(
+                "INSERT INTO apply_result_events "
+                "(url, queue_name, status, apply_error, application_tool_calls, source) "
+                "VALUES ('u0','apply_queue','failed','failed:budget_exhausted',3,'worker')"
+            )
+            cur.execute("UPDATE fleet_config SET paused=FALSE, ats_paused=FALSE WHERE id=1")
+        conn.commit()
+        assert queue.lease_apply(conn, "w1", home_ip="1.1.1.1") is None
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue ORDER BY url")
+            assert [row["status"] for row in cur.fetchall()] == ["queued", "queued"]
+
+
 def test_canary_caps_total_leases_fleetwide(fleet_db):
     from applypilot.fleet import queue
     with pgqueue.connect(fleet_db) as conn:

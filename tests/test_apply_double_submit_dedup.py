@@ -41,7 +41,7 @@ def test_sibling_row_excluded_by_company_and_title(conn):
     # The exact real-world shape: Setpoint as an applied hiring.cafe row + a still-
     # pending LinkedIn row for the same company+role (different url, app_url unresolved).
     _seed(conn, "https://hiring.cafe/viewjob/applied1", company="Setpoint",
-          application_url="https://boards.greenhouse.io/setpoint/jobs/1", apply_status="applied")
+          application_url="https://jobs.lever.co/setpoint/1", apply_status="applied")
     _seed(conn, "https://www.linkedin.com/jobs/view/999", company="Setpoint",
           application_url=None, apply_status=None)
     # The LinkedIn sibling must NOT be acquired -- Setpoint was already applied.
@@ -81,7 +81,7 @@ def test_no_confirmation_blocks_sibling(conn):
     # no_confirmation means the agent DID click submit (just couldn't confirm). A
     # sibling row of that posting must not be applied -> would be a second submission.
     _seed(conn, "https://hiring.cafe/viewjob/unconf", company="Checkr",
-          application_url="https://job-boards.greenhouse.io/checkr/1",
+          application_url="https://jobs.lever.co/checkr/1",
           apply_status="failed", apply_error="no_confirmation")
     _seed(conn, "https://www.linkedin.com/jobs/view/4", company="Checkr",
           application_url=None, apply_status=None)
@@ -116,9 +116,9 @@ def test_unresolved_aggregator_row_is_deferred(conn):
 
 def test_resolved_aggregator_row_is_applyable(conn):
     # Same aggregator source, but enrichment RESOLVED application_url to the real ATS ->
-    # effective host is greenhouse (not the aggregator), dedup works, so it's applyable.
+    # effective host is a non-auth-gated ATS (not the aggregator), dedup works, so it's applyable.
     _seed(conn, "https://www.chiefofstaffjob.com/jobs/aggy", company="RealCo",
-          application_url="https://boards.greenhouse.io/realco/1")
+          application_url="https://jobs.lever.co/realco/1")
     job = L.acquire_job(min_score=7)
     assert job is not None and job["url"].endswith("/jobs/aggy")
 
@@ -128,11 +128,11 @@ def test_dedup_does_not_over_exclude(conn):
     # rule: different roles are not duplicates). "Chief of Staff" and "VP of Marketing"
     # share no role words -> low similarity -> not a near-dup.
     _seed(conn, "https://hiring.cafe/viewjob/cos", company="BigCo",
-          title="Chief of Staff", application_url="https://boards.greenhouse.io/bigco/1",
+          title="Chief of Staff", application_url="https://jobs.lever.co/bigco/1",
           apply_status="applied")
     _seed(conn, "https://hiring.cafe/viewjob/vpmkt", company="BigCo",
           title="VP of Marketing",
-          application_url="https://boards.greenhouse.io/bigco/2", apply_status=None)
+          application_url="https://jobs.lever.co/bigco/2", apply_status=None)
     job = L.acquire_job(min_score=7)
     assert job is not None and job["url"].endswith("/vpmkt")
 
@@ -152,14 +152,14 @@ def _seed_age(conn, url, days_old, *, live=None, company="Acme", title="Chief of
 
 def test_freshness_filter_default_45_skips_stale_unverified(conn):
     # The default is now 45; a stale posting with no liveness confirmation is skipped.
-    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/1", 60)
+    _seed_age(conn, "https://jobs.lever.co/a/1", 60)
     assert L.acquire_job(min_score=7) is None
 
 
 def test_freshness_filter_disabled_allows_stale(conn, monkeypatch):
     # Explicit zero disables the freshness filter for owner-operated runs.
     monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "0")
-    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/5", 60)
+    _seed_age(conn, "https://jobs.lever.co/a/5", 60)
     assert L.acquire_job(min_score=7) is not None
 
 
@@ -168,16 +168,16 @@ def test_freshness_filter_uses_posted_at_tiebreaker(conn, monkeypatch):
     # postings can still be picked later when a fresher posting date exists.
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)
-    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/6", 120, live=None, title="A")
+    _seed_age(conn, "https://jobs.lever.co/a/6", 120, live=None, title="A")
     conn.execute(
         "UPDATE jobs SET posted_at = ? WHERE url = ?",
-        ((now - _dt.timedelta(days=2)).isoformat(), "https://boards.greenhouse.io/a/jobs/6"),
+            ((now - _dt.timedelta(days=2)).isoformat(), "https://jobs.lever.co/a/6"),
     )
     conn.execute(
         "INSERT INTO jobs (url, title, site, company, tailored_resume_path, fit_score, "
         "audit_score, discovered_at, posted_at, liveness_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
-            "https://boards.greenhouse.io/a/jobs/7", "B", "X", "Acme", "x", 8, 9.0,
+            "https://jobs.lever.co/a/7", "B", "X", "Acme", "x", 8, 9.0,
             (now - _dt.timedelta(days=119)).isoformat(),
             (now - _dt.timedelta(days=30)).isoformat(),
             None,
@@ -187,30 +187,30 @@ def test_freshness_filter_uses_posted_at_tiebreaker(conn, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
     job = L.acquire_job(min_score=7)
     assert job is not None
-    assert job["url"] == "https://boards.greenhouse.io/a/jobs/7"
+    assert job["url"] == "https://jobs.lever.co/a/7"
 
 
 def test_freshness_filter_skips_stale_unverified(conn, monkeypatch):
     # With a 45-day bound, a stale posting with no liveness confirmation is skipped --
     # these have a much higher expired-on-visit rate, so we don't waste a launch.
     monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
-    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/2", 60)
+    _seed_age(conn, "https://jobs.lever.co/a/2", 60)
     assert L.acquire_job(min_score=7) is None
 
 
 def test_freshness_filter_keeps_stale_but_liveness_confirmed(conn, monkeypatch):
     # Age alone doesn't disqualify -- a liveness_status='live' row is kept even if old.
     monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
-    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/3", 60, live="live")
+    _seed_age(conn, "https://jobs.lever.co/a/3", 60, live="live")
     job = L.acquire_job(min_score=7)
-    assert job is not None and job["url"].endswith("/jobs/3")
+    assert job is not None and job["url"].endswith("/a/3")
 
 
 def test_freshness_filter_keeps_fresh(conn, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_MAX_JOB_AGE_DAYS", "45")
-    _seed_age(conn, "https://boards.greenhouse.io/a/jobs/4", 5)
+    _seed_age(conn, "https://jobs.lever.co/a/4", 5)
     job = L.acquire_job(min_score=7)
-    assert job is not None and job["url"].endswith("/jobs/4")
+    assert job is not None and job["url"].endswith("/a/4")
 
 
 # --- Crash-stranded lease handling (anti double-submit) -----------------------
@@ -295,7 +295,7 @@ def test_reset_failed_resets_ordinary_failure(conn):
         "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
         "fit_score, audit_score, apply_status, apply_error, apply_attempts) VALUES "
         "('https://hiring.cafe/pe', 'Chief of Staff', 'X', 'Acme', "
-        "'https://job-boards.greenhouse.io/acme/jobs/3', 'x', 8, 9.0, 'failed', "
+        "'https://jobs.lever.co/acme/3', 'x', 8, 9.0, 'failed', "
         "'page_error', 1)")
     conn.commit()
     L.reset_failed()

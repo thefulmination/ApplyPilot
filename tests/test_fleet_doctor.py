@@ -107,6 +107,28 @@ def test_rate_limited_substring_maps_to_hard_block(fleet_db):
     assert clusters["host_failures"]["h.com"]["hard_block"] == 1
 
 
+def test_modern_failure_taxonomy_maps_into_doctor_action_groups():
+    assert doctor._reason_group("failed:browser_unavailable") == "agent"
+    assert doctor._reason_group("failed:no_confirmation") == "agent"
+    assert doctor._reason_group("failed:email_verification_required") == "auth"
+    assert doctor._reason_group("failed:not_a_salaried_position") == "location"
+    assert doctor._reason_group("stale_unapproved") == "non_actionable"
+    assert doctor._reason_group("dedup:already_applied") == "non_actionable"
+
+
+def test_analyze_excludes_retired_and_deduplicated_rows_from_failure_backlog(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply_failure(conn, url="retired", host="old.example", apply_error="stale_unapproved")
+        _seed_apply_failure(conn, url="duplicate", host="dup.example", apply_error="dedup:already_applied")
+        _seed_apply_failure(conn, url="browser", host="broken.example", apply_error="failed:browser_unavailable")
+        clusters = doctor.analyze(conn, window_minutes=60)
+
+    assert clusters["lane_failures"] == 1
+    assert {row["reason"] for row in clusters["cluster_rows"]} == {"agent"}
+    assert "old.example" not in clusters["host_failures"]
+    assert "dup.example" not in clusters["host_failures"]
+
+
 def _seed_host_governor(conn, host, *, attempts):
     """Seed the host governor scope with enough ATTEMPTS that the H6 rate+denominator host_skip
     gate qualifies (block_24h drives both attempts and a high block rate)."""

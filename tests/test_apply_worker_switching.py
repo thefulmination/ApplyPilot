@@ -259,11 +259,13 @@ def test_run_apply_respects_fleet_wide_block(monkeypatch):
 
     awm.run_apply(_conn_factory, loop, max_iterations=1, idle_sleep=0,
                   switcher=sw, rebuild_apply_fn=lambda a: (rebuilt.append(a) or (lambda j: {})),
+                  model_for_agent=lambda a: f"{a}-model",
                   time_fn=lambda: 1000.0, budget=budget)
 
     assert rebuilt == ["codex"]        # fleet-blocked claude -> codex, without a local wall
     assert budget.evaluated >= 1       # ran the predictive evaluator
     assert loop.current_agent == "codex"
+    assert loop.current_model == "codex-model"
     assert loop.agent_chain == "claude,codex"
     awm._STOP_REQUESTED.clear()
 

@@ -414,3 +414,19 @@ def test_run_resolver_dry_run_does_not_write(tmp_path, monkeypatch):
     assert summary.sample_urls == ["https://jobs.lever.co/acme/456"]
     assert row["apply_url_resolution_strategy"] is None
     assert row["apply_url_resolution_attempts"] == 0
+
+
+def test_run_resolver_reports_unresolved_reason_breakdown(tmp_path, monkeypatch):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    monkeypatch.setattr(indeed_resolver, "get_connection", lambda: conn)
+    _insert_job(conn, url="https://www.indeed.com/viewjob?jk=missing")
+    _insert_job(
+        conn,
+        url="https://www.indeed.com/viewjob?jk=ats",
+        application_url="https://www.indeed.com/viewjob?jk=ats",
+    )
+
+    summary = indeed_resolver.run_resolver(indeed_resolver.IndeedResolverOptions(limit=10))
+
+    assert summary.counts == {"unresolved": 2}
+    assert summary.unresolved_kinds == {"ats_reconstruction_needed": 2}

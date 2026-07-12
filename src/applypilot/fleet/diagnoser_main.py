@@ -5,7 +5,7 @@ import argparse
 import sys
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import diagnoser
+from applypilot.fleet import diagnoser, schema as fleet_schema
 
 
 def _failing_workers(conn) -> list[str]:
@@ -28,6 +28,7 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         workers = [args.worker] if args.worker else _failing_workers(conn)
         if not workers:
             print("no failing workers in the last 20 min")

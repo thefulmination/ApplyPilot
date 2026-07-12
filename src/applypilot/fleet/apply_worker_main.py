@@ -238,6 +238,7 @@ def make_apply_fn(
         require_browser_cleanup,
     )
     from applypilot.apply.container_worker import _real_cost
+    agent_model = launcher.effective_agent_model_label(agent, model)
 
     def apply_fn(job: dict) -> dict:
         # `slot` keys this worker's Chrome profile + CDP port + per-run logs, so multiple
@@ -357,7 +358,7 @@ def make_apply_fn(
                 "run_status": status,
                 "est_cost_usd": _real_cost(stats, model),
                 "agent": agent,
-                "agent_model": model,
+                "agent_model": agent_model,
                 "application_tool_calls": stats.get("application_tool_calls"),
                 "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
                 "transcript_digest": stats.get("transcript_digest"),
@@ -502,10 +503,13 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)
-    return WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
+    loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot, fleet_worker_id=worker_id),
                       machine_owner=machine_owner,
                       log_tail_fn=make_log_tail_fn(slot))
+    loop.current_agent = agent
+    loop.current_model = launcher.effective_agent_model_label(agent, model)
+    return loop
 
 
 # When all agents are usage-limit-walled the worker pauses until the nearer reset. Cap a
@@ -558,7 +562,7 @@ class PgAgentBudget:
 
 def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
               switcher=None, rebuild_apply_fn=None, time_fn=None, now_local_fn=None,
-              budget=None) -> dict:
+              budget=None, model_for_agent=None) -> dict:
     """Drive the apply loop. Before each iteration check should_halt (paused/spend cap)
     and idle when halted. A per-tick error backs off (no hot crash loop). Returns a
     counts dict (testable). Production calls with max_iterations=None (forever).
@@ -620,6 +624,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 if agent is None:
                     try:
                         loop.current_agent = None
+                        loop.current_model = None
                         loop.last_agent_switch_reason = "all_agents_walled"
                     except Exception:
                         pass
@@ -642,7 +647,8 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                     loop.apply_fn = rebuild_apply_fn(agent)
                     try:
                         loop.current_agent = agent
-                        loop.current_model = None if agent == "codex" else getattr(loop, "current_model", None)
+                        if model_for_agent is not None:
+                            loop.current_model = model_for_agent(agent)
                         loop.last_agent_switch_at = _now_local()
                         loop.last_agent_switch_reason = "agent_available"
                     except Exception:
@@ -786,8 +792,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     # / run-fleet-worker launchers early-reject too, but this backstops manual + SSH launches).
     enforce_host_identity(args.machine_owner)
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
-    from applypilot.apply import pgqueue
+    from applypilot.apply import launcher, pgqueue
     from applypilot.fleet.agent_switch import AgentSwitcher
+    from applypilot.fleet import schema as fleet_schema
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
                             model=args.model, agent=args.agent, machine_owner=args.machine_owner,
                             slot=slot)
@@ -829,6 +838,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
               switcher=switcher,
               rebuild_apply_fn=lambda agent: make_apply_fn(
                   args.model, agent, slot, fleet_worker_id=args.worker_id),
+              model_for_agent=lambda agent: launcher.effective_agent_model_label(agent, args.model),
               budget=budget,
               max_iterations=max_iterations)
     return 0

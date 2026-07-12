@@ -844,7 +844,7 @@ CREATE INDEX IF NOT EXISTS idx_fleet_console_audit_created
 -- autotriage_actions: audit trail for autonomous bounded LLM/rule triage.
 -- The LLM may choose only from a fixed action menu, and the executor validates
 -- each action before mutating fleet state. This table records both applied and
--- rejected choices so the loop is inspectable and reversible.
+-- rejected choices plus manual-review deferrals so the loop is inspectable and reversible.
 CREATE TABLE IF NOT EXISTS autotriage_actions (
     id                 BIGSERIAL PRIMARY KEY,
     url                TEXT,
@@ -874,6 +874,7 @@ CREATE TABLE IF NOT EXISTS apply_result_events (
     queue_name          TEXT NOT NULL DEFAULT 'apply_queue',
     url                 TEXT NOT NULL,
     worker_id           TEXT,
+    machine_owner       TEXT,
     status              TEXT,
     apply_status        TEXT,
     apply_error         TEXT,
@@ -893,6 +894,7 @@ CREATE TABLE IF NOT EXISTS apply_result_events (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS queue_name TEXT NOT NULL DEFAULT 'apply_queue';
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS machine_owner TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'worker';
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS application_tool_calls INTEGER;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS job_log_path TEXT;

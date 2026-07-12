@@ -85,9 +85,9 @@ def test_llm_decision_cannot_requeue_may_have_submitted_crash():
 
     decision = autotriage.decide(ctx, client=client, enable_llm=True)
 
-    assert decision.action == "no_action"
-    assert decision.status == "rejected"
-    assert "may_have_submitted" in decision.reason
+    assert decision.action == "manual_review_required"
+    assert decision.status == "accepted"
+    assert "missing durable execution evidence" in decision.reason
 
 
 def test_deterministic_usage_limit_requeues_and_writes_audit(fleet_db):

@@ -24,6 +24,7 @@ from typing import Any, Iterable
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding="utf-8")
 
@@ -131,7 +132,7 @@ SET status           = 'crash_unconfirmed'::apply_queue_status,
     updated_at       = now()
 FROM stale s
 WHERE q.url = s.url
-RETURNING q.url, q.status;
+RETURNING q.url, q.status, q.worker_id, q.apply_domain;
 """
 
 
@@ -152,6 +153,29 @@ def reclaim_stale_leases(conn: psycopg.Connection, *, grace_seconds: int = 30) -
     with conn.cursor() as cur:
         cur.execute(_RECLAIM_SQL, {"grace": grace_seconds})
         rows = cur.fetchall()
+        # A watchdog reclaim used to leave no result event behind, making an old
+        # hard-crash indistinguishable from an uninstrumented row. Record the
+        # conservative outcome and its missing-evidence state for later triage.
+        for row in rows:
+            cur.execute(
+                "INSERT INTO apply_result_events ("
+                "queue_name, url, worker_id, status, apply_status, apply_error, "
+                "target_host, application_tool_calls, result_metadata, result_line, source"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    "apply_queue",
+                    row["url"],
+                    row["worker_id"],
+                    "crash_unconfirmed",
+                    "crash_unconfirmed",
+                    "crash_unconfirmed",
+                    row["apply_domain"],
+                    None,
+                    Jsonb({"reclaim_reason": "lease_expired", "execution_evidence": "missing"}),
+                    "RESULT:crash_unconfirmed",
+                    "watchdog",
+                ),
+            )
     conn.commit()
     return rows
 

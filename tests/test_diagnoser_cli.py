@@ -13,6 +13,7 @@ class _Conn:
 
 def test_cli_diagnoses_named_worker(monkeypatch, capsys):
     monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn=None: _Conn())
+    monkeypatch.setattr(diagnoser_main.fleet_schema, "ensure_schema_v3", lambda conn: None)
     monkeypatch.setattr(diagnoser, "load_worker_ctx",
                         lambda conn, w: diagnoser.WorkerCtx(w, recent_log="x"))
     monkeypatch.setattr(diagnoser, "diagnose",

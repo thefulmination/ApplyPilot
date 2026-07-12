@@ -315,6 +315,32 @@ def test_owner_inbox_backlog_ignores_single_manual_challenge_when_otp_is_still_a
 
     assert "owner_inbox_backlog" not in _kinds(alerts)
 
+
+def test_stale_owner_inbox_alerts_on_frozen_ats_leases(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            _arm(cur)
+            _heartbeat(cur, "apply-worker-1", NOW - dt.timedelta(minutes=5))
+            _heartbeat(cur, "watchdog-1", NOW - dt.timedelta(minutes=5))
+            cur.execute(
+                "INSERT INTO apply_queue (url, application_url, score, status, lane, apply_status, "
+                "lease_owner, lease_expires_at) VALUES "
+                "('stale-owner-wall', 'https://example.com/apply', 8, 'leased', 'ats', "
+                "'challenge_pending', 'worker-1', now() + interval '3650 days')"
+            )
+            cur.execute(
+                "INSERT INTO auth_challenge (url, worker_id, kind, route, raised_at) VALUES "
+                "('stale-owner-wall', 'worker-1', 'login_gate', 'owner_inbox', %s)",
+                (NOW - dt.timedelta(days=2),),
+            )
+        conn.commit()
+
+        alerts, _ = deadman.deadman_check(conn, now=NOW)
+
+    stale = [a for a in alerts if a.kind == "owner_inbox_stale"]
+    assert len(stale) == 1
+    assert "1 owner_inbox ATS lease" in stale[0].detail
+
 # ---------------------------------------------------------------------------
 # selfheal_dead
 # ---------------------------------------------------------------------------
@@ -817,6 +843,14 @@ class _FakeImapMailSourceUnknownError:
         raise OSError("network unreachable")
 
 
+class _FakeImapMailSourceOverflow:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
+        raise deadman_mail_source.MailSourceOverflowError("candidate snapshot exceeds probe budget")
+
+
 def test_mail_source_alive_true_when_app_password_login_succeeds(monkeypatch):
     monkeypatch.setattr(
         deadman.config, "load_gmail_app_password", lambda: ("a@b.com", "pw")
@@ -853,6 +887,15 @@ def test_mail_source_alive_false_when_app_password_login_raises_mail_source_erro
     monkeypatch.setattr(deadman, "ImapMailSource", _FakeImapMailSourceLoginFails)
 
     assert deadman.mail_source_alive() is False
+
+
+def test_mail_source_alive_treats_bounded_overflow_as_authenticated(monkeypatch):
+    monkeypatch.setattr(
+        deadman.config, "load_gmail_app_password", lambda: ("a@b.com", "pw")
+    )
+    monkeypatch.setattr(deadman, "ImapMailSource", _FakeImapMailSourceOverflow)
+
+    assert deadman.mail_source_alive() is True
 
 
 def test_mail_source_alive_none_on_unexpected_exception(monkeypatch):

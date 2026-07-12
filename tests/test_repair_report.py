@@ -120,10 +120,14 @@ def test_repair_report_summarizes_crashes_email_queue_and_recommendations(fleet_
     assert timeout_sample["apply_duration_ms"] == 1234
     assert timeout_sample["last_result_line"] == "RESULT:FAILED:timeout"
     assert report["email_reconcile"]["confirmed"] == 1
+    assert len(report["email_reconcile"]["confirmed_samples"]) <= 3
     assert report["queue_diagnosis"]["queued"]["dedup_blocked"] == 1
     assert any("--apply --confirmed-only --max-flips 1" in r["command"] for r in report["recommendations"])
     assert any("applypilot-fleet-dedup-repair" in r["command"] for r in report["recommendations"])
     assert repair_report.classify_crash_error("email_reconcile_review_required") == "email_review_required"
+    assert repair_report.classify_crash_error(
+        "crash_unconfirmed", event_source="worker_lease"
+    ) == "lease_started_no_terminal"
 
 
 def test_repair_report_ignores_stale_worker_heartbeat_result_lines(fleet_db):
@@ -141,6 +145,49 @@ def test_repair_report_ignores_stale_worker_heartbeat_result_lines(fleet_db):
     sample = report["crash"]["buckets"]["email_review_required"]["samples"][0]
     assert sample["worker_id"] == "w-stale"
     assert sample["last_result_line"] is None
+
+
+def test_repair_report_classifies_terminal_backlog_without_recommending_blind_retries(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="stale", status="failed", apply_error="stale_unapproved")
+        _seed_apply_row(cur, url="protected", status="blocked", apply_error="submission_uncertain:applied_set_protected")
+        _seed_apply_row(cur, url="browser", status="failed", apply_error="failed:browser_unavailable")
+        _seed_apply_row(cur, url="auth", status="blocked", apply_error="challenge_pending")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        report = repair_report.build_report(conn)
+
+    breakdown = report["terminal_breakdown"]
+    assert breakdown["terminal_non_retryable"]["count"] == 1
+    assert breakdown["protected_manual_review"]["count"] == 1
+    assert breakdown["infrastructure_review"]["count"] == 1
+    assert breakdown["auth_or_availability"]["count"] == 1
+    concentration = report["infrastructure_concentration"]
+    assert concentration["workers"][0] == {"name": "w1", "count": 1}
+    assert concentration["hosts"][0] == {"name": "acme.com", "count": 1}
+    assert report["canonical_failure_groups"]["retired_unapproved"] == 1
+    assert report["canonical_failure_groups"]["submission_uncertain"] == 1
+    assert report["canonical_failure_groups"]["browser_infrastructure"] == 1
+    assert repair_report.classify_terminal_reason("failed", "stale_unapproved") == "terminal_non_retryable"
+    assert repair_report.classify_terminal_reason("blocked", "submission_uncertain:evidence_gap") == "protected_manual_review"
+
+
+def test_repair_report_separates_strong_and_weak_dedup_metadata(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="weak-dedup", status="blocked", apply_error="submission_uncertain:applied_set_protected", dedup_key="weak")
+        _seed_apply_row(cur, url="strong-dedup", status="blocked", apply_error="submission_uncertain:applied_set_protected", dedup_key="strong")
+        cur.execute("INSERT INTO applied_set (dedup_key) VALUES ('weak')")
+        cur.execute("INSERT INTO applied_set (dedup_key, company, applied_url) VALUES ('strong','Acme','https://acme.test/applied')")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        summary = repair_report.build_report(conn)["dedup_protection"]
+
+    assert summary == {
+        "total": 2, "weak_metadata": 1, "strong_metadata": 1, "missing_dedup_key": 0,
+        "no_queue_evidence": 0, "conflicting_evidence": 0,
+    }
 
 
 def test_repair_report_uses_durable_result_event(fleet_db):
@@ -172,6 +219,12 @@ class _Conn:
 
 def test_repair_report_cli_prints_json(monkeypatch, capsys):
     monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn=None: _Conn())
+    schema_calls = []
+    monkeypatch.setattr(
+        repair_report_main.fleet_schema,
+        "ensure_schema_v3",
+        lambda conn: schema_calls.append(conn),
+    )
     monkeypatch.setattr(
         repair_report,
         "build_report",
@@ -187,5 +240,6 @@ def test_repair_report_cli_prints_json(monkeypatch, capsys):
     rc = repair_report_main.main(["--dsn", "pg", "--home-db", "home.db", "--json"])
 
     assert rc == 0
+    assert len(schema_calls) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["crash"]["total"] == 1

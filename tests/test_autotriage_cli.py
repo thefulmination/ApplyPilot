@@ -13,6 +13,12 @@ class _FakeConn:
 
 def test_autotriage_cli_once_runs_one_pass(monkeypatch, capsys):
     monkeypatch.setattr(autotriage_main.pgqueue, "connect", lambda dsn: _FakeConn())
+    schema_calls = []
+    monkeypatch.setattr(
+        autotriage_main.fleet_schema,
+        "ensure_schema_v3",
+        lambda conn: schema_calls.append(conn),
+    )
 
     calls = []
 
@@ -30,13 +36,15 @@ def test_autotriage_cli_once_runs_one_pass(monkeypatch, capsys):
     rc = autotriage_main.main(["--once", "--dsn", "postgresql://x", "--enable-llm", "--limit", "2"])
 
     assert rc == 0
+    assert len(schema_calls) == 1
     assert calls == [
         {
             "brain_path": None,
             "limit": 2,
             "window_minutes": 1440,
-            "enable_llm": True,
-            "dry_run": False,
-        }
+                "enable_llm": True,
+                "dry_run": False,
+                "crash_only": False,
+            }
     ]
     assert "contexts=2 applied=1" in capsys.readouterr().out

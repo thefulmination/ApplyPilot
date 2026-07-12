@@ -547,6 +547,65 @@ def test_write_result_records_outcome_and_applied_set(fleet_db):
                                         target_host="greenhouse.io", home_ip="1.2.3.4") is False
 
 
+def test_write_apply_result_resolves_challenge_only_after_owned_close(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "challenged-apply", host="greenhouse.io")
+        leased = queue.lease_apply(conn, "owner", home_ip="1.2.3.4")
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO auth_challenge (url, worker_id, kind, route) VALUES (%s,%s,%s,%s)",
+                (leased["url"], "owner", "login_gate", "owner_inbox"),
+            )
+        conn.commit()
+
+        assert queue.write_apply_result(
+            conn, "intruder", leased["url"], status="failed",
+            target_host="greenhouse.io", home_ip="1.2.3.4",
+        ) is False
+        with conn.cursor() as cur:
+            cur.execute("SELECT resolved_at FROM auth_challenge WHERE url=%s", (leased["url"],))
+            assert cur.fetchone()["resolved_at"] is None
+
+        assert queue.write_apply_result(
+            conn, "owner", leased["url"], status="failed",
+            target_host="greenhouse.io", home_ip="1.2.3.4",
+        ) is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT outcome, resolved_at FROM auth_challenge WHERE url=%s", (leased["url"],))
+            challenge = cur.fetchone()
+            assert challenge["outcome"] == "superseded:failed"
+            assert challenge["resolved_at"] is not None
+
+
+def test_write_apply_result_preserves_challenge_for_parked_linkedin_lane(fleet_db):
+    url = "shared-result-challenge"
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, url, host="greenhouse.io")
+        leased = queue.lease_apply(conn, "owner", home_ip="1.2.3.4")
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, application_url, score, status, lane, lease_owner, lease_expires_at, apply_status) "
+                "VALUES (%s,%s,9,'leased','linkedin','linkedin-worker',"
+                "now()+interval '3650 days','challenge_pending')",
+                (url, url),
+            )
+            cur.execute(
+                "INSERT INTO auth_challenge (url, worker_id, kind, route) "
+                "VALUES (%s,'owner','login_gate','owner_inbox')",
+                (url,),
+            )
+        conn.commit()
+
+        assert queue.write_apply_result(
+            conn, "owner", leased["url"], status="failed",
+            target_host="greenhouse.io", home_ip="1.2.3.4",
+        ) is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT resolved_at FROM auth_challenge WHERE url=%s", (url,))
+            assert cur.fetchone()["resolved_at"] is None
+
+
 # ---- write_apply_result records apply-agent cost to llm_usage (Phase 2.1) ------
 # Regression: the apply lane never wrote to llm_usage, so every cost cap read $0
 # while real agent money was spent. write_apply_result must insert one llm_usage
@@ -651,7 +710,8 @@ def test_write_apply_result_records_durable_result_event(fleet_db):
             cur.execute(
                 "SELECT url, worker_id, status, apply_error, target_host, home_ip, "
                 "agent, agent_model, apply_duration_ms, result_line "
-                "FROM apply_result_events WHERE url='event1'"
+                "FROM apply_result_events WHERE url='event1' AND source='worker' "
+                "ORDER BY id DESC LIMIT 1"
             )
             row = cur.fetchone()
         assert row["worker_id"] == "w1"
@@ -858,6 +918,30 @@ def test_search_recurs_after_completion(fleet_db):
             assert r["status"] == "queued" and r["result_count"] == 12 and r["future"] is True
 
 
+def test_search_transaction_retries_deadlock_after_rollback(monkeypatch):
+    class FakeConnection:
+        rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = FakeConnection()
+    attempts = 0
+
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise queue.DeadlockDetected("transient deadlock")
+        return "ok"
+
+    monkeypatch.setattr(queue.time, "sleep", lambda _seconds: None)
+
+    assert queue._run_search_transaction_with_retry(conn, operation) == "ok"
+    assert attempts == 3
+    assert conn.rollbacks == 2
+
+
 # ---- LinkedIn mutex (R1) -------------------------------------------------------
 
 def test_linkedin_owner_ip_and_mutex(fleet_db):
@@ -944,15 +1028,85 @@ def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
         with conn.cursor() as cur:
             cur.execute("SELECT count_24h FROM rate_governor WHERE scope_key='account:linkedin'")
             assert cur.fetchone()["count_24h"] == 1
-        assert queue.write_linkedin_result(conn, "w1", "li-x", status="applied") is True
+        assert queue.write_linkedin_result(
+            conn,
+            "w1",
+            "li-x",
+            status="applied",
+            apply_status="applied",
+            est_cost_usd=0.25,
+            target_host="linkedin.com",
+            home_ip="1.1.1.1",
+            agent="codex",
+            agent_model="codex-default",
+            apply_duration_ms=4321,
+            machine_owner="home",
+            application_tool_calls=3,
+            job_log_path="job.log",
+            transcript_digest="digest",
+            final_result_source="result_line",
+            result_metadata={"apply_channel": "easy_apply"},
+        ) is True
         with conn.cursor() as cur:
-            cur.execute("SELECT status FROM linkedin_queue WHERE url='li-x'")
-            assert cur.fetchone()["status"] == "applied"  # closed in linkedin_queue, not apply_queue
+            cur.execute(
+                "SELECT status, agent_model, apply_duration_ms FROM linkedin_queue WHERE url='li-x'"
+            )
+            queue_row = cur.fetchone()
+            assert queue_row == {
+                "status": "applied",
+                "agent_model": "codex-default",
+                "apply_duration_ms": 4321,
+            }
+            cur.execute(
+                "SELECT queue_name, agent, agent_model, application_tool_calls, result_metadata "
+                "FROM apply_result_events WHERE url='li-x'"
+            )
+            event = cur.fetchone()
+            assert event["queue_name"] == "linkedin_queue"
+            assert event["agent"] == "codex"
+            assert event["agent_model"] == "codex-default"
+            assert event["application_tool_calls"] == 3
+            assert event["result_metadata"] == {"apply_channel": "easy_apply"}
+            cur.execute(
+                "SELECT worker_id, machine_owner, model, provider, cost_usd "
+                "FROM llm_usage WHERE worker_id='w1'"
+            )
+            usage = cur.fetchone()
+            assert usage["machine_owner"] == "home"
+            assert usage["model"] == "codex-default"
+            assert usage["provider"] == "codex"
+            assert float(usage["cost_usd"]) == 0.25
             cur.execute("SELECT count_24h, success_24h FROM rate_governor WHERE scope_key='account:linkedin'")
             g = cur.fetchone()
             assert g["count_24h"] == 1 and g["success_24h"] == 1  # NOT double-bumped
         # a stale/other worker cannot close it
         assert queue.write_linkedin_result(conn, "intruder", "li-x", status="applied") is False
+
+
+def test_write_linkedin_result_resolves_challenge_after_owned_close(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch, "
+                "linkedin_resolve_status, linkedin_resolved_at) "
+                "VALUES ('li-challenge','Co','Role','https://linkedin.com/jobs/challenge',9,'linkedin','b1','easy_apply',now())"
+            )
+        conn.commit()
+        leased = queue.lease_linkedin(conn, "owner", public_ip="1.1.1.1", owner_ip="1.1.1.1")
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO auth_challenge (url, worker_id, kind, route) VALUES (%s,%s,%s,%s)",
+                (leased["url"], "owner", "visible_captcha", "owner_inbox"),
+            )
+        conn.commit()
+
+        assert queue.write_linkedin_result(conn, "owner", leased["url"], status="blocked") is True
+        with conn.cursor() as cur:
+            cur.execute("SELECT outcome, resolved_at FROM auth_challenge WHERE url=%s", (leased["url"],))
+            challenge = cur.fetchone()
+            assert challenge["outcome"] == "superseded:blocked"
+            assert challenge["resolved_at"] is not None
 
 
 # ---- numeric cap actually BLOCKS a lease (not just bookkeeping) -----------------

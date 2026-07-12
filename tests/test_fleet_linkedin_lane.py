@@ -316,18 +316,22 @@ def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
     monkeypatch.setattr(pgqueue, "linkedin_should_halt", lambda conn: False)
     sw = AgentSwitcher(agents=["codex", "claude"], cooldown_seconds=3600)
 
+    loop = _Loop()
     counts = lm.run_linkedin(
         lambda: _Conn(),
-        _Loop(),
+        loop,
         max_iterations=2,
         idle_sleep=0,
         switcher=sw,
         rebuild_apply_fn=rebuild,
+        model_for_agent=lambda agent: f"{agent}-model",
         time_fn=lambda: 1000.0,
     )
 
     assert rebuilt[0] == "codex"
     assert "claude" in rebuilt
+    assert loop.current_agent == "claude"
+    assert loop.current_model == "claude-model"
     assert sw.blocked_until("codex") == 4600.0
     assert counts["applied"] == 1
 
@@ -363,6 +367,8 @@ def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
     sw.note_wall("claude", now=1000.0)
 
     loop = _Loop()
+    loop.current_agent = "codex"
+    loop.current_model = "codex-default"
     counts = lm.run_linkedin(
         lambda: _Conn(),
         loop,
@@ -375,6 +381,8 @@ def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
 
     assert loop.ran == 0
     assert loop.beats == ["paused", "paused"]
+    assert loop.current_agent is None
+    assert loop.current_model is None
     assert counts["idle"] == 2
 
 
@@ -488,3 +496,14 @@ def test_supervised_detects_fleet_linkedin(fleet_db):
     finally:
         holder.close()
     assert launcher.fleet_linkedin_active(fleet_db) is False      # lock free now
+
+
+def test_supervised_linkedin_probe_is_unknown_when_fleet_unreachable(monkeypatch):
+    from applypilot.apply import launcher
+
+    monkeypatch.setattr(
+        "psycopg.connect",
+        lambda _dsn: (_ for _ in ()).throw(OSError("unreachable")),
+    )
+
+    assert launcher.fleet_linkedin_active("postgresql://unreachable") is None

@@ -592,6 +592,25 @@ class WorkerLoop:
         out = self.apply_fn(job)
         run_status = (out or {}).get("run_status") or ""
         cost = (out or {}).get("est_cost_usd", 0)
+        agent = (out or {}).get("agent")
+        agent_model = (out or {}).get("agent_model") or (out or {}).get("model")
+        duration_ms = (out or {}).get("apply_duration_ms") or (out or {}).get("duration_ms")
+        result_evidence = {
+            "application_tool_calls": (out or {}).get("application_tool_calls"),
+            "job_log_path": (out or {}).get("job_log_path"),
+            "transcript_digest": (out or {}).get("transcript_digest"),
+            "final_result_source": (out or {}).get("final_result_source"),
+            "result_metadata": (out or {}).get("result_metadata"),
+        }
+        result_attribution = {
+            "target_host": job.get("target_host") or job.get("apply_domain"),
+            "home_ip": self.home_ip,
+            "agent": agent,
+            "agent_model": agent_model,
+            "apply_duration_ms": duration_ms,
+            "machine_owner": self.machine_owner,
+            **result_evidence,
+        }
         from applypilot.apply.launcher import is_usage_limit_result
         if is_usage_limit_result(run_status):
             queue.requeue_linkedin(conn, self.worker_id, url, apply_error=run_status[:200])
@@ -602,7 +621,8 @@ class WorkerLoop:
             queue.write_linkedin_result(conn, self.worker_id, url, status="applied", apply_status="applied",
                                         est_cost_usd=cost, outcome="success",
                                         apply_channel=(out or {}).get("apply_channel"),
-                                        apply_external_host=(out or {}).get("apply_external_host"))
+                                        apply_external_host=(out or {}).get("apply_external_host"),
+                                        **result_attribution)
             self._record_event(f"wrote linkedin applied {url}")
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
@@ -616,12 +636,16 @@ class WorkerLoop:
                                         apply_status="auth_required", apply_error=apply_error[:200],
                                         est_cost_usd=cost,
                                         apply_channel=(out or {}).get("apply_channel"),
-                                        apply_external_host=external_host)
+                                        apply_external_host=external_host,
+                                        **result_attribution)
             self._record_event(f"wrote linkedin external auth_required {url}")
             self._beat(conn, state="idle")
             return {"action": "external_auth_required", "url": url}
         if run_status in self._WALL_STATUSES:
-            queue.park_linkedin_challenge(conn, self.worker_id, url, halt_seconds=self._linkedin_halt_seconds())
+            queue.park_linkedin_challenge(
+                conn, self.worker_id, url,
+                halt_seconds=self._linkedin_halt_seconds(), commit=False,
+            )
             _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
                               home_ip=self.home_ip, kind="visible_captcha" if run_status == "captcha" else "login_gate",
                               route="owner_inbox")
@@ -630,12 +654,14 @@ class WorkerLoop:
             return {"action": "parked_challenge", "url": url}
         if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
             queue.write_linkedin_result(conn, self.worker_id, url, status="crash_unconfirmed",
-                                        apply_status="crash_unconfirmed", apply_error=run_status[:200], est_cost_usd=cost)
+                                        apply_status="crash_unconfirmed", apply_error=run_status[:200],
+                                        est_cost_usd=cost, **result_attribution)
             self._record_event(f"wrote linkedin crash_unconfirmed {url} ({run_status})")
             self._beat(conn, state="idle")
             return {"action": "crash_unconfirmed", "url": url}
         queue.write_linkedin_result(conn, self.worker_id, url, status="failed", apply_status="failed",
-                                    apply_error=(run_status or "unknown")[:200], est_cost_usd=cost)
+                                    apply_error=(run_status or "unknown")[:200], est_cost_usd=cost,
+                                    **result_attribution)
         self._record_event(f"wrote linkedin failed {url} ({run_status or 'unknown'})")
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}
@@ -701,9 +727,24 @@ class WorkerLoop:
             self._beat(conn, state="idle")
             return {"action": "applied", "url": url}
         if run_status in self._WALL_STATUSES:
-            kind = "login_gate" if run_status in ("login_issue", "auth_required") else "visible_captcha"
-            route = _captcha.route_for(kind, on_owner_machine=self.on_owner_machine)
-            wall_outcome = None if kind == "login_gate" else "captcha"
+            terminal_status = str((result_evidence.get("result_metadata") or {}).get("terminal_status") or "")
+            email_verification = (
+                run_status in ("login_issue", "auth_required")
+                and any(token in terminal_status for token in (
+                    "email_verification_required", "two_factor_required", "2fa_required",
+                    "mfa_required", "otp_required",
+                ))
+            )
+            kind = "email_otp" if email_verification else (
+                "login_gate" if run_status in ("login_issue", "auth_required") else "visible_captcha"
+            )
+            # The launcher already attempted the relay-assisted retry. If it still
+            # reaches this branch, preserve the email-OTP classification for review
+            # but park it in the owner inbox rather than pretending auto-OTP succeeded.
+            route = "owner_inbox" if kind == "email_otp" else _captcha.route_for(
+                kind, on_owner_machine=self.on_owner_machine
+            )
+            wall_outcome = None if kind in ("login_gate", "email_otp") else "captcha"
             self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome, target_host=target_host)
             return {"action": "parked_challenge", "url": url}
         if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):

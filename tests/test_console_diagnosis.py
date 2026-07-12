@@ -438,6 +438,8 @@ def test_diagnosis_separates_live_browser_symptoms_from_challenge_backlog(
     }
     assert body["challenges"]["fresh_open"] == 2
     assert body["challenges"]["stale_open"] == 1
+    assert body["challenges"]["parked_open"] == 0
+    assert body["challenges"]["stale_nonparked"] == 1
 
 
 def test_diagnosis_labels_frozen_challenge_leases_separately(
@@ -464,6 +466,8 @@ def test_diagnosis_labels_frozen_challenge_leases_separately(
     assert apply_q["leased"] == 2
     assert apply_q["active_leased"] == 1
     assert apply_q["parked_frozen"] == 1
+    assert apply_q["challenge_parked"] == 0
+    assert apply_q["unexpected_frozen"] == 1
     assert apply_q["by_lane"]["ats"]["leased"] == 2
     assert apply_q["by_lane"]["ats"]["active_leased"] == 1
     assert apply_q["by_lane"]["ats"]["parked_frozen"] == 1
@@ -565,7 +569,40 @@ def test_diagnosis_recommends_triaging_stale_challenge_backlog(
     body = console_app.diagnosis()
     titles = [r["title"] for r in body["recommendations"]]
     assert titles[0] == "Resume fleet"
-    assert "Triage stale challenges" in titles
+    assert "Clean stale challenge records" in titles
+
+
+def test_diagnosis_distinguishes_aging_parked_challenge_from_stale_record(
+    monkeypatch, fleet_db
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    url = "https://example.com/parked-old"
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1")
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, company, title, application_url, score, status, lane, approved_batch, "
+                "lease_owner, lease_expires_at, apply_status, apply_error) "
+                "VALUES (%s,'Co','Role',%s,9,'leased','ats','batch','worker',"
+                "now() + interval '3650 days','challenge_pending','login_gate')",
+                (url, url),
+            )
+            cur.execute(
+                "INSERT INTO auth_challenge (url, worker_id, kind, route, raised_at) "
+                "VALUES (%s,'worker','login_gate','owner_inbox',now() - interval '30 hours')",
+                (url,),
+            )
+        conn.commit()
+
+    body = console_app.diagnosis()
+    challenges = body["challenges"]
+    assert challenges["parked_open"] == 1
+    assert challenges["stale_parked"] == 1
+    assert challenges["stale_nonparked"] == 0
+    titles = [r["title"] for r in body["recommendations"]]
+    assert "Resolve aging parked challenges" in titles
+    assert "Clean stale challenge records" not in titles
 
 
 def test_diagnosis_recommends_reviewing_unclassified_ats_failures(
@@ -582,6 +619,18 @@ def test_diagnosis_recommends_reviewing_unclassified_ats_failures(
                 "('other','alpha.example','m2','ats',2,'info','job closed / expired posting','review manually','recommended', now() + interval '1 hour'), "
                 "('other','beta.example','m4','ats',3,'info','selector parse failed on apply form','review manually','recommended', now() + interval '1 hour')"
             )
+            for i in range(2):
+                cur.execute(
+                    "INSERT INTO apply_queue (url, application_url, score, status, lane, target_host, apply_error) "
+                    "VALUES (%s,%s,8,'failed','ats','alpha.example','opaque_alpha_failure')",
+                    (f"alpha-{i}", f"https://alpha.example/{i}"),
+                )
+            for i in range(3):
+                cur.execute(
+                    "INSERT INTO apply_queue (url, application_url, score, status, lane, target_host, apply_error) "
+                    "VALUES (%s,%s,8,'failed','ats','beta.example','opaque_beta_failure')",
+                    (f"beta-{i}", f"https://beta.example/{i}"),
+                )
         conn.commit()
 
     body = console_app.diagnosis()
@@ -611,6 +660,29 @@ def test_diagnosis_recommends_reviewing_unclassified_ats_failures(
     assert "expired_posting (2)" in reason
     assert "beta.example (3)" in reason
     assert "alpha.example (2)" in reason
+
+
+def test_diagnosis_suppresses_legacy_other_advisory_without_current_unknown_failure(
+    monkeypatch, fleet_db
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1")
+        cur.execute(
+            "INSERT INTO fleet_diagnoses "
+            "(reason, host, machine, lane, sample_count, severity, diagnosis, recommendation, status, expires_at) "
+            "VALUES ('other','legacy.example','m2','ats',500,'info','legacy unknown','review manually',"
+            "'recommended',now()+interval '1 day')"
+        )
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, score, status, lane, target_host, apply_error) "
+            "VALUES ('retired-known','https://legacy.example/job',5,'failed','ats','legacy.example','stale_unapproved')"
+        )
+        conn.commit()
+
+    body = console_app.diagnosis()
+    assert body["diagnostics_summary"]["other_samples"] == 0
+    assert "Review unclassified ATS failures" not in [r["title"] for r in body["recommendations"]]
 
 
 def test_diagnosis_prioritizes_frozen_leased_backlog(
@@ -741,12 +813,14 @@ def test_diagnosis_decomposes_no_leaseable_jobs_into_blockers(
     body = console_app.diagnosis()
     assert body["apply_state"]["code"] == "no_leaseable_jobs"
     blocker_codes = [b["code"] for b in body["apply_state"]["blockers"]]
-    assert blocker_codes[:2] == ["stale_challenges", "frozen_leases"]
+    assert blocker_codes[0] == "aging_parked_challenges"
+    assert "frozen_leases" not in blocker_codes
     assert "open_challenges" in blocker_codes
-    assert "older than 24 hours" in body["apply_state"]["reason"]
-    assert body["apply_state"]["next_action"] == "Clear stale challenge backlog first."
-    assert body["recommendations"][0]["title"] == "Clear stale challenge backlog"
-    assert "older than 24 hours" in body["recommendations"][0]["reason"]
+    assert "more than 24 hours" in body["apply_state"]["reason"]
+    assert body["apply_state"]["next_action"] == "Resolve or skip those parked jobs."
+    assert body["recommendations"][0]["title"] == "Resolve aging parked challenges"
+    assert "more than 24 hours" in body["recommendations"][0]["reason"]
+    assert "Release parked leases" not in [r["title"] for r in body["recommendations"]]
 
 
 def test_diagnosis_prioritizes_frozen_leases_when_no_leaseable_jobs_are_parked(
@@ -887,6 +961,30 @@ def test_diagnosis_recommends_backfilling_challenge_metadata(
     assert "Backfill challenge metadata" in titles
 
 
+def test_diagnosis_respects_explicit_operator_pause_without_resume_recommendation(
+    monkeypatch, fleet_db
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, ats_pause_source='operator' WHERE id=1"
+        )
+        conn.commit()
+
+    body = console_app.diagnosis()
+    assert body["apply_state"] == {
+        "code": "operator_paused",
+        "severity": "info",
+        "reason": "Fleet is intentionally paused by the operator.",
+        "blockers": [],
+    }
+    titles = [row["title"] for row in body["recommendations"]]
+    assert titles[0] == "Operator pause active"
+    assert "Resume fleet" not in titles
+    assert "Resume ATS lane" not in titles
+    assert "Seed approvals" not in titles
+
+
 def test_diagnosis_includes_compute_health_and_recommends_worker_start(
     monkeypatch, fleet_db
 ) -> None:
@@ -936,7 +1034,7 @@ def test_diagnosis_recommends_backfilling_model_telemetry(
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE worker_heartbeat SET current_agent=%s, current_model=%s WHERE worker_id=%s",
-                ("codex", None, "m2-0"),
+                ("claude", None, "m2-0"),
             )
             cur.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1")
         conn.commit()
@@ -946,6 +1044,25 @@ def test_diagnosis_recommends_backfilling_model_telemetry(
     titles = [r["title"] for r in body["recommendations"]]
     assert titles[0] == "Resume fleet"
     assert "Backfill apply model telemetry" in titles
+
+
+def test_diagnosis_does_not_recommend_model_backfill_for_stale_worker(
+    monkeypatch, fleet_db
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "stale-model-worker", machine_owner="m2", role="apply", state="idle")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat SET current_agent='claude', current_model=NULL, "
+                "last_beat=now()-interval '1 hour' WHERE worker_id='stale-model-worker'"
+            )
+        conn.commit()
+
+    body = console_app.diagnosis()
+    assert body["agents"]["model_missing_workers"] == 0
+    assert body["agents"]["stale_model_missing_workers"] == 1
+    assert "Backfill apply model telemetry" not in [r["title"] for r in body["recommendations"]]
 
 
 def test_diagnosis_includes_linkedin_lane_summary_and_halt_recommendation(

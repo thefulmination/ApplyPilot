@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 _FLEET_LI_KEY = "applypilot:linkedin_driver"
 
 
-def fleet_linkedin_active(pg_dsn: str | None) -> bool:
+def fleet_linkedin_active(pg_dsn: str | None) -> bool | None:
     """Probe whether the fleet LinkedIn driver holds the advisory interlock.
 
     Opens a transient connection to the fleet PG and attempts
@@ -70,9 +70,8 @@ def fleet_linkedin_active(pg_dsn: str | None) -> bool:
       holds it) → returns **True** (fleet is active; supervised must defer).
     * If the try-lock returns TRUE (we acquired it) → immediately unlocks
       (non-destructive probe, never leaves the lock held) and returns **False**.
-    * Any error (missing/unreachable fleet PG, connect failure, etc.) →
-      returns **False** so a probe failure never crashes the supervised run.
-      The runbook is the backstop for that edge.
+    * Any error with a configured fleet PG returns ``None`` (unknown), which callers
+      must treat as active so LinkedIn ownership fails closed.
     """
     if not pg_dsn:
         return False
@@ -101,7 +100,7 @@ def fleet_linkedin_active(pg_dsn: str | None) -> bool:
             return True
     except Exception:
         logger.debug("fleet_linkedin_active probe failed", exc_info=True)
-        return False
+        return None
     finally:
         if conn is not None:
             try:
@@ -618,6 +617,16 @@ def _codex_effective_model(model: str | None) -> str | None:
     if model and model.strip().lower() not in _CLAUDE_MODEL_TIERS:
         return model
     return None
+
+
+def effective_agent_model_label(agent: str, model: str | None) -> str:
+    """Return the model identity actually selected by the agent launcher."""
+    normalized = _normalize_agent(agent)
+    if normalized == "claude":
+        return model or "sonnet"
+    # A Claude tier is deliberately omitted from the Codex command. In that case
+    # the CLI selects its configured default, whose concrete name is not exposed.
+    return _codex_effective_model(model) or "codex-default"
 
 
 def _codex_model_args(model: str | None) -> list[str]:
@@ -1327,6 +1336,23 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     and not assisted
                     and config.is_auth_gated_application(apply_url)
                     and not _tenant_bypasses_auth_gate(conn, apply_url)):
+                # Deduplication is a stronger no-submit decision than the auth
+                # classification. An auth-gated repost should be deferred as a
+                # near duplicate instead of being mislabeled auth_required.
+                if not target_url and NEAR_DUP_JACCARD > 0:
+                    _dup_of = _find_near_duplicate_applied(
+                        conn, apply_url, row["title"] or "", row["company"]
+                    )
+                    if _dup_of:
+                        conn.execute(
+                            "UPDATE jobs SET apply_status = 'deferred', "
+                            "apply_error = 'near_duplicate_role' WHERE url = ?",
+                            (row["url"],),
+                        )
+                        conn.commit()
+                        logger.info("Skipping near-duplicate of applied '%s': %s",
+                                    _dup_of[:40], (row["title"] or "")[:40])
+                        continue
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'auth_required', apply_error = 'auth_gate', "
                     "apply_attempts = 99 WHERE url = ?",
@@ -2520,7 +2546,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
             # Persist the apply-agent's REAL per-job cost durably (stage='apply_agent').
-            # The agent runs via the claude CLI -- its cost is otherwise only kept in
+            # The selected agent's cost is otherwise only kept in
             # in-process worker state, which resets on every crash/restart. Recording it
             # to the durable llm_usage table lets the supervisor compute ACTUAL
             # cross-crash spend (snapshot-at-start delta) instead of estimating from
@@ -2529,7 +2555,9 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 try:
                     from applypilot.database import record_llm_usage
                     record_llm_usage(
-                        stage="apply_agent", model=model, provider="claude-cli",
+                        stage="apply_agent",
+                        model=effective_agent_model_label(agent, model),
+                        provider=f"{_normalize_agent(agent)}-cli",
                         usage={
                             "prompt_tokens": stats.get("input_tokens") or 0,
                             "completion_tokens": stats.get("output_tokens") or 0,
@@ -3265,7 +3293,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             _fleet_dsn = os.environ.get("FLEET_PG_DSN")
             exclude_li = (
                 (not browser_li_ok) or _linkedin_halt.is_set()
-                or (bool(_fleet_dsn) and fleet_linkedin_active(_fleet_dsn))
+                or (
+                    bool(_fleet_dsn)
+                    and fleet_linkedin_active(_fleet_dsn) is not False
+                )
             )
             if not exclude_li:
                 try:

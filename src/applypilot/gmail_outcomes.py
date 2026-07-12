@@ -21,6 +21,8 @@ from __future__ import annotations
 import base64
 import logging
 import re
+from functools import lru_cache
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -416,8 +418,11 @@ _STOP_TOKENS = frozenset({"a", "an", "the", "of", "for", "to", "at", "in", "and"
                            "inc", "llc", "ltd", "co", "corp", "company"})
 
 
-def _tokens(s: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", s.lower())) - _STOP_TOKENS
+@lru_cache(maxsize=100_000)
+def _tokens(s: str) -> frozenset[str]:
+    """Tokenize immutable input once; reconciliation compares the same job fields
+    against many emails, so caching avoids repeated regex work without changing scores."""
+    return frozenset(re.findall(r"[a-z0-9]+", s.lower())) - _STOP_TOKENS
 
 
 def _token_overlap(a: str, b: str) -> float:
@@ -560,6 +565,45 @@ _LINKEDIN_JID_RE = re.compile(r"(?:jobs/view/|currentjobid=)(\d{6,})", re.IGNORE
 
 def _linkedin_job_ids(text: str) -> set[str]:
     return set(_LINKEDIN_JID_RE.findall(text or ""))
+
+
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def _canonical_match_url(value: str) -> str | None:
+    """Normalize transport noise while preserving path and query for exact evidence."""
+    try:
+        parsed = urlsplit((value or "").strip().rstrip(".,;:!?)]}>"))
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    query = parsed.query[:-1] if parsed.query.endswith("/") else parsed.query
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/") or "/",
+            query,
+            "",
+        )
+    )
+
+
+def _exact_job_url_match(text: str, jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    email_urls = {
+        canonical
+        for raw in _HTTP_URL_RE.findall(text or "")
+        if (canonical := _canonical_match_url(raw)) is not None
+    }
+    if not email_urls:
+        return None
+    for job in jobs:
+        for key in ("url", "application_url"):
+            canonical = _canonical_match_url(job.get(key) or "")
+            if canonical and canonical in email_urls:
+                return job
+    return None
 
 
 def _extract_title_from_subject(subject: str) -> str | None:
@@ -718,6 +762,12 @@ def _match_tiers(
             jids = _linkedin_job_ids((job.get("url") or "") + " " + (job.get("application_url") or ""))
             if jids & email_jids:
                 return job, "linkedin_job_id", 1.0
+
+    # 0c. Exact URL from the email -> the queued job/application URL. This covers
+    # boards without a dedicated identifier parser and outranks fuzzy signals.
+    exact_job = _exact_job_url_match(subject + " " + body, jobs)
+    if exact_job is not None:
+        return exact_job, "exact_job_url", 1.0
 
     # Company hints from BOTH subject and body -- try each (a garbage subject hint must
     # not block the body hint).

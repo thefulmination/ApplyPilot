@@ -35,8 +35,8 @@ def test_linkedin_cap_is_db_derived_and_excludes_lane(tmp_path, monkeypatch):
 
     # Top-ranked LinkedIn Easy-Apply candidate + a lower-ranked offsite ATS candidate.
     _seed(conn, "https://www.linkedin.com/jobs/view/111", "CoS LinkedIn", audit=9.5)
-    _seed(conn, "https://boards.greenhouse.io/acme/jobs/222", "CoS Offsite",
-          application_url="https://boards.greenhouse.io/acme/jobs/222", audit=8.0)
+    _seed(conn, "https://jobs.lever.co/acme/222", "CoS Offsite",
+          application_url="https://jobs.lever.co/acme/222", audit=8.0)
 
     # Simulate the rolling-24h LinkedIn cap already being reached (3 recent applies).
     now = datetime.now(timezone.utc).isoformat()
@@ -53,10 +53,10 @@ def test_linkedin_cap_is_db_derived_and_excludes_lane(tmp_path, monkeypatch):
     job = L.acquire_job(min_score=7, exclude_linkedin=True)
     assert job is not None
     eff = job["application_url"] or job["url"]
-    assert "greenhouse" in eff and "linkedin.com" not in eff
+    assert "lever.co" in eff and "linkedin.com" not in eff
 
     # Control: without exclusion, the higher-ranked LinkedIn job is picked.
-    conn.execute("UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url LIKE '%greenhouse%'")
+    conn.execute("UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url LIKE '%lever.co%'")
     conn.commit()
     job2 = L.acquire_job(min_score=7, exclude_linkedin=False)
     assert job2 is not None and "linkedin.com" in job2["url"]

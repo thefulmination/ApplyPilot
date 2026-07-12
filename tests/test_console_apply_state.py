@@ -135,9 +135,9 @@ def test_apply_state_reflects_paused_and_ats_paused(fleet_db, monkeypatch) -> No
 
     payload = console_app.build_status()
     state = payload["apply_state"]
-    assert state["code"] == "ats_paused"
-    assert state["severity"] == "halted"
-    assert "ats lane is paused" in (state["reason"] or "").lower()
+    assert state["code"] == "operator_paused"
+    assert state["severity"] == "info"
+    assert "operator" in (state["reason"] or "").lower()
 
 
 def test_apply_state_reflects_spend_cap_reached(fleet_db, monkeypatch) -> None:

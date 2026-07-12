@@ -10,6 +10,7 @@ import sys
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import email_reconcile as er
+from applypilot.fleet import schema as fleet_schema
 
 
 def _default_home_db() -> str:
@@ -68,6 +69,7 @@ def main(argv=None) -> int:
         return 0
 
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         jobs = er.load_crash_jobs(conn, limit=args.limit)
         consumed_message_ids = er.load_consumed_message_ids(conn)
         result = er.reconcile(

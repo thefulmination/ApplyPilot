@@ -34,6 +34,7 @@ ACTION_MENU = frozenset(
         ACTION_RESTART_WORKER,
         ACTION_QUARANTINE_JOB,
         ACTION_DEFER_MANUAL_AUTH,
+        ACTION_MANUAL_REVIEW,
     }
 )
 
@@ -159,7 +160,13 @@ def ensure_schema(conn) -> None:
     conn.commit()
 
 
-def load_contexts(conn, *, limit: int = 50, window_minutes: int = 1440) -> list[TriageContext]:
+def load_contexts(
+    conn,
+    *,
+    limit: int = 50,
+    window_minutes: int = 1440,
+    crash_only: bool = False,
+) -> list[TriageContext]:
     """Load recent ATS terminal failures plus the worker heartbeat log tail."""
     ensure_schema(conn)
     with conn.cursor() as cur:
@@ -182,7 +189,8 @@ def load_contexts(conn, *, limit: int = 50, window_minutes: int = 1440) -> list[
                 LIMIT 1
             ) ar ON TRUE
             WHERE q.lane = 'ats'
-              AND q.status IN ('failed', 'blocked', 'crash_unconfirmed')
+              AND """ + ("q.status = 'crash_unconfirmed'" if crash_only else
+                           "q.status IN ('failed', 'blocked', 'crash_unconfirmed')") + """
               AND COALESCE(q.apply_error, '') NOT IN ('dedup:already_applied', 'expired')
               AND (
                   q.updated_at > now() - make_interval(mins => %(window)s)
@@ -200,7 +208,8 @@ def load_contexts(conn, *, limit: int = 50, window_minutes: int = 1440) -> list[
                         'applied',
                         'already_applied',
                         'vetoed_applied_set',
-                        'vetoed_email'
+                        'vetoed_email',
+                        'manual_review_required'
                     )
                     AND a.created_at > now() - interval '1 day'
               )
@@ -336,6 +345,20 @@ def _llm_decision(ctx: TriageContext, *, client=None) -> TriageDecision:
 
 def decide(ctx: TriageContext, *, client=None, enable_llm: bool = False) -> TriageDecision:
     """Return a bounded decision. Deterministic provable cases outrank the LLM."""
+    if _is_repeat_pre_touch_repair(ctx):
+        return TriageDecision(
+            ACTION_MANUAL_REVIEW,
+            "pre-touch crash already received an automatic requeue; require manual review before another retry",
+            confidence=1.0,
+            source="rules",
+        )
+    if _is_tool_touched_crash(ctx):
+        return TriageDecision(
+            ACTION_MANUAL_REVIEW,
+            "crash_unconfirmed has durable application tool calls; leave parked for manual review",
+            confidence=1.0,
+            source="rules",
+        )
     if _is_requeueable_transient_limit(ctx):
         return TriageDecision(
             ACTION_REQUEUE_USAGE_LIMIT,
@@ -397,6 +420,10 @@ def validate_decision(ctx: TriageContext, decision: TriageDecision) -> TriageDec
         if _AUTH_RE.search(text or ""):
             return decision
         return _reject(decision, "manual_auth_requires_auth_or_captcha_evidence")
+    if action == ACTION_MANUAL_REVIEW:
+        if _requires_manual_review(ctx):
+            return decision
+        return _reject(decision, "manual_review_requires_missing_execution_evidence")
     return _reject(decision, "invalid_action")
 
 
@@ -467,6 +494,15 @@ def execute_decision(
         return _execute_quarantine_job(conn, ctx, decision)
     if decision.action == ACTION_DEFER_MANUAL_AUTH:
         return _execute_defer_manual_auth(conn, ctx, decision)
+    if decision.action == ACTION_MANUAL_REVIEW:
+        _record_action(
+            conn,
+            ctx,
+            decision,
+            action_status=ACTION_MANUAL_REVIEW,
+            how_to_reverse="No queue mutation was made; resolve after reviewing the worker evidence.",
+        )
+        return False
     _record_action(conn, ctx, decision, action_status="rejected", how_to_reverse="No action taken.")
     return False
 
@@ -634,6 +670,7 @@ def _record_action(
     *,
     action_status: str,
     how_to_reverse: str,
+    commit: bool = True,
 ) -> None:
     evidence = {
         "target_host": ctx.target_host,
@@ -669,7 +706,8 @@ def _record_action(
                 how_to_reverse,
             ),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def run_pass(
@@ -681,20 +719,45 @@ def run_pass(
     enable_llm: bool = False,
     client=None,
     dry_run: bool = False,
+    crash_only: bool = False,
 ) -> dict[str, Any]:
     """Run one autonomous triage pass and return a compact summary."""
     ensure_schema(conn)
-    contexts = load_contexts(conn, limit=limit, window_minutes=window_minutes)
+    contexts = load_contexts(
+        conn, limit=limit, window_minutes=window_minutes, crash_only=crash_only
+    )
     actions: Counter[str] = Counter()
     statuses: Counter[str] = Counter()
     applied = 0
     for ctx in contexts:
         decision = decide(ctx, client=client, enable_llm=enable_llm)
+        # Preserve the loader scope in every audit row so later incident review can
+        # distinguish the historical broad pass from crash-only scheduled runs.
+        decision.evidence["triage_scope"] = "crash_only" if crash_only else "general"
         actions[decision.action] += 1
+        # Manual-review deferrals only write an audit row. Batch these writes so
+        # a large historical backlog does not pay one commit and two audit-count
+        # queries per parked job; all state-changing actions keep their guarded path.
+        if (
+            not dry_run
+            and decision.action == ACTION_MANUAL_REVIEW
+            and decision.status != "rejected"
+        ):
+            _record_action(
+                conn,
+                ctx,
+                validate_decision(ctx, decision),
+                action_status=ACTION_MANUAL_REVIEW,
+                how_to_reverse="No queue mutation was made; resolve after reviewing the worker evidence.",
+                commit=False,
+            )
+            statuses[ACTION_MANUAL_REVIEW] += 1
+            continue
         before = _audit_count(conn)
         if execute_decision(conn, ctx, decision, brain_path=brain_path, dry_run=dry_run):
             applied += 1
         statuses.update(_new_audit_statuses(conn, before))
+    conn.commit()
     return {
         "contexts": len(contexts),
         "actions": dict(actions),
@@ -707,7 +770,6 @@ def _audit_count(conn) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM autotriage_actions")
         row = cur.fetchone()
-    conn.rollback()
     return int(row["n"])
 
 
@@ -719,7 +781,6 @@ def _new_audit_statuses(conn, before_count: int) -> Counter[str]:
             (before_count,),
         )
         rows = cur.fetchall()
-    conn.rollback()
     return Counter(str(r["action_status"]) for r in rows)
 
 

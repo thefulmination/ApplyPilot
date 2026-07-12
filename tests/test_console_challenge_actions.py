@@ -168,10 +168,11 @@ def test_challenge_skip_apply_sets_blocked_and_skipped_outcome(fleet_db, monkeyp
 
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT status, apply_status FROM apply_queue WHERE url=%s", (url,))
+            cur.execute("SELECT status, apply_status, apply_error FROM apply_queue WHERE url=%s", (url,))
             row = cur.fetchone()
             assert row["status"] == "blocked"
             assert row["apply_status"] == "challenge_skipped"
+            assert row["apply_error"] == "challenge_skipped"
             cur.execute("SELECT outcome FROM auth_challenge WHERE url=%s", (url,))
             assert cur.fetchone()["outcome"] == "skipped"
 
@@ -190,12 +191,47 @@ def test_challenge_skip_linkedin_sets_blocked_and_skipped_outcome(fleet_db, monk
 
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT status, apply_status FROM linkedin_queue WHERE url=%s", (url,))
+            cur.execute("SELECT status, apply_status, apply_error FROM linkedin_queue WHERE url=%s", (url,))
             row = cur.fetchone()
             assert row["status"] == "blocked"
             assert row["apply_status"] == "challenge_skipped"
+            assert row["apply_error"] == "challenge_skipped"
             cur.execute("SELECT outcome FROM auth_challenge WHERE url=%s", (url,))
             assert cur.fetchone()["outcome"] == "skipped"
+
+
+def test_resolving_one_lane_preserves_shared_challenge_for_other_parked_lane(fleet_db):
+    url = "https://shared.example/jobs/1"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, status, lane, lease_owner, lease_expires_at, apply_status) "
+            "VALUES (%s,%s,9,'leased','ats','apply-worker',now()+interval '3650 days','challenge_pending')",
+            (url, url),
+        )
+        cur.execute(
+            "INSERT INTO linkedin_queue "
+            "(url, application_url, score, status, lane, lease_owner, lease_expires_at, apply_status) "
+            "VALUES (%s,%s,9,'leased','linkedin','linkedin-worker',now()+interval '3650 days','challenge_pending')",
+            (url, url),
+        )
+        cur.execute(
+            "INSERT INTO auth_challenge (url, kind, route) VALUES (%s,'login_gate','owner_inbox')",
+            (url,),
+        )
+        conn.commit()
+
+        assert queue.resolve_challenge(conn, url, requeue=True) is True
+        cur.execute("SELECT resolved_at FROM auth_challenge WHERE url=%s", (url,))
+        assert cur.fetchone()["resolved_at"] is None
+        cur.execute("SELECT apply_status FROM linkedin_queue WHERE url=%s", (url,))
+        assert cur.fetchone()["apply_status"] == "challenge_pending"
+
+        assert queue.resolve_linkedin_challenge(conn, url, requeue=True) is True
+        cur.execute("SELECT outcome, resolved_at FROM auth_challenge WHERE url=%s", (url,))
+        challenge = cur.fetchone()
+        assert challenge["outcome"] == "solved"
+        assert challenge["resolved_at"] is not None
 
 
 # ---- (3) lane isolation: same url parked in BOTH queues --------------------

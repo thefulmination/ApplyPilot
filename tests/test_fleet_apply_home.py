@@ -324,6 +324,23 @@ def test_push_home_survives_inbox_outcomes_failure(fleet_db, tmp_path, monkeypat
     assert n == 0  # no eligible jobs staged; the point is it didn't raise
 
 
+def test_push_home_threads_explicit_approved_batch(fleet_db, monkeypatch):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.fleet import sync
+
+    seen = {}
+
+    def _push(**kwargs):
+        seen["approved_batch"] = kwargs["approved_batch"]
+        return 0
+
+    monkeypatch.setattr(sync, "push_apply_eligible", _push)
+    monkeypatch.setattr(sync, "push_inbox_outcomes", lambda **kwargs: 0)
+    with pgqueue.connect(fleet_db) as conn:
+        assert hm.push_home(conn, approved_batch="human-2026-07-12") == 0
+    assert seen["approved_batch"] == "human-2026-07-12"
+
+
 def test_apply_home_resolve_challenge(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     from applypilot.fleet import queue

@@ -304,7 +304,8 @@ def push_apply_eligible(
     approved_batch: str | None = None,
     limit: int | None = None,
     lane_filter: bool = True,
-) -> int:
+    diagnostics: bool = False,
+) -> int | dict[str, int]:
     """Push approved offsite-eligible jobs from the brain into ``apply_queue`` (idempotent).
 
     Each pushed row carries a computed ``dedup_key`` (R9) and ``target_host`` (governor key),
@@ -371,6 +372,9 @@ def push_apply_eligible(
                 "url": r["url"], "company": r["company"], "title": r["title"],
                 "application_url": r["application_url"], "score": r["score"],
                 "target_host": host, "apply_domain": host,
+                "liveness_status": r["liveness_status"],
+                "liveness_reason": r["liveness_reason"],
+                "liveness_checked_at": r["last_verified_live"],
                 "dedup_key": _dedup.dedup_key(r["company"], r["title"]),
                 "eligibility_status": eligibility_status,
                 "eligibility_reason": eligibility_reason,
@@ -485,7 +489,8 @@ def _pull_results(
     pg = pg_conn or pgqueue.connect()
     counts: dict[str, int] = {}
     try:
-        for res in pgqueue.fetch_pending_results(pg, limit=batch, table=table):
+        fetched = pgqueue.fetch_pending_results(pg, limit=batch, table=table)
+        for res in fetched:
             url, status = res["url"], res["status"]
             if not sq.execute("SELECT 1 FROM jobs WHERE url = ?", (url,)).fetchone():
                 counts["skipped"] = counts.get("skipped", 0) + 1
@@ -511,6 +516,17 @@ def _pull_results(
             sq.commit()
             pgqueue.mark_synced(pg, url, table=table)
             counts[status] = counts.get(status, 0) + 1
+        if len(fetched) >= batch:
+            with pg.cursor() as cur:
+                cur.execute(
+                    f"SELECT COUNT(*) AS n FROM {table} "
+                    "WHERE status IN ('applied','failed','blocked','crash_unconfirmed') "
+                    "AND synced_to_home_at IS NULL"
+                )
+                pending_remaining = int(cur.fetchone()["n"] or 0)
+            pg.rollback()
+            counts["pending_remaining"] = pending_remaining
+            counts["batch_limited"] = int(pending_remaining > 0)
         return counts
     finally:
         if own_sq:
@@ -601,6 +617,8 @@ def push_linkedin_eligible(
             ),
             location_expr="j.location AS location" if _jobs_column_exists(sq, "location") else "NULL AS location",
             company_blocklist=company_blocklist,
+            fresh_statuses=",".join("?" for _ in _queue.LINKEDIN_FRESH_STATUSES),
+            resolve_recency=resolve_recency,
             recency=recency,
             thin_description_chars=THIN_DESCRIPTION_CHARS,
             attempts_predicate=(

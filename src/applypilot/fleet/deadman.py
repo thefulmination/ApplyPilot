@@ -285,6 +285,39 @@ def _check_owner_inbox_backlog(conn, cfg: dict, now: dt.datetime) -> Alert | Non
     )
 
 
+def _check_stale_owner_inbox(conn, cfg: dict, now: dt.datetime) -> Alert | None:
+    """Alert when owner-gated ATS leases remain frozen beyond the review window."""
+    if not _is_armed(cfg):
+        return None
+    stale_before = now - dt.timedelta(hours=OWNER_INBOX_STALE_HOURS)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n, MIN(a.raised_at) AS oldest
+            FROM auth_challenge a
+            JOIN apply_queue q ON q.url = a.url AND q.lane = 'ats'
+            WHERE a.resolved_at IS NULL AND a.route = 'owner_inbox'
+              AND q.status = 'leased' AND q.apply_status = 'challenge_pending'
+              AND a.raised_at < %s
+            """,
+            (stale_before,),
+        )
+        row = cur.fetchone()
+    count = int(row["n"] or 0)
+    if count <= 0:
+        return None
+    oldest = row["oldest"]
+    age_hours = int(max(dt.timedelta(0), now - oldest).total_seconds() // 3600) if oldest else 0
+    return Alert(
+        kind="owner_inbox_stale",
+        severity="critical",
+        detail=(
+            f"{count} owner_inbox ATS lease(s) older than {OWNER_INBOX_STALE_HOURS}h; "
+            f"oldest age {age_hours}h"
+        ),
+    )
+
+
 def deadman_check(
     conn, *, now: dt.datetime, prev_hot_streak: int = 0, gmail_token_ok: bool | None = None
 ) -> tuple[list[Alert], int]:
@@ -320,6 +353,10 @@ def deadman_check(
     owner_inbox = _check_owner_inbox_backlog(conn, cfg, now)
     if owner_inbox:
         alerts.append(owner_inbox)
+
+    stale_owner_inbox = _check_stale_owner_inbox(conn, cfg, now)
+    if stale_owner_inbox:
+        alerts.append(stale_owner_inbox)
 
     hot_alert, new_streak = _check_running_hot(conn, cfg, now, prev_hot_streak)
     if hot_alert:
@@ -477,6 +514,20 @@ def run_deadman(conn, *, now: dt.datetime, alert_dir: Path,
     return alerts
 
 
+def _write_monitor_failure_alert(alert_dir: Path, *, now: dt.datetime) -> None:
+    """Persist a credential-free fallback when the database monitor cannot run."""
+    try:
+        alert_dir = Path(alert_dir)
+        alert_dir.mkdir(parents=True, exist_ok=True)
+        (alert_dir / ALERT_FILENAME).write_text(
+            f"ApplyPilot fleet dead-man alert -- {now.isoformat()}\n\n"
+            "[critical] monitor_failure: fleet health check could not complete\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
     p = argparse.ArgumentParser(
         prog="applypilot-fleet-deadman",
@@ -491,6 +542,11 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
         "--alert-dir",
         default=os.path.join(os.environ.get("LOCALAPPDATA", ""), "ApplyPilot"),
     )
+    p.add_argument(
+        "--ensure-schema",
+        action="store_true",
+        help="Apply the fleet schema before checking (use during bootstrap, not on every scheduled pass).",
+    )
     p.add_argument("--once", action="store_true", default=True,
                     help="run a single pass and exit (default; the scheduled task "
                          "triggers this once per cadence)")
@@ -501,21 +557,21 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
         return 1
 
     from applypilot.apply import pgqueue
-    from applypilot.fleet.schema import ensure_schema_v3
+    from applypilot.fleet import schema as fleet_schema
 
+    now = dt.datetime.now(dt.timezone.utc)
     try:
         with pgqueue.connect(args.dsn) as conn:
-            ensure_schema_v3(conn)
+            if args.ensure_schema:
+                fleet_schema.ensure_schema_v3(conn)
             alerts = run_deadman(
-                conn, now=dt.datetime.now(dt.timezone.utc), alert_dir=Path(args.alert_dir),
+                conn, now=now, alert_dir=Path(args.alert_dir),
                 gmail_token_ok=mail_source_alive(),  # network probe stays in the untested CLI glue
             )
-    except Exception as exc:  # pragma: no cover - defensive: a monitor must not
-        # error-spam Task Scheduler. Only a connection/infra failure gets here
-        # (run_deadman itself swallows delivery errors); print + exit 0 so the
-        # scheduled task doesn't show a permanent red X for a transient DB blip.
-        print(f"[fleet-deadman] check failed: {exc}", flush=True)
-        return 0
+    except Exception:  # pragma: no cover - exercised through CLI tests
+        _write_monitor_failure_alert(Path(args.alert_dir), now=now)
+        print("[fleet-deadman] check failed; see local alert", flush=True)
+        return 2
 
     if alerts:
         print(f"[fleet-deadman] ALERT: {_summarize(alerts)}", flush=True)

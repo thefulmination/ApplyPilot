@@ -108,6 +108,7 @@ def list_challenges(conn) -> list:
             "SELECT ac.id, ac.url, ac.worker_id, ac.kind, ac.route, ac.raised_at "
             "FROM auth_challenge ac "
             "JOIN linkedin_queue lq ON lq.url = ac.url "
+            "  AND lq.status='leased' AND lq.apply_status='challenge_pending' "
             "WHERE ac.resolved_at IS NULL ORDER BY ac.raised_at DESC"
         )
         return [dict(r) for r in cur.fetchall()]
@@ -141,7 +142,9 @@ def _print_status(conn) -> None:
         halted_until = str(halt_row["halted_until"]) if halt_row else None
         cur.execute(
             "SELECT count(*) AS n FROM auth_challenge ac "
-            "JOIN linkedin_queue lq ON lq.url = ac.url WHERE ac.resolved_at IS NULL"
+            "JOIN linkedin_queue lq ON lq.url = ac.url "
+            "  AND lq.status='leased' AND lq.apply_status='challenge_pending' "
+            "WHERE ac.resolved_at IS NULL"
         )
         open_ch = cur.fetchone()["n"]
         # apply-time channel recorder: how applied jobs actually submitted (easy_apply vs external ATS)
@@ -206,7 +209,9 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
+    from applypilot.fleet import schema as fleet_schema
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         if args.cmd == "push":
             n = sync.push_linkedin_eligible(pg_conn=conn, score_floor=args.score_floor,
                                             max_age_days=args.max_age_days, limit=args.limit,

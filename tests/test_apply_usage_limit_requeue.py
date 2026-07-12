@@ -160,11 +160,21 @@ def test_container_worker_no_result_line_still_crash_unconfirmed(monkeypatch):
 
     action = container_worker._handle_run_status(
         pg=None, worker_id=0, url="u2", status="failed:no_result_line",
-        cost=0.0, dur_ms=0, model="deepseek-chat")
+        cost=0.0, dur_ms=0, model="deepseek-chat",
+        evidence={
+            "application_tool_calls": 7,
+            "job_log_path": "logs/u2.log",
+            "transcript_digest": "sha256:u2",
+            "final_result_source": "transcript",
+            "result_metadata": {"execution_evidence": "durable"},
+        })
 
     assert action == "other"
     assert "requeue" not in calls
     assert calls["write"]["k"]["status"] == "crash_unconfirmed"
+    assert calls["write"]["k"]["application_tool_calls"] == 7
+    assert calls["write"]["k"]["job_log_path"] == "logs/u2.log"
+    assert calls["write"]["k"]["result_metadata"]["execution_evidence"] == "durable"
 
 
 def test_map_status_no_result_line_unchanged():

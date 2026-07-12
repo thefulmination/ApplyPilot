@@ -62,9 +62,9 @@ def test_build_status_includes_worker_machine_name_and_model_switching_data(flee
     m2 = workers["m2-0"]
     assert m2["machine"] == "tarpon"
     assert m2["current_agent"] == "codex"
-    assert m2["current_model"] == "sonnet"
-    assert m2["current_model_family"] == "claude"
-    assert m2["current_model_vendor"] == "claude"
+    assert m2["current_model"] == "codex-default"
+    assert m2["current_model_family"] == "codex-like"
+    assert m2["current_model_vendor"] == "codex"
     assert m2["agent_chain"] == "claude,codex"
     assert m2["last_agent_switch_reason"] == "canary rotation"
     assert m2["last_agent_switch_at"] is not None
@@ -230,7 +230,7 @@ def test_agents_api_includes_switch_verdicts_and_spend(monkeypatch, fleet_db) ->
     workers = {w["worker_id"]: w for w in payload["workers"]}
     assert workers["m2-0"]["machine"] == "tarpon"
     assert workers["m2-0"]["current_agent"] == "codex"
-    assert workers["m2-0"]["current_model"] == "haiku"
+    assert workers["m2-0"]["current_model"] == "codex-default"
     assert workers["m2-0"]["switch_verdict"] == "partial"
     assert workers["m2-0"]["active_blocked_agents"] == ["codex"]
     assert payload["agent_blocks"]["codex"]["reason"] == "usage_limit_wall"
@@ -241,7 +241,7 @@ def test_agents_api_includes_switch_verdicts_and_spend(monkeypatch, fleet_db) ->
     assert summary["switched_workers"] == 0
     assert summary["partial_workers"] == 1
     assert summary["blocked_workers"] == 0
-    assert summary["model_usage"]["haiku"] == 1
+    assert summary["model_usage"]["codex-default"] == 1
     assert summary["model_count"] == 1
     assert summary["model_missing_workers"] == 0
 
@@ -337,6 +337,108 @@ def test_build_status_uses_llm_usage_fallback_for_missing_worker_model(monkeypat
     assert workers["m2-0"]["current_model_vendor"] == "codex"
     assert agents["model_usage"] == {"gpt-5": 1}
     assert agents["model_family_usage"] == {"codex-like": 1}
+
+
+def test_build_status_uses_zero_cost_result_evidence_for_missing_worker_model(
+    monkeypatch, fleet_db
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "home-apply-0", machine_owner="home", role="apply", state="idle")
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO apply_result_events (queue_name, url, worker_id, machine_owner, "
+                "status, agent, agent_model, est_cost_usd) "
+                "VALUES ('apply_queue', 'apply-zero', 'home-apply-0', 'home', "
+                "'applied', 'codex', 'codex-default', 0)"
+            )
+        conn.commit()
+
+    payload = console_app.build_status()
+    worker = {w["worker_id"]: w for w in payload["workers"]}["home-apply-0"]
+
+    assert worker["current_agent"] == "codex"
+    assert worker["current_model"] == "codex-default"
+    assert worker["current_model_family"] == "codex-like"
+    assert worker["current_model_vendor"] == "codex"
+
+
+def test_build_status_tolerates_pre_migration_result_event_schema(monkeypatch, fleet_db) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "legacy-apply-0", machine_owner="home", role="apply", state="idle")
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE apply_result_events DROP COLUMN machine_owner")
+            cur.execute(
+                "INSERT INTO apply_result_events (queue_name, url, worker_id, status, agent, agent_model) "
+                "VALUES ('apply_queue', 'legacy-zero', 'legacy-apply-0', "
+                "'applied', 'codex', 'codex-default')"
+            )
+        conn.commit()
+
+    payload = console_app.build_status()
+    worker = {w["worker_id"]: w for w in payload["workers"]}["legacy-apply-0"]
+    assert worker["current_model"] == "codex-default"
+
+
+def test_build_status_normalizes_legacy_codex_sonnet_telemetry(monkeypatch, fleet_db) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "legacy-codex-0", machine_owner="home", role="apply", state="idle")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat SET current_agent='codex', current_model=NULL "
+                "WHERE worker_id='legacy-codex-0'"
+            )
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id, machine_owner, provider, model, task, cost_usd) "
+                "VALUES ('legacy-codex-0', 'home', 'codex', 'sonnet', 'apply_agent', 0)"
+            )
+        conn.commit()
+
+    worker = {
+        w["worker_id"]: w for w in console_app.build_status()["workers"]
+    }["legacy-codex-0"]
+    assert worker["current_agent"] == "codex"
+    assert worker["current_model"] == "codex-default"
+    assert worker["current_model_vendor"] == "codex"
+
+
+def test_build_status_does_not_mix_model_from_different_agent(monkeypatch, fleet_db) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "switched-0", machine_owner="home", role="apply", state="idle")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat SET current_agent='claude', current_model=NULL "
+                "WHERE worker_id='switched-0'"
+            )
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id, machine_owner, provider, model, task, cost_usd) "
+                "VALUES ('switched-0', 'home', 'codex', 'gpt-5', 'apply_agent', 0)"
+            )
+        conn.commit()
+
+    worker = {w["worker_id"]: w for w in console_app.build_status()["workers"]}["switched-0"]
+    assert worker["current_agent"] == "claude"
+    assert worker["current_model"] is None
+
+
+def test_build_status_labels_legacy_codex_without_usage_as_cli_default(monkeypatch, fleet_db) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        heartbeat.beat(conn, "codex-no-usage", machine_owner="m2", role="apply", state="paused")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat SET current_agent='codex', current_model=NULL "
+                "WHERE worker_id='codex-no-usage'"
+            )
+        conn.commit()
+
+    worker = {
+        w["worker_id"]: w for w in console_app.build_status()["workers"]
+    }["codex-no-usage"]
+    assert worker["current_model"] == "codex-default"
 
 
 def test_agents_summary_counts_apply_agent_usage_rows(monkeypatch, fleet_db) -> None:

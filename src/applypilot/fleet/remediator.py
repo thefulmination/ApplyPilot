@@ -176,7 +176,8 @@ def requeue_job(conn, c: Candidate, *, apply_error_tag: str = REQUEUE_TAG) -> bo
 
 
 def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
-              max_per_job: int = 2, window_minutes: int = 30, backfill: bool = False) -> dict:
+              max_per_job: int = 2, window_minutes: int = 30, backfill: bool = False,
+              pre_touch_backfill: bool = False, dry_run: bool = False) -> dict:
     """One pass: select usage-limit casualties, then re-queue each ONLY if all 3 guards pass,
     bounded by max_requeue. Guard failures and cap overflow are left parked (a recommendation,
     not an action). Returns a summary. brain_path defaults to the live brain (config.DB_PATH).
@@ -194,8 +195,10 @@ def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
         cands = select_backfill_candidates(conn, max_per_job=max_per_job)
     else:
         cands = select_candidates(conn, window_minutes=window_minutes, max_per_job=max_per_job)
+    if pre_touch_backfill:
+        cands.extend(select_pre_touch_backfill_candidates(conn, max_per_job=max_per_job))
     out = {"candidates": len(cands), "requeued": 0, "vetoed_applied_set": 0,
-           "vetoed_email": 0, "capped": 0}
+           "vetoed_email": 0, "capped": 0, "dry_run": dry_run}
     for c in cands:
         if in_applied_set(conn, c.dedup_key):           # guard 2
             out["vetoed_applied_set"] += 1
@@ -205,6 +208,8 @@ def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
             continue
         if out["requeued"] >= max_requeue:              # per-pass blast-radius cap
             out["capped"] += 1
+            continue
+        if dry_run:
             continue
         if requeue_job(conn, c):                        # guard 1 already satisfied by selection
             out["requeued"] += 1

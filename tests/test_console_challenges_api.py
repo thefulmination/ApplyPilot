@@ -213,6 +213,32 @@ def test_build_challenges_humanizes_machine_name(fleet_db, monkeypatch):
     assert rows[0]["machine"] == "gggtower"
 
 
+def test_build_challenges_infers_company_display_from_application_host(fleet_db, monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    url = "https://www.indeed.com/viewjob?jk=inferred-company"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, company, title, score, status, apply_status, lane, lease_expires_at) "
+            "VALUES (%s,'https://www.amazon.jobs/jobs/123',NULL,'Business Development Manager',8,"
+            "'leased','challenge_pending','ats',now()+interval '3650 days')",
+            (url,),
+        )
+        cur.execute(
+            "INSERT INTO auth_challenge (url, kind, route) VALUES (%s,'login_gate','owner_inbox')",
+            (url,),
+        )
+        conn.commit()
+
+    result = console_app.build_challenges()
+    row = next(row for group in result["groups"] for row in group["rows"] if row["url"] == url)
+    assert row["company"] == "amazon.jobs"
+    assert row["title"] == "Business Development Manager"
+    assert row["metadata_inferred_fields"] == ["company"]
+    assert row["has_metadata"] is True
+    assert result["summary"]["missing_metadata_rows"] == 0
+
+
 def test_build_challenges_marks_stale_rows_and_missing_metadata(fleet_db, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn:

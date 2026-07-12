@@ -89,11 +89,14 @@ class IndeedResolverSummary:
     considered: int = 0
     dry_run: bool = False
     counts: dict[str, int] | None = None
+    unresolved_kinds: dict[str, int] | None = None
     sample_urls: list[str] | None = None
 
     def __post_init__(self) -> None:
         if self.counts is None:
             self.counts = {}
+        if self.unresolved_kinds is None:
+            self.unresolved_kinds = {}
         if self.sample_urls is None:
             self.sample_urls = []
 
@@ -379,10 +382,13 @@ def run_resolver(
     )
 
     counts: Counter[str] = Counter()
+    unresolved_kinds: Counter[str] = Counter()
     sample_urls: list[str] = []
     for candidate in candidates:
         decision = classify_candidate(candidate)
         counts[decision.status] += 1
+        if decision.status == "unresolved" and decision.unresolved_kind:
+            unresolved_kinds[decision.unresolved_kind] += 1
         record_resolution(candidate.url, decision, dry_run=options.dry_run, conn=conn)
         if len(sample_urls) < 10:
             sample_urls.append(_summary_url(candidate, decision))
@@ -391,6 +397,7 @@ def run_resolver(
         considered=len(candidates),
         dry_run=options.dry_run,
         counts=dict(counts),
+        unresolved_kinds=dict(unresolved_kinds),
         sample_urls=sample_urls,
     )
 

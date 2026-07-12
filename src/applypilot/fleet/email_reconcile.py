@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
 
 from applypilot.gmail_outcomes import match_email_to_job
+from applypilot.fleet.queue import resolve_superseded_challenges
 
 CONFIRMING_STAGES = frozenset({"acknowledged", "screen", "assessment", "interview", "offer", "rejected"})
 # Exact per-job methods that confirm a match regardless of score. Bare company_domain is
 # review-only: LinkedIn/Indeed/company career domains can hold many simultaneous crash rows.
-STRONG_METHODS = frozenset({"board_slug", "linkedin_job_id"})
+STRONG_METHODS = frozenset({"exact_job_url", "board_slug", "linkedin_job_id"})
 # Fuzzy methods strong ENOUGH to auto-confirm when they clear MIN_STRONG. Only `ats_domain`
 # qualifies: an ATS sender (Greenhouse/Lever/...) plus a matching extracted employer name is
 # materially stronger than a bare token overlap. `company_name` and `title` are NOT here — a
@@ -45,6 +46,10 @@ class Resolution:
     stage: str
     occurred_at: str | None
     classification: str  # "confirmed" | "probable"
+    job_company: str | None = None
+    job_title: str | None = None
+    email_sender: str | None = None
+    email_subject: str | None = None
 
 
 @dataclass
@@ -247,8 +252,19 @@ def reconcile(
         if cls == "probable" and _exact_company_title_evidence(e, job):
             cls = "confirmed"
         url = job["url"]
-        cand = Resolution(job_url=url, message_id=e.message_id, method=method, score=float(score),
-                          stage=e.stage, occurred_at=e.occurred_at, classification=cls)
+        cand = Resolution(
+            job_url=url,
+            message_id=e.message_id,
+            method=method,
+            score=float(score),
+            stage=e.stage,
+            occurred_at=e.occurred_at,
+            classification=cls,
+            job_company=str(job.get("company") or job.get("site") or "") or None,
+            job_title=str(job.get("title") or "") or None,
+            email_sender=e.sender,
+            email_subject=e.subject,
+        )
         prev = best.get(url)
         if prev is None or cand.score > prev.score:
             best[url] = cand
@@ -290,6 +306,9 @@ def apply_resolutions(
                 if cur.rowcount == 0:
                     skipped += 1
                     continue
+                resolve_superseded_challenges(
+                    cur, r.job_url, terminal_status="applied", queue_name="apply_queue"
+                )
                 cur.execute(
                     "INSERT INTO email_reconcile_actions (url, message_id, match_method, match_score, "
                     "stage, prior_status, how_to_reverse) VALUES (%s,%s,%s,%s,%s,%s,%s)",

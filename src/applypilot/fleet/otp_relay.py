@@ -35,6 +35,10 @@ class RelayCode:
     kind: str  # 'code' | 'magic_link'
 
 
+class OtpResponderOverloadError(RuntimeError):
+    """The bounded responder could not inspect a complete request/mail snapshot."""
+
+
 def _apply_domain(application_url: str) -> str:
     return (urlparse(application_url or "").hostname or "").lower()
 
@@ -354,6 +358,8 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
     conn.commit()
     if not pending or len(pending) > _MAX_RESPONDER_ITEMS:
         return 0
+    if len(pending) > _MAX_RESPONDER_ITEMS:
+        raise OtpResponderOverloadError("pending_request_snapshot_overflow")
     answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
     scan_max_messages = min(
         validate_max_messages(max_messages, cap=None), _MAX_RESPONDER_ITEMS

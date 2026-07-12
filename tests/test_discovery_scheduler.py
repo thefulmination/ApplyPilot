@@ -74,13 +74,13 @@ def test_parallel_discovery_scheduler_runs_safe_tasks_concurrently(monkeypatch) 
 
     monkeypatch.setattr(pipeline, "_discover_source_tasks", lambda _cfg, workers, discover_mode: tasks)
 
-    started = time.perf_counter()
     result = pipeline._run_discover(workers=2, discover_mode="safe", search_cfg={})
-    elapsed = time.perf_counter() - started
 
     assert result == {"one": "ok", "two": "ok"}
-    assert elapsed < 0.27
     assert {name for name, _ in events if name.endswith(":start")} == {"one:start", "two:start"}
+    timestamps = dict(events)
+    assert timestamps["one:start"] < timestamps["two:end"]
+    assert timestamps["two:start"] < timestamps["one:end"]
 
 
 def test_discovery_scheduler_marks_source_errors_partial(monkeypatch) -> None:
