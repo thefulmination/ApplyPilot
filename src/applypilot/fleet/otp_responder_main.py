@@ -24,11 +24,12 @@ def run_once(conn, gmail_service=None) -> dict:
     return {"answered": answered, "purged": purged}
 
 
-def _beat(conn, *, machine_owner, state):
+def _beat(conn, *, machine_owner, state, last_error=None):
     try:
         from applypilot.fleet.worker import _heartbeat
         _heartbeat(conn, worker_id="otp_responder", machine_owner=machine_owner,
-                   home_ip="0.0.0.0", role="otp_responder", state=state)
+                   home_ip="0.0.0.0", role="otp_responder", state=state,
+                   last_error=last_error)
     except Exception:  # pragma: no cover - heartbeat is best-effort
         logger.debug("otp_responder heartbeat failed", exc_info=True)
 
@@ -53,8 +54,20 @@ def main(argv=None) -> int:  # pragma: no cover - long-running loop
                 _beat(conn, machine_owner=args.machine_owner, state="idle")
             logger.info("otp responder cycle: answered=%s purged=%s",
                         out["answered"], out["purged"])
-        except Exception:
+        except Exception as exc:
             logger.exception("otp responder cycle failed; backing off")
+            try:
+                with pgqueue.connect(args.dsn) as error_conn:
+                    _beat(
+                        error_conn,
+                        machine_owner=args.machine_owner,
+                        state="error",
+                        last_error=f"otp_responder_cycle_failed:{type(exc).__name__}",
+                    )
+            except Exception:
+                logger.debug("otp responder failure heartbeat failed", exc_info=True)
+            if args.once:
+                return 1
         if args.once:
             return 0
         time.sleep(max(0.5, args.interval))

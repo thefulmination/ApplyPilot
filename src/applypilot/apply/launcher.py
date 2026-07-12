@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 _FLEET_LI_KEY = "applypilot:linkedin_driver"
 
 
-def fleet_linkedin_active(pg_dsn: str | None) -> bool:
+def fleet_linkedin_active(pg_dsn: str | None) -> bool | None:
     """Probe whether the fleet LinkedIn driver holds the advisory interlock.
 
     Opens a transient connection to the fleet PG and attempts
@@ -70,9 +70,8 @@ def fleet_linkedin_active(pg_dsn: str | None) -> bool:
       holds it) → returns **True** (fleet is active; supervised must defer).
     * If the try-lock returns TRUE (we acquired it) → immediately unlocks
       (non-destructive probe, never leaves the lock held) and returns **False**.
-    * Any error (missing/unreachable fleet PG, connect failure, etc.) →
-      returns **False** so a probe failure never crashes the supervised run.
-      The runbook is the backstop for that edge.
+    * Any error with a configured fleet PG returns ``None`` (unknown), which callers
+      must treat as active so LinkedIn ownership fails closed.
     """
     if not pg_dsn:
         return False
@@ -101,7 +100,7 @@ def fleet_linkedin_active(pg_dsn: str | None) -> bool:
             return True
     except Exception:
         logger.debug("fleet_linkedin_active probe failed", exc_info=True)
-        return False
+        return None
     finally:
         if conn is not None:
             try:
@@ -3029,7 +3028,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             _fleet_dsn = os.environ.get("FLEET_PG_DSN")
             exclude_li = (
                 (not browser_li_ok) or _linkedin_halt.is_set()
-                or (bool(_fleet_dsn) and fleet_linkedin_active(_fleet_dsn))
+                or (
+                    bool(_fleet_dsn)
+                    and fleet_linkedin_active(_fleet_dsn) is not False
+                )
             )
             if not exclude_li:
                 try:

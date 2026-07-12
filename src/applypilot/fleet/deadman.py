@@ -477,6 +477,20 @@ def run_deadman(conn, *, now: dt.datetime, alert_dir: Path,
     return alerts
 
 
+def _write_monitor_failure_alert(alert_dir: Path, *, now: dt.datetime) -> None:
+    """Persist a credential-free fallback when the database monitor cannot run."""
+    try:
+        alert_dir = Path(alert_dir)
+        alert_dir.mkdir(parents=True, exist_ok=True)
+        (alert_dir / ALERT_FILENAME).write_text(
+            f"ApplyPilot fleet dead-man alert -- {now.isoformat()}\n\n"
+            "[critical] monitor_failure: fleet health check could not complete\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
     p = argparse.ArgumentParser(
         prog="applypilot-fleet-deadman",
@@ -503,19 +517,18 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
     from applypilot.apply import pgqueue
     from applypilot.fleet.schema import ensure_schema_v3
 
+    now = dt.datetime.now(dt.timezone.utc)
     try:
         with pgqueue.connect(args.dsn) as conn:
             ensure_schema_v3(conn)
             alerts = run_deadman(
-                conn, now=dt.datetime.now(dt.timezone.utc), alert_dir=Path(args.alert_dir),
+                conn, now=now, alert_dir=Path(args.alert_dir),
                 gmail_token_ok=mail_source_alive(),  # network probe stays in the untested CLI glue
             )
-    except Exception as exc:  # pragma: no cover - defensive: a monitor must not
-        # error-spam Task Scheduler. Only a connection/infra failure gets here
-        # (run_deadman itself swallows delivery errors); print + exit 0 so the
-        # scheduled task doesn't show a permanent red X for a transient DB blip.
-        print(f"[fleet-deadman] check failed: {exc}", flush=True)
-        return 0
+    except Exception:  # pragma: no cover - exercised through CLI tests
+        _write_monitor_failure_alert(Path(args.alert_dir), now=now)
+        print("[fleet-deadman] check failed; see local alert", flush=True)
+        return 2
 
     if alerts:
         print(f"[fleet-deadman] ALERT: {_summarize(alerts)}", flush=True)
