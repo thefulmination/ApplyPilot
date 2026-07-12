@@ -121,6 +121,9 @@ def test_dashboard_surfaces_primary_blocker(live_server):
     assert "Primary blocker" in html
     assert "Spend cap halt" in html
     assert "spent over cap" in html
+    assert "LinkedIn owner IP — blocked" in html
+    assert "LinkedIn canary gate — exhausted" in html
+    assert "Apply agents blocked" in html
     assert "No blocking gate" in html
 
 
@@ -231,9 +234,12 @@ def test_dashboard_shows_deployment_drift_targets(live_server):
 
     assert "<th>Machines</th>" in html
     assert "<th>Workers</th>" in html
+    assert "<th>Deployment target</th>" in html
     assert "row.machines" in html
     assert "row.worker_ids" in html
-    assert "reconcile these machines before comparing telemetry" in html
+    assert "on target" in html
+    assert "off target" in html
+    assert "target" in html
 
 
 def test_dashboard_shows_machine_network_summary(live_server):

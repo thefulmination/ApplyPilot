@@ -1792,8 +1792,8 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="deploymentDrift">
     <h2>Deployment Drift</h2>
     <div id="deploymentDriftSummary" class="sub"></div>
-    <div class="table-scroll"><table><thead><tr><th>Version</th><th>Count</th><th>Machines</th><th>Workers</th><th>Status</th></tr></thead>
-      <tbody id="deploymentDriftRows"><tr><td colspan="5" class="mut">loading</td></tr></tbody></table></div>
+    <div class="table-scroll"><table><thead><tr><th>Version</th><th>Count</th><th>Machines</th><th>Workers</th><th>Status</th><th>Deployment target</th></tr></thead>
+      <tbody id="deploymentDriftRows"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
   </section>
 
   <section id="browserHealth">
@@ -2120,9 +2120,19 @@ function renderPrimaryBlocker(){
   const ats = q.ats || {};
   const linkedin = q.linkedin || {};
   const doctor = s.doctor || {};
+  const agents = d.agents || {};
+  const agentVerdict = agents.verdict || {};
   let state = "ok";
   let text = "Primary blocker: No blocking gate";
-  if(gate.should_halt){
+  if(agentVerdict.code === "all_agents_blocked"){
+    state = "severe";
+    const blocked = Object.keys(agents.availability || {})
+      .filter(a => (agents.availability[a] || {}).blocked)
+      .map(a => a + "(until " + ((agents.availability[a] || {}).blocked_until || "unknown") + ")")
+      .join(", ");
+    text = "Primary blocker: Apply agents blocked — " +
+      (blocked || "all known agents currently blocked") + "; unblock before applying";
+  } else if(gate.should_halt){
     state = "severe";
     text = "Primary blocker: Spend cap halt — " +
       money(gate.spent_usd || 0) + " spent over cap " + money(gate.spend_cap_usd || 0);
@@ -2135,11 +2145,16 @@ function renderPrimaryBlocker(){
   } else if(Number(ats.approved || 0) > 0 && Number(ats.leaseable || 0) === 0){
     state = "warn";
     text = "Primary blocker: ATS lease gate — " + ats.approved + " approved but 0 leaseable";
+  } else if(linkedin.owner_ip_context_known && !linkedin.owner_ip_ready){
+    state = "warn";
+    text = "Primary blocker: LinkedIn owner IP — blocked";
+  } else if(linkedin.canary_exhausted){
+    state = "warn";
+    text = "Primary blocker: LinkedIn canary gate — exhausted";
   } else if(Number(linkedin.queued || 0) > 0 && Number(linkedin.leaseable || 0) === 0){
     state = "warn";
     text = "Primary blocker: LinkedIn lease gate — " +
-      (linkedin.canary_exhausted ? "canary exhausted" :
-        (linkedin.owner_ip_context_known && !linkedin.owner_ip_ready ? "owner IP blocked" : "queued but not leaseable"));
+      "queued but not leaseable";
   }
   el.textContent = text;
   el.className = "actionline blockerline " + state;
@@ -2494,7 +2509,7 @@ function renderDeploymentDrift(dep){
   const versions = (dep && dep.worker_versions) || [];
   if(!versions.length){
     summaryEl.textContent = "No worker versions reported.";
-    rowsEl.innerHTML = '<tr><td colspan="5" class="mut">no worker version telemetry</td></tr>';
+    rowsEl.innerHTML = '<tr><td colspan="6" class="mut">no worker version telemetry</td></tr>';
     return;
   }
   const total = versions.reduce((n, row) => n + Number(row.workers || 0), 0);
@@ -2502,13 +2517,27 @@ function renderDeploymentDrift(dep){
     .reduce((n, row) => n + Number(row.workers || 0), 0);
   const unknown = versions.filter(row => classifyBuild(row.version) === "unknown build")
     .reduce((n, row) => n + Number(row.workers || 0), 0);
+  const consoleInfo = dep && dep.console || {};
+  const targetCommit = String(consoleInfo.commit || "").toLowerCase();
+  const targetShort = targetCommit ? targetCommit.slice(0, 7) : "";
+  const targetLabel = (consoleInfo.branch || "branch") + "@" +
+    (targetCommit ? targetCommit.slice(0, 7) : "unknown");
+  const targetHits = targetShort
+    ? versions.filter(row => String(row.version || "").toLowerCase().indexOf("+git.tree." + targetShort) >= 0).reduce((n, row) => n + Number(row.workers || 0), 0)
+    : 0;
   summaryEl.textContent = total + " worker heartbeat(s) across " + versions.length +
-    " version group(s)" + (dirty || unknown ? " - reconcile these machines before comparing telemetry." : ".");
+    " version group(s) — target " + targetLabel + "; " +
+    (targetShort ? (targetHits + " on-target / " + total + " reported") : "target not available") +
+    (targetShort && targetHits < total ? " - reconcile these machines before comparing telemetry." : "") +
+    (dirty || unknown ? " · reconcile mixed/dirty groups before scale" : "");
   rowsEl.innerHTML = versions.map(row => {
     const status = classifyBuild(row.version);
+    const onTarget = targetShort && String(row.version || "").toLowerCase().indexOf("+git.tree." + targetShort) >= 0;
+    const alignment = onTarget ? "on target" : "off target";
     return '<tr><td>'+esc(row.version || "(unknown)")+'</td><td>'+esc(row.workers || 0)+
       '</td><td>'+esc((row.machines || []).join(", ") || "(unknown)")+'</td><td>'+
-      esc((row.worker_ids || []).join(", ") || "(none)")+'</td><td>'+esc(status)+'</td></tr>';
+      esc((row.worker_ids || []).join(", ") || "(none)")+'</td><td>'+esc(status)+
+      '</td><td>'+esc(alignment)+'</td></tr>';
   }).join("");
 }
 
