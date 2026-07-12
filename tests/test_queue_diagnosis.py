@@ -87,3 +87,23 @@ def test_queue_diagnosis_exposes_blocked_reason_breakdown(fleet_db):
         "total": 2,
         "reasons": {"adapter_unsupported": 1, "expired": 1},
     }
+
+
+def test_queue_diagnosis_exposes_terminal_reason_breakdown(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(cur, url="timeout", status="failed", apply_error="failed:timeout")
+        _seed_apply_row(
+            cur,
+            url="uncertain",
+            status="crash_unconfirmed",
+            apply_error="crash_unconfirmed",
+        )
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        result = queue_diagnosis.queue_diagnosis(conn)
+
+    assert result["terminal"] == {
+        "total": 2,
+        "reasons": {"crash_unconfirmed": 1, "failed:timeout": 1},
+    }
