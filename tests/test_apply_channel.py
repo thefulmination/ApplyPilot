@@ -207,10 +207,19 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
         calls.append(inbox_auth_hint)
+        attempt = len(calls)
         monkeypatch.setattr(
             launcher,
             "_last_run_stats",
-            {3: {"application_tool_calls": 1}},
+            {
+                3: {
+                    "application_tool_calls": 0 if attempt == 1 else 1,
+                    "tool_calls_total": 0 if attempt == 1 else 1,
+                    "safe_requeue": True if attempt == 1 else None,
+                    "cost_usd": 1.25 if attempt == 1 else 0.50,
+                    "route": "agent",
+                }
+            },
             raising=False,
         )
         if len(calls) == 1:

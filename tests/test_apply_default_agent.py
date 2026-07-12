@@ -32,6 +32,13 @@ def _mock_schema_startup(monkeypatch):
     )
 
 
+def _stub_schema_check(monkeypatch):
+    from applypilot.fleet import schema as fleet_schema
+
+    monkeypatch.setattr(fleet_schema, "require_apply_result_event_schema", lambda _conn: None)
+    monkeypatch.setattr(fleet_schema, "require_apply_attempt_schema", lambda _conn: None)
+
+
 def test_fleet_apply_worker_defaults_to_codex():
     args = build_parser().parse_args(["--worker-id", "w0"])
     assert args.agent == "codex"
@@ -49,6 +56,7 @@ def test_fleet_apply_worker_once_limits_loop_iterations(monkeypatch):
     monkeypatch.setattr(awm, "build_apply_loop", lambda **_kw: object())
     monkeypatch.setattr(awm, "install_stop_handler", lambda: None)
     monkeypatch.setattr(awm, "make_apply_fn", lambda *_a, **_kw: (lambda _job: {}))
+    _stub_schema_check(monkeypatch)
 
     captured = {}
 
@@ -74,6 +82,7 @@ def test_fleet_apply_worker_max_iterations_limits_loop_iterations(monkeypatch):
     monkeypatch.setattr(awm, "build_apply_loop", lambda **_kw: object())
     monkeypatch.setattr(awm, "install_stop_handler", lambda: None)
     monkeypatch.setattr(awm, "make_apply_fn", lambda *_a, **_kw: (lambda _job: {}))
+    _stub_schema_check(monkeypatch)
 
     captured = {}
 

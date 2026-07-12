@@ -156,8 +156,9 @@ def test_linkedin_schema_columns(fleet_db):
 def test_linkedin_should_halt_ignores_apply_queue_spend_cap(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO apply_queue (url, application_url, score, status, est_cost_usd) "
-            "VALUES ('ats-spend', 'https://example.com/apply', 9, 'applied', 2.0)"
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, status, est_cost_usd, cumulative_cost_usd) "
+            "VALUES ('ats-spend', 'https://example.com/apply', 9, 'applied', 2.0, 2.0)"
         )
         conn.commit()
 

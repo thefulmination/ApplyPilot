@@ -223,6 +223,146 @@ def test_linkedin_queue_has_canonical_provenance(fleet_db):
     assert CANONICAL_QUEUE_COLUMNS <= cols
 
 
+def test_v3_schema_backfills_cumulative_cost_from_latest_or_events(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, est_cost_usd, cumulative_cost_usd) "
+            "VALUES ('legacy-latest', 'legacy-latest', 1, 1.25, 0), "
+            "('legacy-events', 'legacy-events', 1, 0, 0)"
+        )
+        cur.execute(
+            "INSERT INTO apply_result_events (url, est_cost_usd) "
+            "VALUES ('legacy-latest', 0.25), ('legacy-events', 0.40), "
+            "('legacy-events', 0.35)"
+        )
+        conn.commit()
+
+        fleet_schema.ensure_schema_v3(conn)
+
+        cur.execute(
+            "SELECT url, cumulative_cost_usd FROM apply_queue "
+            "WHERE url LIKE 'legacy-%%' ORDER BY url"
+        )
+        rows = {row["url"]: float(row["cumulative_cost_usd"]) for row in cur.fetchall()}
+
+    assert rows == {"legacy-events": 0.75, "legacy-latest": 1.25}
+
+
+def test_apply_result_events_include_cost_router_metadata(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='apply_result_events'"
+        )
+        cols = {r["column_name"] for r in cur.fetchall()}
+
+    assert "route" in cols
+    assert "failure_class" in cols
+    assert "tool_calls_total" in cols
+    assert "application_tool_calls" in cols
+    assert "last_tool" in cols
+    assert "host_policy" in cols
+    assert "result_metadata" in cols
+    assert "job_log_path" in cols
+    assert "transcript_digest" in cols
+    assert "final_result_source" in cols
+
+
+def test_apply_attempts_schema_and_unresolved_index(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='apply_attempts'"
+        )
+        cols = {r["column_name"] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename='apply_attempts' AND indexname='uq_apply_attempts_unresolved_dedup'"
+        )
+        indexdef = cur.fetchone()["indexdef"]
+
+    assert {
+        "attempt_id", "queue_name", "url", "dedup_key", "worker_id", "route",
+        "route_version", "state", "submit_started_at", "finalized_at",
+        "verification_method", "verification_ref", "evidence", "created_at",
+    } <= cols
+    assert "submit_started" in indexdef
+    assert "submitted_unverified" in indexdef
+
+
+def test_apply_attempts_schema_revokes_destructive_worker_privileges():
+    schema = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "applypilot"
+        / "fleet"
+        / "schema_v3.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker" in schema
+    assert (
+        "REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON apply_attempts FROM fleet_worker"
+        in schema
+    )
+
+
+def test_apply_worker_schema_check_passes_with_current_schema(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.require_apply_result_event_schema(conn)
+        fleet_schema.require_apply_attempt_schema(conn)
+
+
+def test_apply_worker_schema_check_reports_missing_columns():
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchall(self):
+            return [{"column_name": "url"}, {"column_name": "status"}]
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def rollback(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="apply_result_events.*route"):
+        fleet_schema.require_apply_result_event_schema(_Conn())
+
+
+def test_apply_attempt_schema_check_reports_missing_columns():
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchall(self):
+            return [{"column_name": "attempt_id"}, {"column_name": "url"}]
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def rollback(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="apply_attempts.*state"):
+        fleet_schema.require_apply_attempt_schema(_Conn())
+
+
 def test_linkedin_queue_freshness_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='linkedin_queue'")

@@ -8,10 +8,15 @@ explicitly told to. No real browser and no real submission in these tests.
 
 from types import SimpleNamespace
 
+import pytest
+
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply import launcher
 from applypilot.apply import greenhouse_submit
 from applypilot.apply.greenhouse_submit import (
+    RequiredFormFieldsError,
+    SubmitReport,
+    _complete_greenhouse_email_challenge,
     adapter_enabled,
     apply_greenhouse,
     capture_answers,
@@ -75,15 +80,243 @@ def test_plan_form_actions_maps_each_type_to_the_right_action():
             for a in plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")]
     assert ("file", "#resume", "/r.pdf") in acts
     assert ("fill", "#first_name", "Jordan") in acts
-    assert ("textarea", "#resume_text", "REAL RESUME") in acts
+    assert not any(selector == "#resume_text" for _, selector, _ in acts)
     assert ("textarea", "#question_1", "why text") in acts
     assert ("select", "#question_2", 1) in acts
+
+
+def test_plan_form_actions_keeps_manual_resume_when_no_file_is_available():
+    acts = [(action.kind, action.selector, action.value)
+            for action in plan_form_actions(_ready_plan(), QUESTIONS, resume_path=None)]
+
+    assert ("textarea", "#resume_text", "REAL RESUME") in acts
+
+
+def test_plan_form_actions_uses_select_for_multi_select_fields():
+    plan = AnswerPlan(
+        fields={"location_q[]": 41},
+        resume_field=None,
+        free_text={},
+        unmapped_required=[],
+        ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "location_q[]", "type": "multi_value_multi_select",
+                     "values": [{"label": "CA | San Francisco", "value": 41}]}]},
+    ]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("select", '[id="location_q[]"]', 41, "CA | San Francisco") in [
+        (action.kind, action.selector, action.value, action.option_label) for action in actions
+    ]
+
+
+def test_plan_form_actions_uses_attribute_selector_for_numeric_demographic_id():
+    plan = AnswerPlan(
+        fields={"864": 4660}, resume_field=None, free_text={},
+        unmapped_required=[], ready=True,
+    )
+    questions = [{"fields": [{
+        "name": "864", "type": "multi_value_multi_select",
+        "values": [{"label": "I don't wish to answer", "value": 4660}],
+    }]}]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("select", '[id="864"]', 4660) in [
+        (action.kind, action.selector, action.value) for action in actions
+    ]
+
+
+def test_plan_form_actions_maps_phone_country_widget():
+    plan = AnswerPlan(
+        fields={"country": "us"},
+        resume_field=None,
+        free_text={},
+        unmapped_required=[],
+        ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "country", "type": "phone_country_select"}]},
+    ]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("phone_country", "#country", "us") in [
+        (action.kind, action.selector, action.value) for action in actions
+    ]
+
+
+def test_plan_form_actions_maps_location_and_coordinates_to_real_dom_controls():
+    plan = AnswerPlan(
+        fields={
+            "location": "San Francisco, California, United States",
+        },
+        resume_field=None, free_text={}, unmapped_required=[], ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "location", "type": "location_autocomplete"}]},
+        {"fields": [{"name": "latitude", "type": "location_virtual"}]},
+        {"fields": [{"name": "longitude", "type": "location_virtual"}]},
+    ]
+
+    actions = plan_form_actions(plan, questions)
+
+    assert ("location", "#candidate-location", "San Francisco, California, United States") in [
+        (action.kind, action.selector, action.value) for action in actions
+    ]
+    assert not any(action.selector in {"#latitude", "#longitude"} for action in actions)
+
+
+def test_execute_form_selects_location_autocomplete_option():
+    class LocationInput:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def click(self):
+            self.calls.append(("location_click",))
+
+        def fill(self, value):
+            self.calls.append(("location_fill", value))
+
+        def press_sequentially(self, value, *, delay):
+            self.calls.append(("location_type", value, delay))
+
+    class LocationOption:
+        def __init__(self, calls, name):
+            self.calls = calls
+            self.name = name
+
+        def click(self):
+            self.calls.append(("location_option", self.name))
+
+    class LocationPage(FakePage):
+        def locator(self, selector):
+            assert selector == "#candidate-location"
+            return LocationInput(self.calls)
+
+        def get_by_role(self, role, *, name, exact):
+            assert role == "option" and exact is True
+            return LocationOption(self.calls, name)
+
+    actions = [
+        type("Action", (), {"kind": "location", "selector": "#candidate-location",
+                             "value": "San Francisco, California, United States"})(),
+    ]
+    page = LocationPage()
+
+    execute_form(actions, page)
+
+    assert ("location_type", "San Francisco, California, United States", 50) in page.calls
+    assert ("location_option", "San Francisco, California, United States") in page.calls
 
 
 def test_plan_form_actions_puts_submit_last():
     acts = plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf")
     assert acts[-1].kind == "submit"
-    assert [a for a in acts if a.kind == "submit"][0].selector == "#submit_app"
+    assert [a for a in acts if a.kind == "submit"][0].selector == "button[type='submit']"
+
+
+def test_execute_form_selects_react_combobox_option_by_label():
+    class FakeLocator:
+        def evaluate(self, script):
+            return "input"
+
+    class FakeOption:
+        def __init__(self, calls, label):
+            self.calls = calls
+            self.label = label
+
+        def click(self):
+            self.calls.append(("option", self.label))
+
+    class FakeReactPage(FakePage):
+        def locator(self, selector):
+            self.calls.append(("locator", selector))
+            return FakeLocator()
+
+        def get_by_role(self, role, *, name, exact):
+            self.calls.append(("role", role, name, exact))
+            return FakeOption(self.calls, name)
+
+    plan = AnswerPlan(
+        fields={"location_q[]": 41},
+        resume_field=None,
+        free_text={},
+        unmapped_required=[],
+        ready=True,
+    )
+    questions = [
+        {"fields": [{"name": "location_q[]", "type": "multi_value_multi_select",
+                     "values": [{"label": "CA | San Francisco", "value": 41}]}]},
+    ]
+    page = FakeReactPage()
+
+    execute_form(plan_form_actions(plan, questions), page)
+
+    assert ("click", '[id="location_q[]"]') in page.calls
+    assert ("option", "CA | San Francisco") in page.calls
+
+
+def test_execute_form_selects_phone_country_by_country_code():
+    class ClickTarget:
+        def __init__(self, calls, value):
+            self.calls = calls
+            self.value = value
+
+        def click(self):
+            self.calls.append(("click_target", self.value))
+
+    class CountryContainer:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def get_by_role(self, role):
+            return ClickTarget(self.calls, role)
+
+    class InputLocator:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def locator(self, selector):
+            self.calls.append(("ancestor", selector))
+            return CountryContainer(self.calls)
+
+        def get_attribute(self, name):
+            assert name == "aria-controls"
+            return "react-select-country-listbox"
+
+    class CountryListbox:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def get_by_role(self, role, *, name, exact):
+            self.calls.append(("country_option", role, name, exact))
+            return ClickTarget(self.calls, name)
+
+    class PhoneCountryPage(FakePage):
+        def locator(self, selector):
+            self.calls.append(("locator", selector))
+            if selector == "#react-select-country-listbox":
+                return CountryListbox(self.calls)
+            return InputLocator(self.calls)
+
+    action_plan = AnswerPlan(
+        fields={"country": "us"}, resume_field=None, free_text={},
+        unmapped_required=[], ready=True,
+    )
+    questions = [{"fields": [
+        {"name": "country", "type": "phone_country_select", "values": [
+            {"label": "United States +1", "value": "us"},
+        ]},
+    ]}]
+    page = PhoneCountryPage()
+
+    execute_form(plan_form_actions(action_plan, questions), page)
+
+    assert ("click_target", "button") in page.calls
+    assert ("click_target", "United States +1") in page.calls
 
 
 def test_plan_form_actions_never_touches_unplanned_fields():
@@ -100,7 +333,7 @@ def test_execute_form_dry_run_fills_but_NEVER_clicks_submit():
     assert rep.dry_run is True
     assert rep.submitted is False
     assert rep.skipped_submit is True
-    assert ("click", "#submit_app") not in page.calls
+    assert ("click", "button[type='submit']") not in page.calls
     assert ("fill", "#first_name", "Jordan") in page.calls
     assert ("file", "#resume", "/r.pdf") in page.calls
 
@@ -110,7 +343,205 @@ def test_execute_form_clicks_submit_only_when_dry_run_false():
     rep = execute_form(plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
                        page, dry_run=False)
     assert rep.submitted is True
-    assert ("click", "#submit_app") in page.calls
+    assert ("click", "button[type='submit']") in page.calls
+
+
+def test_execute_form_captures_expected_greenhouse_post_response():
+    class Request:
+        method = "POST"
+
+    class Response:
+        request = Request()
+        url = "https://boards.greenhouse.io/acme/jobs/123"
+        status = 200
+
+        def header_value(self, name):
+            return "request-123" if name == "x-request-id" else None
+
+    class ExpectedResponse:
+        value = Response()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class ResponsePage(FakePage):
+        def expect_response(self, predicate, *, timeout):
+            self.calls.append(("expect_response", timeout))
+            assert predicate(Response())
+            return ExpectedResponse()
+
+    page = ResponsePage()
+    report = execute_form(
+        plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+        page,
+        dry_run=False,
+        expected_submit_url="https://boards.greenhouse.io/acme/jobs/123",
+    )
+
+    assert report.response_status == 200
+    assert report.response_url == "https://boards.greenhouse.io/acme/jobs/123"
+    assert report.response_request_id == "request-123"
+
+
+def test_execute_form_does_not_click_twice_when_response_wait_times_out():
+    class TimeoutResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            raise TimeoutError("no matching response")
+
+    class TimeoutPage(FakePage):
+        def expect_response(self, predicate, *, timeout):
+            return TimeoutResponse()
+
+    page = TimeoutPage()
+    report = execute_form(
+        plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+        page,
+        dry_run=False,
+        expected_submit_url="https://boards.greenhouse.io/acme/jobs/123",
+    )
+
+    assert page.calls.count(("click", "button[type='submit']")) == 1
+    assert report.response_wait_error == "TimeoutError"
+
+
+def test_greenhouse_email_challenge_uses_fresh_eight_digit_code_and_retries_submit():
+    class Request:
+        method = "POST"
+
+    class Response:
+        request = Request()
+        url = "https://boards.greenhouse.io/alpaca/jobs/123"
+        status = 200
+
+        def header_value(self, name):
+            return "request-456" if name == "x-request-id" else None
+
+        def json(self):
+            return {}
+
+    class ExpectedResponse:
+        value = Response()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class ChallengePage(FakePage):
+        def wait_for_selector(self, selector, *, state, timeout):
+            self.calls.append(("wait", selector, state, timeout))
+
+        def expect_response(self, predicate, *, timeout):
+            assert predicate(Response())
+            return ExpectedResponse()
+
+    page = ChallengePage()
+    report = SubmitReport(
+        dry_run=False,
+        submitted=True,
+        response_status=428,
+        response_code="captcha-failed",
+    )
+
+    completed = _complete_greenhouse_email_challenge(
+        page,
+        board="alpaca",
+        company_name="Alpaca",
+        expected_submit_url="https://boards.greenhouse.io/alpaca/jobs/123",
+        report=report,
+        code_fn=lambda **kwargs: "12345678",
+    )
+
+    assert completed is True
+    assert [(call[1], call[2]) for call in page.calls if call[0] == "fill"] == [
+        (f"#security-input-{index}", digit) for index, digit in enumerate("12345678")
+    ]
+    assert page.calls.count(("click", "button[type='submit']")) == 1
+    assert report.challenge_response_status == 428
+    assert report.challenge_response_code == "captcha-failed"
+    assert report.response_status == 200
+    assert report.response_request_id == "request-456"
+    assert report.security_code_used is True
+
+
+def test_execute_form_checkpoints_immediately_before_submit():
+    page = FakePage()
+
+    def checkpoint():
+        page.calls.append(("checkpoint",))
+
+    execute_form(
+        plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+        page,
+        dry_run=False,
+        before_submit=checkpoint,
+    )
+
+    assert page.calls[-2:] == [("checkpoint",), ("click", "button[type='submit']")]
+
+
+def test_execute_form_checkpoint_failure_prevents_submit():
+    page = FakePage()
+
+    def checkpoint():
+        raise RuntimeError("checkpoint unavailable")
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        execute_form(
+            plan_form_actions(_ready_plan(), QUESTIONS, resume_path="/r.pdf"),
+            page,
+            dry_run=False,
+            before_submit=checkpoint,
+        )
+
+    assert ("click", "button[type='submit']") not in page.calls
+
+
+def test_execute_form_blocks_invalid_required_controls_before_checkpoint():
+    class InvalidControls:
+        def evaluate_all(self, expression):
+            return ["Location (City)", "Gender"]
+
+    class InvalidForm:
+        def count(self):
+            return 1
+
+        def evaluate(self, expression):
+            return False
+
+        def locator(self, selector):
+            assert selector == ":invalid"
+            return InvalidControls()
+
+    class InvalidPage(FakePage):
+        def locator(self, selector):
+            assert selector == "form"
+            return InvalidForm()
+
+    page = InvalidPage()
+    checkpoints = []
+
+    with pytest.raises(RequiredFormFieldsError) as raised:
+        execute_form(
+            [
+                type("Action", (), {"kind": "fill", "selector": "#first_name", "value": "J"})(),
+                type("Action", (), {"kind": "submit", "selector": "button[type='submit']"})(),
+            ],
+            page,
+            dry_run=False,
+            before_submit=lambda: checkpoints.append(True),
+        )
+
+    assert raised.value.fields == ["Location (City)", "Gender"]
+    assert checkpoints == []
+    assert ("click", "button[type='submit']") not in page.calls
 
 
 # --- decide_route (the "both 1 and 2" glue) --------------------------------
@@ -140,7 +571,8 @@ _UNREADY_QS = _READY_QS + [
     {"required": True, "label": "Favorite color?",
      "fields": [{"name": "q_c", "type": "multi_value_single_select", "values": [{"label": "Red", "value": 1}]}]},
 ]
-_PROFILE = {"personal": {"full_name": "Jordan Rivera", "email": "j@x.com", "phone": "5551234567"},
+_PROFILE = {"personal": {"full_name": "Jordan Rivera", "email": "j@x.com",
+                         "phone": "5551234567", "country": "USA"},
             "work_authorization": {}}
 _RESUME = "Quant developer, Python, supported a $300M book."
 
@@ -171,7 +603,23 @@ def test_apply_greenhouse_deterministic_path_is_dry_run_by_default():
     assert res["report"].submitted is False
     assert res["report"].skipped_submit is True
     assert ("fill", "#first_name", "Jordan") in page.calls
-    assert ("click", "#submit_app") not in page.calls
+    assert ("click", "button[type='submit']") not in page.calls
+
+
+def test_apply_greenhouse_result_includes_route_for_deterministic_dry_run():
+    page = FakePage()
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE,
+        resume_text=_RESUME,
+        resume_path="/r.pdf",
+        page=page,
+        fetch=lambda u: {"questions": _READY_QS},
+        answer_fn=_good,
+    )
+
+    assert res["route"] == "deterministic"
+    assert res["ready"] is True
 
 
 def test_apply_greenhouse_falls_back_to_agent_and_never_touches_the_form():
@@ -260,20 +708,90 @@ def test_apply_greenhouse_owns_submit_and_reports_applied_on_confirmation():
         fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
     )
     assert res["report"].submitted is True
-    assert ("click", "#submit_app") in page.calls
+    assert ("click", "button[type='submit']") in page.calls
     assert res["status"] == "applied"
 
 
-def test_apply_greenhouse_reports_no_confirmation_when_success_not_seen():
+def test_apply_greenhouse_waits_for_async_confirmation_before_verifying():
+    class DelayedConfirmationPage(FakePage):
+        def wait_for_function(self, expression, *, timeout):
+            self.calls.append(("wait_for_function", timeout))
+            self.url = "https://job-boards.greenhouse.io/acme/jobs/123/confirmation"
+            self.set_content("Thank you for applying. Your application has been received.")
+
+    page = DelayedConfirmationPage()
+    page.set_content("<form>Application form</form>")
+
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
+    )
+
+    assert ("wait_for_function", 15_000) in page.calls
+    assert res["status"] == "applied"
+    assert res["verification_status"] == "verified"
+
+
+def test_apply_greenhouse_quarantines_when_success_not_seen_after_submit():
     page = FakePage()
-    page.set_content("<form>Please correct the errors below.</form>")
+    page.set_content("<form>Application form</form>")
     res = apply_greenhouse(
         "https://boards.greenhouse.io/acme/jobs/123",
         profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
         fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
     )
     assert res["report"].submitted is True
-    assert res["status"] == "failed:no_confirmation"
+    assert res["status"] == "crash_unconfirmed"
+    assert res["verification_status"] == "unverified"
+
+
+def test_apply_greenhouse_creates_prepared_context_only_for_ready_live_submit():
+    page = FakePage()
+    page.set_content("Your application has been submitted. Thanks for applying!")
+    calls = []
+
+    def on_plan_ready(plan, actions):
+        calls.append(("prepared", plan.ready, len(actions)))
+        return "attempt-1"
+
+    def before_submit(context):
+        calls.append(("submit_started", context))
+
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE,
+        resume_text=_RESUME,
+        resume_path="/r.pdf",
+        page=page,
+        fetch=lambda u: {"questions": _READY_QS},
+        answer_fn=_good,
+        dry_run=False,
+        on_plan_ready=on_plan_ready,
+        before_submit=before_submit,
+    )
+
+    assert calls[0][0] == "prepared"
+    assert calls[1] == ("submit_started", "attempt-1")
+    assert res["attempt_context"] == "attempt-1"
+
+
+def test_unready_greenhouse_plan_creates_no_attempt_context():
+    calls = []
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE,
+        resume_text=_RESUME,
+        resume_path="/r.pdf",
+        page=FakePage(),
+        fetch=lambda u: {"questions": _UNREADY_QS},
+        answer_fn=_good,
+        dry_run=False,
+        on_plan_ready=lambda *args: calls.append(args),
+    )
+
+    assert res["route"] == "agent_fallback"
+    assert calls == []
 
 
 def test_apply_greenhouse_owns_ambiguous_result_when_click_raises_after_dispatch():
@@ -355,12 +873,20 @@ def test_launcher_does_not_release_agent_fallback_when_page_close_fails_after_su
     import playwright.sync_api
     monkeypatch.setattr(playwright.sync_api, "sync_playwright", lambda: PlaywrightContext())
 
+    class AttemptStore:
+        def create_prepared(self, **_kwargs):
+            return "attempt-1"
+
+        def transition(self, *_args, **_kwargs):
+            return None
+
     result = launcher._maybe_greenhouse_apply(
         {"url": "https://boards.greenhouse.io/acme/jobs/123"},
         9222,
         dry_run=False,
         resume_text="",
         resume_path=None,
+        attempt_store=AttemptStore(),
     )
     assert result is not None
     assert result[0] == "failed:no_confirmation"

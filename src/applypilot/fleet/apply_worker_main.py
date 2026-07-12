@@ -178,15 +178,23 @@ def _browser_tool_retryable(status: str | None) -> bool:
     return reason in _BROWSER_TOOL_RETRY_REASONS
 
 
-def _prearmed_auth_retryable(status: str | None) -> bool:
+def _prearmed_auth_retryable(status: str | None, stats: dict | None) -> bool:
     normalized = (status or "").strip().lower()
-    return (
-        normalized == "expired"
-        or normalized == "timeout"
+    retryable_status = (
+        _browser_tool_retryable(status)
         or normalized.startswith("failed:no_result")
         or normalized.startswith("failed:timeout")
         or normalized.startswith("failed:browser_")
-        or normalized.startswith("crash_unconfirmed")
+    )
+    evidence = stats or {}
+    try:
+        application_tool_calls = int(evidence.get("application_tool_calls") or 0)
+    except (TypeError, ValueError):
+        application_tool_calls = 0
+    return (
+        retryable_status
+        and application_tool_calls == 0
+        and evidence.get("safe_requeue") is True
     )
 
 
@@ -212,6 +220,34 @@ def _assisted_retry_is_terminal(status: str | None) -> bool:
 
 def _should_launch_chrome_headless() -> bool:
     return platform.system() == "Linux" and not bool(os.environ.get("DISPLAY"))
+
+
+class PgAttemptStore:
+    """Bind the durable attempt ledger to one held canonical queue lease."""
+
+    def __init__(self, conn, job: dict, *, worker_id: str):
+        self.conn = conn
+        self.job = job
+        self.worker_id = worker_id
+
+    def create_prepared(self, *, route, route_version, evidence=None):
+        from applypilot.fleet import apply_attempts
+
+        return apply_attempts.create_prepared(
+            self.conn,
+            queue_name="apply_queue",
+            url=self.job["url"],
+            dedup_key=self.job.get("dedup_key"),
+            worker_id=self.worker_id,
+            route=route,
+            route_version=route_version,
+            evidence=evidence,
+        )
+
+    def transition(self, attempt_id, **kwargs):
+        from applypilot.fleet import apply_attempts
+
+        return apply_attempts.transition(self.conn, attempt_id, **kwargs)
 
 
 def make_apply_fn(
@@ -240,7 +276,7 @@ def make_apply_fn(
     from applypilot.apply.container_worker import _real_cost
     agent_model = launcher.effective_agent_model_label(agent, model)
 
-    def apply_fn(job: dict) -> dict:
+    def apply_fn(job: dict, *, attempt_store=None) -> dict:
         # `slot` keys this worker's Chrome profile + CDP port + per-run logs, so multiple
         # workers on ONE machine (distinct slots) never collide in a shared browser.
         worker_id = slot
@@ -313,11 +349,18 @@ def make_apply_fn(
                 if launcher._should_prearm_inbox_auth(job)
                 else None
             )
-            status, _dur = launcher.run_job(job, port, worker_id, model=model, agent=agent)
+            run_kwargs = {"model": model, "agent": agent}
+            if attempt_store is not None:
+                run_kwargs["attempt_store"] = attempt_store
+            status, _dur = launcher.run_job(job, port, worker_id, **run_kwargs)
+            first_stats = dict(
+                (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
+            )
+            attempt_statuses = [status]
+            attempt_stats = [first_stats]
             if prearmed_request_id is not None and (
                 launcher._is_auth_required_result(status)
-                or _browser_tool_retryable(status)
-                or _prearmed_auth_retryable(status)
+                or _prearmed_auth_retryable(status, first_stats)
             ):
                 total_timeout = max(
                     0,
@@ -344,22 +387,44 @@ def make_apply_fn(
                     assisted_hint_kind = (
                         "magic_link" if inbox_hint.startswith("magic_link=") else "code"
                     )
+                    retry_kwargs = dict(run_kwargs)
+                    retry_kwargs["inbox_auth_hint"] = inbox_hint
                     status, _dur = launcher.run_job(
-                        job,
-                        port,
-                        worker_id,
-                        model=model,
-                        agent=agent,
-                        inbox_auth_hint=inbox_hint,
+                        job, port, worker_id, **retry_kwargs
                     )
-            stats = (getattr(launcher, "_last_run_stats", {}) or {}).get(worker_id, {})
+                    attempt_statuses.append(status)
+                    attempt_stats.append(
+                        dict(
+                            (getattr(launcher, "_last_run_stats", {}) or {}).get(
+                                worker_id,
+                                {},
+                            )
+                        )
+                    )
+            stats = attempt_stats[-1]
+
+            def _sum_int(field: str) -> int:
+                total = 0
+                for item in attempt_stats:
+                    try:
+                        total += int(item.get(field) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                return total
+
+            attempt_costs = [_real_cost(item, model) for item in attempt_stats]
+            total_cost = round(sum(attempt_costs), 4)
             # agent flows to write_apply_result -> llm_usage.provider for per-agent spend.
             out = {
                 "run_status": status,
-                "est_cost_usd": _real_cost(stats, model),
+                "est_cost_usd": total_cost,
                 "agent": agent,
                 "agent_model": agent_model,
-                "application_tool_calls": stats.get("application_tool_calls"),
+                "route": stats.get("route") or "agent",
+                "failure_class": stats.get("failure_class"),
+                "tool_calls_total": _sum_int("tool_calls_total"),
+                "application_tool_calls": _sum_int("application_tool_calls"),
+                "last_tool": stats.get("last_tool"),
                 "job_log_path": stats.get("job_log_path") or stats.get("job_log"),
                 "transcript_digest": stats.get("transcript_digest"),
                 "final_result_source": stats.get("final_result_source"),
@@ -372,6 +437,29 @@ def make_apply_fn(
                 ),
             }
             result_metadata = dict(out.get("result_metadata") or {})
+            result_metadata.update({
+                "unmapped_required": stats.get("unmapped_required"),
+                "unmapped_required_count": stats.get("unmapped_required_count"),
+                "attempt_id": stats.get("attempt_id"),
+                "route_version": stats.get("route_version"),
+                "adapter_version": stats.get("adapter_version"),
+                "submit_checkpoint_state": stats.get("submit_checkpoint_state"),
+                "verification_status": stats.get("verification_status"),
+                "verification_method": stats.get("verification_method"),
+                "verification_ref": stats.get("verification_ref"),
+                "submission_diagnostics": stats.get("submission_diagnostics"),
+                "safe_requeue": stats.get("safe_requeue"),
+                "worker_level_failure": stats.get("worker_level_failure"),
+                "adapter_name": stats.get("adapter_name"),
+                "adapter_plan_ready": stats.get("adapter_plan_ready"),
+                "attempt_count": len(attempt_stats),
+                "prior_attempt_status": (
+                    attempt_statuses[0] if len(attempt_statuses) > 1 else None
+                ),
+                "prior_attempt_cost_usd": (
+                    attempt_costs[0] if len(attempt_costs) > 1 else None
+                ),
+            })
             result_metadata["inbox_auth"] = {
                 "prearmed": prearmed_request_id is not None,
                 "assisted_retry_count": assisted_retry_count,
@@ -499,14 +587,18 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
 
     enforce_no_lifecycle_faults()
-    from applypilot.apply import launcher, pgqueue
+    from applypilot.apply import launcher, liveness, pgqueue
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)
     loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot, fleet_worker_id=worker_id),
                       machine_owner=machine_owner,
-                      log_tail_fn=make_log_tail_fn(slot))
+                      log_tail_fn=make_log_tail_fn(slot),
+                      preflight_fn=liveness.probe_url,
+                      attempt_store_factory=lambda conn, job: PgAttemptStore(
+                          conn, job, worker_id=worker_id
+                      ))
     loop.current_agent = agent
     loop.current_model = launcher.effective_agent_model_label(agent, model)
     return loop
@@ -796,7 +888,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     from applypilot.fleet.agent_switch import AgentSwitcher
     from applypilot.fleet import schema as fleet_schema
     with pgqueue.connect(args.dsn) as schema_conn:
-        fleet_schema.ensure_schema_v3(schema_conn)
+        try:
+            fleet_schema.require_apply_result_event_schema(schema_conn)
+            fleet_schema.require_apply_attempt_schema(schema_conn)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
     loop = build_apply_loop(dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
                             model=args.model, agent=args.agent, machine_owner=args.machine_owner,
                             slot=slot)

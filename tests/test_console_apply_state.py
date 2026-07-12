@@ -158,8 +158,8 @@ def test_apply_state_reflects_spend_cap_reached(fleet_db, monkeypatch) -> None:
         )
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE apply_queue SET est_cost_usd=%s WHERE url=%s",
-                (4.5, "https://boards.greenhouse.io/acme/jobs/4"),
+                "UPDATE apply_queue SET est_cost_usd=%s, cumulative_cost_usd=%s WHERE url=%s",
+                (4.5, 4.5, "https://boards.greenhouse.io/acme/jobs/4"),
             )
             cur.execute("UPDATE fleet_config SET spend_cap_usd=3, canary_enabled=FALSE WHERE id=1")
         conn.commit()

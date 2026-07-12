@@ -188,7 +188,7 @@ _HALT_SQL = """
 SELECT
     fc.paused
     OR (fc.spend_cap_usd > 0
-        AND COALESCE((SELECT SUM(est_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
+        AND COALESCE((SELECT SUM(cumulative_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
         AS should_halt
 FROM fleet_config fc
 WHERE fc.id = 1;
@@ -196,7 +196,7 @@ WHERE fc.id = 1;
 
 
 def should_halt(conn: psycopg.Connection) -> bool:
-    """True if the fleet must stop leasing: globally paused OR SUM(est_cost_usd) >= cap.
+    """True if the fleet must stop leasing: globally paused OR cumulative spend >= cap.
     A soft pre-lease gate (spec S6) -- up to ~N in-flight jobs may overshoot, which is fine
     against the POC budget.
 
@@ -238,7 +238,7 @@ SELECT
     fc.paused
     OR COALESCE(fc.ats_paused, FALSE)
     OR (fc.spend_cap_usd > 0
-        AND COALESCE((SELECT SUM(est_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
+        AND COALESCE((SELECT SUM(cumulative_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
         AS should_halt
 FROM fleet_config fc
 WHERE fc.id = 1;
@@ -299,6 +299,7 @@ SET status                  = %(status)s::apply_queue_status,
     verification_confidence = %(verification_confidence)s,
     agent_model             = %(agent_model)s,
     est_cost_usd            = %(est_cost_usd)s,
+    cumulative_cost_usd     = COALESCE(cumulative_cost_usd, 0) + %(est_cost_usd)s,
     applied_at              = CASE WHEN %(status)s = 'applied' THEN now() ELSE applied_at END,
     worker_id               = %(worker)s,
     apply_duration_ms       = %(apply_duration_ms)s,
@@ -473,8 +474,8 @@ SELECT
     COUNT(*) FILTER (WHERE status='crash_unconfirmed')                                    AS crash_unconfirmed,
     ROUND(100.0 * COUNT(*) FILTER (WHERE status='applied')
           / NULLIF(COUNT(*) FILTER (WHERE status IN ('applied','failed','blocked','crash_unconfirmed')),0), 1) AS success_pct,
-    COALESCE(SUM(est_cost_usd),0)                                                          AS total_cost,
-    ROUND(COALESCE(SUM(est_cost_usd),0)
+    COALESCE(SUM(cumulative_cost_usd),0)                                                   AS total_cost,
+    ROUND(COALESCE(SUM(cumulative_cost_usd),0)
           / NULLIF(COUNT(*) FILTER (WHERE status='applied'),0), 4)                         AS cost_per_apply
 FROM apply_queue
 {group};

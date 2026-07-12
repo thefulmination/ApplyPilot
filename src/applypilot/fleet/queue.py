@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from psycopg.errors import DeadlockDetected
 from psycopg.types.json import Jsonb
 
+from psycopg.types.json import Jsonb
+
 from applypilot import config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
@@ -167,7 +169,7 @@ WITH cfg AS (SELECT ats_apply_mode, canary_enabled, canary_remaining, paused, at
               )
          )
          AND (COALESCE(cfg.spend_cap_usd, 0) <= 0
-              OR (SELECT COALESCE(SUM(est_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
+              OR (SELECT COALESCE(SUM(cumulative_cost_usd), 0) FROM apply_queue) < cfg.spend_cap_usd)
          AND (glob.count_24h IS NULL OR glob.count_24h < glob.daily_cap)
          AND COALESCE(home.breaker_state, 'ok') != 'demoted'
          AND COALESCE(NOT (home.breaker_state = 'paused' AND COALESCE(home.breaker_until, 'infinity'::timestamptz) >= now()), TRUE)
@@ -179,6 +181,11 @@ WITH cfg AS (SELECT ats_apply_mode, canary_enabled, canary_remaining, paused, at
          -- NOT an approved_batch=NULL un-approve -- so vetted owner approval is preserved and
          -- the skip auto-reverts at its TTL exactly like the breaker's breaker_until.
          AND COALESCE(g.doctor_skip_until, '-infinity'::timestamptz) < now()
+         AND NOT EXISTS (
+           SELECT 1 FROM apply_attempts aa
+           WHERE aa.dedup_key = q.dedup_key
+             AND aa.state IN ('submit_started', 'submitted_unverified')
+         )
          AND NOT (
            LOWER(TRIM(COALESCE(q.company,''))) = ANY(%(blocked_names)s)
            OR q.url ILIKE ANY(%(blocked_pats)s)
@@ -504,7 +511,9 @@ def resolve_superseded_challenges(cur, url, *, terminal_status, queue_name) -> i
 def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                         apply_status=None, apply_error=None, est_cost_usd=0, outcome=None,
                         agent=None, agent_model=None, apply_duration_ms=None, machine_owner=None,
-                        application_tool_calls=None, job_log_path=None, transcript_digest=None,
+                        route=None, failure_class=None, tool_calls_total=None,
+                        application_tool_calls=None, last_tool=None, host_policy=None,
+                        job_log_path=None, transcript_digest=None,
                         final_result_source=None, result_metadata=None):
     """Close the apply (lease-owner guarded), record the governor outcome on
     global+host+home_ip (bump cap on a confirmed apply), and UPSERT applied_set
@@ -525,12 +534,14 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
              if status == "applied" else ", last_attempt_at = now()")
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
+            "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, "
+            "est_cost_usd=COALESCE(%s,0), "
+            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+COALESCE(%s,0), "
             "agent_model=%s, apply_duration_ms=%s, "
             "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s",
+            "WHERE url=%s AND lease_owner=%s RETURNING host_policy",
             (
-                status, apply_status, apply_error, est_cost_usd,
+                status, apply_status, apply_error, est_cost_usd, est_cost_usd,
                 agent_model, apply_duration_ms,
                 status, worker_id, url, worker_id,
             ),
@@ -538,6 +549,7 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         if cur.rowcount == 0:
             conn.rollback()
             return False
+        queue_host_policy = cur.fetchone()["host_policy"]
         resolve_superseded_challenges(
             cur, url, terminal_status=status, queue_name="apply_queue"
         )
@@ -559,9 +571,10 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
         cur.execute(
             "INSERT INTO apply_result_events ("
             "queue_name, url, worker_id, machine_owner, status, apply_status, apply_error, target_host, home_ip, "
-            "agent, agent_model, est_cost_usd, apply_duration_ms, application_tool_calls, "
-            "job_log_path, transcript_digest, final_result_source, result_metadata, result_line, source"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s)",
+            "agent, agent_model, est_cost_usd, apply_duration_ms, route, failure_class, tool_calls_total, "
+            "application_tool_calls, last_tool, host_policy, job_log_path, transcript_digest, "
+            "final_result_source, result_metadata, result_line, source"
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 "apply_queue",
                 url,
@@ -576,7 +589,12 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 agent_model,
                 est_cost_usd,
                 apply_duration_ms,
+                route,
+                failure_class,
+                tool_calls_total,
                 application_tool_calls,
+                last_tool,
+                host_policy if host_policy is not None else queue_host_policy,
                 job_log_path,
                 transcript_digest,
                 final_result_source,
@@ -599,6 +617,70 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                 (worker_id, machine_owner, "apply_agent", agent_model, agent, est_cost_usd),
             )
     conn.commit()
+    return True
+
+
+def record_apply_challenge_event(
+    conn,
+    worker_id,
+    url,
+    *,
+    kind,
+    target_host,
+    home_ip,
+    est_cost_usd=0,
+    agent=None,
+    agent_model=None,
+    apply_duration_ms=None,
+    route=None,
+    failure_class=None,
+    tool_calls_total=None,
+    application_tool_calls=None,
+    last_tool=None,
+    result_metadata=None,
+    job_log_path=None,
+    transcript_digest=None,
+    final_result_source=None,
+    commit=True,
+):
+    """Persist nonterminal challenge spend without closing the held lease."""
+    cost = float(est_cost_usd or 0)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE apply_queue SET est_cost_usd=COALESCE(est_cost_usd,0)+%s, "
+            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+%s, "
+            "agent_model=COALESCE(%s,agent_model), worker_id=%s, updated_at=now() "
+            "WHERE url=%s AND lease_owner=%s AND status='leased'",
+            (cost, cost, agent_model, worker_id, url, worker_id),
+        )
+        if cur.rowcount == 0:
+            if commit:
+                conn.rollback()
+            return False
+        cur.execute(
+            "INSERT INTO apply_result_events ("
+            "queue_name,url,worker_id,status,apply_status,apply_error,target_host,home_ip,"
+            "agent,agent_model,est_cost_usd,apply_duration_ms,result_line,source,route,"
+            "failure_class,tool_calls_total,application_tool_calls,last_tool,result_metadata,"
+            "job_log_path,transcript_digest,final_result_source"
+            ") VALUES ("
+            "%s,%s,%s,'challenge_pending','challenge_pending',%s,%s,%s,%s,%s,%s,%s,"
+            "'RESULT:challenge_pending','worker',%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                "apply_queue", url, worker_id, f"challenge:{kind}", target_host, home_ip,
+                agent, agent_model, cost, apply_duration_ms, route, failure_class,
+                tool_calls_total, application_tool_calls, last_tool,
+                Jsonb(result_metadata or {}) if result_metadata is not None else None,
+                job_log_path, transcript_digest, final_result_source,
+            ),
+        )
+        if cost > 0:
+            cur.execute(
+                "INSERT INTO llm_usage (worker_id,task,provider,cost_usd) VALUES (%s,%s,%s,%s)",
+                (worker_id, "apply_agent", agent, cost),
+            )
+    if commit:
+        conn.commit()
     return True
 
 

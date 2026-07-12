@@ -135,7 +135,7 @@ def _print_status(conn) -> None:
             "linkedin_policy_version FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone()
-        cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM linkedin_queue")
+        cur.execute("SELECT COALESCE(SUM(cumulative_cost_usd),0) AS s FROM linkedin_queue")
         spend = float(cur.fetchone()["s"])
         cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
         halt_row = cur.fetchone()

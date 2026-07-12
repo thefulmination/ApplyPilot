@@ -11,6 +11,50 @@ from applypilot.apply import pgqueue
 _SCHEMA_V3_SQL = Path(__file__).with_name("schema_v3.sql")
 _SCHEMA_LOCK_KEY = "applypilot:schema:v3"
 
+_APPLY_RESULT_EVENT_REQUIRED_COLUMNS = frozenset({
+    "queue_name",
+    "url",
+    "worker_id",
+    "status",
+    "apply_status",
+    "apply_error",
+    "target_host",
+    "home_ip",
+    "agent",
+    "agent_model",
+    "est_cost_usd",
+    "apply_duration_ms",
+    "result_line",
+    "source",
+    "route",
+    "failure_class",
+    "tool_calls_total",
+    "application_tool_calls",
+    "last_tool",
+    "host_policy",
+    "result_metadata",
+    "job_log_path",
+    "transcript_digest",
+    "final_result_source",
+})
+_APPLY_ATTEMPT_REQUIRED_COLUMNS = frozenset({
+    "attempt_id",
+    "queue_name",
+    "url",
+    "dedup_key",
+    "worker_id",
+    "route",
+    "route_version",
+    "state",
+    "submit_started_at",
+    "finalized_at",
+    "verification_method",
+    "verification_ref",
+    "evidence",
+    "created_at",
+})
+_APPLY_QUEUE_COST_REQUIRED_COLUMNS = frozenset({"cumulative_cost_usd"})
+
 
 def _nonnegative_timeout(value, default: float = 30.0) -> float:
     try:
@@ -191,3 +235,59 @@ def ensure_schema_v3(conn, *, lock_timeout_seconds: float = _SCHEMA_LOCK_TIMEOUT
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (_SCHEMA_LOCK_KEY,))
         conn.commit()
+
+
+def _table_columns(conn, table_name: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name=%s",
+            (table_name,),
+        )
+        columns = {
+            row["column_name"] if hasattr(row, "get") else row[0]
+            for row in cur.fetchall()
+        }
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    return columns
+
+
+def require_apply_result_event_schema(conn) -> None:
+    """Fail closed when a worker cannot persist complete result evidence."""
+    missing = sorted(
+        _APPLY_RESULT_EVENT_REQUIRED_COLUMNS - _table_columns(conn, "apply_result_events")
+    )
+    if missing:
+        raise RuntimeError(
+            "fleet schema is missing apply_result_events columns: "
+            + ", ".join(missing)
+            + "; run applypilot-fleet-apply-home with the owner/home DSN once to migrate "
+            "before starting remote apply workers"
+        )
+    missing_queue = sorted(
+        _APPLY_QUEUE_COST_REQUIRED_COLUMNS - _table_columns(conn, "apply_queue")
+    )
+    if missing_queue:
+        raise RuntimeError(
+            "fleet schema is missing apply_queue columns: "
+            + ", ".join(missing_queue)
+            + "; run applypilot-fleet-apply-home with the owner/home DSN once to migrate "
+            "before starting remote apply workers"
+        )
+
+
+def require_apply_attempt_schema(conn) -> None:
+    """Fail closed before adapter submit ownership when its ledger is incomplete."""
+    missing = sorted(
+        _APPLY_ATTEMPT_REQUIRED_COLUMNS - _table_columns(conn, "apply_attempts")
+    )
+    if missing:
+        raise RuntimeError(
+            "fleet schema is missing apply_attempts columns: "
+            + ", ".join(missing)
+            + "; run applypilot-fleet-apply-home with the owner/home DSN once before "
+            "enabling APPLYPILOT_GREENHOUSE_ADAPTER_SUBMIT"
+        )

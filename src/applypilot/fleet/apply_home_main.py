@@ -15,7 +15,7 @@ import uuid
 
 from applypilot import config
 from applypilot.apply import pgqueue
-from applypilot.fleet import queue, queue_diagnosis, sync
+from applypilot.fleet import queue, queue_diagnosis, schema as fleet_schema, sync
 
 logger = logging.getLogger("applypilot.fleet.apply_home_main")
 

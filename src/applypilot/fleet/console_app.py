@@ -746,7 +746,7 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
     base_leasable is the approved queued pool before global stop gates.
     leasable is the operator-facing effective count after pause, ATS pause,
     spend cap, and canary exhaustion are applied.
-    spent_usd = SUM(est_cost_usd) over apply_queue (same SUM the cap halt uses)."""
+    spent_usd = SUM(cumulative_cost_usd) over apply_queue (same SUM the cap halt uses)."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT paused, ats_paused, ats_pause_source, ats_apply_mode, "
@@ -755,7 +755,7 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
         )
         cfg = cur.fetchone() or {}
 
-        cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM apply_queue")
+        cur.execute("SELECT COALESCE(SUM(cumulative_cost_usd),0) AS s FROM apply_queue")
         spent = float(cur.fetchone()["s"])
 
         cur.execute("SELECT status, COUNT(*) AS n FROM apply_queue GROUP BY status")

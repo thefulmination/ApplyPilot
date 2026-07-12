@@ -112,7 +112,7 @@ def test_prearm_request_ttl_uses_effective_agent_timeout_override(monkeypatch):
     assert seen["ttl_seconds"] >= 1020
 
 
-def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypatch):
+def test_prearm_uses_auth_and_prearm_domains_not_generic_path_patterns(monkeypatch):
     monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "1")
     monkeypatch.setenv("APPLYPILOT_INBOX_AUTH_MODE", "relay")
 
@@ -120,9 +120,21 @@ def test_prearm_only_uses_auth_gated_domains_not_generic_path_patterns(monkeypat
         "url": "https://indeed.com/viewjob?jk=1",
         "application_url": "https://fa-ewji-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions/preview/83866",
     })
+    assert launcher._should_prearm_inbox_auth({
+        "url": "https://boards.greenhouse.io/acme/jobs/1",
+        "application_url": "https://boards.greenhouse.io/acme/jobs/1",
+    })
     assert not launcher._should_prearm_inbox_auth({
         "url": "https://remotejobs.org/remote-jobs/account-manager-readymode",
         "application_url": "https://remotejobs.org/remote-jobs/account-manager-readymode",
+    })
+    assert not launcher._should_prearm_inbox_auth({
+        "url": "https://evilgreenhouse.io/jobs/1",
+        "application_url": "https://evilgreenhouse.io/jobs/1",
+    })
+    assert not launcher._should_prearm_inbox_auth({
+        "url": "https://example.test/jobs/1?next=boards.greenhouse.io",
+        "application_url": "https://example.test/jobs/1?next=boards.greenhouse.io",
     })
 
 

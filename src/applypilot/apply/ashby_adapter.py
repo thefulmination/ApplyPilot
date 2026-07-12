@@ -1,12 +1,35 @@
-"""Deterministic Ashby application-form adapter."""
+"""Deterministic Ashby form discovery, planning, and browser actions."""
+
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import dataclass
-from urllib.parse import urlparse
+import urllib.parse
 
-from bs4 import BeautifulSoup
+from applypilot.apply.greenhouse_adapter import AnswerPlan, _DEMOGRAPHIC, _has
+from applypilot.apply.greenhouse_submit import FormAction, RequiredFormFieldsError
+
+
+_DISCOVERY_JS = r"""() => [...document.querySelectorAll(
+  '.ashby-application-form-field-entry[data-field-path]'
+)].map(entry => {
+  const path = entry.getAttribute('data-field-path') || '';
+  const label = (entry.querySelector('label')?.innerText || '').trim();
+  const control = entry.querySelector('input, textarea, select');
+  let type = control?.type || control?.tagName?.toLowerCase() || '';
+  if (path === '_systemfield_location') type = 'location';
+  else if (control?.type === 'checkbox' && entry.querySelectorAll('button').length >= 2) {
+    type = 'boolean';
+  } else if (control?.tagName === 'TEXTAREA') type = 'textarea';
+  else if (control?.tagName === 'SELECT') type = 'select';
+  return {
+    path, label, type,
+    required: !!control?.required || !!entry.querySelector('label[class*="required"]'),
+    options: control?.tagName === 'SELECT'
+      ? [...control.options].filter(option => option.value).map(option => ({
+          label: (option.text || '').trim(), value: option.value,
+        })) : [],
+  };
+}).filter(field => field.path && field.label)"""
 
 
 def _flag(name: str) -> bool:
@@ -23,181 +46,192 @@ def submit_enabled() -> bool:
 
 def parse_ashby_url(url: str) -> tuple[str, str] | None:
     try:
-        parsed = urlparse(url)
+        parsed = urllib.parse.urlparse(url)
     except (TypeError, ValueError):
         return None
     if (parsed.hostname or "").lower() != "jobs.ashbyhq.com":
         return None
-    parts = [part for part in parsed.path.split("/") if part]
+    parts = [part for part in parsed.path.split("/") if part and part != "application"]
     if len(parts) < 2:
         return None
     return parts[0], parts[1]
 
 
-@dataclass(frozen=True)
-class AshbyField:
-    title: str
-    path: str
-    kind: str
-    required: bool
-    options: tuple[str, ...] = ()
+def discover_fields(page) -> list[dict]:
+    return list(page.evaluate(_DISCOVERY_JS) or [])
 
 
-@dataclass(frozen=True)
-class AshbyAnswerPlan:
-    fields: tuple[AshbyField, ...]
-    values: dict[str, object]
-    resume_field: str | None
-    unmapped_required: list[str]
-    ready: bool
+def _location(personal: dict) -> str | None:
+    city = str(personal.get("city") or "").strip()
+    state = str(personal.get("province_state") or "").strip()
+    country = str(personal.get("country") or "").strip()
+    if country.lower() in {"us", "usa", "united states of america"}:
+        country = "United States"
+    return ", ".join(value for value in (city, state, country) if value) or None
 
 
-def extract_form_definition(html: str) -> list[AshbyField]:
-    script = next(
-        (node.string or node.get_text() for node in BeautifulSoup(html or "", "html.parser").find_all("script")
-         if "window.__appData" in (node.string or node.get_text() or "")),
-        None,
-    )
-    if not script:
-        return []
-    marker = script.index("window.__appData")
-    start = script.index("{", marker)
-    data, _ = json.JSONDecoder().raw_decode(script[start:])
-    definition = data["posting"]["applicationForm"]["formDefinition"]
-    result: list[AshbyField] = []
-    for section in definition.get("sections") or []:
-        for entry in section.get("fields") or []:
-            field = entry.get("field") or {}
-            title, path, kind = field.get("title"), field.get("path"), field.get("type")
-            if not title or not path or not kind:
-                continue
-            raw_options = field.get("selectableValues") or field.get("values") or []
-            options = tuple(str(option.get("label")) for option in raw_options if option.get("label"))
-            result.append(AshbyField(title, path, kind, bool(entry.get("isRequired")), options))
-    return result
+def build_ashby_plan(fields, *, profile, resume_text, corpus=None, answer_fn=None, job=None):
+    if answer_fn is None:
+        from applypilot.apply.answerer import answer_question
+        answer_fn = answer_question
 
-
-def _bool(value) -> bool | None:
-    normalized = str(value).strip().lower()
-    if normalized in {"true", "yes", "y", "1"}: return True
-    if normalized in {"false", "no", "n", "0"}: return False
-    return None
-
-
-def _select(options: tuple[str, ...], wanted: bool) -> str | None:
-    prefix = "yes" if wanted else "no"
-    return next((option for option in options if option.strip().lower().startswith(prefix)), None)
-
-
-def build_answer_plan(fields, *, profile, resume_text, answer_fn=None, job=None, budget=None) -> AshbyAnswerPlan:
-    default_answerer = answer_fn is None
-    if default_answerer:
-        from applypilot.apply.answerer import answer_question_bounded
-        answer_fn = answer_question_bounded
-        from applypilot.apply.phase_budget import PhaseBudgetManager
-        budget = budget or PhaseBudgetManager()
-    personal = (profile or {}).get("personal", {})
-    auth = (profile or {}).get("work_authorization", {})
-    values: dict[str, object] = {}
-    unmapped: list[str] = []
+    personal = (profile or {}).get("personal") or {}
+    work_auth = (profile or {}).get("work_authorization") or {}
+    compensation = (profile or {}).get("compensation") or {}
+    mapped: dict = {}
+    free_text: dict = {}
     resume_field = None
+    unmapped: list[str] = []
 
-    for field in fields:
-        low = field.title.lower()
+    for field in fields or []:
+        path = str(field.get("path") or "")
+        label = str(field.get("label") or path).strip()
+        low = label.lower()
+        field_type = str(field.get("type") or "")
+        required = bool(field.get("required"))
         value = None
-        known = True
-        if field.path == "_systemfield_name": value = personal.get("full_name")
-        elif field.path == "_systemfield_email": value = personal.get("email")
-        elif field.path == "_systemfield_location":
-            value = ", ".join(filter(None, (personal.get("city"), personal.get("province_state"), personal.get("country"))))
-        elif field.path == "_systemfield_resume" or field.kind == "File":
-            resume_field = field.path
+
+        if path == "_systemfield_name":
+            value = personal.get("full_name")
+        elif path == "_systemfield_email":
+            value = personal.get("email")
+        elif path == "_systemfield_resume":
+            resume_field = path
             value = "__resume__"
-        elif "phone" in low: value = personal.get("phone")
-        elif "linkedin" in low: value = personal.get("linkedin") or personal.get("linkedin_url")
-        elif "preferred first" in low: value = (personal.get("full_name") or "").split()[0] if personal.get("full_name") else None
-        elif "preferred last" in low: value = (personal.get("full_name") or "").split()[-1] if personal.get("full_name") else None
-        elif "address" in low: value = personal.get("address")
-        elif field.kind == "Boolean" and ("authorized" in low or "eligible to work" in low):
-            value = _bool(auth.get("legally_authorized_to_work"))
-        elif field.kind == "ValueSelect" and "sponsor" in low:
-            sponsorship = _bool(auth.get("require_sponsorship"))
-            value = _select(field.options, sponsorship) if sponsorship is not None else None
-        elif field.kind in {"LongText", "String"}:
-            try:
-                answer = answer_fn(field.title, job=job or {}, profile=profile,
-                                   resume_text=resume_text, kind="open",
-                                   **({"budget": budget} if default_answerer else {}))
-                value = answer.text if getattr(answer, "verified", False) else None
-            except Exception as exc:
-                from applypilot.apply.phase_budget import PhaseBudgetExceeded
-                if not isinstance(exc, PhaseBudgetExceeded):
-                    raise
+        elif path == "_systemfield_location" or field_type == "location":
+            value = _location(personal)
+        elif "linkedin" in low:
+            value = personal.get("linkedin_url") or personal.get("linkedin")
+        elif any(token in low for token in ("website", "portfolio", "personal site")):
+            value = personal.get("portfolio_url") or personal.get("website_url")
+        elif "compensation" in low or "salary" in low:
+            minimum = compensation.get("salary_range_min")
+            maximum = compensation.get("salary_range_max")
+            value = (
+                f"${minimum}-${maximum}"
+                if minimum and maximum
+                else compensation.get("salary_expectation")
+            )
+        elif field_type == "boolean":
+            if "sponsor" in low or "visa" in low:
+                sponsor = work_auth.get("require_sponsorship")
+                if sponsor is not None:
+                    value = not (str(sponsor).strip().lower() in {"no", "false", "0", "n"})
+            elif "authorized" in low or "eligible to work" in low:
+                authorized = work_auth.get("legally_authorized_to_work")
+                if authorized is not None:
+                    value = str(authorized).strip().lower() in {"yes", "true", "1", "y"}
+            elif _has(low, _DEMOGRAPHIC):
                 value = None
-        else:
-            known = False
+        elif field_type == "textarea":
+            result = answer_fn(
+                label,
+                job=job or {},
+                profile=profile,
+                resume_text=resume_text,
+                corpus=corpus,
+                kind="open",
+            )
+            if getattr(result, "verified", False):
+                value = result.text
+                free_text[path] = result.text
+
         if value not in (None, ""):
-            values[field.path] = value
-        elif field.required:
-            unmapped.append(field.title)
-        elif not known:
+            mapped[path] = value
+        elif required:
+            unmapped.append(label)
+
+    ready = bool(mapped.get("_systemfield_name") and mapped.get("_systemfield_email")) and not unmapped
+    return AnswerPlan(
+        fields=mapped,
+        resume_field=resume_field,
+        free_text=free_text,
+        unmapped_required=unmapped,
+        ready=ready,
+    )
+
+
+def plan_ashby_actions(plan: AnswerPlan, fields, *, resume_path=None, include_submit=True):
+    types = {field.get("path"): field.get("type") for field in fields or []}
+    actions: list[FormAction] = []
+    if plan.resume_field and resume_path:
+        actions.append(FormAction("file", f'[id="{plan.resume_field}"]', resume_path))
+    for path, value in plan.fields.items():
+        if path == plan.resume_field:
             continue
+        field_type = types.get(path)
+        entry = f'[data-field-path="{path}"]'
+        if field_type == "location":
+            actions.append(FormAction("ashby_location", f'{entry} input[role="combobox"]', value))
+        elif field_type == "boolean":
+            actions.append(FormAction("ashby_boolean", entry, bool(value)))
+        elif field_type == "textarea":
+            actions.append(FormAction("textarea", f'[id="{path}"]', value))
+        elif field_type == "select":
+            actions.append(FormAction("select", f'[id="{path}"]', value))
+        else:
+            actions.append(FormAction("fill", f'[id="{path}"]', value))
+    if include_submit:
+        actions.append(FormAction("submit", 'button:has-text("Submit Application")'))
+    return actions
 
-    ready = bool(values.get("_systemfield_name") and values.get("_systemfield_email")) and not unmapped
-    return AshbyAnswerPlan(tuple(fields), values, resume_field, unmapped, ready)
+
+def execute_ashby_actions(actions, page, *, dry_run=True, before_submit=None):
+    filled = []
+    submitted = False
+    for action in actions:
+        if action.kind == "submit":
+            if dry_run:
+                continue
+            invalid = page.locator("form").locator(":invalid").evaluate_all(
+                "elements => elements.map(element => element.id || element.name || element.type)"
+            )
+            if invalid:
+                raise RequiredFormFieldsError([str(item) for item in invalid])
+            if before_submit is not None:
+                before_submit()
+            page.get_by_role("button", name="Submit Application", exact=True).click()
+            submitted = True
+        elif action.kind == "file":
+            page.set_input_files(action.selector, action.value)
+            filled.append(action.selector)
+        elif action.kind == "ashby_location":
+            control = page.locator(action.selector)
+            control.click()
+            control.fill("")
+            control.press_sequentially(str(action.value), delay=50)
+            page.get_by_role("option", name=str(action.value), exact=True).click()
+            filled.append(action.selector)
+        elif action.kind == "ashby_boolean":
+            page.locator(action.selector).get_by_role(
+                "button", name="Yes" if action.value else "No", exact=True,
+            ).click()
+            filled.append(action.selector)
+        elif action.kind == "textarea":
+            page.fill(action.selector, action.value)
+            filled.append(action.selector)
+        elif action.kind == "select":
+            page.select_option(action.selector, str(action.value))
+            filled.append(action.selector)
+        else:
+            page.fill(action.selector, action.value)
+            filled.append(action.selector)
+    return {"filled": filled, "submitted": submitted, "dry_run": dry_run}
 
 
-def _confirmed(page, *, inbox_confirmed=False) -> bool:
-    if inbox_confirmed:
+def verify_ashby_submission(page) -> bool:
+    try:
+        page.wait_for_function(
+            """() => {
+                const text = (document.body?.innerText || '').toLowerCase();
+                const path = window.location.pathname.toLowerCase();
+                return path.includes('confirmation') || path.includes('submitted') ||
+                    text.includes('application submitted') ||
+                    text.includes('thank you for applying') ||
+                    text.includes('thanks for applying');
+            }""",
+            timeout=15_000,
+        )
         return True
-    try:
-        text = (page.content() or "").lower()
-        if any(marker in text for marker in ("thank you for applying", "application was submitted",
-                                             "application has been submitted")):
-            return True
-    except Exception:
-        pass
-    try:
-        return any(part in {"confirmation", "submitted", "thank-you"}
-                   for part in urlparse(str(page.url)).path.lower().split("/"))
     except Exception:
         return False
-
-
-def apply_ashby(job_url, *, page, profile, resume_text, resume_path,
-                answer_fn=None, inbox_confirmation_fn=None, dry_run=True) -> dict:
-    parsed = parse_ashby_url(job_url)
-    if not parsed:
-        return {"route": "not_ashby"}
-    fields = extract_form_definition(page.content())
-    plan = build_answer_plan(fields, profile=profile, resume_text=resume_text,
-                             answer_fn=answer_fn, job={"site": parsed[0]})
-    if not plan.ready:
-        return {"route": "exception", "ready": False, "unmapped": plan.unmapped_required, "plan": plan}
-    for field in plan.fields:
-        if field.path not in plan.values:
-            continue
-        locator = page.get_by_label(field.title, exact=True)
-        value = plan.values[field.path]
-        if value == "__resume__":
-            if resume_path: locator.set_input_files(resume_path)
-        elif field.kind == "ValueSelect": locator.select_option(label=str(value))
-        elif field.kind == "Boolean":
-            if value: locator.check()
-        else: locator.fill(str(value))
-    result = {"route": "deterministic", "ready": True, "plan": plan,
-              "submit_attempted": False}
-    if dry_run:
-        return result
-    result["submit_attempted"] = True
-    try:
-        page.get_by_role("button", name="Submit Application", exact=True).click()
-    except Exception:
-        result["status"] = "failed:no_confirmation"
-        return result
-    inbox = False
-    if inbox_confirmation_fn:
-        try: inbox = bool(inbox_confirmation_fn(board=parsed[0], job_id=parsed[1]))
-        except Exception: inbox = False
-    result["status"] = "applied" if _confirmed(page, inbox_confirmed=inbox) else "failed:no_confirmation"
-    return result

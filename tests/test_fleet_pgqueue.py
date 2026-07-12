@@ -342,7 +342,9 @@ def test_cost_cap_halts(db):
         _seed_queued(conn, 3)
         # attach costs summing to $4.50
         with conn.cursor() as cur:
-            cur.execute("UPDATE apply_queue SET est_cost_usd = 1.50")
+            cur.execute(
+                "UPDATE apply_queue SET est_cost_usd = 1.50, cumulative_cost_usd = 1.50"
+            )
         conn.commit()
         pgqueue.set_spend_cap(conn, 5.00)
         assert pgqueue.should_halt(conn) is False           # 4.50 < 5.00
@@ -399,13 +401,14 @@ def test_write_result_lease_owner_guard(db):
         assert pgqueue.write_result(conn, "A", job["url"], status="applied",
                                     est_cost_usd=0.5, agent_model="deepseek-chat") is True
         with conn.cursor() as cur:
-            cur.execute("SELECT status, applied_at, est_cost_usd, agent_model, lease_owner "
+            cur.execute("SELECT status, applied_at, est_cost_usd, cumulative_cost_usd, agent_model, lease_owner "
                         "FROM apply_queue WHERE url=%s", (job["url"],))
             r = cur.fetchone()
         assert r["status"] == "applied"
         assert r["applied_at"] is not None
         assert r["lease_owner"] is None
         assert float(r["est_cost_usd"]) == 0.5
+        assert float(r["cumulative_cost_usd"]) == 0.5
         assert r["agent_model"] == "deepseek-chat"
 
 

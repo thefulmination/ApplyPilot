@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS apply_queue (
     apply_error             TEXT,
     verification_confidence TEXT,                             -- pass-through (NULL in live DB today)
     agent_model             TEXT,                             -- provider/model that ran this job (the Sonnet-vs-DeepSeek A/B)
-    est_cost_usd            NUMERIC(10,4),                    -- apply-agent total_cost_usd (drives the cap)
+    est_cost_usd            NUMERIC(10,4),                    -- latest/current attempt cost
+    cumulative_cost_usd     NUMERIC(12,4) NOT NULL DEFAULT 0, -- all attempts; drives caps and CPA
     applied_at              TIMESTAMPTZ,
     worker_id               TEXT,
     machine_owner           TEXT,
@@ -136,7 +137,7 @@ CREATE INDEX IF NOT EXISTS idx_apply_queue_host_recent
 -- Single-row global control: spend cap + kill switch. id=1 enforced.
 CREATE TABLE IF NOT EXISTS fleet_config (
     id              INTEGER       PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    spend_cap_usd   NUMERIC(10,2) NOT NULL DEFAULT 0,        -- 0 = no cap; halt when SUM(est_cost_usd) >= this
+    spend_cap_usd   NUMERIC(10,2) NOT NULL DEFAULT 0,        -- 0 = no cap; halt on cumulative spend
     paused          BOOLEAN       NOT NULL DEFAULT FALSE,    -- global kill switch
     ats_policy_version      TEXT,
     ats_policy_lane         TEXT GENERATED ALWAYS AS ('ats'::text) STORED,

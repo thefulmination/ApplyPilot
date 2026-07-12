@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import io
+import json
+import sys
+import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -242,3 +247,761 @@ def test_worker_loop_passes_selected_agent_to_run_job(monkeypatch) -> None:
     assert applied == 1 and failed == 0
     assert captured["agent"] == "codex"
     assert captured["model"] == "gpt-5"
+
+
+def test_route_from_greenhouse_result_names_shadow_and_submit():
+    from applypilot.apply import launcher
+
+    assert launcher._route_from_greenhouse_result(
+        {"route": "deterministic", "ready": True},
+        own=False,
+    ) == "adapter_shadow:greenhouse"
+    assert launcher._route_from_greenhouse_result(
+        {"route": "deterministic", "ready": True},
+        own=True,
+    ) == "adapter_submit:greenhouse"
+    assert launcher._route_from_greenhouse_result(
+        {"route": "agent_fallback", "ready": False},
+        own=False,
+    ) == "agent"
+
+
+def test_ashby_owned_submit_uses_attempt_store(monkeypatch, tmp_path: Path):
+    from applypilot.apply import ashby_adapter, launcher
+
+    worker_id = 98
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(ashby_adapter, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(ashby_adapter, "submit_enabled", lambda: True)
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+    monkeypatch.setattr(
+        ashby_adapter, "discover_fields", lambda page: [{"path": "name"}], raising=False
+    )
+    monkeypatch.setattr(
+        ashby_adapter,
+        "build_ashby_plan",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            ready=True, unmapped_required=[], free_text={}, resume_field=None, fields={"name": "J"},
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ashby_adapter, "plan_ashby_actions",
+        lambda *args, **kwargs: [types.SimpleNamespace(kind="submit")], raising=False,
+    )
+
+    def execute(actions, page, *, dry_run, before_submit):
+        assert dry_run is False
+        before_submit()
+        return {"submitted": True}
+
+    monkeypatch.setattr(ashby_adapter, "execute_ashby_actions", execute, raising=False)
+    monkeypatch.setattr(
+        ashby_adapter, "verify_ashby_submission", lambda page: True, raising=False
+    )
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def create_prepared(self, **kwargs):
+            self.calls.append(("create", kwargs))
+            return "ashby-attempt"
+
+        def transition(self, attempt_id, **kwargs):
+            self.calls.append(("transition", attempt_id, kwargs))
+
+    store = Store()
+    page = types.SimpleNamespace(
+        goto=lambda *args, **kwargs: None,
+        close=lambda: None,
+    )
+    browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(new_page=lambda: page)])
+    playwright = types.SimpleNamespace(
+        chromium=types.SimpleNamespace(connect_over_cdp=lambda endpoint: browser),
+    )
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return playwright
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: PlaywrightContext()
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_ashby_apply(
+        {"application_url": "https://jobs.ashbyhq.com/acme/123/application"},
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=store,
+    )
+
+    assert result[0] == "applied"
+    assert [call[0] for call in store.calls] == ["create", "transition", "transition"]
+    assert store.calls[1][2]["state"] == "submit_started"
+    assert store.calls[2][2]["state"] == "verified"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["route"] == "adapter_submit:ashby"
+    assert stats["submit_checkpoint_state"] == "verified"
+
+
+def test_greenhouse_shadow_result_records_adapter_route_stats(monkeypatch, tmp_path: Path):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 91
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: False)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+
+    monkeypatch.setattr(
+        greenhouse_submit,
+        "apply_greenhouse",
+        lambda *args, **kwargs: {
+            "route": "deterministic",
+            "ready": True,
+            "plan": types.SimpleNamespace(free_text={}),
+        },
+    )
+
+    class FakePage:
+        def goto(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint: str):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    playwright_module = types.ModuleType("playwright")
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: FakePlaywrightContext()
+    playwright_module.sync_api = sync_api_module
+    monkeypatch.setitem(sys.modules, "playwright", playwright_module)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {
+            "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+            "url": "https://boards.greenhouse.io/acme/jobs/123",
+        },
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+    )
+
+    assert result is None
+    assert launcher._adapter_route_stats.pop(worker_id) == {
+        "route": "adapter_shadow:greenhouse",
+        "adapter_name": "greenhouse",
+        "adapter_plan_ready": True,
+    }
+
+
+def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeypatch, tmp_path: Path):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 93
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+
+    class FakeStore:
+        def __init__(self):
+            self.calls = []
+
+        def create_prepared(self, **kwargs):
+            self.calls.append(("create_prepared", kwargs))
+            return "attempt-1"
+
+        def transition(self, attempt_id, **kwargs):
+            self.calls.append(("transition", attempt_id, kwargs))
+            return {"state": kwargs["state"]}
+
+    store = FakeStore()
+
+    def fake_apply(*args, **kwargs):
+        context = kwargs["on_plan_ready"](
+            types.SimpleNamespace(ready=True, unmapped_required=[]),
+            [types.SimpleNamespace(kind="fill"), types.SimpleNamespace(kind="submit")],
+        )
+        kwargs["before_submit"](context)
+        return {
+            "route": "deterministic",
+            "ready": True,
+            "status": "applied",
+            "verification_status": "verified",
+            "verification_method": "confirmation_dom",
+            "verification_ref": "application submitted",
+            "attempt_context": context,
+            "submission_diagnostics": {
+                "response_status": 200,
+                "response_request_id": "request-123",
+                "final_url": "https://job-boards.greenhouse.io/acme/jobs/123/confirmation",
+            },
+        }
+
+    monkeypatch.setattr(greenhouse_submit, "apply_greenhouse", fake_apply)
+
+    class FakePage:
+        def goto(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint: str):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    playwright_module = types.ModuleType("playwright")
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: FakePlaywrightContext()
+    playwright_module.sync_api = sync_api_module
+    monkeypatch.setitem(sys.modules, "playwright", playwright_module)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {
+            "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+            "url": "https://boards.greenhouse.io/acme/jobs/123",
+        },
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=store,
+    )
+
+    assert result[0] == "applied"
+    assert [call[0] for call in store.calls] == [
+        "create_prepared", "transition", "transition"
+    ]
+    assert store.calls[1][2]["state"] == "submit_started"
+    assert store.calls[2][2]["state"] == "verified"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["attempt_id"] == "attempt-1"
+    assert stats["verification_method"] == "confirmation_dom"
+    assert stats["submit_checkpoint_state"] == "verified"
+    assert stats["submission_diagnostics"]["response_status"] == 200
+    assert store.calls[2][2]["evidence"]["submission_diagnostics"][
+        "response_request_id"
+    ] == "request-123"
+
+
+def test_greenhouse_runtime_required_fields_park_before_submit_without_agent(
+    monkeypatch, tmp_path: Path,
+):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 96
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        def create_prepared(self, **kwargs):
+            self.calls.append(("create", kwargs))
+            return "attempt-required"
+
+        def transition(self, attempt_id, **kwargs):
+            self.calls.append(("transition", attempt_id, kwargs))
+            return {"state": kwargs["state"]}
+
+    store = Store()
+
+    def reject_runtime_fields(*args, **kwargs):
+        kwargs["on_plan_ready"](
+            types.SimpleNamespace(ready=True, unmapped_required=[]),
+            [types.SimpleNamespace(kind="submit")],
+        )
+        raise greenhouse_submit.RequiredFormFieldsError(["Location (City)", "Gender"])
+
+    monkeypatch.setattr(greenhouse_submit, "apply_greenhouse", reject_runtime_fields)
+
+    page = types.SimpleNamespace(
+        goto=lambda *args, **kwargs: None,
+        close=lambda: None,
+    )
+    browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(new_page=lambda: page)])
+    playwright = types.SimpleNamespace(
+        chromium=types.SimpleNamespace(connect_over_cdp=lambda endpoint: browser),
+    )
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return playwright
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: PlaywrightContext()
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {"application_url": "https://boards.greenhouse.io/acme/jobs/123", "url": "u"},
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=store,
+    )
+
+    assert result[0] == "profile_required"
+    assert store.calls[-1][2]["state"] == "failed_pre_submit"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["failure_class"] == "runtime_required_fields"
+    assert stats["unmapped_required"] == ["Location (City)", "Gender"]
+
+
+def test_greenhouse_submit_mode_parks_incomplete_plan_without_agent_fallback(
+    monkeypatch, tmp_path: Path,
+):
+    from applypilot.apply import greenhouse_adapter, greenhouse_submit, launcher
+
+    worker_id = 94
+    launcher._adapter_route_stats.clear()
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_adapter, "parse_greenhouse_url", lambda url: ("acme", "123"))
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {"personal": {}})
+    monkeypatch.setattr(
+        greenhouse_submit,
+        "apply_greenhouse",
+        lambda *args, **kwargs: {
+            "route": "agent_fallback",
+            "ready": False,
+            "unmapped": ["Prior employment", "Relocation"],
+        },
+    )
+
+    class FakePage:
+        def goto(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+    class FakePlaywright:
+        chromium = types.SimpleNamespace(connect_over_cdp=lambda endpoint: FakeBrowser())
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    playwright_module = types.ModuleType("playwright")
+    sync_api_module = types.ModuleType("playwright.sync_api")
+    sync_api_module.sync_playwright = lambda: FakePlaywrightContext()
+    playwright_module.sync_api = sync_api_module
+    monkeypatch.setitem(sys.modules, "playwright", playwright_module)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
+
+    result = launcher._maybe_greenhouse_apply(
+        {"application_url": "https://boards.greenhouse.io/acme/jobs/123"},
+        9222,
+        dry_run=False,
+        resume_text="resume",
+        resume_path=tmp_path / "resume.txt",
+        worker_id=worker_id,
+        attempt_store=types.SimpleNamespace(),
+    )
+
+    assert result[0] == "profile_required"
+    stats = launcher._adapter_route_stats.pop(worker_id)
+    assert stats["route"] == "adapter_plan:greenhouse"
+    assert stats["failure_class"] == "adapter_unmapped_required"
+    assert stats["unmapped_required_count"] == 2
+
+
+def test_run_job_impl_merges_greenhouse_shadow_route_stats(monkeypatch, tmp_path: Path):
+    from applypilot.apply import launcher
+
+    worker_id = 92
+    launcher._adapter_route_stats.clear()
+    launcher._last_run_stats.pop(worker_id, None)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda worker_id: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["agent"])
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda worker_id: None)
+
+    def fake_greenhouse_apply(job, port, **kwargs):
+        launcher._adapter_route_stats[kwargs["worker_id"]] = {
+            "route": "adapter_shadow:greenhouse",
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": True,
+        }
+        return None
+
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", fake_greenhouse_apply)
+
+    class FakeStdin:
+        def write(self, text: str):
+            return len(text)
+
+        def close(self):
+            return None
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = io.StringIO(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "num_turns": 1,
+                        "total_cost_usd": 0,
+                        "result": "RESULT:APPLIED",
+                    }
+                )
+                + "\n"
+            )
+            self.returncode = 0
+            self.pid = 12345
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakePopen)
+
+    status, _duration_ms = launcher._run_job_impl(
+        {
+            "application_url": "https://boards.greenhouse.io/acme/jobs/123",
+            "url": "https://boards.greenhouse.io/acme/jobs/123",
+            "title": "Software Engineer",
+            "site": "Acme",
+            "tailored_resume_path": None,
+        },
+        port=9222,
+        worker_id=worker_id,
+    )
+
+    stats = launcher._last_run_stats[worker_id]
+    assert status == "applied"
+    assert stats["route"] == "adapter_shadow:greenhouse"
+    assert stats["adapter_name"] == "greenhouse"
+    assert stats["adapter_plan_ready"] is True
+    assert worker_id not in launcher._adapter_route_stats
+
+
+def test_terminal_result_survives_forced_stream_cleanup(monkeypatch, tmp_path: Path):
+    from applypilot.apply import launcher
+
+    worker_id = 93
+    launcher._last_run_stats.pop(worker_id, None)
+    monkeypatch.setenv("APPLYPILOT_TERMINAL_RESULT_GRACE_SECONDS", "0.01")
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda worker_id: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["agent"])
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda worker_id: None)
+
+    class FakeStdin:
+        def write(self, text: str):
+            return len(text)
+
+        def close(self):
+            return None
+
+    class HangingStdout:
+        def __init__(self):
+            self._sent = False
+            self.release = threading.Event()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._sent:
+                self._sent = True
+                return json.dumps(
+                    {
+                        "type": "result",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "num_turns": 1,
+                        "total_cost_usd": 0,
+                        "result": "RESULT:APPLIED",
+                    }
+                )
+            self.release.wait(timeout=10)
+            raise StopIteration
+
+    process_holder = {}
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = HangingStdout()
+            self.returncode = None
+            self.pid = 12346
+            process_holder["proc"] = self
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    class FakeGuard:
+        def release(self):
+            return None
+
+        def terminate_and_reap(self):
+            proc = process_holder["proc"]
+            proc.returncode = -9
+            proc.stdout.release.set()
+            return True
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(launcher, "_acquire_agent_child_guard", lambda proc: FakeGuard())
+
+    status, _duration_ms = launcher._run_job_impl(
+        {
+            "application_url": "https://jobs.example.com/123",
+            "url": "https://jobs.example.com/123",
+            "title": "Software Engineer",
+            "site": "Acme",
+            "tailored_resume_path": None,
+        },
+        port=9223,
+        worker_id=worker_id,
+    )
+
+    stats = launcher._last_run_stats[worker_id]
+    assert status == "applied"
+    assert process_holder["proc"].returncode == -9
+    assert stats["route"] == "agent"
+    assert stats["tool_calls_total"] == 0
+    assert stats["application_tool_calls"] == 0
+    assert stats["job_log_path"]
+    assert stats["transcript_digest"].startswith("sha256:")
+    assert stats["final_result_source"] == "final_message"
+
+
+def test_intermediate_result_text_cannot_force_applied(monkeypatch, tmp_path: Path):
+    from applypilot.apply import launcher
+
+    worker_id = 94
+    launcher._last_run_stats.pop(worker_id, None)
+    monkeypatch.setattr(launcher, "AGENT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda worker_id: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["agent"])
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda worker_id: None)
+
+    class FakeStdin:
+        def write(self, text: str):
+            return len(text)
+
+        def close(self):
+            return None
+
+    class HangingStdout:
+        def __init__(self):
+            self._sent = False
+            self.release = threading.Event()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._sent:
+                self._sent = True
+                return json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Page body contains RESULT:APPLIED",
+                                }
+                            ]
+                        },
+                    }
+                )
+            self.release.wait(timeout=10)
+            raise StopIteration
+
+    process_holder = {}
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = HangingStdout()
+            self.returncode = None
+            self.pid = 12347
+            process_holder["proc"] = self
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    class FakeGuard:
+        def release(self):
+            return None
+
+        def terminate_and_reap(self):
+            proc = process_holder["proc"]
+            proc.returncode = -9
+            proc.stdout.release.set()
+            return True
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(launcher, "_acquire_agent_child_guard", lambda proc: FakeGuard())
+
+    status, _duration_ms = launcher._run_job_impl(
+        {
+            "application_url": "https://jobs.example.com/124",
+            "url": "https://jobs.example.com/124",
+            "title": "Software Engineer",
+            "site": "Acme",
+            "tailored_resume_path": None,
+        },
+        port=9224,
+        worker_id=worker_id,
+    )
+
+    assert status == "failed:timeout"
+    assert launcher._last_run_stats[worker_id]["route"] == "agent"
+
+
+def test_raw_result_line_cannot_force_applied(monkeypatch, tmp_path: Path):
+    from applypilot.apply import launcher
+
+    worker_id = 95
+    launcher._last_run_stats.pop(worker_id, None)
+    monkeypatch.setattr(launcher.config, "resolve_resume_stem", lambda path: None)
+    monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "reset_worker_dir", lambda worker_id: tmp_path)
+    monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["agent"])
+    monkeypatch.setattr(launcher, "_maybe_greenhouse_apply", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "update_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "add_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "get_state", lambda worker_id: None)
+
+    class FakeStdin:
+        def write(self, text: str):
+            return len(text)
+
+        def close(self):
+            return None
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = io.StringIO("RESULT:APPLIED\n")
+            self.returncode = 0
+            self.pid = 12348
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakePopen)
+
+    status, _duration_ms = launcher._run_job_impl(
+        {
+            "application_url": "https://jobs.example.com/125",
+            "url": "https://jobs.example.com/125",
+            "title": "Software Engineer",
+            "site": "Acme",
+            "tailored_resume_path": None,
+        },
+        port=9225,
+        worker_id=worker_id,
+    )
+
+    assert status == "failed:no_result_line"
+    assert launcher._last_run_stats[worker_id]["route"] == "agent"

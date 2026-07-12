@@ -137,7 +137,10 @@ def test_lease_blocked_when_spend_cap_breached(fleet_db):
     from applypilot.fleet import queue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         _seed_approved_apply_rows(conn, 1)
-        cur.execute("UPDATE apply_queue SET est_cost_usd = 5.0 WHERE url='u0'")  # already-spent row
+        cur.execute(
+            "UPDATE apply_queue SET est_cost_usd = 5.0, cumulative_cost_usd = 5.0 "
+            "WHERE url='u0'"
+        )  # already-spent row
         # add a second leasable row so the SUM (5.0) is what blocks, not an empty queue
         _seed_approved_apply_rows(conn, 1, start=1)
         cur.execute("UPDATE fleet_config SET spend_cap_usd = 1.0 WHERE id=1")
@@ -167,6 +170,54 @@ def test_apply_env_preserves_existing_lane_filter(monkeypatch):
     am._setup_apply_env()
     import os
     assert os.environ.get("APPLYPILOT_LANE_FILTER") == "1"
+
+
+def test_apply_worker_main_validates_schema_before_building_loop(monkeypatch):
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import apply_worker_main as am
+    from applypilot.fleet import schema as fleet_schema
+
+    calls = []
+    conn = object()
+
+    class _Ctx:
+        def __enter__(self):
+            calls.append("connect")
+            return conn
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(am, "enforce_host_identity", lambda machine_owner: calls.append("identity"))
+    monkeypatch.setattr(pgqueue, "connect", lambda dsn: _Ctx())
+    monkeypatch.setattr(
+        fleet_schema,
+        "ensure_schema_v3",
+        lambda c: (_ for _ in ()).throw(AssertionError("remote worker must not run DDL")),
+    )
+    monkeypatch.setattr(
+        fleet_schema,
+        "require_apply_result_event_schema",
+        lambda c: calls.append(("schema_check", c)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fleet_schema,
+        "require_apply_attempt_schema",
+        lambda c: calls.append(("attempt_schema_check", c)),
+        raising=False,
+    )
+    monkeypatch.setattr(am, "build_apply_loop", lambda **kwargs: calls.append("build") or object())
+    monkeypatch.setattr(am, "install_stop_handler", lambda: calls.append("install"))
+    monkeypatch.setattr(am, "run_apply", lambda conn_factory, loop, **kwargs: calls.append("run") or {})
+
+    assert am.main(["--dsn", "postgresql://fleet", "--worker-id", "w-schema"]) == 0
+
+    assert ("schema_check", conn) in calls
+    assert calls.index(("schema_check", conn)) < calls.index("build")
+    assert calls.index(("schema_check", conn)) < calls.index(("attempt_schema_check", conn))
+    assert calls.index(("attempt_schema_check", conn)) < calls.index("build")
+    assert calls.index("build") < calls.index("run")
 
 
 def test_run_apply_idles_when_halted(fleet_db):

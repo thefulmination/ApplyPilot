@@ -88,7 +88,8 @@ def main_worker(argv=None) -> int:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
     with pgqueue.connect(args.dsn) as conn:
-        fleet_schema.ensure_schema_v3(conn)
+        fleet_schema.require_apply_result_event_schema(conn)
+        fleet_schema.require_apply_attempt_schema(conn)
     loop = build_discovery_loop(
         dsn=args.dsn,
         worker_id=args.worker_id,

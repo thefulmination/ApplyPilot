@@ -197,6 +197,8 @@ class WorkerLoop:
         role:          one of ``apply`` / ``compute`` / ``discovery``.
         apply_fn:      INJECTED. ``apply_fn(job) -> html`` (or a 4-tuple). Wraps
                        ``container_worker.run_job``. STUBBED in tests.
+        preflight_fn:  INJECTED read-only posting probe. ``url -> (status, reason)``;
+                       only ``status == 'dead'`` prevents apply execution.
         score_fn:      INJECTED. ``score_fn(job) -> (result_dict, cost_usd)``.
                        Wraps the LLM scorer/auditor. STUBBED in tests.
         search_fn:     INJECTED. ``search_fn(task) -> list[posting]``. Wraps
@@ -214,6 +216,8 @@ class WorkerLoop:
         home_ip: str,
         role: str,
         apply_fn: Optional[Callable[[dict], Any]] = None,
+        attempt_store_factory: Optional[Callable[[Any, dict], Any]] = None,
+        preflight_fn: Optional[Callable[[str], tuple[str, str]]] = None,
         score_fn: Optional[Callable[[dict], tuple]] = None,
         search_fn: Optional[Callable[[dict], list]] = None,
         classify_fn: Callable[..., str] = _captcha.classify,
@@ -233,6 +237,8 @@ class WorkerLoop:
         self.home_ip = home_ip
         self.role = role
         self.apply_fn = apply_fn
+        self.attempt_store_factory = attempt_store_factory
+        self.preflight_fn = preflight_fn
         self.score_fn = score_fn
         self.search_fn = search_fn
         self.classify_fn = classify_fn
@@ -380,6 +386,8 @@ class WorkerLoop:
                                      and the job was PARKED (NOT marked applied).
             ``skipped``           -- an apply wall that no human can solve (cf /
                                      invisible_block): closed as blocked.
+            ``lease_lost``        -- the lease-owner-guarded terminal write was
+                                     rejected because ownership was lost.
             ``idle``              -- nothing eligible to lease.
             ``paused``            -- a remote 'pause' is in effect: heartbeat only.
             ``stop``              -- a remote 'restart'/'drain' arrived: the caller
@@ -515,8 +523,51 @@ class WorkerLoop:
         if self.apply_fn is None:
             raise RuntimeError("apply role requires an injected apply_fn")
 
+        if self.preflight_fn is not None:
+            try:
+                preflight_status, preflight_reason = self.preflight_fn(
+                    job.get("application_url") or url
+                )
+            except Exception as exc:
+                preflight_status = "uncertain"
+                preflight_reason = f"probe_err:{type(exc).__name__}"
+            preflight_status = str(preflight_status or "").strip().lower() or "uncertain"
+            preflight_reason = str(preflight_reason or "")
+            if not preflight_reason.strip():
+                preflight_reason = "unknown"
+            preflight_reason = preflight_reason[:160]
+            if preflight_status == "dead":
+                wrote_result = queue.write_apply_result(
+                    conn,
+                    self.worker_id,
+                    url,
+                    status="failed",
+                    apply_status="expired",
+                    apply_error=f"preflight_{preflight_reason}"[:200],
+                    est_cost_usd=0.0,
+                    target_host=target_host,
+                    home_ip=self.home_ip,
+                    route="preflight",
+                    failure_class="preflight_dead",
+                    result_metadata={
+                        "preflight_status": "dead",
+                        "preflight_reason": preflight_reason,
+                    },
+                )
+                if not wrote_result:
+                    self._record_event(f"preflight_dead write rejected (lease lost) {url}")
+                    self._beat(conn, state="idle")
+                    return {"action": "lease_lost", "url": url, "reason": preflight_reason}
+                self._record_event(f"wrote apply preflight_dead {url} ({preflight_reason})")
+                self._beat(conn, state="idle")
+                return {"action": "preflight_dead", "url": url, "reason": preflight_reason}
+
         # Drive the real browser (STUBBED in tests) and classify the resulting page.
-        out = self.apply_fn(job)
+        if self.attempt_store_factory is not None:
+            attempt_store = self.attempt_store_factory(conn, job)
+            out = self.apply_fn(job, attempt_store=attempt_store)
+        else:
+            out = self.apply_fn(job)
         if isinstance(out, dict) and "run_status" in out:
             return self._apply_status_passthrough(conn, url, target_host, out)
         # --- legacy html-classify path (existing test fakes return html/4-tuple) ---
@@ -574,7 +625,15 @@ class WorkerLoop:
         return {"action": "parked_challenge", "url": url, "kind": kind, "route": route}
 
     _WALL_STATUSES = ("captcha", "login_issue", "auth_required")
+    _PROFILE_STATUSES = ("profile_required", "adapter_blocked")
     _CRASH_STATUSES = ("failed:no_result_line", "failed:timeout")
+
+    @staticmethod
+    def _adapter_may_have_submitted(run_status: str, res: dict) -> bool:
+        return (
+            run_status == "failed:no_confirmation"
+            and str((res or {}).get("route") or "").startswith("adapter_submit:")
+        )
 
     def _linkedin_halt_seconds(self) -> int:
         import os
@@ -681,7 +740,11 @@ class WorkerLoop:
         agent_model = res.get("agent_model") or res.get("model")
         duration_ms = res.get("apply_duration_ms") or res.get("duration_ms")
         result_evidence = {
+            "route": res.get("route"),
+            "failure_class": res.get("failure_class"),
+            "tool_calls_total": res.get("tool_calls_total"),
             "application_tool_calls": res.get("application_tool_calls"),
+            "last_tool": res.get("last_tool"),
             "job_log_path": res.get("job_log_path"),
             "transcript_digest": res.get("transcript_digest"),
             "final_result_source": res.get("final_result_source"),
@@ -750,9 +813,44 @@ class WorkerLoop:
                 kind, on_owner_machine=self.on_owner_machine
             )
             wall_outcome = None if kind in ("login_gate", "email_otp") else "captcha"
-            self._raise_and_park(conn, url, kind, route=route, outcome=wall_outcome, target_host=target_host)
+            self._raise_and_park(
+                conn,
+                url,
+                kind,
+                route=route,
+                outcome=wall_outcome,
+                target_host=target_host,
+                telemetry={
+                    "est_cost_usd": cost,
+                    "agent": agent,
+                    "agent_model": agent_model,
+                    "apply_duration_ms": duration_ms,
+                    **result_evidence,
+                },
+            )
             return {"action": "parked_challenge", "url": url}
-        if run_status in self._CRASH_STATUSES or run_status.startswith("failed:worker_error"):
+        if run_status in self._PROFILE_STATUSES:
+            self._raise_and_park(
+                conn,
+                url,
+                run_status,
+                route="owner_inbox",
+                outcome=None,
+                target_host=target_host,
+                telemetry={
+                    "est_cost_usd": cost,
+                    "agent": agent,
+                    "agent_model": agent_model,
+                    "apply_duration_ms": duration_ms,
+                    **result_evidence,
+                },
+            )
+            return {"action": "parked_challenge", "url": url}
+        if (
+            run_status in self._CRASH_STATUSES
+            or run_status.startswith("failed:worker_error")
+            or self._adapter_may_have_submitted(run_status, res)
+        ):
             queue.write_apply_result(conn, self.worker_id, url, status="crash_unconfirmed",
                                      apply_status="crash_unconfirmed", apply_error=run_status[:200],
                                      target_host=target_host, home_ip=self.home_ip, est_cost_usd=cost,
@@ -772,7 +870,8 @@ class WorkerLoop:
         self._beat(conn, state="idle")
         return {"action": "failed", "url": url}
 
-    def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host) -> int:
+    def _raise_and_park(self, conn, url, kind, *, route, outcome, target_host,
+                        telemetry=None) -> int:
         """Raise an auth_challenge row, optionally record the wall outcome on the
         governor, and FREEZE the held lease out of the reclaim pool
         (``queue.park_challenge``) so the SAME wall is never reclaimed and re-driven
@@ -790,6 +889,29 @@ class WorkerLoop:
                 scopes.append(governor.host_scope(target_host))
             governor.record_outcome(conn, scopes, outcome, commit=False)
         queue.park_challenge(conn, self.worker_id, url, commit=False)
+        if telemetry is not None:
+            queue.record_apply_challenge_event(
+                conn,
+                self.worker_id,
+                url,
+                kind=kind,
+                target_host=target_host,
+                home_ip=self.home_ip,
+                est_cost_usd=telemetry.get("est_cost_usd", 0),
+                agent=telemetry.get("agent"),
+                agent_model=telemetry.get("agent_model"),
+                apply_duration_ms=telemetry.get("apply_duration_ms"),
+                route=telemetry.get("route"),
+                failure_class=telemetry.get("failure_class"),
+                tool_calls_total=telemetry.get("tool_calls_total"),
+                application_tool_calls=telemetry.get("application_tool_calls"),
+                last_tool=telemetry.get("last_tool"),
+                result_metadata=telemetry.get("result_metadata"),
+                job_log_path=telemetry.get("job_log_path"),
+                transcript_digest=telemetry.get("transcript_digest"),
+                final_result_source=telemetry.get("final_result_source"),
+                commit=False,
+            )
         conn.commit()
         self._record_event(f"parked challenge {url} ({kind}->{route})")
         self._beat(conn, state="challenge_pending", current_job=url)

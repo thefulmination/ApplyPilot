@@ -309,6 +309,86 @@ def _target_host(application_url: str | None) -> str | None:
     return host or None
 
 
+def _routing_company(company: str | None, application_url: str | None) -> str | None:
+    """Recover a stable employer key from a hosted Greenhouse board.
+
+    Aggregators frequently omit company even though the application URL carries
+    the tenant. Keeping company blank makes unrelated generic roles collide in
+    posting-level dedup, so use the public board token when it is available.
+    """
+    if str(company or "").strip():
+        return company
+    parsed = parse_greenhouse_url(application_url or "")
+    return parsed[0] if parsed else company
+
+
+def push_apply_rows(
+    conn: Any,
+    rows: list[dict[str, Any]],
+    *,
+    approved_batch: str | None = None,
+    enforce_host_policy: bool = False,
+    trusted_hosts: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Push prepared ATS rows, parking rows that are not safe for unattended apply."""
+    from applypilot.fleet.host_policy import decide_host_policy
+
+    allowed: list[dict[str, Any]] = []
+    parked = []
+    for row in rows:
+        decision = decide_host_policy(row.get("application_url"), trusted_hosts=trusted_hosts)
+        if enforce_host_policy and not decision.unattended_allowed:
+            parked.append((row, decision))
+        else:
+            allowed.append(row)
+
+    pushed = (
+        _queue.push_apply_jobs(conn, allowed, approved_batch=approved_batch, commit=False)
+        if allowed
+        else 0
+    )
+    parked_count = 0
+    with conn.cursor() as cur:
+        for row, decision in parked:
+            host = (
+                row.get("target_host")
+                or row.get("apply_domain")
+                or _target_host(row.get("application_url"))
+            )
+            cur.execute(
+                "INSERT INTO apply_queue "
+                "(url, company, title, application_url, score, apply_domain, target_host, "
+                "lane, dedup_key, approved_batch, status, apply_status, apply_error) "
+                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,"
+                "%(apply_domain)s,%(target_host)s,'ats',%(dedup_key)s,%(approved_batch)s,"
+                "'failed'::apply_queue_status,'skipped',%(apply_error)s) "
+                "ON CONFLICT (url) DO UPDATE SET company=EXCLUDED.company, "
+                "title=EXCLUDED.title, application_url=EXCLUDED.application_url, "
+                "score=EXCLUDED.score, apply_domain=EXCLUDED.apply_domain, "
+                "target_host=EXCLUDED.target_host, lane=EXCLUDED.lane, "
+                "dedup_key=EXCLUDED.dedup_key, "
+                "approved_batch=COALESCE(EXCLUDED.approved_batch, apply_queue.approved_batch), "
+                "status=EXCLUDED.status, apply_status=EXCLUDED.apply_status, "
+                "apply_error=EXCLUDED.apply_error, updated_at=now() "
+                "WHERE apply_queue.status='queued'",
+                {
+                    "url": row.get("url"),
+                    "company": row.get("company"),
+                    "title": row.get("title"),
+                    "application_url": row.get("application_url"),
+                    "score": row.get("score"),
+                    "apply_domain": host,
+                    "target_host": host,
+                    "dedup_key": row.get("dedup_key"),
+                    "approved_batch": approved_batch,
+                    "apply_error": f"host_policy:{decision.reason}",
+                },
+            )
+            parked_count += cur.rowcount
+    conn.commit()
+    return {"pushed": pushed, "parked": parked_count}
+
+
 def push_apply_eligible(
     *,
     sqlite_conn: sqlite3.Connection | None = None,

@@ -868,6 +868,41 @@ CREATE INDEX IF NOT EXISTS idx_autotriage_url
 CREATE INDEX IF NOT EXISTS idx_autotriage_status
     ON autotriage_actions (action_status, created_at);
 
+-- apply_attempts: durable adapter submit boundary. An unresolved irreversible
+-- action for a dedup key excludes every second submit path until it is verified,
+-- contradicted, or quarantined by the owner-controlled workflow.
+CREATE TABLE IF NOT EXISTS apply_attempts (
+    attempt_id          UUID PRIMARY KEY,
+    queue_name          TEXT NOT NULL,
+    url                 TEXT NOT NULL,
+    dedup_key           TEXT,
+    worker_id           TEXT NOT NULL,
+    route               TEXT NOT NULL,
+    route_version       TEXT,
+    state               TEXT NOT NULL CHECK (state IN (
+        'prepared', 'submit_started', 'submitted_unverified', 'verified',
+        'contradicted', 'quarantined', 'failed_pre_submit'
+    )),
+    submit_started_at   TIMESTAMPTZ,
+    finalized_at        TIMESTAMPTZ,
+    verification_method TEXT,
+    verification_ref   TEXT,
+    evidence            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_apply_attempts_unresolved_dedup
+    ON apply_attempts (dedup_key)
+    WHERE dedup_key IS NOT NULL
+      AND state IN ('submit_started', 'submitted_unverified');
+CREATE INDEX IF NOT EXISTS idx_apply_attempts_url_created
+    ON apply_attempts (queue_name, url, created_at DESC);
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fleet_worker') THEN
+        GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker;
+        REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON apply_attempts FROM fleet_worker;
+    END IF;
+END $$;
+
 -- apply_result_events: durable per-job terminal evidence written by the worker when
 -- it closes a lease. worker_heartbeat.recent_log is only a moving tail; repair tools
 -- should prefer this table for job-specific result evidence.
@@ -898,7 +933,13 @@ CREATE TABLE IF NOT EXISTS apply_result_events (
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS queue_name TEXT NOT NULL DEFAULT 'apply_queue';
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS machine_owner TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'worker';
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS route TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS failure_class TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS tool_calls_total INTEGER;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS application_tool_calls INTEGER;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS last_tool TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS host_policy TEXT;
+ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS result_metadata JSONB;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS job_log_path TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS transcript_digest TEXT;
 ALTER TABLE apply_result_events ADD COLUMN IF NOT EXISTS final_result_source TEXT;
@@ -908,6 +949,27 @@ ALTER TABLE apply_result_events ALTER COLUMN result_metadata SET DEFAULT '{}'::j
 ALTER TABLE apply_result_events ALTER COLUMN result_metadata SET NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_apply_result_events_url_created
     ON apply_result_events (queue_name, url, created_at DESC);
+
+-- Preserve all-in spend across retries. est_cost_usd remains the latest/current
+-- attempt value for diagnostics; cumulative_cost_usd is the cap/reporting ledger.
+ALTER TABLE apply_queue
+    ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
+UPDATE apply_queue q
+SET cumulative_cost_usd = GREATEST(
+    COALESCE(q.cumulative_cost_usd, 0),
+    COALESCE(q.est_cost_usd, 0),
+    COALESCE((
+        SELECT SUM(e.est_cost_usd)
+        FROM apply_result_events e
+        WHERE e.queue_name = 'apply_queue' AND e.url = q.url
+    ), 0)
+);
+ALTER TABLE linkedin_queue
+    ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
+UPDATE linkedin_queue
+SET cumulative_cost_usd = GREATEST(
+    COALESCE(cumulative_cost_usd, 0), COALESCE(est_cost_usd, 0)
+);
 
 -- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on
 -- the diagnosis row, so a Reverse / audit can report exactly which/how-many rows were affected,

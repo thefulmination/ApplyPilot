@@ -20,8 +20,10 @@ import urllib.parse
 from dataclasses import dataclass
 
 import httpx
+from bs4 import BeautifulSoup
 
 _GH_HOSTS = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+_GH_SHORT_HOSTS = {"grnh.se"}
 _QUESTIONS_API = "https://boards-api.greenhouse.io/v1/boards/{board}/jobs/{job_id}?questions=true"
 
 
@@ -46,10 +48,42 @@ def parse_greenhouse_url(url: str) -> tuple[str, str] | None:
     return (token, job_id)
 
 
+def resolve_greenhouse_url(url: str, *, resolve=None) -> str | None:
+    """Return a canonical hosted Greenhouse URL, following ``grnh.se`` once.
+
+    Direct hosted URLs are returned without network I/O. A short URL is useful
+    only when its final redirect is still a parseable Greenhouse job.
+    """
+    if parse_greenhouse_url(url):
+        return url
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except (TypeError, ValueError):
+        return None
+    if host not in _GH_SHORT_HOSTS:
+        return None
+    if resolve is None:
+        def resolve(value):
+            response = httpx.get(value, follow_redirects=True, timeout=20)
+            response.raise_for_status()
+            return str(response.url)
+    try:
+        final_url = str(resolve(url) or "")
+    except Exception:
+        return None
+    return final_url if parse_greenhouse_url(final_url) else None
+
+
 def _default_fetch(url: str) -> dict:
     resp = httpx.get(url, headers={"Accept": "application/json"}, timeout=20)
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_job(board_token, job_id, *, fetch=None) -> dict:
+    """Return one public Greenhouse job payload, including form questions."""
+    fetch = fetch or _default_fetch
+    return fetch(_QUESTIONS_API.format(board=board_token, job_id=job_id)) or {}
 
 
 def fetch_questions(board_token, job_id, *, fetch=None) -> list[dict]:
@@ -58,9 +92,122 @@ def fetch_questions(board_token, job_id, *, fetch=None) -> list[dict]:
     ``fetch`` is an injectable ``url -> parsed-json-dict`` callable (defaults to
     an unauthenticated httpx GET).
     """
-    fetch = fetch or _default_fetch
-    data = fetch(_QUESTIONS_API.format(board=board_token, job_id=job_id)) or {}
+    data = fetch_job(board_token, job_id, fetch=fetch)
     return list(data.get("questions") or [])
+
+
+def _phone_country_code(value: object) -> str | None:
+    country = str(value or "").strip().lower()
+    if country in {"us", "usa", "united states", "united states of america"}:
+        return "us"
+    if len(country) == 2 and country.isalpha():
+        return country
+    return None
+
+
+def builtin_questions_from_payload(payload: dict, *, profile: dict) -> list[dict]:
+    """Describe modern Greenhouse built-ins omitted from ``questions``."""
+    questions: list[dict] = []
+    api_questions = list((payload or {}).get("questions") or [])
+    phone_question = next(
+        (
+            question for question in api_questions
+            if any(field.get("name") == "phone" for field in question.get("fields") or [])
+        ),
+        None,
+    )
+    personal = (profile or {}).get("personal") or {}
+
+    province = str(personal.get("province_state") or "").strip()
+    province = _US_STATE_NAMES.get(province.upper(), province)
+    country = str(personal.get("country") or "").strip()
+    if country.lower() in {"us", "usa", "united states of america"}:
+        country = "United States"
+    city = str(personal.get("city") or "").strip()
+    location_value = ", ".join(
+        value for value in (city, province, country) if value
+    ) if city else ""
+    for question in (payload or {}).get("location_questions") or []:
+        fields = []
+        for source_field in question.get("fields") or []:
+            name = str(source_field.get("name") or "")
+            field = dict(source_field)
+            field["type"] = "location_autocomplete" if name == "location" else "location_virtual"
+            if name == "location" and location_value:
+                field["profile_value"] = location_value
+            fields.append(field)
+        questions.append({
+            "required": bool(question.get("required")),
+            "label": f"Location: {question.get('label') or 'Field'}",
+            "fields": fields,
+        })
+
+    demographic = (payload or {}).get("demographic_questions") or {}
+    for question in demographic.get("questions") or []:
+        values = [
+            {
+                "label": option.get("label"),
+                "value": option.get("id"),
+                "decline_to_answer": bool(option.get("decline_to_answer")),
+            }
+            for option in (question.get("answer_options") or [])
+        ]
+        questions.append({
+            "required": bool(question.get("required")),
+            "label": str(question.get("label") or "Demographic question"),
+            "fields": [{
+                "name": str(question.get("id") or ""),
+                "type": str(question.get("type") or "multi_value_single_select"),
+                "values": values,
+            }],
+        })
+
+    if phone_question is not None and (payload or {}).get("id") is not None:
+        country_code = _phone_country_code(personal.get("country"))
+        field = {"name": "country", "type": "phone_country_select", "values": []}
+        if country_code:
+            field["profile_value"] = country_code
+            if country_code == "us":
+                field["values"] = [{"label": "United States +1", "value": "us"}]
+        questions.append({
+            "required": bool(phone_question.get("required")),
+            "label": "Phone Country",
+            "fields": [field],
+        })
+
+    education_mode = str((payload or {}).get("education") or "")
+    if education_mode == "education_required":
+        education = ((profile or {}).get("resume_facts") or {}).get("education") or {}
+        definitions = (
+            ("school--0", "School", "react_select", education.get("school")),
+            ("degree--0", "Degree", "react_select", education.get("degree")),
+            ("discipline--0", "Discipline", "react_select", education.get("discipline")),
+            ("start-year--0", "Start year", "input_text", education.get("start_year")),
+            ("end-year--0", "End year", "input_text", education.get("end_year")),
+        )
+        for name, label, field_type, value in definitions:
+            field = {"name": name, "type": field_type, "values": []}
+            if value not in (None, ""):
+                field["profile_value"] = str(value)
+                if field_type == "react_select":
+                    field["values"] = [{"label": str(value), "value": str(value)}]
+            questions.append({
+                "required": True,
+                "label": f"Education: {label}",
+                "fields": [field],
+            })
+    return questions
+
+
+def job_context_from_payload(data: dict, *, board: str) -> dict:
+    return {
+        "site": board,
+        "company": board,
+        "title": str(data.get("title") or ""),
+        "description": BeautifulSoup(
+            str(data.get("content") or ""), "html.parser",
+        ).get_text("\n", strip=True),
+    }
 
 
 @dataclass
@@ -81,6 +228,22 @@ _SPONSOR = ("sponsorship", "visa sponsor", "require sponsorship", "need sponsors
 _DECLINE = ("decline", "prefer not", "don't wish", "do not wish", "not to answer",
             "not to disclose", "not to identify", "not wish to")
 
+_US_STATE_NAMES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island",
+    "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas",
+    "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "Washington, D.C.",
+}
+
 
 def _name_parts(full: str) -> tuple[str, str]:
     toks = (full or "").split()
@@ -96,6 +259,147 @@ def _pick_value(values, pred):
 
 def _has(label: str, needles) -> bool:
     return any(n in label for n in needles)
+
+
+def _profile_text_answer(
+    low: str, *, personal, compensation, experience, availability, first, last,
+):
+    label = " ".join(low.split()).strip(" :?*")
+    if "desired salary" in label or "salary expectation" in label:
+        value = compensation.get("salary_expectation") or compensation.get("salary_range_min")
+        return str(value) if value not in (None, "") else None
+    if "legal first name" in label:
+        return first or None
+    if "legal last name" in label:
+        return last or None
+    if label in {"address", "address line 1", "street address", "mailing address"}:
+        return personal.get("address")
+    if label in {"city", "current city"}:
+        return personal.get("city")
+    if "highest level of education" in label:
+        return experience.get("education_level")
+    if label in {"years of work experience", "total years of experience"}:
+        value = experience.get("years_of_experience_total")
+        return str(value) if value not in (None, "") else None
+    if any(phrase in label for phrase in (
+        "how did you hear", "how did you learn", "how did you first learn",
+    )):
+        return "Online job board"
+    if "preferred start date" in label:
+        return availability.get("earliest_start_date")
+    return None
+
+
+def _profile_select_value(
+    low: str, values, *, personal, work_auth, experience, compensation, resume_facts, job,
+):
+    label = " ".join(low.split()).strip(" :?*")
+    if "resident of the following states" in label:
+        province = str(personal.get("province_state") or "").strip()
+        state_code = province.upper()
+        if len(state_code) != 2:
+            state_code = next(
+                (code for code, name in _US_STATE_NAMES.items() if name.lower() == province.lower()),
+                "",
+            )
+        allowed = bool(state_code and re.search(rf"\b{re.escape(state_code.lower())}\b", label))
+        answer = "yes" if allowed else "no"
+        return _pick_value(values, lambda option: option == answer)
+    state = str(personal.get("province_state") or "").strip()
+    if "state" in label and state:
+        candidates = {state.lower(), _US_STATE_NAMES.get(state.upper(), state).lower()}
+        return _pick_value(values, lambda option: option in candidates)
+    if label in {"country", "country of residence"}:
+        country = str(personal.get("country") or "").strip().lower()
+        aliases = {country}
+        if country in {"us", "usa", "united states", "united states of america"}:
+            aliases.update({"us", "usa", "united states", "united states of america"})
+        return _pick_value(values, lambda option: option in aliases)
+    if label == "address type" and personal.get("address"):
+        return _pick_value(values, lambda option: option == "home")
+    if any(phrase in label for phrase in (
+        "privacy acknowledgement", "privacy policy", "data protection notice",
+    )):
+        acknowledged = _pick_value(
+            values,
+            lambda option: "acknowledge" in option or option == "confirm",
+        )
+        return acknowledged if acknowledged is not None else _pick_value(
+            values, lambda option: option == "yes",
+        )
+    if "receive communications via sms" in label or "receive communications via whatsapp" in label:
+        return _pick_value(values, lambda option: option == "no")
+    if label.startswith("have you worked at "):
+        employer = re.sub(r"^have you worked at\s+|\?$", "", label).strip()
+        preserved = [
+            re.sub(r"[^a-z0-9]+", "", str(company).lower())
+            for company in (resume_facts.get("preserved_companies") or [])
+        ]
+        normalized_employer = re.sub(r"[^a-z0-9]+", "", employer)
+        if preserved and normalized_employer not in preserved:
+            return _pick_value(values, lambda option: "not worked" in option)
+    if "declare" in label and "particulars" in label and "true" in label:
+        return _pick_value(values, lambda option: option == "yes")
+    if "documents" in label and "employment eligibility" in label:
+        authorized = str(work_auth.get("legally_authorized_to_work") or "").lower()
+        if authorized in {"yes", "true", "y"}:
+            return _pick_value(values, lambda option: option == "yes")
+    if label.startswith("are you located in "):
+        city = str(personal.get("city") or "").strip().lower()
+        province = str(personal.get("province_state") or "").strip()
+        state_code = province.upper()
+        if len(state_code) != 2:
+            state_code = next(
+                (code for code, name in _US_STATE_NAMES.items() if name.lower() == province.lower()),
+                "",
+            )
+        located = bool(city and city in label and state_code and re.search(
+            rf"\b{re.escape(state_code.lower())}\b", label,
+        ))
+        answer = "yes" if located else "no"
+        return _pick_value(values, lambda option: option == answer)
+    if "leadership/management experience" in label:
+        title = str(experience.get("current_title") or "").lower()
+        has_leadership = any(token in title for token in (
+            "chief", "coo", "ceo", "president", "director", "manager", "head", "vp",
+        ))
+        answer = "yes" if has_leadership else "no"
+        return _pick_value(values, lambda option: option == answer)
+    if "graduated" in label and "bachelor" in label and "degree" in label:
+        education = str(experience.get("education_level") or "").lower()
+        answer = "yes" if "bachelor" in education else "no"
+        return _pick_value(values, lambda option: option == answer)
+    if "compensation range match your expectation" in label:
+        description = str((job or {}).get("description") or "")
+        match = re.search(
+            r"\$\s*([\d,]+)\s*(?:-|\u2013|\u2014|to)\s*\$?\s*([\d,]+)",
+            description,
+            re.I,
+        )
+        try:
+            expected_min = float(str(compensation.get("salary_range_min") or "").replace(",", ""))
+            expected_max = float(str(compensation.get("salary_range_max") or "").replace(",", ""))
+            job_min = float(match.group(1).replace(",", "")) if match else 0
+            job_max = float(match.group(2).replace(",", "")) if match else 0
+        except (TypeError, ValueError):
+            return None
+        if expected_min and expected_max and job_min and job_max:
+            overlaps = max(expected_min, job_min) <= min(expected_max, job_max)
+            answer = "yes" if overlaps else "no"
+            return _pick_value(values, lambda option: option == answer)
+    if "location" in label and "closest" in label:
+        city = str(personal.get("city") or "").strip()
+        province = str(personal.get("province_state") or "").strip()
+        state_code = province.upper()
+        if len(state_code) != 2:
+            state_code = next(
+                (code for code, name in _US_STATE_NAMES.items() if name.lower() == province.lower()),
+                "",
+            )
+        if city and state_code:
+            exact = f"{state_code} | {city}".lower()
+            return _pick_value(values, lambda option: option == exact)
+    return None
 
 
 def build_answer_plan(questions, *, profile, resume_text, corpus=None,
@@ -118,6 +422,10 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
 
     personal = (profile or {}).get("personal", {})
     work_auth = (profile or {}).get("work_authorization", {})
+    compensation = (profile or {}).get("compensation", {})
+    experience = (profile or {}).get("experience", {})
+    availability = (profile or {}).get("availability", {})
+    resume_facts = (profile or {}).get("resume_facts", {})
     first, last = _name_parts(personal.get("full_name", ""))
 
     fields: dict = {}
@@ -135,6 +443,23 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
             name = f.get("name", "")
             ftype = f.get("type", "")
             values = f.get("values") or []
+
+            if f.get("profile_value") not in (None, ""):
+                fields[name] = f["profile_value"]
+                mapped = True
+                continue
+
+            if ftype == "location_virtual":
+                # The hosted React location widget populates these API fields
+                # internally after an autocomplete option is selected. They do
+                # not exist as DOM inputs and must never be filled directly.
+                mapped = bool(personal.get("city"))
+                continue
+
+            if ftype == "location_autocomplete":
+                # A profile-backed value is handled above. Do not fall through
+                # to the generic location field, which would accept country-only.
+                continue
 
             if ftype == "input_hidden":
                 mapped = True
@@ -172,6 +497,51 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     mapped = True
                 continue
 
+            # Custom Greenhouse questions often use opaque names such as
+            # question_123 even when the answer already exists in the profile.
+            # Map only high-confidence labels; ambiguous questions still fall
+            # through to the answerer or unmapped-required guard.
+            if ftype == "input_text":
+                value = _profile_text_answer(
+                    low,
+                    personal=personal,
+                    compensation=compensation,
+                    experience=experience,
+                    availability=availability,
+                    first=first,
+                    last=last,
+                )
+                if "preferred" in low and "name" in low:
+                    value = personal.get("preferred_name") or first
+                elif "linkedin" in low:
+                    value = personal.get("linkedin_url")
+                elif "github" in low:
+                    value = personal.get("github_url")
+                elif "portfolio" in low:
+                    value = personal.get("portfolio_url")
+                elif "website" in low:
+                    value = personal.get("website_url")
+                elif "postal" in low or "zip code" in low:
+                    value = personal.get("postal_code")
+                if value:
+                    fields[name] = str(value)
+                    mapped = True
+                continue
+
+            profile_text = _profile_text_answer(
+                low,
+                personal=personal,
+                compensation=compensation,
+                experience=experience,
+                availability=availability,
+                first=first,
+                last=last,
+            )
+            if ftype == "textarea" and profile_text:
+                fields[name] = str(profile_text)
+                mapped = True
+                continue
+
             # Greenhouse offers resume/cover-letter as a paste TEXTAREA too
             # (name resume_text / cover_letter_text). These are documents, not
             # questions -- fill the resume verbatim, never send them to the
@@ -204,7 +574,16 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                 continue  # unverified -> never submit; leave unmapped
 
             if ftype == "multi_value_single_select":
-                val = None
+                val = _profile_select_value(
+                    low,
+                    values,
+                    personal=personal,
+                    work_auth=work_auth,
+                    experience=experience,
+                    compensation=compensation,
+                    resume_facts=resume_facts,
+                    job=job,
+                )
                 if _has(low, _DEMOGRAPHIC):
                     val = _pick_value(values, lambda label_l: _has(label_l, _DECLINE))
                 elif _has(low, _SPONSOR):
@@ -218,7 +597,25 @@ def build_answer_plan(questions, *, profile, resume_text, corpus=None,
                     mapped = True
                 continue
 
-            # multi_value_multi_select / unknown types: not handled in this slice.
+            if ftype == "multi_value_multi_select":
+                val = _profile_select_value(
+                    low,
+                    values,
+                    personal=personal,
+                    work_auth=work_auth,
+                    experience=experience,
+                    compensation=compensation,
+                    resume_facts=resume_facts,
+                    job=job,
+                )
+                if _has(low, _DEMOGRAPHIC):
+                    val = _pick_value(values, lambda label_l: _has(label_l, _DECLINE))
+                if val is not None:
+                    fields[name] = val
+                    mapped = True
+                continue
+
+            # Unknown types remain unmapped and fail closed when required.
 
         if required and not mapped:
             unmapped.append(label)

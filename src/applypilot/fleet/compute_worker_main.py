@@ -73,7 +73,8 @@ def main(argv=None) -> int:
     fallback = [s for s in args.fallback.split(",") if s]
 
     with pgqueue.connect(args.dsn) as conn:
-        fleet_schema.ensure_schema_v3(conn)
+        fleet_schema.require_apply_result_event_schema(conn)
+        fleet_schema.require_apply_attempt_schema(conn)
         loop, ctx_version = build_compute_loop(
             conn, dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
             providers=providers, fallback=fallback, ensemble=args.ensemble,

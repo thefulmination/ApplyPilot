@@ -52,26 +52,38 @@ def test_ci_runs_automatically_with_bounded_permissions() -> None:
 
 
 def test_fleet_workers_migrate_schema_before_building_loops() -> None:
-    workers = {
+    remote_workers = {
         "apply_worker_main.py": ("main", "build_apply_loop"),
         "compute_worker_main.py": ("main", "build_compute_loop"),
         "discovery_main.py": ("main_worker", "build_discovery_loop"),
-        "linkedin_worker_main.py": ("main", "build_linkedin_loop"),
     }
-    for filename, (entrypoint, builder) in workers.items():
+    for filename, (entrypoint, builder) in remote_workers.items():
         path = ROOT / "src" / "applypilot" / "fleet" / filename
         tree = ast.parse(path.read_text(encoding="utf-8"))
         main = next(
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == entrypoint
         )
-        schema_lines = [
+        ddl_lines = [
             node.lineno
             for node in ast.walk(main)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "ensure_schema_v3"
         ]
+        required_schema_lines = {
+            name: [
+                node.lineno
+                for node in ast.walk(main)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+            ]
+            for name in (
+                "require_apply_result_event_schema",
+                "require_apply_attempt_schema",
+            )
+        }
         loop_lines = [
             node.lineno
             for node in ast.walk(main)
@@ -79,9 +91,34 @@ def test_fleet_workers_migrate_schema_before_building_loops() -> None:
             and isinstance(node.func, ast.Name)
             and node.func.id == builder
         ]
-        assert len(schema_lines) == 1, filename
+        assert ddl_lines == [], filename
+        assert all(len(lines) == 1 for lines in required_schema_lines.values()), filename
         assert len(loop_lines) == 1, filename
-        assert schema_lines[0] < loop_lines[0], filename
+        assert all(lines[0] < loop_lines[0] for lines in required_schema_lines.values()), filename
+
+    owner_worker = ROOT / "src" / "applypilot" / "fleet" / "linkedin_worker_main.py"
+    tree = ast.parse(owner_worker.read_text(encoding="utf-8"))
+    main = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    ddl_lines = [
+        node.lineno
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "ensure_schema_v3"
+    ]
+    loop_lines = [
+        node.lineno
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_linkedin_loop"
+    ]
+    assert len(ddl_lines) == 1, "linkedin_worker_main.py"
+    assert len(loop_lines) == 1, "linkedin_worker_main.py"
+    assert ddl_lines[0] < loop_lines[0], "linkedin_worker_main.py"
 
 
 def test_primary_fleet_controllers_migrate_schema_on_startup() -> None:

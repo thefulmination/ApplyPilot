@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,6 +35,7 @@ from applypilot.applications import record_application
 from applypilot.ats_domains import ATS_SENDER_DOMAINS
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
+from applypilot.apply.failure_classification import FailureEvidence, classify_apply_failure
 from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -194,6 +196,7 @@ _agent_guards: dict[int, SpawnedChildGuard] = {}
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
+_adapter_route_stats: dict[int, dict] = {}
 INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
 MAX_INBOX_AUTH_HINT_BYTES = 64 * 1024
 _AUTH_SECRET_MATERIAL_MULTIPLIER = 128
@@ -1934,8 +1937,18 @@ def is_usage_limit_result(status: str | None) -> bool:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
+def _route_from_greenhouse_result(res: dict | None, *, own: bool) -> str | None:
+    if not res:
+        return None
+    if res.get("route") != "deterministic":
+        return "agent"
+    return "adapter_submit:greenhouse" if own else "adapter_shadow:greenhouse"
+
+
 def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
-                            resume_text: str, resume_path) -> tuple[str, int] | None:
+                            resume_text: str, resume_path,
+                            worker_id: int = 0,
+                            attempt_store=None) -> tuple[str, int] | None:
     """Opt-in deterministic Greenhouse path. Returns (status, duration_ms) if it
     OWNED the application, else None so the apply agent proceeds. Never raises.
 
@@ -1951,8 +1964,12 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     loop's lease / canary / cost gates before we get here.
     """
     try:
-        from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
+        from applypilot.apply.greenhouse_adapter import (
+            parse_greenhouse_url,
+            resolve_greenhouse_url,
+        )
         from applypilot.apply.greenhouse_submit import (
+            RequiredFormFieldsError,
             adapter_enabled,
             apply_greenhouse,
             submit_enabled,
@@ -1962,12 +1979,54 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     if not adapter_enabled():
         return None
     url = job.get("application_url") or job.get("url") or ""
+    url = resolve_greenhouse_url(url) or url
     if not parse_greenhouse_url(url):
         return None
 
-    own = submit_enabled() and not dry_run  # may we actually submit and own the outcome?
+    # A real adapter submit is impossible without the durable attempt ledger.
+    # With the submit flag on but no injected store, stay in shadow and let the
+    # existing agent path own the application.
     t0 = time.time()
+    submit_requested = submit_enabled() and not dry_run
+    own = submit_requested and attempt_store is not None
+    if submit_requested and attempt_store is None:
+        _adapter_route_stats[worker_id] = {
+            "route": "adapter_plan:greenhouse",
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": False,
+            "failure_class": "attempt_store_unavailable",
+        }
+        return ("adapter_blocked", int((time.time() - t0) * 1000))
     res = None
+    attempt_id = None
+    attempt_state = None
+
+    def on_plan_ready(plan, actions):
+        nonlocal attempt_id, attempt_state
+        attempt_id = attempt_store.create_prepared(
+            route="adapter_submit:greenhouse",
+            route_version="greenhouse-v1",
+            evidence={
+                "plan_ready": bool(plan.ready),
+                "unmapped_required_count": len(plan.unmapped_required or []),
+                "action_count": len(actions or []),
+                "adapter_name": "greenhouse",
+                "adapter_version": "v1",
+            },
+        )
+        attempt_state = "prepared"
+        return attempt_id
+
+    def before_submit(context):
+        nonlocal attempt_state
+        attempt_store.transition(
+            context,
+            expected="prepared",
+            state="submit_started",
+            evidence={"submit_checkpoint_state": "submit_started"},
+        )
+        attempt_state = "submit_started"
+
     try:
         from playwright.sync_api import sync_playwright
         profile = config.load_profile()
@@ -1979,10 +2038,12 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 res = apply_greenhouse(url, profile=profile, resume_text=resume_text,
-                                       resume_path=pdf, page=page, dry_run=not own)
+                                       resume_path=pdf, page=page, dry_run=not own,
+                                       on_plan_ready=on_plan_ready if own else None,
+                                       before_submit=before_submit if own else None)
             finally:
                 page.close()
-    except Exception:
+    except Exception as exc:
         # If submit was attempted, the adapter owns ambiguity. Even a page-close or
         # post-click browser error must never release this job to a second submitter.
         report = (res or {}).get("report") if isinstance(res, dict) else None
@@ -1996,32 +2057,132 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
                 exc_info=True,
             )
             return (status, duration_ms)
+        if own and attempt_id and attempt_state:
+            final_state = (
+                "quarantined" if attempt_state == "submit_started" else "failed_pre_submit"
+            )
+            unmapped = list(getattr(exc, "fields", None) or getattr(exc, "missing", None) or [])
+            try:
+                attempt_store.transition(
+                    attempt_id,
+                    expected=attempt_state,
+                    state=final_state,
+                    evidence={
+                        "adapter_exception": type(exc).__name__,
+                        "unmapped_required": unmapped,
+                    },
+                )
+            except Exception:
+                logger.exception("greenhouse attempt finalization failed")
+            _adapter_route_stats[worker_id] = {
+                "route": "adapter_submit:greenhouse",
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": True,
+                "attempt_id": attempt_id,
+                "submit_checkpoint_state": final_state,
+                "failure_class": (
+                    "runtime_required_fields"
+                    if isinstance(exc, RequiredFormFieldsError)
+                    else "adapter_runtime_error"
+                ),
+                "unmapped_required": unmapped,
+                "unmapped_required_count": len(unmapped),
+            }
+            status = "crash_unconfirmed" if final_state == "quarantined" else "profile_required"
+            return status, int((time.time() - t0) * 1000)
         logger.debug("greenhouse adapter failed before submit; agent proceeds", exc_info=True)
         return None
 
     if not res or res.get("route") != "deterministic":
         logger.info("greenhouse adapter: deferring to agent (route=%s unmapped=%s)",
                     (res or {}).get("route"), (res or {}).get("unmapped"))
+        if submit_requested:
+            unmapped = list((res or {}).get("unmapped") or [])
+            _adapter_route_stats[worker_id] = {
+                "route": "adapter_plan:greenhouse",
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": False,
+                "failure_class": "adapter_unmapped_required",
+                "unmapped_required": unmapped,
+                "unmapped_required_count": len(unmapped),
+            }
+            return ("profile_required", int((time.time() - t0) * 1000))
         return None
     if not own:
         plan = res.get("plan")
         logger.info("greenhouse shadow OK: ready=%s free_text=%s",
                     res.get("ready"), list(plan.free_text) if plan else [])
+        _adapter_route_stats[worker_id] = {
+            "route": _route_from_greenhouse_result(res, own=own),
+            "adapter_name": "greenhouse",
+            "adapter_plan_ready": bool(res.get("ready")),
+        }
         return None  # shadow: agent still owns the submission
 
-    status = res.get("status", "failed:no_confirmation")
+    verification_status = res.get("verification_status") or "unverified"
+    submission_diagnostics = dict(res.get("submission_diagnostics") or {})
+    final_state = {
+        "verified": "verified",
+        "contradicted": "contradicted",
+        "unverified": "quarantined",
+    }.get(verification_status, "quarantined")
+    status = res.get("status", "crash_unconfirmed")
+    try:
+        attempt_store.transition(
+            attempt_id,
+            expected="submit_started",
+            state=final_state,
+            verification_method=res.get("verification_method"),
+            verification_ref=res.get("verification_ref"),
+            evidence={
+                "verification_status": verification_status,
+                "verification_method": res.get("verification_method"),
+                "verification_ref": res.get("verification_ref"),
+                "submission_diagnostics": submission_diagnostics,
+            },
+        )
+        attempt_state = final_state
+    except Exception:
+        # The click already happened. A ledger outage can never escape into the
+        # agent fallback or queue reclaim path; close the lease ambiguously.
+        logger.exception("greenhouse post-submit attempt finalization failed")
+        attempt_state = "quarantined"
+        verification_status = "unverified"
+        status = "crash_unconfirmed"
+    _adapter_route_stats[worker_id] = {
+        "route": "adapter_submit:greenhouse",
+        "adapter_name": "greenhouse",
+        "adapter_plan_ready": True,
+        "attempt_id": attempt_id,
+        "route_version": "greenhouse-v1",
+        "adapter_version": "v1",
+        "submit_checkpoint_state": attempt_state,
+        "verification_status": verification_status,
+        "verification_method": res.get("verification_method"),
+        "verification_ref": res.get("verification_ref"),
+        "submission_diagnostics": submission_diagnostics,
+    }
     duration_ms = int((time.time() - t0) * 1000)
     logger.info("greenhouse adapter OWNED submit for %s -> %s", url, status)
     return (status, duration_ms)
 
 
 def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
-                       resume_text: str, resume_path) -> tuple[str, int] | None:
-    """Opt-in deterministic Ashby path with sticky post-submit ownership."""
+                       resume_text: str, resume_path, worker_id: int = 0,
+                       attempt_store=None) -> tuple[str, int] | None:
+    """Deterministic Ashby path with shadow and durable submit ownership."""
     try:
         from applypilot.apply.ashby_adapter import (
-            adapter_enabled, apply_ashby, parse_ashby_url, submit_enabled,
+            adapter_enabled,
+            build_ashby_plan,
+            discover_fields,
+            execute_ashby_actions,
+            parse_ashby_url,
+            plan_ashby_actions,
+            submit_enabled,
+            verify_ashby_submission,
         )
+        from applypilot.apply.greenhouse_submit import RequiredFormFieldsError
     except Exception:
         return None
     if not adapter_enabled():
@@ -2029,9 +2190,21 @@ def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
     url = job.get("application_url") or job.get("url") or ""
     if not parse_ashby_url(url):
         return None
-    own = submit_enabled() and not dry_run
     started = time.time()
-    res = None
+    submit_requested = submit_enabled() and not dry_run
+    own = submit_requested and attempt_store is not None
+    if submit_requested and attempt_store is None:
+        _adapter_route_stats[worker_id] = {
+            "route": "adapter_plan:ashby",
+            "adapter_name": "ashby",
+            "adapter_plan_ready": False,
+            "failure_class": "attempt_store_unavailable",
+        }
+        return "adapter_blocked", int((time.time() - started) * 1000)
+
+    attempt_id = None
+    attempt_state = None
+    plan = None
     try:
         from playwright.sync_api import sync_playwright
         profile = config.load_profile()
@@ -2041,33 +2214,123 @@ def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
             page = ctx.new_page()
             try:
-                apply_url = url.rstrip("/")
-                if not apply_url.endswith("/application"):
-                    apply_url += "/application"
-                page.goto(apply_url, wait_until="domcontentloaded", timeout=30000)
-                res = apply_ashby(
-                    url, page=page, profile=profile, resume_text=resume_text,
-                    resume_path=pdf, dry_run=not own,
+                page.goto(url, wait_until="networkidle", timeout=30_000)
+                fields = discover_fields(page)
+                answer_fn = None
+                if not own:
+                    answer_fn = lambda *args, **kwargs: types.SimpleNamespace(
+                        verified=False, text="",
+                    )
+                plan = build_ashby_plan(
+                    fields, profile=profile, resume_text=resume_text,
+                    job={"site": job.get("site", ""), "title": job.get("title", "")},
+                    answer_fn=answer_fn,
                 )
+                if not plan.ready:
+                    unmapped = list(plan.unmapped_required)
+                    _adapter_route_stats[worker_id] = {
+                        "route": "adapter_plan:ashby",
+                        "adapter_name": "ashby",
+                        "adapter_plan_ready": False,
+                        "failure_class": "adapter_unmapped_required",
+                        "unmapped_required": unmapped,
+                        "unmapped_required_count": len(unmapped),
+                    }
+                    if submit_requested:
+                        return "profile_required", int((time.time() - started) * 1000)
+                    return None
+
+                actions = plan_ashby_actions(
+                    plan, fields, resume_path=pdf, include_submit=True,
+                )
+                if own:
+                    attempt_id = attempt_store.create_prepared(
+                        route="adapter_submit:ashby",
+                        route_version="ashby-v1",
+                        evidence={
+                            "plan_ready": True,
+                            "action_count": len(actions),
+                            "adapter_name": "ashby",
+                            "adapter_version": "v1",
+                        },
+                    )
+                    attempt_state = "prepared"
+
+                def before_submit():
+                    nonlocal attempt_state
+                    attempt_store.transition(
+                        attempt_id, expected="prepared", state="submit_started",
+                        evidence={"submit_checkpoint_state": "submit_started"},
+                    )
+                    attempt_state = "submit_started"
+
+                execute_ashby_actions(
+                    actions, page, dry_run=not own,
+                    before_submit=before_submit if own else None,
+                )
+                if not own:
+                    _adapter_route_stats[worker_id] = {
+                        "route": "adapter_shadow:ashby",
+                        "adapter_name": "ashby",
+                        "adapter_plan_ready": True,
+                    }
+                    return None
+                verified = verify_ashby_submission(page)
             finally:
                 page.close()
-    except Exception:
-        if own and isinstance(res, dict) and res.get("submit_attempted"):
-            status = res.get("status", "failed:no_confirmation")
-            logger.warning("ashby adapter retained submit ownership after browser error for %s -> %s",
-                           url, status, exc_info=True)
+    except Exception as exc:
+        if attempt_id and attempt_state:
+            final_state = (
+                "quarantined" if attempt_state == "submit_started" else "failed_pre_submit"
+            )
+            try:
+                attempt_store.transition(
+                    attempt_id, expected=attempt_state, state=final_state,
+                    evidence={"adapter_exception": type(exc).__name__},
+                )
+            except Exception:
+                logger.exception("ashby attempt finalization failed")
+            _adapter_route_stats[worker_id] = {
+                "route": "adapter_submit:ashby",
+                "adapter_name": "ashby",
+                "adapter_plan_ready": bool(plan and plan.ready),
+                "attempt_id": attempt_id,
+                "submit_checkpoint_state": final_state,
+                "failure_class": (
+                    "runtime_required_fields"
+                    if isinstance(exc, RequiredFormFieldsError)
+                    else "adapter_runtime_error"
+                ),
+            }
+            status = "crash_unconfirmed" if final_state == "quarantined" else "profile_required"
             return status, int((time.time() - started) * 1000)
-        logger.debug("ashby adapter failed before submit; agent proceeds", exc_info=True)
+        logger.debug("ashby adapter failed pre-submit; agent proceeds", exc_info=True)
         return None
-    if not res or res.get("route") != "deterministic":
-        logger.info("ashby adapter routed to exception/fallback: route=%s unmapped=%s",
-                    (res or {}).get("route"), (res or {}).get("unmapped"))
-        return None
-    if not own:
-        logger.info("ashby shadow OK: ready=%s", res.get("ready"))
-        return None
-    status = res.get("status", "failed:no_confirmation")
-    logger.info("ashby adapter OWNED submit for %s -> %s", url, status)
+
+    final_state = "verified" if verified else "quarantined"
+    status = "applied" if verified else "crash_unconfirmed"
+    try:
+        attempt_store.transition(
+            attempt_id, expected="submit_started", state=final_state,
+            verification_method="ashby_dom_confirmation" if verified else None,
+            verification_ref=str(url)[:500] if verified else None,
+            evidence={"verification_status": "verified" if verified else "unverified"},
+        )
+    except Exception:
+        logger.exception("ashby post-submit attempt finalization failed")
+        final_state = "quarantined"
+        status = "crash_unconfirmed"
+    _adapter_route_stats[worker_id] = {
+        "route": "adapter_submit:ashby",
+        "adapter_name": "ashby",
+        "adapter_plan_ready": True,
+        "attempt_id": attempt_id,
+        "route_version": "ashby-v1",
+        "adapter_version": "v1",
+        "submit_checkpoint_state": final_state,
+        "verification_status": "verified" if status == "applied" else "unverified",
+        "verification_method": "ashby_dom_confirmation" if status == "applied" else None,
+    }
     return status, int((time.time() - started) * 1000)
 
 
@@ -2142,7 +2405,7 @@ def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path,
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str | None = "sonnet", dry_run: bool = False,
             agent: str = "claude", inbox_auth_hint: str | None = None,
-            supervised: bool = False) -> tuple[str, int]:
+            supervised: bool = False, attempt_store=None) -> tuple[str, int]:
     """Spawn an apply-agent session for one job application.
 
     Args:
@@ -2165,7 +2428,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     """
     status, duration_ms = _run_job_impl(
         job, port, worker_id=worker_id, model=model, dry_run=dry_run,
-        agent=agent, inbox_auth_hint=inbox_auth_hint,
+        agent=agent, inbox_auth_hint=inbox_auth_hint, attempt_store=attempt_store,
     )
     if supervised:
         apply_url = job.get("application_url") or job.get("url") or ""
@@ -2180,11 +2443,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                    model: str | None = "sonnet", dry_run: bool = False,
                    agent: str = "claude",
-                   inbox_auth_hint: str | None = None) -> tuple[str, int]:
+                   inbox_auth_hint: str | None = None,
+                   attempt_store=None) -> tuple[str, int]:
     """Actual apply-agent run. See run_job for the public contract; this has
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
     wrapper, not the run itself)."""
+    _adapter_route_stats.pop(worker_id, None)
+    _last_run_stats.pop(worker_id, None)
     try:
         inbox_auth_hint = _validate_inbox_auth_hint(inbox_auth_hint)
     except _InboxAuthHintRejected as exc:
@@ -2198,17 +2464,129 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
+    def _write_job_log(transcript: str, *, label: str | None = None) -> Path | None:
+        if not transcript:
+            return None
+        try:
+            config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            agent_label = label or agent or "agent"
+            site = str(job.get("site", "unknown"))[:20]
+            job_log_path = config.LOG_DIR / f"{agent_label}_{ts}_w{worker_id}_{site}.txt"
+            job_log_path.write_text(transcript, encoding="utf-8")
+            return job_log_path
+        except Exception:
+            logger.debug("apply-agent job log write failed", exc_info=True)
+            return None
+
+    def _record_run_metadata(
+        status: str,
+        duration_ms: int,
+        *,
+        transcript: str | None = "",
+        stats_data: dict | None = None,
+        application_tool_calls_count: int = 0,
+        tool_calls_total_count: int = 0,
+        last_tool: str = "",
+        route: str | None = "agent",
+        job_log: Path | str | None = None,
+        final_result_source: str | None = None,
+        worker_level_failure: bool | None = None,
+    ) -> tuple[str, int]:
+        run_stats = dict(stats_data or {})
+        adapter_stats = _adapter_route_stats.pop(worker_id, {})
+        run_stats.update(adapter_stats)
+        transcript_text = transcript or ""
+        if route and not run_stats.get("route"):
+            run_stats["route"] = route
+        run_stats["route"] = run_stats.get("route") or "agent"
+        run_stats["transcript"] = transcript_text[-20000:]
+        if job_log is not None:
+            run_stats["job_log"] = str(job_log)
+            run_stats["job_log_path"] = str(job_log)
+        else:
+            run_stats["job_log"] = None
+            run_stats["job_log_path"] = None
+        run_stats["transcript_digest"] = (
+            "sha256:"
+            + hashlib.sha256(
+                transcript_text.encode("utf-8", errors="replace")
+            ).hexdigest()
+        )
+        if final_result_source:
+            run_stats["final_result_source"] = final_result_source
+
+        run_stats["application_tool_calls"] = int(application_tool_calls_count or 0)
+        run_stats["tool_calls_total"] = int(tool_calls_total_count or 0)
+        run_stats["last_tool"] = last_tool
+
+        if status != "applied" and "failure_class" not in run_stats:
+            classification = classify_apply_failure(
+                FailureEvidence(
+                    status=status,
+                    transcript=transcript_text,
+                    application_tool_calls=run_stats["application_tool_calls"],
+                    tool_calls_total=run_stats["tool_calls_total"],
+                    last_tool=last_tool,
+                    timeout_seconds=AGENT_TIMEOUT_SECONDS,
+                )
+            )
+            run_stats["failure_class"] = classification.failure_class
+            run_stats["safe_requeue"] = classification.safe_requeue
+            run_stats["worker_level_failure"] = (
+                classification.worker_level
+                if worker_level_failure is None
+                else worker_level_failure
+            )
+
+        _last_run_stats[worker_id] = run_stats
+        return status, duration_ms
+
+    ashby_result = _maybe_ashby_apply(
+        job, port, dry_run=dry_run, resume_text=resume_text,
+        resume_path=resume_path, worker_id=worker_id, attempt_store=attempt_store,
+    )
+    if ashby_result is not None:
+        status, duration_ms = ashby_result
+        return _record_run_metadata(
+            status,
+            duration_ms,
+            stats_data={
+                "route": "adapter_submit:ashby",
+                "adapter_name": "ashby",
+                "adapter_plan_ready": True,
+                "failure_class": None if status == "applied" else "adapter_no_confirmation",
+                "safe_requeue": False,
+                "worker_level_failure": False,
+                "application_tool_calls": 0,
+                "tool_calls_total": 0,
+                "last_tool": "ashby_adapter",
+            },
+            last_tool="ashby_adapter",
+        )
+
     # Opt-in deterministic Greenhouse adapter (no-op unless
     # APPLYPILOT_GREENHOUSE_ADAPTER is set). Owns the application only with the
     # second submit gate on a ready plan; otherwise validates + falls through.
     gh_result = _maybe_greenhouse_apply(job, port, dry_run=dry_run,
-                                        resume_text=resume_text, resume_path=resume_path)
+                                        resume_text=resume_text, resume_path=resume_path,
+                                        worker_id=worker_id,
+                                        attempt_store=attempt_store)
     if gh_result is not None:
-        return gh_result
-    ashby_result = _maybe_ashby_apply(job, port, dry_run=dry_run,
-                                     resume_text=resume_text, resume_path=resume_path)
-    if ashby_result is not None:
-        return ashby_result
+        status, duration_ms = gh_result
+        return _record_run_metadata(
+            status,
+            duration_ms,
+            stats_data={
+                "route": "adapter_submit:greenhouse",
+                "adapter_name": "greenhouse",
+                "adapter_plan_ready": True,
+                "failure_class": None if status == "applied" else "adapter_no_confirmation",
+                "safe_requeue": False,
+                "worker_level_failure": False,
+            },
+            last_tool="greenhouse_adapter",
+        )
     lever_result = _maybe_lever_shadow(
         job, port, resume_text=resume_text, resume_path=resume_path, dry_run=dry_run
     )
@@ -2270,6 +2648,16 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
     start = time.time()
     stats: dict = {}
+    stats_holder: dict = {}
+    text_parts: list[str] = []
+    final_result_text: list[str] = []  # text from the final 'result' message
+    # Count all actual tool calls separately from application-touching calls. ZERO
+    # app tool calls + a usage-limit signature == safely re-queuable, while total
+    # calls preserves non-application tool activity for worker metadata.
+    application_tool_calls = [0]
+    tool_calls_total = [0]
+    last_tool_seen = [""]
+    terminal_result_seen = threading.Event()
     proc = None
     guard = None
     execution_evidence = _ExecutionEvidence(time.monotonic())
@@ -2277,20 +2665,41 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     def _record_run_stats(*, transcript: str, job_log_path: str | None,
                           application_tool_calls: int, final_result_source: str,
                           terminal_status: str | None = None) -> None:
-        run_stats = dict(stats) if stats else {}
-        run_stats["transcript"] = transcript[-20000:]
-        run_stats["job_log"] = job_log_path
-        run_stats["job_log_path"] = job_log_path
-        run_stats["application_tool_calls"] = application_tool_calls
-        run_stats["transcript_digest"] = (
-            "sha256:" + hashlib.sha256(transcript.encode("utf-8", errors="replace")).hexdigest()
-        )
-        run_stats["final_result_source"] = final_result_source
-        run_stats["result_metadata"] = execution_evidence.snapshot(
-            cost_usd=float(run_stats.get("cost_usd") or 0),
+        stats_data = dict(stats) if stats else {}
+        result_metadata = execution_evidence.snapshot(
+            cost_usd=float(stats_data.get("cost_usd") or 0),
             terminal_status=terminal_status,
         )
-        _last_run_stats[worker_id] = run_stats
+        _record_run_metadata(
+            terminal_status or "failed:no_result_line",
+            int((time.time() - start) * 1000),
+            transcript=transcript,
+            stats_data={**stats_data, "result_metadata": result_metadata},
+            application_tool_calls_count=application_tool_calls,
+            tool_calls_total_count=tool_calls_total[0],
+            last_tool=last_tool_seen[0],
+            job_log=job_log_path,
+            final_result_source=final_result_source,
+        )
+
+    def _note_terminal_result(text: str | None, *, trusted: bool = False) -> None:
+        if trusted and text and "RESULT:" in text:
+            terminal_result_seen.set()
+
+    def _finish(status: str, duration_ms: int) -> tuple[str, int]:
+        current = dict(_last_run_stats.get(worker_id, {}))
+        return _record_run_metadata(
+            status,
+            duration_ms,
+            transcript=current.get("transcript", ""),
+            stats_data=current,
+            application_tool_calls_count=application_tool_calls[0],
+            tool_calls_total_count=tool_calls_total[0],
+            last_tool=last_tool_seen[0],
+            route=current.get("route") or "agent",
+            job_log=current.get("job_log_path"),
+            final_result_source=current.get("final_result_source"),
+        )
 
     try:
         enforce_no_lifecycle_faults()
@@ -2309,19 +2718,6 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         with _agent_lock:
             _agent_procs[worker_id] = proc
             _agent_guards[worker_id] = guard
-
-        text_parts: list[str] = []
-        final_result_text: list[str] = []  # text from the final 'result' message
-        stats_holder: dict = {}
-        terminal_result_seen = threading.Event()
-        # Count only application-touching tool calls. ZERO app tool calls + a usage-limit
-        # signature == the agent hit a wall before touching the page -> safely re-queuable
-        # (see _no_result_status). A list so the daemon-thread closure can mutate it.
-        application_tool_calls = [0]
-
-        def _note_terminal_result(text: str | None) -> None:
-            if _parse_terminal_result(text) is not None:
-                terminal_result_seen.set()
 
         def _consume_stream() -> None:
             """Read the agent's stream-json stdout to EOF.
@@ -2352,6 +2748,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         .replace("mcp__playwright__", "")
                                         .replace("mcp__gmail__", "gmail:")
                                     )
+                                    tool_calls_total[0] += 1
+                                    last_tool_seen[0] = name
                                     if _tool_call_touches_application(name):
                                         application_tool_calls[0] += 1
                                     inp = block.get("input", {})
@@ -2396,7 +2794,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             text_parts.append(rt)
                             final_result_text.clear()
                             final_result_text.append(rt)
-                            _note_terminal_result(rt)
+                            _note_terminal_result(rt, trusted=True)
                         elif msg_type == "item.completed":
                             item = msg.get("item", {})
                             item_type = item.get("type")
@@ -2410,6 +2808,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     lf.write(redact_persistent(text) + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
                                 name = item.get("name") or item.get("tool_name") or item_type
+                                tool_calls_total[0] += 1
+                                last_tool_seen[0] = str(name)
                                 if _tool_call_touches_application(str(name)):
                                     application_tool_calls[0] += 1
                                 execution_evidence.note_action(str(name), str(name), json.dumps(item, default=str))
@@ -2435,6 +2835,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                 "cost_usd": usage.get("total_cost_usd", 0),
                                 "turns": usage.get("turns", 0),
                             })
+                            _note_terminal_result(
+                                "\n".join(final_result_text),
+                                trusted=True,
+                            )
                         elif msg_type in ("error", "turn.failed"):
                             # Codex surfaces hard failures (e.g. an invalid --model, an
                             # auth/quota error) as an `error` or `turn.failed` event and
@@ -2521,7 +2925,6 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         parsed_status = _parse_terminal_result(final_text)
         final_result_source = "final_message"
         if parsed_status is None:
-            parsed_status = _parse_terminal_result(output)
             final_result_source = "transcript"
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
@@ -2574,7 +2977,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         if parsed_status == "dry_run":
             add_event(f"[W{worker_id}] DRY-RUN OK ({elapsed}s): {job['title'][:30]}")
             update_state(worker_id, status="dry_run", last_action=f"DRY-RUN ({elapsed}s)")
-            return "dry_run", duration_ms
+            return _finish("dry_run", duration_ms)
 
         for result_status in ["applied", "expired", "captcha", "login_issue", "auth_required"]:
             if parsed_status == result_status:
@@ -2607,20 +3010,43 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         else:
             add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
             update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return status, duration_ms
+        return _finish(status, duration_ms)
 
+    except LifecycleHardFault:
+        raise
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        output = "\n".join(text_parts)
+        job_log = _write_job_log(output, label=agent)
+        return _record_run_metadata(
+            "failed:timeout",
+            duration_ms,
+            transcript=output,
+            stats_data=stats_holder or stats,
+            application_tool_calls_count=application_tool_calls[0],
+            tool_calls_total_count=tool_calls_total[0],
+            last_tool=last_tool_seen[0],
+            route="agent",
+            job_log=job_log,
+        )
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         safe_error = _redact_inbox_auth_secrets(str(e), inbox_auth_hint)
         add_event(f"[W{worker_id}] ERROR: {safe_error[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {safe_error[:25]}")
-        return f"failed:{safe_error[:100]}", duration_ms
+        return _record_run_metadata(
+            f"failed:{safe_error[:100]}",
+            duration_ms,
+            transcript=safe_error,
+            stats_data=stats_holder or stats,
+            application_tool_calls_count=application_tool_calls[0],
+            tool_calls_total_count=tool_calls_total[0],
+            last_tool=last_tool_seen[0],
+            route="agent",
+        )
     finally:
         with _agent_lock:
             _agent_procs.pop(worker_id, None)
@@ -2744,13 +3170,24 @@ def _should_prearm_inbox_auth(job: dict) -> bool:
         from urllib.parse import urlparse
 
         apply_target = job.get("application_url") or job.get("url")
-        url_lower = (apply_target or "").lower()
         host = (urlparse(apply_target or "").hostname or "").lower()
         sites_cfg = config.load_sites_config()
         auth_cfg = sites_cfg.get("auth_gated", {}) or {}
+        prearm_cfg = sites_cfg.get("inbox_auth_prearm", {}) or {}
         domains = [str(d).lower() for d in (auth_cfg.get("domains", []) or [])]
+        domains.extend(
+            str(d).lower() for d in (prearm_cfg.get("domains", []) or [])
+        )
         domains.extend(str(d).lower() for d in config.load_blocked_sso())
-        return any(d and (d in host or d in url_lower) for d in domains)
+        normalized_domains = {
+            d.strip().strip(".")
+            for d in domains
+            if d and d.strip().strip(".")
+        }
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in normalized_domains
+        )
     except Exception:
         logger.debug("Could not evaluate inbox auth pre-arm eligibility", exc_info=True)
         return False

@@ -689,7 +689,7 @@ def test_write_apply_result_records_model_and_duration(fleet_db):
 
 def test_write_apply_result_records_durable_result_event(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
-        _seed_apply(conn, "event1", host="ashbyhq.com", company="Epsilon", title="Staff Engineer")
+        _seed_apply(conn, "event1", host="ashbyhq.com", score=9, company="Epsilon", title="Staff Engineer")
         a = queue.lease_apply(conn, "w1", home_ip="1.2.3.4")
         ok = queue.write_apply_result(
             conn,
