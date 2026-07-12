@@ -3,18 +3,15 @@ from __future__ import annotations
 from applypilot.fleet import version
 
 
-def test_worker_version_includes_sanitized_branch_commit_and_dirty(monkeypatch):
-    values = {
-        ("rev-parse", "--short", "HEAD"): "abc1234",
-        ("rev-parse", "--abbrev-ref", "HEAD"): "codex/fleet ops",
-        ("status", "--porcelain"): " M file.py",
-    }
-    monkeypatch.setattr(version, "_git_text", lambda args: values.get(tuple(args)))
+def test_worker_version_uses_canonical_tree_identity(monkeypatch):
+    monkeypatch.setattr(
+        version, "current_sw_version", lambda: "0.3.0+git.tree.abc1234.dirty"
+    )
 
-    assert version.worker_version() == "0.3.0+git.codex-fleet-ops.abc1234.dirty"
+    assert version.worker_version() == "0.3.0+git.tree.abc1234.dirty"
 
 
-def test_worker_version_falls_back_to_package_version_without_git(monkeypatch):
-    monkeypatch.setattr(version, "_git_text", lambda args: None)
+def test_worker_version_preserves_canonical_no_git_fallback(monkeypatch):
+    monkeypatch.setattr(version, "current_sw_version", lambda: "0.3.0+git.unavailable")
 
-    assert version.worker_version() == "0.3.0"
+    assert version.worker_version() == "0.3.0+git.unavailable"
