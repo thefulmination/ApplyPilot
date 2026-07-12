@@ -19,6 +19,7 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
+from applypilot import config
 from applypilot.fleet import schema as fleet_schema
 
 # Tables truncated between tests (in addition to apply_queue / fleet_config).
@@ -31,6 +32,12 @@ _V3_TABLES = [
     "fleet_console_audit", "agent_availability", "autotriage_actions", "apply_result_events",
     "fleet_machine_blackout",
 ]
+
+
+@pytest.fixture(autouse=True)
+def isolate_local_runtime_state(tmp_path, monkeypatch):
+    """Keep durable lifecycle interlocks created by tests out of the live runtime."""
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "applypilot.db")
 
 
 def _find_pg_bin() -> Path | None:
