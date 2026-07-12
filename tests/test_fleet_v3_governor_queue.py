@@ -530,6 +530,65 @@ def test_linkedin_lease_serializes_under_concurrency(fleet_db):
     assert len(leased) == 1, f"account:linkedin must serialize to ONE concurrent session, got {leased}"
 
 
+def test_ats_canary_exhaustion_does_not_globally_pause_linkedin(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "ats-canary", host="greenhouse.io", score=9)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-after-ats-canary', 'Co', 'Role', "
+                "'https://linkedin.com/jobs/1', 8, 'linkedin', 'b1')"
+            )
+            cur.execute(
+                "UPDATE fleet_config SET canary_enabled=TRUE, canary_remaining=1, "
+                "linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL, paused=FALSE WHERE id=1"
+            )
+        conn.commit()
+
+        assert queue.lease_apply(conn, "w-ats", home_ip="1.1.1.1") is not None
+        with conn.cursor() as cur:
+            cur.execute("SELECT paused, canary_remaining FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+        assert cfg["canary_remaining"] == 0
+        assert cfg["paused"] is False
+
+        leased = queue.lease_linkedin(
+            conn, "w-li", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        )
+        assert leased is not None
+        assert leased["url"] == "li-after-ats-canary"
+
+
+def test_linkedin_canary_exhaustion_does_not_block_ats(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "ats-after-li-canary", host="greenhouse.io", score=9)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, company, title, application_url, score, lane, approved_batch) "
+                "VALUES ('li-canary', 'Co', 'Role', 'https://linkedin.com/jobs/1', 8, 'linkedin', 'b1')"
+            )
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1, "
+                "canary_enabled=FALSE, canary_remaining=NULL, paused=FALSE WHERE id=1"
+            )
+        conn.commit()
+
+        assert queue.lease_linkedin(
+            conn, "w-li", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        ) is not None
+        with conn.cursor() as cur:
+            cur.execute("SELECT paused, linkedin_canary_remaining FROM fleet_config WHERE id=1")
+            cfg = cur.fetchone()
+        assert cfg["linkedin_canary_remaining"] == 0
+        assert cfg["paused"] is False
+
+        leased = queue.lease_apply(conn, "w-ats", home_ip="1.1.1.1")
+        assert leased is not None
+        assert leased["url"] == "ats-after-li-canary"
+
+
 def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)

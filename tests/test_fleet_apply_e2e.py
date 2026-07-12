@@ -51,14 +51,12 @@ def test_canary_go_live_path(fleet_db):
     # ---- canary capped the fleet at exactly K=2 ---------------------------------
     assert applied == 2, (
         f"expected exactly 2 applied (canary K=2) but got {applied}; "
-        "check that the canary decrement+pause is atomic in queue.lease_apply"
+        "check that the canary decrement is atomic in queue.lease_apply"
     )
 
-    # ---- fleet_config auto-paused for operator review ---------------------------
+    # ---- ATS canary exhausted without globally pausing other lanes ---------------
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT paused FROM fleet_config WHERE id=1")
+        cur.execute("SELECT paused, canary_remaining FROM fleet_config WHERE id=1")
         row = cur.fetchone()
-        assert row["paused"] is True, (
-            "fleet_config.paused must be TRUE after the canary budget is exhausted "
-            "(the auto-pause gate in the lease CTE)"
-        )
+        assert row["canary_remaining"] == 0
+        assert row["paused"] is False

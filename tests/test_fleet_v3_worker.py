@@ -13,6 +13,7 @@ import pytest
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import captcha
+from applypilot.fleet import config as fcfg
 from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
 
@@ -252,6 +253,53 @@ def _seed_one_apply(conn, url="a1", host="greenhouse.io"):
         "url": url, "company": "Acme", "title": "Chief of Staff",
         "application_url": f"https://{host}/jobs/1", "score": 9.0, "target_host": host,
     }], approved_batch="batchA")
+
+
+def test_worker_refuses_to_lease_when_source_version_is_stale(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "stale-version")
+        fcfg.set_pinned_version(conn, "0.3.0+git.tree.expected")
+
+    loop = WorkerLoop(
+        _factory(fleet_db), "w-stale", home_ip="5.5.5.5", role="apply",
+        apply_fn=lambda job: _CLEAR_HTML, sw_version="0.3.0+git.tree.stale",
+    )
+
+    res = loop.run_once()
+    assert res == {
+        "action": "version_mismatch",
+        "expected_version": "0.3.0+git.tree.expected",
+        "sw_version": "0.3.0+git.tree.stale",
+    }
+
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM apply_queue WHERE url='stale-version'")
+        assert cur.fetchone()["status"] == "queued"
+        cur.execute("SELECT state, sw_version FROM worker_heartbeat WHERE worker_id='w-stale'")
+        hb = cur.fetchone()
+        assert hb["state"] == "version_mismatch"
+        assert hb["sw_version"] == "0.3.0+git.tree.stale"
+
+
+def test_canary_source_version_only_unblocks_the_declared_worker(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_one_apply(conn, "canary-version")
+        fcfg.set_pinned_version(
+            conn,
+            "0.3.0+git.tree.stable",
+            canary_version="0.3.0+git.tree.canary",
+            canary_worker_id="w-canary",
+        )
+
+        assert queue.lease_apply(
+            conn, "w-other", home_ip="5.5.5.5", sw_version="0.3.0+git.tree.canary"
+        ) is None
+        leased = queue.lease_apply(
+            conn, "w-canary", home_ip="5.5.5.5", sw_version="0.3.0+git.tree.canary"
+        )
+
+    assert leased is not None
+    assert leased["url"] == "canary-version"
 
 
 def test_worker_apply_visible_captcha_parks_and_raises_challenge(fleet_db):

@@ -384,6 +384,16 @@ class WorkerLoop:
             if self._paused:
                 self._beat(conn, state="paused")
                 return {"action": "paused"}
+            expected_version = queue.version_mismatch(conn, self.worker_id, self.sw_version)
+            if expected_version:
+                self._record_event(
+                    f"version mismatch expected={expected_version} current={self.sw_version}")
+                self._beat(conn, state="version_mismatch")
+                return {
+                    "action": "version_mismatch",
+                    "expected_version": expected_version,
+                    "sw_version": self.sw_version,
+                }
             if self.role == ROLE_COMPUTE:
                 return self._tick_compute(conn)
             if self.role == ROLE_DISCOVERY:
@@ -394,7 +404,7 @@ class WorkerLoop:
 
     # -- COMPUTE: score/audit/tailor -- IP-free, cost-governed (§8, R14) -------
     def _tick_compute(self, conn) -> dict:
-        job = queue.lease_compute(conn, self.worker_id)
+        job = queue.lease_compute(conn, self.worker_id, sw_version=self.sw_version)
         if job is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}
@@ -420,7 +430,7 @@ class WorkerLoop:
 
     # -- DISCOVERY: governed scrape (RF2/§8.5) --------------------------------
     def _tick_discovery(self, conn) -> dict:
-        task = queue.lease_search(conn, self.worker_id)
+        task = queue.lease_search(conn, self.worker_id, sw_version=self.sw_version)
         if task is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}
@@ -454,7 +464,7 @@ class WorkerLoop:
 
     # -- APPLY: governed, dedup-gated, approval-gated, captcha-aware (§5/§7) ---
     def _tick_apply(self, conn) -> dict:
-        job = queue.lease_apply(conn, self.worker_id, home_ip=self.home_ip)
+        job = queue.lease_apply(conn, self.worker_id, home_ip=self.home_ip, sw_version=self.sw_version)
         if job is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}
@@ -528,7 +538,10 @@ class WorkerLoop:
     def _tick_linkedin(self, conn) -> dict:
         # Pre-checks (belts; the lease SQL is the real enforcement). Session pre-flight +
         # halt pre-check; the interlock is held by the entrypoint for the worker's life.
-        job = queue.lease_linkedin(conn, self.worker_id, public_ip=self.public_ip, owner_ip=self.owner_ip)
+        job = queue.lease_linkedin(
+            conn, self.worker_id, public_ip=self.public_ip, owner_ip=self.owner_ip,
+            sw_version=self.sw_version,
+        )
         if job is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}

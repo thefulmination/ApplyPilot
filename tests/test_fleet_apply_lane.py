@@ -46,7 +46,7 @@ def test_canary_caps_total_leases_fleetwide(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT canary_remaining, paused FROM fleet_config WHERE id=1")
         row = cur.fetchone()
-        assert row["canary_remaining"] == 0 and row["paused"] is True
+        assert row["canary_remaining"] == 0 and row["paused"] is False
 
 
 def test_canary_atomic_under_concurrency(fleet_db):

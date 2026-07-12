@@ -24,7 +24,7 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import answer_bank, broker as broker_mod, queue
+from applypilot.fleet import answer_bank, broker as broker_mod, config as fcfg, queue
 from applypilot.fleet.broker import AuthError, Broker, CapabilityError
 
 OWNER_IP = "203.0.113.7"
@@ -128,6 +128,24 @@ def test_lease_routes_by_lane(fleet_db):
 
         srch = b.lease(conn, wid, token, lane="search")
         assert srch is not None and srch["task_id"] == "t1"
+
+
+def test_broker_lease_refuses_stale_worker_version(fleet_db):
+    b = Broker(owner_ip=OWNER_IP)
+    with pgqueue.connect(fleet_db) as conn:
+        wid, token = b.enroll_worker(conn, "alice", capabilities=_ALL_CAPS, public_ip=OWNER_IP)
+        _seed_apply(conn)
+        fcfg.set_pinned_version(conn, "0.3.0+git.tree.expected")
+
+        assert b.lease(
+            conn, wid, token, lane="ats", sw_version="0.3.0+git.tree.stale"
+        ) is None
+        leased = b.lease(
+            conn, wid, token, lane="ats", sw_version="0.3.0+git.tree.expected"
+        )
+
+    assert leased is not None
+    assert leased["url"].endswith("/ats1")
 
 
 def test_lease_capability_gate(fleet_db):

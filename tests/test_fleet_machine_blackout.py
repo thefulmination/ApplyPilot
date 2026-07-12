@@ -74,13 +74,14 @@ def test_status_line_is_powershell_friendly(fleet_db):
 
 def test_control_cli_defaults_allow_home_and_mac_without_duplicates(fleet_db, monkeypatch, capsys):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    until = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
 
     rc = machine_blackout_main.main([
         "blackout",
         "--name",
         "default-policy",
         "--until",
-        "2026-07-06 17:00",
+        until,
         "--reason",
         "default allow list",
     ])

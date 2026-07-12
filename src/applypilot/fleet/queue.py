@@ -14,8 +14,19 @@ import numbers
 import urllib.parse as _urlparse
 
 from applypilot import config
+from applypilot.fleet import config as fleet_config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
+
+
+def version_mismatch(conn, worker_id: str, sw_version: str | None) -> str | None:
+    """Return the required version when this worker must not lease work."""
+    if sw_version is None:
+        return None
+    expected = fleet_config.version_for_worker(conn, worker_id)
+    if expected and sw_version != expected:
+        return expected
+    return None
 
 # ---------------------------------------------------------------------------
 # APPLY lease -- governed, approval-gated, dedup-guarded (R6, R9, R11).
@@ -24,12 +35,11 @@ from applypilot.fleet import governor
 #   - cfg … FOR UPDATE row-locks the single fleet_config row, serializing ALL
 #     apply leases on it — exactly as _LEASE_LINKEDIN locks 'account:linkedin'.
 #     No two transactions can pass the canary guard simultaneously.
-#   - The reserve UPDATE is a data-modifying CTE. Postgres runs ALL WITH
-#     data-modifying CTEs to completion even when unreferenced in the outer
-#     statement. It only fires when EXISTS(next_job), so a no-op lease (empty
-#     queue / all guards fail) never decrements canary_remaining.
-#   - paused = (paused OR canary_remaining-1 <= 0) only ever SETS paused to
-#     TRUE; it never clears it, so a cost-pause or manual pause is preserved.
+#   - The reserve UPDATE is referenced by the outer UPDATE, so the canary
+#     decrement is part of the lease statement. It only fires when EXISTS(next_job),
+#     so a no-op lease (empty queue / all guards fail) never decrements canary_remaining.
+#   - canary_remaining is lane-local. Exhausting an ATS canary must not write
+#     the shared paused flag, because that would stall the LinkedIn lane too.
 # ---------------------------------------------------------------------------
 _LEASE_APPLY = """
 WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_cap_usd FROM fleet_config WHERE id=1 FOR UPDATE),
@@ -86,21 +96,24 @@ WITH cfg AS (SELECT canary_enabled, canary_remaining, paused, ats_paused, spend_
      ),
      reserve AS (
        UPDATE fleet_config
-          SET canary_remaining = canary_remaining - 1,
-              paused = (paused OR canary_remaining - 1 <= 0)
+          SET canary_remaining = canary_remaining - 1
         WHERE id = 1 AND canary_enabled AND EXISTS (SELECT 1 FROM next_job)
        RETURNING 1
      )
 UPDATE apply_queue q
 SET status='leased', lease_owner=%(worker)s, lease_expires_at = now() + make_interval(secs => %(ttl)s),
     last_attempted_at = now(), attempts = q.attempts + 1, updated_at = now(), worker_home_ip = %(home_ip)s
-FROM next_job WHERE q.url = next_job.url
+FROM next_job
+LEFT JOIN reserve ON TRUE
+WHERE q.url = next_job.url
 RETURNING q.url, q.company, q.title, q.application_url,
           COALESCE(q.target_host, q.apply_domain) AS target_host, q.score, q.dedup_key, q.attempts;
 """
 
 
-def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200):
+def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200, sw_version=None):
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         cur.execute(_LEASE_APPLY, {
@@ -392,7 +405,9 @@ RETURNING c.url, c.task, c.payload, c.attempts;
 """
 
 
-def lease_compute(conn, worker_id, *, ttl_seconds=1200):
+def lease_compute(conn, worker_id, *, ttl_seconds=1200, sw_version=None):
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     if _cost_cap_exceeded(conn):
         return None
     with conn.cursor() as cur:
@@ -475,7 +490,9 @@ RETURNING s.task_id, s.query, s.board, s.location, s.params, s.cadence_seconds;
 """
 
 
-def lease_search(conn, worker_id, *, ttl_seconds=900):
+def lease_search(conn, worker_id, *, ttl_seconds=900, sw_version=None):
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     with conn.cursor() as cur:
         cur.execute(_LEASE_SEARCH, {"worker": worker_id, "ttl": ttl_seconds})
         row = cur.fetchone()
@@ -564,13 +581,16 @@ WITH cfg AS (SELECT linkedin_canary_enabled, linkedin_canary_remaining FROM flee
      )
 UPDATE linkedin_queue q SET status='leased', lease_owner=%(worker)s,
   lease_expires_at = now() + make_interval(secs => %(ttl)s), last_attempted_at=now(), attempts=q.attempts+1, updated_at=now()
-FROM next WHERE q.url = next.url
+FROM next
+LEFT JOIN reserve ON TRUE
+LEFT JOIN canary ON TRUE
+WHERE q.url = next.url
 RETURNING q.url, q.company, q.title, q.application_url, q.score;
 """
 
 
 def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
-                   daily_cap=20, min_gap_seconds=1200):
+                   daily_cap=20, min_gap_seconds=1200, sw_version=None):
     """LinkedIn lease: ONLY from the one owner IP, serialized by the account mutex.
 
     ``public_ip`` is the worker's REGISTERED egress IP and ``owner_ip`` is the
@@ -578,6 +598,8 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
     worker. They must match or the lease is refused outright."""
     if public_ip is None or owner_ip is None or public_ip != owner_ip:
         return None  # LinkedIn never from a different IP than the owner's
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         # Ensure the account governor row EXISTS so the FOR UPDATE mutex has a row to
