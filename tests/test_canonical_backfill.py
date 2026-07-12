@@ -68,17 +68,19 @@ def test_pairwise_ab_artifact_resolves_item_ids_and_kg_schema_version(tmp_path):
     urls = ("https://example.com/a", "https://example.com/b")
     for url in urls:
         conn.execute("INSERT INTO jobs (url,title) VALUES (?,?)", (url, "Role"))
-    for event_id, item_id in (("l-a", "item-a"), ("l-b", "item-b")):
-        conn.execute(
-            "INSERT INTO research_labels (id,item_id,job_url,raw_event_json) VALUES (?,?,?,?)",
-            (event_id, item_id, None, "{}"),
-        )
     conn.commit()
+    (tmp_path / "labels.jsonl").write_text(
+        "\n".join(
+            json.dumps({"id": event_id, "itemId": item_id, "createdAt": "2026-01-01T00:00:00Z"})
+            for event_id, item_id in (("l-a", "item-a"), ("l-b", "item-b"))
+        ) + "\n",
+        encoding="utf-8",
+    )
     (tmp_path / "pairwise.jsonl").write_text(
         json.dumps({"id": "pw-1", "jobAItemId": "item-a", "jobBItemId": "item-b", "result": "b"}) + "\n",
         encoding="utf-8",
     )
-    (tmp_path / "pairwise-candidates.json").write_text(
+    (tmp_path / "pairwise-catalog-map.json").write_text(
         json.dumps([{
             "pairId": "pair-1",
             "jobA": {"itemId": "item-a", "applicationUrl": urls[0]},
@@ -94,6 +96,9 @@ def test_pairwise_ab_artifact_resolves_item_ids_and_kg_schema_version(tmp_path):
     report = backfill_research_artifacts(conn, tmp_path)
 
     assert report["pairwise"]["written"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM research_labels WHERE job_url IS NOT NULL"
+    ).fetchone()[0] == 2
     row = conn.execute(
         "SELECT left_job_url,right_job_url,winner FROM research_pairwise_labels WHERE id='pw-1'"
     ).fetchone()

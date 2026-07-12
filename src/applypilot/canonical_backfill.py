@@ -106,6 +106,45 @@ def _import_pairwise_rows(conn: sqlite3.Connection, paths: list[Path]) -> dict[s
     return {"read": len(rows), "written": written, "skipped": skipped, "sha256": _digest(rows)}
 
 
+def _import_label_rows(
+    conn: sqlite3.Connection, label_paths: list[Path], mapping_paths: list[Path]
+) -> dict[str, Any]:
+    rows = [row for path in label_paths for row in _read_json_records(path)]
+    mappings = [row for path in mapping_paths for row in _read_json_records(path)]
+    job_urls: dict[str, str] = {}
+    for job_url, application_url in conn.execute(
+        "SELECT url,application_url FROM jobs ORDER BY url"
+    ).fetchall():
+        job_urls.setdefault(job_url, job_url)
+        if application_url:
+            job_urls.setdefault(application_url, job_url)
+    item_urls: dict[str, str] = {}
+    for row in mappings:
+        for side in ("jobA", "jobB"):
+            job = row.get(side)
+            if not isinstance(job, dict):
+                continue
+            item_id = job.get("itemId") or job.get("item_id")
+            candidate_url = (
+                job.get("jobUrl") or job.get("sourceUrl") or job.get("applicationUrl")
+                or job.get("url")
+            )
+            if item_id and candidate_url and str(candidate_url) in job_urls:
+                item_urls[str(item_id)] = job_urls[str(candidate_url)]
+    written = 0
+    skipped = 0
+    for row in sorted(rows, key=_canonical):
+        enriched = dict(row)
+        item_id = row.get("item_id") or row.get("itemId")
+        if not (row.get("job_url") or row.get("jobUrl")) and item_id in item_urls:
+            enriched["jobUrl"] = item_urls[str(item_id)]
+        if _label(conn, enriched):
+            written += 1
+        else:
+            skipped += 1
+    return {"read": len(rows), "written": written, "skipped": skipped, "sha256": _digest(rows)}
+
+
 def _score(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     url = row.get("job_url") or row.get("jobUrl") or row.get("url")
     if not url or conn.execute("SELECT 1 FROM jobs WHERE url=?", (url,)).fetchone() is None:
@@ -156,7 +195,10 @@ def _label(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
             tags_json,method,fit_map_feedback_json,review_queue_json,item_status_at_review,
             created_at,raw_event_json
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET raw_event_json=excluded.raw_event_json
+        ON CONFLICT(id) DO UPDATE SET
+            job_url=COALESCE(research_labels.job_url,excluded.job_url),
+            item_id=COALESCE(research_labels.item_id,excluded.item_id),
+            raw_event_json=excluded.raw_event_json
         """,
         (
             event_id, row.get("job_url") or row.get("jobUrl"), row.get("item_id") or row.get("itemId"),
@@ -297,9 +339,12 @@ def _kg(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
 def backfill_research_artifacts(conn: sqlite3.Connection, fixture_dir: str | Path) -> dict[str, Any]:
     """Import every supported artifact deterministically and idempotently."""
     root = Path(fixture_dir)
+    mapping_paths = _files(root, "catalog-map")
     reports = {
         "scores": _import_rows(conn, _files(root, "score", exclude=("pairwise",)), _score),
-        "labels": _import_rows(conn, _files(root, "label", exclude=("pairwise",)), _label),
+        "labels": _import_label_rows(
+            conn, _files(root, "label", exclude=("pairwise",)), mapping_paths
+        ),
         "pairwise": _import_pairwise_rows(conn, _files(root, "pairwise")),
         "kg": _import_rows(conn, _files(root, "knowledge_graph") + _files(root, "compact_kg"), _kg),
         "outcomes": _import_rows(conn, _files(root, "outcome"), _outcome),
