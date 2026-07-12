@@ -85,6 +85,7 @@ def test_queue_diagnosis_exposes_blocked_reason_breakdown(fleet_db):
 
     assert result["blocked"] == {
         "total": 2,
+        "groups": {"routing_or_policy": 1, "unavailable": 1},
         "reasons": {"adapter_unsupported": 1, "expired": 1},
     }
 
@@ -105,5 +106,6 @@ def test_queue_diagnosis_exposes_terminal_reason_breakdown(fleet_db):
 
     assert result["terminal"] == {
         "total": 2,
+        "groups": {"submission_uncertain": 1, "timeout_or_stuck": 1},
         "reasons": {"crash_unconfirmed": 1, "failed:timeout": 1},
     }

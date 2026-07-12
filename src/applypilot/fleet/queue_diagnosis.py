@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from applypilot.fleet.failure_taxonomy import group_reason_counts
+
 _NONWORD = re.compile(r"[^a-z0-9]+")
 _KNOWN_AGGREGATOR_COMPANIES = {
     "chiefofstaffjob com",
@@ -182,10 +184,12 @@ def queue_diagnosis(conn, *, overbroad_limit: int = 25) -> dict[str, Any]:
         },
         "blocked": {
             "total": sum(blocked_reasons.values()),
+            "groups": group_reason_counts(blocked_reasons),
             "reasons": blocked_reasons,
         },
         "terminal": {
             "total": sum(terminal_reasons.values()),
+            "groups": group_reason_counts(terminal_reasons),
             "reasons": terminal_reasons,
         },
         "dedup": {
