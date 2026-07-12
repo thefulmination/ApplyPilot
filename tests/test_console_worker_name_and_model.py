@@ -159,7 +159,7 @@ def test_workers_table_includes_model_and_machine_columns_in_html(live_server) -
     assert "<th>Model</th>" in html
     assert "<th>Model vendor</th>" in html
     assert "<th>Last switch</th>" in html
-    assert 'class="table-wrap"' in html
+    assert 'class="table-scroll"' in html
     assert "id=\"workers\"" in html
     assert "id=\"aPrimaryModel\"" in html
     assert "id=\"aSwitchStatus\"" in html

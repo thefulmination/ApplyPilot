@@ -35,16 +35,21 @@ import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import socket
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+from psycopg import errors
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
 from applypilot.fleet import compute_home_main as compute_home
+from applypilot.fleet import console_machines
 from applypilot.fleet import queue as _queue
 from applypilot.fleet.failure_taxonomy import canonical_failure_group
 from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor (S1: scrub on READ too)
@@ -539,6 +544,69 @@ def _seconds_since(ts: Any) -> int | None:
     return int((now - t).total_seconds())
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _git_text(args: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=_repo_root(), text=True, capture_output=True,
+            timeout=3, check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _deployment_info(conn) -> dict[str, Any]:
+    """Read-only console/schema/version facts for the dashboard."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='worker_heartbeat' "
+            "AND column_name IN ('current_agent','current_model','agent_chain',"
+            "'last_agent_switch_at','last_agent_switch_reason')"
+        )
+        telemetry_cols = {r["column_name"] for r in cur.fetchall()}
+        cur.execute("SELECT to_regclass('public.fleet_console_audit') AS audit_table")
+        audit_table = cur.fetchone()["audit_table"]
+        cur.execute(
+            "SELECT COALESCE(sw_version, '(unknown)') AS version, worker_id, machine_owner "
+            "FROM worker_heartbeat ORDER BY 1, worker_id"
+        )
+        groups: dict[str, dict[str, Any]] = {}
+        for row in cur.fetchall():
+            version = row["version"]
+            owner = console_machines.infer_machine_owner(row["worker_id"], row.get("machine_owner"))
+            machine = console_machines.display_name(owner)
+            group = groups.setdefault(
+                version, {"version": version, "workers": 0, "machines": [], "worker_ids": []}
+            )
+            group["workers"] += 1
+            group["worker_ids"].append(row["worker_id"])
+            if machine not in group["machines"]:
+                group["machines"].append(machine)
+    conn.rollback()
+    return {
+        "console": {
+            "branch": _git_text(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown",
+            "commit": _git_text(["rev-parse", "--short", "HEAD"]) or "unknown",
+            "path": str(_repo_root()),
+        },
+        "schema": {
+            "agent_telemetry": {
+                "current_agent", "current_model", "agent_chain",
+                "last_agent_switch_at", "last_agent_switch_reason",
+            }.issubset(telemetry_cols),
+            "audit_table": bool(audit_table),
+        },
+        "worker_versions": list(groups.values()),
+    }
+
+
 def _classify_browser_issue(text: Any) -> str | None:
     if not text:
         return None
@@ -978,7 +1046,7 @@ def _workers(conn) -> list[dict]:
     latest_usage = _latest_worker_llm_usage(conn)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT wh.worker_id, wh.machine_owner, wh.state, wh.role, wh.current_job, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.home_ip, wh.state, wh.role, wh.current_job, "
             "       wh.sw_version, wh.last_beat, wh.current_agent, wh.current_model, "
             "       wh.agent_chain, wh.last_agent_switch_at, wh.last_agent_switch_reason, "
             "       aq.company AS cur_company, aq.title AS cur_title, "
@@ -1001,14 +1069,22 @@ def _workers(conn) -> list[dict]:
         current = None
         if r["current_job"] and r["state"] == "applying":
             current = {"company": r["cur_company"], "title": r["cur_title"]}
+        machine_owner = console_machines.infer_machine_owner(
+            r["worker_id"], r.get("machine_owner")
+        )
         out.append({
             "worker_id": r["worker_id"],
             "machine": _machine_display_name(machine_owner),
             "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
+            "home_ip": r.get("home_ip"),
             "alive": bool(alive),
+            "health": "alive" if alive else "stale",
             "state": r.get("state"),
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
+            "role": r["role"],
+            "state": r["state"],
             "lane": r["role"],
             "sw_version": r.get("sw_version"),
             "applied": int(r["applied_n"] or 0),
@@ -1766,7 +1842,7 @@ def _discovery(conn) -> dict:
         )
         d = dict(cur.fetchone())
         cur.execute(
-            "SELECT wh.worker_id, wh.machine_owner, wh.state, wh.last_beat, "
+            "SELECT wh.worker_id, wh.machine_owner, wh.home_ip, wh.state, wh.last_beat, "
             "       (SELECT COUNT(*) FROM discovered_postings dp "
             "          WHERE dp.worker_id = wh.worker_id "
             "            AND dp.discovered_at > now() - interval '24 hours') AS found_24h "
@@ -1783,10 +1859,14 @@ def _discovery(conn) -> dict:
     workers = []
     for r in wrows:
         secs = _seconds_since(r["last_beat"])
+        machine_owner = console_machines.infer_machine_owner(
+            r["worker_id"], r.get("machine_owner")
+        )
         workers.append({
             "worker_id": r["worker_id"],
-            "machine": _machine_display_name(r.get("machine_owner")),
-            "machine_owner": r.get("machine_owner"),
+            "machine_owner": machine_owner,
+            "machine_display_name": console_machines.display_name(machine_owner),
+            "home_ip": r.get("home_ip"),
             "alive": bool(secs is not None and secs <= _HB_ALIVE_SECONDS),
             "last_beat": _iso(r["last_beat"]),
             "seconds_since": secs,
@@ -2468,6 +2548,8 @@ def diagnosis() -> dict:
             }
         try:
             discovery = _discovery(conn)
+            for worker in discovery.get("workers", []):
+                worker["machine"] = _machine_display_name(worker.get("machine_owner"))
         except Exception:
             try:
                 conn.rollback()
@@ -2927,6 +3009,16 @@ def build_status() -> dict:
     try:
         gate, queue, apply_state = _gate_and_queue(conn)
         try:
+            from applypilot.fleet import console_diagnosis
+
+            fleet_diagnosis = console_diagnosis.queue_diagnosis(conn)
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            fleet_diagnosis = None
+        try:
             gate["should_halt"] = bool(pgqueue.should_halt(conn))
         except Exception:
             gate["should_halt"] = gate["paused"]
@@ -2956,6 +3048,7 @@ def build_status() -> dict:
                 pass
             browser = {"summary": {}, "issues": []}
         versions = _versions(conn)
+        deployment = _deployment_info(conn)
         recent = _recent(conn, 15)
         ch = cb._challenges(conn)
         challenges = len(ch.get("challenges", []))
@@ -2970,6 +3063,8 @@ def build_status() -> dict:
             doctor_sig = None
         try:
             discovery = _discovery(conn)
+            for worker in discovery.get("workers", []):
+                worker["machine"] = _machine_display_name(worker.get("machine_owner"))
         except Exception:
             try:
                 conn.rollback()
@@ -3039,6 +3134,7 @@ def build_status() -> dict:
         "queue": queue,
         "workers": workers,
         "versions": versions,
+        "deployment": deployment,
         "recent": recent,
         "challenges": challenges,
         "linkedin": linkedin,
@@ -3651,6 +3747,116 @@ _ACTIONS = {
     "challenge_skip_host": _do_challenge_skip_host,
 }
 
+_AUDIT_ACTION_CAP = 120
+_AUDIT_MESSAGE_CAP = 500
+_AUDIT_LANE_CAP = 120
+_AUDIT_TARGET_CAP = 300
+_AUDIT_READ_LIMIT = 25
+_AUDIT_SECRET_WORD_RE = re.compile(
+    r"(?i)\b(token|password|passwd|pwd|secret|api[_-]?key)\s+[^\s,'\"}{]+"
+)
+
+
+def _audit_text(value: Any, limit: int) -> str:
+    safe = _scrub("" if value is None else str(value))
+    safe = _AUDIT_SECRET_WORD_RE.sub(r"\1 [REDACTED]", safe)
+    return safe[:limit]
+
+
+def _audit_optional_text(value: Any, limit: int) -> str | None:
+    if value is None:
+        return None
+    return _audit_text(value, limit)
+
+
+def _audit_action(conn, *, action: str, ok: bool, message: str,
+                  lane: str | None = None, target: str | None = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fleet_console_audit (action, actor, ok, message, lane, target) "
+            "VALUES (%s,'console',%s,%s,%s,%s)",
+            (
+                _audit_text(action or "unknown", _AUDIT_ACTION_CAP),
+                bool(ok),
+                _audit_text(message or "", _AUDIT_MESSAGE_CAP),
+                _audit_optional_text(lane, _AUDIT_LANE_CAP),
+                _audit_optional_text(target, _AUDIT_TARGET_CAP),
+            ),
+        )
+    conn.commit()
+
+
+def _rollback_quietly(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _try_audit_action(conn, **kwargs) -> None:
+    try:
+        _audit_action(conn, **kwargs)
+    except Exception:
+        _rollback_quietly(conn)
+
+
+def audit_lifecycle_event(action: str, message: str) -> None:
+    """Best-effort audit for console process lifecycle events.
+
+    Lifecycle audit must never prevent the dashboard from starting or stopping.
+    """
+    conn = None
+    try:
+        conn = pgqueue.connect()
+        _audit_action(conn, action=action, ok=True, message=message, lane="console")
+    except Exception:
+        if conn is not None:
+            _rollback_quietly(conn)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def audit_rows(limit: int = _AUDIT_READ_LIMIT) -> dict[str, Any]:
+    limit = max(1, min(int(limit), _AUDIT_READ_LIMIT))
+    conn = pgqueue.connect()
+    try:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, created_at, action, ok, message, lane, target "
+                    "FROM fleet_console_audit "
+                    "ORDER BY created_at DESC, id DESC "
+                    "LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        except errors.UndefinedTable:
+            _rollback_quietly(conn)
+            return {
+                "rows": [],
+                "schema_missing": True,
+                "reason": "Console audit table is not installed; apply the fleet v3 schema migration.",
+            }
+        return {
+            "rows": [
+                {
+                    "time": _iso(r["created_at"]),
+                    "action": _audit_text(r["action"], _AUDIT_ACTION_CAP),
+                    "ok": bool(r["ok"]),
+                    "result": "ok" if r["ok"] else "failed",
+                    "message": _audit_text(r["message"] or "", _AUDIT_MESSAGE_CAP),
+                    "lane": _audit_optional_text(r["lane"], _AUDIT_LANE_CAP),
+                    "target": _audit_optional_text(r["target"], _AUDIT_TARGET_CAP),
+                }
+                for r in rows
+            ],
+            "schema_missing": False,
+        }
+    finally:
+        _rollback_quietly(conn)
+        conn.close()
+
 
 def _audit_lane(action: str, body: dict) -> str | None:
     lane = body.get("lane")
@@ -3723,28 +3929,35 @@ def run_action(body: dict) -> tuple[bool, str]:
     action = body.get("action")
     fn = _ACTIONS.get(action) if isinstance(action, str) else None
     if fn is None:
+        conn = None
+        try:
+            conn = pgqueue.connect()
+            _try_audit_action(conn, action=str(action), ok=False, message="unknown action")
+        except Exception:
+            if conn is not None:
+                _rollback_quietly(conn)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return False, "unknown action"
     conn = pgqueue.connect()
     try:
         try:
             result = fn(conn, body)
         except Exception as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            _record_console_audit(conn, action, body, ok=False, message=str(exc))
+            _rollback_quietly(conn)
+            _try_audit_action(conn, action=action, ok=False, message=str(exc),
+                              lane=_audit_lane(action, body), target=_audit_target(action, body))
             raise
-        if isinstance(result, tuple):
-            _record_console_audit(conn, action, body, ok=bool(result[0]), message=str(result[1]))
-            return result
-        _record_console_audit(conn, action, body, ok=True, message=str(result))
-        return True, result
+        ok, message = result if isinstance(result, tuple) else (True, result)
+        _try_audit_action(conn, action=action, ok=bool(ok), message=str(message),
+                          lane=_audit_lane(action, body), target=_audit_target(action, body))
+        return ok, message
     finally:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        _rollback_quietly(conn)
         conn.close()
 
 
@@ -3875,6 +4088,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
+        if path == "/favicon.ico":
+            self._send(204, b"", "image/x-icon")
+            return
         if path == "/":
             import urllib.parse as _up
             qs = _up.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
@@ -3896,17 +4112,13 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
-        if path == "/api/agents":
-            try:
-                self._send_json(200, agents())
-            except Exception as e:
-                self._send_json(500, {"error": str(e)})
-            return
         if path == "/api/diagnosis":
             try:
+                from applypilot.fleet import console_diagnosis  # noqa: F401
+
                 self._send_json(200, diagnosis())
             except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                self._send_json(500, {"error": _audit_text(str(e), 500)})
             return
         if path == "/api/diagnostics":
             # Dedicated endpoint (NOT folded into the 4s /api/status poll): the Doctor blob
@@ -3928,6 +4140,18 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, build_challenges())
             except Exception as e:
                 self._send_json(500, {"error": str(e)})   # match sibling GET routes
+            return
+        if path == "/api/agents":
+            try:
+                self._send_json(200, agents())
+            except Exception as e:
+                self._send_json(500, {"error": _audit_text(str(e), 500)})
+            return
+        if path == "/api/audit":
+            try:
+                self._send_json(200, audit_rows())
+            except Exception as e:
+                self._send_json(500, {"error": _audit_text(str(e), 500)})
             return
         if path == "/api/logs":
             # Separate endpoint (NOT folded into /api/status) so the big text blobs
@@ -4053,6 +4277,8 @@ _INDEX_HTML = r"""<!doctype html>
   section h2{font-size:13px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
   .table-wrap{width:100%;overflow:auto}
   table{width:100%;border-collapse:collapse;font-size:13px}
+  .table-scroll{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;overflow-wrap:anywhere}
+  .table-scroll table{min-width:620px}
   th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
   th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
   tr:last-child td{border-bottom:none}
@@ -4121,14 +4347,17 @@ _INDEX_HTML = r"""<!doctype html>
   pre.log.err{border-color:rgba(218,54,51,.45)}
   .dgrp{margin-bottom:14px}
   .dgrp .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
-  .rec{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px}
-  .rec .rh{display:flex;gap:10px;align-items:center;margin-bottom:4px}
+  .rec{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px;overflow:hidden;overflow-wrap:anywhere}
+  .rec .rh{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:4px}
+  .rec .rh .mut{min-width:0;flex:1 1 180px;overflow-wrap:anywhere}
+  .rec .rh button.sm{flex:0 0 auto}
   .rec .sev{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:6px;
     border:1px solid var(--border);color:var(--muted)}
   .rec .sev.warn{color:var(--amber);border-color:rgba(210,153,34,.4)}
   .rec .sev.severe{color:var(--red2);border-color:rgba(218,54,51,.4)}
   .rec .body{font-size:13px}
   .rec .recm{color:var(--muted);font-size:12px;margin-top:4px}
+  @media(max-width:560px){.rec .rh button.sm{margin-left:0!important}}
   button.sm{padding:5px 10px;font-size:12px}
   #challenges .chgrp{margin-bottom:14px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
   #challenges .chgrp-h{display:flex;flex-wrap:wrap;align-items:center;gap:10px;
@@ -4158,6 +4387,7 @@ _INDEX_HTML = r"""<!doctype html>
   <div>
     <h1>ApplyPilot Fleet Console</h1>
     <div class="sub">LAN-only control panel &mdash; this operates a system that submits REAL applications</div>
+    <div class="sub" id="deploymentMeta">console version loading</div>
   </div>
   <div class="sub" id="conn">connecting&hellip;</div>
 </header>
@@ -4204,11 +4434,22 @@ _INDEX_HTML = r"""<!doctype html>
     <div id="stateHeadline" class="headline">Loading</div>
     <div id="stateReason" class="sub"></div>
     <div id="stateAction" class="actionline">—</div>
+    <div id="primaryBlocker" class="actionline blockerline">Primary blocker: loading</div>
+    <div id="nextAction" class="actionline">Recommended Next Action: Loading</div>
+    <h2 style="margin-top:14px">Action Queue</h2>
+    <div id="recommendationList" class="rec-list"><div class="mut">loading recommendations</div></div>
+  </section>
+
+  <section id="laneActivity">
+    <h2>Lane Activity</h2>
+    <div id="laneActivityGrid" class="diagnosis-grid"></div>
   </section>
 
   <section id="safetyRails">
     <h2>Safety Rails</h2>
     <div class="metric-grid" id="safetyGrid"></div>
+    <h2 style="margin-top:14px">Lane State</h2>
+    <div class="diagnosis-grid lane-state" id="laneStateGrid"></div>
   </section>
 
   <section id="whyNotApplying">
@@ -4216,18 +4457,55 @@ _INDEX_HTML = r"""<!doctype html>
     <div class="diagnosis-grid" id="whyBody"></div>
   </section>
 
+  <section id="applyReadiness">
+    <h2>Apply Readiness</h2>
+    <div id="applyReadinessVerdict" class="headline">loading</div>
+    <div id="applyReadinessSummary" class="sub">waiting for fleet status, diagnosis, and agent telemetry</div>
+    <div id="applyReadinessChecks" class="readiness-checks"></div>
+  </section>
+
+  <section id="discoveryBacklog">
+    <h2>Discovery Backlog</h2>
+    <div class="diagnosis-grid" id="discoveryBacklogGrid"></div>
+  </section>
+
   <section id="machineHealth">
     <h2>Machine Health</h2>
     <div class="machine-grid" id="machineMap"></div>
+    <div class="dgrp" style="margin-top:12px"><div class="lbl">Stale Apply Workers</div>
+      <div id="staleWorkers" class="mut">loading stale worker details</div></div>
   </section>
 
   <section id="agentRouting">
     <h2>Agent Routing</h2>
+    <div id="agentVerdict" class="sub"></div>
+    <div id="agentSummary" class="diagnosis-grid"></div>
+    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Machine</th><th>Agent</th><th>Model</th><th>Chain</th><th>Version</th><th>Switch</th></tr></thead>
+      <tbody id="agentWorkers"><tr><td colspan="7" class="mut">loading</td></tr></tbody></table></div>
     <div class="funnel" id="agentBody"></div>
+  </section>
+
+  <section id="machineNetwork">
+    <h2>Machine Network</h2>
+    <div class="table-scroll"><table><thead><tr><th>Machine</th><th>Home IP</th><th>Roles</th><th>Live</th><th>Workers</th></tr></thead>
+      <tbody id="machineNetworkRows"><tr><td colspan="5" class="mut">loading</td></tr></tbody></table></div>
+  </section>
+
+  <section id="deploymentDrift">
+    <h2>Deployment Drift</h2><div id="deploymentDriftSummary" class="sub"></div>
+    <div class="table-scroll"><table><thead><tr><th>Version</th><th>Count</th><th>Machines</th><th>Workers</th><th>Status</th><th>Deployment target</th></tr></thead>
+      <tbody id="deploymentDriftRows"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
+  </section>
+
+  <section id="browserHealth">
+    <h2>Browser Health</h2><div id="browserBody" class="diagnosis-grid"></div>
+    <div id="browserWallQueue" class="mut">loading browser wall queue</div>
   </section>
 
   <section id="workerComparison">
     <h2>Worker Comparison</h2>
+    <div class="table-scroll"><table><thead><tr><th>Worker</th><th>Applied</th><th>Total</th><th>Success</th><th>Crash</th><th>Cost / Apply</th></tr></thead>
+      <tbody id="workerComparisonRows"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
     <div class="funnel" id="workerComparisonBody"></div>
   </section>
 
@@ -4244,6 +4522,22 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="throughputForecast">
     <h2>Throughput Forecast</h2>
     <div class="funnel" id="forecastBody"></div>
+  </section>
+
+  <section id="throughputSummary">
+    <h2>Throughput</h2><div class="diagnosis-grid" id="throughputGrid"></div>
+  </section>
+
+  <section id="hostQuality">
+    <h2>Host Quality</h2>
+    <div class="table-scroll"><table><thead><tr><th>Host</th><th>Total</th><th>Applied</th><th>Failed</th><th>Challenges</th><th>Bad Rate</th></tr></thead>
+      <tbody id="hostQualityRows"><tr><td colspan="6" class="mut">loading</td></tr></tbody></table></div>
+  </section>
+
+  <section id="auditLog">
+    <h2>Audit Log</h2>
+    <div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Message</th></tr></thead>
+      <tbody id="auditRows"><tr><td colspan="4" class="mut">audit endpoint not loaded</td></tr></tbody></table></div>
   </section>
 
   <section id="dailyGoals">
@@ -4461,7 +4755,7 @@ _INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 
-  <section>
+<section>
   <h2>Recent outcomes (read-only)</h2>
    <div class="table-wrap">
      <table><thead><tr><th>Time</th><th>Company / Title</th><th>Stage</th><th>Outcome</th></tr></thead>
@@ -4520,6 +4814,62 @@ const QUEUE_FLOW_WINDOW_SECONDS = 600;
 
 function esc(s){ return s==null ? "" : String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function pct(v){
+  if(v==null || isNaN(v)) return "—";
+  return Math.round(Number(v) * 100) + "%";
+}
+
+function money(v){
+  if(v==null || isNaN(v)) return "—";
+  return "$" + Number(v).toFixed(2);
+}
+
+function displayMachineName(value){
+  const raw = value == null ? "" : String(value).trim();
+  if(!raw) return "(unknown)";
+  const names = {
+    "home": "Home",
+    "m2": "TARPON",
+    "m4": "GGGTower",
+    "mac": "Paloma Mac",
+    "mac-mac": "Paloma Mac",
+  };
+  return names[raw.toLowerCase()] || raw;
+}
+
+function machineName(obj, fallback){
+  return displayMachineName((obj && obj.machine_display_name) || fallback);
+}
+
+function isUsefulHomeIp(ip){
+  const value = String(ip || "").trim();
+  return Boolean(value && value !== "0.0.0.0" && value !== "::" && value.toLowerCase() !== "unknown");
+}
+
+function formatMachineCounts(items){
+  const counts = {};
+  (items || []).forEach(item => {
+    const name = machineName(item, item && item.machine_owner);
+    counts[name] = (counts[name] || 0) + 1;
+  });
+  return Object.keys(counts).sort().map(name => counts[name] > 1 ? name + "×" + counts[name] : name).join(", ");
+}
+
+function openWorkerLogs(workerId){
+  const sel = document.getElementById("logWorker");
+  if(!sel) return false;
+  if(workerId && !Array.from(sel.options).some(o => o.value === workerId)){
+    const opt = document.createElement("option");
+    opt.value = workerId;
+    opt.textContent = workerId;
+    sel.appendChild(opt);
+  }
+  sel.value = workerId || "";
+  loadLogs();
+  document.getElementById("logArea").scrollIntoView({block:"center"});
+  return false;
+}
 
 function rel(iso){
   if(!iso) return "never";
@@ -4680,7 +5030,615 @@ function toast(msg, kind){
   el._t = setTimeout(()=>{ el.className = "toast " + (kind||""); }, 5000);
 }
 
+async function loadDiagnosis(){
+  try{
+    const r = await fetch("/api/diagnosis", {cache:"no-store"});
+    if(!r.ok) return;
+    diagnosisSnapshot = await r.json();
+    renderDiagnosis(diagnosisSnapshot);
+    renderApplyReadiness();
+  }catch(e){}
+}
+
+async function loadAgents(){
+  try{
+    const r = await fetch("/api/agents", {cache:"no-store"});
+    if(!r.ok) return;
+    agentsSnapshot = await r.json();
+    renderAgents(agentsSnapshot);
+    renderApplyReadiness();
+  }catch(e){}
+}
+
+function renderDiagnosis(d){
+  const q = d.queue || {};
+  const ats = q.ats || {};
+  const li = q.linkedin || {};
+  const roll = d.rollups || {};
+  const state = q.state || {};
+  document.getElementById("stateHeadline").textContent = state.code || "unknown";
+  document.getElementById("stateReason").textContent = state.reason || "";
+  const recs = d.recommendations || [];
+  document.getElementById("nextAction").textContent = recs.length
+    ? "Recommended Next Action: " + recs[0].title + " — " + recs[0].reason
+    : "Recommended Next Action: No recommendation";
+  renderPrimaryBlocker();
+  renderRecommendationList(recs);
+  document.getElementById("whyBody").innerHTML = [
+    ["ATS queued", ats.queued],
+    ["ATS approved", ats.approved],
+    ["ATS leaseable", ats.leaseable],
+    ["ATS dedup-blocked", ats.dedup_blocked],
+    ["LinkedIn queued", li.queued],
+    ["LinkedIn leaseable", li.leaseable],
+    ["LinkedIn canary exhausted", li.canary_exhausted ? "yes" : "no"]
+  ].map(([k,v]) => '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
+  const browser = d.browser || {};
+  const counts = browser.counts || {};
+  const examples = browser.examples || {};
+  const keys = Object.keys(counts);
+  document.getElementById("browserBody").innerHTML = keys.length
+    ? keys.map(k => {
+        const ex = examples[k] || {};
+        const detail = ex.worker_id
+          ? '<small>'+esc(machineName(ex, ex.machine_owner))+' / '+esc(ex.worker_id)+
+            ' · <a href="'+esc(ex.logs_url||"#")+'" onclick="return openWorkerLogs('+
+            esc(JSON.stringify(String(ex.worker_id)))+')">logs</a></small>'
+          : "";
+        return '<div class="mini"><span>'+esc(k)+'</span><b>'+esc(counts[k])+'</b>'+detail+'</div>';
+      }).join("")
+    : '<div class="mut">no classified browser failures</div>';
+  renderBrowserWallQueue(browser.wall_queue || []);
+  document.getElementById("funnelBody").innerHTML = [
+    ["Queued", ats.queued],
+    ["Approved", ats.approved],
+    ["Leaseable", ats.leaseable],
+    ["Leased", ats.leased],
+    ["Applied", ats.applied],
+    ["Failed", ats.failed],
+    ["Crash unconfirmed", ats.crash_unconfirmed]
+  ].map(([k,v]) => '<div class="fstep"><span>'+esc(k)+'</span><b>'+esc(v)+'</b></div>').join("");
+  renderThroughput(roll.throughput || {}, roll.freshness || {}, roll.daily_goal || {});
+  renderHostQuality(roll.host_quality || []);
+  const machines = roll.machines || {};
+  document.getElementById("machineMap").innerHTML = Object.keys(machines).length
+    ? Object.keys(machines).map(k => '<div class="mini"><span>'+esc(machines[k].display_name || k)+'</span><b>'+
+      esc(machines[k].workers)+'</b><small class="mut">'+esc(machines[k].alive_workers||0)+
+      ' alive / '+esc(machines[k].stale_workers||0)+' stale</small></div>').join("")
+    : '<div class="mut">no machine heartbeats</div>';
+  renderWorkerComparison(roll.worker_comparison || []);
+}
+
+function renderPrimaryBlocker(){
+  const el = document.getElementById("primaryBlocker");
+  if(!el) return;
+  const s = statusSnapshot || {};
+  const d = diagnosisSnapshot || {};
+  const gate = s.gate || {};
+  const q = d.queue || s.fleet_diagnosis || {};
+  const ats = q.ats || {};
+  const linkedin = q.linkedin || {};
+  const doctor = s.doctor || {};
+  const agents = d.agents || {};
+  const agentVerdict = agents.verdict || {};
+  let state = "ok";
+  let text = "Primary blocker: No blocking gate";
+  if(agentVerdict.code === "all_agents_blocked"){
+    state = "severe";
+    const blocked = Object.keys(agents.availability || {})
+      .filter(a => (agents.availability[a] || {}).blocked)
+      .map(a => a + "(until " + ((agents.availability[a] || {}).blocked_until || "unknown") + ")")
+      .join(", ");
+    text = "Primary blocker: Apply agents blocked — " +
+      (blocked || "all known agents currently blocked") + "; unblock before applying";
+  } else if(gate.should_halt){
+    state = "severe";
+    text = "Primary blocker: Spend cap halt — " +
+      money(gate.spent_usd || 0) + " spent over cap " + money(gate.spend_cap_usd || 0);
+  } else if(gate.paused || ats.paused){
+    state = "severe";
+    text = "Primary blocker: Fleet pause — shared pause is active";
+  } else if(ats.ats_paused || doctor.ats_paused){
+    state = "warn";
+    text = "Primary blocker: ATS pause — source " + (doctor.ats_pause_source || "unknown");
+  } else if(Number(ats.approved || 0) > 0 && Number(ats.leaseable || 0) === 0){
+    state = "warn";
+    text = "Primary blocker: ATS lease gate — " + ats.approved + " approved but 0 leaseable";
+  } else if(linkedin.owner_ip_context_known && !linkedin.owner_ip_ready){
+    state = "warn";
+    text = "Primary blocker: LinkedIn owner IP — blocked";
+  } else if(linkedin.canary_exhausted){
+    state = "warn";
+    text = "Primary blocker: LinkedIn canary gate — exhausted";
+  } else if(Number(linkedin.queued || 0) > 0 && Number(linkedin.leaseable || 0) === 0){
+    state = "warn";
+    text = "Primary blocker: LinkedIn lease gate — " +
+      "queued but not leaseable";
+  }
+  el.textContent = text;
+  el.className = "actionline blockerline " + state;
+}
+
+function renderAgents(d){
+  const verdict = d.verdict || {};
+  document.getElementById("agentVerdict").textContent = (verdict.code || "unknown") + " — " + (verdict.reason || "");
+  renderAgentSummary(d);
+  const rows = d.workers || [];
+  const body = document.getElementById("agentWorkers");
+  body.innerHTML = rows.length ? rows.map(w =>
+    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_display_name||w.machine_owner||"")+'</td><td>'+
+    esc(w.current_agent||"unknown")+'</td><td>'+esc(w.current_model||"unknown")+'</td><td>'+
+    esc(w.agent_chain||"")+'</td><td>'+esc(w.sw_version||"unknown")+'</td><td>'+
+    esc(w.last_agent_switch_reason||"")+'</td></tr>'
+  ).join("") : '<tr><td colspan="7" class="mut">no apply worker agent telemetry</td></tr>';
+}
+
+function renderAgentSummary(d){
+  const el = document.getElementById("agentSummary");
+  if(!el) return;
+  const workers = d.workers || [];
+  const verdict = d.verdict || {};
+  const availability = d.availability || {};
+  const spend = d.spend_24h || [];
+  const modelCounts = {};
+  workers.forEach(w => {
+    if(w.current_agent || w.current_model){
+      const key = (w.current_agent || "unknown") + " / " + (w.current_model || "model unknown");
+      modelCounts[key] = (modelCounts[key] || 0) + 1;
+    }
+  });
+  const modelKeys = Object.keys(modelCounts);
+  const modelText = modelKeys.length
+    ? modelKeys.map(k => k + "×" + modelCounts[k]).join(", ")
+    : "unknown";
+  const switched = workers.filter(w =>
+    w.last_agent_switch_reason || String(w.agent_chain || "").indexOf(">") >= 0
+  ).length;
+  const telemetryMissing = verdict.code === "telemetry_missing" || !modelKeys.length;
+  const switchingText = telemetryMissing ? "not observable" : (switched ? "observed" : "not observed");
+  const cards = [
+    ["Model in use", modelText,
+      modelKeys.length ? "current worker heartbeat telemetry" : "workers have not reported agent/model telemetry"],
+    ["Dynamic switching", switchingText,
+      telemetryMissing ? "redeploy/restart workers before judging switching" : (switched ? switched+" worker(s) show switch evidence" : "no switch rows reported")],
+  ];
+  Object.keys(availability).sort().forEach(agent => {
+    const row = availability[agent] || {};
+    cards.push([
+      "Agent " + agent,
+      row.blocked ? "blocked" : "ready",
+      row.blocked ? ((row.reason || "blocked") + (row.blocked_until ? " until " + row.blocked_until : "")) : "not currently blocked",
+    ]);
+  });
+  if(spend.length){
+    spend.forEach(row => cards.push([
+      "24h spend " + (row.provider || "unknown"),
+      money(row.cost_usd || 0),
+      (row.count || 0) + " call(s)" + (row.model ? " / " + row.model : " / model unknown"),
+    ]));
+  } else {
+    cards.push(["24h spend", "$0.00", "no apply-agent usage recorded"]);
+  }
+  el.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
+function renderRecommendationList(recs){
+  const el = document.getElementById("recommendationList");
+  if(!el) return;
+  if(!recs.length){
+    el.innerHTML = '<div class="mut">no current recommendations</div>';
+    return;
+  }
+  el.innerHTML = recs.map(r => {
+    const sev = r.severity || "info";
+    return '<div class="action-item '+esc(sev)+'"><div class="k">'+
+      esc([sev, r.lane, r.action_type].filter(Boolean).join(" / "))+'</div><div class="t">'+
+      esc(r.title || r.code || "Recommendation")+'</div><div class="r">'+
+      esc(r.reason || "")+'</div><div class="cmd"><b>Operator step:</b> '+
+      esc(r.command || "Review the linked runbook before taking action.")+'</div></div>';
+  }).join("");
+}
+
+function renderBrowserWallQueue(rows){
+  const el = document.getElementById("browserWallQueue");
+  if(!el) return;
+  if(!rows.length){
+    el.innerHTML = '<div class="mut">no browser/login/captcha walls in worker logs</div>';
+    return;
+  }
+  el.innerHTML = '<div class="table-scroll"><table><thead><tr>'+
+    '<th>Kind</th><th>Machine</th><th>Worker</th><th>Sample</th><th>Action</th><th>Logs</th>'+
+    '</tr></thead><tbody>' + rows.map(r =>
+      '<tr><td>'+esc(r.kind||"unknown")+'</td><td>'+esc(r.machine_display_name||r.machine_owner||"")+
+      '</td><td>'+esc(r.worker_id||"")+'</td><td>'+esc(r.sample||"")+'</td><td>'+
+      esc(r.action||"Open logs and inspect before scaling applies.")+'</td><td><a href="'+
+      esc(r.logs_url||"#")+'" onclick="return openWorkerLogs('+esc(JSON.stringify(String(r.worker_id||"")))+')">logs</a></td></tr>'
+    ).join("") + '</tbody></table></div>';
+}
+
+function renderWorkerComparison(rows){
+  const body = document.getElementById("workerComparisonRows");
+  if(!body) return;
+  body.innerHTML = rows.length ? rows.map(w =>
+    '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.applied||0)+'</td><td>'+esc(w.total||0)+
+    '</td><td>'+esc(pct(w.success_rate))+'</td><td>'+esc(pct(w.crash_rate))+
+    '</td><td>'+esc(money(w.cost_per_applied))+'</td></tr>'
+  ).join("") : '<tr><td colspan="6" class="mut">no worker outcome data yet</td></tr>';
+}
+
+function renderHostQuality(rows){
+  const body = document.getElementById("hostQualityRows");
+  if(!body) return;
+  if(!rows.length){
+    body.innerHTML = '<tr><td colspan="6" class="mut">no host outcome data yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(h => {
+    const total = Number(h.total || 0);
+    const bad = Number(h.failed || 0) + Number(h.challenges || 0);
+    const badRate = total ? (bad / total) : null;
+    return '<tr><td>'+esc(h.host || "(unknown)")+'</td><td>'+esc(total)+'</td><td>'+
+      esc(h.applied || 0)+'</td><td>'+esc(h.failed || 0)+'</td><td>'+
+      esc(h.challenges || 0)+'</td><td>'+esc(pct(badRate))+'</td></tr>';
+  }).join("");
+}
+
+function renderThroughput(throughput, freshness, dailyGoal){
+  const grid = document.getElementById("throughputGrid");
+  if(!grid) return;
+  const configured = Boolean(dailyGoal && dailyGoal.configured);
+  const goalValue = configured ? String(dailyGoal.applied_today || 0) + " / " + String(dailyGoal.target || 0) : "not set";
+  const goalHint = configured
+    ? String(dailyGoal.remaining == null ? "unknown" : dailyGoal.remaining) + " remaining today"
+    : "daily apply target not configured";
+  const cards = [
+    ["Last apply", freshness.last_apply_at ? rel(freshness.last_apply_at) : "never",
+      freshness.last_apply_at || "no applied timestamp recorded"],
+    ["Applied 1h", throughput.applied_1h == null ? "—" : throughput.applied_1h,
+      "recent confirmed applies"],
+    ["Applied 24h", throughput.applied_24h == null ? "—" : throughput.applied_24h,
+      "confirmed applies in the last day"],
+    ["Daily goal", goalValue, goalHint],
+  ];
+  grid.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
+function renderApplyReadiness(){
+  const checksEl = document.getElementById("applyReadinessChecks");
+  const verdictEl = document.getElementById("applyReadinessVerdict");
+  const summaryEl = document.getElementById("applyReadinessSummary");
+  if(!checksEl || !verdictEl || !summaryEl) return;
+  const s = statusSnapshot || {};
+  const d = diagnosisSnapshot || {};
+  const agents = agentsSnapshot || {};
+  const q = d.queue || s.fleet_diagnosis || {};
+  const ats = q.ats || {};
+  const linkedin = q.linkedin || {};
+  const gate = s.gate || {};
+  const doctor = s.doctor || {};
+  const deployment = s.deployment || {};
+  const browser = d.browser || {};
+  const browserCounts = browser.counts || {};
+  const wallRows = browser.wall_queue || [];
+  const rollups = d.rollups || {};
+  const dailyGoal = rollups.daily_goal || {};
+  const versions = deployment.worker_versions || [];
+  const applyWorkers = (s.workers || []).filter(w => (w.role || "apply") === "apply");
+  const staleApply = applyWorkers.filter(w => w.alive === false);
+  const staleActiveApply = staleApply.filter(w => ["applying", "challenge_pending"].includes(w.state || ""));
+  const agentWorkers = agents.workers || [];
+  const availability = agents.availability || {};
+  const availabilityNames = Object.keys(availability);
+  const blockedAgents = availabilityNames.filter(name => availability[name] && availability[name].blocked);
+  const readyAgents = availabilityNames.filter(name => availability[name] && !availability[name].blocked);
+  const agentVerdict = (agents.verdict || {}).code || "";
+  const telemetryMissing = (agents.verdict || {}).code === "telemetry_missing" ||
+    (agentWorkers.length > 0 && !agentWorkers.some(w => w.current_agent || w.current_model));
+  const dirtyOrUnknown = versions.some(row => {
+    const v = String(row.version || "(unknown)");
+    return v === "(unknown)" || v.indexOf(".dirty") >= 0 || v.indexOf("-dirty") >= 0;
+  });
+  const mixedVersions = versions.length > 1;
+  const paused = Boolean(gate.paused || gate.should_halt || ats.paused || ats.ats_paused || doctor.ats_paused);
+  const leaseable = Number(ats.leaseable || 0);
+  const approved = Number(ats.approved || 0);
+  const linkedinLeaseable = Number(linkedin.leaseable || 0);
+  const linkedinQueued = Number(linkedin.queued || 0);
+  const linkedinOwnerBlocked = linkedin.owner_ip_context_known && !linkedin.owner_ip_ready;
+  const linkedinCanaryExhausted = Boolean(linkedin.canary_exhausted);
+  const authKinds = ["login_gate", "captcha", "email_otp"];
+  const backendKinds = ["browser_backend_crashed", "browser_service_unavailable", "browser_server_unavailable"];
+  const authWallCount = authKinds.reduce((total, kind) => total + Number(browserCounts[kind] || 0), 0) ||
+    wallRows.filter(row => authKinds.includes(row.kind || "")).length;
+  const browserBackendCount = backendKinds.reduce((total, kind) => total + Number(browserCounts[kind] || 0), 0) ||
+    wallRows.filter(row => backendKinds.includes(row.kind || "")).length;
+  const goalConfigured = Boolean(dailyGoal.configured);
+  const leaseableHint = leaseable > 0
+    ? approved + " approved and leaseable"
+    : (approved > 0 ? approved + " approved but not leaseable" : "no approved ATS queue ready");
+  const staleMachineSummary = formatMachineCounts(staleApply);
+  const staleActiveMachineSummary = formatMachineCounts(staleActiveApply);
+  const checks = [
+    ["Pause gates", paused ? "blocked" : "ok", paused ? "blocked" : "clear",
+      paused ? "shared or ATS pause is active" : "no pause gate reported"],
+    ["Leaseable queue", leaseable > 0 ? "ok" : "blocked", leaseable,
+      leaseableHint],
+    ["LinkedIn readiness",
+      linkedinLeaseable > 0 ? "ok" : ((linkedinQueued || linkedinOwnerBlocked || linkedinCanaryExhausted) ? "warn" : "ok"),
+      linkedinLeaseable > 0 ? linkedinLeaseable + " leaseable" : (linkedinQueued ? linkedinQueued + " queued" : "idle"),
+      linkedinOwnerBlocked ? "owner IP blocked" : (linkedinCanaryExhausted ? "canary exhausted" : (linkedinQueued && !linkedinLeaseable ? "queued but not leaseable" : "catastrophe lane ready"))],
+    ["Worker versions", (mixedVersions || dirtyOrUnknown) ? "warn" : "ok",
+      versions.length ? versions.length + " group(s)" : "unknown",
+      (mixedVersions || dirtyOrUnknown) ? "reconcile dirty/unknown workers before scale" : "one reported worker build"],
+    ["Model telemetry", telemetryMissing ? "warn" : "ok",
+      telemetryMissing ? "missing" : "reported",
+      telemetryMissing ? "cannot prove Codex/Claude model switching yet" : "workers report agent/model fields"],
+    ["Agent failover",
+      blockedAgents.length && !readyAgents.length ? "blocked" : ((blockedAgents.length || agentVerdict === "partial") ? "warn" : "ok"),
+      blockedAgents.length ? blockedAgents.length + " blocked provider(s)" : (readyAgents.length ? readyAgents.join(", ") + " ready" : "loading"),
+      blockedAgents.length
+        ? (readyAgents.length ? readyAgents.join(", ") + " still available" : "no provider still available")
+        : (readyAgents.length ? "no blocked provider reported" : "waiting for provider availability")],
+    ["Browser auth walls", authWallCount ? "warn" : "ok", authWallCount,
+      authWallCount ? "login/captcha/OTP needs operator review" : "no auth wall samples"],
+    ["Browser backend", browserBackendCount ? "warn" : "ok", browserBackendCount,
+      browserBackendCount ? "restart browser backend or worker service" : "no backend crash/server samples"],
+    ["Stale workers", staleApply.length ? "warn" : "ok", staleApply.length,
+      staleApply.length ? staleMachineSummary : "all apply heartbeats fresh"],
+    ["Stale active workers", staleActiveApply.length ? "warn" : "ok", staleActiveApply.length,
+      staleActiveApply.length ? staleActiveMachineSummary + " still marked active" : "no stale applying/challenge workers"],
+    ["Daily goal", goalConfigured ? "ok" : "warn",
+      goalConfigured ? String(dailyGoal.applied_today || 0) + " / " + String(dailyGoal.target || 0) : "not set",
+      goalConfigured ? String(dailyGoal.remaining == null ? "unknown" : dailyGoal.remaining) + " remaining today" : "set a daily target before unattended scale"],
+  ];
+  const blockers = checks.filter(c => c[1] === "blocked").length;
+  const warnings = checks.filter(c => c[1] === "warn").length;
+  verdictEl.textContent = blockers
+    ? "Not ready to apply"
+    : (warnings ? "Unsafe to scale" : "Ready to apply carefully");
+  summaryEl.textContent = blockers
+    ? blockers + " blocking gate(s), " + warnings + " scale risk(s)"
+    : (warnings
+      ? "apply lane has queue, but " + warnings + " scale risk(s) remain"
+      : "all readiness checks clear; keep canary and daily caps in place");
+  checksEl.innerHTML = checks.map(([label, state, value, hint]) =>
+    '<div class="ready-check '+esc(state)+'"><div class="name">'+esc(label)+
+    '</div><div class="value">'+esc(value)+'</div><div class="hint">'+esc(hint)+'</div></div>'
+  ).join("");
+}
+
+function renderDiscoveryBacklog(s){
+  const grid = document.getElementById("discoveryBacklogGrid");
+  if(!grid) return;
+  const d = (s && s.discovery) || null;
+  if(!d){
+    grid.innerHTML = '<div class="mut">no discovery telemetry reported</div>';
+    return;
+  }
+  const tasks = d.tasks || {};
+  const postings = d.postings || {};
+  const workers = d.workers || [];
+  const pending = Number(postings.pending_ingest || 0);
+  const last24 = Number(postings.last24h || 0);
+  const due = Number(tasks.due_now || 0);
+  const alive = workers.filter(w => w.alive).length;
+  const latest = (d.recent && d.recent.length && d.recent[0].time) ? rel(d.recent[0].time) : "none";
+  const pressure = pending >= 500 ? "high" : (pending >= 100 ? "watch" : (pending > 0 ? "low" : "clear"));
+  const cards = [
+    ["Pending ingest", pending, pending ? "postings staged but not imported" : "no ingest backlog"],
+    ["Ingest pressure", pressure, due ? due + " search task(s) due now" : "no search tasks due now"],
+    ["Discovery workers", alive + " / " + workers.length, alive ? "heartbeat active" : "no live discovery worker"],
+    ["Found 24h", last24, "latest find " + latest],
+  ];
+  grid.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
+function renderMachineNetwork(s){
+  const body = document.getElementById("machineNetworkRows");
+  if(!body) return;
+  const machines = {};
+  function addWorker(w, fallbackRole){
+    if(!w) return;
+    const machine = w.machine_display_name || w.machine_owner || "(unknown)";
+    const row = machines[machine] || {
+      machine,
+      ips: [],
+      roles: {},
+      alive: 0,
+      stale: 0,
+      workers: [],
+    };
+    const ip = w.home_ip || "";
+    if(isUsefulHomeIp(ip) && row.ips.indexOf(ip) < 0) row.ips.push(ip);
+    const role = w.role || fallbackRole || "worker";
+    row.roles[role] = (row.roles[role] || 0) + 1;
+    if(w.alive) row.alive += 1; else row.stale += 1;
+    if(w.worker_id) row.workers.push(w.worker_id);
+    machines[machine] = row;
+  }
+  (s.workers || []).forEach(w => addWorker(w, "apply"));
+  (((s.discovery || {}).workers) || []).forEach(w => addWorker(w, "discovery"));
+  const rows = Object.keys(machines).sort().map(k => machines[k]);
+  if(!rows.length){
+    body.innerHTML = '<tr><td colspan="5" class="mut">no machine network heartbeats</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(row => {
+    const roles = Object.keys(row.roles).sort().map(role => role + "×" + row.roles[role]).join(", ");
+    return '<tr><td>'+esc(row.machine)+'</td><td>'+esc(row.ips.join(", ") || "unknown")+
+      '</td><td>'+esc(roles || "unknown")+'</td><td>'+esc(row.alive + " alive / " + row.stale + " stale")+
+      '</td><td>'+esc(row.workers.join(", "))+'</td></tr>';
+  }).join("");
+}
+
+function renderStaleWorkers(workers){
+  const el = document.getElementById("staleWorkers");
+  if(!el) return;
+  const stale = (workers || []).filter(w => !w.alive);
+  if(!stale.length){
+    el.innerHTML = '<div class="mut">no stale apply workers</div>';
+    return;
+  }
+  el.innerHTML = '<div class="table-scroll"><table><thead><tr>'+
+    '<th>Worker</th><th>Machine</th><th>Last beat</th><th>State</th><th>Version</th>'+
+    '</tr></thead><tbody>' + stale.map(w =>
+      '<tr><td>'+esc(w.worker_id)+'</td><td>'+esc(w.machine_display_name||w.machine_owner||"")+
+      '</td><td>'+esc(w.last_beat ? rel(w.last_beat) : "never")+
+      '</td><td>'+esc(w.state||"")+'</td><td>'+esc(w.sw_version||"unknown")+'</td></tr>'
+    ).join("") + '</tbody></table></div>';
+}
+
+function classifyBuild(version){
+  const v = String(version || "(unknown)");
+  if(v === "(unknown)") return "unknown build";
+  if(v.indexOf(".dirty") >= 0 || v.indexOf("-dirty") >= 0) return "dirty build";
+  return "reported build";
+}
+
+function renderDeploymentDrift(dep){
+  const rowsEl = document.getElementById("deploymentDriftRows");
+  const summaryEl = document.getElementById("deploymentDriftSummary");
+  if(!rowsEl || !summaryEl) return;
+  const versions = (dep && dep.worker_versions) || [];
+  if(!versions.length){
+    summaryEl.textContent = "No worker versions reported.";
+    rowsEl.innerHTML = '<tr><td colspan="6" class="mut">no worker version telemetry</td></tr>';
+    return;
+  }
+  const total = versions.reduce((n, row) => n + Number(row.workers || 0), 0);
+  const dirty = versions.filter(row => classifyBuild(row.version) === "dirty build")
+    .reduce((n, row) => n + Number(row.workers || 0), 0);
+  const unknown = versions.filter(row => classifyBuild(row.version) === "unknown build")
+    .reduce((n, row) => n + Number(row.workers || 0), 0);
+  const consoleInfo = dep && dep.console || {};
+  const targetCommit = String(consoleInfo.commit || "").toLowerCase();
+  const targetShort = targetCommit ? targetCommit.slice(0, 7) : "";
+  const targetLabel = (consoleInfo.branch || "branch") + "@" +
+    (targetCommit ? targetCommit.slice(0, 7) : "unknown");
+  const targetHits = targetShort
+    ? versions.filter(row => String(row.version || "").toLowerCase().indexOf("+git.tree." + targetShort) >= 0).reduce((n, row) => n + Number(row.workers || 0), 0)
+    : 0;
+  summaryEl.textContent = total + " worker heartbeat(s) across " + versions.length +
+    " version group(s) — target " + targetLabel + "; " +
+    (targetShort ? (targetHits + " on-target / " + total + " reported") : "target not available") +
+    (targetShort && targetHits < total ? " - reconcile these machines before comparing telemetry." : "") +
+    (dirty || unknown ? " · reconcile mixed/dirty groups before scale" : "");
+  rowsEl.innerHTML = versions.map(row => {
+    const status = classifyBuild(row.version);
+    const onTarget = targetShort && String(row.version || "").toLowerCase().indexOf("+git.tree." + targetShort) >= 0;
+    const alignment = onTarget ? "on target" : "off target";
+    return '<tr><td>'+esc(row.version || "(unknown)")+'</td><td>'+esc(row.workers || 0)+
+      '</td><td>'+esc((row.machines || []).join(", ") || "(unknown)")+'</td><td>'+
+      esc((row.worker_ids || []).join(", ") || "(none)")+'</td><td>'+esc(status)+
+      '</td><td>'+esc(alignment)+'</td></tr>';
+  }).join("");
+}
+
+function renderLaneState(s){
+  const grid = document.getElementById("laneStateGrid");
+  if(!grid) return;
+  const diag = s.fleet_diagnosis || {};
+  const ats = diag.ats || {};
+  const linkedin = diag.linkedin || {};
+  const gate = s.gate || {};
+  const statusLinkedin = s.linkedin || {};
+  const doctor = s.doctor || {};
+  const sharedPaused = Boolean(gate.paused || ats.paused);
+  const atsPaused = Boolean(ats.ats_paused || doctor.ats_paused);
+  const ownerKnown = linkedin.owner_ip_context_known;
+  const ownerReady = linkedin.owner_ip_ready;
+  const linkedinCanaryEnabled = linkedin.canary_enabled != null
+    ? linkedin.canary_enabled : statusLinkedin.canary_enabled;
+  const linkedinCanaryRemaining = linkedin.canary_remaining;
+  const linkedinCanary = linkedinCanaryEnabled
+    ? (linkedinCanaryRemaining == null ? "armed" : linkedinCanaryRemaining)
+    : "off";
+  const cells = [
+    ["Shared pause", sharedPaused ? "on" : "off",
+      sharedPaused ? "apply lane halted; compute/discovery may continue" : "shared kill switch clear"],
+    ["ATS pause", atsPaused ? "on" : "off",
+      atsPaused ? "source " + (doctor.ats_pause_source || "unknown") : "ATS pause clear"],
+    ["ATS leaseable", ats.leaseable == null ? "—" : ats.leaseable,
+      "approved, canary-safe, not deduped"],
+    ["LinkedIn owner IP", ownerKnown ? (ownerReady ? "ready" : "blocked") : "unknown",
+      ownerKnown ? "owner-IP context checked" : "owner-IP context unavailable"],
+    ["LinkedIn canary", linkedinCanary,
+      linkedin.canary_exhausted ? "exhausted; re-arm before lease" : "catastrophe lane cap"],
+  ];
+  grid.innerHTML = cells.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
+function renderLaneActivity(s){
+  const grid = document.getElementById("laneActivityGrid");
+  if(!grid) return;
+  const diag = s.fleet_diagnosis || {};
+  const ats = diag.ats || {};
+  const liDiag = diag.linkedin || {};
+  const gate = s.gate || {};
+  const q = (s.queue && s.queue.apply) || {};
+  const recent = s.recent || [];
+  const discovery = s.discovery || {};
+  const discoveryWorkers = discovery.workers || [];
+  const linkedin = s.linkedin || {};
+  const computeRecent = recent.filter(r => r.lane === "compute").length;
+  const applyStatus = (gate.paused || ats.paused || ats.ats_paused || gate.should_halt)
+    ? "halted" : (Number(ats.leaseable || 0) > 0 ? "ready" : "idle");
+  const computeStatus = computeRecent ? "active" : "idle";
+  const discoveryAlive = discoveryWorkers.filter(w => w.alive).length;
+  const discoveryStatus = discoveryAlive ? "active" : "idle";
+  const linkedinStatus = linkedin.halted ? "halted" : (Number(liDiag.leaseable || 0) > 0 ? "ready" : "limited");
+  const cards = [
+    ["Apply lane", applyStatus,
+      (ats.leaseable == null ? "leaseable unknown" : ats.leaseable + " leaseable") +
+      " / " + (q.queued || 0) + " queued"],
+    ["Compute lane", computeStatus,
+      computeRecent + " recent compute result(s)"],
+    ["Discovery lane", discoveryStatus,
+      discoveryAlive + " worker(s) alive / " + (((discovery.tasks || {}).due_now) || 0) + " due search task(s)"],
+    ["LinkedIn lane", linkedinStatus,
+      (liDiag.leaseable == null ? "leaseable unknown" : liDiag.leaseable + " leaseable") +
+      " / " + (linkedin.queued || liDiag.queued || 0) + " queued"],
+  ];
+  grid.innerHTML = cards.map(([label, value, hint]) =>
+    '<div class="mini"><span>'+esc(label)+'</span><b>'+esc(value)+'</b><small>'+esc(hint)+'</small></div>'
+  ).join("");
+}
+
+function renderAudit(d){
+  const body = document.getElementById("auditRows");
+  const rows = (d && d.rows) || [];
+  if(!rows.length){
+    body.innerHTML = '<tr><td colspan="4" class="mut">no audit entries yet</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(r =>
+    '<tr><td class="mut">'+esc(rel(r.time))+'</td><td>'+esc(r.action||"—")+
+    '</td><td>'+esc(r.result || (r.ok ? "ok" : "failed"))+'</td><td>'+
+    esc(r.message||"—")+'</td></tr>'
+  ).join("");
+}
+
+async function loadAudit(){
+  const body = document.getElementById("auditRows");
+  try{
+    const r = await fetch("/api/audit", {cache:"no-store"});
+    if(!r.ok){ body.innerHTML = '<tr><td colspan="4" class="mut">audit unavailable</td></tr>'; return; }
+    renderAudit(await r.json());
+  }catch(e){
+    body.innerHTML = '<tr><td colspan="4" class="mut">audit unavailable</td></tr>';
+  }
+}
+
 function render(s){
+  statusSnapshot = s;
   lastUpdate = Date.now();
   document.getElementById("conn").textContent = "connected";
   const g = s.gate, q = s.queue.apply, li = s.linkedin, doc = s.doctor || {};
@@ -4747,7 +5705,10 @@ function render(s){
   document.getElementById("cSpendHint").textContent =
     g.spend_cap_usd>0 ? ("of $" + g.spend_cap_usd.toFixed(2) + " cap") : "no cap set";
   document.getElementById("cQueued").textContent = q.queued;
-  document.getElementById("cLeasable").textContent = g.leasable;
+  document.getElementById("cLeasable").textContent =
+    liveAts.leaseable == null ? g.leasable : liveAts.leaseable;
+  document.getElementById("cLeasableHint").textContent =
+    liveAts.leaseable == null ? "eligible if running" : "leaseable after pause/canary gates";
   document.getElementById("cChallenges").textContent = s.challenges;
   document.getElementById("cQueuedAts").textContent = laneRateText((q.by_lane && q.by_lane.ats) || {});
   document.getElementById("cQueuedCompute").textContent = laneRateText((q.by_lane && q.by_lane.compute) || {});
@@ -5122,7 +6083,7 @@ function renderDiagnostics(d){
   if(!d.clusters || !d.clusters.length){ ct.innerHTML = '<tr><td colspan="4" class="mut">no failure clusters in the window</td></tr>'; }
   else ct.innerHTML = d.clusters.map(c=>
     '<tr><td>'+esc(c.reason)+'</td><td class="mut">'+esc(c.host)+'</td><td class="mut">'+
-    esc(c.machine)+'</td><td>'+(c.sample_count||0)+'</td></tr>').join("");
+    esc(displayMachineName(c.machine))+'</td><td>'+(c.sample_count||0)+'</td></tr>').join("");
 
   const at = document.getElementById("docAuto");
   if(!d.auto_fixes || !d.auto_fixes.length){ at.innerHTML = '<tr><td colspan="5" class="mut">no active auto-fixes</td></tr>'; }
@@ -5599,6 +6560,12 @@ setInterval(loadChallenges, 4000);
 loadAgents();
 setInterval(loadAgents, 4000);
 
+loadDiagnosis();
+setInterval(loadDiagnosis, 15000);
+loadAgents();
+setInterval(loadAgents, 15000);
+loadAudit();
+setInterval(loadAudit, 15000);
 poll();
 setInterval(poll, 4000);
 loadDiagnostics();
@@ -5607,6 +6574,19 @@ setInterval(loadDiagnostics, 15000);
 </body>
 </html>
 """
+
+# Keep every legacy data table inside the same responsive overflow container as
+# the operations tables added by the console merge.
+_INDEX_HTML = re.sub(
+    r'class="table-wrap([^\"]*)"',
+    r'class="table-scroll\1"',
+    _INDEX_HTML,
+)
+_INDEX_HTML = re.sub(
+    r'(class="table-scroll"[^>]*)>\s*<table',
+    r'\1><table',
+    _INDEX_HTML,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -5634,11 +6614,19 @@ def main(argv=None) -> int:
     print("Open this from a machine on your LAN. Do NOT port-forward it.")
     print(f"One-tap arm URL (sets the mutation-auth cookie): "
           f"http://{host}:{args.port}/?token={get_console_token()}")
+    audit_lifecycle_event(
+        "console_start",
+        f"started on http://{host}:{args.port} from {_repo_root()}",
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        audit_lifecycle_event(
+            "console_stop",
+            f"stopped on http://{host}:{args.port} from {_repo_root()}",
+        )
         server.server_close()
     return 0
 

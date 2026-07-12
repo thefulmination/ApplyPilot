@@ -41,6 +41,8 @@ import os
 import re
 from typing import Any, Callable, Optional
 
+import psycopg.errors as _pg_errors
+
 from applypilot.fleet import captcha as _captcha
 from applypilot.fleet import config as fleet_config
 from applypilot.fleet import governor
@@ -958,6 +960,7 @@ class WorkerLoop:
             agent_chain=self.agent_chain, last_agent_switch_at=self.last_agent_switch_at,
             last_agent_switch_reason=self.last_agent_switch_reason,
         )
+        self._last_agent_switch_reason = None
 
     # -- long-running driver (not exercised by unit tests) --------------------
     def run_forever(self, *, idle_sleep_seconds: float = 5.0, stop=None) -> None:  # pragma: no cover

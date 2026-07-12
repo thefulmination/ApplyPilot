@@ -38,6 +38,19 @@ def test_run_apply_switches_to_fallback_after_usage_limit(monkeypatch):
     actions = iter(["usage_limit", "applied"])
     loop = MagicMock()
     loop._log_tail_fn = None
+    loop._current_model = "sonnet"
+    agent_events = []
+
+    def set_agent_telemetry(*, current_agent, current_model, agent_chain,
+                            last_agent_switch_reason=None):
+        agent_events.append({
+            "current_agent": current_agent,
+            "current_model": current_model,
+            "agent_chain": agent_chain,
+            "last_agent_switch_reason": last_agent_switch_reason,
+        })
+
+    loop.set_agent_telemetry = set_agent_telemetry
 
     def run_once():
         return {"action": next(actions), "url": "u"}
@@ -52,7 +65,79 @@ def test_run_apply_switches_to_fallback_after_usage_limit(monkeypatch):
     assert "codex" in rebuilt                     # tick 2 switched after the wall
     assert sw.blocked_until("claude") == 1000.0 + 3600   # walled for the cooldown
     assert counts["applied"] == 1
+    assert agent_events == [
+        {
+            "current_agent": "claude",
+            "current_model": "sonnet",
+            "agent_chain": "claude>codex",
+            "last_agent_switch_reason": "startup",
+        },
+        {
+            "current_agent": "codex",
+            "current_model": "sonnet",
+            "agent_chain": "claude>codex",
+            "last_agent_switch_reason": "switch:claude->codex",
+        },
+    ]
     awm._STOP_REQUESTED.clear()
+
+
+def test_run_apply_updates_loop_agent_telemetry_on_switch(monkeypatch):
+    from applypilot.fleet.agent_switch import AgentSwitcher
+    from applypilot.fleet import apply_worker_main as M
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+    class Loop:
+        def __init__(self):
+            self.apply_fn = None
+            self._current_model = "sonnet"
+            self.agent_events = []
+            self.calls = 0
+
+        def set_agent_telemetry(self, *, current_agent, current_model, agent_chain,
+                                last_agent_switch_reason=None):
+            self.agent_events.append({
+                "current_agent": current_agent,
+                "current_model": current_model,
+                "agent_chain": agent_chain,
+                "last_agent_switch_reason": last_agent_switch_reason,
+            })
+
+        def run_once(self):
+            self.calls += 1
+            return {"action": "idle"}
+
+    monkeypatch.setattr("applypilot.apply.pgqueue.ats_should_halt", lambda conn: False)
+    monkeypatch.setattr(M, "_apply_timeout_override", lambda conn=None, dsn=None: None)
+
+    loop = Loop()
+    switcher = AgentSwitcher(agents=["claude", "codex"])
+    rebuilt = []
+
+    def rebuild(agent):
+        rebuilt.append(agent)
+        return lambda job: {"run_status": "failed:no_result_line", "agent": agent}
+
+    M.run_apply(
+        lambda: Conn(),
+        loop,
+        max_iterations=1,
+        idle_sleep=0,
+        switcher=switcher,
+        rebuild_apply_fn=rebuild,
+        time_fn=lambda: 1000.0,
+    )
+
+    assert rebuilt == ["claude"]
+    assert loop.agent_events == [{
+        "current_agent": "claude",
+        "current_model": "sonnet",
+        "agent_chain": "claude>codex",
+        "last_agent_switch_reason": "startup",
+    }]
 
 
 def test_run_apply_pauses_when_all_agents_walled(monkeypatch):
@@ -324,3 +409,25 @@ def test_run_apply_without_switcher_is_unchanged(monkeypatch):
     counts = awm.run_apply(_conn_factory, loop, max_iterations=1, idle_sleep=0)
     assert counts["applied"] == 1
     awm._STOP_REQUESTED.clear()
+
+
+def test_build_apply_loop_reports_worker_version(monkeypatch):
+    monkeypatch.setattr(awm, "_setup_apply_env", lambda: None)
+    monkeypatch.setattr(awm, "_apply_timeout_override", lambda dsn=None, conn=None: None)
+    monkeypatch.setattr(awm, "make_apply_fn", lambda model, agent, slot, **_kwargs: lambda job: {})
+    monkeypatch.setattr(awm, "make_log_tail_fn", lambda slot: lambda: None)
+    monkeypatch.setattr(awm, "worker_version", lambda: "0.3.0+git.test.abc123")
+
+    loop = awm.build_apply_loop(
+        dsn="postgres://unused",
+        worker_id="m4-0",
+        home_ip="100.64.0.1",
+        model="sonnet",
+        agent="codex",
+        machine_owner="m4",
+        slot=0,
+    )
+
+    assert loop.sw_version == "0.3.0+git.test.abc123"
+    assert loop.current_agent == "codex"
+    assert loop.current_model == "codex-default"

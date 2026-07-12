@@ -14,6 +14,8 @@ import signal
 import threading
 import time
 
+from applypilot.fleet.version import worker_version
+
 logger = logging.getLogger("applypilot.fleet.apply_worker_main")
 
 # --- graceful stop (SIGTERM) -------------------------------------------------
@@ -594,6 +596,7 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     loop = WorkerLoop(lambda: pgqueue.connect(dsn), worker_id, home_ip=home_ip, role="apply",
                       apply_fn=make_apply_fn(model, agent, slot, fleet_worker_id=worker_id),
                       machine_owner=machine_owner,
+                      sw_version=worker_version(),
                       log_tail_fn=make_log_tail_fn(slot),
                       preflight_fn=liveness.probe_url,
                       attempt_store_factory=lambda conn, job: PgAttemptStore(
@@ -713,6 +716,11 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
             if switcher is not None:
                 now = _time()
                 agent = switcher.effective_agent(now)
+                reason = (
+                    "startup"
+                    if current_agent is None
+                    else f"switch:{current_agent}->{agent}"
+                )
                 if agent is None:
                     try:
                         loop.current_agent = None
@@ -742,10 +750,18 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                         if model_for_agent is not None:
                             loop.current_model = model_for_agent(agent)
                         loop.last_agent_switch_at = _now_local()
-                        loop.last_agent_switch_reason = "agent_available"
+                        loop.last_agent_switch_reason = reason
                     except Exception:
                         pass
                     current_agent = agent
+                    setter = getattr(loop, "set_agent_telemetry", None)
+                    if callable(setter):
+                        setter(
+                            current_agent=agent,
+                            current_model=getattr(loop, "_current_model", None),
+                            agent_chain=">".join(getattr(switcher, "agents", [agent])),
+                            last_agent_switch_reason=reason,
+                        )
             with conn_factory() as conn:
                 # Re-resolve the Doctor's agent_timeout_override on EVERY tick (not just at
                 # startup): the Doctor sets the override mid-flight while this worker is already
