@@ -427,7 +427,7 @@ class WorkerLoop:
 
     # -- COMPUTE: score/audit/tailor -- IP-free, cost-governed (§8, R14) -------
     def _tick_compute(self, conn) -> dict:
-        job = queue.lease_compute(conn, self.worker_id)
+        job = queue.lease_compute(conn, self.worker_id, sw_version=self.sw_version)
         if job is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}
@@ -453,7 +453,7 @@ class WorkerLoop:
 
     # -- DISCOVERY: governed scrape (RF2/§8.5) --------------------------------
     def _tick_discovery(self, conn) -> dict:
-        task = queue.lease_search(conn, self.worker_id)
+        task = queue.lease_search(conn, self.worker_id, sw_version=self.sw_version)
         if task is None:
             self._beat(conn, state="idle")
             return {"action": "idle"}

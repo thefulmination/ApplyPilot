@@ -170,6 +170,7 @@ class Broker:
         home_ip: str | None = None,
         owner_ip: str | None = None,
         ttl_seconds: int | None = None,
+        sw_version: str | None = None,
     ) -> dict[str, Any] | None:
         """Authenticate, gate on capability, then route to the right queue lease.
 
@@ -189,21 +190,24 @@ class Broker:
             raise ValueError(f"unknown lane: {lane!r}")
         if not self._capabilities(worker).get(cap_flag):
             raise CapabilityError(f"worker {worker_id} lacks capability {cap_flag} for lane {lane}")
-        if not fleet_config.worker_version_matches(conn, worker_id):
+        if sw_version is None and not fleet_config.worker_version_matches(conn, worker_id):
             return None
 
         reg_ip = worker.get("public_ip")  # registered egress -- the ONLY IP we trust
         kw = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
         if lane in ("ats", "apply"):
-            return queue.lease_apply(conn, worker_id, home_ip=reg_ip, **kw)
+            return queue.lease_apply(conn, worker_id, home_ip=reg_ip, sw_version=sw_version, **kw)
         if lane == "compute":
-            return queue.lease_compute(conn, worker_id, **kw)
+            return queue.lease_compute(conn, worker_id, sw_version=sw_version, **kw)
         if lane in ("search", "discover"):
-            return queue.lease_search(conn, worker_id, **kw)
+            return queue.lease_search(conn, worker_id, sw_version=sw_version, **kw)
         if lane == "linkedin":
             # R1 mutex: the worker's REGISTERED public_ip vs the broker-configured
             # owner_ip -- both server-side. queue.lease_linkedin refuses a mismatch.
-            return queue.lease_linkedin(conn, worker_id, public_ip=reg_ip, owner_ip=self.owner_ip, **kw)
+            return queue.lease_linkedin(
+                conn, worker_id, public_ip=reg_ip, owner_ip=self.owner_ip,
+                sw_version=sw_version, **kw,
+            )
         raise ValueError(f"unknown lane: {lane!r}")  # pragma: no cover
 
     # -- result writes (route by lane) ---------------------------------------
@@ -450,6 +454,7 @@ def build_app(*, owner_ip: str | None = None, dsn: str | None = None):
             return {"job": _guard(
                 broker.lease, conn, body["worker_id"], token,
                 lane=body["lane"], ttl_seconds=body.get("ttl_seconds"),
+                sw_version=body.get("sw_version"),
             )}
 
     @app.post("/write_result")

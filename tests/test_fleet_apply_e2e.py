@@ -72,7 +72,7 @@ def test_canary_go_live_path(fleet_db):
     # ---- canary capped the fleet at exactly K=2 ---------------------------------
     assert applied == 2, (
         f"expected exactly 2 applied (canary K=2) but got {applied}; "
-        "check that the canary decrement+pause is atomic in queue.lease_apply"
+        "check that the canary decrement is atomic in queue.lease_apply"
     )
 
     # ---- ATS lane stopped for operator review without pausing LinkedIn ----------

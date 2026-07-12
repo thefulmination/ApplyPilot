@@ -19,11 +19,20 @@ from collections.abc import Mapping
 from psycopg.errors import DeadlockDetected
 from psycopg.types.json import Jsonb
 
-from psycopg.types.json import Jsonb
-
 from applypilot import config
+from applypilot.fleet import config as fleet_config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
+
+
+def version_mismatch(conn, worker_id: str, sw_version: str | None) -> str | None:
+    """Return the required version when a reporting worker must not lease work."""
+    if sw_version is None:
+        return None
+    expected = fleet_config.version_for_worker(conn, worker_id)
+    if expected and sw_version != expected:
+        return expected
+    return None
 
 def _nonnegative_env_seconds(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -243,15 +252,19 @@ WITH cfg AS (SELECT ats_apply_mode, canary_enabled, canary_remaining, paused, at
 UPDATE apply_queue q
 SET status='leased', lease_owner=%(worker)s, lease_expires_at = now() + make_interval(secs => %(ttl)s),
     last_attempted_at = now(), attempts = q.attempts + 1, updated_at = now(), worker_home_ip = %(home_ip)s
-FROM next_job WHERE q.url = next_job.url
+FROM next_job
+LEFT JOIN reserve ON TRUE
+WHERE q.url = next_job.url
 RETURNING q.url, q.company, q.title, q.application_url,
           COALESCE(q.target_host, q.apply_domain) AS target_host, q.score, q.dedup_key, q.attempts,
           q.session_required, q.tenant_profile_id, q.execution_route, q.host_policy;
 """
 
 
-def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200,
+def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200, sw_version=None,
                 liveness_fresh_seconds=LIVENESS_FRESH_SECONDS):
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         cur.execute(_LEASE_APPLY, {
@@ -942,7 +955,9 @@ RETURNING c.url, c.task, c.payload, c.attempts;
 """
 
 
-def lease_compute(conn, worker_id, *, ttl_seconds=1200):
+def lease_compute(conn, worker_id, *, ttl_seconds=1200, sw_version=None):
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     if _cost_cap_exceeded(conn):
         return None
     with conn.cursor() as cur:
@@ -1040,7 +1055,9 @@ def _run_search_transaction_with_retry(conn, operation):
             time.sleep(0.05 * (2**attempt))
 
 
-def lease_search(conn, worker_id, *, ttl_seconds=900):
+def lease_search(conn, worker_id, *, ttl_seconds=900, sw_version=None):
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     def operation():
         with conn.cursor() as cur:
             cur.execute(_LEASE_SEARCH, {"worker": worker_id, "ttl": ttl_seconds})
@@ -1174,13 +1191,16 @@ WITH cfg AS (SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canar
      )
 UPDATE linkedin_queue q SET status='leased', lease_owner=%(worker)s,
   lease_expires_at = now() + make_interval(secs => %(ttl)s), last_attempted_at=now(), attempts=q.attempts+1, updated_at=now()
-FROM next WHERE q.url = next.url
+FROM next
+LEFT JOIN reserve ON TRUE
+LEFT JOIN canary ON TRUE
+WHERE q.url = next.url
 RETURNING q.url, q.company, q.title, q.application_url, q.score;
 """
 
 
 def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
-                   daily_cap=20, min_gap_seconds=1200):
+                   daily_cap=20, min_gap_seconds=1200, sw_version=None):
     """LinkedIn lease: ONLY from the one owner IP, serialized by the account mutex.
 
     ``public_ip`` is the worker's REGISTERED egress IP and ``owner_ip`` is the
@@ -1188,6 +1208,8 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
     worker. They must match or the lease is refused outright."""
     if public_ip is None or owner_ip is None or public_ip != owner_ip:
         return None  # LinkedIn never from a different IP than the owner's
+    if version_mismatch(conn, worker_id, sw_version):
+        return None
     blocked_names, blocked_pats = config.load_blocked_companies()
     with conn.cursor() as cur:
         # Ensure the account governor row EXISTS so the FOR UPDATE mutex has a row to
