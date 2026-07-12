@@ -19,14 +19,52 @@ from collections.abc import Mapping
 from psycopg.errors import DeadlockDetected
 from psycopg.types.json import Jsonb
 
-from psycopg.errors import DeadlockDetected
-from psycopg.types.json import Jsonb
-
 from applypilot import config
 from applypilot.fleet import dedup as _dedup
 from applypilot.fleet import governor
 
-LIVENESS_FRESH_SECONDS = int(os.environ.get("APPLYPILOT_LIVENESS_FRESH_SECONDS") or 900)
+def _nonnegative_env_seconds(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
+LIVENESS_FRESH_SECONDS = _nonnegative_env_seconds("APPLYPILOT_LIVENESS_FRESH_SECONDS", 900)
+LIVENESS_UNCERTAIN_RETRY_SECONDS = _nonnegative_env_seconds(
+    "APPLYPILOT_LIVENESS_UNCERTAIN_RETRY_SECONDS", 21_600
+)
+LIVENESS_TRANSIENT_RETRY_SECONDS = _nonnegative_env_seconds(
+    "APPLYPILOT_LIVENESS_TRANSIENT_RETRY_SECONDS", 3_600
+)
+LIVENESS_STRUCTURAL_RETRY_SECONDS = _nonnegative_env_seconds(
+    "APPLYPILOT_LIVENESS_STRUCTURAL_RETRY_SECONDS", 86_400
+)
+LIVENESS_HOST_COOLDOWN_SECONDS = _nonnegative_env_seconds(
+    "APPLYPILOT_LIVENESS_HOST_COOLDOWN_SECONDS", 1_800
+)
+
+
+def liveness_retry_policy(reason: str | None, consecutive_uncertain: int = 0) -> tuple[str, int]:
+    """Return the scheduler class and retry delay for an uncertain reason."""
+    value = reason or ""
+    if (
+        value.endswith(("_invalid_payload", "_id_mismatch"))
+        or value in {"redirect_login", "redirect_home", "empty_body", "thin_body", "workday_unparsed"}
+        or consecutive_uncertain >= 6
+    ):
+        return "structural", LIVENESS_STRUCTURAL_RETRY_SECONDS
+    if consecutive_uncertain >= 3:
+        return "uncertain", LIVENESS_UNCERTAIN_RETRY_SECONDS
+    if value.startswith(("server_", "neterr:", "error:")) or value == "blocked_429":
+        return "transient", LIVENESS_TRANSIENT_RETRY_SECONDS
+    return "uncertain", LIVENESS_UNCERTAIN_RETRY_SECONDS
+
+
 CANONICAL_QUEUE_FIELDS = frozenset({
     "decision_id", "policy_version", "decision_action", "qualification_verdict",
     "qualification_score", "qualification_floor", "preference_score", "outcome_score",
@@ -95,9 +133,20 @@ WITH cfg AS (SELECT ats_apply_mode, canary_enabled, canary_remaining, paused, at
          AND q.qualification_verdict = 'qualified'
          AND q.qualification_score >= q.qualification_floor
          AND q.decision_expires_at > now()
-         AND q.score = q.final_score
-         AND (cfg.approval_threshold IS NULL OR q.final_score >= cfg.approval_threshold)
-         AND EXISTS (
+          AND q.score = q.final_score
+          AND (cfg.approval_threshold IS NULL OR q.final_score >= cfg.approval_threshold)
+          AND COALESCE(q.apply_error, '') NOT ILIKE 'requeued_by_%%'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM apply_result_events prior
+            WHERE prior.queue_name = 'apply_queue'
+              AND prior.url = q.url
+              AND (
+                COALESCE(prior.application_tool_calls, 0) > 0
+                OR COALESCE(prior.apply_error, '') ILIKE 'requeued_by_%%'
+              )
+          )
+          AND EXISTS (
            SELECT 1 FROM fleet_decision_policies p
            WHERE p.policy_version = q.policy_version AND p.lane = 'ats'
               AND p.status IN ('canary', 'active')
@@ -342,53 +391,6 @@ def claim_liveness_check(conn, worker_id, *, ttl_seconds=120,
     return dict(row) if row else None
 
 
-_CLAIM_LIVENESS_SQL = """
-WITH candidate AS (
-    SELECT q.url
-    FROM apply_queue q
-    JOIN fleet_config cfg ON cfg.id = 1
-    WHERE q.status = 'queued'
-      AND q.lane = 'ats'
-      AND q.approved_batch IS NOT NULL
-      AND q.score >= COALESCE(cfg.approval_threshold, 7)
-      AND COALESCE(q.liveness_required, FALSE)
-      AND (
-           q.liveness_checked_at IS NULL
-           OR q.liveness_checked_at < now() - make_interval(secs => %(fresh)s)
-      )
-      AND (
-           q.liveness_check_owner IS NULL
-           OR q.liveness_check_expires_at < now()
-      )
-    ORDER BY q.score DESC, q.url
-    LIMIT 1
-    FOR UPDATE OF q SKIP LOCKED
-)
-UPDATE apply_queue q
-SET liveness_check_owner = %(worker)s,
-    liveness_check_expires_at = now() + make_interval(secs => %(ttl)s),
-    updated_at = now()
-FROM candidate
-WHERE q.url = candidate.url
-RETURNING q.url, q.application_url, q.company, q.title,
-          COALESCE(q.target_host, q.apply_domain) AS target_host;
-"""
-
-
-def claim_liveness_check(conn, worker_id, *, ttl_seconds=120,
-                         fresh_seconds=LIVENESS_FRESH_SECONDS):
-    """Claim one stale required-liveness row without leasing an application."""
-    with conn.cursor() as cur:
-        cur.execute(_CLAIM_LIVENESS_SQL, {
-            "worker": worker_id,
-            "ttl": ttl_seconds,
-            "fresh": fresh_seconds,
-        })
-        row = cur.fetchone()
-    conn.commit()
-    return dict(row) if row else None
-
-
 def write_liveness_result(conn, worker_id, url, *, status, reason) -> bool:
     """Commit an owner-guarded preflight verdict; confirmed dead rows terminate."""
     normalized = status if status in {"live", "dead", "uncertain"} else "uncertain"
@@ -397,6 +399,9 @@ def write_liveness_result(conn, worker_id, url, *, status, reason) -> bool:
             "UPDATE apply_queue SET liveness_status=%s, liveness_reason=%s, "
             "liveness_checked_at=now(), liveness_check_owner=NULL, "
             "liveness_check_expires_at=NULL, "
+            "liveness_check_count=COALESCE(liveness_check_count,0)+1, "
+            "liveness_consecutive_uncertain=CASE WHEN %s='uncertain' "
+            "THEN COALESCE(liveness_consecutive_uncertain,0)+1 ELSE 0 END, "
             "status=CASE WHEN %s='dead' THEN 'failed'::apply_queue_status ELSE status END, "
             "apply_status=CASE WHEN %s='dead' THEN 'expired' ELSE apply_status END, "
             "apply_error=CASE WHEN %s='dead' THEN %s ELSE apply_error END, updated_at=now() "
@@ -404,6 +409,7 @@ def write_liveness_result(conn, worker_id, url, *, status, reason) -> bool:
             (
                 normalized,
                 reason[:200] if reason else None,
+                normalized,
                 normalized,
                 normalized,
                 normalized,
@@ -552,10 +558,10 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
             )
         cur.execute(
             "INSERT INTO apply_result_events ("
-            "queue_name, url, worker_id, status, apply_status, apply_error, target_host, home_ip, "
+            "queue_name, url, worker_id, machine_owner, status, apply_status, apply_error, target_host, home_ip, "
             "agent, agent_model, est_cost_usd, apply_duration_ms, application_tool_calls, "
             "job_log_path, transcript_digest, final_result_source, result_metadata, result_line, source"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s)",
+            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 "apply_queue",
                 url,
@@ -655,7 +661,7 @@ def retire_queued_dead_jobs(
 
 
 def push_apply_jobs(conn, rows, *, approved_batch=None, require_liveness=False,
-                    require_eligibility=False, commit=True) -> int:
+                    require_eligibility=False, commit=True, diagnostics=False) -> int | dict:
     """UPSERT apply_queue rows with the v3 columns (dedup_key, target_host, lane,
     approved_batch). Only refreshes ``queued`` rows. ``rows`` need url, company,
     title, application_url, score, and target_host (or apply_domain)."""
@@ -690,8 +696,8 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, require_liveness=False,
                 dedup_skipped += 1
                 continue
             cur.execute(
-                "INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, target_host, lane, dedup_key, approved_batch, liveness_required, eligibility_required, eligibility_status, eligibility_reason, eligibility_checked_at, session_required, tenant_profile_id, routing_required, execution_route, host_policy, status, apply_status, apply_error, decision_id, policy_version, decision_action, qualification_verdict, qualification_score, qualification_floor, preference_score, outcome_score, final_score, decision_confidence, decision_created_at, decision_expires_at, input_hash) "
-                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,%(host)s,%(host)s,'ats',%(dk)s,%(batch)s,%(require_liveness)s,%(require_eligibility)s,%(eligibility_status)s,%(eligibility_reason)s,CASE WHEN %(require_eligibility)s THEN now() ELSE NULL END,%(session_required)s,%(tenant_profile_id)s,%(routing_required)s,%(execution_route)s,%(host_policy)s,CASE WHEN (%(require_eligibility)s AND %(eligibility_status)s='ineligible') OR %(execution_route)s='exception' THEN 'failed'::apply_queue_status ELSE 'queued'::apply_queue_status END,CASE WHEN %(require_eligibility)s AND %(eligibility_status)s='ineligible' THEN 'failed' WHEN %(execution_route)s='exception' THEN 'exception_pending' ELSE NULL END,CASE WHEN %(require_eligibility)s AND %(eligibility_status)s='ineligible' THEN %(eligibility_reason)s WHEN %(execution_route)s='exception' THEN %(host_policy)s ELSE NULL END,%(decision_id)s,%(policy_version)s,%(decision_action)s,%(qualification_verdict)s,%(qualification_score)s,%(qualification_floor)s,%(preference_score)s,%(outcome_score)s,%(final_score)s,%(decision_confidence)s,%(decision_created_at)s,%(decision_expires_at)s,%(input_hash)s) "
+                "INSERT INTO apply_queue (url, company, title, application_url, score, apply_domain, target_host, lane, dedup_key, approved_batch, liveness_required, liveness_status, liveness_reason, liveness_checked_at, eligibility_required, eligibility_status, eligibility_reason, eligibility_checked_at, session_required, tenant_profile_id, routing_required, execution_route, host_policy, status, apply_status, apply_error, decision_id, policy_version, decision_action, qualification_verdict, qualification_score, qualification_floor, preference_score, outcome_score, final_score, decision_confidence, decision_created_at, decision_expires_at, input_hash) "
+                "VALUES (%(url)s,%(company)s,%(title)s,%(application_url)s,%(score)s,%(host)s,%(host)s,'ats',%(dk)s,%(batch)s,%(require_liveness)s,%(liveness_status)s,%(liveness_reason)s,%(liveness_checked_at)s,%(require_eligibility)s,%(eligibility_status)s,%(eligibility_reason)s,CASE WHEN %(require_eligibility)s THEN now() ELSE NULL END,%(session_required)s,%(tenant_profile_id)s,%(routing_required)s,%(execution_route)s,%(host_policy)s,CASE WHEN (%(require_eligibility)s AND %(eligibility_status)s='ineligible') OR %(execution_route)s='exception' THEN 'failed'::apply_queue_status ELSE 'queued'::apply_queue_status END,CASE WHEN %(require_eligibility)s AND %(eligibility_status)s='ineligible' THEN 'failed' WHEN %(execution_route)s='exception' THEN 'exception_pending' ELSE NULL END,CASE WHEN %(require_eligibility)s AND %(eligibility_status)s='ineligible' THEN %(eligibility_reason)s WHEN %(execution_route)s='exception' THEN %(host_policy)s ELSE NULL END,%(decision_id)s,%(policy_version)s,%(decision_action)s,%(qualification_verdict)s,%(qualification_score)s,%(qualification_floor)s,%(preference_score)s,%(outcome_score)s,%(final_score)s,%(decision_confidence)s,%(decision_created_at)s,%(decision_expires_at)s,%(input_hash)s) "
                 "ON CONFLICT (url) DO UPDATE SET company=EXCLUDED.company, title=EXCLUDED.title, "
                 "application_url=EXCLUDED.application_url, score=EXCLUDED.score, target_host=EXCLUDED.target_host, "
                 "dedup_key=EXCLUDED.dedup_key, "
@@ -708,9 +714,18 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, require_liveness=False,
                 "decision_confidence=EXCLUDED.decision_confidence, decision_created_at=EXCLUDED.decision_created_at, "
                 "decision_expires_at=EXCLUDED.decision_expires_at, input_hash=EXCLUDED.input_hash, "
                 "status=EXCLUDED.status, apply_status=EXCLUDED.apply_status, apply_error=EXCLUDED.apply_error, "
-                "liveness_status=CASE WHEN apply_queue.application_url IS DISTINCT FROM EXCLUDED.application_url THEN NULL ELSE apply_queue.liveness_status END, "
-                "liveness_reason=CASE WHEN apply_queue.application_url IS DISTINCT FROM EXCLUDED.application_url THEN NULL ELSE apply_queue.liveness_reason END, "
-                "liveness_checked_at=CASE WHEN apply_queue.application_url IS DISTINCT FROM EXCLUDED.application_url THEN NULL ELSE apply_queue.liveness_checked_at END, "
+                "liveness_status=CASE "
+                "WHEN apply_queue.application_url IS DISTINCT FROM EXCLUDED.application_url THEN EXCLUDED.liveness_status "
+                "WHEN EXCLUDED.liveness_checked_at IS NOT NULL AND (apply_queue.liveness_checked_at IS NULL OR EXCLUDED.liveness_checked_at > apply_queue.liveness_checked_at) THEN EXCLUDED.liveness_status "
+                "ELSE apply_queue.liveness_status END, "
+                "liveness_reason=CASE "
+                "WHEN apply_queue.application_url IS DISTINCT FROM EXCLUDED.application_url THEN EXCLUDED.liveness_reason "
+                "WHEN EXCLUDED.liveness_checked_at IS NOT NULL AND (apply_queue.liveness_checked_at IS NULL OR EXCLUDED.liveness_checked_at > apply_queue.liveness_checked_at) THEN EXCLUDED.liveness_reason "
+                "ELSE apply_queue.liveness_reason END, "
+                "liveness_checked_at=CASE "
+                "WHEN apply_queue.application_url IS DISTINCT FROM EXCLUDED.application_url THEN EXCLUDED.liveness_checked_at "
+                "WHEN EXCLUDED.liveness_checked_at IS NOT NULL AND (apply_queue.liveness_checked_at IS NULL OR EXCLUDED.liveness_checked_at > apply_queue.liveness_checked_at) THEN EXCLUDED.liveness_checked_at "
+                "ELSE apply_queue.liveness_checked_at END, "
                 "approved_batch=CASE "
                 "WHEN EXCLUDED.approved_batch IS NOT NULL THEN EXCLUDED.approved_batch "
                 "WHEN EXCLUDED.score IS NULL OR EXCLUDED.score < (SELECT COALESCE(approval_threshold, 7) FROM fleet_config WHERE id=1) THEN NULL "
@@ -721,6 +736,9 @@ def push_apply_jobs(conn, rows, *, approved_batch=None, require_liveness=False,
                  "require_eligibility": bool(require_eligibility),
                  "eligibility_status": r.get("eligibility_status"),
                  "eligibility_reason": r.get("eligibility_reason"),
+                 "liveness_status": r.get("liveness_status"),
+                 "liveness_reason": r.get("liveness_reason"),
+                 "liveness_checked_at": r.get("liveness_checked_at"),
                  "session_required": bool(r.get("session_required")),
                  "tenant_profile_id": r.get("tenant_profile_id"),
                  "routing_required": bool(r.get("routing_required")),

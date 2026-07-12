@@ -183,12 +183,12 @@ def test_tool_touch_no_result_crash_stays_parked(fleet_db):
             )
             audit = cur.fetchone()
 
-    assert out["actions"]["no_action"] == 1
+    assert out["actions"]["manual_review_required"] == 1
     assert out["applied"] == 0
     assert q["status"] == "crash_unconfirmed"
     assert q["apply_error"] == "failed:no_result_line"
-    assert audit["chosen_action"] == "no_action"
-    assert audit["action_status"] == "no_action"
+    assert audit["chosen_action"] == "manual_review_required"
+    assert audit["action_status"] == "manual_review_required"
     assert audit["decision_source"] == "rules"
 
 

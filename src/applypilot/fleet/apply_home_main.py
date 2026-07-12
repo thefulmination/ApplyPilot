@@ -20,8 +20,58 @@ from applypilot.fleet import queue, queue_diagnosis, sync
 logger = logging.getLogger("applypilot.fleet.apply_home_main")
 
 
+def crash_liveness_task_diagnosis(log_path: str | os.PathLike[str] | None = None) -> dict:
+    """Report freshness of the scheduled evidence-only liveness runner log."""
+    path = Path(log_path) if log_path else Path(__file__).resolve().parents[3] / ".fleet-logs" / "crash-liveness.log"
+    if not path.exists():
+        return {"available": False, "log_path": str(path), "healthy": False}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    exit_match = None
+    for line in reversed(lines):
+        match = re.search(r"^\[(?P<at>[^]]+)\] exit=(?P<code>\d+)$", line.strip())
+        if match:
+            exit_match = match
+            break
+    last_run_at = None
+    last_exit = None
+    if exit_match:
+        try:
+            last_run_at = _dt.datetime.fromisoformat(exit_match.group("at"))
+        except ValueError:
+            last_run_at = None
+        last_exit = int(exit_match.group("code"))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    age_seconds = None
+    if last_run_at:
+        if last_run_at.tzinfo is None:
+            last_run_at = last_run_at.replace(tzinfo=_dt.timezone.utc)
+        age_seconds = max(0.0, (now - last_run_at.astimezone(_dt.timezone.utc)).total_seconds())
+    healthy = last_exit == 0 and age_seconds is not None and age_seconds <= 90 * 60
+    return {
+        "available": True,
+        "log_path": str(path),
+        "last_run_at": last_run_at,
+        "last_exit": last_exit,
+        "age_seconds": age_seconds,
+        "healthy": healthy,
+    }
+
+
+def _configure_stdio() -> None:
+    """Keep Windows owner-review commands usable with Unicode job metadata."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+
+
 def push_home(conn, *, sqlite_conn=None, score_floor: float = 7.0, limit: int | None = None,
-              lane_filter: bool = True) -> int:
+              lane_filter: bool = True, diagnostics: bool = False,
+              approved_batch: str | None = None) -> int | dict[str, int]:
     """The home 'push' cadence: stage apply-eligible jobs (+ backfill applied_set,
     inside push_apply_eligible), and best-effort push the brain's email_events outcome
     summaries into PG inbox_outcomes (R8 feedback loop). The outcomes push is advisory
@@ -29,7 +79,9 @@ def push_home(conn, *, sqlite_conn=None, score_floor: float = 7.0, limit: int | 
     apply queue, so it is logged and swallowed rather than raised."""
     pushed = sync.push_apply_eligible(sqlite_conn=sqlite_conn, pg_conn=conn,
                                        score_floor=score_floor, limit=limit,
-                                       lane_filter=lane_filter)
+                                       lane_filter=lane_filter,
+                                       diagnostics=diagnostics,
+                                       approved_batch=approved_batch)
     try:
         sync.push_inbox_outcomes(sqlite_conn=sqlite_conn, pg_conn=conn)
     except Exception:
@@ -2330,7 +2382,9 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     p = argparse.ArgumentParser(prog="applypilot-fleet-apply-home")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
     sub = p.add_subparsers(dest="cmd", required=True)
-    sp = sub.add_parser("push"); sp.add_argument("--score-floor", type=float, default=7.0); sp.add_argument("--limit", type=int, default=None)
+    sp = sub.add_parser("push")
+    sp.add_argument("--score-floor", type=float, default=7.0)
+    sp.add_argument("--limit", type=int, default=None)
     sp.add_argument("--no-lane-filter", action="store_true",
                     help="Disable the default off-lane drift filter for this push.")
     sp.add_argument("--diagnostic", action="store_true",
@@ -2535,7 +2589,9 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
         fleet_schema.ensure_schema_v3(conn)
         if args.cmd == "push":
             print("pushed", push_home(conn, score_floor=args.score_floor, limit=args.limit,
-                                      lane_filter=not args.no_lane_filter))
+                                      lane_filter=not args.no_lane_filter,
+                                      diagnostics=args.diagnostic,
+                                      approved_batch=args.approved_batch))
         elif args.cmd == "pull":
             print("pulled", sync.pull_apply_results(pg_conn=conn))
         elif args.cmd == "canary":
@@ -2691,8 +2747,8 @@ def _print_status(conn) -> None:
         cur.execute("SELECT status, count(*) AS n FROM apply_queue GROUP BY status")
         depth = {r["status"]: r["n"] for r in cur.fetchall()}
         cur.execute(
-            "SELECT paused,ats_paused,ats_apply_mode,canary_enabled,canary_remaining,spend_cap_usd,"
-            "ats_policy_version FROM fleet_config WHERE id=1"
+            "SELECT paused, ats_paused, ats_pause_source, ats_apply_mode, canary_enabled, "
+            "canary_remaining, spend_cap_usd, updated_at FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone()
         cur.execute("SELECT to_regclass('fleet_desired_state') AS rel")
@@ -2728,10 +2784,171 @@ def _print_status(conn) -> None:
         apply_heartbeat_summary = dict(cur.fetchone())
         cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM apply_queue")
         spend = float(cur.fetchone()["s"])
-        cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE resolved_at IS NULL")
-        open_ch = cur.fetchone()["n"]
+        cur.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM auth_challenge a
+               WHERE a.resolved_at IS NULL
+                 AND (EXISTS (SELECT 1 FROM apply_queue q WHERE q.url=a.url AND q.lane='ats'
+                              AND q.status='leased' AND q.apply_status='challenge_pending')
+                      OR (NOT EXISTS (SELECT 1 FROM apply_queue q WHERE q.url=a.url)
+                          AND NOT EXISTS (SELECT 1 FROM linkedin_queue l WHERE l.url=a.url)))) AS ats_open,
+              (SELECT COUNT(*) FROM auth_challenge a
+               WHERE a.resolved_at IS NULL
+                 AND EXISTS (SELECT 1 FROM linkedin_queue l WHERE l.url=a.url
+                             AND l.status='leased' AND l.apply_status='challenge_pending')) AS linkedin_open
+            """
+        )
+        challenge_counts = cur.fetchone()
+        open_ch = challenge_counts["ats_open"]
+        linkedin_open_ch = challenge_counts["linkedin_open"]
+        cur.execute(
+            """
+            WITH ats_auth AS (
+              SELECT a.*
+              FROM auth_challenge a
+              WHERE a.resolved_at IS NULL
+                AND (EXISTS (SELECT 1 FROM apply_queue q WHERE q.url=a.url AND q.lane='ats'
+                             AND q.status='leased' AND q.apply_status='challenge_pending')
+                     OR (NOT EXISTS (SELECT 1 FROM apply_queue q WHERE q.url=a.url)
+                         AND NOT EXISTS (SELECT 1 FROM linkedin_queue l WHERE l.url=a.url)))
+            )
+            SELECT
+              (SELECT COUNT(*) FROM ats_auth) AS open_count,
+              (SELECT COUNT(*) FROM ats_auth
+               WHERE raised_at < now() - interval '1 day') AS old_open,
+              (SELECT COUNT(*) FROM apply_queue
+               WHERE lane='ats' AND status = 'leased' AND apply_status = 'challenge_pending'
+                 AND lease_expires_at > now() + interval '1 day') AS parked_frozen,
+              (SELECT COUNT(*) FROM apply_queue
+               WHERE lane='ats' AND status = 'blocked' AND apply_status = 'challenge_skipped') AS blocked_skipped,
+              (SELECT COUNT(*) FROM apply_queue
+               WHERE lane='ats' AND status = 'leased' AND apply_status = 'challenge_pending') AS active_pending,
+              (SELECT COUNT(*) FROM apply_queue q
+               WHERE q.status = 'leased' AND q.apply_status = 'challenge_pending'
+                 AND q.lease_expires_at > now() + interval '1 day'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM auth_challenge open_ch
+                   WHERE open_ch.url = q.url AND open_ch.resolved_at IS NULL
+                 )) AS parked_without_open
+            """
+        )
+        challenge_diag = dict(cur.fetchone())
+        cur.execute(
+            """
+            SELECT a.kind, COUNT(*) AS n
+            FROM auth_challenge a
+            JOIN apply_queue q ON q.url = a.url AND q.lane = 'ats'
+            WHERE a.resolved_at IS NULL
+              AND q.status = 'leased' AND q.apply_status = 'challenge_pending'
+            GROUP BY a.kind ORDER BY n DESC, a.kind
+            """
+        )
+        challenge_kinds = {str(row["kind"] or "unknown"): int(row["n"] or 0) for row in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE ar.application_tool_calls IS NULL) AS missing_evidence,
+              COUNT(*) FILTER (WHERE ar.application_tool_calls = 0) AS zero_tool_calls,
+              COUNT(*) FILTER (WHERE ar.application_tool_calls > 0) AS tool_touched,
+              COUNT(*) FILTER (WHERE ar.url IS NULL) AS no_result_event,
+              COUNT(*) FILTER (WHERE ar.event_source = 'worker_lease') AS lease_started_no_terminal,
+              COUNT(*) FILTER (WHERE q.liveness_status = 'dead') AS liveness_dead,
+              COUNT(*) FILTER (WHERE q.liveness_status = 'live') AS liveness_live,
+              COUNT(*) FILTER (WHERE q.liveness_status = 'uncertain') AS liveness_uncertain,
+              COUNT(*) FILTER (
+                WHERE q.liveness_status = 'dead'
+                  AND q.updated_at < now() - interval '7 days'
+                  AND q.liveness_checked_at >= now() - interval '7 days'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM apply_result_events pe
+                    WHERE pe.queue_name='apply_queue' AND pe.url=q.url
+                      AND (COALESCE(pe.application_tool_calls,0)>0
+                           OR pe.status='applied' OR pe.apply_status='applied')
+                  )
+                  AND NOT EXISTS (SELECT 1 FROM applied_set pas WHERE pas.dedup_key=q.dedup_key)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM inbox_outcomes pio
+                    WHERE pio.dedup_key=q.dedup_key
+                       OR pio.job_url IN (q.url, q.application_url)
+                  )
+              ) AS parkable_dead,
+              COUNT(*) FILTER (WHERE q.updated_at < now() - interval '7 days') AS older_7d,
+              COUNT(*) FILTER (WHERE q.updated_at >= now() - interval '7 days'
+                                      AND q.updated_at < now() - interval '1 day') AS age_1d_to_7d,
+              MIN(q.updated_at) AS oldest_crash_at,
+              COUNT(*) FILTER (
+                WHERE ar.application_tool_calls = 0
+                  AND COALESCE(q.apply_error, '') IN ('failed:no_result_line', 'failed:timeout')
+              ) AS safe_pre_touch_candidates,
+              COUNT(*) FILTER (WHERE aa.action_status = 'manual_review_required') AS manual_review_audited,
+              COUNT(*) FILTER (WHERE aa.action_status IS NULL) AS no_autotriage_audit
+            FROM apply_queue q
+            LEFT JOIN LATERAL (
+              SELECT e.url, e.application_tool_calls, e.source AS event_source
+              FROM apply_result_events e
+              WHERE e.queue_name = 'apply_queue' AND e.url = q.url
+              ORDER BY e.created_at DESC, e.id DESC
+              LIMIT 1
+            ) ar ON TRUE
+            LEFT JOIN LATERAL (
+              SELECT a.action_status
+              FROM autotriage_actions a
+              WHERE a.url = q.url
+              ORDER BY a.created_at DESC, a.id DESC
+              LIMIT 1
+            ) aa ON TRUE
+            WHERE q.lane = 'ats' AND q.status = 'crash_unconfirmed'
+            """
+        )
+        crash_diag = dict(cur.fetchone())
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) AS events_24h,
+              COUNT(*) FILTER (WHERE source = 'worker') AS worker_events_24h,
+              COUNT(*) FILTER (WHERE source = 'worker' AND status = 'crash_unconfirmed') AS worker_crash_events_24h,
+              COUNT(*) FILTER (WHERE source = 'worker' AND application_tool_calls IS NULL) AS worker_missing_evidence_24h,
+              COUNT(*) FILTER (WHERE source = 'worker' AND application_tool_calls IS NOT NULL) AS worker_evidenced_events_24h,
+              COUNT(*) FILTER (WHERE source = 'watchdog') AS watchdog_events_24h,
+              COUNT(*) FILTER (WHERE source LIKE 'historical_reaudit:%') AS historical_reaudit_events_24h
+            FROM apply_result_events
+            WHERE queue_name = 'apply_queue' AND created_at >= now() - interval '24 hours'
+            """
+        )
+        evidence_freshness = dict(cur.fetchone())
+        crash_liveness_task = crash_liveness_task_diagnosis()
+        cur.execute(
+            "SELECT last_beat, state, last_error FROM worker_heartbeat "
+            "WHERE worker_id = 'otp_responder'"
+        )
+        otp_heartbeat = cur.fetchone()
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE consumed_at IS NULL AND code IS NULL AND expires_at > now()) AS pending_requests,
+              COUNT(*) FILTER (WHERE code IS NOT NULL AND consumed_at IS NULL) AS ready_requests,
+              COUNT(*) FILTER (WHERE matched_email_ts >= now() - interval '24 hours') AS matched_requests_24h
+            FROM otp_request
+            """
+        )
+        otp_counts = cur.fetchone()
+        otp_diagnosis = {
+            "heartbeat_healthy": bool(
+                otp_heartbeat and otp_heartbeat["last_beat"] >= _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=45)
+            ),
+            "state": otp_heartbeat["state"] if otp_heartbeat else None,
+            "last_error": otp_heartbeat["last_error"] if otp_heartbeat else None,
+            "pending_requests": int(otp_counts["pending_requests"] or 0),
+            "ready_requests": int(otp_counts["ready_requests"] or 0),
+            "matched_requests_24h": int(otp_counts["matched_requests_24h"] or 0),
+        }
     print({"queue": depth, "paused": cfg["paused"], "ats_paused": cfg["ats_paused"],
-           "ats_apply_mode": cfg["ats_apply_mode"], "ats_policy_version": cfg["ats_policy_version"],
+           "ats_pause_source": cfg["ats_pause_source"], "ats_apply_mode": cfg["ats_apply_mode"],
+           "fleet_config_updated_at": cfg["updated_at"],
+           "desired_control": desired_control,
+           "apply_heartbeat_summary": apply_heartbeat_summary,
+           "canary_enabled": cfg["canary_enabled"],
            "canary_remaining": cfg["canary_remaining"],
            "spend_cap_usd": float(cfg["spend_cap_usd"] or 0), "apply_spend": spend,
            "open_challenges": open_ch, "linkedin_open_challenges": linkedin_open_ch,

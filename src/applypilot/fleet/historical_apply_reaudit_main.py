@@ -7,7 +7,7 @@ import os
 import sys
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import historical_apply_reaudit
+from applypilot.fleet import historical_apply_reaudit, schema as fleet_schema
 
 
 def _default_home_db() -> str:
@@ -41,6 +41,8 @@ def main(argv=None) -> int:
         help="Audit only events recorded from this worker address; repeat as needed.",
     )
     args = parser.parse_args(argv)
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
     remote_hosts = {}
     for value in args.ssh_map:
         if "=" not in value:

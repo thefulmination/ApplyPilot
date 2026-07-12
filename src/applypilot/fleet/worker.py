@@ -528,7 +528,9 @@ class WorkerLoop:
             queue.write_apply_result(
                 conn, self.worker_id, url, status="applied", apply_status="applied",
                 target_host=target_host, home_ip=self.home_ip, outcome="success",
-                machine_owner=self.machine_owner,
+                machine_owner=self.machine_owner, application_tool_calls=0,
+                final_result_source="legacy_html_classifier",
+                result_metadata={"evidence_quality": "legacy_html_classifier"},
             )
             self._record_event(f"wrote apply applied {url} ({kind})")
             self._beat(conn, state="idle")
@@ -551,7 +553,9 @@ class WorkerLoop:
             queue.write_apply_result(
                 conn, self.worker_id, url, status="blocked", apply_status="failed",
                 apply_error=f"captcha:{kind}", target_host=target_host, home_ip=self.home_ip,
-                outcome="block", machine_owner=self.machine_owner,
+                outcome="block", machine_owner=self.machine_owner, application_tool_calls=0,
+                final_result_source="legacy_html_classifier",
+                result_metadata={"evidence_quality": "legacy_html_classifier"},
             )
             self._record_event(f"wrote apply blocked {url} (captcha:{kind})")
             self._beat(conn, state="idle")
@@ -648,7 +652,8 @@ class WorkerLoop:
             )
             _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
                               home_ip=self.home_ip, kind="visible_captcha" if run_status == "captcha" else "login_gate",
-                              route="owner_inbox")
+                              route="owner_inbox", commit=False)
+            conn.commit()
             self._record_event(f"parked linkedin challenge {url} ({run_status})")
             self._beat(conn, state="challenge_pending", current_job=url)
             return {"action": "parked_challenge", "url": url}

@@ -18,6 +18,7 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
+from applypilot import config  # noqa: E402
 from applypilot.apply import pgqueue  # noqa: E402
 from applypilot.fleet import schema as fleet_schema  # noqa: E402
 

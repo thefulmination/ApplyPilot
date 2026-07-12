@@ -114,7 +114,11 @@ def test_worker_requeues_untouched_browser_preflight_failure(fleet_db, monkeypat
             (url,),
         )
         row = cur.fetchone()
-        cur.execute("SELECT count(*) AS n FROM apply_result_events WHERE url=%s", (url,))
+        cur.execute(
+            "SELECT count(*) AS n FROM apply_result_events "
+            "WHERE url=%s AND status <> 'leased'",
+            (url,),
+        )
         events = cur.fetchone()["n"]
     assert row["status"] == "failed"
     assert row["attempts"] == 0

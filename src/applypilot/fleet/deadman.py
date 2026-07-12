@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from applypilot import config, inbox_auth
-from applypilot.mail_source import ImapMailSource, MailSourceError
+from applypilot.mail_source import ImapMailSource, MailSourceError, MailSourceOverflowError
 
 # ---------------------------------------------------------------------------
 # Thresholds (module constants -- tune here, not inline).
@@ -33,6 +33,7 @@ STALL_HOURS = 3         # stalled_queue: how long without an 'applied' row count
 HOT_FRACTION = 0.95     # running_hot: fraction of cost_cap_daily_usd that counts as "hot"
 HOT_STREAK_MIN = 2      # running_hot: consecutive hot checks required before alerting
 OWNER_INBOX_WINDOW_MIN = 30
+OWNER_INBOX_STALE_HOURS = 24
 OTP_STALL_SECONDS_DEFAULT = 120
 OTP_STALL_SECONDS_MIN = 30
 
@@ -427,6 +428,10 @@ def mail_source_alive() -> bool | None:
             max_messages=1,
             gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
         )
+        return True
+    except MailSourceOverflowError:
+        # The bounded probe already authenticated and found candidates; overflow
+        # is evidence of a busy inbox, not evidence that the relay is down.
         return True
     except MailSourceError:
         return False

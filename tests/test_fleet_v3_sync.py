@@ -356,7 +356,7 @@ def test_push_apply_eligible_rejects_score_only_rows(fleet_db, tmp_path):
     assert rows == []
 
 
-def test_push_apply_eligible_accepts_decimal_score_floor(fleet_db, tmp_path):
+def test_push_apply_eligible_score_floor_cannot_override_canonical_authority(fleet_db, tmp_path):
     sq = _home_sqlite(tmp_path)
     _add_job(sq, "https://boards.greenhouse.io/acme/jobs/58",
              company="Acme Inc", title="Chief of Staff", audit_score=5.8)
@@ -367,13 +367,12 @@ def test_push_apply_eligible_accepts_decimal_score_floor(fleet_db, tmp_path):
         n = sync.push_apply_eligible(
             sqlite_conn=sq, pg_conn=pg, score_floor=5.8, approved_batch="batch-A", limit=None
         )
-        assert n == 1
+        assert n == 0
         with pg.cursor() as cur:
             cur.execute("SELECT url, score FROM apply_queue ORDER BY url")
             rows = cur.fetchall()
 
-    assert [r["url"] for r in rows] == ["https://boards.greenhouse.io/acme/jobs/58"]
-    assert float(rows[0]["score"]) == 5.8
+    assert rows == []
 
 
 def test_push_apply_eligible_skips_company_blocklist_matches(fleet_db, tmp_path):

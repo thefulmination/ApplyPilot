@@ -25,6 +25,8 @@ ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_reason TEXT;
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_checked_at TIMESTAMPTZ;
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_check_owner TEXT;
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_check_expires_at TIMESTAMPTZ;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_check_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS liveness_consecutive_uncertain INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_required BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_status TEXT;
 ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS eligibility_reason TEXT;

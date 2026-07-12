@@ -377,7 +377,7 @@ def test_apply_lifecycle_hard_fault_escapes_without_normal_result(
         assert row["apply_status"] is None
         cur.execute(
             "SELECT count(*) AS n FROM apply_result_events "
-            "WHERE url='cleanup-hard-fault'"
+            "WHERE url='cleanup-hard-fault' AND status <> 'leased'"
         )
         assert cur.fetchone()["n"] == 0
 
@@ -847,11 +847,24 @@ def test_linkedin_challenge_insert_failure_rolls_back_park_transaction(fleet_db,
     url = "linkedin-atomic-park"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute(
+            "INSERT INTO fleet_decision_policies (policy_version,lane,status) "
+            "VALUES ('linkedin-atomic-policy','linkedin','active')"
+        )
+        cur.execute(
             "INSERT INTO linkedin_queue "
             "(url, application_url, score, status, lane, approved_batch, dedup_key, "
-            "linkedin_resolve_status, linkedin_resolved_at) "
-            "VALUES (%s,'https://linkedin.com/jobs/x',9,'queued','linkedin','b1',%s,'easy_apply',now())",
+            "linkedin_resolve_status, linkedin_resolved_at, decision_id, policy_version, "
+            "decision_action, qualification_verdict, qualification_score, qualification_floor, "
+            "preference_score, outcome_score, final_score, decision_confidence, "
+            "decision_created_at, decision_expires_at, input_hash) "
+            "VALUES (%s,'https://linkedin.com/jobs/x',9,'queued','linkedin','b1',%s,'easy_apply',now(),"
+            "'decision-linkedin-atomic','linkedin-atomic-policy','apply','qualified',9,7,8,8,9,.9,"
+            "now(),now() + interval '1 day','hash-linkedin-atomic')",
             (url, "dk-" + url),
+        )
+        cur.execute(
+            "UPDATE fleet_config SET linkedin_policy_version='linkedin-atomic-policy', "
+            "linkedin_apply_mode='steady', paused=FALSE WHERE id=1"
         )
         cur.execute(
             "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "

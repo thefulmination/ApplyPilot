@@ -60,6 +60,7 @@ SELECT j.url, j.company, j.title, {application_url} AS application_url,
        CAST(d.confidence AS REAL) AS decision_confidence,
        d.created_at AS decision_created_at, d.expires_at AS decision_expires_at,
        d.input_hash,
+       {liveness_status_expr}, {liveness_reason_expr}, {last_verified_live_expr},
        j.linkedin_resolve_status, j.linkedin_resolved_at, j.linkedin_resolve_error,
        j.linkedin_unresolved_kind, j.linkedin_next_action
 FROM jobs j
@@ -93,6 +94,8 @@ ORDER BY d.final_score DESC, j.url ASC
 """
 
 _PUSH_APPLY_SHAPE = """
+  AND TRIM(COALESCE(j.company, '')) != ''
+  AND TRIM(COALESCE(j.title, '')) != ''
   AND j.application_url LIKE 'http%'
   AND j.application_url NOT LIKE '%linkedin.com%'
 """
@@ -157,6 +160,16 @@ def _tenant_route_policy(sqlite_conn: sqlite3.Connection, host: str) -> dict:
 
 def _jobs_column_exists(sqlite_conn: sqlite3.Connection, column: str) -> bool:
     return any(row[1] == column for row in sqlite_conn.execute("PRAGMA table_info(jobs)").fetchall())
+
+
+def _optional_job_column_expr(
+    sqlite_conn: sqlite3.Connection, column: str, *, alias: str | None = None
+) -> str:
+    """Project an optional legacy jobs column without weakening canonical joins."""
+    output_name = alias or column
+    if _jobs_column_exists(sqlite_conn, column):
+        return f"j.{column} AS {output_name}"
+    return f"NULL AS {output_name}"
 
 
 def _canonical_projection_available(sqlite_conn: sqlite3.Connection) -> bool:
@@ -339,6 +352,9 @@ def push_apply_eligible(
         company_blocklist, company_params = _company_blocklist_sql()
         base_sql = _CANONICAL_PROVENANCE_SELECT.format(
             application_url="j.application_url",
+            liveness_status_expr=_optional_job_column_expr(sq, "liveness_status"),
+            liveness_reason_expr=_optional_job_column_expr(sq, "liveness_reason"),
+            last_verified_live_expr=_optional_job_column_expr(sq, "last_verified_live"),
             shape_predicate=_PUSH_APPLY_SHAPE,
             location_expr="j.location AS location" if _jobs_column_exists(sq, "location") else "NULL AS location",
             company_blocklist=company_blocklist,
@@ -611,6 +627,9 @@ def push_linkedin_eligible(
         company_blocklist, company_params = _company_blocklist_sql()
         sql = _CANONICAL_PROVENANCE_SELECT.format(
             application_url="CASE WHEN j.application_url LIKE 'http%' THEN j.application_url ELSE j.url END",
+            liveness_status_expr=_optional_job_column_expr(sq, "liveness_status"),
+            liveness_reason_expr=_optional_job_column_expr(sq, "liveness_reason"),
+            last_verified_live_expr=_optional_job_column_expr(sq, "last_verified_live"),
             shape_predicate=_PUSH_LINKEDIN_SHAPE.format(
                 fresh_statuses=",".join("?" for _ in _queue.LINKEDIN_FRESH_STATUSES),
                 resolve_recency=resolve_recency,

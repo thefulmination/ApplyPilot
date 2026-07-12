@@ -751,7 +751,7 @@ def test_write_apply_result_records_submit_risk_evidence(fleet_db):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT application_tool_calls, job_log_path, transcript_digest, final_result_source "
-                "FROM apply_result_events WHERE url='event-risk'"
+                "FROM apply_result_events WHERE url='event-risk' AND source='worker'"
             )
             row = cur.fetchone()
         assert row["application_tool_calls"] == 0
@@ -1086,13 +1086,7 @@ def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
 def test_write_linkedin_result_resolves_challenge_after_owned_close(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=1)
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO linkedin_queue (url, company, title, application_url, score, lane, approved_batch, "
-                "linkedin_resolve_status, linkedin_resolved_at) "
-                "VALUES ('li-challenge','Co','Role','https://linkedin.com/jobs/challenge',9,'linkedin','b1','easy_apply',now())"
-            )
-        conn.commit()
+        _seed_linkedin(conn, "li-challenge")
         leased = queue.lease_linkedin(conn, "owner", public_ip="1.1.1.1", owner_ip="1.1.1.1")
         with conn.cursor() as cur:
             cur.execute(

@@ -499,7 +499,7 @@ def build_apply_loop(*, dsn, worker_id, home_ip, model="sonnet", agent="codex", 
     from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
 
     enforce_no_lifecycle_faults()
-    from applypilot.apply import pgqueue
+    from applypilot.apply import launcher, pgqueue
     from applypilot.fleet.worker import WorkerLoop
     # Prefer the Doctor's bounded agent_timeout_override when present (else env/default).
     _apply_timeout_override(dsn)

@@ -1,7 +1,8 @@
 # fleet-daily-unguard.ps1 -RunOnce -Dsn <override> [-RegisterTask]
 #
 # Removes guardrails for apply/compute/discovery/linkedin and clears the operator lock
-# so the whole fleet can run through the day.
+# so the whole fleet can run through the day. This is an explicit operator action;
+# scheduled invocations are intentionally no-ops unless -Force is supplied.
 #
 # Use cases:
 #   - run immediately: .\fleet-daily-unguard.ps1
@@ -10,6 +11,7 @@ param(
   [string]$Dsn = "",
   [string]$Reason = "3am daily guardrail release",
   [switch]$RegisterTask,
+  [switch]$Force,
   [string]$TaskName = "ApplyPilotFleet-DailyUnpause",
   [int]$HeartbeatMinutes = 24
 )
@@ -151,6 +153,10 @@ Set-Location '$repo'
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Daily 03:00 fleet guardrail release for apply/compute/discovery/LinkedIn fronts." -Force | Out-Null
   Write-Host "[fleet-daily-unguard] registered task '$TaskName' for daily 03:00 (local log: $wrapperLog)." -ForegroundColor Green
   return
+}
+
+if (-not $Force) {
+  throw "Refusing to remove fleet guardrails: explicit -Force is required."
 }
 
 Invoke-PgUnguard -HeartbeatMinutes $HeartbeatMinutes -ReasonText $Reason
