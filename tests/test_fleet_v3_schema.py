@@ -1,7 +1,12 @@
 """v3 schema: loads cleanly against real Postgres, idempotent, all tables + columns present."""
 from __future__ import annotations
 
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import schema as fleet_schema
@@ -34,6 +39,72 @@ def test_v3_schema_idempotent(fleet_db):
         fleet_schema.ensure_schema_v3(conn)
         got = _tables(conn)
     assert {"rate_governor", "search_tasks", "compute_queue"} <= got
+
+
+def test_v3_schema_serializes_concurrent_migrations(fleet_db):
+    barrier = threading.Barrier(2)
+
+    def migrate() -> set[str]:
+        with pgqueue.connect(fleet_db) as conn:
+            barrier.wait(timeout=10)
+            fleet_schema.ensure_schema_v3(conn)
+            return _tables(conn)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: migrate(), range(2)))
+    assert all({"apply_queue", "rate_governor", "search_tasks"} <= tables for tables in results)
+
+
+def test_v3_schema_lock_wait_is_bounded(monkeypatch):
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params):
+            return None
+
+        def fetchone(self):
+            return {"acquired": False}
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    ticks = iter((10.0, 10.0))
+    monkeypatch.setattr(fleet_schema.time, "monotonic", lambda: next(ticks))
+
+    with pytest.raises(TimeoutError, match="schema migration lock"):
+        fleet_schema._acquire_migration_lock(Connection(), timeout_seconds=0)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "not-a-number", None])
+def test_v3_schema_lock_timeout_rejects_non_finite_or_invalid_values(value):
+    assert fleet_schema._nonnegative_timeout(value) == 30.0
+
+
+def test_v3_schema_is_read_only_for_least_privilege_worker(fleet_db):
+    role = "schema_reader_" + uuid.uuid4().hex
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE ROLE "{role}" NOLOGIN')
+            # Older PostgreSQL clusters commonly expose CREATE on public. The
+            # worker still cannot alter owner-owned fleet tables and must verify.
+            cur.execute(f'GRANT USAGE, CREATE ON SCHEMA public TO "{role}"')
+            cur.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{role}"')
+        conn.commit()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'SET ROLE "{role}"')
+            fleet_schema.ensure_schema_v3(conn)
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("RESET ROLE")
+                cur.execute(f'DROP OWNED BY "{role}"')
+                cur.execute(f'DROP ROLE "{role}"')
+            conn.commit()
 
 
 def test_v3_schema_declares_dedup_repair_actions_once():
@@ -103,7 +174,10 @@ def test_apply_queue_v3_columns(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='apply_queue'")
         cols = {r["column_name"] for r in cur.fetchall()}
-    for c in ("worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch"):
+    for c in (
+        "worker_home_ip", "target_host", "lane", "dedup_key", "approved_batch",
+        "liveness_check_count", "liveness_consecutive_uncertain",
+    ):
         assert c in cols, f"apply_queue missing {c}"
 
 

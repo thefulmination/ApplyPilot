@@ -6,7 +6,7 @@ import json
 import sys
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import dedup_repair
+from applypilot.fleet import dedup_repair, schema as fleet_schema
 
 
 def main(argv=None) -> int:
@@ -25,6 +25,7 @@ def main(argv=None) -> int:
         return 2
 
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         if args.apply:
             result = dedup_repair.execute_repair(
                 conn,

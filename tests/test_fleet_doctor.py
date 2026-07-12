@@ -14,9 +14,19 @@ from applypilot.fleet import doctor, queue
 # ---------------------------------------------------------------------------
 # Seed helpers
 # ---------------------------------------------------------------------------
-def _seed_apply_failure(conn, *, url, host, worker_id="home-0", apply_error=None,
-                        apply_status=None, status="failed", approved_batch="b1",
-                        queued=False):
+def _seed_apply_failure(
+    conn,
+    *,
+    url,
+    host,
+    worker_id="home-0",
+    apply_error=None,
+    apply_status=None,
+    status="failed",
+    approved_batch="b1",
+    queued=False,
+    score=8.5,
+):
     """Insert one apply_queue row carrying a failure signal (recent updated_at). When
     ``queued`` is True the row is left status='queued' + approved (so host_skip can un-approve
     it); otherwise it's a terminal failure row used for clustering."""
@@ -29,12 +39,12 @@ def _seed_apply_failure(conn, *, url, host, worker_id="home-0", apply_error=None
             "INSERT INTO apply_queue (url, company, title, application_url, score, "
             "apply_domain, target_host, lane, dedup_key, approved_batch, status, "
             "apply_error, apply_status, worker_id, updated_at) "
-            "VALUES (%s,'Co','T',%s,1.0,%s,%s,'ats',%s,%s,%s,%s,%s,%s, now()) "
+            "VALUES (%s,'Co','T',%s,%s,%s,%s,'ats',%s,%s,%s,%s,%s,%s, now()) "
             "ON CONFLICT (url) DO UPDATE SET apply_error=EXCLUDED.apply_error, "
             "apply_status=EXCLUDED.apply_status, status=EXCLUDED.status, "
             "approved_batch=EXCLUDED.approved_batch, target_host=EXCLUDED.target_host, "
             "worker_id=EXCLUDED.worker_id, updated_at=now()",
-            (url, url, host, host, url, approved_batch, st, apply_error, apply_status, worker_id),
+            (url, url, score, host, host, url, approved_batch, st, apply_error, apply_status, worker_id),
         )
     conn.commit()
 
@@ -74,6 +84,28 @@ def test_rate_limited_substring_maps_to_hard_block(fleet_db):
         _seed_apply_failure(conn, url="u1", host="h.com", apply_error="host_rate_limited")
         clusters = doctor.analyze(conn, window_minutes=60)
     assert clusters["host_failures"]["h.com"]["hard_block"] == 1
+
+
+def test_modern_failure_taxonomy_maps_into_doctor_action_groups():
+    assert doctor._reason_group("failed:browser_unavailable") == "agent"
+    assert doctor._reason_group("failed:no_confirmation") == "agent"
+    assert doctor._reason_group("failed:email_verification_required") == "auth"
+    assert doctor._reason_group("failed:not_a_salaried_position") == "location"
+    assert doctor._reason_group("stale_unapproved") == "non_actionable"
+    assert doctor._reason_group("dedup:already_applied") == "non_actionable"
+
+
+def test_analyze_excludes_retired_and_deduplicated_rows_from_failure_backlog(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply_failure(conn, url="retired", host="old.example", apply_error="stale_unapproved")
+        _seed_apply_failure(conn, url="duplicate", host="dup.example", apply_error="dedup:already_applied")
+        _seed_apply_failure(conn, url="browser", host="broken.example", apply_error="failed:browser_unavailable")
+        clusters = doctor.analyze(conn, window_minutes=60)
+
+    assert clusters["lane_failures"] == 1
+    assert {row["reason"] for row in clusters["cluster_rows"]} == {"agent"}
+    assert "old.example" not in clusters["host_failures"]
+    assert "dup.example" not in clusters["host_failures"]
 
 
 def _seed_host_governor(conn, host, *, attempts):
@@ -582,8 +614,11 @@ def test_recommendations_are_idempotent(fleet_db):
 def _seed_linkedin_job(conn, url="li0", dk="lidk0"):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key) "
-            "VALUES (%s,%s,9.0,'queued','ats','b1',%s)", (url, f"https://linkedin.com/jobs/{url}", dk))
+            "INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key, "
+            "linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES (%s,%s,9.0,'queued','ats','b1',%s,'easy_apply',now())",
+            (url, f"https://linkedin.com/jobs/{url}", dk),
+        )
     conn.commit()
 
 

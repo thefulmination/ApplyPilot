@@ -91,6 +91,23 @@ def test_halt_sets_halted_until_and_list_shows_it(monkeypatch, tmp_path):
     assert "yes" in r.stdout.lower()
 
 
+def test_session_command_sets_local_profile_state(monkeypatch, tmp_path):
+    conn = _setup(monkeypatch, tmp_path)
+    monkeypatch.setenv("APPLYPILOT_TENANT_SESSION_REGISTRY", str(tmp_path / "sessions.json"))
+    monkeypatch.setenv("APPLYPILOT_TENANT_PROFILE_DIR", str(tmp_path / "profiles"))
+    r = runner.invoke(
+        cli.app,
+        ["tenants", "session", "foo.com", "ready", "--ttl-hours", "8"],
+    )
+    assert r.exit_code == 0, r.stdout
+    row = conn.execute(
+        "SELECT profile_id, session_state, session_expires_at FROM ats_tenants WHERE host='foo.com'"
+    ).fetchone()
+    assert row["profile_id"]
+    assert row["session_state"] == "ready"
+    assert row["session_expires_at"]
+
+
 def test_list_eligible_job_count(monkeypatch, tmp_path):
     conn = _setup(monkeypatch, tmp_path)
     from applypilot import tenants

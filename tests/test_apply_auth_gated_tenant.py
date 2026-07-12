@@ -17,7 +17,7 @@ from applypilot import database, tenants
 from applypilot.apply import launcher as L
 
 AUTH_GATED_URL = "https://acme.myworkdayjobs.com/en-US/careers/job/12345"
-NON_GATED_URL = "https://boards.greenhouse.io/acme/jobs/999"
+NON_GATED_URL = "https://jobs.lever.co/acme/999"
 
 
 @pytest.fixture

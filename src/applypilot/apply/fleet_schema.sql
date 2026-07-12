@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS apply_queue (
     est_cost_usd            NUMERIC(10,4),                    -- apply-agent total_cost_usd (drives the cap)
     applied_at              TIMESTAMPTZ,
     worker_id               TEXT,
+    machine_owner           TEXT,
     apply_duration_ms       INTEGER,
 
     -- ---- bookkeeping ------------------------------------------------------
@@ -94,3 +95,32 @@ CREATE TABLE IF NOT EXISTS fleet_assets (
     data       BYTEA       NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Durable terminal evidence is also part of the base queue schema so the
+-- watchdog can record lease reclaims before the v3 fleet layer is bootstrapped.
+CREATE TABLE IF NOT EXISTS apply_result_events (
+    id                      BIGSERIAL PRIMARY KEY,
+    queue_name              TEXT NOT NULL DEFAULT 'apply_queue',
+    url                     TEXT NOT NULL,
+    worker_id               TEXT,
+    status                  TEXT,
+    apply_status            TEXT,
+    apply_error             TEXT,
+    target_host             TEXT,
+    home_ip                 TEXT,
+    agent                   TEXT,
+    agent_model             TEXT,
+    est_cost_usd            REAL,
+    apply_duration_ms       INTEGER,
+    application_tool_calls  INTEGER,
+    job_log_path            TEXT,
+    transcript_digest       TEXT,
+    final_result_source     TEXT,
+    result_metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_line             TEXT,
+    source                  TEXT NOT NULL DEFAULT 'worker',
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_apply_result_events_url_created
+    ON apply_result_events (queue_name, url, created_at DESC);

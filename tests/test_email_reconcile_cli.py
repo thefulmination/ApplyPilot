@@ -28,6 +28,7 @@ def test_cli_json_dry_run_passes_limit(monkeypatch, capsys):
     seen = {}
     monkeypatch.setattr(email_reconcile_main.sqlite3, "connect", lambda *a, **kw: _Conn())
     monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn=None: _Conn())
+    monkeypatch.setattr(email_reconcile_main.fleet_schema, "ensure_schema_v3", lambda conn: None)
     monkeypatch.setattr(er, "load_outcome_emails", lambda home: ["email"])
     monkeypatch.setattr(er, "load_consumed_message_ids", lambda conn: set())
 
@@ -62,6 +63,7 @@ def test_cli_apply_confirmed_only_max_flips(monkeypatch, capsys):
     applied = []
     monkeypatch.setattr(email_reconcile_main.sqlite3, "connect", lambda *a, **kw: _Conn())
     monkeypatch.setattr("applypilot.apply.pgqueue.connect", lambda dsn=None: _Conn())
+    monkeypatch.setattr(email_reconcile_main.fleet_schema, "ensure_schema_v3", lambda conn: None)
     monkeypatch.setattr(er, "load_outcome_emails", lambda home: ["email"])
     monkeypatch.setattr(er, "load_crash_jobs", lambda conn, *, limit=None: [{"url": "u1"}])
     monkeypatch.setattr(er, "load_consumed_message_ids", lambda conn: set())

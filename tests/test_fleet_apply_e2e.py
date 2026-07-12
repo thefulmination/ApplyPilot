@@ -54,11 +54,9 @@ def test_canary_go_live_path(fleet_db):
         "check that the canary decrement+pause is atomic in queue.lease_apply"
     )
 
-    # ---- fleet_config auto-paused for operator review ---------------------------
+    # ---- ATS lane auto-stopped for operator review ------------------------------
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT paused FROM fleet_config WHERE id=1")
+        cur.execute("SELECT paused, ats_apply_mode FROM fleet_config WHERE id=1")
         row = cur.fetchone()
-        assert row["paused"] is True, (
-            "fleet_config.paused must be TRUE after the canary budget is exhausted "
-            "(the auto-pause gate in the lease CTE)"
-        )
+        assert row["ats_apply_mode"] == "stopped"
+        assert row["paused"] is False

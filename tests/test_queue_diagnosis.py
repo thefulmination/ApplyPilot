@@ -62,6 +62,8 @@ def test_queue_diagnosis_counts_base_leaseable_and_dedup_blocked_rows(fleet_db):
     assert result["queued"]["approved_ats"] == 3
     assert result["queued"]["dedup_blocked"] == 2
     assert result["queued"]["base_leaseable"] == 1
+    assert result["queued"]["unapproved_ats_older_1d"] == 0
+    assert result["queued"]["approved_ats_older_1d"] == 0
     assert result["dedup"]["blocked_sources"]["has_crash_source"] == 1
     assert result["dedup"]["blocked_sources"]["no_current_queue_source"] == 1
     assert result["dedup"]["overbroad_groups"][0]["dedup_key"] == "dk-board"
@@ -108,6 +110,20 @@ def test_queue_diagnosis_separates_skipped_challenges_from_active_walls(fleet_db
 
     assert result["blocked"]["reasons"] == {"challenge_skipped": 1}
     assert result["blocked"]["groups"] == {"operator_skipped": 1}
+
+
+def test_queue_diagnosis_exposes_unapproved_attempt_history(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, score, status, lane, "
+            "approved_batch, attempts, last_attempted_at) VALUES "
+            "('attempted-unapproved','https://example.test/attempted',8,'queued','ats',NULL,1,now())"
+        )
+        conn.commit()
+    with pgqueue.connect(fleet_db) as conn:
+        queued = queue_diagnosis.queue_diagnosis(conn)["queued"]
+    assert queued["unapproved_ats_attempted"] == 1
+    assert queued["unapproved_ats_with_lease_history"] == 1
 
 
 def test_queue_diagnosis_exposes_terminal_reason_breakdown(fleet_db):

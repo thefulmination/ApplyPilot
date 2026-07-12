@@ -46,6 +46,7 @@ from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
 from applypilot.fleet import compute_home_main as compute_home
 from applypilot.fleet import queue as _queue
+from applypilot.fleet.failure_taxonomy import canonical_failure_group
 from applypilot.fleet.worker import _scrub  # reuse the worker's secret redactor (S1: scrub on READ too)
 
 DEFAULT_PORT = 8787
@@ -207,13 +208,46 @@ def _model_vendor(model: str | None) -> str:
     m = str(model).lower()
     if "claude" in m or "sonnet" in m or "haiku" in m or "opus" in m:
         return "claude"
-    if "gpt" in m or "o1" in m or "o3" in m or "gpt-4" in m or "gpt-5" in m:
+    if "gpt" in m or "codex" in m or "o1" in m or "o3" in m or "gpt-4" in m or "gpt-5" in m:
         return "codex"
     if "gemini" in m:
         return "gemini"
     if "deepseek" in m or "qwen" in m or "llama" in m or "mixtral" in m:
         return "other"
     return "other"
+
+
+_CLAUDE_MODEL_TIERS = frozenset({"sonnet", "opus", "haiku"})
+
+
+def _normalize_agent_model(agent: Any, model: Any) -> str | None:
+    """Normalize legacy telemetry to the model the launcher actually selected."""
+    normalized_agent = str(agent or "").strip().lower()
+    normalized_model = str(model or "").strip()
+    if not normalized_model:
+        return None
+    if normalized_agent == "codex" and normalized_model.lower() in _CLAUDE_MODEL_TIERS:
+        return "codex-default"
+    return normalized_model
+
+
+def _merge_agent_model(heartbeat: Any, usage: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """Merge telemetry without pairing an agent with another agent's model."""
+    heartbeat_agent = str(heartbeat.get("current_agent") or "").strip() or None
+    usage_agent = str((usage or {}).get("current_agent") or "").strip() or None
+    current_agent = heartbeat_agent or usage_agent
+    heartbeat_model = _normalize_agent_model(heartbeat_agent, heartbeat.get("current_model"))
+    if heartbeat_model:
+        return current_agent, heartbeat_model
+    if usage_agent and heartbeat_agent and usage_agent.lower() != heartbeat_agent.lower():
+        usage_model = None
+    else:
+        usage_model = _normalize_agent_model(current_agent, (usage or {}).get("current_model"))
+    if usage_model:
+        return current_agent, usage_model
+    if str(current_agent or "").lower() == "codex":
+        return current_agent, "codex-default"
+    return current_agent, None
 
 
 def _machine_name_map() -> dict[str, str]:
@@ -257,26 +291,43 @@ def _historical_machine_label(machine_owner: str | None) -> str:
 
 
 def _latest_worker_llm_usage(conn, *, tasks: tuple[str, ...] = _APPLY_LLM_TASKS) -> dict[str, dict[str, Any]]:
-    """Latest per-worker LLM usage row for backfilling worker/model attribution."""
+    """Latest durable worker/model evidence, including zero-cost apply runs."""
     placeholders = ", ".join(["%s"] * len(tasks))
     with conn.cursor() as cur:
         cur.execute(
-            """
+            "SELECT EXISTS ("
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name='apply_result_events' "
+            "AND column_name='machine_owner') AS present"
+        )
+        event_machine_owner = (
+            "machine_owner" if cur.fetchone()["present"] else "NULL::TEXT AS machine_owner"
+        )
+        cur.execute(
+            f"""
+            WITH evidence AS (
+                SELECT worker_id, machine_owner, provider, model, ts, id, 2 AS source_priority
+                FROM llm_usage
+                WHERE worker_id IS NOT NULL
+                  AND task IN ({placeholders})
+                UNION ALL
+                SELECT worker_id, {event_machine_owner}, agent AS provider, agent_model AS model,
+                       created_at AS ts, id, 1 AS source_priority
+                FROM apply_result_events
+                WHERE worker_id IS NOT NULL
+                  AND agent IS NOT NULL
+                  AND agent_model IS NOT NULL
+            )
             SELECT DISTINCT ON (worker_id)
-                worker_id,
-                machine_owner,
-                provider,
-                model,
-                ts
-            FROM llm_usage
-            WHERE worker_id IS NOT NULL
-              AND task IN (""" + placeholders + """)
-            ORDER BY worker_id, ts DESC, id DESC
+                worker_id, machine_owner, provider, model, ts
+            FROM evidence
+            ORDER BY worker_id, ts DESC, source_priority DESC, id DESC
             """,
             tuple(tasks),
         )
         rows = cur.fetchall()
     conn.rollback()  # read-only
+
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
         wid = row.get("worker_id")
@@ -415,7 +466,7 @@ def _agents_state() -> dict[str, Any]:
             partial_workers += 1
         if verdict == "blocked":
             blocked_workers += 1
-        current_model = str(row.get("current_model") or "").strip()
+        current_model = _normalize_agent_model(current_agent, row.get("current_model")) or ""
         if current_model:
             model_usage[current_model] = model_usage.get(current_model, 0) + 1
             fam = _model_family(current_model)
@@ -427,7 +478,7 @@ def _agents_state() -> dict[str, Any]:
             "machine": _machine_display_name(row.get("machine_owner")),
             "machine_owner": row.get("machine_owner"),
             "current_agent": current_agent,
-            "current_model": row.get("current_model"),
+            "current_model": current_model or None,
             "current_model_family": _model_family(current_model),
             "current_model_vendor": _model_vendor(current_model),
             "agent_chain": chain,
@@ -563,11 +614,24 @@ def _browser_health(conn) -> dict[str, Any]:
     conn.rollback()  # read-only
 
     total = len(rows)
+    active_total = 0
+    stale_problem_workers = 0
+    inactive_problem_workers = 0
     issues: list[dict[str, Any]] = []
     by_issue: dict[str, int] = {}
     for r in rows:
+        age = _seconds_since(r.get("last_beat"))
+        alive = age is not None and age <= _HB_ALIVE_SECONDS
+        if alive:
+            active_total += 1
         worker_issue = _classify_browser_issue(_scrub(r.get("last_error"))) or _classify_browser_issue(_scrub(r.get("recent_log")))
         if worker_issue is None:
+            continue
+        if not alive:
+            stale_problem_workers += 1
+            continue
+        if str(r.get("state") or "").lower() in {"paused", "stopped", "drained", "version_mismatch"}:
+            inactive_problem_workers += 1
             continue
         by_issue[worker_issue] = by_issue.get(worker_issue, 0) + 1
         issues.append({
@@ -577,7 +641,7 @@ def _browser_health(conn) -> dict[str, Any]:
             "state": r.get("state"),
             "issue": worker_issue,
             "last_beat": _iso(r.get("last_beat")),
-            "age": _seconds_since(r.get("last_beat")),
+            "age": age,
             "current_agent": r.get("current_agent"),
             "current_model": r.get("current_model"),
             "current_model_family": _model_family(r.get("current_model")),
@@ -587,8 +651,12 @@ def _browser_health(conn) -> dict[str, Any]:
     return {
         "issues": issues,
         "summary": {
-            "workers": total,
+            "workers": active_total,
+            "tracked_workers": total,
+            "stale_workers": total - active_total,
             "problem_workers": len(issues),
+            "stale_problem_workers": stale_problem_workers,
+            "inactive_problem_workers": inactive_problem_workers,
             "by_issue": by_issue,
         },
     }
@@ -710,6 +778,12 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
             "       COUNT(*) FILTER (WHERE status='leased') AS leased, "
             "       COUNT(*) FILTER (WHERE status='leased' AND lease_expires_at IS NOT NULL "
             f"                        AND lease_expires_at > now() + interval '{_FROZEN_LEASE_THRESHOLD}') AS parked_frozen, "
+            "       COUNT(*) FILTER (WHERE status='leased' AND lease_expires_at IS NOT NULL "
+            f"                        AND lease_expires_at > now() + interval '{_FROZEN_LEASE_THRESHOLD}' "
+            "                        AND apply_status='challenge_pending') AS challenge_parked, "
+            "       COUNT(*) FILTER (WHERE status='leased' AND lease_expires_at IS NOT NULL "
+            f"                        AND lease_expires_at > now() + interval '{_FROZEN_LEASE_THRESHOLD}' "
+            "                        AND apply_status IS DISTINCT FROM 'challenge_pending') AS unexpected_frozen, "
             "       COUNT(*) FILTER (WHERE status='leased' AND (lease_expires_at IS NULL "
             f"                        OR lease_expires_at <= now() + interval '{_FROZEN_LEASE_THRESHOLD}')) AS active_leased "
             "FROM apply_queue GROUP BY lane"
@@ -720,6 +794,8 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
             lease_by_lane[lane] = {
                 "leased": int(row.get("leased") or 0),
                 "parked_frozen": int(row.get("parked_frozen") or 0),
+                "challenge_parked": int(row.get("challenge_parked") or 0),
+                "unexpected_frozen": int(row.get("unexpected_frozen") or 0),
                 "active_leased": int(row.get("active_leased") or 0),
             }
 
@@ -757,6 +833,7 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
     spend_halted = spend_cap > 0 and spent >= spend_cap
     lease_gate_open = not (paused or ats_paused or lane_stopped or canary_exhausted or spend_halted)
     halt_reasons = []
+    operator_paused = str(cfg.get("ats_pause_source") or "").lower() == "operator" and (paused or ats_paused)
     if paused:
         halt_reasons.append("paused")
     if ats_paused:
@@ -792,9 +869,16 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
             "parked_frozen": lease_by_lane.get("ats", {}).get("parked_frozen", 0)
             + lease_by_lane.get("unknown", {}).get("parked_frozen", 0)
             + lease_by_lane.get("compute", {}).get("parked_frozen", 0),
+            "challenge_parked": lease_by_lane.get("ats", {}).get("challenge_parked", 0)
+            + lease_by_lane.get("unknown", {}).get("challenge_parked", 0)
+            + lease_by_lane.get("compute", {}).get("challenge_parked", 0),
+            "unexpected_frozen": lease_by_lane.get("ats", {}).get("unexpected_frozen", 0)
+            + lease_by_lane.get("unknown", {}).get("unexpected_frozen", 0)
+            + lease_by_lane.get("compute", {}).get("unexpected_frozen", 0),
             "applied": depth.get("applied", 0),
             "failed": depth.get("failed", 0) + depth.get("blocked", 0),
             "crash_unconfirmed": depth.get("crash_unconfirmed", 0),
+            "diagnosis": diagnosis,
         "approved": approved,
         "dedup_blocked": dedup_blocked,
         "base_leasable": base_leasable,
@@ -804,6 +888,8 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
                 "leased": depth_by_lane.get("ats", {}).get("leased", 0),
                 "active_leased": lease_by_lane.get("ats", {}).get("active_leased", 0),
                 "parked_frozen": lease_by_lane.get("ats", {}).get("parked_frozen", 0),
+                "challenge_parked": lease_by_lane.get("ats", {}).get("challenge_parked", 0),
+                "unexpected_frozen": lease_by_lane.get("ats", {}).get("unexpected_frozen", 0),
                 "applied": depth_by_lane.get("ats", {}).get("applied", 0),
             },
             "compute": {
@@ -811,6 +897,8 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
                 "leased": depth_by_lane.get("compute", {}).get("leased", 0),
                 "active_leased": lease_by_lane.get("compute", {}).get("active_leased", 0),
                 "parked_frozen": lease_by_lane.get("compute", {}).get("parked_frozen", 0),
+                "challenge_parked": lease_by_lane.get("compute", {}).get("challenge_parked", 0),
+                "unexpected_frozen": lease_by_lane.get("compute", {}).get("unexpected_frozen", 0),
                 "applied": depth_by_lane.get("compute", {}).get("applied", 0),
             },
             "other": {
@@ -818,12 +906,20 @@ def _gate_and_queue(conn) -> tuple[dict, dict, dict]:
                 "leased": depth_by_lane.get("unknown", {}).get("leased", 0),
                 "active_leased": lease_by_lane.get("unknown", {}).get("active_leased", 0),
                 "parked_frozen": lease_by_lane.get("unknown", {}).get("parked_frozen", 0),
+                "challenge_parked": lease_by_lane.get("unknown", {}).get("challenge_parked", 0),
+                "unexpected_frozen": lease_by_lane.get("unknown", {}).get("unexpected_frozen", 0),
                 "applied": depth_by_lane.get("unknown", {}).get("applied", 0),
             },
         }
     }
     }
-    if paused:
+    if operator_paused:
+        apply_state = {
+            "code": "operator_paused",
+            "severity": "info",
+            "reason": "Fleet is intentionally paused by the operator.",
+        }
+    elif paused:
         apply_state = {
             "code": "paused",
             "severity": "halted",
@@ -901,8 +997,7 @@ def _workers(conn) -> list[dict]:
         alive = secs is not None and secs <= _HB_ALIVE_SECONDS
         usage = latest_usage.get(str(r.get("worker_id") or ""))
         machine_owner = r.get("machine_owner") or (usage or {}).get("machine_owner")
-        current_agent = r.get("current_agent") or (usage or {}).get("current_agent")
-        current_model = r.get("current_model") or (usage or {}).get("current_model")
+        current_agent, current_model = _merge_agent_model(r, usage)
         current = None
         if r["current_job"] and r["state"] == "applying":
             current = {"company": r["cur_company"], "title": r["cur_title"]}
@@ -1078,7 +1173,13 @@ def _agent_routing_summary(conn, workers: list[dict]) -> dict:
     partial_workers = 0
     blocked_workers = 0
     model_missing_workers = 0
-    for worker in workers:
+    stale_model_missing_workers = sum(
+        1 for worker in workers
+        if not worker.get("alive") and worker.get("current_agent")
+        and not str(worker.get("current_model") or "").strip()
+    )
+    active_workers = [worker for worker in workers if worker.get("alive")]
+    for worker in active_workers:
         chain = _agent_parts(worker.get("agent_chain"))
         current_agent = worker.get("current_agent")
         if len(chain) > 1:
@@ -1101,7 +1202,9 @@ def _agent_routing_summary(conn, workers: list[dict]) -> dict:
             model_missing_workers += 1
 
     return {
-        "workers": len(workers),
+        "workers": len(active_workers),
+        "tracked_workers": len(workers),
+        "stale_workers": len(workers) - len(active_workers),
         "dynamic_workers": dynamic_workers,
         "switched_workers": switched_workers,
         "partial_workers": partial_workers,
@@ -1111,6 +1214,7 @@ def _agent_routing_summary(conn, workers: list[dict]) -> dict:
         "model_family_usage": dict(sorted(family_usage.items(), key=lambda kv: (-kv[1], kv[0]))),
         "model_count": sum(model_usage.values()),
         "model_missing_workers": model_missing_workers,
+        "stale_model_missing_workers": stale_model_missing_workers,
     }
 
 
@@ -1288,6 +1392,17 @@ def _status_recommendation(
             "title": "Investigate DeadMan alert",
             "severity": "severe",
             "reason": deadman_reason,
+        }
+
+    operator_paused = (
+        str(gate.get("ats_pause_source") or "").lower() == "operator"
+        and bool(gate.get("paused") or gate.get("ats_paused"))
+    )
+    if operator_paused:
+        return {
+            "title": "Operator pause active",
+            "severity": "info",
+            "reason": "Fleet activity is intentionally suspended by the operator; no resume action is recommended.",
         }
 
     backend_issue_count = sum(
@@ -1584,8 +1699,7 @@ def _worker_comparison(conn, workers: list[dict], limit: int = 12) -> dict:
         heartbeat = by_worker.get(wid, {})
         usage = latest_usage.get(str(wid or ""))
         machine_owner = heartbeat.get("machine_owner") or (usage or {}).get("machine_owner")
-        current_agent = heartbeat.get("current_agent") or (usage or {}).get("current_agent")
-        current_model = heartbeat.get("current_model") or (usage or {}).get("current_model")
+        current_agent, current_model = _merge_agent_model(heartbeat, usage)
         stat = metrics.get(
             wid,
             {
@@ -1707,7 +1821,7 @@ def _discovery(conn) -> dict:
 
 
 def _challenge_backlog_summary(conn) -> dict:
-    """READ-ONLY rollup that separates the open auth backlog from live browser worker symptoms."""
+    """READ-ONLY rollup separating actionable parks from stale challenge records."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT url, kind, raised_at FROM auth_challenge WHERE resolved_at IS NULL ORDER BY raised_at DESC"
@@ -1718,6 +1832,8 @@ def _challenge_backlog_summary(conn) -> dict:
     by_kind: dict[str, int] = {}
     fresh_open = 0
     stale_open = 0
+    stale_parked = 0
+    stale_nonparked = 0
     missing_metadata_rows = 0
     park_only_rows = 0
     now = _utcnow()
@@ -1728,17 +1844,27 @@ def _challenge_backlog_summary(conn) -> dict:
         age_hours = _age_hours(raised_at, now)
         if age_hours is not None and age_hours > 24:
             stale_open += 1
+            if str(row.get("url") or "") in parked_by_url:
+                stale_parked += 1
+            else:
+                stale_nonparked += 1
         else:
             fresh_open += 1
     for _, parked in parked_by_url.values():
         if not ((parked or {}).get("company") and (parked or {}).get("title")):
             missing_metadata_rows += 1
     park_only_rows = sum(1 for url in parked_by_url if url not in {str(r.get("url") or "") for r in rows})
+    parked_open = sum(1 for row in rows if str(row.get("url") or "") in parked_by_url)
+    nonparked_open = len(rows) - parked_open
     return {
         "open_auth": len(rows),
         "parked_urls": len(parked_by_url),
+        "parked_open": parked_open,
+        "nonparked_open": nonparked_open,
         "fresh_open": fresh_open,
         "stale_open": stale_open,
+        "stale_parked": stale_parked,
+        "stale_nonparked": stale_nonparked,
         "missing_metadata_rows": missing_metadata_rows,
         "park_only_rows": park_only_rows,
         "by_kind": dict(sorted(by_kind.items())),
@@ -1754,7 +1880,36 @@ def _diagnostics_backlog_summary(conn) -> dict:
             "WHERE status='recommended' AND (expires_at IS NULL OR expires_at > now())"
         )
         rows = cur.fetchall()
+        cur.execute(
+            "SELECT COALESCE(target_host, apply_domain, 'unknown') AS host, "
+            "       COALESCE(NULLIF(apply_error,''), NULLIF(apply_status,''), status::text) AS reason, "
+            "       COUNT(*) AS n "
+            "FROM apply_queue WHERE lane='ats' AND status IN ('failed','crash_unconfirmed','blocked') "
+            "GROUP BY 1,2"
+        )
+        current_failure_rows = cur.fetchall()
     conn.rollback()  # read-only
+    current_other_by_host: dict[str, int] = {}
+    for row in current_failure_rows:
+        if canonical_failure_group(row.get("reason")) != "other":
+            continue
+        host = str(row.get("host") or "unknown")
+        current_other_by_host[host] = current_other_by_host.get(host, 0) + int(row.get("n") or 0)
+
+    remaining_other = dict(current_other_by_host)
+    effective_rows = []
+    for row in rows:
+        item = dict(row)
+        if item.get("reason") == "other":
+            host = str(item.get("host") or "unknown")
+            current = int(remaining_other.get(host) or 0)
+            samples = min(int(item.get("sample_count") or 0), current)
+            if samples <= 0:
+                continue
+            item["sample_count"] = samples
+            remaining_other[host] = current - samples
+        effective_rows.append(item)
+    rows = effective_rows
     recommendations = _diagnostic_recommendations([{
         "diagnosis_id": None,
         "reason": r.get("reason"),
@@ -1815,7 +1970,6 @@ def _host_risk_summary(source_quality: dict[str, Any]) -> dict[str, Any]:
     """Summarize leaseable ATS hosts that are burning attempts through high failure/challenge rates."""
     risky_hosts: list[dict[str, Any]] = []
     for row in source_quality.get("hosts", []):
-        total = int(row.get("total") or 0)
         failed = int(row.get("failed") or 0)
         challenges = int(row.get("challenges") or 0)
         leaseable = int(row.get("leaseable") or 0)
@@ -1949,35 +2103,49 @@ def _apply_state_blockers(
         })
     elif state.get("code") == "no_leaseable_jobs":
         stale_open = int(challenge_backlog.get("stale_open") or 0)
+        stale_nonparked = int(challenge_backlog.get("stale_nonparked") or 0)
+        stale_parked = int(challenge_backlog.get("stale_parked") or 0)
         fresh_open = int(challenge_backlog.get("fresh_open") or 0)
         open_auth = int(challenge_backlog.get("open_auth") or 0)
         missing_metadata_rows = int(challenge_backlog.get("missing_metadata_rows") or 0)
-        parked_frozen = int(queue_apply.get("parked_frozen") or 0)
+        unexpected_frozen = int(queue_apply.get("unexpected_frozen") or 0)
         approved = int(queue_apply.get("approved") or 0)
         queued = int(queue_apply.get("queued") or 0)
         risky_hosts = int(host_risk.get("hosts") or 0)
         top_host = host_risk.get("top_host") or "unknown"
 
-        if stale_open > 0:
+        if stale_nonparked > 0:
             blockers.append({
-                "code": "stale_challenges",
-                "title": "Stale challenges are blocking backlog",
-                "count": stale_open,
+                "code": "stale_challenge_records",
+                "title": "Stale challenge records need cleanup",
+                "count": stale_nonparked,
                 "severity": "warn",
                 "reason": (
-                    f"{stale_open} open auth challenge(s) are older than 24 hours and should be "
-                    "cleared or dropped before the queue is trusted."
+                    f"{stale_nonparked} old auth record(s) have no corresponding parked queue row. "
+                    "They are bookkeeping residue, not jobs waiting for authentication."
                 ),
-                "next_action": "Clear stale challenge backlog first.",
+                "next_action": "Reconcile or close stale challenge records.",
             })
-        if parked_frozen > 0:
+        if stale_parked > 0:
+            blockers.append({
+                "code": "aging_parked_challenges",
+                "title": "Aging parked challenges need a decision",
+                "count": stale_parked,
+                "severity": "warn",
+                "reason": (
+                    f"{stale_parked} job(s) are still intentionally parked behind authentication "
+                    "after more than 24 hours."
+                ),
+                "next_action": "Resolve or skip those parked jobs.",
+            })
+        if unexpected_frozen > 0:
             blockers.append({
                 "code": "frozen_leases",
                 "title": "Parked leases are still frozen",
-                "count": parked_frozen,
+                "count": unexpected_frozen,
                 "severity": "warn",
                 "reason": (
-                    f"{parked_frozen} ATS row(s) are still leased/frozen, which keeps queue inventory "
+                    f"{unexpected_frozen} ATS row(s) are unexpectedly leased/frozen without an auth challenge, which keeps queue inventory "
                     "out of circulation."
                 ),
                 "next_action": "Release or reclaim parked leases.",
@@ -2025,10 +2193,10 @@ def _apply_state_blockers(
                 "count": open_auth,
                 "severity": "warn",
                 "reason": (
-                    f"{open_auth} total auth challenge(s) are open; even after stale cleanup, fresh rows "
-                    "will still need manual intervention."
+                    f"{open_auth} total auth challenge record(s) are open across parked jobs and "
+                    "nonparked bookkeeping records."
                 ),
-                "next_action": "Work through fresh challenges after stale cleanup.",
+                "next_action": "Resolve parked jobs and reconcile nonparked records separately.",
             })
         if missing_metadata_rows > 0:
             blockers.append({
@@ -2046,8 +2214,9 @@ def _apply_state_blockers(
     if blockers:
         severity_rank = {"severe": 0, "warn": 1, "info": 2}
         blocker_rank = {
-            "stale_challenges": 0,
-            "frozen_leases": 1,
+            "stale_challenge_records": 0,
+            "aging_parked_challenges": 1,
+            "frozen_leases": 2,
             "approval_gap": 2,
             "host_risk": 3,
             "fresh_challenges": 4,
@@ -2354,7 +2523,6 @@ def diagnosis() -> dict:
                 "reason": reason,
             })
         alive_workers = sum(1 for row in workers if row.get("alive"))
-        problem_workers = int(browser.get("summary", {}).get("problem_workers") or 0)
         browser_issues = browser.get("issues") or []
         backend_problem_workers = sum(
             1 for issue in browser_issues
@@ -2375,7 +2543,6 @@ def diagnosis() -> dict:
             discovery_workers_alive = sum(1 for row in discovery.get("workers", []) if row.get("alive"))
         compute_queue = compute.get("queue", {}) if compute else {}
         compute_queued = int(compute_queue.get("queued", {}).get("count") or 0)
-        compute_leased = int(compute_queue.get("leased", {}).get("count") or 0)
         compute_workers_alive = int(compute.get("score_workers", {}).get("active") or 0) if compute else 0
         compute_recent_failed = int(compute.get("score_workers", {}).get("recent_failed_15m") or 0) if compute else 0
         if deadman.get("active"):
@@ -2390,9 +2557,18 @@ def diagnosis() -> dict:
                         or "Fleet watchdog has raised an alert."
                     ),
                 )
-        if gate.get("paused"):
+        operator_paused = (
+            str(gate.get("ats_pause_source") or "").lower() == "operator"
+            and bool(gate.get("paused") or gate.get("ats_paused"))
+        )
+        if operator_paused:
+            add_recommendation(
+                "Operator pause active", "info",
+                "Fleet activity is intentionally suspended by the operator; no resume action is recommended.",
+            )
+        elif gate.get("paused"):
             add_recommendation("Resume fleet", "severe", "Fleet is globally paused.")
-        if gate.get("ats_paused"):
+        if gate.get("ats_paused") and not operator_paused:
             add_recommendation("Resume ATS lane", "warn", "ATS lane paused; review ATS controls and resume when ready.")
         if gate.get("canary_enabled") and (gate.get("canary_remaining") or 0) <= 0:
             add_recommendation("Arm lift", "warn", "ATS canary exhausted; lift canary to continue bounded applying.")
@@ -2410,8 +2586,10 @@ def diagnosis() -> dict:
             for blocker in apply_state.get("blockers") or []:
                 blocker_code = str((blocker or {}).get("code") or "")
                 blocker_reason = str((blocker or {}).get("reason") or apply_state.get("reason") or "No leaseable ATS jobs are available.")
-                if blocker_code == "stale_challenges":
-                    add_recommendation("Clear stale challenge backlog", "warn", blocker_reason)
+                if blocker_code == "stale_challenge_records":
+                    add_recommendation("Clean stale challenge records", "warn", blocker_reason)
+                elif blocker_code == "aging_parked_challenges":
+                    add_recommendation("Resolve aging parked challenges", "warn", blocker_reason)
                 elif blocker_code == "frozen_leases":
                     add_recommendation("Release parked leases", "warn", blocker_reason)
                 elif blocker_code == "approval_gap":
@@ -2422,7 +2600,7 @@ def diagnosis() -> dict:
                     add_recommendation("Resolve browser challenges", "warn", blocker_reason)
                 elif blocker_code == "challenge_metadata_gap":
                     add_recommendation("Backfill challenge metadata", "info", blocker_reason)
-        if queue_apply.get("approved", 0) == 0:
+        if queue_apply.get("approved", 0) == 0 and not operator_paused:
             add_recommendation("Seed approvals", "info", "No approved ATS jobs are queued yet.")
         if apply_state.get("code") == "ready_to_apply" and alive_workers == 0:
             add_recommendation("Start apply workers", "severe", "Leaseable jobs exist, but no apply workers are heartbeating alive.")
@@ -2440,13 +2618,13 @@ def diagnosis() -> dict:
             )
             if (
                 apply_state.get("code") == "ready_to_apply"
-                and int(queue_apply.get("parked_frozen") or 0) > 0
+                and int(queue_apply.get("unexpected_frozen") or 0) > 0
                 and int(queue_apply.get("active_leased") or 0) == 0
             ):
                 add_recommendation(
                     "Release parked leases",
                     "warn",
-                    f"{int(queue_apply.get('parked_frozen') or 0)} leased ATS row(s) are frozen while zero leased rows look actively in progress.",
+                    f"{int(queue_apply.get('unexpected_frozen') or 0)} ATS row(s) are unexpectedly frozen without an auth challenge while zero leased rows look actively in progress.",
                 )
         if apply_state.get("code") == "ready_to_apply" and manual_problem_workers > 0:
             browser_issues = browser.get("issues") or []
@@ -2478,21 +2656,27 @@ def diagnosis() -> dict:
                 f" Suggested actions: {guidance_text}.",
             )
 
-        if int(queue_apply.get("parked_frozen") or 0) > 0 and int(queue_apply.get("active_leased") or 0) == 0:
+        if int(queue_apply.get("unexpected_frozen") or 0) > 0 and int(queue_apply.get("active_leased") or 0) == 0:
             add_recommendation(
                 "Release parked leases",
                 "warn",
-                f"{int(queue_apply.get('parked_frozen') or 0)} leased ATS row(s) are frozen while zero leased rows look actively in progress.",
+                f"{int(queue_apply.get('unexpected_frozen') or 0)} ATS row(s) are unexpectedly frozen without an auth challenge while zero leased rows look actively in progress.",
             )
         if apply_state.get("code") == "ready_to_apply" and missing_total > 0:
             add_recommendation("Restore missing workers", "warn", f"{missing_total} desired apply worker(s) are not heartbeating alive.")
         if not recommendations:
             add_recommendation("Monitor throughput", "info", "Fleet is eligible and should be applying if workers are healthy.")
-        if challenge_backlog.get("stale_open", 0) > 0:
+        if challenge_backlog.get("stale_nonparked", 0) > 0:
             add_recommendation(
-                "Triage stale challenges",
+                "Clean stale challenge records",
                 "warn",
-                f"{int(challenge_backlog.get('stale_open') or 0)} open auth challenge(s) are older than 24 hours; review or clear backlog rows that are no longer actionable.",
+                f"{int(challenge_backlog.get('stale_nonparked') or 0)} old open auth record(s) no longer have a parked queue row and should be reconciled or closed.",
+            )
+        if challenge_backlog.get("stale_parked", 0) > 0:
+            add_recommendation(
+                "Resolve aging parked challenges",
+                "warn",
+                f"{int(challenge_backlog.get('stale_parked') or 0)} job(s) remain deliberately parked behind authentication for more than 24 hours.",
             )
         if challenge_backlog.get("missing_metadata_rows", 0) > 0:
             add_recommendation(
@@ -2634,6 +2818,108 @@ def agents() -> dict:
         raise RuntimeError(f"agent telemetry read failed: {e}") from e
 
 
+def _liveness_summary(conn) -> dict:
+    """Return queue liveness totals plus actionable uncertain-reason groups."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE liveness_status='live') AS live,
+              COUNT(*) FILTER (WHERE liveness_status='dead') AS dead,
+              COUNT(*) FILTER (WHERE liveness_status='uncertain') AS uncertain,
+              COUNT(*) FILTER (WHERE liveness_status IS NULL) AS unchecked
+            FROM apply_queue
+            WHERE lane='ats'
+            """
+        )
+        totals = dict(cur.fetchone())
+        cur.execute(
+            """
+            SELECT COALESCE(NULLIF(BTRIM(liveness_reason),''),'missing_reason') AS reason,
+                   COUNT(*) AS rows,
+                   COUNT(DISTINCT COALESCE(NULLIF(target_host,''), NULLIF(apply_domain,''))) AS hosts,
+                   MAX(liveness_checked_at) AS latest_checked_at,
+                   MAX(COALESCE(liveness_consecutive_uncertain,0)) AS max_consecutive_uncertain
+            FROM apply_queue
+            WHERE lane='ats' AND liveness_status='uncertain'
+            GROUP BY 1
+            ORDER BY rows DESC, reason
+            LIMIT 20
+            """
+        )
+        uncertain_reasons = [
+            {
+                "reason": row["reason"],
+                "rows": int(row["rows"] or 0),
+                "hosts": int(row["hosts"] or 0),
+                "latest_checked_at": _iso(row["latest_checked_at"]),
+                "max_consecutive_uncertain": int(row["max_consecutive_uncertain"] or 0),
+                "retry_class": _queue.liveness_retry_policy(
+                    row["reason"], int(row["max_consecutive_uncertain"] or 0)
+                )[0],
+                "retry_after_seconds": _queue.liveness_retry_policy(
+                    row["reason"], int(row["max_consecutive_uncertain"] or 0)
+                )[1],
+            }
+            for row in cur.fetchall()
+        ]
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (COALESCE(NULLIF(target_host,''), NULLIF(apply_domain,'')))
+                       COALESCE(NULLIF(target_host,''), NULLIF(apply_domain,'')) AS host,
+                       liveness_reason AS reason,
+                       liveness_checked_at AS checked_at
+                FROM apply_queue
+                WHERE lane='ats'
+                  AND liveness_status='uncertain'
+                  AND liveness_checked_at >=
+                      now() - make_interval(secs => %s)
+                  AND (
+                      COALESCE(liveness_reason,'') LIKE 'server_%%'
+                      OR COALESCE(liveness_reason,'') LIKE 'neterr:%%'
+                      OR COALESCE(liveness_reason,'') LIKE 'error:%%'
+                      OR COALESCE(liveness_reason,'') = 'blocked_429'
+                      OR COALESCE(liveness_reason,'') LIKE 'access_gate:%%'
+                  )
+                  AND COALESCE(NULLIF(target_host,''), NULLIF(apply_domain,'')) IS NOT NULL
+                ORDER BY COALESCE(NULLIF(target_host,''), NULLIF(apply_domain,'')),
+                         liveness_checked_at DESC
+            )
+            SELECT latest.host, latest.reason, latest.checked_at,
+                   COUNT(q.url) FILTER (
+                       WHERE q.status='queued' AND COALESCE(q.liveness_required,FALSE)
+                   ) AS deferred_rows,
+                   GREATEST(0, %s - EXTRACT(EPOCH FROM (now() - latest.checked_at)))::INTEGER
+                       AS remaining_seconds
+            FROM latest
+            LEFT JOIN apply_queue q
+              ON COALESCE(NULLIF(q.target_host,''), NULLIF(q.apply_domain,'')) = latest.host
+            GROUP BY latest.host, latest.reason, latest.checked_at
+            ORDER BY remaining_seconds DESC, latest.host
+            """,
+            (_queue.LIVENESS_HOST_COOLDOWN_SECONDS, _queue.LIVENESS_HOST_COOLDOWN_SECONDS),
+        )
+        host_cooldowns = [
+            {
+                "host": row["host"],
+                "reason": row["reason"],
+                "checked_at": _iso(row["checked_at"]),
+                "deferred_rows": int(row["deferred_rows"] or 0),
+                "remaining_seconds": int(row["remaining_seconds"] or 0),
+            }
+            for row in cur.fetchall()
+        ]
+    conn.rollback()
+    return {
+        "available": True,
+        "error": None,
+        "totals": {key: int(totals.get(key) or 0) for key in ("live", "dead", "uncertain", "unchecked")},
+        "uncertain_reasons": uncertain_reasons,
+        "host_cooldowns": host_cooldowns,
+    }
+
+
 def build_status() -> dict:
     """Assemble the full /api/status object. Opens its OWN short-lived connections
     (each helper rolls back and we always close) so no connection is ever leaked."""
@@ -2716,6 +3002,20 @@ def build_status() -> dict:
             except Exception:
                 pass
             freshness = {"endpoint": "status", "generated_at": _utcnow().isoformat(), "ages": {}}
+        try:
+            liveness = _liveness_summary(conn)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            liveness = {
+                "available": False,
+                "error": type(exc).__name__,
+                "totals": None,
+                "uncertain_reasons": [],
+                "host_cooldowns": [],
+            }
         recommendation = _status_recommendation(
             gate=gate,
             queue_apply=queue.get("apply", {}),
@@ -2745,6 +3045,7 @@ def build_status() -> dict:
         "apply_state": apply_state,
         "agents": agents_summary,
         "freshness": freshness,
+        "liveness": liveness,
         "recommendation": recommendation,
         "doctor": doctor_sig,
         "discovery": discovery,
@@ -2808,7 +3109,7 @@ def _challenges_data(conn) -> dict:
         updated_at = park["updated_at"] if park else None
         age_hours = _age_hours(raised_at if ch else updated_at, now)
         staleness = "stale" if age_hours is not None and age_hours > 24 else "fresh"
-        has_metadata = bool((park or {}).get("company") and (park or {}).get("title"))
+        has_metadata = bool((park or {}).get("metadata_complete"))
         row = {
             "url": url,
             "lane": lane,
@@ -2821,6 +3122,7 @@ def _challenges_data(conn) -> dict:
             "age_hours": age_hours,
             "staleness": staleness,
             "has_metadata": has_metadata,
+            "metadata_inferred_fields": list((park or {}).get("metadata_inferred_fields") or []),
         }
         by_kind[kind] = by_kind.get(kind, 0) + 1
         by_staleness[staleness] = by_staleness.get(staleness, 0) + 1
@@ -3565,7 +3867,11 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
     def _send_json(self, code: int, obj: dict) -> None:
-        self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
+        self._send(
+            code,
+            json.dumps(obj, default=str).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
@@ -3928,6 +4234,11 @@ _INDEX_HTML = r"""<!doctype html>
   <section id="queueFunnel">
     <h2>Queue Funnel</h2>
     <div class="funnel" id="funnelBody"></div>
+  </section>
+
+  <section id="livenessReasons">
+    <h2>Job Availability</h2>
+    <div class="funnel" id="livenessBody"></div>
   </section>
 
   <section id="throughputForecast">
@@ -4460,6 +4771,37 @@ function render(s){
   if(asCard){ asCard.className = "card apply-state " + asSeverity; }
   document.getElementById("applyState").textContent = asCode;
   document.getElementById("applyStateHint").textContent = state.reason || "—";
+
+  const liveness = s.liveness || {};
+  const livenessAvailable = liveness.available !== false;
+  const lt = liveness.totals || {};
+  const uncertainReasons = liveness.uncertain_reasons || [];
+  const hostCooldowns = liveness.host_cooldowns || [];
+  const livenessRows = livenessAvailable ? [
+    ["Available", Number(lt.live || 0), "confirmed live"],
+    ["Unavailable", Number(lt.dead || 0), "confirmed dead"],
+    ["Uncertain", Number(lt.uncertain || 0), "grouped by reason below"],
+    ["Unchecked", Number(lt.unchecked || 0), "no availability probe yet"],
+  ].concat(uncertainReasons.slice(0, 8).map((item) => [
+    String(item.reason || "missing_reason").replace(/_/g, " "),
+    Number(item.rows || 0),
+    String(item.retry_class || "uncertain") + " retry / " +
+      Math.round(Number(item.retry_after_seconds || 0) / 3600) + "h / " +
+      "max streak " + Number(item.max_consecutive_uncertain || 0) + " / " +
+      Number(item.hosts || 0) + " host(s)" +
+      (item.latest_checked_at ? (" / checked " + rel(item.latest_checked_at)) : " / check time missing"),
+  ])) : [["Telemetry unavailable", "—", "availability query failed: " + String(liveness.error || "unknown error")]];
+  if(livenessAvailable) hostCooldowns.slice(0, 8).forEach((item) => {
+    livenessRows.push([
+      "Cooldown: " + String(item.host || "unknown"),
+      Math.ceil(Number(item.remaining_seconds || 0) / 60) + "m",
+      Number(item.deferred_rows || 0) + " row(s) deferred / " + String(item.reason || "unknown"),
+    ]);
+  });
+  document.getElementById("livenessBody").innerHTML = livenessRows.map(([label, value, hint]) => (
+    '<div class="fstep"><span>' + esc(label) + '</span><b>' + esc(value) +
+    '</b><div class="sub">' + esc(hint) + '</div></div>'
+  )).join("");
 
   const versions = s.versions || {};
   document.getElementById("versionPinned").textContent = versions.pinned_worker_version || "not pinned";
@@ -5283,6 +5625,9 @@ def main(argv=None) -> int:
     if not _is_private_bind(host):  # belt-and-suspenders: never reach bind() on a public host
         raise SystemExit(f"refusing to bind non-private host {host!r}")
 
+    from applypilot.fleet import schema as fleet_schema
+    with pgqueue.connect() as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
     server = ThreadingHTTPServer((host, args.port), _Handler)
     # Do NOT print the DSN or any secret -- only the LAN URL the owner should open.
     print(f"ApplyPilot fleet console (LAN-only) -> http://{host}:{args.port}")

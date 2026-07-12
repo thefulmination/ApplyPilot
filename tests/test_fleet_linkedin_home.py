@@ -2,11 +2,42 @@
 from applypilot.apply import pgqueue
 
 
+def test_linkedin_challenge_surfaces_exclude_shared_url_not_parked_in_linkedin(fleet_db, capsys):
+    from applypilot.fleet import linkedin_home_main as hm
+
+    url = "https://shared.example/jobs/linkedin-status-collision"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, status, apply_status, lane, lease_owner, lease_expires_at) "
+            "VALUES (%s,%s,9,'leased','challenge_pending','ats','ats-worker',now()+interval '3650 days')",
+            (url, url),
+        )
+        cur.execute(
+            "INSERT INTO linkedin_queue (url, application_url, score, status, lane, apply_status) "
+            "VALUES (%s,%s,9,'queued','linkedin',NULL)",
+            (url, url),
+        )
+        cur.execute(
+            "INSERT INTO auth_challenge (url, worker_id, kind, route) "
+            "VALUES (%s,'ats-worker','login_gate','owner_inbox')",
+            (url,),
+        )
+        conn.commit()
+
+        assert hm.list_challenges(conn) == []
+        hm._print_status(conn)
+    assert "'open_challenges': 0" in capsys.readouterr().out
+
+
 def test_linkedin_approve_gated_by_canary(fleet_db):
     from applypilot.fleet import linkedin_home_main as hm, queue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane) "
-                    "VALUES ('q1','https://linkedin.com/jobs/1','9','queued','ats')")
+        cur.execute(
+            "INSERT INTO linkedin_queue "
+            "(url, application_url, score, status, lane, linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES ('q1','https://linkedin.com/jobs/1','9','queued','ats','easy_apply',now())"
+        )
         conn.commit()
         try:
             hm.approve(conn, all_pushed=True); assert False, "must refuse without canary"

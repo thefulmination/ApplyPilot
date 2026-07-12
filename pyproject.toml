@@ -47,6 +47,9 @@ dependencies = [
 dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
+applypilot-workday-rollout = "applypilot.fleet.workday_rollout_main:main"
+applypilot-workday-onboard = "applypilot.fleet.workday_onboard_main:main"
+applypilot-answer-exceptions = "applypilot.fleet.answer_exceptions_main:main"
 applypilot = "applypilot.cli:app"
 applypilot-fleet-compute = "applypilot.fleet.compute_worker_main:main"
 applypilot-fleet-compute-home = "applypilot.fleet.compute_home_main:main"
@@ -62,6 +65,7 @@ applypilot-fleet-diagnose = "applypilot.fleet.diagnoser_main:main"
 applypilot-fleet-remediate = "applypilot.fleet.remediator_main:main"
 applypilot-fleet-autotriage = "applypilot.fleet.autotriage_main:main"
 applypilot-fleet-repair-report = "applypilot.fleet.repair_report_main:main"
+applypilot-fleet-reaudit-applied = "applypilot.fleet.historical_apply_reaudit_main:main"
 applypilot-fleet-dedup-repair = "applypilot.fleet.dedup_repair_main:main"
 applypilot-fleet-linkedin = "applypilot.fleet.linkedin_worker_main:main"
 applypilot-fleet-linkedin-home = "applypilot.fleet.linkedin_home_main:main"

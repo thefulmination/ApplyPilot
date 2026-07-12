@@ -6,17 +6,19 @@ import sys
 import time
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import remediator
+from applypilot.fleet import remediator, schema as fleet_schema
 
 
 def _one_pass(args) -> None:
     with pgqueue.connect(args.dsn) as conn:
         out = remediator.remediate(conn, max_requeue=args.max_requeue,
                                    max_per_job=args.max_per_job, window_minutes=args.window_minutes,
-                                   backfill=args.usage_limit_backfill)
+                                   backfill=args.usage_limit_backfill,
+                                   pre_touch_backfill=args.pre_touch_backfill,
+                                   dry_run=args.dry_run)
     print(f"[remediate] candidates={out['candidates']} requeued={out['requeued']} "
           f"vetoed_applied_set={out['vetoed_applied_set']} vetoed_email={out['vetoed_email']} "
-          f"capped={out['capped']}")
+          f"capped={out['capped']} dry_run={out.get('dry_run', False)}")
 
 
 def main(argv=None) -> int:
@@ -35,10 +37,17 @@ def main(argv=None) -> int:
                         "window (status-keyed, not update-time-keyed) -- for casualties older "
                         "than any sane --window-minutes. Same 3-guard pipeline as the default "
                         "windowed mode; only the candidate query differs.")
+    p.add_argument("--pre-touch-backfill", action="store_true",
+                   help="Include failed no_browser_tool rows with durable zero tool calls.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Select and guard-check candidates without requeueing them.")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--once", action="store_true", help="single pass")
     g.add_argument("--interval", type=int, help="loop every N seconds")
     args = p.parse_args(argv)
+
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
 
     if args.once:
         _one_pass(args)

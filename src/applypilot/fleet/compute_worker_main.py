@@ -8,6 +8,7 @@ import os
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import compute_context as cc
+from applypilot.fleet import schema as fleet_schema
 from applypilot.fleet.compute_adapters import make_audit_fn, make_score_fn
 from applypilot.fleet.worker import WorkerLoop
 
@@ -72,6 +73,7 @@ def main(argv=None) -> int:
     fallback = [s for s in args.fallback.split(",") if s]
 
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         loop, ctx_version = build_compute_loop(
             conn, dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
             providers=providers, fallback=fallback, ensemble=args.ensemble,

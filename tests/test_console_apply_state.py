@@ -5,6 +5,94 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import console_app, queue
 
 
+def test_status_exposes_ranked_uncertain_liveness_reasons(fleet_db, monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO apply_queue
+                (url, company, title, application_url, score, lane, status,
+                 target_host, liveness_status, liveness_reason, liveness_checked_at)
+            VALUES
+                ('live-1','Acme','A','https://acme.test/a',9,'ats','queued',
+                 'acme.test','live','ok_200',now()),
+                ('uncertain-1','Acme','B','https://acme.test/b',9,'ats','queued',
+                 'acme.test','uncertain','redirect_login',now()),
+                ('uncertain-2','Beta','C','https://beta.test/c',9,'ats','queued',
+                 'beta.test','uncertain','redirect_login',now()),
+                ('uncertain-3','Gamma','D','https://gamma.test/d',9,'ats','queued',
+                 'gamma.test','uncertain',NULL,now()),
+                ('unchecked-1','Delta','E','https://delta.test/e',9,'ats','queued',
+                 'delta.test',NULL,NULL,NULL)
+            """
+        )
+        conn.commit()
+
+    payload = console_app.build_status()
+    summary = payload["liveness"]
+    assert summary["available"] is True
+    assert summary["error"] is None
+    assert summary["totals"] == {"live": 1, "dead": 0, "uncertain": 3, "unchecked": 1}
+    assert summary["uncertain_reasons"][0]["reason"] == "redirect_login"
+    assert summary["uncertain_reasons"][0]["rows"] == 2
+    assert summary["uncertain_reasons"][0]["hosts"] == 2
+    assert summary["uncertain_reasons"][0]["latest_checked_at"] is not None
+    assert summary["uncertain_reasons"][0]["max_consecutive_uncertain"] == 0
+    assert summary["uncertain_reasons"][0]["retry_class"] == "structural"
+    assert summary["uncertain_reasons"][0]["retry_after_seconds"] == 24 * 60 * 60
+    assert summary["uncertain_reasons"][1]["reason"] == "missing_reason"
+    assert 'id="livenessBody"' in console_app._INDEX_HTML
+    assert "uncertain_reasons" in console_app._INDEX_HTML
+
+
+def test_status_does_not_report_zero_liveness_when_query_fails(fleet_db, monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    monkeypatch.setattr(
+        console_app,
+        "_liveness_summary",
+        lambda _conn: (_ for _ in ()).throw(RuntimeError("schema drift")),
+    )
+
+    summary = console_app.build_status()["liveness"]
+
+    assert summary == {
+        "available": False,
+        "error": "RuntimeError",
+        "totals": None,
+        "uncertain_reasons": [],
+        "host_cooldowns": [],
+    }
+    assert "Telemetry unavailable" in console_app._INDEX_HTML
+
+
+def test_status_exposes_active_host_liveness_cooldowns(fleet_db, monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO apply_queue
+                (url, company, title, application_url, score, lane, status,
+                 target_host, liveness_required, liveness_status, liveness_reason,
+                 liveness_checked_at)
+            VALUES
+                ('cooldown-1','Acme','A','https://acme.test/a',9,'ats','queued',
+                 'acme.test',TRUE,'uncertain','server_503',now()),
+                ('cooldown-2','Acme','B','https://acme.test/b',8,'ats','queued',
+                 'acme.test',TRUE,NULL,NULL,NULL),
+                ('specific-1','Beta','C','https://beta.test/c',9,'ats','queued',
+                 'beta.test',TRUE,'uncertain','redirect_login',now())
+            """
+        )
+        conn.commit()
+
+    cooldowns = console_app.build_status()["liveness"]["host_cooldowns"]
+    assert len(cooldowns) == 1
+    assert cooldowns[0]["host"] == "acme.test"
+    assert cooldowns[0]["reason"] == "server_503"
+    assert cooldowns[0]["deferred_rows"] == 2
+    assert 0 < cooldowns[0]["remaining_seconds"] <= 30 * 60
+
+
 def test_apply_state_ready_when_leaseable_jobs_exist(fleet_db, monkeypatch) -> None:
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn:
@@ -106,9 +194,9 @@ def test_apply_state_reflects_paused_and_ats_paused(fleet_db, monkeypatch) -> No
 
     payload = console_app.build_status()
     state = payload["apply_state"]
-    assert state["code"] == "ats_paused"
-    assert state["severity"] == "halted"
-    assert "ats lane is paused" in (state["reason"] or "").lower()
+    assert state["code"] == "operator_paused"
+    assert state["severity"] == "info"
+    assert "operator" in (state["reason"] or "").lower()
 
 
 def test_apply_state_reflects_spend_cap_reached(fleet_db, monkeypatch) -> None:

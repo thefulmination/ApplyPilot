@@ -101,6 +101,40 @@ def test_browser_health_does_not_classify_plain_mcp_tool_calls(monkeypatch, flee
     assert payload["browser_health"]["issues"] == []
 
 
+def test_browser_health_keeps_stale_errors_out_of_actionable_problem_count(monkeypatch, fleet_db) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_browser_heartbeat_error(
+            conn, "stale-browser", machine_owner="m2", role="apply", state="idle",
+            error_text="browser service unavailable",
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE worker_heartbeat SET last_beat=now()-interval '1 hour' WHERE worker_id='stale-browser'"
+            )
+        conn.commit()
+
+    health = console_app.diagnostics()["browser_health"]
+    assert health["summary"]["problem_workers"] == 0
+    assert health["summary"]["stale_problem_workers"] == 1
+    assert health["issues"] == []
+
+
+def test_browser_health_keeps_paused_worker_log_history_out_of_current_problems(monkeypatch, fleet_db) -> None:
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_browser_heartbeat_error(
+            conn, "paused-browser", machine_owner="m2", role="apply", state="paused",
+            log_text="CAPTCHA present from the prior job",
+        )
+        conn.commit()
+
+    health = console_app.diagnostics()["browser_health"]
+    assert health["summary"]["problem_workers"] == 0
+    assert health["summary"]["inactive_problem_workers"] == 1
+    assert health["issues"] == []
+
+
 def test_console_page_has_browser_health_section_and_js_renderer(live_server) -> None:
     with urllib.request.urlopen(f"{live_server}/") as resp:
         html = resp.read().decode("utf-8")

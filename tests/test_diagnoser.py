@@ -207,3 +207,11 @@ def test_write_diagnosis_is_idempotent_on_open_row():
     d = diagnoser.Diagnosis("m2-3", "usage_limit", 1.0, "re-queue", "tier0")
     assert diagnoser.write_diagnosis(conn, d) is False
     assert not any("INSERT INTO fleet_diagnoses" in e[0] for e in conn._cur.executed)
+
+
+def test_write_diagnosis_dedupes_only_active_rows():
+    conn = _FakeConn({"SELECT 1 FROM fleet_diagnoses": []})
+    d = diagnoser.Diagnosis("m2-3", "browser_unavailable", 1.0, "restart browser", "tier0")
+    assert diagnoser.write_diagnosis(conn, d) is True
+    select_sql = next(sql for sql, _ in conn._cur.executed if "SELECT 1 FROM fleet_diagnoses" in sql)
+    assert "expires_at IS NULL OR expires_at > now()" in select_sql

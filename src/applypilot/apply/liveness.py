@@ -33,6 +33,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -55,6 +56,11 @@ CLOSED_PATTERNS = [
 CLOSED_RE = re.compile("|".join(re.escape(p) for p in CLOSED_PATTERNS), re.I)
 VALID_THROUGH_RE = re.compile(r'"validThrough"\s*:\s*"([^"]+)"')
 DATE_POSTED_RE = re.compile(r'"datePosted"\s*:\s*"([^"]+)"')
+ACCESS_GATE_MARKERS = (
+    ("cloudflare", ("cf-ray", "challenges.cloudflare.com"), ("checking your browser",)),
+    ("captcha", ("px-captcha", "captcha-delivery.com"), ("captcha", "verify you are human")),
+    ("access_denied", (), ("access denied", "request blocked", "enable cookies to continue")),
+)
 
 SPA_HOSTS = {"eightfold.ai", "oraclecloud.com", "careerpuck.com", "siriusxm.com",
              "icims.com", "avature.net"}
@@ -68,6 +74,39 @@ INTERVAL_OVERRIDES = {"amazon.jobs": 0.8}
 CONC_DEFAULT = 2
 
 LIVE, DEAD, UNCERTAIN = "live", "dead", "uncertain"
+
+
+class _VisibleTextParser(HTMLParser):
+    _HIDDEN_TAGS = frozenset({"script", "style", "noscript", "template"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.casefold() in self._HIDDEN_TAGS:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in self._HIDDEN_TAGS and self._hidden_depth:
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and data.strip():
+            self.parts.append(data.strip())
+
+
+def _visible_text(body: str) -> str:
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(body)
+        parser.close()
+    except Exception:
+        # HTMLParser is deliberately tolerant, but malformed markup should never
+        # break a batch or become a reason to declare a posting dead.
+        return ""
+    return " ".join(parser.parts)
 
 
 def host_of(url: str) -> str:
@@ -150,6 +189,7 @@ def _classify_body(
     body: str,
     *,
     meta: dict[str, str | None] | None = None,
+    requested_url: str | None = None,
 ) -> tuple[str, str]:
     if status in (404, 410):
         return DEAD, f"http_{status}"
@@ -159,7 +199,25 @@ def _classify_body(
         return UNCERTAIN, f"server_{status}"
     if status != 200:
         return UNCERTAIN, f"http_{status}"
-    m = CLOSED_RE.search(body)
+    if requested_url and final_url != requested_url:
+        final_path = urllib.parse.urlparse(final_url).path.casefold().rstrip("/")
+        if re.search(r"(^|/)(?:login|log-in|signin|sign-in|auth|sso)(?:/|$)", final_path):
+            return UNCERTAIN, "redirect_login"
+        requested_path = urllib.parse.urlparse(requested_url).path.rstrip("/")
+        if requested_path and requested_path != "/" and final_path in ("", "/"):
+            return UNCERTAIN, "redirect_home"
+    normalized = body.casefold().strip()
+    if not normalized:
+        return UNCERTAIN, "empty_body"
+    visible_text = _visible_text(body)
+    normalized_visible = visible_text.casefold()
+    for kind, raw_markers, visible_markers in ACCESS_GATE_MARKERS:
+        if (
+            any(marker in normalized for marker in raw_markers)
+            or any(marker in normalized_visible for marker in visible_markers)
+        ):
+            return UNCERTAIN, f"access_gate:{kind}"
+    m = CLOSED_RE.search(visible_text)
     if m:
         return DEAD, f"text:{m.group(0)[:40]!r}"
     if meta is not None:
@@ -185,6 +243,8 @@ def _classify_body(
             pass
     if base_host(host_of(final_url)) in SPA_HOSTS and len(body) < 1500:
         return UNCERTAIN, "spa_shell"
+    if len(normalized) < 80:
+        return UNCERTAIN, "thin_body"
     return LIVE, "ok_200"
 
 
@@ -206,11 +266,19 @@ def _greenhouse(url: str, *, meta: dict[str, str | None] | None = None) -> tuple
         if i + 1 < len(parts):
             job_id = re.sub(r"\D", "", parts[i + 1]) or parts[i + 1]
     if not token and "gh_jid" in qs:
-        return _classify_body(*_fetch(url), meta=meta)
+        return _classify_body(*_fetch(url), meta=meta, requested_url=url)
     if token and job_id:
         api = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{job_id}"
         st, final, body = _fetch(api, accept="application/json")
-        if st == 200 and '"id"' in body:
+        if st == 200:
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return UNCERTAIN, "gh_api_invalid_json"
+            if not isinstance(payload, dict) or payload.get("id") is None:
+                return UNCERTAIN, "gh_api_invalid_payload"
+            if str(payload["id"]) != str(job_id):
+                return UNCERTAIN, "gh_api_id_mismatch"
             return LIVE, "gh_api_200"
         if st in (404, 410):
             stl, _, _ = _fetch(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs",
@@ -219,7 +287,7 @@ def _greenhouse(url: str, *, meta: dict[str, str | None] | None = None) -> tuple
                 return DEAD, "gh_api_404"
             return UNCERTAIN, "gh_token_unconfirmed"
         return _classify_body(st, final, body, meta=meta)
-    return _classify_body(*_fetch(url), meta=meta)
+    return _classify_body(*_fetch(url), meta=meta, requested_url=url)
 
 
 def _lever(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
@@ -229,7 +297,15 @@ def _lever(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str,
         site, jid = parts[0], parts[1]
         st, final, body = _fetch(f"https://api.lever.co/v0/postings/{site}/{jid}",
                                  accept="application/json")
-        if st == 200 and '"id"' in body:
+        if st == 200:
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return UNCERTAIN, "lever_api_invalid_json"
+            if not isinstance(payload, dict) or payload.get("id") is None:
+                return UNCERTAIN, "lever_api_invalid_payload"
+            if str(payload["id"]) != str(jid):
+                return UNCERTAIN, "lever_api_id_mismatch"
             return LIVE, "lever_api_200"
         if st in (404, 410):
             st2, _, body2 = _fetch(f"https://jobs.lever.co/{site}/{jid}")
@@ -237,7 +313,7 @@ def _lever(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str,
                 return DEAD, "lever_api_404+page"
             return UNCERTAIN, "lever_api404_page200"
         return _classify_body(st, final, body, meta=meta)
-    return _classify_body(*_fetch(url), meta=meta)
+    return _classify_body(*_fetch(url), meta=meta, requested_url=url)
 
 
 def _ashby(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
@@ -250,11 +326,17 @@ def _ashby(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str,
             accept="application/json")
         if st == 200:
             try:
-                ids = {str(j.get("id")) for j in json.loads(body).get("jobs", [])}
-                if jid in ids:
-                    return LIVE, "ashby_api_listed"
-            except Exception:
-                pass
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return UNCERTAIN, "ashby_api_invalid_json"
+            if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+                return UNCERTAIN, "ashby_api_invalid_payload"
+            jobs = payload["jobs"]
+            if any(not isinstance(job, dict) for job in jobs):
+                return UNCERTAIN, "ashby_api_invalid_payload"
+            ids = {str(job.get("id")) for job in jobs if job.get("id") is not None}
+            if jid in ids:
+                return LIVE, "ashby_api_listed"
             st2, _, body2 = _fetch(url)
             if st2 in (404, 410) or CLOSED_RE.search(body2):
                 return DEAD, "ashby_absent+page_gone"
@@ -265,7 +347,7 @@ def _ashby(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str,
                 return DEAD, "ashby_board404+page_gone"
             return UNCERTAIN, "ashby_board404_page200"
         return _classify_body(st, final, body, meta=meta)
-    return _classify_body(*_fetch(url), meta=meta)
+    return _classify_body(*_fetch(url), meta=meta, requested_url=url)
 
 
 def _workday(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
@@ -280,11 +362,35 @@ def _workday(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[st
         if site and rest:
             cxs = f"{p.scheme}://{host}/wday/cxs/{tenant}/{site}/job/" + "/".join(rest)
             st, _, body = _fetch(cxs, accept="application/json")
-            if st == 200 and "jobPostingInfo" in body:
+            if st == 200:
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError:
+                    return UNCERTAIN, "workday_cxs_invalid_json"
+                if not isinstance(payload, dict) or not isinstance(payload.get("jobPostingInfo"), dict):
+                    return UNCERTAIN, "workday_cxs_invalid_payload"
                 return LIVE, "workday_cxs_200"
             if st in (404, 410):
                 return DEAD, "workday_cxs_404"
             if st in (401, 403, 429):
+                # Some Workday tenants block anonymous CXS JSON while serving the
+                # public posting page.  Keep the gate read-only and require both
+                # a healthy page response and recognizable Workday job evidence.
+                page_status, page_url, page_body = _fetch(url)
+                if page_status in (404, 410):
+                    return DEAD, f"workday_page_{page_status}_after_cxs_{st}"
+                if page_status == 200:
+                    normalized = _visible_text(page_body).casefold()
+                    has_job_evidence = any(marker in normalized for marker in (
+                        "jobtitleheading", "apply", "job description", "job posting",
+                    ))
+                    page_state, _page_reason = _classify_body(
+                        page_status, page_url, page_body, meta=meta, requested_url=url
+                    )
+                    if page_state == DEAD:
+                        return DEAD, f"workday_page_closed_after_cxs_{st}"
+                    if page_state == LIVE and has_job_evidence:
+                        return LIVE, f"workday_page_200_after_cxs_{st}"
                 return UNCERTAIN, f"workday_blocked_{st}"
             return UNCERTAIN, f"workday_cxs_{st}"
     return UNCERTAIN, "workday_unparsed"
@@ -303,7 +409,7 @@ def _dispatch(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[s
         return _ashby(url, meta=meta)
     if host.endswith("myworkdayjobs.com"):
         return _workday(url, meta=meta)
-    return _classify_body(*_fetch(url), meta=meta)
+    return _classify_body(*_fetch(url), meta=meta, requested_url=url)
 
 
 def probe_url(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[str, str]:
@@ -359,24 +465,30 @@ def _write_liveness_results(conn, results: list[tuple[str, str, str, dict[str, s
         return wrote
     for i, (url, status, reason, meta) in enumerate(results):
         transient = reason.startswith(("neterr", "error"))
+        expected_url = meta.get("_probed_url") if meta else None
+        url_guard = (
+            " AND (CASE WHEN application_url LIKE 'http%' THEN application_url ELSE url END) = ?"
+            if expected_url else ""
+        )
         if transient:
-            conn.execute(
-                "UPDATE jobs SET liveness_status = ?, liveness_reason = ? WHERE url = ?",
-                (status, reason, url))
+            cursor = conn.execute(
+                "UPDATE jobs SET liveness_status = ?, liveness_reason = ? WHERE url = ?" + url_guard,
+                (status, reason, url, *([expected_url] if expected_url else [])))
         else:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE jobs SET liveness_status = ?, liveness_reason = ?, "
                 "posted_at = COALESCE(posted_at, ?), "
                 "valid_through = COALESCE(valid_through, ?), "
-                "last_verified_live = ? WHERE url = ?",
+                "last_verified_live = ? WHERE url = ?" + url_guard,
                 (
                     status, reason,
                     (meta.get("posted_at") if meta else None),
                     (meta.get("valid_through") if meta else None),
                     now,
                     url,
+                    *([expected_url] if expected_url else []),
                 ))
-        wrote += 1
+        wrote += max(cursor.rowcount, 0)
         if i % 200 == 0:
             conn.commit()
     conn.commit()
@@ -407,8 +519,9 @@ def verify_candidate_rows(conn, rows, *, max_age_days: int = 1, workers: int = 1
                 for (url, app, meta) in todo
             }
             for fut in as_completed(futs):
-                url, _app, meta = futs[fut]
+                url, app, meta = futs[fut]
                 status, reason = fut.result()
+                meta["_probed_url"] = app
                 results.append((url, status, reason, meta))
 
     counts = Counter(s for _, s, _, _ in results)
@@ -470,15 +583,17 @@ def verify_jobs(conn, *, tiers=("priority", "recommended"), score_floor: float |
         todo = todo[:limit]
 
     results: list[tuple[str, str, str, dict[str, str | None]]] = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    worker_count = max(1, int(workers or 1))
+    with ThreadPoolExecutor(max_workers=worker_count) as ex:
         futs = {
             ex.submit(probe_url, app, meta=meta): (url, app, meta)
             for (url, app, meta) in todo
         }
         done = 0
         for fut in as_completed(futs):
-            url, _app, meta = futs[fut]
+            url, app, meta = futs[fut]
             status, reason = fut.result()
+            meta["_probed_url"] = app
             results.append((url, status, reason, meta))
             done += 1
             if progress and (done % 50 == 0 or done == len(todo)):

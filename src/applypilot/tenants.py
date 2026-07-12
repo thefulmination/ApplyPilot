@@ -60,7 +60,8 @@ def list_tenants(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Return all rows in ats_tenants as plain dicts."""
     rows = conn.execute(
         "SELECT host, status, clean_submits, failed_submits, daily_cap, "
-        "halted_until, last_result, updated_at FROM ats_tenants ORDER BY host"
+        "halted_until, last_result, updated_at, profile_id, session_state, "
+        "session_checked_at, session_expires_at, session_reason FROM ats_tenants ORDER BY host"
     ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
@@ -68,7 +69,8 @@ def list_tenants(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def _get_row(conn: sqlite3.Connection, host: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT host, status, clean_submits, failed_submits, daily_cap, "
-        "halted_until, last_result, updated_at FROM ats_tenants WHERE host = ?",
+        "halted_until, last_result, updated_at, profile_id, session_state, "
+        "session_checked_at, session_expires_at, session_reason FROM ats_tenants WHERE host = ?",
         (host,),
     ).fetchone()
 
@@ -217,3 +219,57 @@ def daily_cap(conn: sqlite3.Connection, host: str) -> int:
         return 5
     value = row["daily_cap"] if isinstance(row, sqlite3.Row) else row[0]
     return 5 if value is None else int(value)
+
+
+def set_session_state(
+    conn: sqlite3.Connection,
+    host: str,
+    state: str,
+    *,
+    profile_id: str | None = None,
+    ttl_hours: int | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Update local profile readiness and mirror only non-secret metadata to SQLite."""
+    from applypilot.apply import tenant_sessions
+
+    normalized = _host_of(host) if "://" in host else host.lower().strip(".")
+    session = tenant_sessions.set_session_state(
+        normalized,
+        state,
+        profile_id=profile_id,
+        ttl_hours=ttl_hours,
+        reason=reason,
+    )
+    existing = _get_row(conn, normalized)
+    if existing is None:
+        conn.execute(
+            "INSERT INTO ats_tenants (host, status, profile_id, session_state, "
+            "session_checked_at, session_expires_at, session_reason, updated_at) "
+            "VALUES (?, 'excluded', ?, ?, ?, ?, ?, ?)",
+            (
+                normalized,
+                session["profile_id"],
+                session["state"],
+                session["checked_at"],
+                session["expires_at"],
+                session["reason"],
+                session["checked_at"],
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE ats_tenants SET profile_id=?, session_state=?, session_checked_at=?, "
+            "session_expires_at=?, session_reason=?, updated_at=? WHERE host=?",
+            (
+                session["profile_id"],
+                session["state"],
+                session["checked_at"],
+                session["expires_at"],
+                session["reason"],
+                session["checked_at"],
+                normalized,
+            ),
+        )
+    conn.commit()
+    return _row_to_dict(_get_row(conn, normalized))

@@ -31,8 +31,8 @@ def _seed_linkedin_queued(conn, url):
         )
         cur.execute(
             "INSERT INTO linkedin_queue (url, company, title, application_url, score, "
-            "status, lane, approved_batch, dedup_key) "
-            "VALUES (%s,'Acme','Role',%s,'9','queued','ats','b1',%s)",
+            "status, lane, approved_batch, dedup_key, linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES (%s,'Acme','Role',%s,'9','queued','ats','b1',%s,'easy_apply',now())",
             (url, url, "dk-" + url),
         )
     conn.commit()
@@ -81,6 +81,50 @@ def test_tick_apply_usage_limit_requeues_not_crash(fleet_db):
         assert cur.fetchone()["n"] == 0                       # never entered the dedup ledger
 
 
+def test_tick_apply_zero_tool_no_result_requeues(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_queued(conn, "zero-tool", "acme-zero.com")
+    loop = WorkerLoop(
+        lambda: pgqueue.connect(fleet_db),
+        "w-zero",
+        home_ip="1.1.1.1",
+        role="apply",
+        apply_fn=lambda job: {
+            "run_status": "failed:no_result_line",
+            "est_cost_usd": 0.0,
+            "application_tool_calls": 0,
+        },
+    )
+    assert loop.run_once()["action"] == "zero_tool_requeue"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT status, attempts, apply_error FROM apply_queue WHERE url='zero-tool'")
+        row = cur.fetchone()
+        assert row["status"] == "queued"
+        assert row["attempts"] == 0
+        assert row["apply_error"] == "failed:zero_tool_no_result"
+
+
+def test_tick_apply_positive_or_unknown_tool_count_remains_crash_unconfirmed(fleet_db):
+    for suffix, tool_count in (("positive", 1), ("unknown", None)):
+        with pgqueue.connect(fleet_db) as conn:
+            _seed_queued(conn, suffix, f"acme-{suffix}.com")
+        loop = WorkerLoop(
+            lambda: pgqueue.connect(fleet_db),
+            f"w-{suffix}",
+            home_ip="1.1.1.1",
+            role="apply",
+            apply_fn=lambda job, count=tool_count: {
+                "run_status": "failed:no_result_line",
+                "est_cost_usd": 0.1,
+                "application_tool_calls": count,
+            },
+        )
+        assert loop.run_once()["action"] == "crash_unconfirmed"
+        with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM apply_queue WHERE url=%s", (suffix,))
+            assert cur.fetchone()["status"] == "crash_unconfirmed"
+
+
 def test_tick_linkedin_usage_limit_requeues_not_failed(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_linkedin_queued(conn, "https://linkedin.test/ul")
@@ -116,7 +160,7 @@ def test_tick_linkedin_usage_limit_refunds_canary_and_account_reservation(fleet_
         _seed_linkedin_queued(conn, "https://linkedin.test/canary")
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE fleet_config SET linkedin_canary_enabled=TRUE, "
+                "UPDATE fleet_config SET linkedin_apply_mode='canary', linkedin_canary_enabled=TRUE, "
                 "linkedin_canary_remaining=1 WHERE id=1"
             )
         conn.commit()

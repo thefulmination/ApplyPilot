@@ -139,7 +139,42 @@ def select_backfill_candidates(conn, *, max_per_job: int = 2,
                 for r in cur.fetchall()]
 
 
-def requeue_job(conn, c: Candidate) -> bool:
+_PRE_TOUCH_BACKFILL_SQL = """
+SELECT q.url, q.worker_id, q.dedup_key, q.status::text AS status, q.attempts,
+       q.apply_error, 'pre_touch_browser_backfill' AS reason
+  FROM apply_queue q
+  JOIN LATERAL (
+      SELECT e.application_tool_calls
+        FROM apply_result_events e
+       WHERE e.queue_name='apply_queue' AND e.url=q.url
+       ORDER BY e.created_at DESC, e.id DESC
+       LIMIT 1
+  ) e ON TRUE
+ WHERE q.lane='ats' AND q.status='failed'
+   AND q.apply_error ILIKE '%%no_browser_tool%%'
+   AND e.application_tool_calls=0
+   AND q.url NOT ILIKE '%%linkedin.com%%'
+   AND COALESCE(q.application_url,q.url) NOT ILIKE '%%linkedin.com%%'
+   AND q.dedup_key IS NOT NULL
+   AND (SELECT count(*) FROM remediation_actions ra
+        WHERE ra.url=q.url AND ra.action='requeue') < %(maxperjob)s
+ ORDER BY q.updated_at ASC
+ LIMIT %(hardlimit)s
+"""
+
+
+def select_pre_touch_backfill_candidates(conn, *, max_per_job: int = 2,
+                                         hard_limit: int = 500) -> list[Candidate]:
+    """Select historical failed rows whose durable event proves zero browser calls."""
+    with conn.cursor() as cur:
+        cur.execute(_PRE_TOUCH_BACKFILL_SQL, {"maxperjob": max_per_job, "hardlimit": hard_limit})
+        return [Candidate(url=r["url"], worker_id=r["worker_id"], dedup_key=r["dedup_key"],
+                          status=r["status"], attempts=r["attempts"],
+                          apply_error=r["apply_error"], reason=r["reason"])
+                for r in cur.fetchall()]
+
+
+def requeue_job(conn, c: Candidate, *, apply_error_tag: str = REQUEUE_TAG) -> bool:
     """Reverse the reclaim park for ONE proven-never-submitted job: status -> 'queued', attempts
     -> 0, lease cleared, apply_error tagged. Race-guarded on the prior status. Writes a reversal
     audit row. Caller MUST have passed all 3 guards before calling this. Returns True if updated.
@@ -161,7 +196,7 @@ def requeue_job(conn, c: Candidate) -> bool:
             "SET status='queued'::apply_queue_status, attempts=0, lease_owner=NULL, "
             "    lease_expires_at=NULL, apply_error=%(tag)s, updated_at=now() "
             "WHERE url=%(url)s AND status=%(prior)s::apply_queue_status",
-            {"tag": REQUEUE_TAG, "url": c.url, "prior": c.status})
+            {"tag": apply_error_tag, "url": c.url, "prior": c.status})
         if cur.rowcount != 1:
             return False  # status changed since selection (race) -> do nothing
         if c.dedup_key:
@@ -176,7 +211,8 @@ def requeue_job(conn, c: Candidate) -> bool:
 
 
 def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
-              max_per_job: int = 2, window_minutes: int = 30, backfill: bool = False) -> dict:
+              max_per_job: int = 2, window_minutes: int = 30, backfill: bool = False,
+              pre_touch_backfill: bool = False, dry_run: bool = False) -> dict:
     """One pass: select usage-limit casualties, then re-queue each ONLY if all 3 guards pass,
     bounded by max_requeue. Guard failures and cap overflow are left parked (a recommendation,
     not an action). Returns a summary. brain_path defaults to the live brain (config.DB_PATH).
@@ -194,8 +230,10 @@ def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
         cands = select_backfill_candidates(conn, max_per_job=max_per_job)
     else:
         cands = select_candidates(conn, window_minutes=window_minutes, max_per_job=max_per_job)
+    if pre_touch_backfill:
+        cands.extend(select_pre_touch_backfill_candidates(conn, max_per_job=max_per_job))
     out = {"candidates": len(cands), "requeued": 0, "vetoed_applied_set": 0,
-           "vetoed_email": 0, "capped": 0}
+           "vetoed_email": 0, "capped": 0, "dry_run": dry_run}
     for c in cands:
         if in_applied_set(conn, c.dedup_key):           # guard 2
             out["vetoed_applied_set"] += 1
@@ -205,6 +243,8 @@ def remediate(conn, *, brain_path: str | None = None, max_requeue: int = 50,
             continue
         if out["requeued"] >= max_requeue:              # per-pass blast-radius cap
             out["capped"] += 1
+            continue
+        if dry_run:
             continue
         if requeue_job(conn, c):                        # guard 1 already satisfied by selection
             out["requeued"] += 1

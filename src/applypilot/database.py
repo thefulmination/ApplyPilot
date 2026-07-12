@@ -14,6 +14,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from applypilot.auth_event_storage import (
+    OUTDATED_STORAGE_PREDICATE,
+    scrub_inbox_events,
+)
 from applypilot.config import DB_PATH
 
 MIN_GOOD_DESCRIPTION_CHARS = 200
@@ -618,9 +622,18 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
             matched_method        TEXT,
             snippet               TEXT,
             created_at            TEXT NOT NULL,
+            storage_version       INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(matched_job_url) REFERENCES jobs(url)
         )
     """)
+    inbox_event_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(inbox_events)").fetchall()
+    }
+    if "storage_version" not in inbox_event_columns:
+        conn.execute(
+            "ALTER TABLE inbox_events "
+            "ADD COLUMN storage_version INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS auth_challenges (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -643,9 +656,43 @@ def ensure_inbox_auth_tables(conn: sqlite3.Connection | None = None) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_events_job_url ON inbox_events(matched_job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_events_received_at ON inbox_events(received_at)")
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_inbox_events_storage_outdated
+        ON inbox_events(id)
+        WHERE {OUTDATED_STORAGE_PREDICATE}
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_status ON auth_challenges(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_job_url ON auth_challenges(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)")
+    migration_now = datetime.now(timezone.utc).isoformat()
+    claim_index_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        ("idx_auth_challenges_inbox_event_unique",),
+    ).fetchone()
+    if claim_index_exists is None:
+        conn.execute("""
+            UPDATE auth_challenges
+               SET status = 'failed',
+                   resolved_at = NULL,
+                   inbox_event_id = NULL,
+                   last_error = 'message_claim_conflict',
+                   updated_at = ?
+             WHERE inbox_event_id IS NOT NULL
+               AND id NOT IN (
+                   SELECT MIN(id)
+                     FROM auth_challenges
+                    WHERE inbox_event_id IS NOT NULL
+                    GROUP BY inbox_event_id
+               )
+        """, (migration_now,))
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_challenges_inbox_event_unique
+        ON auth_challenges(inbox_event_id)
+        WHERE inbox_event_id IS NOT NULL
+    """)
+    scrub_inbox_events(conn, migration_now=migration_now)
     conn.commit()
 
 
@@ -691,6 +738,31 @@ def ensure_outcome_tables(conn: sqlite3.Connection | None = None) -> None:
         if col not in ee_existing:
             conn.execute(f"ALTER TABLE email_events ADD COLUMN {col} TEXT")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_event_reviews (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id          TEXT NOT NULL,
+            review_action       TEXT NOT NULL,
+            reviewed_by         TEXT,
+            reviewed_at         TEXT NOT NULL,
+            corrected_job_url   TEXT,
+            corrected_stage     TEXT,
+            corrected_outcome   TEXT,
+            corrected_confidence TEXT,
+            resolution          TEXT NOT NULL,
+            note                TEXT,
+            FOREIGN KEY(message_id) REFERENCES email_events(message_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_event_reviews_message_id "
+        "ON email_event_reviews(message_id, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_email_event_reviews_resolution "
+        "ON email_event_reviews(resolution)"
+    )
+
     conn.commit()
 
 
@@ -716,6 +788,16 @@ def ensure_tenant_tables(conn: sqlite3.Connection | None = None) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ats_tenants_status ON ats_tenants(status)")
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(ats_tenants)").fetchall()}
+    for column, definition in (
+        ("profile_id", "TEXT"),
+        ("session_state", "TEXT NOT NULL DEFAULT 'supervised'"),
+        ("session_checked_at", "TEXT"),
+        ("session_expires_at", "TEXT"),
+        ("session_reason", "TEXT"),
+    ):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE ats_tenants ADD COLUMN {column} {definition}")
 
     conn.commit()
 

@@ -127,3 +127,136 @@ def test_apply_home_challenges_without_grouped_unchanged(fleet_db, capsys):
     apply_home_main.main(["--dsn", fleet_db, "challenges"])
     out = capsys.readouterr().out
     assert "raised_at" in out or "'kind': 'visible_captcha'" in out
+
+
+def test_apply_home_challenges_does_not_leak_linkedin_auth_rows(fleet_db, capsys):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score, status, apply_status) "
+                "VALUES ('https://www.linkedin.com/jobs/view/99', "
+                "'https://www.linkedin.com/jobs/view/99', 9, 'leased', 'challenge_pending')"
+            )
+            cur.execute(
+                "INSERT INTO auth_challenge (url, kind, route, raised_at) VALUES "
+                "('https://www.linkedin.com/jobs/view/99', 'login_gate', 'owner_inbox', "
+                "now() - interval '2 days')"
+            )
+            conn.commit()
+
+    apply_home_main.main(["--dsn", fleet_db, "challenges"])
+    out = capsys.readouterr().out
+
+    assert "https://www.linkedin.com/jobs/view/99" not in out
+
+
+def test_apply_home_challenges_can_filter_stale_rows_and_show_park_state(fleet_db, capsys):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO auth_challenge (url, kind, route, raised_at) "
+                "VALUES ('https://example.test/stale', 'login_gate', 'owner_inbox', "
+                "now() - interval '3 days')"
+            )
+            cur.execute(
+                "INSERT INTO apply_queue (url, application_url, score, status, apply_status, "
+                "lane, lease_expires_at) VALUES ('https://example.test/stale', "
+                "'https://example.test/stale', 9, 'leased', 'challenge_pending', 'ats', "
+                "now() + interval '3650 days')"
+            )
+            conn.commit()
+
+    apply_home_main.main(["--dsn", fleet_db, "challenges", "--stale-days", "1", "--limit", "1"])
+    out = capsys.readouterr().out
+
+    assert "https://example.test/stale" in out
+    assert "age_hours" in out
+    assert "parked" in out
+
+
+def test_apply_home_challenges_can_filter_kind_and_prioritize_score(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue (url, application_url, company, title, score, status, "
+            "apply_status, lane, lease_owner, lease_expires_at) VALUES "
+            "('priority-low', 'https://example.test/low', 'Low', 'Low', 7, 'leased', "
+            "'challenge_pending', 'ats', 'w1', now() + interval '3650 days'), "
+            "('priority-high', 'https://example.test/high', 'High', 'High', 9.8, 'leased', "
+            "'challenge_pending', 'ats', 'w1', now() + interval '3650 days')"
+        )
+        cur.execute(
+            "INSERT INTO auth_challenge (url, kind, route, raised_at) VALUES "
+            "('priority-low', 'login_gate', 'owner_inbox', now() - interval '2 days'), "
+            "('priority-high', 'login_gate', 'owner_inbox', now() - interval '1 day')"
+        )
+        conn.commit()
+
+        rows = apply_home_main.list_challenges(conn, kind="login_gate", priority=True, limit=2)
+
+    assert [row["url"] for row in rows] == ["priority-high", "priority-low"]
+
+
+def test_apply_home_challenges_surfaces_parked_orphan_without_auth_row(fleet_db, capsys):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO apply_queue (url, application_url, score, company, title, status, apply_status, "
+                "lane, lease_owner, updated_at, lease_expires_at) VALUES "
+                "('https://example.test/orphan', 'https://example.test/orphan', 9, 'Acme', "
+                "'Chief of Staff', 'leased', 'challenge_pending', 'ats', 'worker-1', now() - interval '2 days', "
+                "now() + interval '3650 days')"
+            )
+            conn.commit()
+
+    apply_home_main.main(["--dsn", fleet_db, "challenges", "--stale-days", "1"])
+    out = capsys.readouterr().out
+
+    assert "https://example.test/orphan" in out
+    assert "Chief of Staff" in out
+    assert "Acme" in out
+    assert "parked_without_open_challenge" in out
+    assert "'orphan': True" in out
+
+
+def test_apply_home_challenge_list_infers_missing_company_from_application_host(fleet_db):
+    url = "https://indeed.com/viewjob?jk=company-fallback"
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, company, title, score, status, apply_status, lane, lease_expires_at) "
+            "VALUES (%s,'https://amazon.jobs/jobs/123',NULL,'Manager',8,'leased',"
+            "'challenge_pending','ats',now()+interval '3650 days')",
+            (url,),
+        )
+        cur.execute(
+            "INSERT INTO auth_challenge (url, kind, route) VALUES (%s,'login_gate','owner_inbox')",
+            (url,),
+        )
+        conn.commit()
+        rows = apply_home_main.list_challenges(conn)
+
+    assert rows[0]["company"] == "amazon.jobs"
+    assert rows[0]["metadata_inferred_fields"] == ["company"]
+    assert rows[0]["metadata_complete"] is True
+
+
+def test_apply_home_challenges_handles_unicode_metadata(fleet_db, capsys):
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO auth_challenge (url, kind, route, raised_at) "
+                "VALUES ('https://example.test/unicode', 'login_gate', 'owner_inbox', "
+                "now() - interval '3 days')"
+            )
+            cur.execute(
+                "INSERT INTO apply_queue (url, application_url, company, title, score, status, "
+                "apply_status, lane, lease_expires_at) VALUES "
+                "('https://example.test/unicode', 'https://example.test/unicode', 'Mūn Labs', "
+                "'Director, Strategy', 9, 'leased', 'challenge_pending', 'ats', now() + interval '3650 days')"
+            )
+            conn.commit()
+
+    apply_home_main.main(["--dsn", fleet_db, "challenges", "--stale-days", "1"])
+    out = capsys.readouterr().out
+
+    assert "Mūn Labs" in out

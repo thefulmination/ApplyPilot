@@ -6,9 +6,13 @@ from applypilot.apply import pgqueue
 def _seed_li(conn, n, *, batch="b1", approved=True):
     with conn.cursor() as cur:
         for i in range(n):
-            cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, approved_batch, dedup_key) "
-                        "VALUES (%s,%s,%s,'queued','ats',%s,%s)",
-                        (f"li{i}", f"https://linkedin.com/jobs/{i}", 9.0-i*0.01, batch if approved else None, f"dk{i}"))
+            cur.execute(
+                "INSERT INTO linkedin_queue "
+                "(url, application_url, score, status, lane, approved_batch, dedup_key, "
+                "linkedin_resolve_status, linkedin_resolved_at) "
+                "VALUES (%s,%s,%s,'queued','ats',%s,%s,'easy_apply',now())",
+                (f"li{i}", f"https://linkedin.com/jobs/{i}", 9.0 - i * 0.01, batch if approved else None, f"dk{i}"),
+            )
         conn.commit()
 
 
@@ -33,20 +37,86 @@ def test_linkedin_lease_dedup_blocks(fleet_db):
         assert queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1") is None  # already applied
 
 
+def test_approve_linkedin_jobs_requires_fresh_resolver_status(fleet_db):
+    from applypilot.fleet import queue
+
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO linkedin_queue
+                    (url, application_url, score, status, lane, dedup_key,
+                     linkedin_resolve_status, linkedin_resolved_at)
+                VALUES
+                    ('fresh', 'https://linkedin.com/jobs/fresh', 9.0, 'queued', 'ats', 'dk-fresh',
+                     'easy_apply', now()),
+                    ('unresolved', 'https://linkedin.com/jobs/unresolved', 9.0, 'queued', 'ats', 'dk-unresolved',
+                     NULL, NULL),
+                    ('stale', 'https://linkedin.com/jobs/stale', 9.0, 'queued', 'ats', 'dk-stale',
+                     'easy_apply', now() - interval '10 days')
+                """
+            )
+        conn.commit()
+
+        assert queue.approve_linkedin_jobs(conn, ["fresh", "unresolved", "stale"], "batch-fresh") == 1
+        with conn.cursor() as cur:
+            cur.execute("SELECT url, approved_batch FROM linkedin_queue ORDER BY url")
+            rows = {r["url"]: r["approved_batch"] for r in cur.fetchall()}
+
+    assert rows == {
+        "fresh": "batch-fresh",
+        "stale": None,
+        "unresolved": None,
+    }
+
+
+def test_lease_linkedin_refuses_approved_rows_without_fresh_resolver_status(fleet_db):
+    from applypilot.fleet import queue
+
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO linkedin_queue
+                    (url, application_url, score, status, lane, approved_batch, dedup_key,
+                     linkedin_resolve_status, linkedin_resolved_at)
+                VALUES
+                    ('unresolved', 'https://linkedin.com/jobs/unresolved', 9.0, 'queued', 'ats',
+                     'batch-old', 'dk-unresolved', NULL, NULL),
+                    ('stale', 'https://linkedin.com/jobs/stale', 8.9, 'queued', 'ats',
+                     'batch-old', 'dk-stale', 'easy_apply', now() - interval '10 days')
+                """
+            )
+        conn.commit()
+
+        assert queue.lease_linkedin(
+            conn,
+            "w1",
+            public_ip="1.1.1.1",
+            owner_ip="1.1.1.1",
+            min_gap_seconds=0,
+        ) is None
+
+
 def test_linkedin_canary_caps(fleet_db):
     from applypilot.fleet import queue
     with pgqueue.connect(fleet_db) as conn:
         _seed_li(conn, 3)
         with conn.cursor() as cur:
-            cur.execute("UPDATE fleet_config SET linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1 WHERE id=1")
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_apply_mode='canary', "
+                "linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1 WHERE id=1"
+            )
             cur.execute("UPDATE rate_governor SET min_gap_seconds=0 WHERE scope_key='account:linkedin'")  # not yet created
         conn.commit()
         a = queue.lease_linkedin(conn, "w1", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0)
         b = queue.lease_linkedin(conn, "w2", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0)
     assert a is not None and b is None  # canary capped at 1
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT linkedin_canary_remaining FROM fleet_config WHERE id=1")
-        assert cur.fetchone()["linkedin_canary_remaining"] == 0
+        cur.execute("SELECT linkedin_apply_mode, linkedin_canary_remaining FROM fleet_config WHERE id=1")
+        row = cur.fetchone()
+        assert row["linkedin_apply_mode"] == "stopped"
+        assert row["linkedin_canary_remaining"] == 0
 
 
 def test_linkedin_min_gap_default_is_ttl(fleet_db):
@@ -167,9 +237,10 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
 
     captured = {}
 
-    def _fake_make_apply_fn(model, agent):
+    def _fake_make_apply_fn(model, agent, *args, **kwargs):
         captured["model"] = model
         captured["agent"] = agent
+        captured["fleet_worker_id"] = kwargs.get("fleet_worker_id")
         return lambda job: {"run_status": "failed:usage_limit", "est_cost_usd": 0.0}
 
     monkeypatch.setattr(awm, "make_apply_fn", _fake_make_apply_fn)
@@ -177,6 +248,7 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
     lm.build_linkedin_loop(dsn="postgresql://example.invalid/db", worker_id="w", owner_ip="1.1.1.1")
 
     assert captured["agent"] == "codex"
+    assert captured["fleet_worker_id"] == "w"
 
 
 def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
@@ -230,18 +302,22 @@ def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
     monkeypatch.setattr(pgqueue, "linkedin_should_halt", lambda conn: False)
     sw = AgentSwitcher(agents=["codex", "claude"], cooldown_seconds=3600)
 
+    loop = _Loop()
     counts = lm.run_linkedin(
         lambda: _Conn(),
-        _Loop(),
+        loop,
         max_iterations=2,
         idle_sleep=0,
         switcher=sw,
         rebuild_apply_fn=rebuild,
+        model_for_agent=lambda agent: f"{agent}-model",
         time_fn=lambda: 1000.0,
     )
 
     assert rebuilt[0] == "codex"
     assert "claude" in rebuilt
+    assert loop.current_agent == "claude"
+    assert loop.current_model == "claude-model"
     assert sw.blocked_until("codex") == 4600.0
     assert counts["applied"] == 1
 
@@ -277,6 +353,8 @@ def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
     sw.note_wall("claude", now=1000.0)
 
     loop = _Loop()
+    loop.current_agent = "codex"
+    loop.current_model = "codex-default"
     counts = lm.run_linkedin(
         lambda: _Conn(),
         loop,
@@ -289,6 +367,8 @@ def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
 
     assert loop.ran == 0
     assert loop.beats == ["paused", "paused"]
+    assert loop.current_agent is None
+    assert loop.current_model is None
     assert counts["idle"] == 2
 
 
@@ -402,3 +482,14 @@ def test_supervised_detects_fleet_linkedin(fleet_db):
     finally:
         holder.close()
     assert launcher.fleet_linkedin_active(fleet_db) is False      # lock free now
+
+
+def test_supervised_linkedin_probe_is_unknown_when_fleet_unreachable(monkeypatch):
+    from applypilot.apply import launcher
+
+    monkeypatch.setattr(
+        "psycopg.connect",
+        lambda _dsn: (_ for _ in ()).throw(OSError("unreachable")),
+    )
+
+    assert launcher.fleet_linkedin_active("postgresql://unreachable") is None

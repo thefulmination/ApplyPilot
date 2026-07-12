@@ -14,6 +14,7 @@ import os
 
 from applypilot.apply import pgqueue
 from applypilot.fleet.discovery_adapter import make_search_fn
+from applypilot.fleet import schema as fleet_schema
 from applypilot.fleet.worker import WorkerLoop
 
 
@@ -86,6 +87,8 @@ def main_worker(argv=None) -> int:
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
+    with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
     loop = build_discovery_loop(
         dsn=args.dsn,
         worker_id=args.worker_id,
@@ -110,11 +113,14 @@ def main_home(argv=None) -> int:
                    help="Path to searches JSON or YAML config (required for expand)")
     args = p.parse_args(argv)
 
+    if not args.dsn:
+        raise SystemExit("set --dsn or FLEET_PG_DSN")
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
+
     if args.cmd == "expand":
         if not args.config:
             raise SystemExit("expand requires --config <path>")
-        if not args.dsn:
-            raise SystemExit("set --dsn or FLEET_PG_DSN")
         path = args.config
         if path.endswith(".yaml") or path.endswith(".yml"):
             import yaml
@@ -127,8 +133,6 @@ def main_home(argv=None) -> int:
             n = expand_searches(conn, config)
         print("expanded", n)
     else:  # pull
-        if not args.dsn:
-            raise SystemExit("set --dsn or FLEET_PG_DSN")
         with pgqueue.connect(args.dsn) as pg:
             n = pull(pg_conn=pg)
         print("pulled", n)

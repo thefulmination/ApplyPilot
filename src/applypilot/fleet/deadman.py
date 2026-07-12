@@ -22,8 +22,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from applypilot import config
-from applypilot.mail_source import ImapMailSource, MailSourceError
+from applypilot import config, inbox_auth
+from applypilot.mail_source import ImapMailSource, MailSourceError, MailSourceOverflowError
 
 # ---------------------------------------------------------------------------
 # Thresholds (module constants -- tune here, not inline).
@@ -33,6 +33,9 @@ STALL_HOURS = 3         # stalled_queue: how long without an 'applied' row count
 HOT_FRACTION = 0.95     # running_hot: fraction of cost_cap_daily_usd that counts as "hot"
 HOT_STREAK_MIN = 2      # running_hot: consecutive hot checks required before alerting
 OWNER_INBOX_WINDOW_MIN = 30
+OWNER_INBOX_STALE_HOURS = 24
+OTP_STALL_SECONDS_DEFAULT = 120
+OTP_STALL_SECONDS_MIN = 30
 
 _WATCHDOG_OR_LINKEDIN_RE = re.compile(r"watchdog|linkedin")
 _WATCHDOG_RE = re.compile(r"watchdog")
@@ -159,25 +162,87 @@ def _check_running_hot(
     return None, 0
 
 
-def _check_otp_relay(conn, now: dt.datetime, gmail_token_ok: bool | None) -> Alert | None:
-    """The OTP relay (otp_responder + the home Gmail token) gives the WHOLE fleet its
-    email-verification / two-step (2FA) capability: remote workers file otp_request rows and
-    the home box reads Gmail to answer them (otp_relay.answer_pending). It is DOWN if the
-    backing Gmail token is dead (`gmail_token_ok is False` -> the responder can't read codes,
-    so every email-2FA apply stalls) OR if a once-running otp_responder stopped heartbeating.
-    `gmail_token_ok` is injected (None = couldn't check -> skip). The heartbeat is only alarmed
-    when a row EXISTS but is stale (absent = the relay simply isn't in use). Not armed-gated:
-    a dead relay matters whenever the fleet applies."""
-    reasons: list[str] = []
+def _otp_stall_seconds() -> int:
+    raw = os.environ.get("APPLYPILOT_OTP_STALL_SECONDS")
+    if raw is None:
+        return OTP_STALL_SECONDS_DEFAULT
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        return OTP_STALL_SECONDS_DEFAULT
+    return max(configured, OTP_STALL_SECONDS_MIN)
+
+
+def _active_otp_demand(conn, now: dt.datetime) -> tuple[int, dt.datetime | None]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS pending_count, "
+            "MIN(wait_started_at) AS oldest_wait_started_at "
+            "FROM otp_request "
+            "WHERE code IS NULL AND consumed_at IS NULL "
+            "AND wait_started_at IS NOT NULL "
+            "AND requested_at <= %s AND expires_at > %s",
+            (now, now),
+        )
+        row = cur.fetchone()
+    if not row:
+        return 0, None
+    return int(row["pending_count"]), row["oldest_wait_started_at"]
+
+
+def _check_otp_relay(
+    conn, now: dt.datetime, gmail_token_ok: bool | None
+) -> list[Alert]:
+    """Report relay health and delivery stalls without exposing request data."""
+    alerts: list[Alert] = []
+    relay_down_reasons: list[str] = []
     if gmail_token_ok is False:
-        reasons.append("Gmail token dead -- can't read verification codes")
+        relay_down_reasons.append("mail source authentication failed")
+
+    pending_count, oldest_wait_started_at = _active_otp_demand(conn, now)
     otp_beat = _max_last_beat(conn, "otp_responder", negate=False)
-    if otp_beat is not None and otp_beat < now - dt.timedelta(minutes=STALE_MIN):
-        reasons.append(f"otp_responder heartbeat stale ({otp_beat.isoformat()})")
-    if reasons:
-        return Alert(kind="otp_relay_down", severity="critical",
-                     detail="OTP relay down: " + "; ".join(reasons))
-    return None
+    stale_before = now - dt.timedelta(minutes=STALE_MIN)
+    if otp_beat is None and pending_count:
+        relay_down_reasons.append(
+            f"responder heartbeat absent with {pending_count} active wait(s)"
+        )
+    elif otp_beat is not None and otp_beat < stale_before:
+        stale_seconds = max(0, int((now - otp_beat).total_seconds()))
+        relay_down_reasons.append(
+            f"responder heartbeat stale by {stale_seconds}s"
+        )
+
+    if relay_down_reasons:
+        alerts.append(
+            Alert(
+                kind="otp_relay_down",
+                severity="critical",
+                detail="OTP relay down: " + "; ".join(relay_down_reasons),
+            )
+        )
+
+    responder_fresh = otp_beat is not None and otp_beat >= stale_before
+    if (
+        pending_count
+        and oldest_wait_started_at is not None
+        and responder_fresh
+        and gmail_token_ok is True
+    ):
+        wait_age = max(dt.timedelta(0), now - oldest_wait_started_at)
+        wait_age_seconds = int(wait_age.total_seconds())
+        if wait_age.total_seconds() > _otp_stall_seconds():
+            alerts.append(
+                Alert(
+                    kind="otp_delivery_stalled",
+                    severity="critical",
+                    detail=(
+                        f"{pending_count} active wait(s); oldest age "
+                        f"{wait_age_seconds}s; responder and mail source healthy"
+                    ),
+                )
+            )
+
+    return alerts
 
 
 def _check_owner_inbox_backlog(conn, cfg: dict, now: dt.datetime) -> Alert | None:
@@ -221,6 +286,39 @@ def _check_owner_inbox_backlog(conn, cfg: dict, now: dt.datetime) -> Alert | Non
     )
 
 
+def _check_stale_owner_inbox(conn, cfg: dict, now: dt.datetime) -> Alert | None:
+    """Alert when owner-gated ATS leases remain frozen beyond the review window."""
+    if not _is_armed(cfg):
+        return None
+    stale_before = now - dt.timedelta(hours=OWNER_INBOX_STALE_HOURS)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n, MIN(a.raised_at) AS oldest
+            FROM auth_challenge a
+            JOIN apply_queue q ON q.url = a.url AND q.lane = 'ats'
+            WHERE a.resolved_at IS NULL AND a.route = 'owner_inbox'
+              AND q.status = 'leased' AND q.apply_status = 'challenge_pending'
+              AND a.raised_at < %s
+            """,
+            (stale_before,),
+        )
+        row = cur.fetchone()
+    count = int(row["n"] or 0)
+    if count <= 0:
+        return None
+    oldest = row["oldest"]
+    age_hours = int(max(dt.timedelta(0), now - oldest).total_seconds() // 3600) if oldest else 0
+    return Alert(
+        kind="owner_inbox_stale",
+        severity="critical",
+        detail=(
+            f"{count} owner_inbox ATS lease(s) older than {OWNER_INBOX_STALE_HOURS}h; "
+            f"oldest age {age_hours}h"
+        ),
+    )
+
+
 def deadman_check(
     conn, *, now: dt.datetime, prev_hot_streak: int = 0, gmail_token_ok: bool | None = None
 ) -> tuple[list[Alert], int]:
@@ -251,13 +349,15 @@ def deadman_check(
     if selfheal:
         alerts.append(selfheal)
 
-    otp = _check_otp_relay(conn, now, gmail_token_ok)
-    if otp:
-        alerts.append(otp)
+    alerts.extend(_check_otp_relay(conn, now, gmail_token_ok))
 
     owner_inbox = _check_owner_inbox_backlog(conn, cfg, now)
     if owner_inbox:
         alerts.append(owner_inbox)
+
+    stale_owner_inbox = _check_stale_owner_inbox(conn, cfg, now)
+    if stale_owner_inbox:
+        alerts.append(stale_owner_inbox)
 
     hot_alert, new_streak = _check_running_hot(conn, cfg, now, prev_hot_streak)
     if hot_alert:
@@ -323,7 +423,15 @@ def mail_source_alive() -> bool | None:
         return gmail_token_alive()
 
     try:
-        ImapMailSource(creds[0], creds[1]).fetch(since_days=1, max_messages=1)
+        ImapMailSource(creds[0], creds[1]).fetch(
+            since_days=1,
+            max_messages=1,
+            gmail_raw_query=inbox_auth.AUTH_GMAIL_RAW_QUERY,
+        )
+        return True
+    except MailSourceOverflowError:
+        # The bounded probe already authenticated and found candidates; overflow
+        # is evidence of a busy inbox, not evidence that the relay is down.
         return True
     except MailSourceError:
         return False
@@ -411,6 +519,20 @@ def run_deadman(conn, *, now: dt.datetime, alert_dir: Path,
     return alerts
 
 
+def _write_monitor_failure_alert(alert_dir: Path, *, now: dt.datetime) -> None:
+    """Persist a credential-free fallback when the database monitor cannot run."""
+    try:
+        alert_dir = Path(alert_dir)
+        alert_dir.mkdir(parents=True, exist_ok=True)
+        (alert_dir / ALERT_FILENAME).write_text(
+            f"ApplyPilot fleet dead-man alert -- {now.isoformat()}\n\n"
+            "[critical] monitor_failure: fleet health check could not complete\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
     p = argparse.ArgumentParser(
         prog="applypilot-fleet-deadman",
@@ -425,6 +547,11 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
         "--alert-dir",
         default=os.path.join(os.environ.get("LOCALAPPDATA", ""), "ApplyPilot"),
     )
+    p.add_argument(
+        "--ensure-schema",
+        action="store_true",
+        help="Apply the fleet schema before checking (use during bootstrap, not on every scheduled pass).",
+    )
     p.add_argument("--once", action="store_true", default=True,
                     help="run a single pass and exit (default; the scheduled task "
                          "triggers this once per cadence)")
@@ -435,21 +562,21 @@ def main(argv=None) -> int:  # pragma: no cover - thin CLI glue
         return 1
 
     from applypilot.apply import pgqueue
-    from applypilot.fleet.schema import ensure_schema_v3
+    from applypilot.fleet import schema as fleet_schema
 
+    now = dt.datetime.now(dt.timezone.utc)
     try:
         with pgqueue.connect(args.dsn) as conn:
-            ensure_schema_v3(conn)
+            if args.ensure_schema:
+                fleet_schema.ensure_schema_v3(conn)
             alerts = run_deadman(
-                conn, now=dt.datetime.now(dt.timezone.utc), alert_dir=Path(args.alert_dir),
+                conn, now=now, alert_dir=Path(args.alert_dir),
                 gmail_token_ok=mail_source_alive(),  # network probe stays in the untested CLI glue
             )
-    except Exception as exc:  # pragma: no cover - defensive: a monitor must not
-        # error-spam Task Scheduler. Only a connection/infra failure gets here
-        # (run_deadman itself swallows delivery errors); print + exit 0 so the
-        # scheduled task doesn't show a permanent red X for a transient DB blip.
-        print(f"[fleet-deadman] check failed: {exc}", flush=True)
-        return 0
+    except Exception:  # pragma: no cover - exercised through CLI tests
+        _write_monitor_failure_alert(Path(args.alert_dir), now=now)
+        print("[fleet-deadman] check failed; see local alert", flush=True)
+        return 2
 
     if alerts:
         print(f"[fleet-deadman] ALERT: {_summarize(alerts)}", flush=True)

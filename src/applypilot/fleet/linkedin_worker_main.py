@@ -101,23 +101,27 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
     from applypilot.fleet.worker import WorkerLoop
     from applypilot.fleet.apply_worker_main import make_apply_fn, make_log_tail_fn
 
-    return WorkerLoop(
+    from applypilot.apply import launcher
+    loop = WorkerLoop(
         lambda: pgqueue.connect(dsn),
         worker_id,
         home_ip=owner_ip,
         role="linkedin",
-        apply_fn=make_apply_fn(model, agent),
+        apply_fn=make_apply_fn(model, agent, fleet_worker_id=worker_id),
         machine_owner=machine_owner,
         public_ip=owner_ip,
         owner_ip=owner_ip,
         on_owner_machine=True,
         log_tail_fn=make_log_tail_fn(0),
     )
+    loop.current_agent = agent
+    loop.current_model = launcher.effective_agent_model_label(agent, model)
+    return loop
 
 
 def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                  switcher=None, rebuild_apply_fn=None, time_fn=None, now_local_fn=None,
-                 budget=None) -> dict:
+                 budget=None, model_for_agent=None) -> dict:
     """Drive the LinkedIn apply loop (mirrors run_apply from apply_worker_main).
 
     Before each iteration check the LinkedIn-specific shared kill switch and idle when
@@ -155,6 +159,7 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                 if agent is None:
                     try:
                         loop.current_agent = None
+                        loop.current_model = None
                         loop.last_agent_switch_reason = "all_agents_walled"
                     except Exception:
                         pass
@@ -176,7 +181,8 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                     loop.apply_fn = rebuild_apply_fn(agent)
                     try:
                         loop.current_agent = agent
-                        loop.current_model = None if agent == "codex" else getattr(loop, "current_model", None)
+                        if model_for_agent is not None:
+                            loop.current_model = model_for_agent(agent)
                         loop.last_agent_switch_at = _now_local()
                         loop.last_agent_switch_reason = "agent_available"
                     except Exception:
@@ -252,6 +258,10 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
 
     _setup_apply_env()
     from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
 
     # Open a DEDICATED long-lived connection solely for holding the advisory lock.
     # This connection is kept open for the process life; releasing it releases the lock.
@@ -270,6 +280,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
         agent=args.agent,
         machine_owner=args.machine_owner,
     )
+    from applypilot.apply import launcher
     from applypilot.fleet.agent_switch import AgentSwitcher
     from applypilot.fleet.apply_worker_main import PgAgentBudget, make_apply_fn
 
@@ -302,7 +313,9 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
             lambda: pgqueue.connect(args.dsn),
             loop,
             switcher=switcher,
-            rebuild_apply_fn=lambda agent: make_apply_fn(args.model, agent),
+            rebuild_apply_fn=lambda agent: make_apply_fn(
+                args.model, agent, fleet_worker_id=args.worker_id),
+            model_for_agent=lambda agent: launcher.effective_agent_model_label(agent, args.model),
             budget=budget,
         )
     finally:

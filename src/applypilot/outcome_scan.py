@@ -11,10 +11,8 @@ import logging
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-log = logging.getLogger(__name__)
 
 from applypilot.database import get_connection
 from applypilot.gmail_outcomes import (
@@ -23,6 +21,8 @@ from applypilot.gmail_outcomes import (
     match_email_to_job,
 )
 from applypilot.outcome_extract import extract_outcome
+
+log = logging.getLogger(__name__)
 
 
 def _occurred_at(date_header: str) -> str:

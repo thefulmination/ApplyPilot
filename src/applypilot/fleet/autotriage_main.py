@@ -6,7 +6,7 @@ import sys
 import time
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import autotriage
+from applypilot.fleet import autotriage, schema as fleet_schema
 
 
 def _one_pass(args) -> dict:
@@ -18,6 +18,7 @@ def _one_pass(args) -> dict:
             window_minutes=args.window_minutes,
             enable_llm=args.enable_llm,
             dry_run=args.dry_run,
+            crash_only=args.crash_only,
         )
 
 
@@ -41,10 +42,15 @@ def main(argv=None) -> int:
     p.add_argument("--window-minutes", type=int, default=1440, help="Failure lookback window.")
     p.add_argument("--enable-llm", action="store_true", help="Let the LLM choose from the fixed action menu.")
     p.add_argument("--dry-run", action="store_true", help="Write audit rows but do not apply actions.")
+    p.add_argument("--crash-only", action="store_true",
+                   help="Limit selection to crash_unconfirmed rows; never triage failed/blocked rows.")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--once", action="store_true", help="Run a single pass.")
     g.add_argument("--interval", type=int, help="Loop every N seconds.")
     args = p.parse_args(argv)
+
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
 
     if args.once:
         print(_format_summary(_one_pass(args)), flush=True)

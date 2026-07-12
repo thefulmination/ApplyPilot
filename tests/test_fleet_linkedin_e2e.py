@@ -61,8 +61,8 @@ def test_linkedin_canary_then_halt(fleet_db):
         for i in range(3):
             cur.execute(
                 "INSERT INTO linkedin_queue "
-                "(url, application_url, score, status, lane, dedup_key) "
-                "VALUES (%s,%s,%s,'queued','ats',%s)",
+                "(url, application_url, score, status, lane, dedup_key, linkedin_resolve_status, linkedin_resolved_at) "
+                "VALUES (%s,%s,%s,'queued','ats',%s,'easy_apply',now())",
                 (f"e{i}", f"https://linkedin.com/jobs/{i}", 9 - i * 0.01, f"dke{i}"),
             )
         # Seed the account governor with min_gap=0 so min-gap never caps first.
@@ -103,6 +103,7 @@ def test_linkedin_canary_then_halt(fleet_db):
     # still 'queued' and approved — the wall tick will lease one of them.
     with pgqueue.connect(fleet_db) as conn:
         hm.set_linkedin_canary(conn, 2)  # re-arm with headroom
+        hm.approve(conn, all_pushed=True)
 
     wall_action = _make_loop(fleet_db, "wall-worker",
                              lambda job: {"run_status": "captcha", "est_cost_usd": 0.0}).run_once()
@@ -145,8 +146,8 @@ def test_linkedin_canary_then_halt(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO linkedin_queue "
-            "(url, application_url, score, status, lane, dedup_key) "
-            "VALUES (%s,%s,%s,'queued','ats',%s)",
+            "(url, application_url, score, status, lane, dedup_key, linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES (%s,%s,%s,'queued','ats',%s,'easy_apply',now())",
             ("e99", "https://linkedin.com/jobs/99", 9.0, "dke99"),
         )
         conn.commit()

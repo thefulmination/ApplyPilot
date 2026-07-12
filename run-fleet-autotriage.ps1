@@ -8,7 +8,8 @@ param(
   [int]$Limit = 25,
   [int]$WindowMinutes = 1440,
   [switch]$DryRun,
-  [switch]$DisableLlm
+  [switch]$DisableLlm,
+  [switch]$CrashOnly
 )
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -51,8 +52,9 @@ if ($Once) {
 }
 if (-not $DisableLlm) { $margs += "--enable-llm" }
 if ($DryRun) { $margs += "--dry-run" }
+if ($CrashOnly) { $margs += "--crash-only" }
 
-Write-Host "[fleet-autotriage] limit=$Limit window=$WindowMinutes min interval=$Interval s once=$($Once.IsPresent) llm=$(-not $DisableLlm) dry_run=$($DryRun.IsPresent)"
+Write-Host "[fleet-autotriage] limit=$Limit window=$WindowMinutes min interval=$Interval s once=$($Once.IsPresent) llm=$(-not $DisableLlm) dry_run=$($DryRun.IsPresent) crash_only=$($CrashOnly.IsPresent)"
 if ($exe) {
   & $exe @margs
 } else {

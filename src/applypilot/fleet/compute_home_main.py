@@ -555,6 +555,10 @@ def main(argv=None) -> int:
     p.add_argument("--minutes-ahead", type=int, default=60)
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+    with pgqueue.connect() as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
     if args.cmd == "push":
         print("pushed", push_backlog(task=args.task, score_floor=args.score_floor,
                                      limit=args.limit, unscored_only=args.unscored_only))

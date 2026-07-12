@@ -7,7 +7,7 @@ import os
 import sys
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import email_reconcile, repair_report
+from applypilot.fleet import email_reconcile, repair_report, schema as fleet_schema
 
 
 def _default_home_db() -> str:
@@ -25,6 +25,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         report = repair_report.build_report(
             conn,
             home_db_path=args.home_db,

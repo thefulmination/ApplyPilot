@@ -16,7 +16,7 @@ import sqlite3
 from typing import Iterable, Sequence
 
 from applypilot.database import get_connection
-from applypilot.linkedin_resolver import is_external_apply_url, is_linkedin_url
+from applypilot.linkedin_resolver import is_external_apply_url
 
 
 RESOLVED_STATUS = "resolved_company_match"

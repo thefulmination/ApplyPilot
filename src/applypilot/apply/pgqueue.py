@@ -8,7 +8,7 @@ re-pushes and nothing important is gone.
 
 Every function takes an OPEN psycopg connection so callers control transaction scope and the
 whole layer is trivially testable against a throwaway local Postgres. The production DSN comes
-from DATABASE_URL (Railway injects it for the worker; the home box uses the public URL).
+from APPLYPILOT_FLEET_DSN when set, otherwise DATABASE_URL (Railway injects it for the worker).
 
 Concurrency contract (the part that must never break):
   * lease_one  -> FOR UPDATE SKIP LOCKED: N workers each grab a DISTINCT row, never blocking.
@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from applypilot import config
 
@@ -35,7 +36,7 @@ _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding=
 # ---------------------------------------------------------------------------
 
 def get_dsn(dsn: str | None = None) -> str:
-    dsn = dsn or os.environ.get("DATABASE_URL") or os.environ.get("APPLYPILOT_FLEET_DSN")
+    dsn = dsn or os.environ.get("APPLYPILOT_FLEET_DSN") or os.environ.get("DATABASE_URL")
     if not dsn:
         raise RuntimeError(
             "No Postgres DSN: set DATABASE_URL (Railway) or APPLYPILOT_FLEET_DSN."
@@ -147,7 +148,7 @@ SET status           = 'crash_unconfirmed'::apply_queue_status,
     updated_at       = now()
 FROM stale s
 WHERE q.url = s.url
-RETURNING q.url, q.status;
+RETURNING q.url, q.status, q.worker_id, q.apply_domain;
 """
 
 
@@ -168,6 +169,29 @@ def reclaim_stale_leases(conn: psycopg.Connection, *, grace_seconds: int = 30) -
     with conn.cursor() as cur:
         cur.execute(_RECLAIM_SQL, {"grace": grace_seconds})
         rows = cur.fetchall()
+        # A watchdog reclaim used to leave no result event behind, making an old
+        # hard-crash indistinguishable from an uninstrumented row. Record the
+        # conservative outcome and its missing-evidence state for later triage.
+        for row in rows:
+            cur.execute(
+                "INSERT INTO apply_result_events ("
+                "queue_name, url, worker_id, status, apply_status, apply_error, "
+                "target_host, application_tool_calls, result_metadata, result_line, source"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    "apply_queue",
+                    row["url"],
+                    row["worker_id"],
+                    "crash_unconfirmed",
+                    "crash_unconfirmed",
+                    "crash_unconfirmed",
+                    row["apply_domain"],
+                    None,
+                    Jsonb({"reclaim_reason": "lease_expired", "execution_evidence": "missing"}),
+                    "RESULT:crash_unconfirmed",
+                    "watchdog",
+                ),
+            )
     conn.commit()
     return rows
 

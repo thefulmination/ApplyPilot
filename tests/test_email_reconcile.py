@@ -114,6 +114,23 @@ def test_reconcile_board_slug_is_confirmed():
     assert res.confirmed[0].method == "board_slug"
 
 
+def test_reconcile_exact_non_ats_job_url_is_confirmed():
+    job_url = "https://www.indeed.com/viewjob?jk=abc123"
+    jobs = [{"url": job_url, "application_url": "https://company.example/apply/abc123",
+             "company": "Acme", "title": "Analyst", "site": "indeed.com"}]
+    emails = [_email(
+        message_id="m-exact-url",
+        sender="no-reply@company.example",
+        subject="Application received",
+        body=f"Thanks for applying. View the posting: {job_url}/",
+    )]
+
+    res = er.reconcile(emails, jobs)
+
+    assert len(res.confirmed) == 1
+    assert res.confirmed[0].method == "exact_job_url"
+
+
 def test_reconcile_no_overlap_is_unmatched():
     jobs = [{"url": "https://stripe.com/jobs/1", "application_url": "", "company": "Stripe",
              "title": "Analyst", "site": "stripe.com"}]
@@ -254,7 +271,10 @@ class _ScriptCursor:
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
         if sql.strip().upper().startswith("UPDATE"):
-            self.rowcount = self._rc.pop(0) if self._rc else 0
+            if sql.strip().upper().startswith("UPDATE AUTH_CHALLENGE"):
+                self.rowcount = 0
+            else:
+                self.rowcount = self._rc.pop(0) if self._rc else 0
 
     def fetchall(self):
         return self._rows
@@ -291,6 +311,7 @@ def test_apply_resolutions_flips_confirmed_and_audits():
     assert len(updates) == 1 and len(inserts) == 1
     assert "status='applied'" in updates[0][0].replace(" ", "") or "status = 'applied'" in updates[0][0]
     assert "status='crash_unconfirmed'" in updates[0][0].replace(" ", "")   # guarded
+    assert any("UPDATE auth_challenge" in sql for sql, _ in conn._cur.executed)
 
 
 def test_apply_resolutions_skips_consumed_message_id():

@@ -749,7 +749,7 @@ RESULT:AUTH_REQUIRED -- login, account creation, email verification, SSO, or 2FA
 RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
 RESULT:FAILED:no_confirmation -- clicked Submit but could not confirm the application actually went through
-RESULT:FAILED:reason -- any other failure (brief reason)
+RESULT:FAILED:<brief_specific_reason> -- any other failure; replace the placeholder with a concrete snake_case reason and never output the literal word "reason"
 Output EXACTLY one RESULT: line as the LAST line of your response, using only the codes above. Do not invent new codes.
 
 == BROWSER EFFICIENCY ==

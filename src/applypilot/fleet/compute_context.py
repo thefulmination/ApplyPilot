@@ -30,7 +30,8 @@ def _txt(conn, name) -> str:
 
 def load_context(conn, *, providers, fallback=(), ensemble=False) -> tuple[ComputeContext, str]:
     version = _txt(conn, _VER)
-    pref = _txt(conn, _PREF); cfg = _txt(conn, _CFG)
+    pref = _txt(conn, _PREF)
+    cfg = _txt(conn, _CFG)
     ctx = ComputeContext(
         resume_text=_txt(conn, _RESUME),
         preference_profile=json.loads(pref) if pref else None,

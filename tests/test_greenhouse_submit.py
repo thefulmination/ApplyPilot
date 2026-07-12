@@ -6,7 +6,11 @@ contract: execute_form DEFAULTS to dry-run and never clicks submit unless
 explicitly told to. No real browser and no real submission in these tests.
 """
 
+from types import SimpleNamespace
+
 from applypilot.apply.greenhouse_adapter import AnswerPlan
+from applypilot.apply import launcher
+from applypilot.apply import greenhouse_submit
 from applypilot.apply.greenhouse_submit import (
     adapter_enabled,
     apply_greenhouse,
@@ -43,6 +47,7 @@ class FakePage:
     def __init__(self):
         self.calls = []
         self._content = ""
+        self.url = "https://boards.greenhouse.io/acme/jobs/123"
 
     def set_content(self, html):
         self._content = html
@@ -228,6 +233,17 @@ def test_detect_confirmation_defaults_to_no_confirmation_when_unproven():
     assert detect_confirmation(page) == "failed:no_confirmation"
 
 
+def test_detect_confirmation_accepts_greenhouse_completion_url():
+    page = FakePage()
+    page.url = "https://boards.greenhouse.io/acme/jobs/123/confirmation"
+    assert detect_confirmation(page) == "applied"
+
+
+def test_detect_confirmation_accepts_attributed_inbox_receipt():
+    page = FakePage()
+    assert detect_confirmation(page, inbox_confirmed=True) == "applied"
+
+
 def test_detect_confirmation_never_raises():
     class Boom:
         def content(self):
@@ -258,6 +274,96 @@ def test_apply_greenhouse_reports_no_confirmation_when_success_not_seen():
     )
     assert res["report"].submitted is True
     assert res["status"] == "failed:no_confirmation"
+
+
+def test_apply_greenhouse_owns_ambiguous_result_when_click_raises_after_dispatch():
+    class DispatchedThenRaisedPage(FakePage):
+        def click(self, selector):
+            self.calls.append(("click", selector))
+            raise RuntimeError("navigation interrupted after click dispatch")
+
+    page = DispatchedThenRaisedPage()
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good, dry_run=False,
+    )
+    assert res["report"].submit_attempted is True
+    assert res["status"] == "failed:no_confirmation"
+
+
+def test_confirmed_submit_survives_answer_capture_failure():
+    page = FakePage()
+    page.set_content("Your application has been submitted. Thanks for applying!")
+
+    def broken_capture(*_args, **_kwargs):
+        raise RuntimeError("answer corpus unavailable")
+
+    res = apply_greenhouse(
+        "https://boards.greenhouse.io/acme/jobs/123",
+        profile=_PROFILE, resume_text=_RESUME, resume_path="/r.pdf", page=page,
+        fetch=lambda u: {"questions": _READY_QS}, answer_fn=_good,
+        remember_fn=broken_capture, dry_run=False,
+    )
+    assert res["status"] == "applied"
+
+
+def test_launcher_does_not_release_agent_fallback_when_page_close_fails_after_submit(monkeypatch):
+    class Page:
+        def goto(self, *_args, **_kwargs):
+            return None
+
+        def close(self):
+            raise RuntimeError("page close failed")
+
+    page = Page()
+
+    class Context:
+        def new_page(self):
+            return page
+
+    class Browser:
+        contexts = [Context()]
+
+    class Chromium:
+        def connect_over_cdp(self, _url):
+            return Browser()
+
+    class Playwright:
+        chromium = Chromium()
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return Playwright()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(greenhouse_submit, "adapter_enabled", lambda: True)
+    monkeypatch.setattr(greenhouse_submit, "submit_enabled", lambda: True)
+    monkeypatch.setattr(
+        greenhouse_submit,
+        "apply_greenhouse",
+        lambda *_args, **_kwargs: {
+            "route": "deterministic",
+            "status": "failed:no_confirmation",
+            "report": SimpleNamespace(submit_attempted=True),
+        },
+    )
+    monkeypatch.setattr(launcher.config, "load_profile", lambda: {})
+
+    import playwright.sync_api
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright", lambda: PlaywrightContext())
+
+    result = launcher._maybe_greenhouse_apply(
+        {"url": "https://boards.greenhouse.io/acme/jobs/123"},
+        9222,
+        dry_run=False,
+        resume_text="",
+        resume_path=None,
+    )
+    assert result is not None
+    assert result[0] == "failed:no_confirmation"
 
 
 # --- remember_answer capture loop ------------------------------------------

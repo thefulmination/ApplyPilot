@@ -21,11 +21,15 @@ from __future__ import annotations
 import base64
 import logging
 import re
+from functools import lru_cache
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+
+from applypilot.ats_domains import ATS_SENDER_DOMAINS
 
 log = logging.getLogger(__name__)
 
@@ -221,21 +225,7 @@ _ACK_BODY = [
 # subdomains ATS platforms actually send from (e.g. greenhouse-mail.io, teamtailor-mail
 # .com) -- the bare board domains (greenhouse.io) never appear as the From, so matching
 # and ATS detection used to miss every greenhouse/teamtailor confirmation.
-_ATS_DOMAINS: frozenset[str] = frozenset({
-    "greenhouse.io", "greenhouse-mail.io",
-    "lever.co", "hire.lever.co",
-    "workday.com", "myworkdayjobs.com", "myworkday.com",
-    "icims.com", "brassring.com",
-    "smartrecruiters.com", "smartrecruiters-mail.com",
-    "workable.com", "workablemail.com", "taleo.net",
-    "jobvite.com", "jobvite-mail.com", "recruitee.com",
-    "ashbyhq.com", "ashbyhq-mail.com", "ashby.email",
-    "successfactors.com", "applytojob.com",
-    "bamboohr.com", "rippling.com",
-    "eightfold.ai", "beamery.com", "paradox.ai", "fountain.com",
-    "dover.com", "dover.io", "teamtailor.com", "teamtailor-mail.com",
-    "pinpointhq.com", "comeet.co", "gem.com", "breezy.hr", "hiringthing.com",
-})
+_ATS_DOMAINS = ATS_SENDER_DOMAINS
 
 # Generic webmail domains that give no company signal
 _GENERIC_DOMAINS: frozenset[str] = frozenset({
@@ -428,8 +418,11 @@ _STOP_TOKENS = frozenset({"a", "an", "the", "of", "for", "to", "at", "in", "and"
                            "inc", "llc", "ltd", "co", "corp", "company"})
 
 
-def _tokens(s: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", s.lower())) - _STOP_TOKENS
+@lru_cache(maxsize=100_000)
+def _tokens(s: str) -> frozenset[str]:
+    """Tokenize immutable input once; reconciliation compares the same job fields
+    against many emails, so caching avoids repeated regex work without changing scores."""
+    return frozenset(re.findall(r"[a-z0-9]+", s.lower())) - _STOP_TOKENS
 
 
 def _token_overlap(a: str, b: str) -> float:
@@ -572,6 +565,45 @@ _LINKEDIN_JID_RE = re.compile(r"(?:jobs/view/|currentjobid=)(\d{6,})", re.IGNORE
 
 def _linkedin_job_ids(text: str) -> set[str]:
     return set(_LINKEDIN_JID_RE.findall(text or ""))
+
+
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def _canonical_match_url(value: str) -> str | None:
+    """Normalize transport noise while preserving path and query for exact evidence."""
+    try:
+        parsed = urlsplit((value or "").strip().rstrip(".,;:!?)]}>"))
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    query = parsed.query[:-1] if parsed.query.endswith("/") else parsed.query
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/") or "/",
+            query,
+            "",
+        )
+    )
+
+
+def _exact_job_url_match(text: str, jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    email_urls = {
+        canonical
+        for raw in _HTTP_URL_RE.findall(text or "")
+        if (canonical := _canonical_match_url(raw)) is not None
+    }
+    if not email_urls:
+        return None
+    for job in jobs:
+        for key in ("url", "application_url"):
+            canonical = _canonical_match_url(job.get(key) or "")
+            if canonical and canonical in email_urls:
+                return job
+    return None
 
 
 def _extract_title_from_subject(subject: str) -> str | None:
@@ -730,6 +762,12 @@ def _match_tiers(
             jids = _linkedin_job_ids((job.get("url") or "") + " " + (job.get("application_url") or ""))
             if jids & email_jids:
                 return job, "linkedin_job_id", 1.0
+
+    # 0c. Exact URL from the email -> the queued job/application URL. This covers
+    # boards without a dedicated identifier parser and outranks fuzzy signals.
+    exact_job = _exact_job_url_match(subject + " " + body, jobs)
+    if exact_job is not None:
+        return exact_job, "exact_job_url", 1.0
 
     # Company hints from BOTH subject and body -- try each (a garbage subject hint must
     # not block the body hint).
@@ -921,7 +959,14 @@ def _get_text_body(payload: dict[str, Any]) -> str:
 
     if mime == "text/html" and data:
         raw = base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
-        return re.sub(r"<[^>]+>", " ", raw)
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(raw, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor.get("href") or "").strip()
+            if href.lower().startswith(("http://", "https://")) and href not in anchor.get_text(" "):
+                anchor.append(f" {href} ")
+        return soup.get_text(" ")
 
     plain, html = "", ""
     for part in payload.get("parts", []):

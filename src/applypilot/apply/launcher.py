@@ -18,9 +18,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit
 
 from rich.console import Console
 from rich.live import Live
@@ -28,13 +31,24 @@ from rich.live import Live
 from applypilot import config
 from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
+from applypilot.ats_domains import ATS_SENDER_DOMAINS
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
 from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
+    reset_worker_dir, cleanup_on_exit,
     BASE_CDP_PORT,
+)
+from applypilot.apply.process_guard import (
+    SpawnedChildGuard,
+    emergency_cleanup_direct_child,
+)
+from applypilot.apply.lifecycle_fault import (
+    LifecycleHardFault,
+    enforce_no_lifecycle_faults,
+    persist_lifecycle_hard_fault,
+    require_browser_cleanup,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
@@ -46,7 +60,7 @@ logger = logging.getLogger(__name__)
 _FLEET_LI_KEY = "applypilot:linkedin_driver"
 
 
-def fleet_linkedin_active(pg_dsn: str | None) -> bool:
+def fleet_linkedin_active(pg_dsn: str | None) -> bool | None:
     """Probe whether the fleet LinkedIn driver holds the advisory interlock.
 
     Opens a transient connection to the fleet PG and attempts
@@ -56,9 +70,8 @@ def fleet_linkedin_active(pg_dsn: str | None) -> bool:
       holds it) → returns **True** (fleet is active; supervised must defer).
     * If the try-lock returns TRUE (we acquired it) → immediately unlocks
       (non-destructive probe, never leaves the lock held) and returns **False**.
-    * Any error (missing/unreachable fleet PG, connect failure, etc.) →
-      returns **False** so a probe failure never crashes the supervised run.
-      The runbook is the backstop for that edge.
+    * Any error with a configured fleet PG returns ``None`` (unknown), which callers
+      must treat as active so LinkedIn ownership fails closed.
     """
     if not pg_dsn:
         return False
@@ -87,7 +100,7 @@ def fleet_linkedin_active(pg_dsn: str | None) -> bool:
             return True
     except Exception:
         logger.debug("fleet_linkedin_active probe failed", exc_info=True)
-        return False
+        return None
     finally:
         if conn is not None:
             try:
@@ -176,11 +189,373 @@ _stop_event = threading.Event()
 
 # Track active apply-agent processes for skip (Ctrl+C) handling
 _agent_procs: dict[int, subprocess.Popen] = {}
+_agent_guards: dict[int, SpawnedChildGuard] = {}
 # Last apply-agent run stats per worker (cost_usd / tokens). run_job records cost to the
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
+INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
+MAX_INBOX_AUTH_HINT_BYTES = 64 * 1024
+_AUTH_SECRET_MATERIAL_MULTIPLIER = 128
+_MIN_AUTH_SECRET_MATERIAL_BYTES = 4096
+_AUTH_SECRET_WORK_MULTIPLIER = 64
+_MIN_AUTH_SECRET_WORK_BYTES = 4096
+
+
+class _InboxAuthHintRejected(ValueError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _secret_material_budget(value: str) -> int:
+    input_bytes = len(value.encode("utf-8", errors="strict"))
+    return max(
+        _MIN_AUTH_SECRET_MATERIAL_BYTES,
+        input_bytes * _AUTH_SECRET_MATERIAL_MULTIPLIER,
+    )
+
+
+def _percent_escape_case(value: str, *, upper: bool) -> str:
+    def replace(match: re.Match) -> str:
+        digits = match.group(1)
+        return "%" + (digits.upper() if upper else digits.lower())
+
+    return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
+
+
+def _progressive_percent_decode_layers(value: str) -> Iterator[str]:
+    current = value
+    while True:
+        yield current
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        if len(decoded) >= len(current):
+            raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+        current = decoded
+
+
+def _exact_secret_variants(value: str) -> tuple[str, ...]:
+    """Return every exact decode layer and its relevant encoded forms."""
+    if not value:
+        return ()
+    variants: dict[str, None] = {}
+    material_bytes = 0
+    material_budget = _secret_material_budget(value)
+
+    def add(candidate: str) -> None:
+        nonlocal material_bytes
+        if not candidate or candidate in variants:
+            return
+        candidate_bytes = len(candidate.encode("utf-8", errors="strict"))
+        material_bytes += candidate_bytes
+        if material_bytes > material_budget:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+        variants[candidate] = None
+
+    for current in _progressive_percent_decode_layers(value):
+        plus_spaced = current.replace("+", " ")
+        plus_decoded = unquote_plus(current)
+        for candidate in (current, plus_spaced, plus_decoded):
+            add(candidate)
+            add(_percent_escape_case(candidate, upper=True))
+            add(_percent_escape_case(candidate, upper=False))
+            add(quote(candidate, safe=""))
+            add(quote_plus(candidate, safe=""))
+    return tuple(variants)
+
+
+def _trusted_ats_host_suffix(hostname: str) -> str | None:
+    matches = [
+        domain
+        for domain in ATS_SENDER_DOMAINS
+        if hostname == domain or hostname.endswith(f".{domain}")
+    ]
+    return max(matches, key=lambda domain: (domain.count("."), len(domain))) if matches else None
+
+
+def _raw_url_port(netloc: str) -> str | None:
+    authority = netloc.rpartition("@")[2]
+    if authority.startswith("["):
+        bracket = authority.find("]")
+        if bracket < 0 or authority[bracket + 1:bracket + 2] != ":":
+            return None
+        return authority[bracket + 2:] or None
+    _host, separator, port = authority.rpartition(":")
+    return port if separator and port else None
+
+
+def _decode_url_structural_delimiters(value: str) -> str:
+    delimiters = frozenset(":/?#@;&=\\")
+
+    def replace(match: re.Match) -> str:
+        decoded = chr(int(match.group(1), 16))
+        return decoded if decoded in delimiters else match.group(0)
+
+    return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
+
+
+def _magic_link_secrets(url: str) -> set[str]:
+    url_bytes = len(url.encode("utf-8", errors="strict"))
+    if url_bytes > MAX_INBOX_AUTH_HINT_BYTES:
+        raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
+    secrets: set[str] = set()
+    derived: set[str] = set()
+    pending: deque[str] = deque()
+    material_bytes = 0
+    material_budget = _secret_material_budget(url)
+    work_bytes = 0
+    work_budget = max(
+        _MIN_AUTH_SECRET_WORK_BYTES,
+        url_bytes * _AUTH_SECRET_WORK_MULTIPLIER,
+    )
+
+    def add_secret(value: str) -> None:
+        nonlocal material_bytes
+        if not value:
+            return
+        plus_spaced = value.replace("+", " ")
+        plus_decoded = unquote_plus(value)
+        candidates = (value, plus_spaced, plus_decoded)
+        variants = (
+            candidate_variant
+            for candidate in candidates
+            for candidate_variant in (
+                candidate,
+                _percent_escape_case(candidate, upper=True),
+                _percent_escape_case(candidate, upper=False),
+                quote(candidate, safe=""),
+                quote_plus(candidate, safe=""),
+            )
+        )
+        for variant in variants:
+            if not variant:
+                continue
+            if variant in secrets:
+                continue
+            material_bytes += len(variant.encode("utf-8", errors="strict"))
+            if material_bytes > material_budget:
+                raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+            secrets.add(variant)
+
+    def derive(value: str) -> None:
+        nonlocal work_bytes
+        if not value or value in derived:
+            return
+        work_bytes += len(value.encode("utf-8", errors="strict"))
+        if work_bytes > work_budget:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+        derived.add(value)
+        add_secret(value)
+        pending.append(value)
+
+    def derive_parameter(token: str) -> None:
+        raw_key, separator, raw_value = token.partition("=")
+        if not separator:
+            derive(token)
+            return
+        derive(raw_key)
+        derive(raw_value)
+
+    def derive_json(value: str) -> None:
+        stripped = value.strip()
+        if not stripped.startswith(("{", "[")):
+            return
+        try:
+            parsed_json = json.loads(
+                stripped,
+                parse_int=str,
+                parse_float=str,
+                parse_constant=str,
+            )
+        except json.JSONDecodeError:
+            return
+        except RecursionError as exc:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex") from exc
+
+        containers = [parsed_json]
+        while containers:
+            item = containers.pop()
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    derive(key)
+                    containers.append(child)
+            elif isinstance(item, list):
+                containers.extend(item)
+            elif isinstance(item, str):
+                derive(item)
+
+    derive(url)
+    while pending:
+        current = pending.popleft()
+        decoded = unquote(current)
+        if decoded != current:
+            if len(decoded) >= len(current):
+                raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+            derive(decoded)
+        form_decoded = unquote_plus(current)
+        if form_decoded != current:
+            derive(form_decoded)
+        derive(_decode_url_structural_delimiters(current))
+        derive_json(current)
+
+        parsed = urlsplit(current)
+
+        raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
+        if separator:
+            username, password_separator, password = raw_userinfo.partition(":")
+            derive(username)
+            if password_separator:
+                derive(password)
+        derive(_raw_url_port(parsed.netloc) or "")
+
+        hostname = parsed.hostname or ""
+        trusted_suffix = _trusted_ats_host_suffix(hostname)
+        if trusted_suffix and hostname == trusted_suffix:
+            secret_hostname = ""
+        elif trusted_suffix and hostname.endswith(f".{trusted_suffix}"):
+            prefix = hostname[: -(len(trusted_suffix) + 1)]
+            secret_hostname = prefix
+        else:
+            secret_hostname = hostname
+        for label in secret_hostname.split("."):
+            derive(label)
+
+        derive(parsed.query)
+        derive(parsed.fragment)
+        query_components = [parsed.query, parsed.fragment]
+        if not any((parsed.scheme, parsed.netloc, parsed.query, parsed.fragment)):
+            query_components.append(current)
+        for component in query_components:
+            if "=" not in component and not re.search(r"[&;]", component):
+                continue
+            for token in re.split(r"[&;]", component):
+                derive_parameter(token)
+
+        for segment in re.split(r"[/\\]", parsed.path):
+            if not segment:
+                continue
+            path_value, *matrix_tokens = segment.split(";")
+            derive(path_value)
+            for token in matrix_tokens:
+                derive_parameter(token)
+    return secrets
+
+
+def _inbox_auth_hint_secrets(hint: str) -> set[str]:
+    secrets: set[str] = set()
+    material_bytes = 0
+    # Bound both whole-hint variants and the independently bounded credential graph.
+    material_budget = _secret_material_budget(hint) * 2
+
+    def add_many(values) -> None:
+        nonlocal material_bytes
+        for value in values:
+            if not value or value in secrets:
+                continue
+            material_bytes += len(value.encode("utf-8", errors="strict"))
+            if material_bytes > material_budget:
+                raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+            secrets.add(value)
+
+    add_many(_exact_secret_variants(hint))
+    for hint_layer in _progressive_percent_decode_layers(hint):
+        for line in hint_layer.splitlines():
+            key, separator, value = line.partition("=")
+            normalized_key = key.strip().lower()
+            if not separator or normalized_key not in {"code", "magic_link"}:
+                continue
+            credential = value.strip()
+            add_many(_exact_secret_variants(credential))
+            if normalized_key == "magic_link":
+                add_many(_magic_link_secrets(credential))
+    return secrets
+
+
+def _validate_inbox_auth_hint(hint: str | None) -> str | None:
+    if hint is None:
+        return None
+    if not isinstance(hint, str):
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid")
+    try:
+        hint_bytes = len(hint.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as exc:
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    if hint_bytes > MAX_INBOX_AUTH_HINT_BYTES:
+        raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
+    try:
+        _inbox_auth_hint_secrets(hint)
+    except _InboxAuthHintRejected:
+        raise
+    except (UnicodeError, ValueError) as exc:
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    return hint
+
+
+def _replace_exact_secret(text: str, secret: str) -> str:
+    if len(secret) < 6 and secret.isalnum():
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(secret)}(?![A-Za-z0-9])"
+        return re.sub(pattern, INBOX_AUTH_REDACTION, text)
+    return text.replace(secret, INBOX_AUTH_REDACTION)
+
+
+def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
+    """Remove prompt-only inbox credentials before text reaches durable sinks."""
+    if not text or not hint:
+        return text
+    secrets = _inbox_auth_hint_secrets(hint)
+    redacted = text
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            redacted = _replace_exact_secret(redacted, secret)
+    return redacted
 _agent_lock = threading.Lock()
+
+
+def _terminate_agent_child(
+    worker_id: int,
+    process: subprocess.Popen,
+    guard: SpawnedChildGuard | None,
+    reason: str,
+) -> bool:
+    try:
+        if process.poll() is not None:
+            if guard is not None:
+                guard.release()
+            return True
+        if guard is None:
+            raise RuntimeError("stable child guard missing")
+        cleaned = guard.terminate_and_reap()
+    except Exception as exc:
+        persist_lifecycle_hard_fault(
+            f"agent {reason} cleanup exception",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(f"agent {reason} cleanup could not be proven") from exc
+    if not cleaned:
+        persist_lifecycle_hard_fault(
+            f"agent {reason} cleanup unproven",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(f"agent {reason} cleanup could not be proven")
+    return True
+
+
+def _acquire_agent_child_guard(process: subprocess.Popen) -> SpawnedChildGuard:
+    guard = SpawnedChildGuard.acquire(process)
+    if guard is not None:
+        return guard
+    cleaned = emergency_cleanup_direct_child(process)
+    if not cleaned:
+        persist_lifecycle_hard_fault(
+            "agent spawn guard unavailable cleanup uncertain",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(
+            "stable agent child guard unavailable; direct child cleanup uncertain"
+        )
+    raise RuntimeError("stable agent child guard unavailable; direct child reaped")
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -242,6 +617,16 @@ def _codex_effective_model(model: str | None) -> str | None:
     if model and model.strip().lower() not in _CLAUDE_MODEL_TIERS:
         return model
     return None
+
+
+def effective_agent_model_label(agent: str, model: str | None) -> str:
+    """Return the model identity actually selected by the agent launcher."""
+    normalized = _normalize_agent(agent)
+    if normalized == "claude":
+        return model or "sonnet"
+    # A Claude tier is deliberately omitted from the Codex command. In that case
+    # the CLI selects its configured default, whose concrete name is not exposed.
+    return _codex_effective_model(model) or "codex-default"
 
 
 def _codex_model_args(model: str | None) -> list[str]:
@@ -951,6 +1336,23 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     and not assisted
                     and config.is_auth_gated_application(apply_url)
                     and not _tenant_bypasses_auth_gate(conn, apply_url)):
+                # Deduplication is a stronger no-submit decision than the auth
+                # classification. An auth-gated repost should be deferred as a
+                # near duplicate instead of being mislabeled auth_required.
+                if not target_url and NEAR_DUP_JACCARD > 0:
+                    _dup_of = _find_near_duplicate_applied(
+                        conn, apply_url, row["title"] or "", row["company"]
+                    )
+                    if _dup_of:
+                        conn.execute(
+                            "UPDATE jobs SET apply_status = 'deferred', "
+                            "apply_error = 'near_duplicate_role' WHERE url = ?",
+                            (row["url"],),
+                        )
+                        conn.commit()
+                        logger.info("Skipping near-duplicate of applied '%s': %s",
+                                    _dup_of[:40], (row["title"] or "")[:40])
+                        continue
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'auth_required', apply_error = 'auth_gate', "
                     "apply_attempts = 99 WHERE url = ?",
@@ -1397,6 +1799,154 @@ def _no_result_status(transcript: str | None, tool_calls: int) -> str:
     return "failed:no_result_line"
 
 
+_TERMINAL_RESULT_RE = re.compile(
+    r"RESULT:(APPLIED|EXPIRED|CAPTCHA|LOGIN_ISSUE|AUTH_REQUIRED|DRY_RUN|FAILED)(?::(.+))?",
+    re.IGNORECASE,
+)
+
+
+def _normalize_failure_reason(value: str | None) -> str:
+    reason = str(value or "").strip().strip('*`"').strip().lower()
+    if not reason or reason in {"reason", "unknown", "failure", "failed"}:
+        return "unspecified"
+    return reason
+
+
+def _parse_terminal_result(text: str | None) -> str | None:
+    """Return the last valid standalone RESULT line from agent output.
+
+    Agent narrative and page content can mention strings such as ``RESULT:APPLIED``.
+    Only a line consisting entirely of a supported result code, with optional common
+    markdown wrappers, is authoritative.
+    """
+    if not text:
+        return None
+
+    parsed: str | None = None
+    for line in text.splitlines():
+        candidate = line.strip().strip('*`"').strip()
+        match = _TERMINAL_RESULT_RE.fullmatch(candidate)
+        if not match:
+            continue
+
+        result_code = match.group(1).upper()
+        if result_code == "FAILED":
+            parsed = f"failed:{_normalize_failure_reason(match.group(2))}"
+        else:
+            parsed = result_code.lower()
+    return parsed
+
+
+def _parse_terminal_result_detail(text: str | None) -> str | None:
+    """Return the authoritative RESULT code while retaining its reason suffix."""
+    if not text:
+        return None
+    parsed: str | None = None
+    for line in text.splitlines():
+        candidate = line.strip().strip('*`"').strip()
+        match = _TERMINAL_RESULT_RE.fullmatch(candidate)
+        if not match:
+            continue
+        code = match.group(1).lower()
+        reason = (match.group(2) or "").strip().strip('*`"').strip().lower()
+        parsed = f"failed:{_normalize_failure_reason(reason)}" if code == "failed" else (
+            f"{code}:{reason}" if reason else code
+        )
+    return parsed
+
+
+class _ExecutionEvidence:
+    """Collect bounded, factual execution metadata without affecting control flow."""
+
+    _WORKDAY_STEPS = (
+        ("confirmation", ("thank you", "application submitted", "confirmation")),
+        ("submit", ("submit application", "submit")),
+        ("review", ("review",)),
+        ("self_id", ("self-identification", "self identification", "demographic")),
+        ("disclosures", ("disclosure", "terms and conditions")),
+        ("questions", ("application question", "questionnaire")),
+        ("experience", ("work experience", "education", "resume")),
+        ("personal_information", ("personal information", "contact information")),
+        ("login", ("sign in", "create account", "login")),
+    )
+
+    def __init__(self, started_at: float) -> None:
+        self.started_at = started_at
+        self.last_at = started_at
+        self.last_action = "starting"
+        self.workday_step: str | None = None
+        self.is_workday = False
+        self.submit_clicked = False
+        self.timeline: list[dict] = []
+        self.phase_durations_ms: dict[str, int] = {}
+        self.current_phase = "startup"
+
+    def _phase_for(self, text: str) -> str:
+        low = text.lower()
+        if any(word in low for word in ("confirm", "thank you", "submitted")):
+            return "confirmation"
+        if any(word in low for word in ("submit", "click", "fill", "type", "select", "upload")):
+            return "form_fill"
+        if any(word in low for word in ("login", "sign in", "account", "verification", "otp")):
+            return "authentication"
+        return "navigation"
+
+    def note_action(self, tool: str, description: str, raw_text: str = "") -> None:
+        now = time.monotonic()
+        elapsed_ms = max(0, int((now - self.last_at) * 1000))
+        self.phase_durations_ms[self.current_phase] = (
+            self.phase_durations_ms.get(self.current_phase, 0) + elapsed_ms
+        )
+        combined = f"{description} {raw_text}".strip()
+        self.current_phase = self._phase_for(combined)
+        self.last_at = now
+        self.last_action = description[:200]
+        low = combined.lower()
+        self.is_workday = self.is_workday or "workday" in low
+        if self.is_workday:
+            for step, markers in self._WORKDAY_STEPS:
+                if any(marker in low for marker in markers):
+                    self.workday_step = step
+                    break
+        if "click" in tool.lower() and any(
+            marker in low for marker in ("submit application", "submit my application", "submit")
+        ):
+            self.submit_clicked = True
+        if len(self.timeline) < 50:
+            self.timeline.append({
+                "at_ms": max(0, int((now - self.started_at) * 1000)),
+                "phase": self.current_phase,
+                "tool": tool[:100],
+                "action": self.last_action,
+            })
+
+    def snapshot(self, *, cost_usd: float, terminal_status: str | None) -> dict:
+        now = time.monotonic()
+        durations = dict(self.phase_durations_ms)
+        durations[self.current_phase] = durations.get(self.current_phase, 0) + max(
+            0, int((now - self.last_at) * 1000)
+        )
+        confirmations = []
+        if terminal_status == "applied":
+            confirmations.append({
+                "kind": "agent_terminal_result",
+                "authoritative": False,
+                "status": "applied",
+            })
+        return {
+            "schema_version": 1,
+            "terminal_status": terminal_status,
+            "last_action": self.last_action,
+            "workday_step": self.workday_step,
+            "submit_clicked": self.submit_clicked,
+            "confirmation_evidence": confirmations,
+            "phase_durations_ms": durations,
+            "phase_costs_usd": {"agent_execution": round(float(cost_usd or 0), 6)},
+            "cost_allocation": "aggregate_only",
+            "action_timeline": list(self.timeline),
+        }
+
+
 def is_usage_limit_result(status: str | None) -> bool:
     """True if a run_job status is the retryable usage/quota-wall outcome. Consumed by the
     fleet worker to RE-QUEUE (vs crash_unconfirmed) and to back off when walls repeat."""
@@ -1458,7 +2008,20 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
             finally:
                 page.close()
     except Exception:
-        logger.debug("greenhouse adapter failed (non-fatal); agent proceeds", exc_info=True)
+        # If submit was attempted, the adapter owns ambiguity. Even a page-close or
+        # post-click browser error must never release this job to a second submitter.
+        report = (res or {}).get("report") if isinstance(res, dict) else None
+        if own and report is not None and getattr(report, "submit_attempted", False):
+            duration_ms = int((time.time() - t0) * 1000)
+            status = (res or {}).get("status", "failed:no_confirmation")
+            logger.warning(
+                "greenhouse adapter retained submit ownership after browser error for %s -> %s",
+                url,
+                status,
+                exc_info=True,
+            )
+            return (status, duration_ms)
+        logger.debug("greenhouse adapter failed before submit; agent proceeds", exc_info=True)
         return None
 
     if not res or res.get("route") != "deterministic":
@@ -1477,7 +2040,64 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
     return (status, duration_ms)
 
 
-def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) -> None:
+def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
+                       resume_text: str, resume_path) -> tuple[str, int] | None:
+    """Opt-in deterministic Ashby path with sticky post-submit ownership."""
+    try:
+        from applypilot.apply.ashby_adapter import (
+            adapter_enabled, apply_ashby, parse_ashby_url, submit_enabled,
+        )
+    except Exception:
+        return None
+    if not adapter_enabled():
+        return None
+    url = job.get("application_url") or job.get("url") or ""
+    if not parse_ashby_url(url):
+        return None
+    own = submit_enabled() and not dry_run
+    started = time.time()
+    res = None
+    try:
+        from playwright.sync_api import sync_playwright
+        profile = config.load_profile()
+        pdf = str(Path(resume_path).with_suffix(".pdf")) if resume_path else None
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+            try:
+                apply_url = url.rstrip("/")
+                if not apply_url.endswith("/application"):
+                    apply_url += "/application"
+                page.goto(apply_url, wait_until="domcontentloaded", timeout=30000)
+                res = apply_ashby(
+                    url, page=page, profile=profile, resume_text=resume_text,
+                    resume_path=pdf, dry_run=not own,
+                )
+            finally:
+                page.close()
+    except Exception:
+        if own and isinstance(res, dict) and res.get("submit_attempted"):
+            status = res.get("status", "failed:no_confirmation")
+            logger.warning("ashby adapter retained submit ownership after browser error for %s -> %s",
+                           url, status, exc_info=True)
+            return status, int((time.time() - started) * 1000)
+        logger.debug("ashby adapter failed before submit; agent proceeds", exc_info=True)
+        return None
+    if not res or res.get("route") != "deterministic":
+        logger.info("ashby adapter routed to exception/fallback: route=%s unmapped=%s",
+                    (res or {}).get("route"), (res or {}).get("unmapped"))
+        return None
+    if not own:
+        logger.info("ashby shadow OK: ready=%s", res.get("ready"))
+        return None
+    status = res.get("status", "failed:no_confirmation")
+    logger.info("ashby adapter OWNED submit for %s -> %s", url, status)
+    return status, int((time.time() - started) * 1000)
+
+
+def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path,
+                        dry_run: bool = False) -> tuple[str, int] | None:
     """Opt-in SHADOW validation of the deterministic Lever adapter.
 
     Lever's submit is hCaptcha-gated, so the adapter never owns submission: this
@@ -1490,6 +2110,8 @@ def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) 
         from applypilot.apply.greenhouse_submit import adapter_enabled, execute_form
         from applypilot.apply.lever_adapter import (
             build_lever_plan,
+            decide_bounded_route,
+            detect_captcha_boundary,
             discover_fields,
             parse_lever_url,
             plan_lever_form_actions,
@@ -1501,6 +2123,11 @@ def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) 
     url = job.get("application_url") or job.get("url") or ""
     if not parse_lever_url(url):
         return
+    bounded = os.environ.get("APPLYPILOT_LEVER_BOUNDED_PATH", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    started = time.time()
+    decision = None
     try:
         from playwright.sync_api import sync_playwright
         profile = config.load_profile()
@@ -1516,12 +2143,25 @@ def _maybe_lever_shadow(job: dict, port: int, *, resume_text: str, resume_path) 
                                         job={"site": job.get("site", "")})
                 execute_form(plan_lever_form_actions(plan, fields, resume_path=pdf),
                              page, dry_run=True)
+                decision = decide_bounded_route(
+                    plan, captcha_present=detect_captcha_boundary(page)
+                )
                 logger.info("lever shadow: fields=%d ready=%s free_text=%s unmapped=%s",
                             len(fields), plan.ready, list(plan.free_text), plan.unmapped_required)
             finally:
                 page.close()
     except Exception:
+        if bounded and not dry_run:
+            logger.warning("lever bounded pre-submit path failed; parking", exc_info=True)
+            return "failed:lever_preflight", int((time.time() - started) * 1000)
         logger.debug("lever shadow failed (non-fatal); agent proceeds", exc_info=True)
+        return None
+    if not bounded or dry_run or decision is None:
+        return None
+    route, reason = decision
+    status = "captcha" if reason == "captcha" else f"failed:{reason}"
+    logger.info("lever bounded route=%s reason=%s; agent skipped", route, reason)
+    return status, int((time.time() - started) * 1000)
 
 
 def run_job(job: dict, port: int, worker_id: int = 0,
@@ -1570,6 +2210,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
     wrapper, not the run itself)."""
+    try:
+        inbox_auth_hint = _validate_inbox_auth_hint(inbox_auth_hint)
+    except _InboxAuthHintRejected as exc:
+        logger.warning("Rejected inbox auth hint: %s", exc.reason)
+        return f"failed:{exc.reason}", 0
+
     # Read tailored resume text
     resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -1584,7 +2230,15 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         resume_text=resume_text, resume_path=resume_path)
     if gh_result is not None:
         return gh_result
-    _maybe_lever_shadow(job, port, resume_text=resume_text, resume_path=resume_path)
+    ashby_result = _maybe_ashby_apply(job, port, dry_run=dry_run,
+                                     resume_text=resume_text, resume_path=resume_path)
+    if ashby_result is not None:
+        return ashby_result
+    lever_result = _maybe_lever_shadow(
+        job, port, resume_text=resume_text, resume_path=resume_path, dry_run=dry_run
+    )
+    if lever_result is not None:
+        return lever_result
 
     # Reset the worker's isolated working directory FIRST. build_prompt stages
     # upload files under worker-{id}/current and reset_worker_dir wipes
@@ -1600,6 +2254,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         worker_id=worker_id,
         inbox_auth_hint=inbox_auth_hint,
     )
+    def redact_persistent(text) -> str:
+        return _redact_inbox_auth_secrets(str(text), inbox_auth_hint)
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
@@ -1640,8 +2296,29 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     start = time.time()
     stats: dict = {}
     proc = None
+    guard = None
+    execution_evidence = _ExecutionEvidence(time.monotonic())
+
+    def _record_run_stats(*, transcript: str, job_log_path: str | None,
+                          application_tool_calls: int, final_result_source: str,
+                          terminal_status: str | None = None) -> None:
+        run_stats = dict(stats) if stats else {}
+        run_stats["transcript"] = transcript[-20000:]
+        run_stats["job_log"] = job_log_path
+        run_stats["job_log_path"] = job_log_path
+        run_stats["application_tool_calls"] = application_tool_calls
+        run_stats["transcript_digest"] = (
+            "sha256:" + hashlib.sha256(transcript.encode("utf-8", errors="replace")).hexdigest()
+        )
+        run_stats["final_result_source"] = final_result_source
+        run_stats["result_metadata"] = execution_evidence.snapshot(
+            cost_usd=float(run_stats.get("cost_usd") or 0),
+            terminal_status=terminal_status,
+        )
+        _last_run_stats[worker_id] = run_stats
 
     try:
+        enforce_no_lifecycle_faults()
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1653,8 +2330,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
+        guard = _acquire_agent_child_guard(proc)
         with _agent_lock:
             _agent_procs[worker_id] = proc
+            _agent_guards[worker_id] = guard
 
         text_parts: list[str] = []
         final_result_text: list[str] = []  # text from the final 'result' message
@@ -1666,7 +2345,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         application_tool_calls = [0]
 
         def _note_terminal_result(text: str | None) -> None:
-            if text and "RESULT:" in text:
+            if _parse_terminal_result(text) is not None:
                 terminal_result_seen.set()
 
         def _consume_stream() -> None:
@@ -1691,7 +2370,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                 if bt == "text":
                                     text_parts.append(block["text"])
                                     _note_terminal_result(block["text"])
-                                    lf.write(block["text"] + "\n")
+                                    lf.write(redact_persistent(block["text"]) + "\n")
                                 elif bt == "tool_use":
                                     name = (
                                         block.get("name", "")
@@ -1702,9 +2381,13 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         application_tool_calls[0] += 1
                                     inp = block.get("input", {})
                                     if "url" in inp:
-                                        desc = f"{name} {inp['url'][:60]}"
+                                        safe_url = redact_persistent(inp["url"])
+                                        desc = f"{name} {safe_url[:60]}"
                                     elif "ref" in inp:
-                                        desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
+                                        detail = redact_persistent(
+                                            inp.get("element", inp.get("text", ""))
+                                        )
+                                        desc = f"{name} {detail}"[:50]
                                     elif "fields" in inp:
                                         desc = f"{name} ({len(inp['fields'])} fields)"
                                     elif "paths" in inp:
@@ -1712,12 +2395,19 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     else:
                                         desc = name
 
+                                    execution_evidence.note_action(name, desc, json.dumps(inp, default=str))
+                                    desc = redact_persistent(desc)
                                     lf.write(f"  >> {desc}\n")
                                     ws = get_state(worker_id)
                                     cur_actions = ws.actions if ws else 0
+                                    last_action = (
+                                        INBOX_AUTH_REDACTION
+                                        if INBOX_AUTH_REDACTION in desc
+                                        else desc[:35]
+                                    )
                                     update_state(worker_id,
                                                  actions=cur_actions + 1,
-                                                 last_action=desc[:35])
+                                                 last_action=last_action)
                         elif msg_type == "result":
                             stats_holder.update({
                                 "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
@@ -1742,17 +2432,24 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     _note_terminal_result(text)
                                     final_result_text.clear()
                                     final_result_text.append(text)
-                                    lf.write(text + "\n")
+                                    lf.write(redact_persistent(text) + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
                                 name = item.get("name") or item.get("tool_name") or item_type
                                 if _tool_call_touches_application(str(name)):
                                     application_tool_calls[0] += 1
-                                lf.write(f"  >> {name}\n")
+                                execution_evidence.note_action(str(name), str(name), json.dumps(item, default=str))
+                                safe_name = redact_persistent(str(name))
+                                lf.write(f"  >> {safe_name}\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
+                                last_action = (
+                                    INBOX_AUTH_REDACTION
+                                    if INBOX_AUTH_REDACTION in safe_name
+                                    else safe_name[:35]
+                                )
                                 update_state(worker_id,
                                              actions=cur_actions + 1,
-                                             last_action=str(name)[:35])
+                                             last_action=last_action)
                         elif msg_type == "turn.completed":
                             usage = msg.get("usage", {})
                             stats_holder.update({
@@ -1771,11 +2468,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             # into a logged, diagnosable reason.
                             err = msg.get("message") or msg.get("error") or line
                             text_parts.append(str(err))
-                            lf.write(str(err) + "\n")
+                            lf.write(redact_persistent(str(err)) + "\n")
                     except json.JSONDecodeError:
                         text_parts.append(line)
                         _note_terminal_result(line)
-                        lf.write(line + "\n")
+                        lf.write(redact_persistent(line) + "\n")
 
         # Start reading BEFORE writing the prompt so a large prompt can't deadlock
         # against a full stdout pipe.
@@ -1807,55 +2504,68 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             if terminal_result_seen.wait(timeout=min(1.0, remaining)):
                 reader.join(timeout=float(os.environ.get("APPLYPILOT_TERMINAL_RESULT_GRACE_SECONDS") or 5))
                 if reader.is_alive():
-                    _kill_process_tree(proc.pid)
+                    _terminate_agent_child(worker_id, proc, guard, "terminal-result-grace")
                     reader.join(timeout=15)
                 break
         if reader.is_alive():
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "reader-timeout")
             reader.join(timeout=15)
             elapsed = int(time.time() - start)
             add_event(f"[W{worker_id}] TIMEOUT/hung ({elapsed}s)")
             update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
+            output = "\n".join(text_parts)
+            _record_run_stats(
+                transcript=output,
+                job_log_path=None,
+                application_tool_calls=application_tool_calls[0],
+                final_result_source="transcript",
+            )
             return "failed:timeout", int((time.time() - start) * 1000)
 
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "wait-timeout")
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
         returncode = proc.returncode
         stats = stats_holder
+        guard.release()
+        guard = None
         proc = None
 
         output = "\n".join(text_parts)
+        persisted_output = redact_persistent(output)
         # Prefer the agent's FINAL result message for the RESULT code; only fall
         # back to scanning the full transcript when the final message has none.
         # This stops a page that merely contains the literal text
         # "RESULT:APPLIED" from spoofing the outcome.
         final_text = "\n".join(t for t in final_result_text if t).strip()
-        result_source = final_text if "RESULT:" in final_text else output
+        parsed_status = _parse_terminal_result(final_text)
+        terminal_detail = _parse_terminal_result_detail(final_text)
+        final_result_source = "final_message"
+        if parsed_status is None:
+            parsed_status = _parse_terminal_result(output)
+            terminal_detail = _parse_terminal_result_detail(output)
+            final_result_source = "transcript"
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
-        if returncode and returncode < 0 and "RESULT:" not in result_source:
+        if returncode and returncode < 0 and parsed_status is None:
             return "skipped", duration_ms
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
-        run_stats = dict(stats) if stats else {}
-        run_stats["transcript"] = output[-20000:]
-        run_stats["job_log"] = str(job_log)
-        run_stats["job_log_path"] = str(job_log)
-        run_stats["application_tool_calls"] = application_tool_calls[0]
-        run_stats["transcript_digest"] = (
-            "sha256:" + hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
+        job_log.write_text(persisted_output, encoding="utf-8")
+        _record_run_stats(
+            transcript=persisted_output,
+            job_log_path=str(job_log),
+            application_tool_calls=application_tool_calls[0],
+            final_result_source=final_result_source,
+            terminal_status=terminal_detail or parsed_status,
         )
-        run_stats["final_result_source"] = "final_message" if final_text and "RESULT:" in final_text else "transcript"
-        _last_run_stats[worker_id] = run_stats
 
         if stats:
             cost = stats.get("cost_usd", 0)
@@ -1863,7 +2573,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
             # Persist the apply-agent's REAL per-job cost durably (stage='apply_agent').
-            # The agent runs via the claude CLI -- its cost is otherwise only kept in
+            # The selected agent's cost is otherwise only kept in
             # in-process worker state, which resets on every crash/restart. Recording it
             # to the durable llm_usage table lets the supervisor compute ACTUAL
             # cross-crash spend (snapshot-at-start delta) instead of estimating from
@@ -1872,7 +2582,9 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 try:
                     from applypilot.database import record_llm_usage
                     record_llm_usage(
-                        stage="apply_agent", model=model, provider="claude-cli",
+                        stage="apply_agent",
+                        model=effective_agent_model_label(agent, model),
+                        provider=f"{_normalize_agent(agent)}-cli",
                         usage={
                             "prompt_tokens": stats.get("input_tokens") or 0,
                             "completion_tokens": stats.get("output_tokens") or 0,
@@ -1884,43 +2596,33 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 except Exception:
                     logger.debug("apply-agent usage record failed", exc_info=True)
 
-        def _clean_reason(s: str) -> str:
-            return re.sub(r'[*`"]+$', '', s).strip()
-
         # Dry run: the agent reviewed/filled the form but intentionally did NOT
         # submit. Never let this be recorded as 'applied'.
-        if "RESULT:DRY_RUN" in result_source:
+        if parsed_status == "dry_run":
             add_event(f"[W{worker_id}] DRY-RUN OK ({elapsed}s): {job['title'][:30]}")
             update_state(worker_id, status="dry_run", last_action=f"DRY-RUN ({elapsed}s)")
             return "dry_run", duration_ms
 
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE", "AUTH_REQUIRED"]:
-            if f"RESULT:{result_status}" in result_source:
-                add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
-                             last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
+        for result_status in ["applied", "expired", "captcha", "login_issue", "auth_required"]:
+            if parsed_status == result_status:
+                result_label = result_status.upper()
+                add_event(f"[W{worker_id}] {result_label} ({elapsed}s): {job['title'][:30]}")
+                update_state(worker_id, status=result_status,
+                             last_action=f"{result_label} ({elapsed}s)")
+                return result_status, duration_ms
 
-        if "RESULT:FAILED" in result_source:
-            for out_line in result_source.split("\n"):
-                if "RESULT:FAILED" in out_line:
-                    reason = (
-                        out_line.split("RESULT:FAILED:")[-1].strip()
-                        if ":" in out_line[out_line.index("FAILED") + 6:]
-                        else "unknown"
-                    )
-                    reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue", "auth_required"}
-                    if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
-                        update_state(worker_id, status=reason,
-                                     last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
-                    add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
-                    update_state(worker_id, status="failed",
-                                 last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
+        if parsed_status and parsed_status.startswith("failed:"):
+            reason = redact_persistent(parsed_status.split(":", 1)[1])
+            promote_to_status = {"captcha", "expired", "login_issue", "auth_required"}
+            if reason in promote_to_status:
+                add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
+                update_state(worker_id, status=reason,
+                             last_action=f"{reason.upper()} ({elapsed}s)")
+                return reason, duration_ms
+            add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
+            update_state(worker_id, status="failed",
+                         last_action=f"FAILED: {reason[:25]}")
+            return parsed_status, duration_ms
 
         # No RESULT: line. Distinguish an agent usage/quota wall hit on turn 1 (no tool
         # calls -> the page was never touched -> RETRYABLE, re-queued upstream) from a
@@ -1942,14 +2644,17 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         return "failed:timeout", duration_ms
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
-        add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        safe_error = _redact_inbox_auth_secrets(str(e), inbox_auth_hint)
+        add_event(f"[W{worker_id}] ERROR: {safe_error[:40]}")
+        update_state(worker_id, status="failed", last_action=f"ERROR: {safe_error[:25]}")
+        return f"failed:{safe_error[:100]}", duration_ms
     finally:
         with _agent_lock:
             _agent_procs.pop(worker_id, None)
-        if proc is not None and proc.poll() is None:
-            _kill_process_tree(proc.pid)
+            _agent_guards.pop(worker_id, None)
+        active_fault = isinstance(sys.exc_info()[1], LifecycleHardFault)
+        if proc is not None and not active_fault:
+            _terminate_agent_child(worker_id, proc, guard, "finally")
 
 
 # ---------------------------------------------------------------------------
@@ -2088,10 +2793,13 @@ def _prearm_inbox_auth_request(job: dict) -> int | None:
         if not dsn:
             return None
         worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
-        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
-        agent_timeout = int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT", str(AGENT_TIMEOUT_SECONDS)))
-        postrun_timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or "45")
-        ttl_seconds = max(timeout, agent_timeout + postrun_timeout)
+        timeout = max(1, int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT") or 300))
+        agent_timeout = max(
+            1,
+            int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or AGENT_TIMEOUT_SECONDS),
+            AGENT_TIMEOUT_SECONDS,
+        )
+        ttl_seconds = agent_timeout + timeout
         apply_target = job.get("application_url") or job["url"]
         with pgqueue.connect(dsn) as conn:
             return otp_relay.request_code(
@@ -2170,14 +2878,8 @@ def _relay_inbox_auth_hint(job: dict) -> str | None:
 
 def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
     if match.candidate.kind == "magic_link":
-        return f"magic_link={match.candidate.value}\nreason={'; '.join(match.reasons)}"
-    return (
-        f"code={match.candidate.value}\n"
-        f"sender={match.sender}\n"
-        f"subject={match.subject}\n"
-        f"received_at={match.received_at or 'unknown'}\n"
-        f"reason={'; '.join(match.reasons)}"
-    )
+        return f"magic_link={match.candidate.value}"
+    return f"code={match.candidate.value}"
 
 
 def _poll_inbox_auth_hint(job: dict) -> str | None:
@@ -2199,7 +2901,11 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
         max_errors = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_ERRORS", "3"))
         minutes = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MINUTES", "15"))
-        max_messages = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "25"))
+        from applypilot.mail_source import validate_max_messages
+
+        max_messages = validate_max_messages(
+            os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "1000")
+        )
         challenge_type = os.environ.get("APPLYPILOT_INBOX_AUTH_CHALLENGE_TYPE", "email_code").strip().lower()
         if challenge_type not in {"email_code", "magic_link"}:
             logger.debug(
@@ -2207,6 +2913,7 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
                 challenge_type,
             )
             challenge_type = "email_code"
+        challenge_started_at = datetime.now(timezone.utc)
         challenge_id = inbox_auth.create_auth_challenge(
             job_url=job["url"],
             application_url=apply_target,
@@ -2217,33 +2924,24 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         inbox_auth.mark_auth_challenge_attempt(challenge_id, "polling")
         inbox_auth.expire_stale_challenges()
 
+        def claim_matches(matches: list[inbox_auth.AuthEmailMatch]):
+            return inbox_auth.claim_unique_auth_match(
+                challenge_id,
+                matches,
+            )
+
         match = inbox_auth.watch_gmail_for_auth_code(
             timeout_seconds=timeout,
             poll_seconds=poll,
             max_errors=max_errors,
             minutes=minutes,
             max_messages=max_messages,
+            not_before=challenge_started_at,
+            provider_domain=provider,
+            claim_matches=claim_matches,
         )
         if not match:
             return None
-        try:
-            event_id = inbox_auth.record_inbox_event(
-                message_id=match.message_id,
-                thread_id=match.thread_id,
-                sender=match.sender,
-                subject=match.subject,
-                event_type="auth_code",
-                confidence=match.candidate.confidence,
-                matched_job_url=job["url"],
-                matched_company=job.get("company"),
-                matched_method=match.candidate.kind,
-                snippet=match.snippet,
-                received_at=match.received_at,
-            )
-            inbox_auth.resolve_auth_challenge(challenge_id=challenge_id, inbox_event_id=event_id)
-        except Exception:
-            logger.debug("Failed to persist inbox auth event/challenge resolution", exc_info=True)
-
         return _format_inbox_auth_hint(match)
     except Exception:
         logger.debug("Inbox auth polling failed", exc_info=True)
@@ -2622,7 +3320,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             _fleet_dsn = os.environ.get("FLEET_PG_DSN")
             exclude_li = (
                 (not browser_li_ok) or _linkedin_halt.is_set()
-                or (bool(_fleet_dsn) and fleet_linkedin_active(_fleet_dsn))
+                or (
+                    bool(_fleet_dsn)
+                    and fleet_linkedin_active(_fleet_dsn) is not False
+                )
             )
             if not exclude_li:
                 try:
@@ -2787,6 +3488,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                         supervised=supervised,
                     )
 
+            cleanup_proc = chrome_proc
+            chrome_proc = None
+            require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
+
             # --auth-gated same-day halt: a challenge-class result means this
             # tenant hit a wall the agent can't solve unattended -- halt it
             # for the rest of the UTC day and keep applying to other hosts
@@ -2860,12 +3565,20 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 _update_host_breaker(job, ok=False, reason=reason, worker_id=worker_id)
 
         except KeyboardInterrupt:
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
             release_lock(job["url"])
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
             release_lock(job["url"])  # keeps the job retryable
@@ -2876,8 +3589,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             if _note_systemic_failure(job["url"]):
                 _trip_systemic_breaker(worker_id)
         finally:
-            if chrome_proc:
-                cleanup_worker(worker_id, chrome_proc)
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
 
         # Cost-budget guard: stop the whole run once accumulated apply cost hits
         # the cap (APPLYPILOT_APPLY_MAX_COST / --max-cost-usd; 0 = no cap). Read at
@@ -3077,15 +3792,17 @@ def main(limit: int = 1, target_url: str | None = None,
             # Kill all active apply-agent processes to skip current jobs
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+                    _terminate_agent_child(
+                        wid, cproc, _agent_guards.get(wid), "sigint-skip"
+                    )
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+                    _terminate_agent_child(
+                        wid, cproc, _agent_guards.get(wid), "sigint-stop"
+                    )
             kill_all_chrome()
             raise KeyboardInterrupt
 

@@ -72,6 +72,10 @@ _DISCOVERY_JS = r"""() => {
   return out;
 }"""
 
+_CAPTCHA_JS = r"""() => Boolean(
+  document.querySelector('iframe[src*="hcaptcha.com"], [data-hcaptcha-widget-id], .h-captcha')
+)"""
+
 
 def parse_lever_url(url: str) -> tuple[str, str] | None:
     """Return (site, posting_id) for a Lever job/apply URL, else None."""
@@ -113,12 +117,33 @@ def discover_fields(page) -> list[dict]:
     return normalize_fields(page.evaluate(_DISCOVERY_JS))
 
 
+def detect_captcha_boundary(page) -> bool:
+    """Return whether Lever has rendered its hCaptcha submit boundary."""
+    try:
+        return bool(page.evaluate(_CAPTCHA_JS))
+    except Exception:
+        # Unknown boundary state is not permission to launch an unbounded agent.
+        return True
+
+
+def decide_bounded_route(plan: AnswerPlan, *, captcha_present: bool) -> tuple[str, str]:
+    """Route after deterministic fill. No branch invokes a general-purpose agent."""
+    if not plan.ready:
+        return "exception", "unmapped_required"
+    if captcha_present:
+        return "exception", "captcha"
+    return "supervised_review", "submit_requires_supervision"
+
+
 def build_lever_plan(fields, *, profile, resume_text, corpus=None,
-                     answer_fn=None, job=None) -> AnswerPlan:
+                     answer_fn=None, job=None, budget=None) -> AnswerPlan:
     """Map discovered Lever fields into a deterministic AnswerPlan."""
-    if answer_fn is None:
-        from applypilot.apply.answerer import answer_question
-        answer_fn = answer_question
+    default_answerer = answer_fn is None
+    if default_answerer:
+        from applypilot.apply.answerer import answer_question_bounded
+        answer_fn = answer_question_bounded
+        from applypilot.apply.phase_budget import PhaseBudgetManager
+        budget = budget or PhaseBudgetManager()
 
     personal = (profile or {}).get("personal", {})
     work_auth = (profile or {}).get("work_authorization", {})
@@ -170,8 +195,17 @@ def build_lever_plan(fields, *, profile, resume_text, corpus=None,
                 out[name] = value
                 mapped = True
         elif ftype == "textarea":
-            res = answer_fn(label or "Additional information", job=job or {}, profile=profile,
-                            resume_text=resume_text, corpus=corpus, kind="open")
+            try:
+                res = answer_fn(
+                    label or "Additional information", job=job or {}, profile=profile,
+                    resume_text=resume_text, corpus=corpus, kind="open",
+                    **({"budget": budget} if default_answerer else {}),
+                )
+            except Exception as exc:
+                from applypilot.apply.phase_budget import PhaseBudgetExceeded
+                if not isinstance(exc, PhaseBudgetExceeded):
+                    raise
+                continue
             if getattr(res, "verified", False):
                 out[name] = res.text
                 free_text[name] = res.text

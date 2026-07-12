@@ -52,6 +52,7 @@ def test_apply_home_canary_and_approve_gate(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     from applypilot.apply import pgqueue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute("UPDATE fleet_config SET canary_enabled=FALSE, canary_remaining=NULL WHERE id=1")
         cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
                     "VALUES ('q1','http://x','9','queued','ats','x.com')")  # unapproved
         conn.commit()
@@ -71,6 +72,80 @@ def test_apply_home_canary_and_approve_gate(fleet_db):
         assert cur.fetchone()["canary_remaining"] == 3
         cur.execute("SELECT approved_batch FROM apply_queue WHERE url='q1'")
         assert cur.fetchone()["approved_batch"] == token
+
+
+def test_approve_refuses_zero_remaining_canary(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET ats_apply_mode='canary', canary_enabled=TRUE, "
+            "canary_remaining=0, paused=TRUE, ats_paused=FALSE WHERE id=1"
+        )
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('zero-canary','http://x','9','queued','ats','x.com')")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        try:
+            hm.approve(conn, all_pushed=True)
+            assert False, "approve must refuse when canary has no remaining capacity"
+        except SystemExit:
+            pass
+        with conn.cursor() as cur:
+            cur.execute("SELECT approved_batch FROM apply_queue WHERE url='zero-canary'")
+            assert cur.fetchone()["approved_batch"] is None
+
+
+def test_approve_all_pushed_respects_approval_threshold_and_canary_capacity(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET approval_threshold=7, ats_apply_mode='canary', "
+            "canary_enabled=TRUE, canary_remaining=1, paused=FALSE, ats_paused=FALSE WHERE id=1"
+        )
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('high','http://x/high','9','queued','ats','x.com')")
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('low','http://x/low','6.9','queued','ats','x.com')")
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('second-high','http://x/second','8','queued','ats','x.com')")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        token = hm.approve(conn, all_pushed=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT url, approved_batch FROM apply_queue ORDER BY url")
+            rows = {r["url"]: r["approved_batch"] for r in cur.fetchall()}
+
+    assert rows["high"] == token
+    assert rows["low"] is None
+    assert rows["second-high"] is None
+
+
+def test_approve_all_pushed_respects_operator_threshold_below_seven(fleet_db):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.apply import pgqueue
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fleet_config SET approval_threshold=6.5, ats_apply_mode='canary', "
+            "canary_enabled=TRUE, canary_remaining=2, paused=FALSE, ats_paused=FALSE WHERE id=1"
+        )
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('at-floor','http://x/floor','6.5','queued','ats','x.com')")
+        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain) "
+                    "VALUES ('below-floor','http://x/below','6.4','queued','ats','x.com')")
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        token = hm.approve(conn, all_pushed=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT url, approved_batch FROM apply_queue ORDER BY url")
+            rows = {r["url"]: r["approved_batch"] for r in cur.fetchall()}
+
+    assert rows["at-floor"] == token
+    assert rows["below-floor"] is None
 
 
 def test_two_consecutive_cycles_auto_approve(fleet_db):
@@ -247,6 +322,23 @@ def test_push_home_survives_inbox_outcomes_failure(fleet_db, tmp_path, monkeypat
         # Must not raise despite push_inbox_outcomes blowing up.
         n = hm.push_home(conn, sqlite_conn=sq, score_floor=7, limit=None)
     assert n == 0  # no eligible jobs staged; the point is it didn't raise
+
+
+def test_push_home_threads_explicit_approved_batch(fleet_db, monkeypatch):
+    from applypilot.fleet import apply_home_main as hm
+    from applypilot.fleet import sync
+
+    seen = {}
+
+    def _push(**kwargs):
+        seen["approved_batch"] = kwargs["approved_batch"]
+        return 0
+
+    monkeypatch.setattr(sync, "push_apply_eligible", _push)
+    monkeypatch.setattr(sync, "push_inbox_outcomes", lambda **kwargs: 0)
+    with pgqueue.connect(fleet_db) as conn:
+        assert hm.push_home(conn, approved_batch="human-2026-07-12") == 0
+    assert seen["approved_batch"] == "human-2026-07-12"
 
 
 def test_apply_home_resolve_challenge(fleet_db):

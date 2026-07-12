@@ -14,10 +14,10 @@ import os
 import time
 from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
-
 from applypilot.apply import pgqueue
 from applypilot.fleet import governor, heartbeat, queue
+
+logger = logging.getLogger(__name__)
 
 WATCHDOG_ID = "watchdog"
 WATCHDOG_ROLE = "watchdog"
@@ -111,6 +111,9 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
+    from applypilot.fleet import schema as fleet_schema
+    with pgqueue.connect(args.dsn) as schema_conn:
+        fleet_schema.ensure_schema_v3(schema_conn)
     cfg = WatchdogConfig(
         cadence_seconds=args.cadence,
         heartbeat_timeout=args.heartbeat_timeout,

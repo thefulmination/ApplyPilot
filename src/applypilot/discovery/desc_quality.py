@@ -42,7 +42,6 @@ def assess_description(title: str | None, full_description: str | None) -> tuple
     per-flag penalty, then floors at zero.
     """
     title_norm = _normalize_text(title or "")
-    desc_norm = (full_description or "").strip()
     desc_text = (full_description or "").strip()
 
     flags: list[str] = []

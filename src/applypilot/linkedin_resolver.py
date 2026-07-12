@@ -9,7 +9,7 @@ Apply workflows.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import os
 import random
@@ -21,6 +21,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from applypilot.apply.chrome import BASE_CDP_PORT, cleanup_worker, launch_chrome
+from applypilot.apply.lifecycle_fault import require_browser_cleanup
 from applypilot.aggregator_resolver import (
     is_external_apply_url,
     next_action_for_unresolved_kind,
@@ -91,6 +92,7 @@ class PageSnapshot:
     url: str
     text: str
     controls: tuple[ApplyControl, ...]
+    company_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,7 @@ class PageDecision:
     control: ApplyControl | None = None
     unresolved_kind: str | None = None
     next_action: str | None = None
+    company_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,10 +163,110 @@ def _snapshot_text_lower(snapshot: PageSnapshot) -> str:
     return (snapshot.text or "").lower()
 
 
+_COMPANY_HINT_BAD_EXACT = {
+    "about the job",
+    "apply",
+    "easy apply",
+    "employment type",
+    "full-time",
+    "hybrid",
+    "internship",
+    "job function",
+    "on-site",
+    "part-time",
+    "remote",
+    "save",
+    "seniority level",
+    "share",
+    "united states",
+}
+
+_COMPANY_HINT_BAD_TOKENS = (
+    " applicants",
+    " connections",
+    " employees",
+    " followers",
+    " promoted",
+    " reposted",
+    " views",
+    " weeks ago",
+    " week ago",
+    " days ago",
+    " day ago",
+    " hours ago",
+    " hour ago",
+    " minutes ago",
+    " minute ago",
+)
+
+_ROLE_LINE_TOKENS = (
+    "analyst",
+    "associate",
+    "chief of staff",
+    "director",
+    "engineer",
+    "gtm",
+    "head of",
+    "lead",
+    "manager",
+    "operations",
+    "principal",
+    "product",
+    "sales",
+    "senior",
+    "strategy",
+)
+
+
+def _clean_company_hint(value: str | None) -> str | None:
+    text = " ".join(str(value or "").replace("\xa0", " ").split()).strip(" -|•")
+    for separator in (" · ", " | ", " • "):
+        if separator in text:
+            text = text.split(separator, 1)[0].strip()
+    if not text or len(text) > 120:
+        return None
+    low = f" {text.lower()} "
+    if text.lower() in _COMPANY_HINT_BAD_EXACT:
+        return None
+    if any(token in low for token in _COMPANY_HINT_BAD_TOKENS):
+        return None
+    if "linkedin" == text.lower():
+        return None
+    return text
+
+
+def _looks_like_role_line(value: str) -> bool:
+    low = value.lower()
+    return any(token in low for token in _ROLE_LINE_TOKENS)
+
+
+def extract_company_hint(snapshot: PageSnapshot) -> str | None:
+    """Best-effort LinkedIn company name extraction from the page top card."""
+    direct = _clean_company_hint(snapshot.company_hint)
+    if direct:
+        return direct
+
+    lines = [
+        cleaned
+        for raw in str(snapshot.text or "").splitlines()
+        if (cleaned := _clean_company_hint(raw))
+    ]
+    if not lines:
+        return None
+
+    if len(lines) < 2 or not _looks_like_role_line(lines[0]):
+        return None
+    for line in lines[1:8]:
+        if not _looks_like_role_line(line):
+            return line
+    return None
+
+
 def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
     url = str(snapshot.url or "").lower()
     text = _snapshot_text_lower(snapshot)
     controls = tuple(snapshot.controls or ())
+    company_hint = extract_company_hint(snapshot)
 
     if "/checkpoint/" in url or "/uas/" in url:
         return unresolved_decision(
@@ -194,14 +297,14 @@ def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
         )
 
     if any(token in text for token in UNAVAILABLE_TEXTS):
-        return PageDecision(status="unavailable")
+        return PageDecision(status="unavailable", company_hint=company_hint)
 
     easy_apply = next(
         (control for control in controls if "easy apply" in str(control.text or "").lower()),
         None,
     )
     if easy_apply is not None:
-        return PageDecision(status="easy_apply", control=easy_apply)
+        return PageDecision(status="easy_apply", control=easy_apply, company_hint=company_hint)
 
     apply_control = next(
         (control for control in controls if "apply" in str(control.text or "").lower()),
@@ -215,9 +318,10 @@ def classify_snapshot(snapshot: PageSnapshot) -> PageDecision:
             status="resolved_offsite",
             final_url=apply_control.href,
             control=apply_control,
+            company_hint=company_hint,
         )
 
-    return PageDecision(status="needs_click", control=apply_control)
+    return PageDecision(status="needs_click", control=apply_control, company_hint=company_hint)
 
 
 def _normalize_tiers(tiers: Iterable[str] | None, include_low: bool) -> tuple[str, ...]:
@@ -358,6 +462,7 @@ def record_resolution(
     *,
     status: str,
     final_url: str | None = None,
+    company_hint: str | None = None,
     error: str | None = None,
     unresolved_kind: str | None = None,
     next_action: str | None = None,
@@ -375,8 +480,9 @@ def record_resolution(
         next_action = None
 
     now = datetime.now(timezone.utc).isoformat()
+    clean_company_hint = _clean_company_hint(company_hint)
     existing = conn.execute(
-        "SELECT application_url FROM jobs WHERE url = ?",
+        "SELECT application_url, company FROM jobs WHERE url = ?",
         (url,),
     ).fetchone()
     if existing is None:
@@ -420,6 +526,39 @@ def record_resolution(
             """,
             (final_url, status, error, unresolved_kind, next_action, now, url),
         )
+    if clean_company_hint:
+        conn.execute(
+            """
+            UPDATE jobs
+               SET company = ?
+             WHERE url = ?
+               AND TRIM(COALESCE(company, '')) = ''
+            """,
+            (clean_company_hint, url),
+        )
+    if status == "unavailable":
+        conn.execute(
+            """
+            UPDATE jobs
+               SET liveness_status = 'dead',
+                   liveness_reason = 'linkedin_resolver_unavailable',
+                   last_verified_live = ?
+             WHERE url = ?
+            """,
+            (now, url),
+        )
+    elif status in {"easy_apply", "resolved_offsite"}:
+        conn.execute(
+            """
+            UPDATE jobs
+               SET liveness_status = 'live',
+                   liveness_reason = ?,
+                   last_verified_live = ?
+             WHERE url = ?
+               AND COALESCE(liveness_status, '') != 'dead'
+            """,
+            (f"linkedin_resolver_{status}", now, url),
+        )
     conn.commit()
 
 
@@ -456,6 +595,7 @@ def _run_candidates(
             candidate.url,
             status=decision.status,
             final_url=decision.final_url,
+            company_hint=decision.company_hint,
             error=decision.error,
             unresolved_kind=decision.unresolved_kind,
             next_action=decision.next_action,
@@ -512,6 +652,62 @@ def _snapshot_page(page) -> PageSnapshot:
     except Exception:
         text = ""
 
+    company_hint = None
+    try:
+        company_hint = _clean_company_hint(
+            page.evaluate(
+                """
+                () => {
+                  const clean = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
+                  const fromOrg = (org) => {
+                    if (!org) return '';
+                    if (typeof org === 'string') return clean(org);
+                    return clean(org.name);
+                  };
+                  const visit = (node) => {
+                    if (!node || typeof node !== 'object') return '';
+                    if (Array.isArray(node)) {
+                      for (const item of node) {
+                        const found = visit(item);
+                        if (found) return found;
+                      }
+                      return '';
+                    }
+                    const org = fromOrg(node.hiringOrganization);
+                    if (org) return org;
+                    for (const value of Object.values(node)) {
+                      const found = visit(value);
+                      if (found) return found;
+                    }
+                    return '';
+                  };
+                  for (const script of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
+                    try {
+                      const found = visit(JSON.parse(script.textContent || ''));
+                      if (found) return found;
+                    } catch (_) {}
+                  }
+                  const selectors = [
+                    '.jobs-unified-top-card__company-name a',
+                    '.jobs-unified-top-card__company-name',
+                    '.job-details-jobs-unified-top-card__company-name a',
+                    '.job-details-jobs-unified-top-card__company-name',
+                    '.topcard__org-name-link',
+                    '.topcard__flavor--black-link',
+                    'a[data-control-name="company_link"]'
+                  ];
+                  for (const selector of selectors) {
+                    const value = clean(document.querySelector(selector)?.innerText || document.querySelector(selector)?.textContent);
+                    if (value) return value;
+                  }
+                  return '';
+                }
+                """
+            )
+        )
+    except Exception:
+        company_hint = None
+
     controls_raw = page.evaluate(
         """
         () => {
@@ -555,7 +751,7 @@ def _snapshot_page(page) -> PageSnapshot:
         for item in controls_raw
         if isinstance(item, dict)
     )
-    return PageSnapshot(url=page.url, text=text, controls=controls)
+    return PageSnapshot(url=page.url, text=text, controls=controls, company_hint=company_hint)
 
 
 def _is_browser_closed_error(message: str) -> bool:
@@ -570,6 +766,13 @@ def _is_browser_closed_error(message: str) -> bool:
             "browser closed",
         )
     )
+
+
+def _with_company_hint(decision: PageDecision, company_hint: str | None) -> PageDecision:
+    clean_hint = _clean_company_hint(company_hint)
+    if not clean_hint or decision.company_hint:
+        return decision
+    return replace(decision, company_hint=clean_hint)
 
 
 def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOptions) -> PageDecision:
@@ -587,7 +790,8 @@ def _resolve_one_with_context(context, candidate: Candidate, options: ResolverOp
         if decision.status == "resolved_offsite" and decision.final_url:
             return decision
         if decision.status == "needs_click" and decision.control:
-            return _click_and_capture_external(page, decision.control, options)
+            clicked = _click_and_capture_external(page, decision.control, options)
+            return _with_company_hint(clicked, decision.company_hint)
         return decision
     except PlaywrightTimeoutError:
         return unresolved_decision("page_unreachable", error="page_timeout")
@@ -781,4 +985,4 @@ def _run_live_browser_batch(candidates: Sequence[Candidate], options: ResolverOp
             finally:
                 browser.close()
     finally:
-        cleanup_worker(options.worker_id, proc)
+        require_browser_cleanup(cleanup_worker, options.worker_id, proc)

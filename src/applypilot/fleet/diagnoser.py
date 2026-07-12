@@ -218,7 +218,8 @@ def write_diagnosis(conn, d: Diagnosis, ttl_seconds: int = 86400) -> bool:
                       f"Evidence: {d.evidence[:200]}")
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM fleet_diagnoses WHERE cluster_key=%s "
-                    "AND status IN ('open','recommended','auto_applied') LIMIT 1", (cluster_key,))
+                    "AND status IN ('open','recommended','auto_applied') "
+                    "AND (expires_at IS NULL OR expires_at > now()) LIMIT 1", (cluster_key,))
         if cur.fetchone():
             return False
         cur.execute(

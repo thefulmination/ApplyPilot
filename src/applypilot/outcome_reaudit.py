@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Re-audit stored email_events attributions against today's match guards.
 
 `reaudit_email_events` replays `match_email_to_job` over rows already persisted
@@ -12,6 +10,8 @@ Idempotent: a flipped row has job_url = NULL afterward, so it is skipped (not
 re-checked) on the next run; a backfilled row has match_status set, so the
 backfill UPDATE's `AND match_status IS NULL` guard no-ops.
 """
+
+from __future__ import annotations
 
 from typing import Any
 

@@ -28,7 +28,9 @@ from applypilot.fleet import queue, sync
 def set_linkedin_canary(conn, k: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE fleet_config SET linkedin_canary_enabled=TRUE, linkedin_canary_remaining=%s WHERE id=1",
+            "UPDATE fleet_config "
+            "SET linkedin_apply_mode='canary', linkedin_canary_enabled=TRUE, linkedin_canary_remaining=%s "
+            "WHERE id=1",
             (k,),
         )
     conn.commit()
@@ -36,15 +38,31 @@ def set_linkedin_canary(conn, k: int) -> None:
 
 def lift_linkedin_canary(conn) -> None:
     with conn.cursor() as cur:
-        cur.execute("UPDATE fleet_config SET linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL WHERE id=1")
+        cur.execute(
+            "UPDATE fleet_config "
+            "SET linkedin_apply_mode='stopped', linkedin_canary_enabled=FALSE, linkedin_canary_remaining=NULL "
+            "WHERE id=1"
+        )
     conn.commit()
 
 
-def _linkedin_canary_armed(conn) -> bool:
+def _linkedin_canary_capacity(conn) -> int:
     with conn.cursor() as cur:
-        cur.execute("SELECT linkedin_canary_enabled FROM fleet_config WHERE id=1")
+        cur.execute(
+            "SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canary_remaining "
+            "FROM fleet_config WHERE id=1"
+        )
         row = cur.fetchone()
-    return bool(row and row["linkedin_canary_enabled"])
+    if not row or row["linkedin_apply_mode"] != "canary" or not row["linkedin_canary_enabled"]:
+        return 0
+    remaining = row["linkedin_canary_remaining"]
+    if remaining is None:
+        return 0
+    return max(int(remaining), 0)
+
+
+def _linkedin_canary_armed(conn) -> bool:
+    return _linkedin_canary_capacity(conn) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -56,13 +74,23 @@ def approve(conn, *, urls=None, all_pushed: bool = False) -> str:
 
     REFUSES unless the LinkedIn canary is armed (so the runbook's
     arm-then-approve order can't invert -- same gate as apply_home_main)."""
-    if not _linkedin_canary_armed(conn):
+    capacity = _linkedin_canary_capacity(conn)
+    if capacity <= 0:
         raise SystemExit(
-            "refusing to approve: arm the LinkedIn canary first (linkedin-home linkedin-canary <K>)"
+            "refusing to approve: arm the LinkedIn canary with positive remaining capacity first (linkedin-home linkedin-canary <K>)"
         )
     if all_pushed:
         with conn.cursor() as cur:
-            cur.execute("SELECT url FROM linkedin_queue WHERE status='queued' AND approved_batch IS NULL")
+            cur.execute(
+                "SELECT q.url FROM linkedin_queue q CROSS JOIN fleet_config cfg "
+                "WHERE q.status='queued' AND q.approved_batch IS NULL "
+                "AND q.score >= GREATEST(COALESCE(cfg.approval_threshold, 7), 7) "
+                "AND q.linkedin_resolve_status = ANY(%s) "
+                "AND q.linkedin_resolved_at IS NOT NULL "
+                "AND q.linkedin_resolved_at >= now() - make_interval(days => %s) "
+                "ORDER BY q.score DESC, q.url LIMIT %s",
+                (list(queue.LINKEDIN_FRESH_STATUSES), queue.LINKEDIN_FRESH_MAX_AGE_DAYS, capacity),
+            )
             urls = [r["url"] for r in cur.fetchall()]
     token = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     queue.approve_linkedin_jobs(conn, urls or [], token)
@@ -80,6 +108,7 @@ def list_challenges(conn) -> list:
             "SELECT ac.id, ac.url, ac.worker_id, ac.kind, ac.route, ac.raised_at "
             "FROM auth_challenge ac "
             "JOIN linkedin_queue lq ON lq.url = ac.url "
+            "  AND lq.status='leased' AND lq.apply_status='challenge_pending' "
             "WHERE ac.resolved_at IS NULL ORDER BY ac.raised_at DESC"
         )
         return [dict(r) for r in cur.fetchall()]
@@ -102,7 +131,7 @@ def _print_status(conn) -> None:
         cur.execute("SELECT status, count(*) AS n FROM linkedin_queue GROUP BY status")
         depth = {r["status"]: r["n"] for r in cur.fetchall()}
         cur.execute(
-            "SELECT linkedin_canary_enabled, linkedin_canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1"
+            "SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canary_remaining, spend_cap_usd FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone()
         cur.execute("SELECT COALESCE(SUM(est_cost_usd),0) AS s FROM linkedin_queue")
@@ -112,7 +141,9 @@ def _print_status(conn) -> None:
         halted_until = str(halt_row["halted_until"]) if halt_row else None
         cur.execute(
             "SELECT count(*) AS n FROM auth_challenge ac "
-            "JOIN linkedin_queue lq ON lq.url = ac.url WHERE ac.resolved_at IS NULL"
+            "JOIN linkedin_queue lq ON lq.url = ac.url "
+            "  AND lq.status='leased' AND lq.apply_status='challenge_pending' "
+            "WHERE ac.resolved_at IS NULL"
         )
         open_ch = cur.fetchone()["n"]
         # apply-time channel recorder: how applied jobs actually submitted (easy_apply vs external ATS)
@@ -121,6 +152,7 @@ def _print_status(conn) -> None:
         channels = {r["ch"]: r["n"] for r in cur.fetchall()}
     print({
         "queue": depth,
+        "linkedin_apply_mode": cfg["linkedin_apply_mode"],
         "linkedin_canary_enabled": cfg["linkedin_canary_enabled"],
         "linkedin_canary_remaining": cfg["linkedin_canary_remaining"],
         "spend_cap_usd": float(cfg["spend_cap_usd"] or 0),
@@ -137,11 +169,15 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("push")
-    sp.add_argument("--score-floor", type=int, default=7)
+    sp.add_argument("--score-floor", type=float, default=7.0)
+    sp.add_argument("--include-research", action="store_true",
+                    help="Also stage jobs whose fleet research_fit_score meets the score floor.")
     sp.add_argument("--max-age-days", type=int, default=21,
                     help="only push LinkedIn jobs discovered within N days (liveness proxy -- "
                          "LinkedIn can't be network-probed; stale postings are likely dead). "
                          "Pass 0 to disable.")
+    sp.add_argument("--max-resolved-age-days", type=int, default=queue.LINKEDIN_FRESH_MAX_AGE_DAYS,
+                    help="only push LinkedIn jobs whose logged-in resolver decision is this many days old or newer")
     sp.add_argument("--limit", type=int, default=None)
     sp.add_argument("--no-lane-filter", action="store_true",
                     help="Disable the default off-lane drift filter for this push.")
@@ -171,13 +207,17 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
+    from applypilot.fleet import schema as fleet_schema
     with pgqueue.connect(args.dsn) as conn:
+        fleet_schema.ensure_schema_v3(conn)
         if args.cmd == "push":
             n = sync.push_linkedin_eligible(pg_conn=conn, score_floor=args.score_floor,
                                             max_age_days=args.max_age_days, limit=args.limit,
+                                            max_resolved_age_days=args.max_resolved_age_days,
+                                            include_research=args.include_research,
                                             lane_filter=not args.no_lane_filter)
             print("pushed", n)
-            unscored = sync.count_linkedin_unscored()
+            unscored = sync.count_linkedin_unscored(include_research=args.include_research)
             if unscored:
                 print(f"note: {unscored} apply-shaped LinkedIn jobs are UNSCORED and held out "
                       f"of the push -- run the scorer to fold them into the candidate pool")

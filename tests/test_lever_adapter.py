@@ -10,6 +10,8 @@ No browser here: the page's field-discovery result and the answerer are injected
 
 from applypilot.apply.greenhouse_adapter import AnswerPlan
 from applypilot.apply.lever_adapter import (
+    decide_bounded_route,
+    detect_captcha_boundary,
     build_lever_plan,
     discover_fields,
     normalize_fields,
@@ -173,3 +175,27 @@ def test_lever_form_actions_use_name_selectors_and_never_submit():
     assert ("select", '[name="cards[u][field1]"]', "Yes") in got
     # Lever submit is hCaptcha-gated -> the deterministic path never emits a submit.
     assert all(a.kind != "submit" for a in actions)
+
+
+def test_hcaptcha_is_an_explicit_exception_boundary():
+    class Page:
+        def evaluate(self, _js):
+            return True
+
+    assert detect_captcha_boundary(Page()) is True
+    decision = decide_bounded_route(_plan(), captcha_present=True)
+    assert decision == ("exception", "captcha")
+
+
+def test_ready_lever_form_routes_to_supervised_submit_not_agent():
+    assert decide_bounded_route(_plan(), captcha_present=False) == (
+        "supervised_review", "submit_requires_supervision"
+    )
+
+
+def test_unmapped_lever_form_routes_to_exception_not_agent():
+    q = [{"name": "cards[u][field3]", "type": "text", "label": "Secret code",
+          "required": True, "options": []}]
+    assert decide_bounded_route(_plan(q), captcha_present=False) == (
+        "exception", "unmapped_required"
+    )

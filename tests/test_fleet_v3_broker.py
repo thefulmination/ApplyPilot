@@ -24,7 +24,7 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import answer_bank, broker as broker_mod, queue
+from applypilot.fleet import answer_bank, broker as broker_mod, config as fleet_config, heartbeat, queue
 from applypilot.fleet.broker import AuthError, Broker, CapabilityError
 
 OWNER_IP = "203.0.113.7"
@@ -63,8 +63,9 @@ def _seed_search(conn):
 def _seed_linkedin(conn):
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO linkedin_queue (url, application_url, score, status, approved_batch) "
-            "VALUES ('https://www.linkedin.com/jobs/view/1','https://www.linkedin.com/jobs/view/1',9.0,'queued','b1')"
+            "INSERT INTO linkedin_queue "
+            "(url, application_url, score, status, approved_batch, linkedin_resolve_status, linkedin_resolved_at) "
+            "VALUES ('https://www.linkedin.com/jobs/view/1','https://www.linkedin.com/jobs/view/1',9.0,'queued','b1','easy_apply',now())"
         )
     conn.commit()
 
@@ -143,6 +144,45 @@ def test_lease_capability_gate(fleet_db):
             b.lease(conn, wid, token, lane="ats", home_ip="10.0.0.9")
         # its own lane works
         assert b.lease(conn, wid, token, lane="compute") is not None
+
+
+def test_lease_refuses_worker_without_matching_reported_version(fleet_db):
+    b = Broker(owner_ip=OWNER_IP)
+    with pgqueue.connect(fleet_db) as conn:
+        wid, token = b.enroll_worker(conn, "alice", capabilities=_ALL_CAPS, public_ip=OWNER_IP)
+        _seed_apply(conn)
+        fleet_config.set_pinned_version(conn, "2.0.0")
+
+        assert b.lease(conn, wid, token, lane="ats") is None
+
+        heartbeat.beat(
+            conn,
+            wid,
+            machine_owner="alice",
+            home_ip=OWNER_IP,
+            role="apply",
+            state="idle",
+            sw_version="1.0.0",
+        )
+        assert b.lease(conn, wid, token, lane="ats") is None
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, lease_owner FROM apply_queue LIMIT 1")
+            q = cur.fetchone()
+        assert q["status"] == "queued"
+        assert q["lease_owner"] is None
+
+        heartbeat.beat(
+            conn,
+            wid,
+            machine_owner="alice",
+            home_ip=OWNER_IP,
+            role="apply",
+            state="idle",
+            sw_version="2.0.0",
+        )
+        job = b.lease(conn, wid, token, lane="ats")
+        assert job is not None and job["url"].endswith("/ats1")
 
 
 # ---------------------------------------------------------------------------

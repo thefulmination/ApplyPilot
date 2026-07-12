@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from applypilot import inbox_auth
+from applypilot import mail_source
 from applypilot.fleet import otp_relay
 from applypilot.mail_source import MailMessage
 
@@ -37,6 +40,129 @@ def test_scan_gmail_for_auth_codes_messages_path_extracts_code():
     assert match.candidate.value == "123456"
 
 
+def test_message_list_candidate_overflow_fails_closed():
+    now = dt.datetime.now(dt.timezone.utc)
+    messages = [
+        MailMessage(
+            id=str(index),
+            thread_id=str(index),
+            subject="Verify your email",
+            sender="no-reply@greenhouse.io",
+            date=_rfc(now),
+            body="Use verification code 123456 to continue.",
+        )
+        for index in range(1001)
+    ]
+
+    with pytest.raises(mail_source.MailSourceOverflowError):
+        inbox_auth.scan_gmail_for_auth_codes(
+            messages=messages,
+            max_messages=1000,
+        )
+
+
+def test_message_list_exact_candidate_bound_remains_bounded():
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)
+    messages = [
+        MailMessage(
+            id=str(index),
+            thread_id=str(index),
+            subject="Unrelated",
+            sender="news@example.com",
+            date=_rfc(old),
+            body="newsletter",
+        )
+        for index in range(1000)
+    ]
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        messages=messages,
+        max_messages=1000,
+    ) == []
+
+
+def test_scan_nonpositive_message_budget_does_not_touch_message_list():
+    class _MustNotIterate:
+        def __getitem__(self, key):
+            raise AssertionError(f"message list touched: {key}")
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        messages=_MustNotIterate(), max_messages=0
+    ) == []
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        messages=_MustNotIterate(), max_messages=-1
+    ) == []
+
+
+def test_scan_nonpositive_service_budget_does_not_touch_gmail_api():
+    class _MustNotBuildService:
+        def users(self):
+            raise AssertionError("Gmail API touched")
+
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        service=_MustNotBuildService(), max_messages=0
+    ) == []
+    assert inbox_auth.scan_gmail_for_auth_codes(
+        service=_MustNotBuildService(), max_messages=-1
+    ) == []
+
+
+def test_watch_nonpositive_budget_does_not_resolve_mail_source(monkeypatch):
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source",
+        lambda: (_ for _ in ()).throw(AssertionError("mail source touched")),
+    )
+
+    assert inbox_auth.watch_gmail_for_auth_code(max_messages=0) is None
+    assert inbox_auth.watch_gmail_for_auth_code(max_messages=-1) is None
+
+
+def test_watcher_candidate_overflow_returns_no_hint_without_retry(monkeypatch):
+    calls = 0
+
+    class _OverflowSource:
+        def fetch(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise mail_source.MailSourceOverflowError("candidate overflow")
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source",
+        lambda **_kwargs: _OverflowSource(),
+    )
+
+    assert inbox_auth.watch_gmail_for_auth_code(
+        timeout_seconds=1,
+        poll_seconds=0,
+        max_errors=3,
+        max_messages=1000,
+    ) is None
+    assert calls == 1
+
+
+@pytest.mark.parametrize("budget", [True, 1.5, float("nan"), float("inf"), "1.5", "nan", ""])
+def test_scanners_reject_malformed_budget_without_touching_inputs(budget):
+    class _MustNotTouch:
+        def __getitem__(self, key):
+            raise AssertionError(key)
+
+    with pytest.raises((TypeError, ValueError), match="max_messages"):
+        inbox_auth.scan_gmail_for_auth_codes(messages=_MustNotTouch(), max_messages=budget)
+    with pytest.raises((TypeError, ValueError), match="max_messages"):
+        inbox_auth.scan_gmail_for_auth_codes(service=_MustNotTouch(), max_messages=budget)
+
+
+def test_scanners_reject_budget_above_1000_without_touching_inputs():
+    class _MustNotTouch:
+        def __getitem__(self, key):
+            raise AssertionError(key)
+
+    with pytest.raises(ValueError, match="1000"):
+        inbox_auth.scan_gmail_for_auth_codes(messages=_MustNotTouch(), max_messages=1001)
+    with pytest.raises(ValueError, match="1000"):
+        inbox_auth.scan_gmail_for_auth_codes(service=_MustNotTouch(), max_messages=1001)
+
+
 def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
     """Same subject/sender/body through both paths -> identical candidate value
     and confidence, proving the parser itself is untouched."""
@@ -62,20 +188,30 @@ def test_scan_gmail_for_auth_codes_messages_path_matches_service_path():
         def list(self, userId, q, maxResults):
             return _FakeRequest({"messages": [{"id": "m2", "threadId": "t2"}]})
 
-        def get(self, userId, id, format):  # noqa: A002
-            import base64
-
-            encoded = base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii").rstrip("=")
-            payload = {
-                "headers": [
-                    {"name": "Subject", "value": subject},
-                    {"name": "From", "value": sender},
-                    {"name": "Date", "value": _rfc(now)},
-                ],
-                "mimeType": "text/plain",
-                "body": {"data": encoded},
-            }
-            return _FakeRequest({"payload": payload})
+        def get(  # noqa: A002
+            self,
+            userId,
+            id,
+            format,
+            fields=None,
+            metadataHeaders=None,
+        ):
+            assert format == "metadata"
+            return _FakeRequest(
+                {
+                    "id": id,
+                    "threadId": "t2",
+                    "sizeEstimate": 100,
+                    "snippet": body,
+                    "payload": {
+                        "headers": [
+                            {"name": "Subject", "value": subject},
+                            {"name": "From", "value": sender},
+                            {"name": "Date", "value": _rfc(now)},
+                        ]
+                    },
+                }
+            )
 
     class _FakeUsers:
         def messages(self):
@@ -145,7 +281,8 @@ def test_watch_gmail_for_auth_code_picks_newest_recent_match(monkeypatch):
     now = dt.datetime.now(dt.timezone.utc)
 
     class _FakeSource:
-        def fetch(self, *, since_days, max_messages):
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
+            assert "verification" in gmail_raw_query
             return [
                 MailMessage(
                     id="older", thread_id="t-old", subject="Verify your email",
@@ -172,14 +309,99 @@ def test_watch_gmail_for_auth_code_picks_newest_recent_match(monkeypatch):
     assert match.candidate.value == "222222"
 
 
+def test_watch_continues_after_losing_atomic_message_claim(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+    calls = {"fetch": 0, "claim": []}
+
+    def message(message_id, code, seconds):
+        return MailMessage(
+            id=message_id,
+            thread_id=message_id,
+            subject="Verify your email",
+            sender="no-reply@greenhouse.io",
+            date=_rfc(now + dt.timedelta(seconds=seconds)),
+            body=f"Use verification code {code} to continue.",
+        )
+
+    class _RacingSource:
+        def fetch(self, **_kwargs):
+            calls["fetch"] += 1
+            if calls["fetch"] == 1:
+                return [message("lost", "111111", 1)]
+            return [message("lost", "111111", 1), message("won", "222222", 2)]
+
+    def claim(match):
+        calls["claim"].append(match.message_id)
+        return match.message_id == "won"
+
+    monkeypatch.setattr("applypilot.mail_source.get_mail_source", lambda: _RacingSource())
+
+    match = inbox_auth.watch_gmail_for_auth_code(
+        timeout_seconds=1,
+        poll_seconds=0,
+        max_errors=1,
+        minutes=10,
+        max_messages=25,
+        claim_match=claim,
+    )
+
+    assert match is not None
+    assert match.message_id == "won"
+    assert calls["claim"] == ["lost", "won"]
+
+
+def test_watch_rejects_prechallenge_and_wrong_provider_messages(monkeypatch):
+    now = dt.datetime.now(dt.timezone.utc)
+
+    class _FakeSource:
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
+            assert "verification" in gmail_raw_query
+            return [
+                MailMessage(
+                    id="stale-greenhouse", thread_id="1", subject="Verify your email",
+                    sender="no-reply@greenhouse.io", date=_rfc(now - dt.timedelta(minutes=2)),
+                    body="Use verification code 111111 to continue.",
+                ),
+                MailMessage(
+                    id="fresh-workday", thread_id="2", subject="Verify your email",
+                    sender="no-reply@workday.com", date=_rfc(now + dt.timedelta(seconds=5)),
+                    body="Use verification code 222222 to continue.",
+                ),
+                MailMessage(
+                    id="fresh-greenhouse", thread_id="3", subject="Verify your email",
+                    sender="no-reply@greenhouse-mail.io", date=_rfc(now + dt.timedelta(seconds=10)),
+                    body="Use verification code 333333 to continue.",
+                ),
+            ]
+
+    monkeypatch.setattr(
+        "applypilot.mail_source.get_mail_source", lambda: _FakeSource()
+    )
+
+    match = inbox_auth.watch_gmail_for_auth_code(
+        not_before=now,
+        provider_domain="greenhouse.io",
+        timeout_seconds=1,
+        poll_seconds=0,
+        max_errors=1,
+        minutes=15,
+        max_messages=1000,
+    )
+
+    assert match is not None
+    assert match.message_id == "fresh-greenhouse"
+    assert match.candidate.value == "333333"
+
+
 def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
     """service=None -> resolves via get_mail_source().fetch(...) then scans."""
     seen = {}
 
     class _FakeSource:
-        def fetch(self, *, since_days, max_messages):
+        def fetch(self, *, since_days, max_messages, gmail_raw_query=None):
             seen["since_days"] = since_days
             seen["max_messages"] = max_messages
+            seen["gmail_raw_query"] = gmail_raw_query
             return [
                 MailMessage(
                     id="m3", thread_id="t3", subject="Verify your email",
@@ -200,6 +422,7 @@ def test_watch_gmail_for_auth_code_defaults_to_mail_source(monkeypatch):
     assert match.candidate.value == "654321"
     assert seen["max_messages"] == 25
     assert seen["since_days"] == 1
+    assert "verification" in seen["gmail_raw_query"]
 
 
 def test_answer_pending_defaults_to_mail_source(monkeypatch):
@@ -229,6 +452,7 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
     class _FakeCursor:
         def __init__(self, rows):
             self._rows = rows
+            self._row = None
 
         def __enter__(self):
             return self
@@ -236,8 +460,14 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def execute(self, *a, **kw):
-            pass
+        def execute(self, query, params=None):
+            if "pg_try_advisory_lock" in query:
+                self._row = {"acquired": True}
+            elif "pg_advisory_unlock" in query:
+                self._row = {"released": True}
+
+        def fetchone(self):
+            return self._row
 
         def fetchall(self):
             return self._rows
@@ -252,6 +482,9 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
         def commit(self):
             pass
 
+        def rollback(self):
+            pass
+
     pending_row = {"id": 1, "requested_at": dt.datetime.now(dt.timezone.utc)}
     conn = _FakeConn([pending_row])
 
@@ -261,6 +494,20 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
     assert scan_calls["messages"] == ["sentinel-messages"]
     assert fetch_calls["max_messages"] == 25
     assert "verification" in fetch_calls["gmail_raw_query"]
+
+
+def test_answer_pending_does_not_fetch_mail_without_pending_rows(fleet_db, monkeypatch):
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import schema as fleet_schema
+
+    def fail_if_resolved():
+        raise AssertionError("mail source must not be resolved without pending rows")
+
+    monkeypatch.setattr("applypilot.mail_source.get_mail_source", fail_if_resolved)
+
+    with pgqueue.connect(fleet_db) as conn:
+        fleet_schema.ensure_schema_v3(conn)
+        assert otp_relay.answer_pending(conn) == 0
 
 
 def test_answer_pending_writes_code_via_mail_source(fleet_db, monkeypatch):

@@ -6,8 +6,8 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import machine_blackout, machine_blackout_main
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import machine_blackout, machine_blackout_main  # noqa: E402
 
 
 def test_blackout_blocks_non_home_non_mac_until_expiry(fleet_db):
@@ -74,16 +74,18 @@ def test_status_line_is_powershell_friendly(fleet_db):
 
 def test_control_cli_defaults_allow_home_and_mac_without_duplicates(fleet_db, monkeypatch, capsys):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    controlled_now = datetime(2035, 7, 6, 16, 0, tzinfo=timezone.utc)
+    until = controlled_now + timedelta(hours=1)
 
     rc = machine_blackout_main.main([
         "blackout",
         "--name",
         "default-policy",
         "--until",
-        "2026-07-06 17:00",
+        until.isoformat(),
         "--reason",
         "default allow list",
-    ])
+    ], now_fn=lambda: controlled_now)
     assert rc == 0
 
     with pgqueue.connect(fleet_db) as conn:

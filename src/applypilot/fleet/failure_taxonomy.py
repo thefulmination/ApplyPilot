@@ -12,6 +12,12 @@ def canonical_failure_group(reason: str | None) -> str:
         return "unclassified"
     if "challenge_skipped" in token:
         return "operator_skipped"
+    if "stale_unapproved" in token or "canonical_provenance_missing" in token:
+        return "retired_unapproved"
+    if token in {"failed:reason", "reason", "failed:unspecified", "unspecified"}:
+        return "malformed_failure_reason"
+    if "not_a_job_application" in token:
+        return "not_an_application"
     if "requeued_by_" in token:
         return "remediation_history"
     if "usage_limit" in token:
@@ -26,6 +32,7 @@ def canonical_failure_group(reason: str | None) -> str:
         return "agent_no_result"
     if any(part in token for part in (
         "page_error", "suspicious_page", "wrong_job_redirect", "page_redirected",
+        "site_error",
     )):
         return "page_or_content_failure"
     if any(part in token for part in (
@@ -41,6 +48,7 @@ def canonical_failure_group(reason: str | None) -> str:
         return "budget_exhausted"
     if any(part in token for part in (
         "not_eligible", "citizenship", "work_auth", "wrong_role", "job_mismatch",
+        "bar_license", "required_current_residence",
     )):
         return "eligibility"
     if any(part in token for part in (
@@ -52,16 +60,29 @@ def canonical_failure_group(reason: str | None) -> str:
         "application_limit", "rate_limited", "too_many_attempts",
     )):
         return "rate_or_application_limit"
-    if "no_confirmation" in token or "crash_unconfirmed" in token:
+    if any(part in token for part in (
+        "no_confirmation",
+        "crash_unconfirmed",
+        "submission_uncertain",
+        "outcome unresolved",
+        "no confirmed applied event or inbox outcome",
+    )):
+        return "submission_uncertain"
+    if "unsafe_prior_attempt" in token:
         return "submission_uncertain"
     if any(part in token for part in (
         "reference", "loom", "video", "photo_required", "resume_data", "resume_text",
+        "resume_content", "screenshots_unavailable",
     )):
         return "missing_required_material"
     if any(part in token for part in (
         "contract", "part_time", "internship", "not_full_time", "not_salaried",
+        "not_a_salaried",
+        "not_a_paid_job",
     )):
         return "job_type_excluded"
+    if "no_decline_option" in token or "no_truthful_option" in token:
+        return "form_or_profile_constraint"
     if "spam" in token:
         return "spam_or_abuse_filter"
     if any(part in token for part in (

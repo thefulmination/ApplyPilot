@@ -155,6 +155,17 @@ def test_codex_model_override_keeps_claude_model_separate(monkeypatch, tmp_path:
     assert 'model_reasoning_effort="medium"' in canary
 
 
+def test_effective_agent_model_label_matches_launcher_selection(monkeypatch) -> None:
+    from applypilot.apply import launcher
+
+    assert launcher.effective_agent_model_label("claude", "sonnet") == "sonnet"
+    assert launcher.effective_agent_model_label("codex", "sonnet") == "codex-default"
+    assert launcher.effective_agent_model_label("codex", "gpt-5-codex") == "gpt-5-codex"
+
+    monkeypatch.setenv("APPLYPILOT_CODEX_MODEL", "gpt-5.4-mini")
+    assert launcher.effective_agent_model_label("codex", "sonnet") == "gpt-5.4-mini"
+
+
 def test_codex_reasoning_effort_rejects_invalid_value(monkeypatch, tmp_path: Path) -> None:
     from applypilot.apply import launcher
 
