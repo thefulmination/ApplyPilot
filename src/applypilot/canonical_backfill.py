@@ -63,6 +63,49 @@ def _import_rows(
     return {"read": len(rows), "written": written, "skipped": skipped, "sha256": _digest(rows)}
 
 
+def _import_pairwise_rows(conn: sqlite3.Connection, paths: list[Path]) -> dict[str, Any]:
+    rows = [row for path in paths for row in _read_json_records(path)]
+    item_urls: dict[str, str] = {}
+    job_urls: dict[str, str] = {}
+    for job_url, application_url in conn.execute(
+        "SELECT url,application_url FROM jobs ORDER BY url"
+    ).fetchall():
+        job_urls.setdefault(job_url, job_url)
+        if application_url:
+            job_urls.setdefault(application_url, job_url)
+    for row in rows:
+        for side in ("jobA", "jobB"):
+            job = row.get(side)
+            if not isinstance(job, dict):
+                continue
+            item_id = job.get("itemId") or job.get("item_id")
+            candidate_url = (
+                job.get("jobUrl") or job.get("sourceUrl") or job.get("applicationUrl")
+                or job.get("url")
+            )
+            if not item_id or not candidate_url:
+                continue
+            match = job_urls.get(str(candidate_url))
+            if match:
+                item_urls[str(item_id)] = match
+
+    written = 0
+    skipped = 0
+    for row in sorted(rows, key=_canonical):
+        enriched = dict(row)
+        left_item = row.get("leftItemId") or row.get("jobAItemId")
+        right_item = row.get("rightItemId") or row.get("jobBItemId")
+        if left_item in item_urls:
+            enriched.setdefault("leftJobUrl", item_urls[str(left_item)])
+        if right_item in item_urls:
+            enriched.setdefault("rightJobUrl", item_urls[str(right_item)])
+        if _pairwise(conn, enriched):
+            written += 1
+        else:
+            skipped += 1
+    return {"read": len(rows), "written": written, "skipped": skipped, "sha256": _digest(rows)}
+
+
 def _score(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     url = row.get("job_url") or row.get("jobUrl") or row.get("url")
     if not url or conn.execute("SELECT 1 FROM jobs WHERE url=?", (url,)).fetchone() is None:
@@ -257,7 +300,7 @@ def backfill_research_artifacts(conn: sqlite3.Connection, fixture_dir: str | Pat
     reports = {
         "scores": _import_rows(conn, _files(root, "score", exclude=("pairwise",)), _score),
         "labels": _import_rows(conn, _files(root, "label", exclude=("pairwise",)), _label),
-        "pairwise": _import_rows(conn, _files(root, "pairwise"), _pairwise),
+        "pairwise": _import_pairwise_rows(conn, _files(root, "pairwise")),
         "kg": _import_rows(conn, _files(root, "knowledge_graph") + _files(root, "compact_kg"), _kg),
         "outcomes": _import_rows(conn, _files(root, "outcome"), _outcome),
     }

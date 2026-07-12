@@ -68,14 +68,22 @@ def test_pairwise_ab_artifact_resolves_item_ids_and_kg_schema_version(tmp_path):
     urls = ("https://example.com/a", "https://example.com/b")
     for url in urls:
         conn.execute("INSERT INTO jobs (url,title) VALUES (?,?)", (url, "Role"))
-    for event_id, item_id, url in (("l-a", "item-a", urls[0]), ("l-b", "item-b", urls[1])):
+    for event_id, item_id in (("l-a", "item-a"), ("l-b", "item-b")):
         conn.execute(
             "INSERT INTO research_labels (id,item_id,job_url,raw_event_json) VALUES (?,?,?,?)",
-            (event_id, item_id, url, "{}"),
+            (event_id, item_id, None, "{}"),
         )
     conn.commit()
     (tmp_path / "pairwise.jsonl").write_text(
         json.dumps({"id": "pw-1", "jobAItemId": "item-a", "jobBItemId": "item-b", "result": "b"}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pairwise-candidates.json").write_text(
+        json.dumps([{
+            "pairId": "pair-1",
+            "jobA": {"itemId": "item-a", "applicationUrl": urls[0]},
+            "jobB": {"itemId": "item-b", "applicationUrl": urls[1]},
+        }]),
         encoding="utf-8",
     )
     (tmp_path / "knowledge_graph.json").write_text(
