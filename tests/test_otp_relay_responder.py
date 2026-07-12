@@ -357,7 +357,11 @@ def test_answer_pending_request_snapshot_overflow_fails_before_scan(
             )
         conn.commit()
 
-        assert otp_relay.answer_pending(conn, _FakeGmail(matches)) == 0
+        with pytest.raises(
+            otp_relay.OtpResponderOverloadError,
+            match="pending_request_snapshot_overflow",
+        ):
+            otp_relay.answer_pending(conn, _FakeGmail(matches))
         assert conn.info.transaction_status == TransactionStatus.IDLE
         with conn.cursor() as cur:
             cur.execute(
@@ -383,7 +387,7 @@ def test_answer_pending_request_snapshot_overflow_fails_before_scan(
     assert scan_called is False
 
 
-def test_answer_pending_candidate_overflow_returns_zero_and_releases_lock(
+def test_answer_pending_candidate_overflow_raises_and_releases_lock(
     fleet_db, monkeypatch,
 ):
     def overflow(**_kwargs):
@@ -397,7 +401,11 @@ def test_answer_pending_candidate_overflow_returns_zero_and_releases_lock(
 
     with _fresh(fleet_db) as conn:
         request_id = _pending(conn, worker_id="candidate-overflow")
-        assert otp_relay.answer_pending(conn, _FakeGmail([])) == 0
+        with pytest.raises(
+            otp_relay.OtpResponderOverloadError,
+            match="mail_candidate_snapshot_overflow",
+        ):
+            otp_relay.answer_pending(conn, _FakeGmail([]))
         assert conn.info.transaction_status == TransactionStatus.IDLE
         assert otp_relay.poll_for_code(
             conn,

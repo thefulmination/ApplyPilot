@@ -402,3 +402,14 @@ def test_supervised_detects_fleet_linkedin(fleet_db):
     finally:
         holder.close()
     assert launcher.fleet_linkedin_active(fleet_db) is False      # lock free now
+
+
+def test_supervised_linkedin_probe_is_unknown_when_fleet_unreachable(monkeypatch):
+    from applypilot.apply import launcher
+
+    monkeypatch.setattr(
+        "psycopg.connect",
+        lambda _dsn: (_ for _ in ()).throw(OSError("unreachable")),
+    )
+
+    assert launcher.fleet_linkedin_active("postgresql://unreachable") is None
