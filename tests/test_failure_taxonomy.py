@@ -21,6 +21,7 @@ def test_canonical_failure_group_preserves_distinct_operator_actions():
     assert canonical_failure_group("failed:usage_limit") == "provider_usage_limit"
     assert canonical_failure_group("email_reconcile_review_required") == "manual_review"
     assert canonical_failure_group("failed:suspicious_page") == "page_or_content_failure"
+    assert canonical_failure_group("challenge_skipped") == "operator_skipped"
 
 
 def test_group_reason_counts_keeps_total_and_sorts_by_frequency():

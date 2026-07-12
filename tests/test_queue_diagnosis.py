@@ -12,13 +12,14 @@ def _seed_apply_row(
     dedup_key="dk",
     approved=True,
     apply_error=None,
+    apply_status=None,
 ):
     cur.execute(
         "INSERT INTO apply_queue "
         "(url, application_url, score, status, lane, apply_domain, target_host, "
-        "dedup_key, approved_batch, company, title, apply_error) "
+        "dedup_key, approved_batch, company, title, apply_error, apply_status) "
         "VALUES (%s,%s,9,%s,'ats','boards.greenhouse.io','boards.greenhouse.io',"
-        "%s,%s,%s,%s,%s)",
+        "%s,%s,%s,%s,%s,%s)",
         (
             url,
             f"https://example.test/{url}",
@@ -28,6 +29,7 @@ def _seed_apply_row(
             company,
             title,
             apply_error,
+            apply_status,
         ),
     )
 
@@ -88,6 +90,24 @@ def test_queue_diagnosis_exposes_blocked_reason_breakdown(fleet_db):
         "groups": {"routing_or_policy": 1, "unavailable": 1},
         "reasons": {"adapter_unsupported": 1, "expired": 1},
     }
+
+
+def test_queue_diagnosis_separates_skipped_challenges_from_active_walls(fleet_db):
+    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
+        _seed_apply_row(
+            cur,
+            url="skipped-wall",
+            status="blocked",
+            apply_error="challenge_pending",
+            apply_status="challenge_skipped",
+        )
+        conn.commit()
+
+    with pgqueue.connect(fleet_db) as conn:
+        result = queue_diagnosis.queue_diagnosis(conn)
+
+    assert result["blocked"]["reasons"] == {"challenge_skipped": 1}
+    assert result["blocked"]["groups"] == {"operator_skipped": 1}
 
 
 def test_queue_diagnosis_exposes_terminal_reason_breakdown(fleet_db):

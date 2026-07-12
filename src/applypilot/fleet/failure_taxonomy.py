@@ -10,6 +10,8 @@ def canonical_failure_group(reason: str | None) -> str:
     token = str(reason or "").strip().lower()
     if not token:
         return "unclassified"
+    if "challenge_skipped" in token:
+        return "operator_skipped"
     if "requeued_by_" in token:
         return "remediation_history"
     if "usage_limit" in token:
@@ -43,6 +45,7 @@ def canonical_failure_group(reason: str | None) -> str:
         return "eligibility"
     if any(part in token for part in (
         "auth", "login", "verification", "captcha", "cloudflare", "challenge_pending",
+        "challenge_skipped",
     )):
         return "access_or_verification"
     if any(part in token for part in (
