@@ -168,6 +168,8 @@ def _classify_body(
             meta["posted_at"] = dp.group(1).strip()
     vt = VALID_THROUGH_RE.search(body)
     if vt:
+        if meta is not None and not meta.get("valid_through"):
+            meta["valid_through"] = vt.group(1).strip()
         try:
             s = vt.group(1).strip().replace("Z", "+00:00")
             dt = datetime.fromisoformat(s)
@@ -181,10 +183,6 @@ def _classify_body(
                 return DEAD, f"jsonld_validThrough_{vt.group(1)[:10]}"
         except Exception:
             pass
-    if meta is not None and not meta.get("valid_through"):
-        vt = VALID_THROUGH_RE.search(body)
-        if vt:
-            meta["valid_through"] = vt.group(1).strip()
     if base_host(host_of(final_url)) in SPA_HOSTS and len(body) < 1500:
         return UNCERTAIN, "spa_shell"
     return LIVE, "ok_200"

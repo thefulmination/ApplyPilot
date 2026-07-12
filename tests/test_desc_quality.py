@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 from applypilot import database
 from applypilot.discovery import desc_quality
@@ -145,10 +146,11 @@ def test_refresh_then_parse_health_thresholds(tmp_path, monkeypatch) -> None:
         (f"https://example.com/{i}", "A", "Engineer", "x" * 200)
         for i in range(3, 104)
     ]
+    discovered_at = datetime.now(timezone.utc).isoformat()
     conn.executemany(
         "INSERT INTO jobs (url, title, site, full_description, discovered_at, duplicate_of_url) "
-        "VALUES (?, ?, ?, ?, '2026-07-04T00:00:00+00:00', NULL)",
-        rows,
+        "VALUES (?, ?, ?, ?, ?, NULL)",
+        [(*row, discovered_at) for row in rows],
     )
     conn.commit()
 
