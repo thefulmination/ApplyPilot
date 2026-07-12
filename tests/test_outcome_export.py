@@ -28,6 +28,9 @@ def _seed(conn):
              body_text="long body", snippet="long", extracted_by="llm", scanned_at="2026-06-29T00:00:00+00:00"),
     ]:
         S.upsert_email_event(conn, row)
+    from applypilot.outcome_review import record_review
+    record_review(conn, "m1", resolution="trusted", reviewed_by="test")
+    record_review(conn, "m2", resolution="trusted", reviewed_by="test")
 
 
 def test_export_writes_both_jsonl_with_enrichment(tmp_path):

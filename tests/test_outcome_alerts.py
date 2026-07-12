@@ -33,6 +33,9 @@ def _seed(conn):
              scanned_at="2026-06-29T00:00:00+00:00"),
     ]:
         S.upsert_email_event(conn, row)
+    from applypilot.outcome_review import record_review
+    record_review(conn, "m1", resolution="trusted", reviewed_by="test")
+    record_review(conn, "m3", resolution="trusted", reviewed_by="test")
 
 
 def test_alert_builder_classifies_and_collapses_threads(tmp_path):

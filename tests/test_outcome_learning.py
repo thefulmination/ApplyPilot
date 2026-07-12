@@ -31,6 +31,8 @@ def _seed(conn):
              match_reason="ambiguous_company"),
     ]:
         S.upsert_email_event(conn, row)
+    from applypilot.outcome_review import record_review
+    record_review(conn, "m1", resolution="trusted", reviewed_by="test")
 
 
 def test_learning_export_excludes_needs_review_rows(tmp_path):
