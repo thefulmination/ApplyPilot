@@ -335,6 +335,7 @@ foreach ($target in $targets) {
     Invoke-RemoteCommand $target "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
   } else {
     $body = New-MacBody $target
+    $body = $body -replace "`r`n", "`n"
     $encodedBody = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
     Invoke-RemoteCommand $target "bash -lc `"echo $encodedBody | base64 --decode | bash`""
   }

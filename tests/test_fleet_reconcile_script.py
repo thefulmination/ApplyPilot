@@ -58,6 +58,8 @@ def test_reconcile_script_is_check_only_by_default_and_uses_tailscale_targets() 
     ):
         assert text in script
 
+    assert '$body = $body -replace "`r`n", "`n"' in script
+
     assert "192.168.1.187" not in script
     assert '$HOME/ApplyPilot' not in script
     assert 'git fetch "$remote_name"' not in script
