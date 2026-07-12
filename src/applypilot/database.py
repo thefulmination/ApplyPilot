@@ -1139,12 +1139,25 @@ def ensure_research_tables(conn: sqlite3.Connection | None = None) -> None:
             raw_event_json        TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS research_label_confidence (
+            label_id      TEXT PRIMARY KEY,
+            item_id       TEXT,
+            weight        REAL NOT NULL CHECK(weight > 0 AND weight <= 1),
+            item_flip_rate REAL NOT NULL CHECK(item_flip_rate >= 0 AND item_flip_rate <= 1),
+            method        TEXT NOT NULL,
+            imported_at   TEXT NOT NULL,
+            raw_json      TEXT NOT NULL,
+            FOREIGN KEY(label_id) REFERENCES research_labels(id)
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_job_url ON research_scores(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_model ON research_scores(model)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_research_scores_scored_at ON research_scores(scored_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_research_labels_job_url ON research_labels(job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_research_pairwise_left ON research_pairwise_labels(left_job_url)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_research_pairwise_right ON research_pairwise_labels(right_job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_label_confidence_method ON research_label_confidence(method)")
     conn.commit()
 
 

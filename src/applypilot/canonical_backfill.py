@@ -336,6 +336,36 @@ def _kg(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
     return True
 
 
+def _label_confidence(conn: sqlite3.Connection, row: dict[str, Any]) -> bool:
+    label_id = row.get("id") or row.get("label_id") or row.get("labelId")
+    weight = row.get("weight")
+    flip_rate = row.get("itemFlipRate", row.get("item_flip_rate"))
+    method = row.get("method")
+    if not label_id or not isinstance(weight, (int, float)) or not 0 < weight <= 1:
+        return False
+    if not isinstance(flip_rate, (int, float)) or not 0 <= flip_rate <= 1 or not method:
+        return False
+    if conn.execute("SELECT 1 FROM research_labels WHERE id=?", (label_id,)).fetchone() is None:
+        return False
+    conn.execute(
+        """
+        INSERT INTO research_label_confidence (
+            label_id,item_id,weight,item_flip_rate,method,imported_at,raw_json
+        ) VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(label_id) DO UPDATE SET
+            item_id=excluded.item_id,weight=excluded.weight,
+            item_flip_rate=excluded.item_flip_rate,method=excluded.method,
+            imported_at=excluded.imported_at,raw_json=excluded.raw_json
+        """,
+        (
+            label_id, row.get("itemId") or row.get("item_id"), float(weight),
+            float(flip_rate), str(method), datetime.now(timezone.utc).isoformat(),
+            _canonical(row),
+        ),
+    )
+    return True
+
+
 def backfill_research_artifacts(conn: sqlite3.Connection, fixture_dir: str | Path) -> dict[str, Any]:
     """Import every supported artifact deterministically and idempotently."""
     root = Path(fixture_dir)
@@ -343,7 +373,12 @@ def backfill_research_artifacts(conn: sqlite3.Connection, fixture_dir: str | Pat
     reports = {
         "scores": _import_rows(conn, _files(root, "score", exclude=("pairwise",)), _score),
         "labels": _import_label_rows(
-            conn, _files(root, "label", exclude=("pairwise",)), mapping_paths
+            conn, _files(root, "label", exclude=("pairwise", "confidence")), mapping_paths
+        ),
+        "label_confidence": _import_rows(
+            conn,
+            _files(root, "labelconfidence") + _files(root, "label-confidence"),
+            _label_confidence,
         ),
         "pairwise": _import_pairwise_rows(conn, _files(root, "pairwise")),
         "kg": _import_rows(conn, _files(root, "knowledge_graph") + _files(root, "compact_kg"), _kg),

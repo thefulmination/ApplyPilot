@@ -63,6 +63,34 @@ def test_only_explicit_accepted_outcomes_enter_model_input(tmp_path):
     assert json.loads(rows[0]["attribution_json"])["messageId"] == "mail-a"
 
 
+def test_backfill_imports_label_confidence_without_mutating_labels(tmp_path):
+    conn = database.init_db(tmp_path / "brain.db")
+    url = "https://jobs.example.com/confidence"
+    conn.execute("INSERT INTO jobs (url,title) VALUES (?,?)", (url, "Role"))
+    conn.execute(
+        "INSERT INTO research_labels (id,job_url,item_id,decision,created_at) VALUES (?,?,?,?,?)",
+        ("label-1", url, "item-1", "upvote", "2026-01-01T00:00:00Z"),
+    )
+    (tmp_path / "labelConfidence.jsonl").write_text(
+        json.dumps({
+            "id": "label-1", "itemId": "item-1", "weight": 0.25,
+            "itemFlipRate": 0.75, "method": "pairwise_comparison",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    report = backfill_research_artifacts(conn, tmp_path)
+
+    assert report["label_confidence"]["written"] == 1
+    row = conn.execute(
+        "SELECT weight,item_flip_rate,method FROM research_label_confidence WHERE label_id='label-1'"
+    ).fetchone()
+    assert tuple(row) == (0.25, 0.75, "pairwise_comparison")
+    assert conn.execute(
+        "SELECT decision FROM research_labels WHERE id='label-1'"
+    ).fetchone()[0] == "upvote"
+
+
 def test_pairwise_ab_artifact_resolves_item_ids_and_kg_schema_version(tmp_path):
     conn = database.init_db(tmp_path / "brain.db")
     urls = ("https://example.com/a", "https://example.com/b")
