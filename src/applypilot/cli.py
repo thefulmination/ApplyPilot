@@ -328,6 +328,17 @@ def canonical_outcome_review(
     )
     console.print_json(data=row)
 
+
+@canonical_app.command("outcome-review-queue")
+def canonical_outcome_review_queue(
+    limit: int = typer.Option(100, "--limit", min=1),
+) -> None:
+    """Show unreviewed email evidence; no row is accepted automatically."""
+    from applypilot.outcome_review import list_canonical_review_queue
+
+    rows = list_canonical_review_queue(_canonical_connection())
+    console.print_json(data={"total": len(rows), "items": rows[:limit]})
+
 @app.callback()
 def main(
     version: bool = typer.Option(

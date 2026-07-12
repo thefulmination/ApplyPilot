@@ -88,6 +88,48 @@ def test_reassign_job_moves_event_to_other_job(tmp_path):
     assert rows[0]["job_url"] == "https://acme/2"
 
 
+def test_explicit_reviews_materialize_canonical_outcomes(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed(conn)
+
+    from applypilot.outcome_review import record_review
+
+    record_review(conn, "m2", resolution="trusted", reviewed_by="owner", note="confirmed")
+    accepted = conn.execute(
+        "SELECT * FROM reviewed_outcomes WHERE event_id = 'm2'"
+    ).fetchone()
+    assert accepted["job_url"] == "https://acme/1"
+    assert accepted["review_status"] == "accepted"
+    assert accepted["normalized_stage"] == "rejected"
+    assert accepted["reviewer"] == "owner"
+    assert accepted["reviewed_at"] is not None
+
+    record_review(
+        conn, "m2", resolution="corrected", corrected_job_url="https://acme/2",
+        corrected_stage="interview", reviewed_by="owner",
+    )
+    rows = conn.execute(
+        "SELECT job_url, review_status, normalized_stage FROM reviewed_outcomes "
+        "WHERE event_id = 'm2' ORDER BY job_url"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("https://acme/2", "accepted", "interview"),
+    ]
+
+
+def test_ignored_review_is_never_model_input(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed(conn)
+
+    from applypilot.outcome_review import record_review
+
+    record_review(conn, "m2", resolution="ignored", reviewed_by="owner")
+    row = conn.execute(
+        "SELECT review_status FROM reviewed_outcomes WHERE event_id = 'm2'"
+    ).fetchone()
+    assert row["review_status"] == "rejected"
+
+
 def test_review_queue_includes_needs_review_rows(tmp_path):
     conn = database.init_db(tmp_path / "applypilot.db")
     _seed(conn)
@@ -95,7 +137,22 @@ def test_review_queue_includes_needs_review_rows(tmp_path):
     from applypilot.outcome_review import list_review_queue
 
     rows = list_review_queue(conn)
-    assert [row["message_id"] for row in rows] == ["m3"]
+    assert [row["message_id"] for row in rows] == ["m1", "m2", "m3"]
+
+
+def test_canonical_queue_includes_attributed_but_unreviewed_events(tmp_path):
+    conn = database.init_db(tmp_path / "applypilot.db")
+    _seed(conn)
+
+    from applypilot.outcome_review import list_canonical_review_queue, record_review
+
+    assert [row["message_id"] for row in list_canonical_review_queue(conn)] == [
+        "m1", "m2", "m3",
+    ]
+    record_review(conn, "m1", resolution="trusted", reviewed_by="owner")
+    assert [row["message_id"] for row in list_canonical_review_queue(conn)] == [
+        "m2", "m3",
+    ]
 
 
 def test_recommendation_mail_is_rejected_before_matching():

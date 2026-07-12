@@ -50,7 +50,10 @@ def test_outcomes_review_resolve_trusted(monkeypatch, tmp_path):
 
     result = runner.invoke(
         cli.app,
-        ["outcomes-review", "resolve", "m1", "--resolution", "trusted"],
+        [
+            "outcomes-review", "resolve", "m1", "--resolution", "trusted",
+            "--job-url", "https://acme/1",
+        ],
     )
     assert result.exit_code == 0
 
@@ -58,6 +61,10 @@ def test_outcomes_review_resolve_trusted(monkeypatch, tmp_path):
 
     row = next(r for r in build_effective_events(conn) if r["message_id"] == "m1")
     assert row["trust_state"] == "trusted"
+    outcome = conn.execute(
+        "SELECT job_url, review_status FROM reviewed_outcomes WHERE event_id = 'm1'"
+    ).fetchone()
+    assert tuple(outcome) == ("https://acme/1", "accepted")
 
 
 def test_outcomes_review_resolve_ignored(monkeypatch, tmp_path):

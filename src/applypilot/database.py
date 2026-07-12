@@ -939,6 +939,10 @@ def ensure_canonical_decision_tables(conn: sqlite3.Connection | None = None) -> 
         ON reviewed_outcomes(review_status)
     """)
     conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reviewed_outcomes_event
+        ON reviewed_outcomes(event_id)
+    """)
+    conn.execute("""
         CREATE TRIGGER IF NOT EXISTS trg_job_decisions_policy_lane_insert
         BEFORE INSERT ON job_decisions
         FOR EACH ROW

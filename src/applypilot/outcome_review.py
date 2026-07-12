@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
+import json
 from typing import Any
 
 from applypilot.database import get_connection
@@ -119,12 +120,94 @@ def record_review(
             note,
         ),
     )
-    conn.commit()
     row = conn.execute(
         "SELECT * FROM email_event_reviews WHERE id = ?",
         (cur.lastrowid,),
     ).fetchone()
-    return _row_to_dict(row)
+    review = _row_to_dict(row)
+    _materialize_reviewed_outcome(conn, message_id, review)
+    conn.commit()
+    return review
+
+
+def _materialize_reviewed_outcome(conn, message_id: str, review: dict[str, Any]) -> None:
+    """Project one explicit review into the canonical model-input boundary."""
+    event_row = conn.execute(
+        """
+        SELECT message_id, thread_id, job_url, occurred_at, sender, sender_domain, subject,
+               stage, outcome, reason, title, company, match_method, match_score,
+               confidence, body_text, snippet, extracted_by, scanned_at,
+               match_status, match_reason, prev_job_url
+          FROM email_events
+         WHERE message_id = ?
+        """,
+        (message_id,),
+    ).fetchone()
+    if event_row is None:
+        raise ValueError(f"unknown message_id '{message_id}'")
+
+    event = _row_to_dict(event_row)
+    effective = _apply_review(event, review)
+    job_url = effective.get("job_url")
+    status = (
+        "accepted" if effective["trust_state"] in TRUSTED_STATES
+        else "rejected" if effective["trust_state"] == "ignored"
+        else "needs_review"
+    )
+    reviewed_at = review["reviewed_at"]
+
+    # email_event_reviews retains history; reviewed_outcomes is the single current projection.
+    conn.execute(
+        "DELETE FROM reviewed_outcomes WHERE event_id = ? AND (? IS NULL OR job_url != ?)",
+        (message_id, job_url, job_url),
+    )
+    if not job_url:
+        if status == "accepted":
+            raise ValueError("trusted outcome review requires a job URL")
+        return
+    if conn.execute("SELECT 1 FROM jobs WHERE url = ?", (job_url,)).fetchone() is None:
+        raise ValueError(f"outcome review references unknown job URL '{job_url}'")
+
+    attribution = {
+        "messageId": message_id,
+        "rawJobUrl": event.get("job_url"),
+        "jobUrl": job_url,
+        "matchMethod": event.get("match_method"),
+        "matchScore": event.get("match_score"),
+        "matchStatus": event.get("match_status"),
+        "reviewAction": review.get("review_action"),
+        "reviewResolution": review.get("resolution"),
+        "evidence": [f"email:{message_id}"],
+    }
+    reason = review.get("note") or event.get("match_reason") or event.get("reason")
+    conn.execute(
+        """
+        INSERT INTO reviewed_outcomes (
+            event_id, job_url, attribution_json, review_status, normalized_stage, weight,
+            reviewer, reason, created_at, reviewed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id, job_url) DO UPDATE SET
+            attribution_json = excluded.attribution_json,
+            review_status = excluded.review_status,
+            normalized_stage = excluded.normalized_stage,
+            reviewer = excluded.reviewer,
+            reason = excluded.reason,
+            reviewed_at = excluded.reviewed_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            message_id,
+            job_url,
+            json.dumps(attribution, sort_keys=True, separators=(",", ":")),
+            status,
+            effective.get("stage"),
+            review.get("reviewed_by"),
+            reason,
+            event.get("occurred_at") or reviewed_at,
+            reviewed_at,
+            reviewed_at,
+        ),
+    )
 
 
 def list_reviews(conn, message_id: str) -> list[dict[str, Any]]:
@@ -158,10 +241,6 @@ def _apply_review(event: dict[str, Any], review: dict[str, Any] | None) -> dict[
         if review.get("corrected_confidence"):
             resolved["confidence"] = review["corrected_confidence"]
         trust_state = review["resolution"]
-    elif event.get("match_status") == "needs_review":
-        trust_state = "needs_review"
-    elif event.get("job_url"):
-        trust_state = "trusted"
     else:
         trust_state = "needs_review"
 
@@ -243,5 +322,25 @@ def list_review_queue(conn=None) -> list[dict[str, Any]]:
     if conn is None:
         conn = get_connection()
     rows = [row for row in build_effective_events(conn, include_ignored=False) if row["needs_review"]]
+    rows.sort(key=lambda row: (row.get("occurred_at") or "", row.get("message_id") or ""))
+    return rows
+
+
+def list_canonical_review_queue(conn=None) -> list[dict[str, Any]]:
+    """List every email event that lacks an explicit canonical review."""
+    if conn is None:
+        conn = get_connection()
+    reviewed = set(_latest_reviews(conn))
+    rows = []
+    for row in build_effective_events(conn, include_ignored=True):
+        if row["message_id"] in reviewed:
+            continue
+        candidate = dict(row)
+        candidate["suggested_resolution"] = (
+            "ignored" if classify_review_candidate(
+                sender=row.get("sender"), subject=row.get("subject")
+            ) == "rejected" else "needs_review"
+        )
+        rows.append(candidate)
     rows.sort(key=lambda row: (row.get("occurred_at") or "", row.get("message_id") or ""))
     return rows
