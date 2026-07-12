@@ -401,6 +401,7 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
     parsed = list(unique_parsed.values())
     if not parsed:
         return 0
+    answered_ttl_seconds = _answered_ttl_seconds(answered_ttl_seconds)
 
     candidate_message_ids = list(dict.fromkeys(m.message_id for m, _ts in parsed))
     with conn.cursor() as cur:
