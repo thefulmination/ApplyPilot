@@ -372,7 +372,7 @@ function Test-PowerShellPayloadContainsComposition([string[]]$PayloadTokens) {
     }
     $executionToken = $executableText.ToString()
     if ($index -eq 0 -and $executionToken -ceq '.') { return $true }
-    if ($executionToken.Contains('$(')) { return $true }
+    if ($executionToken.Contains('$(') -or $executionToken.Contains('@(')) { return $true }
     if ($executionToken -match '(?:&&|\|\||[;|`\r\n])' -or
         $executionToken -match '^(?:\d+|\*)?(?:>>?|<)(?:&\d+)?$') {
       return $true
