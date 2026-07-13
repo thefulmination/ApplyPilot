@@ -40,12 +40,49 @@ param(
   [string]$Dsn,
   # Per-cycle apply-lane canary budget. Cost caps and rate governors still bind.
   [int]$CanaryK = 40,
-  [switch]$Unregister
+  [switch]$Unregister,
+  [string]$RenderApplyCycleWrapper,
+  [string]$ReadinessCommand,
+  [string[]]$ReadinessArgument,
+  [string]$PostReadinessCommand
 )
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
 if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
 Set-Location $repo
+
+function New-ReadinessGateContent([string]$Command, [string[]]$Arguments, [string]$OutputRedirection = '') {
+  $escapedCommand = $Command.Replace("'", "''")
+  $escapedArguments = @($Arguments | ForEach-Object { "'" + ([string]$_).Replace("'", "''") + "'" }) -join ', '
+  return @"
+`$ReadinessCommand = '$escapedCommand'
+`$ReadinessArgs = @($escapedArguments)
+& `$ReadinessCommand @ReadinessArgs $OutputRedirection
+`$readinessExit = `$LASTEXITCODE
+if (`$readinessExit -ne 0) {
+  Write-Error "ApplyCycle readiness denied with exit `$readinessExit"
+  exit `$readinessExit
+}
+"@
+}
+
+# Source-only test seam: render the exact readiness gate used by the registered wrapper
+# without requiring elevation or touching Task Scheduler.
+if ($RenderApplyCycleWrapper) {
+  if (-not $ReadinessCommand -or -not $PostReadinessCommand) {
+    throw '-RenderApplyCycleWrapper requires -ReadinessCommand and -PostReadinessCommand'
+  }
+  $gate = New-ReadinessGateContent $ReadinessCommand $ReadinessArgument
+  $escapedPost = $PostReadinessCommand.Replace("'", "''")
+  $content = @"
+`$ErrorActionPreference = 'Continue'
+$gate
+& '$escapedPost'
+exit `$LASTEXITCODE
+"@
+  [IO.File]::WriteAllText($RenderApplyCycleWrapper, $content, [Text.UTF8Encoding]::new($false))
+  exit 0
+}
 
 $TaskPrefix = "ApplyPilot "
 $wrapperDir = Join-Path $repo ".fleet-logs\_task-wrappers"
@@ -241,15 +278,7 @@ Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle
 # the apply push+resume for a whole 4h cycle -- the steps are largely independent). Track the last
 # failure and exit non-zero at the end so Task Scheduler's Last-Result still surfaces it.
 `$fail = 0
-`$rc = Step 'readiness' { & '$applyHomeExe' readiness --strict }
-if (`$rc -eq 2) {
-  Add-Content -Path `$log -Value 'ApplyCycle: readiness blocked by safety gate (expected no-op); skipping verify-live/apply stages'
-  `$rc = Step 'pull' { & '$applyHomeExe' pull }
-  if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: pull FAILED (continuing best-effort)' }
-  Add-Content -Path `$log -Value ('[' + (Get-Date -Format 'o') + '] === ApplyCycle done (paused fail=' + `$fail + ') ===')
-  exit `$fail
-}
-if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: readiness probe FAILED; skipping apply stages' }
+$(New-ReadinessGateContent $applyHomeExe @('readiness', '--strict') '*>> $log')
 `$rc = Step 'verify-live' { Invoke-VerifyLive { & '$runApplyPilotPs1' verify-live --max-age-days 3 --limit 300 } }
 if (`$rc -ne 0) { `$fail = `$rc; Add-Content -Path `$log -Value 'ApplyCycle: verify-live FAILED (continuing best-effort)' }
 `$rc = Step 'push' { & '$applyHomeExe' push --score-floor 5.8 }

@@ -6,6 +6,8 @@ import pytest
 
 from applypilot.fleet.apply_worker_main import classify_apply_channel, classify_apply_channel_from_text
 
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
+
 
 @pytest.fixture(autouse=True)
 def _healthy_browser_preflight(monkeypatch):

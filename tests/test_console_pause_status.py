@@ -59,6 +59,7 @@ def test_gate_leasable_is_zero_when_ats_paused(fleet_db):
 
 def test_console_arm_canary_refuses_ats_paused(fleet_db, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, "
@@ -76,11 +77,12 @@ def test_console_arm_canary_refuses_ats_paused(fleet_db, monkeypatch):
     assert cfg["paused"] is True
     assert cfg["ats_paused"] is True
     assert cfg["canary_enabled"] is False
-    assert cfg["canary_remaining"] is None
+    assert cfg["canary_remaining"] == 0
 
 
 def test_console_lift_canary_disarms_without_unpausing(fleet_db, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE fleet_config SET paused=TRUE, ats_paused=FALSE, "

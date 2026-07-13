@@ -1399,6 +1399,16 @@ def apply(
     tenant: Optional[str] = typer.Option(None, "--tenant", help="With --auth-gated: scope this run to a single tenant host (e.g. acme.myworkdayjobs.com)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
+    if url:
+        from applypilot.fleet import emergency_admission
+
+        admission = emergency_admission.local_apply_admission(target_url=url)
+        if not admission.allowed:
+            typer.echo(
+                f"{emergency_admission.denial_marker(admission)} {admission.reason}",
+                err=True,
+            )
+            raise typer.Exit(code=emergency_admission.DENIAL_EXIT_CODE)
     _bootstrap()
 
     from applypilot import config

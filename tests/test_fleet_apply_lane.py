@@ -6,6 +6,8 @@ import pytest
 
 from applypilot.apply import pgqueue
 
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
+
 
 def _activate_policy(conn, lane="ats"):
     policy = f"test-{lane}-policy"

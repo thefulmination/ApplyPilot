@@ -130,6 +130,7 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
     (testable). Production calls with max_iterations=None (forever).
     """
     from applypilot.apply import pgqueue
+    from applypilot.fleet import emergency_admission
     from applypilot.fleet.agent_switch import parse_reset_at
     from datetime import datetime
     _time = time_fn or time.time
@@ -143,6 +144,11 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
         except Exception:
             pass
     while max_iterations is None or it < max_iterations:
+        admission = emergency_admission.linkedin_tick_admission()
+        if not admission.allowed:
+            logger.error(admission.reason)
+            counts["halted"] += 1
+            break
         it += 1
         try:
             if budget is not None and switcher is not None:
@@ -256,12 +262,19 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
+    from applypilot.fleet import emergency_admission
+    emergency_admission.require_allowed(emergency_admission.linkedin_worker_admission())
+
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet import schema as fleet_schema
 
     with pgqueue.connect(args.dsn) as schema_conn:
-        fleet_schema.ensure_schema_v3(schema_conn)
+        try:
+            fleet_schema.require_apply_result_event_schema(schema_conn)
+            fleet_schema.require_apply_attempt_schema(schema_conn)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
 
     # Open a DEDICATED long-lived connection solely for holding the advisory lock.
     # This connection is kept open for the process life; releasing it releases the lock.
@@ -280,7 +293,6 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
         agent=args.agent,
         machine_owner=args.machine_owner,
     )
-    from applypilot.apply import launcher
     from applypilot.fleet.agent_switch import AgentSwitcher
     from applypilot.fleet.apply_worker_main import PgAgentBudget, make_apply_fn
 

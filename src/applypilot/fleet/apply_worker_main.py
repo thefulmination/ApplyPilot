@@ -14,6 +14,7 @@ import signal
 import threading
 import time
 
+from applypilot.fleet import emergency_admission
 from applypilot.fleet.version import worker_version
 
 logger = logging.getLogger("applypilot.fleet.apply_worker_main")
@@ -279,6 +280,7 @@ def make_apply_fn(
     agent_model = launcher.effective_agent_model_label(agent, model)
 
     def apply_fn(job: dict, *, attempt_store=None) -> dict:
+        emergency_admission.require_allowed(emergency_admission.launcher_admission())
         # `slot` keys this worker's Chrome profile + CDP port + per-run logs, so multiple
         # workers on ONE machine (distinct slots) never collide in a shared browser.
         worker_id = slot
@@ -684,6 +686,11 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
         except Exception:
             pass
     while not _STOP_REQUESTED.is_set() and (max_iterations is None or it < max_iterations):
+        admission = emergency_admission.worker_tick_admission()
+        if not admission.allowed:
+            logger.error(admission.reason)
+            counts["halted"] += 1
+            break
         it += 1
         try:
             command_handler = (
@@ -842,20 +849,17 @@ def enforce_host_identity(machine_owner, *, env=None) -> None:
     2026-07-04 "TARPON/m2 workers spawned on the home box" incident, where home's own
     desired count is 0). When the box is labeled and the two disagree, refuse to start.
 
-    Backward-compatible: an unset/blank APPLYPILOT_FLEET_LABEL means the box identity is
-    unknown, so we cannot guard -- allow (with a warning) rather than break as-yet
-    unlabeled boxes.
+    Unknown or incomplete identity is not enrolled and must fail closed.
     """
     env = os.environ if env is None else env
     box = (env.get("APPLYPILOT_FLEET_LABEL") or "").strip()
     owner = (machine_owner or "").strip()
     if not box:
-        logger.warning(
-            "APPLYPILOT_FLEET_LABEL is not set on this box; host-identity guard is OFF "
-            "(set it to this machine's fleet label -- home/m2/m4 -- to refuse cross-host "
-            "worker spawns)."
+        raise SystemExit(
+            "host-identity guard: APPLYPILOT_FLEET_LABEL is not set; refusing unenrolled worker"
         )
-        return
+    if not owner:
+        raise SystemExit("host-identity guard: machine-owner is missing; refusing unenrolled worker")
     if owner and owner.lower() != box.lower():
         raise SystemExit(
             f"host-identity guard: this box is '{box}' but was asked to run "
@@ -904,6 +908,14 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     from applypilot.fleet.agent_switch import AgentSwitcher
     from applypilot.fleet import schema as fleet_schema
     with pgqueue.connect(args.dsn) as schema_conn:
+        emergency_admission.require_allowed(
+            emergency_admission.worker_admission(
+                schema_conn,
+                machine_label=os.environ.get("APPLYPILOT_FLEET_LABEL"),
+                machine_owner=args.machine_owner,
+                worker_id=args.worker_id,
+            )
+        )
         try:
             fleet_schema.require_apply_result_event_schema(schema_conn)
             fleet_schema.require_apply_attempt_schema(schema_conn)

@@ -15,7 +15,7 @@ import uuid
 
 from applypilot import config
 from applypilot.apply import pgqueue
-from applypilot.fleet import queue, queue_diagnosis, schema as fleet_schema, sync
+from applypilot.fleet import emergency_admission, queue, queue_diagnosis, schema as fleet_schema, sync
 
 logger = logging.getLogger("applypilot.fleet.apply_home_main")
 
@@ -94,7 +94,7 @@ def set_canary(conn, k: int) -> None:
         cur.execute(
             "UPDATE fleet_config "
             "SET ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=%s, "
-            "paused=FALSE, updated_at=now() "
+            "updated_at=now() "
             "WHERE id=1 AND ats_paused=FALSE",
             (k,),
         )
@@ -1381,7 +1381,7 @@ def readiness(conn) -> dict:
         and not otp_row["last_error"]
     )
     liveness = crash_liveness_task_diagnosis()
-    blockers = []
+    blockers = ["emergency_acquisition_hold"]
     if cfg["paused"] or cfg["ats_paused"]:
         blockers.append("operator_pause")
     if desired_workers <= 0:
@@ -1819,14 +1819,16 @@ def arm_canary_if_safe(conn, k: int) -> bool:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE fleet_config "
-            "SET ats_apply_mode='canary', canary_enabled=TRUE, canary_remaining=%s, "
-            "paused=FALSE, updated_at=now() "
-            "WHERE id=1 AND ats_paused=FALSE",
+            "SET ats_apply_mode=CASE WHEN paused OR ats_paused THEN ats_apply_mode ELSE 'canary' END, "
+            "canary_enabled=CASE WHEN paused OR ats_paused THEN FALSE ELSE TRUE END, "
+            "canary_remaining=CASE WHEN paused OR ats_paused THEN 0 ELSE %s END, "
+            "updated_at=now() "
+            "WHERE id=1 RETURNING paused, ats_paused",
             (k,),
         )
-        n = cur.rowcount
+        state = cur.fetchone()
     conn.commit()
-    return n > 0
+    return bool(state and not state["paused"] and not state["ats_paused"])
 
 
 def _stale_codex_canary_pause_clearable(conn) -> bool:
@@ -1847,32 +1849,9 @@ def _stale_codex_canary_pause_clearable(conn) -> bool:
 
 
 def resume_if_safe(conn) -> bool:
-    """Guarded self-resume: clears ONLY a plain `paused` flag so the autonomous
-    ApplyCycle can self-resume after a cap window frees capacity. SAFETY-CRITICAL --
-    must NEVER override a Doctor/LinkedIn safety pause (ats_paused) and must never
-    resume into an exceeded cost cap.
-
-    The `AND ats_paused=FALSE` in the WHERE clause is the catastrophe guard: it is
-    mandatory so a Doctor safety pause is never overridden by this self-resume path.
-    """
-    if queue._cost_cap_exceeded(conn):
-        return False
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE fleet_config SET paused=FALSE, updated_at=now() "
-            "WHERE id=1 AND paused=TRUE AND ats_paused=FALSE"
-        )
-        n = cur.rowcount
-        if n == 0 and _stale_codex_canary_pause_clearable(conn):
-            cur.execute(
-                "UPDATE fleet_config "
-                "SET paused=FALSE, ats_paused=FALSE, ats_pause_source=NULL, updated_at=now() "
-                "WHERE id=1 AND ats_paused=TRUE "
-                "AND COALESCE(ats_pause_source, '') LIKE 'codex_canary_%'"
-            )
-            n = cur.rowcount
-    conn.commit()
-    return n > 0
+    """Keep every pause intact while the emergency acquisition hold is active."""
+    del conn
+    return False
 
 
 def resolve_challenge_cmd(conn, url: str, *, skip: bool) -> bool:
@@ -2584,9 +2563,12 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     args = p.parse_args(argv)
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
-    from applypilot.fleet import schema as fleet_schema
+    admission = emergency_admission.apply_home_admission(args.cmd)
+    if not admission.allowed:
+        print(admission.reason, file=sys.stderr)
+        return 2
     with pgqueue.connect(args.dsn) as conn:
-        fleet_schema.ensure_schema_v3(conn)
+        fleet_schema._verify_schema_v3(conn)
         if args.cmd == "push":
             print("pushed", push_home(conn, score_floor=args.score_floor, limit=args.limit,
                                       lane_filter=not args.no_lane_filter,

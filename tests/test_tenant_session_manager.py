@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
+import pytest
 
 from applypilot import database, tenants
 from applypilot.apply import tenant_sessions
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 def _local_registry(monkeypatch, tmp_path):

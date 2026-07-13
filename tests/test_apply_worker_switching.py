@@ -7,8 +7,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
 from applypilot.fleet import apply_worker_main as awm
 from applypilot.fleet.agent_switch import AgentSwitcher
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 class _StubCtx:

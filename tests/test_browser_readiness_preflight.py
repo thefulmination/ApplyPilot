@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from applypilot.apply import browser_preflight, lifecycle_fault, pgqueue
 from applypilot.fleet import queue
 from applypilot.fleet.worker import WorkerLoop
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 def _isolate_lifecycle_faults(monkeypatch, tmp_path):

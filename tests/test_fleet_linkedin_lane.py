@@ -215,7 +215,7 @@ def test_linkedin_external_auth_required_closes_job_without_account_halt(fleet_d
         assert governor is not None and governor["halted_until"] is None
 
 
-def test_linkedin_driver_uses_lane_specific_halt(monkeypatch):
+def test_linkedin_driver_uses_lane_specific_halt(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
 
     class _Conn:
@@ -266,7 +266,7 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
     assert captured["fleet_worker_id"] == "w"
 
 
-def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
+def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
 
     class _Conn:
@@ -289,7 +289,7 @@ def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
     assert sleeps == [7]
 
 
-def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
+def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
     from applypilot.fleet.agent_switch import AgentSwitcher
 
@@ -337,7 +337,7 @@ def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
     assert counts["applied"] == 1
 
 
-def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
+def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
     from applypilot.fleet.agent_switch import AgentSwitcher
 

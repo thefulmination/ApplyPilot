@@ -2218,9 +2218,8 @@ def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
                 fields = discover_fields(page)
                 answer_fn = None
                 if not own:
-                    answer_fn = lambda *args, **kwargs: types.SimpleNamespace(
-                        verified=False, text="",
-                    )
+                    def answer_fn(*args, **kwargs):
+                        return types.SimpleNamespace(verified=False, text="")
                 plan = build_ashby_plan(
                     fields, profile=profile, resume_text=resume_text,
                     job={"site": job.get("site", ""), "title": job.get("title", "")},
@@ -4059,6 +4058,9 @@ def main(limit: int = 1, target_url: str | None = None,
             the real terminal status and a challenge-class result halts that
             tenant for the day.
     """
+    from applypilot.fleet.emergency_admission import launcher_admission, require_allowed
+
+    require_allowed(launcher_admission())
     global POLL_INTERVAL
     POLL_INTERVAL = int(os.environ.get("APPLYPILOT_POLL_INTERVAL") or poll_interval)
     _stop_event.clear()

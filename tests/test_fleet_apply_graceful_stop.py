@@ -3,7 +3,11 @@ finish the CURRENT job and exit before the next lease (a mid-apply kill parks th
 crash_unconfirmed = the 'may-have-submitted' double-apply vector)."""
 from unittest.mock import MagicMock
 
+import pytest
+
 from applypilot.fleet import apply_worker_main as awm
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 class _StubCtx:

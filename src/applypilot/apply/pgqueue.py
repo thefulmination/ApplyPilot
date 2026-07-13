@@ -8,7 +8,7 @@ re-pushes and nothing important is gone.
 
 Every function takes an OPEN psycopg connection so callers control transaction scope and the
 whole layer is trivially testable against a throwaway local Postgres. The production DSN comes
-from APPLYPILOT_FLEET_DSN when set, otherwise DATABASE_URL (Railway injects it for the worker).
+only from APPLYPILOT_FLEET_DSN; generic DATABASE_URL may identify an unrelated database.
 
 Concurrency contract (the part that must never break):
   * lease_one  -> FOR UPDATE SKIP LOCKED: N workers each grab a DISTINCT row, never blocking.
@@ -34,11 +34,15 @@ _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding=
 # ---------------------------------------------------------------------------
 
 def get_dsn(dsn: str | None = None) -> str:
-    dsn = dsn or os.environ.get("APPLYPILOT_FLEET_DSN") or os.environ.get("DATABASE_URL")
+    if dsn:
+        return dsn
+    fleet_dsn = os.environ.get("FLEET_PG_DSN")
+    applypilot_dsn = os.environ.get("APPLYPILOT_FLEET_DSN")
+    if fleet_dsn and applypilot_dsn and fleet_dsn != applypilot_dsn:
+        raise RuntimeError("Inconsistent fleet Postgres DSN references; refusing ambiguous control database.")
+    dsn = fleet_dsn or applypilot_dsn
     if not dsn:
-        raise RuntimeError(
-            "No Postgres DSN: set DATABASE_URL (Railway) or APPLYPILOT_FLEET_DSN."
-        )
+        raise RuntimeError("No fleet Postgres DSN: set FLEET_PG_DSN or APPLYPILOT_FLEET_DSN explicitly.")
     return dsn
 
 

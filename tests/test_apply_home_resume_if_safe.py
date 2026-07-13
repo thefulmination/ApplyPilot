@@ -15,16 +15,16 @@ def _get_flags(conn):
     return row["paused"], row["ats_paused"]
 
 
-def test_resume_if_safe_clears_plain_pause(fleet_db):
+def test_resume_if_safe_preserves_plain_pause_during_emergency_hold(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("UPDATE fleet_config SET paused=TRUE, ats_paused=FALSE WHERE id=1")
         conn.commit()
     with pgqueue.connect(fleet_db) as conn:
         result = hm.resume_if_safe(conn)
-        assert result is True
+        assert result is False
         paused, ats_paused = _get_flags(conn)
-        assert paused is False
+        assert paused is True
         assert ats_paused is False
 
 
@@ -48,7 +48,7 @@ def test_resume_if_safe_never_overrides_ats_paused(fleet_db):
             assert cur.fetchone()["ats_pause_source"] == "doctor", "ats_pause_source must never be touched"
 
 
-def test_resume_if_safe_clears_stale_codex_canary_pause_without_live_blockers(fleet_db):
+def test_resume_if_safe_preserves_stale_codex_canary_pause_during_emergency_hold(fleet_db):
     from applypilot.fleet import apply_home_main as hm
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("UPDATE fleet_config SET paused=TRUE, ats_paused=TRUE, "
@@ -56,13 +56,13 @@ def test_resume_if_safe_clears_stale_codex_canary_pause_without_live_blockers(fl
         conn.commit()
     with pgqueue.connect(fleet_db) as conn:
         result = hm.resume_if_safe(conn)
-        assert result is True
+        assert result is False
         paused, ats_paused = _get_flags(conn)
-        assert paused is False
-        assert ats_paused is False
+        assert paused is True
+        assert ats_paused is True
         with conn.cursor() as cur:
             cur.execute("SELECT ats_pause_source FROM fleet_config WHERE id=1")
-            assert cur.fetchone()["ats_pause_source"] is None
+            assert cur.fetchone()["ats_pause_source"] == "codex_canary_blocked_agent_limits"
 
 
 def test_resume_if_safe_keeps_codex_canary_pause_when_paused_breaker_is_live(fleet_db):

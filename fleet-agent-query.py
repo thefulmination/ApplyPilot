@@ -1,20 +1,25 @@
 """fleet-agent-query.py <machine_label>
 
-Print "<desired_workers>|<agent>|<model>|<generation>" for one machine from the home Postgres
-table fleet_desired_state. Used by fleet-agent.ps1 on each worker box (which has Python+psycopg but
-usually no psql.exe). Reads the DSN from FLEET_PG_DSN / APPLYPILOT_FLEET_DSN / DATABASE_URL.
+Validate one machine's desired-state control row from home Postgres. Used by fleet-agent.ps1 on
+each worker box (which has Python+psycopg but usually no psql.exe). During the emergency hold it
+always prints "STOP|||" after a successful validation and on every error. Reads an explicitly
+fleet-scoped DSN only.
 
-On any error (DB unreachable, table missing) it prints "KEEP|||" so the agent leaves the local
-workers exactly as-is rather than killing them on a transient blip (fail-safe, never fail-destructive).
+On any error it prints "STOP|||" so stale desired state cannot preserve acquisition authority.
 """
 import os
 import sys
 
 label = sys.argv[1] if len(sys.argv) > 1 else "home"
-dsn = (os.environ.get("FLEET_PG_DSN") or os.environ.get("APPLYPILOT_FLEET_DSN")
-       or os.environ.get("DATABASE_URL"))
+fleet_dsn = os.environ.get("FLEET_PG_DSN")
+applypilot_dsn = os.environ.get("APPLYPILOT_FLEET_DSN")
+dsn = fleet_dsn or applypilot_dsn
 try:
     from applypilot.apply import pgqueue
+    if not dsn:
+        raise RuntimeError("fleet DSN unavailable")
+    if fleet_dsn and applypilot_dsn and fleet_dsn != applypilot_dsn:
+        raise RuntimeError("inconsistent fleet DSN references")
     conn = pgqueue.connect(dsn)
     with conn.cursor() as cur:
         cur.execute(
@@ -22,10 +27,9 @@ try:
             "FROM fleet_desired_state WHERE machine_owner=%s", (label,))
         r = cur.fetchone()
     if r:
-        print(f"{r['desired_workers']}|{r['agent']}|{r['model']}|{r['generation']}")
+        print("STOP|||")
     else:
-        # no row for this machine yet -> desired 0 (idle), but say so explicitly
-        print("0|claude||0")
+        print("STOP|||")
 except Exception as exc:
-    print(f"fleet-agent-query: {type(exc).__name__}: {exc}", file=sys.stderr)
-    print("KEEP|||")  # fail-safe: leave local workers untouched
+    print(f"fleet-agent-query: {type(exc).__name__}: control state unavailable", file=sys.stderr)
+    print("STOP|||")

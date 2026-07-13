@@ -11,16 +11,58 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LOCAL_SRC = (_REPO_ROOT / "src").resolve()
+
+
+def _pin_local_src() -> None:
+    sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _LOCAL_SRC]
+    sys.path.insert(0, str(_LOCAL_SRC))
+
+
+_pin_local_src()
 
 psycopg = pytest.importorskip("psycopg")
 
 from applypilot import config  # noqa: E402
 from applypilot.apply import pgqueue  # noqa: E402
 from applypilot.fleet import schema as fleet_schema  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def pin_local_applypilot_checkout():
+    """Keep test imports bound to this worktree rather than an editable sibling."""
+    _pin_local_src()
+    import applypilot
+
+    assert Path(applypilot.__file__).resolve().is_relative_to(_LOCAL_SRC)
+
+
+@pytest.fixture
+def acquisition_admitted(monkeypatch):
+    """Explicitly cross the A1 admission seam for downstream unit behavior tests."""
+    from applypilot.fleet import emergency_admission
+
+    def admitted(*_args, **_kwargs):
+        return emergency_admission.allow("explicit downstream unit-test admission")
+
+    for name in (
+        "launcher_admission",
+        "worker_tick_admission",
+        "linkedin_worker_admission",
+        "linkedin_tick_admission",
+        "workday_onboard_admission",
+        "workday_rollout_admission",
+        "linkedin_home_admission",
+        "worker_admission",
+    ):
+        monkeypatch.setattr(emergency_admission, name, admitted)
 
 # Tables truncated between tests (in addition to apply_queue / fleet_config).
 _V3_TABLES = [
@@ -105,8 +147,10 @@ def fleet_pg():
 
 
 @pytest.fixture
-def fleet_db(fleet_pg):
+def fleet_db(fleet_pg, monkeypatch):
     """Clean v3 schema for each test; yields the DSN."""
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_pg)
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_pg)
     with pgqueue.connect(fleet_pg) as conn:
         fleet_schema.ensure_schema_v3(conn)
         with conn.cursor() as cur:

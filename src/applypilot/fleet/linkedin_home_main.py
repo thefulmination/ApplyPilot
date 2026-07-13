@@ -209,9 +209,12 @@ def main(argv=None) -> int:  # pragma: no cover - CLI wiring
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
-    from applypilot.fleet import schema as fleet_schema
+    from applypilot.fleet import emergency_admission, schema as fleet_schema
+    emergency_admission.require_allowed(
+        emergency_admission.linkedin_home_admission(args.cmd)
+    )
     with pgqueue.connect(args.dsn) as conn:
-        fleet_schema.ensure_schema_v3(conn)
+        fleet_schema._verify_schema_v3(conn)
         if args.cmd == "push":
             n = sync.push_linkedin_eligible(pg_conn=conn, score_floor=args.score_floor,
                                             max_age_days=args.max_age_days, limit=args.limit,

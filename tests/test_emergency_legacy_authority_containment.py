@@ -1,0 +1,1467 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import runpy
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+SCRIPT = ROOT / "scripts" / "emergency-contain-legacy-authority.ps1"
+
+
+ADAPTER = r"""
+function Read-FakeState { Get-Content -LiteralPath $env:FAKE_STATE -Raw | ConvertFrom-Json }
+function Write-FakeState($State) { $State | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $env:FAKE_STATE -Encoding utf8 }
+function Get-LegacyTasks {
+  if ($env:FAKE_ENUM_FAIL -eq 'scheduled_tasks') { throw 'task enumeration leaked-secret' }
+  $state = Read-FakeState
+  return @($state.tasks | ForEach-Object {
+    [pscustomobject]@{
+      TaskName=$_.name; TaskPath='\'; State=$_.state
+      Principal=[pscustomobject]@{UserId=$_.principal}
+      Actions=@([pscustomobject]@{Execute='pwsh.exe'; Arguments=$_.arguments; WorkingDirectory='C:\secret'})
+    }
+  })
+}
+function Stop-LegacyTask($Task) {
+  if ($env:FAKE_FAIL_ACTION -eq 'stop_task') { throw 'injected stop failure' }
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  $state=Read-FakeState; foreach($item in $state.tasks){if($item.name -eq $Task.TaskName){$item.state='Ready'}}; Write-FakeState $state
+}
+function Disable-LegacyTask($Task) {
+  if ($env:FAKE_FAIL_ACTION -eq 'disable_task') { throw 'injected disable failure' }
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  $state=Read-FakeState; foreach($item in $state.tasks){if($item.name -eq $Task.TaskName){$item.state='Disabled'}}; Write-FakeState $state
+}
+function Get-LegacyServices {
+  if ($env:FAKE_ENUM_FAIL -eq 'services') { throw 'service enumeration leaked-secret' }
+  $state=Read-FakeState
+  return @($state.services | ForEach-Object { [pscustomobject]@{Name=$_.name; Status=$_.status; StartType=$_.start_type} })
+}
+function Stop-LegacyService($Service) {
+  if ($env:FAKE_FAIL_ACTION -eq 'stop_service') { throw 'injected service failure' }
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  $state=Read-FakeState; foreach($item in $state.services){if($item.name -eq $Service.Name){$item.status='Stopped'}}; Write-FakeState $state
+}
+function Disable-LegacyService($Service) {
+  if ($env:FAKE_FAIL_ACTION -eq 'disable_service') { throw 'injected service failure' }
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  $state=Read-FakeState; foreach($item in $state.services){if($item.name -eq $Service.Name){$item.start_type='Disabled'}}; Write-FakeState $state
+}
+function Get-LegacyProcesses {
+  if ($env:FAKE_ENUM_FAIL -eq 'processes') { throw 'process enumeration leaked-secret' }
+  $state=Read-FakeState
+  return @($state.processes | ForEach-Object { [pscustomobject]@{ProcessId=$_.id; Name=$_.name; ExecutablePath=$_.path; CommandLine=$_.command} })
+}
+function Stop-LegacyProcess($Process) {
+  if ($env:FAKE_FAIL_ACTION -eq 'stop_process') { throw 'injected process failure' }
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  $state=Read-FakeState; $state.processes=@($state.processes | Where-Object {$_.id -ne $Process.ProcessId}); Write-FakeState $state
+}
+function Set-KnownWrapperContent([string]$Path, [string]$Content) {
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
+function Get-ControlEvidence {
+  return [ordered]@{
+    admission_state=[ordered]@{
+      available=$true; authority_source='fleet_postgres'; dsn_reference='FLEET_PG_DSN'
+      fields=[ordered]@{paused=$true; ats_paused=$false; ats_apply_mode='canary'; canary_enabled=$false; linkedin_apply_mode='paused'}
+    }
+    unresolved_attempt_counts=[ordered]@{
+      available=$true; authority_source='fleet_postgres'; dsn_reference='FLEET_PG_DSN'
+      queues=[ordered]@{apply_queue=[ordered]@{leased=2; unresolved=3}; linkedin_queue=[ordered]@{leased=1; unresolved=1}}
+    }
+  }
+}
+function Get-SupplementaryLocalAttemptCounts {
+  return [ordered]@{available=$true; authority_source='local_sqlite_supplementary'; ambiguous=9; in_progress=4}
+}
+"""
+
+
+def _fixture(tmp_path: Path) -> dict[str, Path]:
+    secret = "postgresql://operator:super-secret@db.invalid/fleet"
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "name": "ApplyPilot ApplyCycle",
+                        "state": "Running",
+                        "principal": "DOMAIN\\secret-operator",
+                        "arguments": f"-dsn {secret}",
+                    }
+                ],
+                "services": [
+                    {
+                        "name": "ApplyPilotWorkday",
+                        "status": "Running",
+                        "start_type": "Automatic",
+                    }
+                ],
+                "processes": [
+                    {
+                        "id": 4242,
+                        "name": "applypilot-workday-rollout.exe",
+                        "path": "C:\\secret\\applypilot-workday-rollout.exe",
+                        "command": "applypilot-workday-rollout canary --approval-token secret-token",
+                    }
+                ],
+                "evidence": ["must-survive"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter = tmp_path / "adapter.ps1"
+    adapter.write_text(ADAPTER, encoding="utf-8")
+    probe = tmp_path / "applypilot-probe.ps1"
+    probe.write_text(
+        "Write-Output 'APPLYPILOT_ADMISSION_DENIED:EMERGENCY_HOLD verified'; exit 78\n",
+        encoding="utf-8",
+    )
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    known = wrappers / "apply-cycle-task.ps1"
+    known.write_text(f"$env:FLEET_PG_DSN = '{secret}'\n# evidence remains\n", encoding="utf-8")
+    known_cmd = wrappers / "apply-worker-m2.cmd"
+    known_cmd.write_text(
+        "\n".join(
+            [
+                f"set FLEET_PG_DSN={secret}",
+                f'set "DATABASE_URL={secret}/database-url"',
+                "set APPLYPILOT_OPENAI_API_KEY=raw-wrapper-secret",
+                "REM evidence remains",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    known_bat = wrappers / "linkedin-m2.bat"
+    known_bat.write_text(
+        f'set "APPLYPILOT_FLEET_DSN={secret}/legacy"\nREM linkedin evidence remains\n',
+        encoding="utf-8",
+    )
+    outside = wrappers / "unrelated-maintenance.ps1"
+    outside.write_text(f"# unrelated {secret}\n", encoding="utf-8")
+    nested = wrappers / "nested"
+    nested.mkdir()
+    nested_outside = nested / "workday-unrelated.ps1"
+    nested_outside.write_text(f"# nested unrelated {secret}\n", encoding="utf-8")
+    return {
+        "state": state,
+        "adapter": adapter,
+        "probe": probe,
+        "wrappers": wrappers,
+        "known": known,
+        "known_cmd": known_cmd,
+        "known_bat": known_bat,
+        "outside": outside,
+        "nested_outside": nested_outside,
+    }
+
+
+def _run(
+    mode: str,
+    fixture: dict[str, Path],
+    *,
+    fail_action: str | None = None,
+    noop_actions: bool = False,
+    probe=None,
+    inject_adapter: bool = True,
+    inject_console: bool = True,
+):
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_STATE": str(fixture["state"]),
+            "FLEET_PG_DSN": "postgresql://operator:super-secret@db.invalid/fleet",
+            "APPLYPILOT_OPENAI_API_KEY": "raw-api-secret",
+        }
+    )
+    if not inject_adapter:
+        env.pop("FLEET_PG_DSN", None)
+        env.pop("APPLYPILOT_FLEET_DSN", None)
+    if fail_action:
+        env["FAKE_FAIL_ACTION"] = fail_action
+    if noop_actions:
+        env["FAKE_NOOP_ACTIONS"] = "1"
+    command = ["pwsh", "-NoProfile", "-File", str(SCRIPT), f"-{mode}"]
+    if inject_adapter:
+        command.extend(["-AdapterPath", str(fixture["adapter"])])
+    command.extend(["-WrapperRoot", str(fixture["wrappers"])])
+    if inject_console:
+        command.extend(["-ConsoleCommand", str(probe or fixture["probe"])])
+    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, check=False)
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    return result, payload
+
+
+def _ps_quote(value: Path | str) -> str:
+    return str(value).replace("'", "''")
+
+
+def _run_orchestration(
+    mode: str,
+    fixture: dict[str, Path],
+    *,
+    fail_action: str | None = None,
+    noop_actions: bool = False,
+    enumeration_failure: str | None = None,
+    probe_verified: bool = True,
+    include_disposition: bool = False,
+):
+    harness = fixture["state"].parent / f"orchestration-{mode}.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(fixture['wrappers'])}'",
+                ADAPTER,
+                "function Invoke-RejectionProbe {",
+                (
+                    "  return [ordered]@{status='verified'; verified=$true; decision='deny'; "
+                    "exit_code=78; output_digest='probe-digest'}"
+                    if probe_verified
+                    else "  return [ordered]@{status='unverified'; verified=$false; decision=$null; "
+                    "exit_code=1; output_digest='probe-digest'}"
+                ),
+                "}",
+                f"$result = Invoke-ContainmentOrchestration -Operation '{mode.lower()}'",
+                (
+                    "$disposition = Get-ContainmentDisposition -Core $result; "
+                    "[ordered]@{core=$result; disposition=$disposition} | ConvertTo-Json -Depth 12 -Compress"
+                    if include_disposition
+                    else "$result | ConvertTo-Json -Depth 12 -Compress"
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "FAKE_STATE": str(fixture["state"]),
+            "FLEET_PG_DSN": "postgresql://operator:super-secret@db.invalid/fleet",
+            "APPLYPILOT_OPENAI_API_KEY": "raw-api-secret",
+        }
+    )
+    if fail_action:
+        env["FAKE_FAIL_ACTION"] = fail_action
+    if noop_actions:
+        env["FAKE_NOOP_ACTIONS"] = "1"
+    if enumeration_failure:
+        env["FAKE_ENUM_FAIL"] = enumeration_failure
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    return result, payload
+
+
+@pytest.mark.parametrize("mode", ["Inspect", "Contain"])
+def test_injected_seams_are_rejected_without_touching_fixture(mode, tmp_path):
+    fixture = _fixture(tmp_path)
+    state_before = fixture["state"].read_bytes()
+    known_before = fixture["known"].read_bytes()
+    outside_before = fixture["outside"].read_bytes()
+    nested_before = fixture["nested_outside"].read_bytes()
+
+    result, payload = _run(mode, fixture)
+
+    assert result.returncode != 0
+    assert payload == {
+        "schema_version": 3,
+        "mode": "test",
+        "operation": mode.lower(),
+        "operational": False,
+        "non_operational_reasons": ["adapter_injected", "console_command_injected"],
+        "success": False,
+        "rejection": "injected_execution_seam_disabled",
+        "evidence_deleted": False,
+    }
+    assert len(result.stdout.strip().splitlines()) == 1
+    assert "super-secret" not in result.stdout
+    assert "raw-api-secret" not in result.stdout
+    assert "secret-token" not in result.stdout
+    assert fixture["state"].read_bytes() == state_before
+    assert fixture["known"].read_bytes() == known_before
+    assert fixture["outside"].read_bytes() == outside_before
+    assert fixture["nested_outside"].read_bytes() == nested_before
+
+
+def test_pure_after_state_evaluation_reports_unresolved_targets_and_is_nonoperational():
+    snapshot = {
+        "scheduled_tasks": [{"state": "Ready", "target_digest": "task-digest"}],
+        "services": [
+            {"status": "Running", "start_type": "Automatic", "target_digest": "service-digest"}
+        ],
+        "process_identities": [{"target_digest": "process-digest"}],
+        "wrapper_hashes": [{"embedded_dsn": True, "path_digest": "wrapper-digest"}],
+    }
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(SCRIPT),
+            "-EvaluateAfterStateJson",
+            json.dumps(snapshot, separators=(",", ":")),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    payload = json.loads(result.stdout.strip())
+    assert payload["mode"] == "test"
+    assert payload["operation"] == "evaluate_after_state"
+    assert payload["operational"] is False
+    assert payload["success"] is False
+    assert payload["postconditions_satisfied"] is False
+    assert {item["kind"] for item in payload["unresolved_targets"]} == {
+        "task",
+        "service",
+        "process",
+        "wrapper",
+    }
+
+
+def test_definition_import_direct_invocation_is_nonoperational_and_nonzero():
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-DefinitionImport"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert json.loads(result.stdout.strip()) == {
+        "schema_version": 3,
+        "mode": "test",
+        "operation": "definition_import",
+        "operational": False,
+        "success": False,
+        "rejection": "definition_import_requires_dot_source",
+        "evidence_deleted": False,
+    }
+
+
+def test_shared_orchestration_executes_complete_containment_and_is_idempotent(tmp_path):
+    fixture = _fixture(tmp_path)
+    outside_before = fixture["outside"].read_bytes()
+    nested_before = fixture["nested_outside"].read_bytes()
+
+    inspect_result, inspected = _run_orchestration("Inspect", fixture)
+    assert inspect_result.returncode == 0, inspect_result.stderr
+    assert inspected["operation"] == "inspect"
+    assert "operational" not in inspected
+    assert "success" not in inspected
+    assert inspected["before_rejection_probe"]["status"] == "verified"
+    assert inspected["before"]["pause_admission_state"]["authority_source"] == "fleet_postgres"
+    assert inspected["before"]["unresolved_attempt_counts"]["authority_source"] == "fleet_postgres"
+
+    first_result, first = _run_orchestration("Contain", fixture)
+    assert first_result.returncode == 0, first_result.stderr
+    assert first["operation"] == "contain"
+    assert "operational" not in first
+    assert "success" not in first
+    assert first["postconditions_satisfied"] is True
+    assert first["failures"] == []
+    assert first["after_rejection_probe"]["decision"] == "deny"
+    assert "removed by emergency containment" in fixture["known"].read_text(encoding="utf-8")
+    assert "evidence remains" in fixture["known"].read_text(encoding="utf-8")
+    cmd_content = fixture["known_cmd"].read_text(encoding="utf-8")
+    assert "FLEET_PG_DSN=" not in cmd_content
+    assert "DATABASE_URL=" not in cmd_content
+    assert "APPLYPILOT_OPENAI_API_KEY=" not in cmd_content
+    assert "super-secret" not in cmd_content
+    assert "raw-wrapper-secret" not in cmd_content
+    assert "REM evidence remains" in cmd_content
+    bat_content = fixture["known_bat"].read_text(encoding="utf-8")
+    assert "APPLYPILOT_FLEET_DSN=" not in bat_content
+    assert "super-secret" not in bat_content
+    assert "REM linkedin evidence remains" in bat_content
+    assert "super-secret" not in first_result.stdout
+    assert "raw-wrapper-secret" not in first_result.stdout
+    assert fixture["outside"].read_bytes() == outside_before
+    assert fixture["nested_outside"].read_bytes() == nested_before
+    state = json.loads(fixture["state"].read_text(encoding="utf-8-sig"))
+    assert state["evidence"] == ["must-survive"]
+    assert state["tasks"][0]["state"] == "Disabled"
+    assert state["services"][0]["status"] == "Stopped"
+    assert state["services"][0]["start_type"] == "Disabled"
+    assert state["processes"] == []
+
+    known_after_first = fixture["known"].read_bytes()
+    second_result, second = _run_orchestration("Contain", fixture)
+    assert second_result.returncode == 0, second_result.stderr
+    assert second["postconditions_satisfied"] is True
+    assert second["failures"] == []
+    assert "operational" not in second
+    assert "success" not in second
+    assert fixture["known"].read_bytes() == known_after_first
+
+
+def test_shared_orchestration_reports_action_failure(tmp_path):
+    fixture = _fixture(tmp_path)
+    result, payload = _run_orchestration("Contain", fixture, fail_action="disable_task")
+
+    assert result.returncode == 0, result.stderr
+    assert payload["postconditions_satisfied"] is False
+    assert any(failure["action"] == "disable_task" for failure in payload["failures"])
+    assert "operational" not in payload
+    assert "success" not in payload
+    assert "super-secret" not in result.stdout
+
+
+def test_shared_orchestration_rejects_successful_noop_after_snapshot(tmp_path):
+    fixture = _fixture(tmp_path)
+    result, payload = _run_orchestration("Contain", fixture, noop_actions=True)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["postconditions_satisfied"] is False
+    assert {item["kind"] for item in payload["unresolved_targets"]} == {
+        "task",
+        "service",
+        "process",
+        "wrapper",
+    }
+    assert all(item["target_digest"] for item in payload["unresolved_targets"])
+    assert "operational" not in payload
+    assert "success" not in payload
+
+
+@pytest.mark.parametrize("source", ["scheduled_tasks", "services", "processes"])
+def test_enumeration_failure_is_sanitized_and_cannot_succeed(source, tmp_path):
+    fixture = _fixture(tmp_path)
+    result, payload = _run_orchestration(
+        "Inspect",
+        fixture,
+        enumeration_failure=source,
+        include_disposition=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    core = payload["core"]
+    assert core["postconditions_satisfied"] is False
+    assert core["enumeration_failures"] == [
+        {"source": source, "error": "enumeration_unavailable"}
+    ]
+    assert payload["disposition"] == {"success": False, "exit_code": 1}
+    assert "leaked-secret" not in result.stdout
+
+
+def test_unverified_inspect_disposition_is_unsuccessful_and_nonzero(tmp_path):
+    fixture = _fixture(tmp_path)
+    result, payload = _run_orchestration(
+        "Inspect",
+        fixture,
+        probe_verified=False,
+        include_disposition=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert payload["core"]["after_rejection_probe"]["verified"] is False
+    assert payload["disposition"] == {"success": False, "exit_code": 1}
+    assert "operational" not in payload
+
+
+def test_control_query_reads_dsn_from_environment_not_child_argv(tmp_path):
+    argv_capture = tmp_path / "python-argv.json"
+    harness = tmp_path / "dsn-argv-harness.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                "function py {",
+                "  [IO.File]::WriteAllText($env:ARGV_CAPTURE, (@($args) | ConvertTo-Json -Compress))",
+                "  $global:LASTEXITCODE = 0",
+                "  Write-Output '{\"state\":{\"paused\":true},\"counts\":{}}'",
+                "}",
+                "$result = Get-ControlEvidence",
+                "$result | ConvertTo-Json -Depth 8 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    secret_dsn = "postgresql://operator:argv-secret@db.invalid/fleet"
+    env = os.environ.copy()
+    env["FLEET_PG_DSN"] = secret_dsn
+    env.pop("APPLYPILOT_FLEET_DSN", None)
+    env["ARGV_CAPTURE"] = str(argv_capture)
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["admission_state"]["available"] is True
+    argv_text = argv_capture.read_text(encoding="utf-8-sig")
+    assert secret_dsn not in argv_text
+    assert "argv-secret" not in argv_text
+
+
+def test_authority_inventory_enumerates_all_and_survivors_are_unresolved(tmp_path):
+    harness = tmp_path / "authority-inventory.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                "$global:FakeTasks = @(",
+                "  [pscustomobject]@{TaskName='ApplyPilot ApplyCycle'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='cmd.exe'; Arguments='/c echo benign'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Neutral Exec'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='C:\\ApplyPilot\\applypilot-fleet-apply.exe'; Arguments='--worker-id m2-0'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Neutral Task'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='pwsh.exe'; Arguments='-File C:\\repo\\run-fleet-worker.ps1'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Program Files PowerShell Action'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='C:\\Program Files\\PowerShell\\7\\pwsh.exe'; Arguments='-NoProfile -File run-fleet-workers.ps1 -Count 2'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Program Files Python Action'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='C:\\Program Files\\Python312\\python.exe'; Arguments='-I -m applypilot.fleet.apply_worker_main --worker-id m2-0'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Program Files PowerShell Benign'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='C:\\Program Files\\PowerShell\\7\\pwsh.exe'; Arguments='-Command benign -File run-fleet-workers.ps1'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Program Files Python Benign'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='C:\\Program Files\\Python312\\python.exe'; Arguments='-c pass -m applypilot.fleet.apply_worker_main'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='ApplyPilot LinkedIn Report'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='C:\\ApplyPilot\\applypilot-workday-report.exe'; Arguments='--read-only'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='ApplyPilot Workday Discovery'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='cmd.exe'; Arguments='/c echo discovery'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='ApplyPilot LinkedIn Monitor'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='cmd.exe'; Arguments='/c echo monitor'; WorkingDirectory='C:\\repo'})},",
+                "  [pscustomobject]@{TaskName='Benign Task'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='pwsh.exe'; Arguments='-File C:\\repo\\run-fleet-worker-report.ps1'; WorkingDirectory='C:\\repo'})}",
+                ")",
+                "$global:FakeServices = @(",
+                "  [pscustomobject]@{Name='ApplyPilotWorkday'; State='Running'; StartMode='Auto'; PathName='cmd.exe /c echo benign'},",
+                "  [pscustomobject]@{Name='NeutralService'; State='Running'; StartMode='Auto'; PathName='pwsh.exe -File C:\\repo\\run-tarpon-linkedin.ps1'},",
+                "  [pscustomobject]@{Name='ApplyPilotWorkdayReport'; State='Running'; StartMode='Auto'; PathName='C:\\ApplyPilot\\applypilot-workday-report.exe --read-only'},",
+                "  [pscustomobject]@{Name='ApplyPilot LinkedIn Report'; State='Running'; StartMode='Auto'; PathName='cmd.exe /c echo report'},",
+                "  [pscustomobject]@{Name='ApplyPilot Workday Discovery'; State='Running'; StartMode='Auto'; PathName='cmd.exe /c echo discovery'},",
+                "  [pscustomobject]@{Name='ApplyPilotLinkedInMonitor'; State='Running'; StartMode='Auto'; PathName='cmd.exe /c echo monitor'},",
+                "  [pscustomobject]@{Name='BenignService'; State='Running'; StartMode='Auto'; PathName='pwsh.exe -File C:\\repo\\run-tarpon-linkedin-report.ps1'}",
+                ")",
+                "$global:FakeProcesses = @(",
+                "  [pscustomobject]@{ProcessId=9001; Name='py.exe'; ExecutablePath='C:\\Windows\\py.exe'; CommandLine='py.exe -3.12 -X utf8 -m applypilot.fleet.apply_worker_main --worker-id m2-0'},",
+                "  [pscustomobject]@{ProcessId=9002; Name='py.exe'; ExecutablePath='C:\\Windows\\py.exe'; CommandLine='py.exe -m applypilot.fleet.apply_worker_main_helper --read-only'}",
+                ")",
+                "function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName); if ($PSBoundParameters.ContainsKey('TaskName')) { throw 'name-prefiltered' }; $global:FakeTasks }",
+                "function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName); if ($ClassName -eq 'Win32_Service') { $global:FakeServices } elseif ($ClassName -eq 'Win32_Process') { $global:FakeProcesses } }",
+                "$tasks = @(Get-TaskSnapshot)",
+                "$services = @(Get-ServiceSnapshot)",
+                "$processes = @(Get-ProcessSnapshot)",
+                "$snapshot = [pscustomobject]@{scheduled_tasks=$tasks; services=$services; process_identities=$processes; wrapper_hashes=@()}",
+                "$unresolved = @(Get-UnresolvedAfterState $snapshot)",
+                "[ordered]@{tasks=$tasks; services=$services; processes=$processes; unresolved=$unresolved} | ConvertTo-Json -Depth 10 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert [item["name"] for item in payload["tasks"]] == [
+        "ApplyPilot ApplyCycle",
+        "Neutral Exec",
+        "Neutral Task",
+        "Program Files PowerShell Action",
+        "Program Files Python Action",
+    ]
+    assert [item["name"] for item in payload["services"]] == [
+        "ApplyPilotWorkday",
+        "NeutralService",
+    ]
+    assert [item["process_id"] for item in payload["processes"]] == [9001]
+    assert {item["kind"] for item in payload["unresolved"]} == {
+        "task",
+        "service",
+        "process",
+    }
+    assert all(item["target_digest"] for item in payload["unresolved"])
+
+
+def test_generated_wrapper_inventory_uses_only_exact_authorized_basenames(tmp_path):
+    authorized = [
+        "apply-cycle-task.ps1",
+        "fleet-agent-task.ps1",
+        "apply-worker-m2.cmd",
+        "linkedin-m2.bat",
+    ]
+    benign = [
+        "linkedin-report.ps1",
+        "workday-discovery.ps1",
+        "workday-monitor.cmd",
+        "fleet-agent-monitor.ps1",
+    ]
+    for name in authorized + benign:
+        (tmp_path / name).write_text("# fixture\n", encoding="utf-8")
+    harness = tmp_path / "wrapper-inventory.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(tmp_path)}'",
+                "@(Get-KnownWrapperPaths | ForEach-Object Name) | ConvertTo-Json -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(json.loads(result.stdout.strip())) == sorted(authorized)
+
+
+def test_ambiguous_authorities_remain_unresolved_and_are_never_acted_on(tmp_path):
+    harness = tmp_path / "ambiguous-authorities.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                "$global:ActionCalled = $false",
+                "$task = [pscustomobject]@{TaskName='Neutral Task'; TaskPath='\\'; State='Ready'; Principal=[pscustomobject]@{UserId='user'}; Actions=@([pscustomobject]@{Execute='python.exe'; Arguments='--unknown=applypilot.fleet.apply_worker_main'; WorkingDirectory='C:\\repo'})}",
+                "$service = [pscustomobject]@{Name='NeutralService'; State='Running'; StartMode='Auto'; PathName='pwsh.exe -Unknown=run-fleet-workers.ps1'}",
+                "$process = [pscustomobject]@{ProcessId=4300; Name='python.exe'; ExecutablePath='C:\\Python312\\python.exe'; CreationDate=[datetime]'2026-07-13T16:00:00Z'; CommandLine='python --unknown=applypilot.fleet.apply_worker_main'}",
+                "function Get-ScheduledTask { @($task) }",
+                "function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName); if ($ClassName -eq 'Win32_Service') { @($service) } elseif ($ClassName -eq 'Win32_Process') { @($process) } }",
+                "function Get-KnownWrapperPaths { @() }",
+                "function Stop-LegacyTask { $global:ActionCalled = $true }",
+                "function Disable-LegacyTask { $global:ActionCalled = $true }",
+                "function Stop-LegacyService { $global:ActionCalled = $true }",
+                "function Disable-LegacyService { $global:ActionCalled = $true }",
+                "function Open-LegacyProcessHandle { $global:ActionCalled = $true; throw 'must not open' }",
+                "function Get-ControlEvidence { [ordered]@{admission_state=[ordered]@{available=$true; authority_source='fleet_postgres'; fields=[ordered]@{paused=$true}}; unresolved_attempt_counts=[ordered]@{available=$true; authority_source='fleet_postgres'; queues=[ordered]@{}}} }",
+                "function Get-SupplementaryLocalAttemptCounts { [ordered]@{available=$false; authority_source='local_sqlite_supplementary'} }",
+                "function Invoke-RejectionProbe { [ordered]@{status='verified'; verified=$true; decision='deny'; exit_code=78; output_digest='probe-digest'} }",
+                "$core = Invoke-ContainmentOrchestration -Operation 'contain'",
+                "$disposition = Get-ContainmentDisposition -Core $core",
+                "[ordered]@{core=$core; disposition=$disposition; action_called=$global:ActionCalled} | ConvertTo-Json -Depth 12 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload["action_called"] is False
+    assert payload["disposition"] == {"success": False, "exit_code": 1}
+    assert {item["kind"] for item in payload["core"]["unresolved_targets"]} == {
+        "task",
+        "service",
+        "process",
+    }
+    assert all(
+        item["conditions"] == ["ambiguous_command"]
+        for item in payload["core"]["unresolved_targets"]
+    )
+    assert all(
+        item["classification"] == "ambiguous"
+        for item in payload["core"]["after"]["scheduled_tasks"]
+        + payload["core"]["after"]["services"]
+        + payload["core"]["after"]["process_identities"]
+    )
+
+
+def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
+    encoded = base64.b64encode(
+        "run-fleet-workers.ps1 || Write-Output done".encode("utf-16le")
+    ).decode("ascii")
+    commands = [
+        "python -c \"import runpy; runpy.run_module('applypilot.fleet.apply_worker_main')\"",
+        'pwsh -Command "run-fleet-workers.ps1; Write-Output done"',
+        'pwsh -Command "run-fleet-workers.ps1 && Write-Output done"',
+        'pwsh -Command "run-fleet-workers.ps1 &"',
+        'pwsh -Command "run-fleet-workers.ps1 -Count 2" ; Write-Output done',
+        'pwsh -Command "run-fleet-workers.ps1 -Count 2" && Write-Output done',
+        f"pwsh -EncodedCommand {encoded}",
+        "pwsh -EncodedCommand not-valid-base64!",
+    ]
+    process_rows = ",".join(
+        (
+            "[pscustomobject]@{ProcessId="
+            f"{4400 + index}; Name='fixture.exe'; ExecutablePath='C:\\fixture.exe'; "
+            "CreationDate=[datetime]'2026-07-13T16:00:00Z'; CommandLine='"
+            f"{_ps_quote(command)}'"
+            "}"
+        )
+        for index, command in enumerate(commands)
+    )
+    harness = tmp_path / "interpreter-payload-ambiguity.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                "$global:ActionCalled = $false",
+                f"$global:FixtureProcesses = @({process_rows})",
+                "function Get-ScheduledTask { @() }",
+                "function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName); if ($ClassName -eq 'Win32_Service') { @() } elseif ($ClassName -eq 'Win32_Process') { @($global:FixtureProcesses) } }",
+                "function Get-KnownWrapperPaths { @() }",
+                "function Open-LegacyProcessHandle { $global:ActionCalled = $true; throw 'must not open' }",
+                "function Get-ControlEvidence { [ordered]@{admission_state=[ordered]@{available=$true; authority_source='fleet_postgres'; fields=[ordered]@{paused=$true}}; unresolved_attempt_counts=[ordered]@{available=$true; authority_source='fleet_postgres'; queues=[ordered]@{}}} }",
+                "function Get-SupplementaryLocalAttemptCounts { [ordered]@{available=$false; authority_source='local_sqlite_supplementary'} }",
+                "function Invoke-RejectionProbe { [ordered]@{status='verified'; verified=$true; decision='deny'; exit_code=78; output_digest='probe-digest'} }",
+                "$core = Invoke-ContainmentOrchestration -Operation 'contain'",
+                "$disposition = Get-ContainmentDisposition -Core $core",
+                "[ordered]@{core=$core; disposition=$disposition; action_called=$global:ActionCalled} | ConvertTo-Json -Depth 12 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload["action_called"] is False
+    assert payload["disposition"] == {"success": False, "exit_code": 1}
+    assert len(payload["core"]["unresolved_targets"]) == len(commands)
+    assert all(
+        item["conditions"] == ["ambiguous_command"]
+        for item in payload["core"]["unresolved_targets"]
+    )
+
+
+def test_interpreter_execution_modes_cannot_disappear_from_inspect_snapshot(tmp_path):
+    encoded = base64.b64encode(
+        "run-fleet-workers.ps1 -Count 2".encode("utf-16le")
+    ).decode("ascii")
+    commands = [
+        ("python -- apply_worker_main.py --worker-id m2-0", "acquisition"),
+        (
+            "python -c \"import runpy; runpy.run_module('applypilot.fleet.apply_worker_main')\"",
+            "ambiguous",
+        ),
+        ('pwsh -Command "run-fleet-workers.ps1 -Count 2"', "acquisition"),
+        (
+            'pwsh -Command "run-fleet-workers.ps1; Write-Output done"',
+            "ambiguous",
+        ),
+        (f"pwsh -EncodedCommand {encoded}", "acquisition"),
+        ("pwsh -EncodedCommand not-valid-base64!", "ambiguous"),
+    ]
+    process_rows = ",".join(
+        (
+            "[pscustomobject]@{ProcessId="
+            f"{4500 + index}; Name='fixture.exe'; ExecutablePath='C:\\fixture.exe'; "
+            "CreationDate=[datetime]'2026-07-13T16:00:00Z'; CommandLine='"
+            f"{_ps_quote(command)}'"
+            "}"
+        )
+        for index, (command, _) in enumerate(commands)
+    )
+    harness = tmp_path / "interpreter-execution-mode-snapshot.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                f"$global:FixtureProcesses = @({process_rows})",
+                "function Get-ScheduledTask { @() }",
+                "function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName); if ($ClassName -eq 'Win32_Service') { @() } elseif ($ClassName -eq 'Win32_Process') { @($global:FixtureProcesses) } }",
+                "function Get-KnownWrapperPaths { @() }",
+                "function Get-ControlEvidence { [ordered]@{admission_state=[ordered]@{available=$true; authority_source='fleet_postgres'; fields=[ordered]@{paused=$true}}; unresolved_attempt_counts=[ordered]@{available=$true; authority_source='fleet_postgres'; queues=[ordered]@{}}} }",
+                "function Get-SupplementaryLocalAttemptCounts { [ordered]@{available=$false; authority_source='local_sqlite_supplementary'} }",
+                "function Invoke-RejectionProbe { [ordered]@{status='verified'; verified=$true; decision='deny'; exit_code=78; output_digest='probe-digest'} }",
+                "$core = Invoke-ContainmentOrchestration -Operation 'inspect'",
+                "$disposition = Get-ContainmentDisposition -Core $core",
+                "[ordered]@{core=$core; disposition=$disposition} | ConvertTo-Json -Depth 12 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload["disposition"] == {"success": False, "exit_code": 1}
+    assert [
+        item["classification"]
+        for item in payload["core"]["after"]["process_identities"]
+    ] == [expected for _, expected in commands]
+    assert len(payload["core"]["unresolved_targets"]) == len(commands)
+
+
+def _run_process_handle_scenario(
+    tmp_path, scenario: str, replacement_command: str = "", native_tick_delta: int = 0
+):
+    harness = tmp_path / "process-identity-race.ps1"
+    replacement = (
+        f"[pscustomobject]@{{ProcessId=4242; Name='reused.exe'; "
+        "ExecutablePath='C:\\Windows\\reused.exe'; "
+        "CreationDate=[datetime]'2026-07-13T16:01:00Z'; "
+        f"CommandLine='{_ps_quote(replacement_command)}'}}"
+        if scenario == "reuse"
+        else "$null"
+    )
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                "$global:ProcessEnumCount = 0",
+                "$global:PidStopCalled = $false",
+                "$global:OpenPid = $null",
+                "$global:TerminatedToken = $null",
+                "$global:HandleDisposed = $false",
+                "$global:OriginalProcess = [pscustomobject]@{ProcessId=4242; Name='python.exe'; ExecutablePath='C:\\Python312\\python.exe'; CreationDate=[datetime]'2026-07-13T16:00:00Z'; CommandLine='python.exe -m applypilot.fleet.apply_worker_main --worker-id original'}",
+                f"$global:CurrentProcess = {replacement}",
+                "function Get-LegacyTasks { @() }",
+                "function Get-LegacyServices { @() }",
+                "function Get-KnownWrapperPaths { @() }",
+                "function Get-CimInstance {",
+                "  [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName, [string]$Filter)",
+                "  if ($ClassName -eq 'Win32_Service') { return @() }",
+                "  if ($ClassName -ne 'Win32_Process') { return @() }",
+                "  if ($PSBoundParameters.ContainsKey('Filter')) { return @($global:CurrentProcess) }",
+                "  $global:ProcessEnumCount += 1",
+                "  if ($global:ProcessEnumCount -le 2) { return $global:OriginalProcess }",
+                "  return @($global:CurrentProcess)",
+                "}",
+                "function Open-LegacyProcessHandle([int]$ProcessId) {",
+                "  $global:OpenPid = $ProcessId",
+                ("  throw 'simulated open failure'" if scenario == "open_failure" else "  $handle = [pscustomobject]@{Token='validated-handle'}"),
+                *(
+                    []
+                    if scenario == "open_failure"
+                    else [
+                        "  $handle | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $global:HandleDisposed = $true }",
+                        "  return $handle",
+                    ]
+                ),
+                "}",
+                "function Get-LegacyProcessHandleIdentity($Handle) {",
+                "  if ($Handle.Token -ne 'validated-handle') { throw 'wrong handle' }",
+                *(
+                    ["  throw 'simulated identity failure'"]
+                    if scenario == "identity_failure"
+                    else []
+                ),
+                (
+                    "  return [ordered]@{creation_file_time_utc=$global:CurrentProcess.CreationDate.ToUniversalTime().ToFileTimeUtc(); executable_path=$global:CurrentProcess.ExecutablePath}"
+                    if scenario == "reuse"
+                    else f"  return [ordered]@{{creation_file_time_utc=$global:OriginalProcess.CreationDate.ToUniversalTime().ToFileTimeUtc() + {native_tick_delta}; executable_path=$global:OriginalProcess.ExecutablePath}}"
+                ),
+                "}",
+                "function Stop-LegacyProcessHandle($Handle) {",
+                "  if ($Handle.Token -ne 'validated-handle') { throw 'wrong handle' }",
+                "  $global:TerminatedToken = $Handle.Token",
+                *( ["  throw 'simulated termination failure'"] if scenario == "terminate_failure" else [] ),
+                "}",
+                "function Stop-Process { [CmdletBinding()] param([int]$Id, [switch]$Force); $global:PidStopCalled = $true }",
+                "function Get-ControlEvidence { return [ordered]@{admission_state=[ordered]@{available=$true; authority_source='fleet_postgres'; fields=[ordered]@{paused=$true}}; unresolved_attempt_counts=[ordered]@{available=$true; authority_source='fleet_postgres'; queues=[ordered]@{}}} }",
+                "function Get-SupplementaryLocalAttemptCounts { return [ordered]@{available=$false; authority_source='local_sqlite_supplementary'} }",
+                "function Invoke-RejectionProbe { return [ordered]@{status='verified'; verified=$true; decision='deny'; exit_code=78; output_digest='probe-digest'} }",
+                "$core = Invoke-ContainmentOrchestration -Operation 'contain'",
+                "$disposition = Get-ContainmentDisposition -Core $core",
+                "[ordered]@{core=$core; disposition=$disposition; pid_stop_called=$global:PidStopCalled; open_pid=$global:OpenPid; terminated_token=$global:TerminatedToken; handle_disposed=$global:HandleDisposed} | ConvertTo-Json -Depth 12 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip())
+
+
+@pytest.mark.parametrize(
+    ("reused_command", "expected_success", "expected_unresolved"),
+    [
+        ("notepad.exe report.txt", True, 0),
+        ("python.exe -m applypilot.fleet.apply_worker_main --worker-id reused", False, 1),
+    ],
+)
+def test_process_reuse_is_skipped_and_after_snapshot_decides(
+    tmp_path, reused_command, expected_success, expected_unresolved
+):
+    payload = _run_process_handle_scenario(tmp_path, "reuse", reused_command)
+
+    assert payload["pid_stop_called"] is False
+    assert payload["open_pid"] == 4242
+    assert payload["terminated_token"] is None
+    assert payload["handle_disposed"] is True
+    assert payload["disposition"] == {
+        "success": expected_success,
+        "exit_code": 0 if expected_success else 1,
+    }
+    assert len(payload["core"]["unresolved_targets"]) == expected_unresolved
+    assert payload["core"]["failures"] == []
+    assert len(payload["core"]["skipped_actions"]) == 1
+    skipped = payload["core"]["skipped_actions"][0]
+    assert skipped["action"] == "stop_process"
+    assert skipped["result"] == "identity_changed"
+    assert skipped["target_digest"]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_skip", "expected_terminated", "expected_disposed"),
+    [
+        ("open_failure", "handle_open_failed", None, False),
+        ("identity_failure", "identity_unavailable", None, True),
+        ("terminate_failure", "termination_failed", "validated-handle", True),
+        ("successful_termination", None, "validated-handle", True),
+    ],
+)
+def test_process_handle_lifecycle_never_falls_back_to_pid_stop(
+    tmp_path, scenario, expected_skip, expected_terminated, expected_disposed
+):
+    payload = _run_process_handle_scenario(tmp_path, scenario)
+
+    assert payload["pid_stop_called"] is False
+    assert payload["open_pid"] == 4242
+    assert payload["terminated_token"] == expected_terminated
+    assert payload["handle_disposed"] is expected_disposed
+    assert payload["disposition"] == {"success": True, "exit_code": 0}
+    assert payload["core"]["unresolved_targets"] == []
+    skipped = payload["core"]["skipped_actions"]
+    if expected_skip is None:
+        assert skipped == []
+    else:
+        assert len(skipped) == 1
+        assert skipped[0]["result"] == expected_skip
+        assert skipped[0]["target_digest"]
+
+
+@pytest.mark.parametrize(
+    ("native_tick_delta", "expected_match"),
+    [(1, True), (9, True), (10, False)],
+)
+def test_process_creation_filetime_allows_only_sub_microsecond_cim_loss(
+    tmp_path, native_tick_delta, expected_match
+):
+    payload = _run_process_handle_scenario(
+        tmp_path, "precision", native_tick_delta=native_tick_delta
+    )
+
+    assert payload["pid_stop_called"] is False
+    assert payload["terminated_token"] == (
+        "validated-handle" if expected_match else None
+    )
+    assert payload["handle_disposed"] is True
+    if expected_match:
+        assert payload["core"]["skipped_actions"] == []
+    else:
+        assert payload["core"]["skipped_actions"][0]["result"] == "identity_changed"
+
+
+@pytest.mark.parametrize(
+    ("inject_adapter", "inject_console", "reason"),
+    [(True, False, "adapter_injected"), (False, True, "console_command_injected")],
+)
+def test_each_injected_seam_marks_receipt_non_operational(
+    tmp_path, inject_adapter, inject_console, reason
+):
+    fixture = _fixture(tmp_path)
+    result, payload = _run(
+        "Inspect",
+        fixture,
+        inject_adapter=inject_adapter,
+        inject_console=inject_console,
+    )
+
+    assert result.returncode != 0
+    assert payload["mode"] == "test"
+    assert payload["operational"] is False
+    assert payload["success"] is False
+    assert payload["non_operational_reasons"] == [reason]
+    assert payload["rejection"] == "injected_execution_seam_disabled"
+
+
+@pytest.mark.parametrize(
+    ("command_line", "expected"),
+    [
+        ('"C:\\Program Files\\ApplyPilot\\applypilot.exe" apply --url https://example.invalid/job', "acquisition"),
+        ('C:\\ApplyPilot\\applypilot.exe apply --url https://example.invalid/job', "acquisition"),
+        ('"C:\\Python312\\python.exe" -m applypilot apply --url https://example.invalid/job', "acquisition"),
+        ('python -bb -m applypilot.fleet.apply_worker_main', "acquisition"),
+        ('python --check-hash-based-pycs always -m applypilot.fleet.apply_worker_main', "acquisition"),
+        ('python -vv -m applypilot.fleet.apply_worker_main', "acquisition"),
+        ('python -vvv -OO -m applypilot.fleet.apply_worker_main', "acquisition"),
+        ('"C:\\Python312\\python.exe" "C:\\Program Files\\ApplyPilot\\src\\applypilot\\apply\\launcher.py" --limit 1', "acquisition"),
+        ('"C:\\Program Files\\ApplyPilot\\applypilot-workday-onboard.exe" --limit 1', "acquisition"),
+        ('"C:\\Program Files\\ApplyPilot\\applypilot-fleet-apply-home.exe" status', "acquisition"),
+        ('C:\\ApplyPilot\\applypilot-fleet-apply-home.exe readiness --strict', "acquisition"),
+        ('"C:\\Program Files\\ApplyPilot\\applypilot-fleet-linkedin-home.exe" run', "acquisition"),
+        ('C:\\ApplyPilot\\applypilot-fleet-linkedin-home.exe status', "acquisition"),
+        ('"C:\\Python312\\python.exe" -m applypilot.fleet.apply_home_main run', "acquisition"),
+        ('python -m applypilot.fleet.linkedin_home_main status', "acquisition"),
+        ('py.exe -3.12 -X utf8 -m applypilot.fleet.apply_worker_main --worker-id m2-0', "acquisition"),
+        ('"C:\\Windows\\py.exe" -3 -I -m applypilot apply --url https://example.invalid/job', "acquisition"),
+        ('python -W ignore -m applypilot.fleet.linkedin_worker_main --worker-id m2-0', "acquisition"),
+        ('python apply_worker_main.py --worker-id m2-0', "acquisition"),
+        ('python "apply_worker_main.py" --worker-id m2-0', "acquisition"),
+        ('python -- apply_worker_main.py --worker-id m2-0', "acquisition"),
+        ('pwsh.exe -File C:\\ApplyPilot\\run-fleet-worker.ps1 -Slot 0', "acquisition"),
+        ('pwsh.exe -NoProfile run-fleet-workers.ps1', "acquisition"),
+        ('pwsh.exe -NoProfile -Fi run-fleet-workers.ps1', "acquisition"),
+        ('pwsh.exe -NoProfile -Fil run-fleet-workers.ps1', "acquisition"),
+        ('pwsh.exe -NoExit -NoP run-fleet-workers.ps1', "acquisition"),
+        ('pwsh.exe -File run-fleet-workers.ps1 -Count 2', "acquisition"),
+        ('pwsh.exe -NoProfile -File "run-fleet-workers.ps1" -Count 2', "acquisition"),
+        ('powershell.exe -NoProfile -File "C:\\ApplyPilot\\run-fleet-workers.ps1" -Count 2', "acquisition"),
+        ('pwsh.exe -File "C:\\ApplyPilot\\run-tarpon-linkedin.ps1"', "acquisition"),
+        ('powershell.exe -File C:\\ApplyPilot\\keepalive-apply.ps1', "acquisition"),
+        ('pwsh.exe -File C:\\ApplyPilot\\load-canary-remote.ps1 -Count 1', "acquisition"),
+        ('cmd /d /s /c run-fleet-worker.cmd', "acquisition"),
+        ('cmd /c call run-fleet-worker.cmd', "acquisition"),
+        ('cmd /V:ON /R run-fleet-worker.cmd', "acquisition"),
+        ('cmd /c "call run-fleet-worker.cmd"', "acquisition"),
+        ('pwsh.exe -Command run-fleet-workers.ps1', "acquisition"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1 -Count 2"', "acquisition"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1" -Count 2', "acquisition"),
+        ('pwsh.exe -Command "& run-fleet-workers.ps1"', "acquisition"),
+        ('pwsh.exe -Command "& \'run-fleet-workers.ps1\'"', "acquisition"),
+        ('pwsh.exe -Command "& \\"run-fleet-workers.ps1\\""', "acquisition"),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode("run-fleet-workers.ps1 -Count 2".encode("utf-16le")).decode("ascii"),
+            "acquisition",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode("& 'run-fleet-workers.ps1'".encode("utf-16le")).decode("ascii"),
+            "acquisition",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode('& "run-fleet-workers.ps1"'.encode("utf-16le")).decode("ascii"),
+            "acquisition",
+        ),
+        ('"C:\\Python312\\python.exe" "C:\\Program Files\\ApplyPilot\\src\\applypilot\\fleet\\workday_rollout_main.py" canary', "acquisition"),
+        ('"C:\\Program Files\\ApplyPilot\\applypilot-workday-report.exe" --read-only', "benign"),
+        ('"C:\\Program Files\\ApplyPilot\\applypilot-fleet-apply-home-helper.exe" status', "benign"),
+        ('python -m applypilot.fleet.apply_home_main_helper run', "benign"),
+        ('py.exe -m applypilot.fleet.apply_worker_main_helper --read-only', "benign"),
+        ('python -c pass -m applypilot.fleet.apply_worker_main', "benign"),
+        ('python -c "print(1)" -m applypilot apply --url https://example.invalid/job', "benign"),
+        ('python -- -m applypilot.fleet.apply_worker_main', "benign"),
+        ('python -- benign.py applypilot.fleet.apply_worker_main', "benign"),
+        ('python -- --unknown=apply_worker_main.py', "ambiguous"),
+        (
+            'python -c "import runpy; runpy.run_module(\'applypilot.fleet.apply_worker_main\', run_name=\'__main__\')"',
+            "ambiguous",
+        ),
+        (
+            'python -c "import runpy; runpy.run_module(\'applypilot.fleet.apply_worker_main_helper\')"',
+            "benign",
+        ),
+        ('python --unknown-option -m applypilot.fleet.apply_worker_main', "ambiguous"),
+        ('python --unknown=applypilot.fleet.apply_worker_main', "ambiguous"),
+        ('python --unknown=applypilot.fleet.apply_worker_main_helper', "benign"),
+        ('python -bbb -m applypilot.fleet.apply_worker_main', "ambiguous"),
+        ('python -OOO -m applypilot.fleet.apply_worker_main', "ambiguous"),
+        ('python "apply_worker_main.py', "ambiguous"),
+        ('pwsh.exe -Command "Write-Output benign" -File run-fleet-workers.ps1', "benign"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1; Write-Output done"', "ambiguous"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1 && Write-Output done"', "ambiguous"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1 || Write-Output done"', "ambiguous"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1 &"', "ambiguous"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1 | Out-Null"', "ambiguous"),
+        ('pwsh.exe -Command "run-fleet-workers.ps1 > output.txt"', "ambiguous"),
+        (
+            'pwsh.exe -Command "run-fleet-workers.ps1 -Count 2" ; Write-Output done',
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -Command "run-fleet-workers.ps1 -Count 2" && Write-Output done',
+            "ambiguous",
+        ),
+        ('pwsh.exe -Command "run-fleet-workers.ps1.backup"', "benign"),
+        ('pwsh.exe -Command "& \'run-fleet-workers.ps1.backup\'"', "benign"),
+        (
+            'pwsh.exe -Command "& \'run-fleet-workers.ps1.backup\' && Write-Output done"',
+            "benign",
+        ),
+        ('pwsh.exe -Command "Write-Output benign" run-fleet-workers.ps1', "benign"),
+        ('pwsh.exe -Command "Write-Output \'run-fleet-workers.ps1\'"', "benign"),
+        (
+            'pwsh.exe -Command "Write-Output benign" ; Write-Output run-fleet-workers.ps1',
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command "run-fleet-workers.ps1.backup" && Write-Output done',
+            "benign",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                "run-fleet-workers.ps1; Write-Output done".encode("utf-16le")
+            ).decode("ascii"),
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                "run-fleet-workers.ps1 && Write-Output done".encode("utf-16le")
+            ).decode("ascii"),
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                "run-fleet-workers.ps1 || Write-Output done".encode("utf-16le")
+            ).decode("ascii"),
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode("run-fleet-workers.ps1 &".encode("utf-16le")).decode("ascii"),
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode("run-fleet-workers.ps1.backup".encode("utf-16le")).decode("ascii"),
+            "benign",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                "& 'run-fleet-workers.ps1.backup' && Write-Output done".encode("utf-16le")
+            ).decode("ascii"),
+            "benign",
+        ),
+        ('pwsh.exe -EncodedCommand not-valid-base64!', "ambiguous"),
+        ('pwsh.exe -EncodedCommand YQ==', "ambiguous"),
+        ('pwsh.exe -EncodedCommand ANg=', "ambiguous"),
+        ('pwsh.exe -- -File run-fleet-workers.ps1', "benign"),
+        ('pwsh.exe -Unknown run-fleet-workers.ps1', "ambiguous"),
+        ('pwsh.exe -Unknown=run-fleet-workers.ps1', "ambiguous"),
+        ('pwsh.exe -Unknown=run-fleet-workers.ps1.backup', "benign"),
+        ('pwsh.exe -File C:\\ApplyPilot\\run-fleet-worker-report.ps1', "benign"),
+        ('pwsh.exe -File C:\\ApplyPilot\\run-tarpon-linkedin-report.ps1', "benign"),
+        ('pwsh.exe -File linkedin-report.ps1', "benign"),
+        ('pwsh.exe -File workday-discovery.ps1', "benign"),
+        ('cmd /c workday-monitor.cmd', "benign"),
+        ('cmd /V:ON /R "call workday-monitor.cmd"', "benign"),
+        ('pwsh.exe -File fleet-agent-monitor.ps1', "benign"),
+        ('"C:\\Tools\\notapplypilot.exe" apply --url https://example.invalid/job', "benign"),
+        ('python -m unrelated.applypilot apply --url https://example.invalid/job', "benign"),
+        ('notepad.exe "C:\\Program Files\\ApplyPilot\\src\\applypilot\\fleet\\workday_rollout_main.py"', "benign"),
+    ],
+)
+def test_acquisition_command_line_matching_is_bounded_and_quote_aware(command_line, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command_line],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip())
+    assert payload == {
+        "mode": "test",
+        "operational": False,
+        "classification": expected,
+        "matched": expected == "acquisition",
+    }
+
+
+@pytest.mark.parametrize("operator", [";", "&&", "||", "|", ">"])
+def test_encoded_command_probe_never_emits_raw_or_decoded_payload(operator):
+    marker = f"SECRET_PAYLOAD_MARKER_{operator}"
+    decoded = f"run-fleet-workers.ps1 {operator} Write-Output {marker}"
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(SCRIPT),
+            "-CommandLineProbe",
+            f"pwsh -EncodedCommand {encoded}",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+def test_plain_command_probe_never_emits_raw_payload():
+    marker = "SECRET_PLAIN_COMMAND_MARKER"
+    command = (
+        'pwsh -Command "run-fleet-workers.ps1 -Count 2" '
+        f"&& Write-Output {marker}"
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+def test_real_adapters_execute_in_safe_operational_inspect_mode():
+    env = os.environ.copy()
+    env.pop("FLEET_PG_DSN", None)
+    env.pop("APPLYPILOT_FLEET_DSN", None)
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-Inspect"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["mode"] == "operational"
+    assert payload["operation"] == "inspect"
+    assert payload["operational"] is True
+    assert payload["evidence_deleted"] is False
+    assert result.returncode == (0 if payload["success"] else 1)
+    if not payload["success"]:
+        assert (
+            payload["unresolved_targets"]
+            or payload["enumeration_failures"]
+            or not payload["after_rejection_probe"]["verified"]
+        )
+
+
+def test_applypilot_import_is_pinned_to_this_checkout():
+    import applypilot
+
+    imported = Path(applypilot.__file__).resolve()
+    assert Path(sys.path[0]).resolve() == SRC.resolve()
+    assert imported.is_relative_to(SRC.resolve())
+
+
+@pytest.mark.parametrize("mode", ["Inspect", "Contain"])
+def test_hostile_adapter_is_rejected_before_execution(mode, tmp_path):
+    fixture = _fixture(tmp_path)
+    sentinel = tmp_path / "adapter-executed.txt"
+    fixture["adapter"].write_text(
+        "\n".join(
+            [
+                "$operational = $true",
+                "$nonOperationalReasons = @()",
+                "Set-Variable -Scope Script -Name AdapterSeamInjected -Value $false -Force",
+                f"Set-Content -LiteralPath '{sentinel}' -Value 'executed'",
+                "Write-Output 'HOSTILE_ADAPTER_EXECUTED'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result, payload = _run(mode, fixture, inject_console=False)
+
+    assert result.returncode != 0
+    assert not sentinel.exists()
+    assert "HOSTILE_ADAPTER_EXECUTED" not in result.stdout
+    assert payload == {
+        "schema_version": 3,
+        "mode": "test",
+        "operation": mode.lower(),
+        "operational": False,
+        "non_operational_reasons": ["adapter_injected"],
+        "success": False,
+        "rejection": "injected_execution_seam_disabled",
+        "evidence_deleted": False,
+    }
+
+
+def test_containment_script_parses_as_powershell():
+    quoted_path = str(SCRIPT).replace("'", "''")
+    command = (
+        "$errors = $null; "
+        "[void][System.Management.Automation.Language.Parser]::ParseFile("
+        f"(Resolve-Path '{quoted_path}'), [ref]$null, [ref]$errors); "
+        "if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }"
+    )
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command], cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_script_has_no_destructive_evidence_deletion_and_matches_installed_workday_processes():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "Remove-Item" not in text
+    assert "DROP TABLE" not in text.upper()
+    assert "DELETE FROM" not in text.upper()
+    assert "applypilot-workday-rollout" in text
+    assert "applypilot-workday-onboard" in text
+    assert "Get-ChildItem -LiteralPath $root -File -ErrorAction Stop" in text
+    assert "-Recurse" not in text
+
+
+def test_control_database_failure_returns_stop_not_keep(monkeypatch, capsys):
+    from applypilot.apply import pgqueue
+
+    def fail_connect(_dsn):
+        raise RuntimeError("postgresql://user:secret@example.invalid/control")
+
+    monkeypatch.setattr(pgqueue, "connect", fail_connect)
+    monkeypatch.setattr(sys, "argv", ["fleet-agent-query.py", "m2"])
+    runpy.run_path(str(ROOT / "fleet-agent-query.py"), run_name="__main__")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "STOP|||"
+    assert "secret" not in captured.err
+    assert "postgresql://" not in captured.err
+
+
+def test_healthy_control_database_still_returns_stop_during_hold(monkeypatch, capsys):
+    from applypilot.apply import pgqueue
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, *_args): return None
+        def fetchone(self): return {"desired_workers": 8, "agent": "codex", "model": "", "generation": 39}
+
+    class Connection:
+        def cursor(self): return Cursor()
+
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
+    monkeypatch.setattr(sys, "argv", ["fleet-agent-query.py", "m2"])
+    monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    runpy.run_path(str(ROOT / "fleet-agent-query.py"), run_name="__main__")
+    assert capsys.readouterr().out.strip() == "STOP|||"
+
+
+def test_worker_admission_denies_unenrolled_worker_without_mutation():
+    from applypilot.fleet import emergency_admission
+
+    class Cursor:
+        def __init__(self): self.statements = []
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, statement, params=None): self.statements.append((statement, params))
+        def fetchone(self):
+            statement = self.statements[-1][0]
+            if "to_regclass" in statement:
+                return {"desired_state_table": "fleet_desired_state"}
+            if "FROM fleet_desired_state" in statement:
+                return {"desired_workers": 1, "generation": 1, "updated_at": datetime.now(timezone.utc)}
+            if "FROM workers" in statement:
+                return None
+            raise AssertionError(f"unexpected query after missing enrollment: {statement}")
+
+    class Connection:
+        def __init__(self): self.cursor_value = Cursor()
+        def cursor(self): return self.cursor_value
+
+    conn = Connection()
+    result = emergency_admission.worker_admission(conn, machine_label="m2", machine_owner="m2", worker_id="m2-1")
+    assert result.decision.value == "deny"
+    assert "worker-id is not enrolled" in result.reason
+    assert all(
+        not statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"))
+        for statement, _params in conn.cursor_value.statements
+    )
+
+
+def test_worker_admission_denies_stale_desired_state():
+    from applypilot.fleet import emergency_admission
+
+    rows = iter([
+        {"desired_state_table": "fleet_desired_state"},
+        {"desired_workers": 1, "generation": 7, "updated_at": datetime.now(timezone.utc) - timedelta(minutes=6)},
+        {"machine_owner": "m2", "validated": True, "revoked_at": None},
+        {"paused": False, "ats_paused": False},
+    ])
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, *_args): return None
+        def fetchone(self): return next(rows)
+
+    class Connection:
+        def cursor(self): return Cursor()
+
+    result = emergency_admission.worker_admission(Connection(), machine_label="m2", machine_owner="m2", worker_id="m2-1")
+    assert result.decision.value == "deny"
+    assert "stale" in result.reason
+
+
+def test_worker_tick_denies_before_control_or_queue_access():
+    from applypilot.fleet import apply_worker_main
+
+    def forbidden_connection():
+        raise AssertionError("worker touched control or queue state before admission")
+
+    result = apply_worker_main.run_apply(forbidden_connection, object(), max_iterations=1, idle_sleep=0)
+    assert result == {"applied": 0, "halted": 1, "idle": 0, "error": 0}
+
+
+def test_admission_decision_type_has_only_allow_and_deny():
+    from applypilot.fleet.emergency_admission import AdmissionDecision
+
+    assert {decision.value for decision in AdmissionDecision} == {"allow", "deny"}
+
+
+def test_status_and_readiness_do_not_run_schema_ddl(fleet_db, monkeypatch, capsys):
+    from applypilot.fleet import apply_home_main, schema
+
+    monkeypatch.setattr(schema, "ensure_schema_v3", lambda *_a, **_k: pytest.fail("status/readiness attempted schema DDL"))
+    assert apply_home_main.main(["--dsn", fleet_db, "status"]) == 0
+    assert apply_home_main.main(["--dsn", fleet_db, "readiness", "--strict"]) == 2
+    assert "emergency_acquisition_hold" in capsys.readouterr().out

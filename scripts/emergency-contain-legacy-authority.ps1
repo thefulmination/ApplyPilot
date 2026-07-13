@@ -1,0 +1,1221 @@
+[CmdletBinding(DefaultParameterSetName = 'Inspect')]
+param(
+  [Parameter(ParameterSetName = 'Inspect')][switch]$Inspect,
+  [Parameter(Mandatory, ParameterSetName = 'Contain')][switch]$Contain,
+  [Parameter(Mandatory, ParameterSetName = 'Probe')][string]$CommandLineProbe,
+  [Parameter(Mandatory, ParameterSetName = 'Evaluate')][string]$EvaluateAfterStateJson,
+  [Parameter(Mandatory, ParameterSetName = 'DefinitionImport')][switch]$DefinitionImport,
+  [string]$AdapterPath,
+  [string[]]$WrapperRoot,
+  [string]$ConsoleCommand
+)
+
+$ErrorActionPreference = 'Stop'
+$script:KnownAcquisitionTaskNamePattern = '(?i)^(?:ApplyPilot ApplyCycle|ApplyPilotKeepAlive|ApplyPilotFleet-FleetAgent)$'
+$script:KnownAcquisitionServiceNamePattern = '(?i)^ApplyPilotWorkday$'
+$script:AcquisitionConsoleBasenames = @(
+  'applypilot-fleet-apply', 'applypilot-fleet-apply-home',
+  'applypilot-fleet-linkedin', 'applypilot-fleet-linkedin-home',
+  'applypilot-workday-onboard', 'applypilot-workday-rollout'
+)
+$script:AcquisitionPythonModules = @(
+  'applypilot.apply.launcher',
+  'applypilot.fleet.apply_home_main', 'applypilot.fleet.apply_worker_main',
+  'applypilot.fleet.linkedin_home_main', 'applypilot.fleet.linkedin_worker_main',
+  'applypilot.fleet.workday_onboard_main', 'applypilot.fleet.workday_rollout_main'
+)
+$script:AcquisitionPythonScriptBasenames = @(
+  'apply_home_main.py', 'apply_worker_main.py',
+  'linkedin_home_main.py', 'linkedin_worker_main.py',
+  'workday_onboard_main.py', 'workday_rollout_main.py'
+)
+$script:AcquisitionWrapperBasenames = @(
+  'run-fleet-worker.ps1', 'run-fleet-worker.cmd', 'run-fleet-workers.ps1',
+  'run-tarpon-linkedin.ps1',
+  'keepalive-apply.ps1', 'load-canary-home.ps1', 'load-canary-remote.ps1'
+)
+$script:GeneratedAcquisitionWrapperBasenames = @(
+  'apply-cycle-task.ps1', 'fleet-agent-task.ps1',
+  'apply-worker-m2.cmd', 'linkedin-m2.bat'
+)
+$script:SensitiveAssignment = '(?im)^\s*(?:\$env:(?:FLEET_PG_DSN|APPLYPILOT_FLEET_DSN|DATABASE_URL|APPLYPILOT_OPENAI_API_KEY|ANTHROPIC_API_KEY)\s*=.*|set\s+"?(?:FLEET_PG_DSN|APPLYPILOT_FLEET_DSN|DATABASE_URL|APPLYPILOT_OPENAI_API_KEY|ANTHROPIC_API_KEY)\s*=.*)$'
+$script:SensitiveUri = '(?i)(?:postgres(?:ql)?://|host\s*=)[^\r\n''"]+'
+$script:CredentialReferences = @(
+  'FLEET_PG_DSN', 'APPLYPILOT_FLEET_DSN', 'DATABASE_URL',
+  'APPLYPILOT_OPENAI_API_KEY', 'ANTHROPIC_API_KEY'
+)
+$script:Failures = [Collections.Generic.List[object]]::new()
+$script:SkippedActions = [Collections.Generic.List[object]]::new()
+
+$adapterInjected = $PSBoundParameters.ContainsKey('AdapterPath')
+$consoleInjected = $PSBoundParameters.ContainsKey('ConsoleCommand')
+if ($adapterInjected -or $consoleInjected) {
+  $reasons = @()
+  if ($adapterInjected) { $reasons += 'adapter_injected' }
+  if ($consoleInjected) { $reasons += 'console_command_injected' }
+  [ordered]@{
+    schema_version = 3
+    mode = 'test'
+    operation = if ($Contain) { 'contain' } else { 'inspect' }
+    operational = $false
+    non_operational_reasons = $reasons
+    success = $false
+    rejection = 'injected_execution_seam_disabled'
+    evidence_deleted = $false
+  } | ConvertTo-Json -Compress
+  exit 2
+}
+
+function Get-TextDigest([string]$Text) {
+  if ([string]::IsNullOrEmpty($Text)) { return $null }
+  $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+  $hash = [Security.Cryptography.SHA256]::HashData($bytes)
+  return [Convert]::ToHexString($hash).ToLowerInvariant()
+}
+
+function Get-FileDigest([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+  return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-ProcessStableIdentityDigest($Process) {
+  return Get-TextDigest ("{0}|{1}|{2}|{3}" -f
+    [string]$Process.ProcessId,
+    [string]$Process.CreationDate,
+    [string]$Process.ExecutablePath,
+    [string]$Process.CommandLine)
+}
+
+function ConvertFrom-DeterministicCommandLine([string]$CommandLine) {
+  $tokens = [Collections.Generic.List[string]]::new()
+  $current = [Text.StringBuilder]::new()
+  $inQuotes = $false
+  $tokenStarted = $false
+  for ($i = 0; $i -lt $CommandLine.Length; $i++) {
+    $character = $CommandLine[$i]
+    if ($character -eq '\') {
+      $slashCount = 0
+      while ($i -lt $CommandLine.Length -and $CommandLine[$i] -eq '\') {
+        $slashCount++
+        $i++
+      }
+      if ($i -lt $CommandLine.Length -and $CommandLine[$i] -eq '"') {
+        for ($j = 0; $j -lt [Math]::Floor($slashCount / 2); $j++) {
+          [void]$current.Append('\')
+        }
+        if ($slashCount % 2 -eq 0) { $inQuotes = -not $inQuotes } else { [void]$current.Append('"') }
+        $tokenStarted = $true
+      } else {
+        for ($j = 0; $j -lt $slashCount; $j++) { [void]$current.Append('\') }
+        $i--
+      }
+      continue
+    }
+    if ($character -eq '"') {
+      $inQuotes = -not $inQuotes
+      $tokenStarted = $true
+      continue
+    }
+    if ([char]::IsWhiteSpace($character) -and -not $inQuotes) {
+      if ($tokenStarted) {
+        $tokens.Add($current.ToString())
+        [void]$current.Clear()
+        $tokenStarted = $false
+      }
+      continue
+    }
+    [void]$current.Append($character)
+    $tokenStarted = $true
+  }
+  if ($inQuotes) { throw 'unterminated command-line quote' }
+  if ($tokenStarted) { $tokens.Add($current.ToString()) }
+  return @($tokens)
+}
+
+function Get-CommandTokenBasename([string]$Token) {
+  return [IO.Path]::GetFileName(($Token -replace '/', '\')).ToLowerInvariant()
+}
+
+function Get-CommandTokenStem([string]$Token) {
+  $basename = Get-CommandTokenBasename $Token
+  if ($basename.EndsWith('.exe')) { return $basename.Substring(0, $basename.Length - 4) }
+  return $basename
+}
+
+function Test-IsAcquisitionWrapperToken([string]$Token) {
+  $basename = Get-CommandTokenBasename $Token
+  return $script:AcquisitionWrapperBasenames -contains $basename -or
+    $script:GeneratedAcquisitionWrapperBasenames -contains $basename
+}
+
+function Test-IsAcquisitionPythonScript([string]$Token) {
+  $basename = Get-CommandTokenBasename $Token
+  if ($script:AcquisitionPythonScriptBasenames -contains $basename) { return $true }
+  if ($basename -ne 'launcher.py') { return $false }
+  return ($Token -replace '/', '\') -match '(?i)(?:^|\\)apply\\launcher\.py$'
+}
+
+function Test-TextContainsBoundedAcquisitionIndicator([string]$Text) {
+  $indicators = @(
+    $script:AcquisitionWrapperBasenames +
+    $script:GeneratedAcquisitionWrapperBasenames +
+    $script:AcquisitionPythonScriptBasenames +
+    $script:AcquisitionPythonModules +
+    @('applypilot', 'applypilot.cli', 'apply\launcher.py')
+  )
+  foreach ($indicator in $indicators) {
+    $escaped = [regex]::Escape($indicator)
+    if ($Text -match "(?i)(?<![a-z0-9_.-])$escaped(?![a-z0-9_.-])") { return $true }
+  }
+  return $false
+}
+
+function Test-TokensContainAcquisitionIndicator([string[]]$Tokens) {
+  foreach ($token in @($Tokens)) {
+    if (Test-TextContainsBoundedAcquisitionIndicator $token) { return $true }
+  }
+  return $false
+}
+
+function Test-CommandTextContainsAcquisitionIndicator([string]$CommandLine) {
+  return Test-TextContainsBoundedAcquisitionIndicator $CommandLine
+}
+
+function Get-AmbiguousOrBenignClassification([string[]]$Tokens) {
+  if (Test-TokensContainAcquisitionIndicator $Tokens) { return 'ambiguous' }
+  return 'benign'
+}
+
+function Get-EmbeddedCommandTokens([string[]]$PayloadTokens) {
+  $payload = @($PayloadTokens)
+  if ($payload.Count -eq 0) { return @() }
+  if ($payload[0] -notmatch '\s') { return $payload }
+  return @(ConvertFrom-DeterministicCommandLine $payload[0])
+}
+
+function Get-WrapperCommandClassification(
+  [string[]]$PayloadTokens,
+  [string[]]$AllowedInvocationPrefixes = @()
+) {
+  try {
+    $commandTokens = @(Get-EmbeddedCommandTokens $PayloadTokens)
+  } catch {
+    return Get-AmbiguousOrBenignClassification $PayloadTokens
+  }
+  if ($commandTokens.Count -eq 0) { return 'benign' }
+
+  $index = 0
+  if ($AllowedInvocationPrefixes -contains $commandTokens[0].ToLowerInvariant()) { $index++ }
+  $hasControlSyntax = @($commandTokens | Where-Object { $_ -match '[;|<>\r\n]' }).Count -gt 0
+  if (-not $hasControlSyntax -and
+      $index -lt $commandTokens.Count -and
+      (Test-IsAcquisitionWrapperToken $commandTokens[$index])) {
+    return 'acquisition'
+  }
+  return Get-AmbiguousOrBenignClassification $commandTokens
+}
+
+function Test-IsSafePowerShellCommandElement($Element) {
+  if ($Element -is [Management.Automation.Language.StringConstantExpressionAst] -or
+      $Element -is [Management.Automation.Language.ConstantExpressionAst]) {
+    return $true
+  }
+  if ($Element -isnot [Management.Automation.Language.CommandParameterAst]) { return $false }
+  if ($null -eq $Element.Argument) { return $true }
+  return $Element.Argument -is [Management.Automation.Language.StringConstantExpressionAst] -or
+    $Element.Argument -is [Management.Automation.Language.ConstantExpressionAst]
+}
+
+function Get-PowerShellCommandTextClassification([string]$CommandText) {
+  $parseTokens = $null
+  $parseErrors = $null
+  $ast = [Management.Automation.Language.Parser]::ParseInput(
+    $CommandText,
+    [ref]$parseTokens,
+    [ref]$parseErrors
+  )
+  if (@($parseErrors).Count -eq 0) {
+    $statements = @($ast.EndBlock.Statements)
+    if ($statements.Count -eq 1 -and
+        $statements[0] -is [Management.Automation.Language.PipelineAst] -and
+        -not $statements[0].Background -and
+        $statements[0].PipelineElements.Count -eq 1) {
+      $command = $statements[0].PipelineElements[0]
+      $safeInvocationOperator = $command.InvocationOperator -in @(
+        [Management.Automation.Language.TokenKind]::Unknown,
+        [Management.Automation.Language.TokenKind]::Ampersand
+      )
+      $safeElements = @($command.CommandElements | Where-Object {
+        -not (Test-IsSafePowerShellCommandElement $_)
+      }).Count -eq 0
+      if ($command -is [Management.Automation.Language.CommandAst] -and
+          $command.Redirections.Count -eq 0 -and
+          $safeInvocationOperator -and
+          $safeElements -and
+          (Test-IsAcquisitionWrapperToken $command.GetCommandName())) {
+        return 'acquisition'
+      }
+    }
+    $commands = @($ast.FindAll({
+      param($node)
+      $node -is [Management.Automation.Language.CommandAst]
+    }, $true))
+    foreach ($parsedCommand in $commands) {
+      $commandName = $parsedCommand.GetCommandName()
+      $commandPositionText = if ($commandName) {
+        $commandName
+      } elseif ($parsedCommand.CommandElements.Count -gt 0) {
+        $parsedCommand.CommandElements[0].Extent.Text
+      } else {
+        ''
+      }
+      if (Test-TextContainsBoundedAcquisitionIndicator $commandPositionText) {
+        return 'ambiguous'
+      }
+    }
+    return 'benign'
+  }
+  if (Test-TextContainsBoundedAcquisitionIndicator $CommandText) { return 'ambiguous' }
+  return 'benign'
+}
+
+function Get-PowerShellCommandPayloadClassification([string[]]$PayloadTokens) {
+  $payload = @($PayloadTokens)
+  if ($payload.Count -eq 0) { return 'benign' }
+  $commandText = $payload -join ' '
+  return Get-PowerShellCommandTextClassification $commandText
+}
+
+function Get-PowerShellEncodedCommandClassification([string]$EncodedCommand) {
+  try {
+    $bytes = [Convert]::FromBase64String($EncodedCommand)
+    if ($bytes.Length % 2 -ne 0) { return 'ambiguous' }
+    $strictUtf16Le = [Text.UnicodeEncoding]::new($false, $false, $true)
+    $decodedCommand = $strictUtf16Le.GetString($bytes)
+  } catch {
+    return 'ambiguous'
+  }
+  return Get-PowerShellCommandTextClassification $decodedCommand
+}
+
+function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$LauncherStem) {
+  $continuingOptions = @('-B', '-d', '-E', '-i', '-I', '-P', '-q', '-R', '-s', '-S', '-u', '-x')
+  for ($index = 1; $index -lt $Tokens.Count; $index++) {
+    $token = $Tokens[$index]
+    if ($token -ceq '-m') {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      $module = $Tokens[$index + 1]
+      if ($module -cin @('applypilot', 'applypilot.cli')) {
+        if ($index + 2 -lt $Tokens.Count -and $Tokens[$index + 2] -ceq 'apply') {
+          return 'acquisition'
+        }
+        return 'benign'
+      }
+      if ($script:AcquisitionPythonModules -ccontains $module) { return 'acquisition' }
+      return 'benign'
+    }
+    if ($token -ceq '--') {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      $scriptToken = $Tokens[$index + 1]
+      if (Test-IsAcquisitionPythonScript $scriptToken) { return 'acquisition' }
+      if (Test-TextContainsBoundedAcquisitionIndicator $scriptToken) { return 'ambiguous' }
+      return 'benign'
+    }
+    if ($token -ceq '-c') {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      if (Test-TextContainsBoundedAcquisitionIndicator $Tokens[$index + 1]) { return 'ambiguous' }
+      return 'benign'
+    }
+    if ($token -cin @('-h', '--help', '-V', '--version')) { return 'benign' }
+    if ($token -cmatch '^-b{1,2}$') { continue }
+    if ($token -cmatch '^-O{1,2}$') { continue }
+    if ($token -cmatch '^-v+$') { continue }
+    if ($continuingOptions -ccontains $token) { continue }
+    if ($token -cin @('-W', '-X')) {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      $index++
+      continue
+    }
+    if ($token -cmatch '^-(?:W|X).+') { continue }
+    if ($token -ceq '--check-hash-based-pycs') {
+      if ($index + 1 -ge $Tokens.Count -or
+          $Tokens[$index + 1] -cnotin @('always', 'default', 'never')) {
+        return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
+      }
+      $index++
+      continue
+    }
+    if ($LauncherStem -eq 'py' -and $token -match '^-(?:[23](?:\.\d+)?|V:.+)$') { continue }
+    if ($token.StartsWith('-')) {
+      return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
+    }
+    if (Test-IsAcquisitionPythonScript $token) { return 'acquisition' }
+    return 'benign'
+  }
+  return 'benign'
+}
+
+function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
+  $continuingOptions = @('-nologo', '-noprofile', '-nop', '-noexit', '-noninteractive', '-sta', '-mta')
+  $valuedOptions = @('-executionpolicy', '-windowstyle', '-workingdirectory', '-inputformat', '-outputformat', '-configurationname')
+  for ($index = 1; $index -lt $Tokens.Count; $index++) {
+    $token = $Tokens[$index].ToLowerInvariant()
+    if ($token -in @('-file', '-fil', '-fi', '-f')) {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      if (Test-IsAcquisitionWrapperToken $Tokens[$index + 1]) { return 'acquisition' }
+      return 'benign'
+    }
+    if ($token -eq '--') { return 'benign' }
+    if ($token -in @('-command', '-c')) {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      return Get-PowerShellCommandPayloadClassification $Tokens[($index + 1)..($Tokens.Count - 1)]
+    }
+    if ($token -in @('-encodedcommand', '-ec')) {
+      if ($index + 1 -ge $Tokens.Count) { return 'ambiguous' }
+      return Get-PowerShellEncodedCommandClassification $Tokens[$index + 1]
+    }
+    if ($continuingOptions -contains $token) { continue }
+    if ($valuedOptions -contains $token) {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      $index++
+      continue
+    }
+    if ($token.StartsWith('-')) {
+      return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
+    }
+    if (Test-IsAcquisitionWrapperToken $Tokens[$index]) { return 'acquisition' }
+    return 'benign'
+  }
+  return 'benign'
+}
+
+function Get-CmdAcquisitionClassification([string[]]$Tokens) {
+  for ($index = 1; $index -lt $Tokens.Count; $index++) {
+    $token = $Tokens[$index].ToLowerInvariant()
+    if ($token -in @('/d', '/s', '/q', '/a', '/u') -or
+        $token -match '^/(?:e|f|v):(?:on|off)$') {
+      continue
+    }
+    if ($token -in @('/c', '/k', '/r')) {
+      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
+      return Get-WrapperCommandClassification -PayloadTokens $Tokens[($index + 1)..($Tokens.Count - 1)] -AllowedInvocationPrefixes @('call')
+    }
+    return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
+  }
+  return 'benign'
+}
+
+function Get-AcquisitionTokenClassification([string[]]$Tokens) {
+  $tokens = @($Tokens)
+  if ($tokens.Count -eq 0) { return 'benign' }
+  $launcher = Get-CommandTokenStem $tokens[0]
+  if ($launcher -eq 'applypilot') {
+    if ($tokens.Count -gt 1 -and $tokens[1] -ceq 'apply') { return 'acquisition' }
+    return 'benign'
+  }
+  if ($script:AcquisitionConsoleBasenames -contains $launcher) { return 'acquisition' }
+  if ($launcher -in @('python', 'pythonw', 'py')) {
+    return Get-PythonAcquisitionClassification -Tokens $tokens -LauncherStem $launcher
+  }
+  if ($launcher -in @('pwsh', 'powershell')) { return Get-PowerShellAcquisitionClassification $tokens }
+  if ($launcher -eq 'cmd') { return Get-CmdAcquisitionClassification $tokens }
+  if (Test-IsAcquisitionWrapperToken $tokens[0]) { return 'acquisition' }
+  return 'benign'
+}
+
+function Get-CommandLineClassification([string]$CommandLine) {
+  if ([string]::IsNullOrWhiteSpace($CommandLine)) { return 'benign' }
+  try {
+    $tokens = @(ConvertFrom-DeterministicCommandLine $CommandLine)
+  } catch {
+    if (Test-CommandTextContainsAcquisitionIndicator $CommandLine) { return 'ambiguous' }
+    return 'benign'
+  }
+  return Get-AcquisitionTokenClassification $tokens
+}
+
+function Test-IsAcquisitionCommandLine([string]$CommandLine) {
+  return (Get-CommandLineClassification $CommandLine) -eq 'acquisition'
+}
+
+function Get-TaskActionClassification([string]$Executable, [string]$Arguments) {
+  if ([string]::IsNullOrWhiteSpace($Executable)) { return 'benign' }
+  try {
+    $argumentTokens = if ([string]::IsNullOrWhiteSpace($Arguments)) {
+      @()
+    } else {
+      @(ConvertFrom-DeterministicCommandLine $Arguments)
+    }
+  } catch {
+    if (Test-CommandTextContainsAcquisitionIndicator $Arguments) { return 'ambiguous' }
+    return 'benign'
+  }
+  return Get-AcquisitionTokenClassification (@($Executable) + $argumentTokens)
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Probe') {
+  $classification = Get-CommandLineClassification $CommandLineProbe
+  [ordered]@{
+    mode = 'test'
+    operational = $false
+    classification = $classification
+    matched = $classification -eq 'acquisition'
+  } | ConvertTo-Json -Compress
+  exit 0
+}
+
+function Get-LegacyTaskClassification($Task) {
+  if ([string]$Task.TaskName -match $script:KnownAcquisitionTaskNamePattern) { return 'acquisition' }
+  $classification = 'benign'
+  foreach ($action in @($Task.Actions)) {
+    $actionClassification = Get-TaskActionClassification -Executable ([string]$action.Execute) -Arguments ([string]$action.Arguments)
+    if ($actionClassification -eq 'acquisition') { return 'acquisition' }
+    if ($actionClassification -eq 'ambiguous') { $classification = 'ambiguous' }
+  }
+  return $classification
+}
+
+function Get-LegacyServiceClassification($Service) {
+  if ([string]$Service.Name -match $script:KnownAcquisitionServiceNamePattern) { return 'acquisition' }
+  return Get-CommandLineClassification ([string]$Service.PathName)
+}
+
+# Operational adapters are deliberately narrow and cannot be dynamically replaced.
+function Get-LegacyTasks {
+  return @(Get-ScheduledTask -ErrorAction Stop | ForEach-Object {
+    $classification = Get-LegacyTaskClassification $_
+    if ($classification -ne 'benign') {
+      $_ | Add-Member -NotePropertyName AuthorityClassification -NotePropertyValue $classification -Force
+      $_
+    }
+  })
+}
+function Stop-LegacyTask($Task) {
+  Stop-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
+}
+function Disable-LegacyTask($Task) {
+  Disable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop | Out-Null
+}
+function Get-LegacyServices {
+  return @(Get-CimInstance Win32_Service -ErrorAction Stop | ForEach-Object {
+      $classification = Get-LegacyServiceClassification $_
+      if ($classification -ne 'benign') {
+      [pscustomobject]@{
+        Name = [string]$_.Name
+        Status = [string]$_.State
+        StartType = switch ([string]$_.StartMode) {
+          'Auto' { 'Automatic' }
+          'Manual' { 'Manual' }
+          'Disabled' { 'Disabled' }
+          default { [string]$_.StartMode }
+        }
+        PathName = [string]$_.PathName
+        AuthorityClassification = $classification
+      }
+      }
+    })
+}
+function Stop-LegacyService($Service) {
+  Stop-Service -Name $Service.Name -Force -ErrorAction Stop
+}
+function Disable-LegacyService($Service) {
+  Set-Service -Name $Service.Name -StartupType Disabled -ErrorAction Stop
+}
+function Get-LegacyProcesses {
+  $currentPid = $PID
+  return @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+    if ($_.ProcessId -ne $currentPid) {
+      $classification = Get-CommandLineClassification ([string]$_.CommandLine)
+      if ($classification -ne 'benign') {
+        $_ | Add-Member -NotePropertyName AuthorityClassification -NotePropertyValue $classification -Force
+        $_
+      }
+    }
+  })
+}
+
+function Initialize-LegacyProcessNativeApi {
+  if ('ApplyPilot.LegacyProcessNativeApi' -as [type]) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace ApplyPilot
+{
+    public static class LegacyProcessNativeApi
+    {
+        private const uint ProcessTerminate = 0x0001;
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime
+        {
+            public uint Low;
+            public uint High;
+
+            public long ToInt64()
+            {
+                return ((long)High << 32) | Low;
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern SafeProcessHandle OpenProcess(
+            uint desiredAccess,
+            bool inheritHandle,
+            int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(
+            SafeProcessHandle process,
+            out FileTime creationTime,
+            out FileTime exitTime,
+            out FileTime kernelTime,
+            out FileTime userTime);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(
+            SafeProcessHandle process,
+            uint flags,
+            StringBuilder imagePath,
+            ref uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(SafeProcessHandle process, uint exitCode);
+
+        public static SafeProcessHandle Open(int processId)
+        {
+            SafeProcessHandle handle = OpenProcess(
+                ProcessTerminate | ProcessQueryLimitedInformation,
+                false,
+                processId);
+            if (handle == null || handle.IsInvalid)
+            {
+                if (handle != null) handle.Dispose();
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return handle;
+        }
+
+        public static long GetCreationFileTimeUtc(SafeProcessHandle process)
+        {
+            FileTime creation;
+            FileTime exit;
+            FileTime kernel;
+            FileTime user;
+            if (!GetProcessTimes(process, out creation, out exit, out kernel, out user))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return creation.ToInt64();
+        }
+
+        public static string GetImagePath(SafeProcessHandle process)
+        {
+            uint size = 32768;
+            StringBuilder imagePath = new StringBuilder((int)size);
+            if (!QueryFullProcessImageName(process, 0, imagePath, ref size))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return imagePath.ToString();
+        }
+
+        public static void Terminate(SafeProcessHandle process)
+        {
+            if (!TerminateProcess(process, 1))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+'@
+}
+
+function Open-LegacyProcessHandle([int]$ProcessId) {
+  Initialize-LegacyProcessNativeApi
+  return [ApplyPilot.LegacyProcessNativeApi]::Open($ProcessId)
+}
+
+function Get-LegacyProcessHandleIdentity($Handle) {
+  return [ordered]@{
+    creation_file_time_utc = [ApplyPilot.LegacyProcessNativeApi]::GetCreationFileTimeUtc($Handle)
+    executable_path = [ApplyPilot.LegacyProcessNativeApi]::GetImagePath($Handle)
+  }
+}
+
+function Stop-LegacyProcessHandle($Handle) {
+  [ApplyPilot.LegacyProcessNativeApi]::Terminate($Handle)
+}
+
+function ConvertTo-ProcessCreationFileTimeUtc($CreationDate) {
+  if ($CreationDate -is [datetimeoffset]) {
+    return $CreationDate.UtcDateTime.ToFileTimeUtc()
+  }
+  if ($CreationDate -is [datetime]) {
+    return $CreationDate.ToUniversalTime().ToFileTimeUtc()
+  }
+  $text = [string]$CreationDate
+  if ([string]::IsNullOrWhiteSpace($text)) { throw 'missing process creation time' }
+  try {
+    return [Management.ManagementDateTimeConverter]::ToDateTime($text).ToUniversalTime().ToFileTimeUtc()
+  } catch {
+    return [datetime]::Parse(
+      $text,
+      [Globalization.CultureInfo]::InvariantCulture,
+      [Globalization.DateTimeStyles]::AssumeUniversal
+    ).ToUniversalTime().ToFileTimeUtc()
+  }
+}
+
+function Get-NormalizedExecutablePath([string]$Path) {
+  if ([string]::IsNullOrWhiteSpace($Path)) { throw 'missing executable path' }
+  return [IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Add-SkippedProcessAction([string]$TargetDigest, [string]$Result) {
+  $script:SkippedActions.Add([ordered]@{
+    action = 'stop_process'
+    target_digest = $TargetDigest
+    result = $Result
+  })
+}
+
+function Stop-LegacyProcess($Process) {
+  $targetDigest = Get-ProcessStableIdentityDigest $Process
+  $handle = $null
+  try {
+    $handle = Open-LegacyProcessHandle ([int]$Process.ProcessId)
+  } catch {
+    Add-SkippedProcessAction -TargetDigest $targetDigest -Result 'handle_open_failed'
+    return
+  }
+  try {
+    try {
+      $currentIdentity = Get-LegacyProcessHandleIdentity $handle
+      $expectedCreation = ConvertTo-ProcessCreationFileTimeUtc $Process.CreationDate
+      $expectedExecutable = Get-NormalizedExecutablePath ([string]$Process.ExecutablePath)
+      $currentExecutable = Get-NormalizedExecutablePath ([string]$currentIdentity.executable_path)
+    } catch {
+      Add-SkippedProcessAction -TargetDigest $targetDigest -Result 'identity_unavailable'
+      return
+    }
+    $creationDelta = [Math]::Abs(
+      [long]$currentIdentity.creation_file_time_utc - [long]$expectedCreation
+    )
+    if ($creationDelta -gt 9 -or
+        $currentExecutable -ine $expectedExecutable) {
+      Add-SkippedProcessAction -TargetDigest $targetDigest -Result 'identity_changed'
+      return
+    }
+    try {
+      Stop-LegacyProcessHandle $handle
+    } catch {
+      Add-SkippedProcessAction -TargetDigest $targetDigest -Result 'termination_failed'
+    }
+  } finally {
+    $handle.Dispose()
+  }
+}
+function Set-KnownWrapperContent([string]$Path, [string]$Content) {
+  [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
+
+function Get-KnownWrapperPaths {
+  $roots = if ($WrapperRoot) {
+    @($WrapperRoot)
+  } else {
+    @(
+      (Join-Path $PSScriptRoot '..\.fleet-logs\_task-wrappers'),
+      (Join-Path $env:LOCALAPPDATA 'ApplyPilot\_task-wrappers')
+    )
+  }
+  $paths = foreach ($root in $roots) {
+    if ($root -and (Test-Path -LiteralPath $root -PathType Container)) {
+      Get-ChildItem -LiteralPath $root -File -ErrorAction Stop |
+        Where-Object { $script:GeneratedAcquisitionWrapperBasenames -contains $_.Name.ToLowerInvariant() }
+    }
+  }
+  return @($paths | Sort-Object FullName -Unique)
+}
+
+function Get-TaskSnapshot {
+  return @(Get-LegacyTasks | Sort-Object TaskPath, TaskName | ForEach-Object {
+    $task = $_
+    [ordered]@{
+      name = $task.TaskName
+      path = $task.TaskPath
+      target_digest = Get-TextDigest ("{0}{1}" -f $task.TaskPath, $task.TaskName)
+      state = [string]$task.State
+      enabled = ([string]$task.State -ne 'Disabled')
+      classification = if ($task.AuthorityClassification) {
+        [string]$task.AuthorityClassification
+      } else {
+        'acquisition'
+      }
+      principal_digest = Get-TextDigest ([string]$task.Principal.UserId)
+      actions = @($task.Actions | ForEach-Object {
+        [ordered]@{
+          executable = [IO.Path]::GetFileName([string]$_.Execute)
+          arguments_digest = Get-TextDigest ([string]$_.Arguments)
+          working_directory_digest = Get-TextDigest ([string]$_.WorkingDirectory)
+        }
+      })
+    }
+  })
+}
+
+function Get-ServiceSnapshot {
+  return @(Get-LegacyServices | Sort-Object Name | ForEach-Object {
+    [ordered]@{
+      name = $_.Name
+      target_digest = Get-TextDigest ([string]$_.Name)
+      status = [string]$_.Status
+      start_type = [string]$_.StartType
+      classification = if ($_.AuthorityClassification) {
+        [string]$_.AuthorityClassification
+      } else {
+        'acquisition'
+      }
+      executable_digest = Get-TextDigest ([string]$_.PathName)
+    }
+  })
+}
+
+function Get-WrapperSnapshot {
+  return @(Get-KnownWrapperPaths | ForEach-Object {
+    $content = [IO.File]::ReadAllText($_.FullName)
+    [ordered]@{
+      name = $_.Name
+      path_digest = Get-TextDigest $_.FullName
+      sha256 = Get-FileDigest $_.FullName
+      embedded_dsn = [bool](
+        $content -match $script:SensitiveAssignment -or $content -match $script:SensitiveUri
+      )
+    }
+  })
+}
+
+function Get-ProcessSnapshot {
+  return @(Get-LegacyProcesses | Sort-Object ProcessId | ForEach-Object {
+    [ordered]@{
+      process_id = [int]$_.ProcessId
+      name = [string]$_.Name
+      target_digest = Get-ProcessStableIdentityDigest $_
+      creation_digest = Get-TextDigest ([string]$_.CreationDate)
+      executable_digest = Get-TextDigest ([string]$_.ExecutablePath)
+      command_digest = Get-TextDigest ([string]$_.CommandLine)
+      classification = if ($_.AuthorityClassification) {
+        [string]$_.AuthorityClassification
+      } else {
+        'acquisition'
+      }
+    }
+  })
+}
+
+function Get-CredentialReferenceSnapshot {
+  return @($script:CredentialReferences | Sort-Object | ForEach-Object {
+    [ordered]@{ name = $_; present = [bool][Environment]::GetEnvironmentVariable($_) }
+  })
+}
+
+function Get-ControlEvidence {
+  $fleet = [Environment]::GetEnvironmentVariable('FLEET_PG_DSN')
+  $legacy = [Environment]::GetEnvironmentVariable('APPLYPILOT_FLEET_DSN')
+  if ($fleet -and $legacy -and $fleet -cne $legacy) {
+    return [ordered]@{
+      admission_state = [ordered]@{ available = $false; authority_source = 'fleet_postgres'; error = 'inconsistent_dsn_references' }
+      unresolved_attempt_counts = [ordered]@{ available = $false; authority_source = 'fleet_postgres'; error = 'inconsistent_dsn_references' }
+    }
+  }
+  $dsn = if ($fleet) { $fleet } else { $legacy }
+  $reference = if ($fleet) { 'FLEET_PG_DSN' } elseif ($legacy) { 'APPLYPILOT_FLEET_DSN' } else { $null }
+  if (-not $dsn) {
+    return [ordered]@{
+      admission_state = [ordered]@{ available = $false; authority_source = 'fleet_postgres'; error = 'dsn_unavailable' }
+      unresolved_attempt_counts = [ordered]@{ available = $false; authority_source = 'fleet_postgres'; error = 'dsn_unavailable' }
+    }
+  }
+  $code = @'
+import json, os
+import psycopg
+dsn = os.environ.get("FLEET_PG_DSN") or os.environ.get("APPLYPILOT_FLEET_DSN")
+if not dsn:
+    raise RuntimeError("fleet DSN unavailable")
+with psycopg.connect(dsn) as conn:
+    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("""SELECT paused, COALESCE(ats_paused,FALSE) AS ats_paused,
+            ats_apply_mode, canary_enabled, canary_remaining,
+            COALESCE(linkedin_apply_mode,'paused') AS linkedin_apply_mode,
+            COALESCE(linkedin_canary_enabled,FALSE) AS linkedin_canary_enabled,
+            linkedin_canary_remaining FROM fleet_config WHERE id=1""")
+        state = cur.fetchone()
+        counts = {}
+        for table in ("apply_queue", "linkedin_queue"):
+            cur.execute("SELECT to_regclass(%s) AS rel", (table,))
+            if cur.fetchone()["rel"] is None:
+                counts[table] = {"available": False}
+                continue
+            cur.execute(f"""SELECT
+                count(*) FILTER (WHERE status='leased') AS leased,
+                count(*) FILTER (WHERE COALESCE(apply_status,'') IN
+                  ('crash_unconfirmed','no_confirmation','submission_uncertain','in_progress')) AS unresolved
+                FROM {table}""")
+            counts[table] = dict(cur.fetchone())
+print(json.dumps({"state": state, "counts": counts}, default=str, separators=(",", ":")))
+'@
+  try {
+    $raw = & py -3 -I -c $code 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'read-only control query failed' }
+    $data = $raw | ConvertFrom-Json -AsHashtable
+    return [ordered]@{
+      admission_state = [ordered]@{
+        available = [bool]$data.state
+        authority_source = 'fleet_postgres'
+        dsn_reference = $reference
+        fields = $data.state
+      }
+      unresolved_attempt_counts = [ordered]@{
+        available = $true
+        authority_source = 'fleet_postgres'
+        dsn_reference = $reference
+        queues = $data.counts
+      }
+    }
+  } catch {
+    return [ordered]@{
+      admission_state = [ordered]@{ available = $false; authority_source = 'fleet_postgres'; dsn_reference = $reference; error = 'query_unavailable' }
+      unresolved_attempt_counts = [ordered]@{ available = $false; authority_source = 'fleet_postgres'; dsn_reference = $reference; error = 'query_unavailable' }
+    }
+  }
+}
+
+function Get-SupplementaryLocalAttemptCounts {
+  $dbPath = [Environment]::GetEnvironmentVariable('APPLYPILOT_DB_PATH')
+  if (-not $dbPath) { $dbPath = Join-Path $HOME '.applypilot\applypilot.db' }
+  if (-not (Test-Path -LiteralPath $dbPath -PathType Leaf)) {
+    return [ordered]@{ available = $false; authority_source = 'local_sqlite_supplementary' }
+  }
+  $code = @'
+import json, sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+out = {"available": True, "authority_source": "local_sqlite_supplementary", "ambiguous": 0, "in_progress": 0}
+if "jobs" in tables:
+    out["ambiguous"] = conn.execute("SELECT COUNT(*) FROM jobs WHERE apply_status IN ('crash_unconfirmed','no_confirmation','submission_uncertain')").fetchone()[0]
+    out["in_progress"] = conn.execute("SELECT COUNT(*) FROM jobs WHERE apply_status='in_progress'").fetchone()[0]
+print(json.dumps(out, separators=(",", ":")))
+'@
+  try {
+    $raw = & py -3 -I -c $code $dbPath 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'read-only local query failed' }
+    return ($raw | ConvertFrom-Json -AsHashtable)
+  } catch {
+    return [ordered]@{ available = $false; authority_source = 'local_sqlite_supplementary'; error = 'query_unavailable' }
+  }
+}
+
+function Invoke-RejectionProbe {
+  try {
+    $command = (Get-Command applypilot -ErrorAction Stop).Source
+    $lines = @(& $command apply --url 'https://invalid.example/emergency-probe' 2>&1 | ForEach-Object { [string]$_ })
+    $exitCode = $LASTEXITCODE
+    $text = $lines -join "`n"
+    $verified = $exitCode -eq 78 -and $text -match '(?m)^APPLYPILOT_ADMISSION_DENIED:EMERGENCY_HOLD(?:\s|$)'
+    if ($verified) {
+      return [ordered]@{ status = 'verified'; verified = $true; decision = 'deny'; exit_code = $exitCode; output_digest = Get-TextDigest $text }
+    }
+    return [ordered]@{ status = 'unverified'; verified = $false; decision = $null; exit_code = $exitCode; output_digest = Get-TextDigest $text }
+  } catch {
+    return [ordered]@{ status = 'error'; verified = $false; decision = $null; exit_code = $null; error = 'console_probe_failed' }
+  }
+}
+
+function Get-ContainmentSnapshot {
+  $enumerationFailures = [Collections.Generic.List[object]]::new()
+  $tasks = @()
+  $services = @()
+  $wrappers = @()
+  $processes = @()
+  try { $tasks = @(Get-TaskSnapshot) } catch {
+    $enumerationFailures.Add([ordered]@{ source = 'scheduled_tasks'; error = 'enumeration_unavailable' })
+  }
+  try { $services = @(Get-ServiceSnapshot) } catch {
+    $enumerationFailures.Add([ordered]@{ source = 'services'; error = 'enumeration_unavailable' })
+  }
+  try { $wrappers = @(Get-WrapperSnapshot) } catch {
+    $enumerationFailures.Add([ordered]@{ source = 'wrappers'; error = 'enumeration_unavailable' })
+  }
+  try { $processes = @(Get-ProcessSnapshot) } catch {
+    $enumerationFailures.Add([ordered]@{ source = 'processes'; error = 'enumeration_unavailable' })
+  }
+  $control = Get-ControlEvidence
+  return [ordered]@{
+    captured_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+    enumeration_failures = @($enumerationFailures)
+    scheduled_tasks = $tasks
+    services = $services
+    wrapper_hashes = $wrappers
+    process_identities = $processes
+    credential_reference_names = @(Get-CredentialReferenceSnapshot)
+    pause_admission_state = $control.admission_state
+    unresolved_attempt_counts = $control.unresolved_attempt_counts
+    supplementary_local_attempt_counts = Get-SupplementaryLocalAttemptCounts
+  }
+}
+
+function Get-UnresolvedAfterState($Snapshot) {
+  $unresolved = [Collections.Generic.List[object]]::new()
+  foreach ($task in @($Snapshot.scheduled_tasks)) {
+    if ([string]$task.classification -eq 'ambiguous') {
+      $unresolved.Add([ordered]@{
+        kind = 'task'
+        target_digest = $task.target_digest
+        conditions = @('ambiguous_command')
+      })
+    } elseif ([string]$task.state -ne 'Disabled') {
+      $unresolved.Add([ordered]@{
+        kind = 'task'
+        target_digest = $task.target_digest
+        conditions = @('not_disabled_or_still_runnable')
+      })
+    }
+  }
+  foreach ($service in @($Snapshot.services)) {
+    if ([string]$service.classification -eq 'ambiguous') {
+      $unresolved.Add([ordered]@{
+        kind = 'service'
+        target_digest = $service.target_digest
+        conditions = @('ambiguous_command')
+      })
+      continue
+    }
+    $conditions = [Collections.Generic.List[string]]::new()
+    if ([string]$service.status -ne 'Stopped') { $conditions.Add('not_stopped') }
+    if ([string]$service.start_type -ne 'Disabled') { $conditions.Add('not_disabled') }
+    if ($conditions.Count -gt 0) {
+      $unresolved.Add([ordered]@{
+        kind = 'service'
+        target_digest = $service.target_digest
+        conditions = @($conditions)
+      })
+    }
+  }
+  foreach ($process in @($Snapshot.process_identities)) {
+    $conditions = if ([string]$process.classification -eq 'ambiguous') {
+      'ambiguous_command'
+    } else {
+      'still_running'
+    }
+    $unresolved.Add([ordered]@{
+      kind = 'process'
+      target_digest = $process.target_digest
+      conditions = @($conditions)
+    })
+  }
+  foreach ($wrapper in @($Snapshot.wrapper_hashes)) {
+    if ([bool]$wrapper.embedded_dsn) {
+      $unresolved.Add([ordered]@{
+        kind = 'wrapper'
+        target_digest = $wrapper.path_digest
+        conditions = @('embedded_dsn_present')
+      })
+    }
+  }
+  return @($unresolved)
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Evaluate') {
+  try {
+    $snapshot = $EvaluateAfterStateJson | ConvertFrom-Json -AsHashtable
+    $unresolvedTargets = @(Get-UnresolvedAfterState $snapshot)
+    [ordered]@{
+      schema_version = 3
+      mode = 'test'
+      operation = 'evaluate_after_state'
+      operational = $false
+      non_operational_reasons = @('pure_data_evaluation')
+      success = $false
+      postconditions_satisfied = $unresolvedTargets.Count -eq 0
+      unresolved_targets = $unresolvedTargets
+      evidence_deleted = $false
+    } | ConvertTo-Json -Depth 8 -Compress
+  } catch {
+    [ordered]@{
+      schema_version = 3
+      mode = 'test'
+      operation = 'evaluate_after_state'
+      operational = $false
+      non_operational_reasons = @('pure_data_evaluation')
+      success = $false
+      postconditions_satisfied = $false
+      unresolved_targets = @()
+      rejection = 'invalid_snapshot_json'
+      evidence_deleted = $false
+    } | ConvertTo-Json -Compress
+  }
+  exit 2
+}
+
+function Invoke-RecordedAction([string]$Action, [string]$Target, [scriptblock]$Operation) {
+  try {
+    $null = & $Operation
+  } catch {
+    $script:Failures.Add([ordered]@{
+      action = $Action
+      target_digest = Get-TextDigest $Target
+      error_type = $_.Exception.GetType().Name
+    })
+  }
+}
+
+function Disable-LegacyTasksAndServices {
+  foreach ($task in @(Get-LegacyTasks)) {
+    if ($task.AuthorityClassification -eq 'ambiguous') { continue }
+    if ([string]$task.State -eq 'Running') {
+      Invoke-RecordedAction 'stop_task' "$($task.TaskPath)$($task.TaskName)" { Stop-LegacyTask $task }
+    }
+    if ([string]$task.State -ne 'Disabled') {
+      Invoke-RecordedAction 'disable_task' "$($task.TaskPath)$($task.TaskName)" { Disable-LegacyTask $task }
+    }
+  }
+  foreach ($service in @(Get-LegacyServices)) {
+    if ($service.AuthorityClassification -eq 'ambiguous') { continue }
+    if ([string]$service.Status -ne 'Stopped') {
+      Invoke-RecordedAction 'stop_service' $service.Name { Stop-LegacyService $service }
+    }
+    if ([string]$service.StartType -ne 'Disabled') {
+      Invoke-RecordedAction 'disable_service' $service.Name { Disable-LegacyService $service }
+    }
+  }
+}
+
+function Stop-LegacyAcquisitionProcesses {
+  foreach ($process in @(Get-LegacyProcesses)) {
+    if ($process.AuthorityClassification -eq 'ambiguous') { continue }
+    Invoke-RecordedAction 'stop_process' ([string]$process.ProcessId) { Stop-LegacyProcess $process }
+  }
+}
+
+function Remove-EmbeddedWrapperDsns {
+  foreach ($wrapper in @(Get-KnownWrapperPaths)) {
+    Invoke-RecordedAction 'rewrite_wrapper' $wrapper.FullName {
+      $content = [IO.File]::ReadAllText($wrapper.FullName)
+      $assignmentReplacement = if ($wrapper.Extension -match '(?i)^\.(?:cmd|bat)$') {
+        'REM fleet credential removed by emergency containment'
+      } else {
+        '# fleet credential removed by emergency containment'
+      }
+      $redacted = [regex]::Replace(
+        $content,
+        $script:SensitiveAssignment,
+        $assignmentReplacement
+      )
+      $redacted = [regex]::Replace($redacted, $script:SensitiveUri, '[redacted-dsn]')
+      if ($redacted -cne $content) {
+        Set-KnownWrapperContent -Path ([string]$wrapper.FullName) -Content $redacted
+      }
+    }
+  }
+}
+
+function Invoke-ContainmentOrchestration {
+  param(
+    [Parameter(Mandatory)]
+    [ValidateSet('inspect', 'contain')]
+    [string]$Operation
+  )
+
+  $script:Failures.Clear()
+  $script:SkippedActions.Clear()
+  $before = Get-ContainmentSnapshot
+  $beforeProbe = Invoke-RejectionProbe
+  if ($Operation -eq 'contain' -and @($before.enumeration_failures).Count -eq 0) {
+    try {
+      Disable-LegacyTasksAndServices
+      Stop-LegacyAcquisitionProcesses
+      Remove-EmbeddedWrapperDsns
+    } catch {
+      $script:Failures.Add([ordered]@{
+        action = 'containment_actions'
+        target_digest = $null
+        error_type = 'enumeration_unavailable'
+      })
+    }
+  }
+  $after = Get-ContainmentSnapshot
+  $afterProbe = Invoke-RejectionProbe
+  $unresolvedTargets = @(Get-UnresolvedAfterState $after)
+  $enumerationFailures = @(
+    @($before.enumeration_failures) + @($after.enumeration_failures) |
+      Sort-Object source, error -Unique
+  )
+
+  return [ordered]@{
+    operation = $Operation
+    postconditions_satisfied = $enumerationFailures.Count -eq 0 -and $unresolvedTargets.Count -eq 0
+    enumeration_failures = $enumerationFailures
+    unresolved_targets = $unresolvedTargets
+    before = $before
+    before_rejection_probe = $beforeProbe
+    after = $after
+    after_rejection_probe = $afterProbe
+    rejection_probe_satisfied = $afterProbe.verified -and $afterProbe.decision -eq 'deny'
+    failures = @($script:Failures)
+    skipped_actions = @($script:SkippedActions)
+    evidence_deleted = $false
+  }
+}
+
+function Get-ContainmentDisposition($Core) {
+  $success = if ([string]$Core.operation -eq 'contain') {
+    @($Core.failures).Count -eq 0 -and
+      [bool]$Core.postconditions_satisfied -and
+      [bool]$Core.rejection_probe_satisfied
+  } else {
+    [bool]$Core.postconditions_satisfied -and [bool]$Core.rejection_probe_satisfied
+  }
+  return [ordered]@{
+    success = $success
+    exit_code = if ($success) { 0 } else { 1 }
+  }
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'DefinitionImport') {
+  if ($MyInvocation.InvocationName -eq '.') { return }
+  [ordered]@{
+    schema_version = 3
+    mode = 'test'
+    operation = 'definition_import'
+    operational = $false
+    success = $false
+    rejection = 'definition_import_requires_dot_source'
+    evidence_deleted = $false
+  } | ConvertTo-Json -Compress
+  exit 2
+}
+
+$operation = if ($Contain) { 'contain' } else { 'inspect' }
+$core = Invoke-ContainmentOrchestration -Operation $operation
+$disposition = Get-ContainmentDisposition -Core $core
+
+[ordered]@{
+  schema_version = 3
+  mode = 'operational'
+  operation = $core.operation
+  operational = $true
+  non_operational_reasons = @()
+  success = $disposition.success
+  postconditions_satisfied = $core.postconditions_satisfied
+  enumeration_failures = $core.enumeration_failures
+  unresolved_targets = $core.unresolved_targets
+  before = $core.before
+  before_rejection_probe = $core.before_rejection_probe
+  after = $core.after
+  after_rejection_probe = $core.after_rejection_probe
+  failures = $core.failures
+  skipped_actions = $core.skipped_actions
+  evidence_deleted = $core.evidence_deleted
+} | ConvertTo-Json -Depth 12 -Compress
+
+if ($disposition.exit_code -ne 0) { exit $disposition.exit_code }

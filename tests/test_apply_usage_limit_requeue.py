@@ -18,9 +18,13 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 from applypilot.apply import launcher
 from applypilot.apply import container_worker
 from applypilot.apply import pgqueue
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 # ---------------------------------------------------------------------------

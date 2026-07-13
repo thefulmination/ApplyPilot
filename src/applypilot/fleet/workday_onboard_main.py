@@ -36,6 +36,8 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--base-port", type=int, default=9420)
     args = parser.parse_args()
+    from applypilot.fleet import emergency_admission
+    emergency_admission.require_allowed(emergency_admission.workday_onboard_admission())
     limit = max(1, min(args.limit, 5))
 
     profile = config.load_profile()
