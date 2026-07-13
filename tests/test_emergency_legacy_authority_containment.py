@@ -1504,6 +1504,137 @@ def test_split_command_composition_probe_redacts_all_payload_tokens():
     assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '. "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+        'Write-Output before ; . "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+        'Write-Output $(& "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1")',
+        "Write-Output $(python -m applypilot.fleet.apply_worker_main)",
+        'Write-Output before $(& "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1") after',
+        "Write-Output before $(python -m applypilot.fleet.apply_worker_main) after",
+    ],
+)
+def test_plain_dot_and_compact_subexpression_acquisition_is_ambiguous(payload):
+    command = f"pwsh.exe -Command {payload}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            '& "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "acquisition",
+        ),
+        (
+            "Write-Output 'literal $(' 'run-fleet-workers.ps1'",
+            "benign",
+        ),
+        (
+            'Write-Output $(& "C:\\Program Files\\Neutral\\run-fleet-workers.ps1.backup")',
+            "benign",
+        ),
+        (
+            "Write-Output $(python -m applypilot.fleet.apply_worker_main_helper)",
+            "benign",
+        ),
+    ],
+)
+def test_plain_subexpression_guard_preserves_simple_and_bounded_cases(payload, expected):
+    command = f"pwsh.exe -Command {payload}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize(
+    ("decoded", "expected"),
+    [
+        (
+            ". 'C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1'",
+            "ambiguous",
+        ),
+        (
+            "Write-Output before; . 'C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1'",
+            "ambiguous",
+        ),
+        (
+            "Write-Output $(& 'C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1')",
+            "ambiguous",
+        ),
+        (
+            "Write-Output $(python -m applypilot.fleet.apply_worker_main)",
+            "ambiguous",
+        ),
+        ("Write-Output 'literal $(' 'run-fleet-workers.ps1'", "benign"),
+        (
+            "Write-Output $(python -m applypilot.fleet.apply_worker_main_helper)",
+            "benign",
+        ),
+    ],
+)
+def test_encoded_dot_and_subexpression_classification_is_bounded(decoded, expected):
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe -EncodedCommand {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert decoded not in result.stdout
+    assert decoded not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+def test_compact_subexpression_probe_redacts_payload():
+    marker = "SECRET_COMPACT_SUBEXPRESSION_MARKER"
+    command = (
+        "pwsh.exe -Command Write-Output $(& "
+        f'"C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1" "{marker}")'
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
 @pytest.mark.parametrize("operator", [";", "&&", "||", "|", ">"])
 def test_encoded_command_probe_never_emits_raw_or_decoded_payload(operator):
     marker = f"SECRET_PAYLOAD_MARKER_{operator}"

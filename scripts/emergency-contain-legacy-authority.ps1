@@ -353,15 +353,45 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
 
 function Test-PowerShellPayloadContainsComposition([string[]]$PayloadTokens) {
   $payload = @($PayloadTokens)
+  $inSingleQuotedString = $false
   for ($index = 0; $index -lt $payload.Count; $index++) {
     $token = $payload[$index]
-    if ($token -match '(?:&&|\|\||[;|`\r\n])' -or
-        $token -match '^(?:\d+|\*)?(?:>>?|<)(?:&\d+)?$') {
+    $executableText = [Text.StringBuilder]::new()
+    for ($characterIndex = 0; $characterIndex -lt $token.Length; $characterIndex++) {
+      $character = $token[$characterIndex]
+      if ($character -eq "'") {
+        if ($inSingleQuotedString -and $characterIndex + 1 -lt $token.Length -and
+            $token[$characterIndex + 1] -eq "'") {
+          $characterIndex++
+          continue
+        }
+        $inSingleQuotedString = -not $inSingleQuotedString
+        continue
+      }
+      if (-not $inSingleQuotedString) { [void]$executableText.Append($character) }
+    }
+    $executionToken = $executableText.ToString()
+    if ($index -eq 0 -and $executionToken -ceq '.') { return $true }
+    if ($executionToken.Contains('$(')) { return $true }
+    if ($executionToken -match '(?:&&|\|\||[;|`\r\n])' -or
+        $executionToken -match '^(?:\d+|\*)?(?:>>?|<)(?:&\d+)?$') {
       return $true
     }
-    if ($token -ceq '&' -and $index -ne 0) { return $true }
+    if ($executionToken -ceq '&' -and $index -ne 0) { return $true }
   }
   return $false
+}
+
+function Get-PowerShellAstCommandTokens($Command) {
+  $tokens = [Collections.Generic.List[string]]::new()
+  foreach ($element in @($Command.CommandElements)) {
+    if ($element -is [Management.Automation.Language.StringConstantExpressionAst]) {
+      $tokens.Add([string]$element.Value)
+    } else {
+      $tokens.Add([string]$element.Extent.Text)
+    }
+  }
+  return @($tokens)
 }
 
 function Get-PowerShellCommandTextClassification([string]$CommandText) {
@@ -400,6 +430,11 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
     }, $true))
     foreach ($parsedCommand in $commands) {
       if (Test-IsIndirectPowerShellAcquisition $parsedCommand) { return 'ambiguous' }
+      $parsedTokens = @(Get-PowerShellAstCommandTokens $parsedCommand)
+      if ($parsedTokens.Count -gt 0 -and
+          (Get-AcquisitionTokenClassification $parsedTokens) -eq 'acquisition') {
+        return 'ambiguous'
+      }
       $commandName = $parsedCommand.GetCommandName()
       $commandPositionText = if ($commandName) {
         $commandName
