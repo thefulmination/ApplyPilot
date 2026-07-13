@@ -642,6 +642,59 @@ function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
   return 'benign'
 }
 
+function Test-CmdTokensContainControlSyntax([string[]]$Tokens) {
+  foreach ($token in @($Tokens)) {
+    if ($token -match '(?:&&|\|\||[&|<>^()\r\n])') { return $true }
+  }
+  return $false
+}
+
+function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
+  $payload = @($PayloadTokens)
+  if ($payload.Count -eq 0) { return 'benign' }
+  $containsExactIndicator = Test-TokensContainExactAcquisitionIndicator $payload
+
+  $index = 0
+  $current = $payload[$index]
+  if ($current -ceq '@') {
+    $index++
+    if ($index -ge $payload.Count) { return 'benign' }
+    $current = $payload[$index]
+  } elseif ($current.StartsWith('@')) {
+    $current = $current.Substring(1).TrimStart()
+    if (-not $current) {
+      $index++
+      if ($index -ge $payload.Count) { return 'benign' }
+      $current = $payload[$index]
+    }
+  }
+
+  if ($current -ieq 'call') {
+    $index++
+    if ($index -ge $payload.Count) {
+      if ($containsExactIndicator) { return 'ambiguous' }
+      return 'benign'
+    }
+    $candidate = $payload[$index]
+  } elseif ($current -match '(?i)^call\s+(?<target>.+)$') {
+    $candidate = $Matches.target.Trim()
+  } else {
+    $candidate = $current
+  }
+
+  $trailingTokens = if ($index + 1 -lt $payload.Count) {
+    @($payload[($index + 1)..($payload.Count - 1)])
+  } else {
+    @()
+  }
+  if (Test-IsAcquisitionWrapperToken $candidate) {
+    if (Test-CmdTokensContainControlSyntax $trailingTokens) { return 'ambiguous' }
+    return 'acquisition'
+  }
+  if ($containsExactIndicator) { return 'ambiguous' }
+  return 'benign'
+}
+
 function Get-CmdAcquisitionClassification([string[]]$Tokens) {
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
     $rawToken = $Tokens[$index]
@@ -652,35 +705,15 @@ function Get-CmdAcquisitionClassification([string[]]$Tokens) {
     }
     if ($token -in @('/c', '/k', '/r')) {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
-      return Get-WrapperCommandClassification -PayloadTokens $Tokens[($index + 1)..($Tokens.Count - 1)] -AllowedInvocationPrefixes @('call')
+      return Get-CmdPostModeClassification -PayloadTokens $Tokens[($index + 1)..($Tokens.Count - 1)]
     }
     if ($rawToken -match '(?i)^/(?<mode>[ck])(?<command>.+)$') {
       $commandToken = $Matches.command
-      $trailingTokens = if ($index + 1 -lt $Tokens.Count) {
-        @($Tokens[($index + 1)..($Tokens.Count - 1)])
-      } else {
-        @()
+      $payload = @($commandToken)
+      if ($index + 1 -lt $Tokens.Count) {
+        $payload += $Tokens[($index + 1)..($Tokens.Count - 1)]
       }
-      $allTokens = @($commandToken) + $trailingTokens
-      $trailingControl = @($trailingTokens | Where-Object {
-        $_ -match '(?:&&|\|\||[&|<>\r\n])'
-      }).Count -gt 0
-      if ($trailingControl) {
-        if (Test-TokensContainExactAcquisitionIndicator $allTokens) { return 'ambiguous' }
-        return 'benign'
-      }
-      if (Test-IsAcquisitionWrapperToken $commandToken) { return 'acquisition' }
-
-      $simpleTarget = $commandToken
-      if ($simpleTarget -match '(?i)^call\s+(?<target>.+)$') {
-        $simpleTarget = $Matches.target.Trim()
-      }
-      if (Test-IsAcquisitionWrapperToken $simpleTarget) { return 'acquisition' }
-      if ($commandToken -match '(?:&&|\|\||[&|<>\r\n])' -and
-          (Test-TokensContainExactAcquisitionIndicator @($commandToken))) {
-        return 'ambiguous'
-      }
-      return 'benign'
+      return Get-CmdPostModeClassification -PayloadTokens $payload
     }
     return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
   }

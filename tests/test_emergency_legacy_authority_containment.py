@@ -835,6 +835,9 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         'pwsh -Command "& $env:APPLYPILOT_TARGET"',
         'pwsh -Command "Start-Process -FilePath $env:APPLYPILOT_TARGET"',
         'pwsh -Command "Invoke-Expression $env:APPLYPILOT_COMMAND"',
+        "cmd /c(run-fleet-worker.cmd)",
+        "cmd /c^run-fleet-worker.cmd",
+        'cmd /c"run-fleet-worker.cmd & echo done"',
     ]
     process_rows = ",".join(
         (
@@ -1579,6 +1582,129 @@ def test_compact_quoted_cmd_probe_redacts_compound_payload():
         'cmd /c"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd '
         f'& echo {marker}"'
     )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize("mode", ["c", "k"])
+@pytest.mark.parametrize(
+    "command_tail",
+    [
+        "@ call run-fleet-worker.cmd",
+        "@call run-fleet-worker.cmd",
+        "@run-fleet-worker.cmd",
+        '@ call "C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"',
+        '@"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"',
+    ],
+)
+def test_cmd_post_mode_optional_echo_and_call_prefixes_are_acquisition(mode, command_tail):
+    command = f"cmd /{mode} {command_tail}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize("mode", ["c", "k"])
+@pytest.mark.parametrize(
+    "attached_tail",
+    [
+        "@call run-fleet-worker.cmd",
+        "@run-fleet-worker.cmd",
+        '@call "C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"',
+        '@"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"',
+    ],
+)
+def test_compact_cmd_optional_echo_and_call_prefixes_are_acquisition(mode, attached_tail):
+    command = f"cmd /{mode}{attached_tail}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize("mode", ["c", "k"])
+@pytest.mark.parametrize(
+    "syntax",
+    [
+        "(run-fleet-worker.cmd)",
+        "^run-fleet-worker.cmd",
+        "run-fleet-worker.cmd & echo done",
+        "run-fleet-worker.cmd && echo done",
+        "run-fleet-worker.cmd || echo done",
+        "run-fleet-worker.cmd | more",
+        "run-fleet-worker.cmd > output.txt",
+        "start /wait run-fleet-worker.cmd",
+        "echo run-fleet-worker.cmd",
+    ],
+)
+def test_cmd_unfamiliar_exact_wrapper_syntax_is_ambiguous(mode, syntax):
+    command = f'cmd /{mode}"{syntax}"'
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cmd /c"(run-fleet-worker.cmd.backup)"',
+        'cmd /k"^run-fleet-worker-report.cmd"',
+        'cmd /c"echo run-fleet-worker.cmd.backup"',
+        'cmd /k @call run-fleet-worker.cmd.backup',
+    ],
+)
+def test_cmd_post_mode_near_matches_remain_benign(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "benign"
+
+
+def test_cmd_unfamiliar_syntax_probe_redacts_payload():
+    marker = "SECRET_CMD_TRI_STATE_MARKER"
+    command = f'cmd /c"(run-fleet-worker.cmd) & echo {marker}"'
 
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
