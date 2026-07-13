@@ -226,18 +226,18 @@ function Test-IsSafePowerShellCommandElement($Element) {
     $Element.Argument -is [Management.Automation.Language.ConstantExpressionAst]
 }
 
-function Test-IsSimplePowerShellTokenAcquisition([string[]]$PayloadTokens) {
+function Get-SimplePowerShellTokenClassification([string[]]$PayloadTokens) {
   $payload = @($PayloadTokens)
-  if ($payload.Count -eq 0) { return $false }
+  if ($payload.Count -eq 0) { return '' }
   $targetIndex = if ($payload[0] -ceq '&') { 1 } else { 0 }
   if ($targetIndex -ge $payload.Count -or
       -not (Test-IsAcquisitionWrapperToken $payload[$targetIndex])) {
-    return $false
+    return ''
   }
   foreach ($token in $payload[$targetIndex..($payload.Count - 1)]) {
-    if ($token -match '(?:&&|\|\||[;&|<>`\r\n]|\$\(|[{}])') { return $false }
+    if ($token -match '(?:&&|\|\||[;&|<>`\r\n]|\$\(|[{}])') { return 'ambiguous' }
   }
-  return $true
+  return 'acquisition'
 }
 
 function Get-StartProcessTargetText($Command) {
@@ -336,7 +336,8 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
 function Get-PowerShellCommandPayloadClassification([string[]]$PayloadTokens) {
   $payload = @($PayloadTokens)
   if ($payload.Count -eq 0) { return 'benign' }
-  if (Test-IsSimplePowerShellTokenAcquisition $payload) { return 'acquisition' }
+  $tokenClassification = Get-SimplePowerShellTokenClassification $payload
+  if ($tokenClassification) { return $tokenClassification }
   $commandText = $payload -join ' '
   return Get-PowerShellCommandTextClassification $commandText
 }
