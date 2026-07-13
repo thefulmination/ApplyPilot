@@ -1523,6 +1523,137 @@ def test_compact_launcher_forms_are_bounded(command, expected):
     assert json.loads(result.stdout.strip())["classification"] == expected
 
 
+@pytest.mark.parametrize("mode", ["c", "k"])
+def test_compact_quoted_cmd_preserves_single_wrapper_token(mode):
+    command = f'cmd /{mode}"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"'
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            'cmd /c"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd.backup"',
+            "benign",
+        ),
+        (
+            'cmd /k"C:\\Program Files\\ApplyPilot\\run-fleet-worker-report.cmd"',
+            "benign",
+        ),
+        (
+            'cmd /c"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd & echo done"',
+            "ambiguous",
+        ),
+        (
+            'cmd /k"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd" && echo done',
+            "ambiguous",
+        ),
+    ],
+)
+def test_compact_quoted_cmd_is_bounded_and_compound_aware(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+def test_compact_quoted_cmd_probe_redacts_compound_payload():
+    marker = "SECRET_COMPACT_CMD_MARKER"
+    command = (
+        'cmd /c"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd '
+        f'& echo {marker}"'
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "pwsh.exe -Command Start-Process -FilePath:'$env:APPLYPILOT_TARGET'",
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command Start-Process -FilePath:"$env:APPLYPILOT_TARGET"',
+            "ambiguous",
+        ),
+        (
+            "pwsh.exe -Command Start-Process -FilePath:$env:APPLYPILOT_TARGET",
+            "ambiguous",
+        ),
+    ],
+)
+def test_attached_powershell_filepath_preserves_quote_semantics(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize(
+    ("decoded", "expected"),
+    [
+        ("Start-Process -FilePath:'$env:APPLYPILOT_TARGET'", "benign"),
+        ('Start-Process -FilePath:"$env:APPLYPILOT_TARGET"', "ambiguous"),
+        ("Start-Process -FilePath:$env:APPLYPILOT_TARGET", "ambiguous"),
+    ],
+)
+def test_encoded_powershell_filepath_quote_semantics_agree(decoded, expected):
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe -enc {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert decoded not in result.stdout
+    assert decoded not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
 @pytest.mark.parametrize("option", ["-e", "-en", "-enc"])
 def test_encoded_command_unique_abbreviations_decode_and_classify(option):
     decoded = "run-fleet-workers.ps1 -Count 2"

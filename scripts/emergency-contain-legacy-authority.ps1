@@ -378,6 +378,7 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
 
   $targetToken = ''
   $attachedFilePath = $false
+  $targetWasSingleQuotedLiteral = $false
   for ($index = 1; $index -lt $payload.Count; $index++) {
     if ($payload[$index] -ieq '-FilePath') {
       if ($index + 1 -lt $payload.Count) { $targetToken = $payload[$index + 1] }
@@ -392,6 +393,8 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
   if (-not $targetToken -and -not $payload[1].StartsWith('-')) {
     $targetToken = $payload[1]
   }
+  $targetWasSingleQuotedLiteral = $targetToken.Length -ge 2 -and
+    $targetToken.StartsWith("'") -and $targetToken.EndsWith("'")
   if ($targetToken.Length -ge 2 -and
       (($targetToken.StartsWith("'") -and $targetToken.EndsWith("'")) -or
        ($targetToken.StartsWith('"') -and $targetToken.EndsWith('"')))) {
@@ -401,9 +404,7 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
     return 'ambiguous'
   }
   if ($attachedFilePath) {
-    $singleQuotedLiteral = $targetToken.Length -ge 2 -and
-      $targetToken.StartsWith("'") -and $targetToken.EndsWith("'")
-    if (-not $singleQuotedLiteral) {
+    if (-not $targetWasSingleQuotedLiteral) {
       if ($targetToken -match '^\s*(?:[({]|@\()') { return 'ambiguous' }
       for ($characterIndex = 0; $characterIndex -lt $targetToken.Length; $characterIndex++) {
         if ($targetToken[$characterIndex] -eq '`') {
@@ -643,7 +644,8 @@ function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
 
 function Get-CmdAcquisitionClassification([string[]]$Tokens) {
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
-    $token = $Tokens[$index].ToLowerInvariant()
+    $rawToken = $Tokens[$index]
+    $token = $rawToken.ToLowerInvariant()
     if ($token -in @('/d', '/s', '/q', '/a', '/u') -or
         $token -match '^/(?:e|f|v):(?:on|off)$') {
       continue
@@ -652,10 +654,33 @@ function Get-CmdAcquisitionClassification([string[]]$Tokens) {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
       return Get-WrapperCommandClassification -PayloadTokens $Tokens[($index + 1)..($Tokens.Count - 1)] -AllowedInvocationPrefixes @('call')
     }
-    if ($token -match '^/(?<mode>[ck])(?<command>.+)$') {
-      $payload = @($Matches.command)
-      if ($index + 1 -lt $Tokens.Count) { $payload += $Tokens[($index + 1)..($Tokens.Count - 1)] }
-      return Get-WrapperCommandClassification -PayloadTokens $payload -AllowedInvocationPrefixes @('call')
+    if ($rawToken -match '(?i)^/(?<mode>[ck])(?<command>.+)$') {
+      $commandToken = $Matches.command
+      $trailingTokens = if ($index + 1 -lt $Tokens.Count) {
+        @($Tokens[($index + 1)..($Tokens.Count - 1)])
+      } else {
+        @()
+      }
+      $allTokens = @($commandToken) + $trailingTokens
+      $trailingControl = @($trailingTokens | Where-Object {
+        $_ -match '(?:&&|\|\||[&|<>\r\n])'
+      }).Count -gt 0
+      if ($trailingControl) {
+        if (Test-TokensContainExactAcquisitionIndicator $allTokens) { return 'ambiguous' }
+        return 'benign'
+      }
+      if (Test-IsAcquisitionWrapperToken $commandToken) { return 'acquisition' }
+
+      $simpleTarget = $commandToken
+      if ($simpleTarget -match '(?i)^call\s+(?<target>.+)$') {
+        $simpleTarget = $Matches.target.Trim()
+      }
+      if (Test-IsAcquisitionWrapperToken $simpleTarget) { return 'acquisition' }
+      if ($commandToken -match '(?:&&|\|\||[&|<>\r\n])' -and
+          (Test-TokensContainExactAcquisitionIndicator @($commandToken))) {
+        return 'ambiguous'
+      }
+      return 'benign'
     }
     return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
   }
