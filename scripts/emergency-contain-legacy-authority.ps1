@@ -279,6 +279,34 @@ function Test-IsIndirectPowerShellAcquisition($Command) {
   return $false
 }
 
+function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
+  $payload = @($PayloadTokens)
+  if ($payload.Count -lt 2) { return '' }
+  $commandName = $payload[0].ToLowerInvariant()
+  if ($commandName -in @('invoke-expression', 'iex')) {
+    if (Test-TokensContainAcquisitionIndicator $payload[1..($payload.Count - 1)]) {
+      return 'ambiguous'
+    }
+    return ''
+  }
+  if ($commandName -notin @('start-process', 'saps', 'start')) { return '' }
+
+  $targetToken = ''
+  for ($index = 1; $index -lt $payload.Count; $index++) {
+    if ($payload[$index] -ieq '-FilePath') {
+      if ($index + 1 -lt $payload.Count) { $targetToken = $payload[$index + 1] }
+      break
+    }
+  }
+  if (-not $targetToken -and -not $payload[1].StartsWith('-')) {
+    $targetToken = $payload[1]
+  }
+  if ($targetToken -and (Test-IsAcquisitionWrapperToken $targetToken)) {
+    return 'ambiguous'
+  }
+  return ''
+}
+
 function Get-PowerShellCommandTextClassification([string]$CommandText) {
   $parseTokens = $null
   $parseErrors = $null
@@ -338,6 +366,8 @@ function Get-PowerShellCommandPayloadClassification([string[]]$PayloadTokens) {
   if ($payload.Count -eq 0) { return 'benign' }
   $tokenClassification = Get-SimplePowerShellTokenClassification $payload
   if ($tokenClassification) { return $tokenClassification }
+  $indirectClassification = Get-IndirectPowerShellTokenClassification $payload
+  if ($indirectClassification) { return $indirectClassification }
   $commandText = $payload -join ' '
   return Get-PowerShellCommandTextClassification $commandText
 }

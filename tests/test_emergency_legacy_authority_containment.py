@@ -706,6 +706,9 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         'pwsh -Command "run-fleet-workers.ps1 -Count 2" && Write-Output done',
         'pwsh -Command "Invoke-Expression \'run-fleet-workers.ps1\'"',
         'pwsh -Command "Start-Process run-fleet-workers.ps1"',
+        'pwsh -Command Start-Process -FilePath "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+        'pwsh -Command Start-Process "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+        'pwsh -Command saps -FilePath "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
         f"pwsh -EncodedCommand {encoded}",
         "pwsh -EncodedCommand not-valid-base64!",
     ]
@@ -1171,6 +1174,18 @@ def test_each_injected_seam_marks_receipt_non_operational(
             "ambiguous",
         ),
         (
+            'pwsh.exe -Command Start-Process -FilePath "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -Command Start-Process "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -Command saps -FilePath "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "ambiguous",
+        ),
+        (
             'pwsh.exe -Command "Invoke-Command -ScriptBlock { run-fleet-workers.ps1 }"',
             "ambiguous",
         ),
@@ -1178,9 +1193,17 @@ def test_each_injected_seam_marks_receipt_non_operational(
             'pwsh.exe -Command "Start-Process notepad.exe -ArgumentList \'run-fleet-workers.ps1\'"',
             "benign",
         ),
+        (
+            'pwsh.exe -Command Start-Process notepad.exe -ArgumentList "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "benign",
+        ),
         ('pwsh.exe -Command "iex \'run-fleet-workers.ps1.backup\'"', "benign"),
         (
             'pwsh.exe -Command "Start-Process run-fleet-workers.ps1.backup"',
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command Start-Process -FilePath "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1.backup"',
             "benign",
         ),
         (
@@ -1330,6 +1353,30 @@ def test_indirect_command_probe_never_emits_raw_payload():
     command = (
         "pwsh -Command \"Invoke-Expression "
         f"'run-fleet-workers.ps1; Write-Output {marker}'\""
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+def test_split_start_process_probe_never_emits_raw_payload():
+    marker = "SECRET_SPLIT_START_PROCESS_MARKER"
+    command = (
+        'pwsh -Command Start-Process -FilePath '
+        '"C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1" '
+        f'-ArgumentList "{marker}"'
     )
 
     result = subprocess.run(
