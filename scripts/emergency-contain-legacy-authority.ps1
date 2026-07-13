@@ -177,6 +177,24 @@ function Test-TokensContainAcquisitionIndicator([string[]]$Tokens) {
   return $false
 }
 
+function Test-TokensContainExactAcquisitionIndicator([string[]]$Tokens) {
+  $indicators = @(
+    $script:AcquisitionConsoleBasenames +
+    @($script:AcquisitionConsoleBasenames | ForEach-Object { "$_.exe" }) +
+    $script:AcquisitionPythonModules +
+    $script:AcquisitionPythonScriptBasenames +
+    $script:AcquisitionWrapperBasenames +
+    $script:GeneratedAcquisitionWrapperBasenames
+  )
+  foreach ($token in @($Tokens)) {
+    foreach ($indicator in $indicators) {
+      $escaped = [regex]::Escape($indicator)
+      if ($token -match "(?i)(?<![a-z0-9_.-])$escaped(?![a-z0-9_.-])") { return $true }
+    }
+  }
+  return $false
+}
+
 function Test-CommandTextContainsAcquisitionIndicator([string]$CommandLine) {
   return Test-TextContainsBoundedAcquisitionIndicator $CommandLine
 }
@@ -333,6 +351,19 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
   return ''
 }
 
+function Test-PowerShellPayloadContainsComposition([string[]]$PayloadTokens) {
+  $payload = @($PayloadTokens)
+  for ($index = 0; $index -lt $payload.Count; $index++) {
+    $token = $payload[$index]
+    if ($token -match '(?:&&|\|\||[;|`\r\n])' -or
+        $token -match '^(?:\d+|\*)?(?:>>?|<)(?:&\d+)?$') {
+      return $true
+    }
+    if ($token -ceq '&' -and $index -ne 0) { return $true }
+  }
+  return $false
+}
+
 function Get-PowerShellCommandTextClassification([string]$CommandText) {
   $parseTokens = $null
   $parseErrors = $null
@@ -390,6 +421,10 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
 function Get-PowerShellCommandPayloadClassification([string[]]$PayloadTokens) {
   $payload = @($PayloadTokens)
   if ($payload.Count -eq 0) { return 'benign' }
+  if ((Test-PowerShellPayloadContainsComposition $payload) -and
+      (Test-TokensContainExactAcquisitionIndicator $payload)) {
+    return 'ambiguous'
+  }
   $tokenClassification = Get-SimplePowerShellTokenClassification $payload
   if ($tokenClassification) { return $tokenClassification }
   $indirectClassification = Get-IndirectPowerShellTokenClassification $payload

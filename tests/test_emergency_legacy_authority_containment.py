@@ -1157,7 +1157,7 @@ def test_each_injected_seam_marks_receipt_non_operational(
         ('pwsh.exe -Command "Write-Output \'run-fleet-workers.ps1\'"', "benign"),
         (
             'pwsh.exe -Command "Write-Output benign" ; Write-Output run-fleet-workers.ps1',
-            "benign",
+            "ambiguous",
         ),
         (
             'pwsh.exe -Command "run-fleet-workers.ps1.backup" && Write-Output done',
@@ -1373,6 +1373,135 @@ def test_acquisition_command_line_matching_is_bounded_and_quote_aware(command_li
         "classification": expected,
         "matched": expected == "acquisition",
     }
+
+
+@pytest.mark.parametrize("operator", [";", "&&", "|"])
+def test_split_command_composition_with_acquisition_indicator_is_ambiguous(operator):
+    command = (
+        "pwsh.exe -Command Start-Process -FilePath:notepad.exe "
+        f'{operator} & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"'
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            'pwsh.exe -Command Start-Process -FilePath:notepad.exe -ArgumentList "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command Write-Output "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command Start-Process -FilePath:notepad.exe ; & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1.backup"',
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "acquisition",
+        ),
+        (
+            'pwsh.exe -Command "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "acquisition",
+        ),
+    ],
+)
+def test_split_command_composition_guard_preserves_bounded_simple_cases(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize("operator", [";", "&&", "|"])
+def test_encoded_command_composition_with_acquisition_indicator_is_ambiguous(operator):
+    decoded = (
+        "Start-Process -FilePath:notepad.exe "
+        f'{operator} & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"'
+    )
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe -EncodedCommand {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert decoded not in result.stdout
+    assert decoded not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+def test_encoded_command_composition_near_match_remains_benign():
+    decoded = (
+        "Start-Process -FilePath:notepad.exe ; & "
+        '"C:\\Program Files\\Neutral\\run-fleet-workers.ps1.backup"'
+    )
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe -EncodedCommand {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert decoded not in result.stdout
+    assert decoded not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "benign"
+
+
+def test_split_command_composition_probe_redacts_all_payload_tokens():
+    marker = "SECRET_SPLIT_COMPOSITION_MARKER"
+    command = (
+        "pwsh.exe -Command Start-Process -FilePath:notepad.exe ; & "
+        f'"C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1" "{marker}"'
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
 
 
 @pytest.mark.parametrize("operator", [";", "&&", "||", "|", ">"])
