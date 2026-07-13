@@ -44,6 +44,9 @@ $script:CredentialReferences = @(
   'FLEET_PG_DSN', 'APPLYPILOT_FLEET_DSN', 'DATABASE_URL',
   'APPLYPILOT_OPENAI_API_KEY', 'ANTHROPIC_API_KEY'
 )
+$script:SensitiveIdentifier = '(?i)(?<![a-z0-9_])(?:' +
+  (($script:CredentialReferences | ForEach-Object { [regex]::Escape($_) }) -join '|') +
+  ')(?![a-z0-9_])'
 $script:Failures = [Collections.Generic.List[object]]::new()
 $script:SkippedActions = [Collections.Generic.List[object]]::new()
 
@@ -280,6 +283,61 @@ function Get-StartProcessTargetText($Command) {
   return ''
 }
 
+function Get-StartProcessTargetElement($Command) {
+  $elements = @($Command.CommandElements)
+  for ($index = 1; $index -lt $elements.Count; $index++) {
+    $element = $elements[$index]
+    if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+        $element.ParameterName -ieq 'FilePath') {
+      if ($null -ne $element.Argument) { return $element.Argument }
+      if ($index + 1 -lt $elements.Count) { return $elements[$index + 1] }
+      return $null
+    }
+  }
+  if ($elements.Count -gt 1 -and
+      $elements[1] -isnot [Management.Automation.Language.CommandParameterAst]) {
+    return $elements[1]
+  }
+  return $null
+}
+
+function Test-IsStaticallyResolvedPowerShellElement($Element) {
+  if ($null -eq $Element) { return $false }
+  if ($Element -is [Management.Automation.Language.StringConstantExpressionAst] -or
+      $Element -is [Management.Automation.Language.ConstantExpressionAst]) {
+    return $true
+  }
+  if ($Element -is [Management.Automation.Language.ExpandableStringExpressionAst]) {
+    return @($Element.NestedExpressions).Count -eq 0
+  }
+  return $false
+}
+
+function Test-HasDynamicPowerShellExecutionTarget($Command) {
+  $elements = @($Command.CommandElements)
+  if ($Command.InvocationOperator -in @(
+      [Management.Automation.Language.TokenKind]::Ampersand,
+      [Management.Automation.Language.TokenKind]::Dot
+    )) {
+    return $elements.Count -eq 0 -or
+      -not (Test-IsStaticallyResolvedPowerShellElement $elements[0])
+  }
+
+  $commandName = ([string]$Command.GetCommandName()).ToLowerInvariant()
+  if ($commandName -in @('invoke-expression', 'iex')) {
+    if ($elements.Count -lt 2) { return $false }
+    return @($elements | Select-Object -Skip 1 | Where-Object {
+      -not (Test-IsStaticallyResolvedPowerShellElement $_)
+    }).Count -gt 0
+  }
+  if ($commandName -in @('start-process', 'saps', 'start')) {
+    $target = Get-StartProcessTargetElement $Command
+    return $null -ne $target -and
+      -not (Test-IsStaticallyResolvedPowerShellElement $target)
+  }
+  return $false
+}
+
 function Test-IsIndirectPowerShellAcquisition($Command) {
   $commandName = ([string]$Command.GetCommandName()).ToLowerInvariant()
   if ($commandName -in @('invoke-expression', 'iex')) {
@@ -343,8 +401,17 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
     return 'ambiguous'
   }
   if ($attachedFilePath) {
-    foreach ($token in $payload) {
-      if ($token -match '(?:&&|\|\||[;&|<>`\r\n])') { return '' }
+    $singleQuotedLiteral = $targetToken.Length -ge 2 -and
+      $targetToken.StartsWith("'") -and $targetToken.EndsWith("'")
+    if (-not $singleQuotedLiteral) {
+      if ($targetToken -match '^\s*(?:[({]|@\()') { return 'ambiguous' }
+      for ($characterIndex = 0; $characterIndex -lt $targetToken.Length; $characterIndex++) {
+        if ($targetToken[$characterIndex] -eq '`') {
+          $characterIndex++
+          continue
+        }
+        if ($targetToken[$characterIndex] -eq '$') { return 'ambiguous' }
+      }
     }
     return 'benign'
   }
@@ -429,6 +496,7 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
       $node -is [Management.Automation.Language.CommandAst]
     }, $true))
     foreach ($parsedCommand in $commands) {
+      if (Test-HasDynamicPowerShellExecutionTarget $parsedCommand) { return 'ambiguous' }
       if (Test-IsIndirectPowerShellAcquisition $parsedCommand) { return 'ambiguous' }
       $parsedTokens = @(Get-PowerShellAstCommandTokens $parsedCommand)
       if ($parsedTokens.Count -gt 0 -and
@@ -484,11 +552,13 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
   $continuingOptions = @('-B', '-d', '-E', '-i', '-I', '-P', '-q', '-R', '-s', '-S', '-u', '-x')
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
     $token = $Tokens[$index]
-    if ($token -ceq '-m') {
-      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
-      $module = $Tokens[$index + 1]
+    if ($token -ceq '-m' -or $token -cmatch '^-m(?<module>.+)$') {
+      $attachedModule = $token -cne '-m'
+      if (-not $attachedModule -and $index + 1 -ge $Tokens.Count) { return 'benign' }
+      $module = if ($attachedModule) { $Matches.module } else { $Tokens[$index + 1] }
+      $nextIndex = if ($attachedModule) { $index + 1 } else { $index + 2 }
       if ($module -cin @('applypilot', 'applypilot.cli')) {
-        if ($index + 2 -lt $Tokens.Count -and $Tokens[$index + 2] -ceq 'apply') {
+        if ($nextIndex -lt $Tokens.Count -and $Tokens[$nextIndex] -ceq 'apply') {
           return 'acquisition'
         }
         return 'benign'
@@ -552,7 +622,7 @@ function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
       return Get-PowerShellCommandPayloadClassification $Tokens[($index + 1)..($Tokens.Count - 1)]
     }
-    if ($token -in @('-encodedcommand', '-ec')) {
+    if ($token -in @('-encodedcommand', '-enc', '-en', '-e', '-ec')) {
       if ($index + 1 -ge $Tokens.Count) { return 'ambiguous' }
       return Get-PowerShellEncodedCommandClassification $Tokens[$index + 1]
     }
@@ -581,6 +651,11 @@ function Get-CmdAcquisitionClassification([string[]]$Tokens) {
     if ($token -in @('/c', '/k', '/r')) {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
       return Get-WrapperCommandClassification -PayloadTokens $Tokens[($index + 1)..($Tokens.Count - 1)] -AllowedInvocationPrefixes @('call')
+    }
+    if ($token -match '^/(?<mode>[ck])(?<command>.+)$') {
+      $payload = @($Matches.command)
+      if ($index + 1 -lt $Tokens.Count) { $payload += $Tokens[($index + 1)..($Tokens.Count - 1)] }
+      return Get-WrapperCommandClassification -PayloadTokens $payload -AllowedInvocationPrefixes @('call')
     }
     return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
   }
@@ -901,6 +976,10 @@ function Set-KnownWrapperContent([string]$Path, [string]$Content) {
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {
+  [IO.File]::WriteAllBytes($Path, $Content)
+}
+
 function Get-KnownWrapperPaths {
   $roots = if ($WrapperRoot) {
     @($WrapperRoot)
@@ -970,7 +1049,7 @@ function Get-WrapperSnapshot {
       path_digest = Get-TextDigest $_.FullName
       sha256 = Get-FileDigest $_.FullName
       embedded_dsn = [bool](
-        $content -match $script:SensitiveAssignment -or $content -match $script:SensitiveUri
+        $content -match $script:SensitiveIdentifier -or $content -match $script:SensitiveUri
       )
     }
   })
@@ -1282,20 +1361,37 @@ function Stop-LegacyAcquisitionProcesses {
 function Remove-EmbeddedWrapperDsns {
   foreach ($wrapper in @(Get-KnownWrapperPaths)) {
     Invoke-RecordedAction 'rewrite_wrapper' $wrapper.FullName {
+      $preimageBytes = [IO.File]::ReadAllBytes($wrapper.FullName)
       $content = [IO.File]::ReadAllText($wrapper.FullName)
-      $assignmentReplacement = if ($wrapper.Extension -match '(?i)^\.(?:cmd|bat)$') {
-        'REM fleet credential removed by emergency containment'
+      $containsSensitiveContent = $content -match $script:SensitiveIdentifier -or
+        $content -match $script:SensitiveUri
+      if (-not $containsSensitiveContent) { return }
+
+      $preimageDigest = (Get-FileHash -LiteralPath $wrapper.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+      $evidencePath = "{0}.emergency-containment-evidence-{1}" -f $wrapper.FullName, $preimageDigest
+      if (Test-Path -LiteralPath $evidencePath -PathType Leaf) {
+        if ((Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+            $preimageDigest) {
+          throw 'wrapper evidence digest collision'
+        }
       } else {
-        '# fleet credential removed by emergency containment'
+        Set-KnownWrapperEvidence -Path $evidencePath -Content $preimageBytes
       }
-      $redacted = [regex]::Replace(
-        $content,
-        $script:SensitiveAssignment,
-        $assignmentReplacement
-      )
-      $redacted = [regex]::Replace($redacted, $script:SensitiveUri, '[redacted-dsn]')
-      if ($redacted -cne $content) {
-        Set-KnownWrapperContent -Path ([string]$wrapper.FullName) -Content $redacted
+      if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf) -or
+          (Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+          $preimageDigest) {
+        throw 'wrapper evidence preservation failed'
+      }
+
+      $denyStub = if ($wrapper.Extension -match '(?i)^\.(?:cmd|bat)$') {
+        "@echo off`r`necho ApplyPilot acquisition denied: emergency containment 1>&2`r`nexit /b 78`r`n"
+      } else {
+        "Write-Error 'ApplyPilot acquisition denied: emergency containment'`nexit 78`n"
+      }
+      Set-KnownWrapperContent -Path ([string]$wrapper.FullName) -Content $denyStub
+      $written = [IO.File]::ReadAllText($wrapper.FullName)
+      if ($written -match $script:SensitiveIdentifier -or $written -match $script:SensitiveUri) {
+        throw 'wrapper sensitive content remains after containment'
       }
     }
   }

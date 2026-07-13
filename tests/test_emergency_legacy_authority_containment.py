@@ -70,6 +70,10 @@ function Set-KnownWrapperContent([string]$Path, [string]$Content) {
   if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
   [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
+function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  [IO.File]::WriteAllBytes($Path, $Content)
+}
 function Get-ControlEvidence {
   return [ordered]@{
     admission_state=[ordered]@{
@@ -366,6 +370,10 @@ def test_shared_orchestration_executes_complete_containment_and_is_idempotent(tm
     fixture = _fixture(tmp_path)
     outside_before = fixture["outside"].read_bytes()
     nested_before = fixture["nested_outside"].read_bytes()
+    wrapper_preimages = {
+        path.name: path.read_bytes()
+        for path in [fixture["known"], fixture["known_cmd"], fixture["known_bat"]]
+    }
 
     inspect_result, inspected = _run_orchestration("Inspect", fixture)
     assert inspect_result.returncode == 0, inspect_result.stderr
@@ -384,19 +392,21 @@ def test_shared_orchestration_executes_complete_containment_and_is_idempotent(tm
     assert first["postconditions_satisfied"] is True
     assert first["failures"] == []
     assert first["after_rejection_probe"]["decision"] == "deny"
-    assert "removed by emergency containment" in fixture["known"].read_text(encoding="utf-8")
-    assert "evidence remains" in fixture["known"].read_text(encoding="utf-8")
-    cmd_content = fixture["known_cmd"].read_text(encoding="utf-8")
-    assert "FLEET_PG_DSN=" not in cmd_content
-    assert "DATABASE_URL=" not in cmd_content
-    assert "APPLYPILOT_OPENAI_API_KEY=" not in cmd_content
-    assert "super-secret" not in cmd_content
-    assert "raw-wrapper-secret" not in cmd_content
-    assert "REM evidence remains" in cmd_content
-    bat_content = fixture["known_bat"].read_text(encoding="utf-8")
-    assert "APPLYPILOT_FLEET_DSN=" not in bat_content
-    assert "super-secret" not in bat_content
-    assert "REM linkedin evidence remains" in bat_content
+    evidence_after_first = {}
+    for wrapper in [fixture["known"], fixture["known_cmd"], fixture["known_bat"]]:
+        stub = wrapper.read_text(encoding="utf-8")
+        assert "acquisition denied: emergency containment" in stub.lower()
+        assert "78" in stub
+        assert "FLEET_PG_DSN" not in stub
+        assert "APPLYPILOT_FLEET_DSN" not in stub
+        assert "DATABASE_URL" not in stub
+        assert "APPLYPILOT_OPENAI_API_KEY" not in stub
+        assert "super-secret" not in stub
+        assert "raw-wrapper-secret" not in stub
+        evidence = list(wrapper.parent.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+        assert len(evidence) == 1
+        assert evidence[0].read_bytes() == wrapper_preimages[wrapper.name]
+        evidence_after_first[wrapper.name] = (evidence[0].name, evidence[0].read_bytes())
     assert "super-secret" not in first_result.stdout
     assert "raw-wrapper-secret" not in first_result.stdout
     assert fixture["outside"].read_bytes() == outside_before
@@ -416,6 +426,115 @@ def test_shared_orchestration_executes_complete_containment_and_is_idempotent(tm
     assert "operational" not in second
     assert "success" not in second
     assert fixture["known"].read_bytes() == known_after_first
+    for wrapper in [fixture["known"], fixture["known_cmd"], fixture["known_bat"]]:
+        evidence = list(wrapper.parent.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+        assert [(item.name, item.read_bytes()) for item in evidence] == [
+            evidence_after_first[wrapper.name]
+        ]
+
+
+def test_sensitive_wrapper_identifiers_force_evidence_backup_and_deny_stub(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    contents = {
+        "apply-cycle-task.ps1": (
+            "${env:FLEET_PG_DSN} = 'raw-secret-one'\n# powershell evidence\n"
+        ),
+        "fleet-agent-task.ps1": (
+            "[Environment]::SetEnvironmentVariable( 'DATABASE_URL', "
+            "'raw-secret-two' )\n# environment evidence\n"
+        ),
+        "apply-worker-m2.cmd": (
+            '@set "APPLYPILOT_FLEET_DSN=raw-secret-three"\r\n'
+            "REM cmd evidence\r\n"
+        ),
+        "linkedin-m2.bat": (
+            '  @SeT   "anthropic_api_key=raw-secret-four"\n'
+            "REM bat evidence\n"
+        ),
+    }
+    preimages = {}
+    for name, content in contents.items():
+        path = wrappers / name
+        path.write_text(
+            content,
+            encoding="utf-16" if name == "fleet-agent-task.ps1" else "utf-8",
+            newline="",
+        )
+        preimages[name] = path.read_bytes()
+
+    harness = tmp_path / "sanitize-sensitive-wrappers.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrappers)}'",
+                "$before = @(Get-WrapperSnapshot)",
+                "Remove-EmbeddedWrapperDsns",
+                "$after = @(Get-WrapperSnapshot)",
+                "[ordered]@{before=$before; after=$after} | ConvertTo-Json -Depth 8 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    first = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stderr
+    payload = json.loads(first.stdout.strip())
+    assert all(item["embedded_dsn"] for item in payload["before"])
+    assert not any(item["embedded_dsn"] for item in payload["after"])
+    for secret in [
+        "raw-secret-one",
+        "raw-secret-two",
+        "raw-secret-three",
+        "raw-secret-four",
+    ]:
+        assert secret not in first.stdout
+        assert secret not in first.stderr
+
+    sensitive_identifiers = [
+        "FLEET_PG_DSN",
+        "APPLYPILOT_FLEET_DSN",
+        "DATABASE_URL",
+        "APPLYPILOT_OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ]
+    first_stubs = {}
+    first_evidence = {}
+    for name, preimage in preimages.items():
+        wrapper = wrappers / name
+        stub = wrapper.read_text(encoding="utf-8")
+        first_stubs[name] = wrapper.read_bytes()
+        assert "emergency containment" in stub.lower()
+        assert "78" in stub
+        assert all(identifier.lower() not in stub.lower() for identifier in sensitive_identifiers)
+        evidence = list(wrappers.glob(f"{name}.emergency-containment-evidence-*"))
+        assert len(evidence) == 1
+        assert evidence[0].read_bytes() == preimage
+        first_evidence[name] = (evidence[0].name, evidence[0].read_bytes())
+
+    second = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert second.returncode == 0, second.stderr
+    second_payload = json.loads(second.stdout.strip())
+    assert not any(item["embedded_dsn"] for item in second_payload["before"])
+    assert not any(item["embedded_dsn"] for item in second_payload["after"])
+    for name, stub in first_stubs.items():
+        assert (wrappers / name).read_bytes() == stub
+        evidence = list(wrappers.glob(f"{name}.emergency-containment-evidence-*"))
+        assert [(item.name, item.read_bytes()) for item in evidence] == [first_evidence[name]]
 
 
 def test_shared_orchestration_reports_action_failure(tmp_path):
@@ -713,6 +832,9 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         'pwsh -Command saps -FilePath="C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
         f"pwsh -EncodedCommand {encoded}",
         "pwsh -EncodedCommand not-valid-base64!",
+        'pwsh -Command "& $env:APPLYPILOT_TARGET"',
+        'pwsh -Command "Start-Process -FilePath $env:APPLYPILOT_TARGET"',
+        'pwsh -Command "Invoke-Expression $env:APPLYPILOT_COMMAND"',
     ]
     process_rows = ",".join(
         (
@@ -1373,6 +1495,169 @@ def test_acquisition_command_line_matching_is_bounded_and_quote_aware(command_li
         "classification": expected,
         "matched": expected == "acquisition",
     }
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("python -mapplypilot.fleet.apply_worker_main", "acquisition"),
+        ("python -mapplypilot apply --url https://example.invalid/job", "acquisition"),
+        ("python -mapplypilot.fleet.apply_worker_main_helper", "benign"),
+        ("python -mapplypilot.fleet.apply_worker_main.backup", "benign"),
+        ("cmd /crun-fleet-worker.cmd", "acquisition"),
+        ("cmd /krun-fleet-worker.cmd", "acquisition"),
+        ("cmd /crun-fleet-worker.cmd.backup", "benign"),
+        ("cmd /kworkday-monitor.cmd", "benign"),
+    ],
+)
+def test_compact_launcher_forms_are_bounded(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize("option", ["-e", "-en", "-enc"])
+def test_encoded_command_unique_abbreviations_decode_and_classify(option):
+    decoded = "run-fleet-workers.ps1 -Count 2"
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe {option} {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert decoded not in result.stdout
+    assert decoded not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+def test_encoded_command_abbreviation_redacts_ambiguous_payload():
+    marker = "SECRET_ENCODED_ABBREVIATION_MARKER"
+    decoded = f"run-fleet-workers.ps1; Write-Output {marker}"
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe -en {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "& ('run-fleet-' + 'workers.ps1')",
+        "$x = 'run-fleet-workers.ps1'; & $x",
+        ". ('run-fleet-' + 'workers.ps1')",
+        "Start-Process -FilePath $env:APPLYPILOT_TARGET",
+        "Start-Process -FilePath:$env:APPLYPILOT_TARGET",
+        "Start-Process -FilePath=$env:APPLYPILOT_TARGET",
+        "Start-Process ($env:APPLYPILOT_TARGET)",
+        "Invoke-Expression $env:APPLYPILOT_COMMAND",
+        "Write-Output $(& $env:APPLYPILOT_TARGET)",
+        "Write-Output @(& $env:APPLYPILOT_TARGET)",
+        "Write-Output $(Start-Process $env:APPLYPILOT_TARGET)",
+        "& $env:APPLYPILOT_TARGET",
+    ],
+)
+def test_dynamic_powershell_executable_targets_are_ambiguous(payload):
+    command = f"pwsh.exe -Command {payload}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ("& 'notepad.exe'", "benign"),
+        (". 'benign-profile.ps1'", "benign"),
+        ("Start-Process -FilePath notepad.exe", "benign"),
+        ("Invoke-Expression 'Write-Output benign'", "benign"),
+        ("Write-Output $env:APPLYPILOT_TARGET", "benign"),
+        (
+            '& "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "acquisition",
+        ),
+    ],
+)
+def test_dynamic_target_guard_preserves_static_commands_and_arguments(payload, expected):
+    command = f"pwsh.exe -Command {payload}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize(
+    "decoded",
+    [
+        "& ('run-fleet-' + 'workers.ps1')",
+        "$x = 'run-fleet-workers.ps1'; & $x",
+        ". ('run-fleet-' + 'workers.ps1')",
+        "Start-Process -FilePath $env:APPLYPILOT_TARGET",
+        "Invoke-Expression $env:APPLYPILOT_COMMAND",
+        "Write-Output $(& $env:APPLYPILOT_TARGET)",
+        "Write-Output @(. $env:APPLYPILOT_TARGET)",
+    ],
+)
+def test_encoded_dynamic_powershell_targets_are_ambiguous_and_redacted(decoded):
+    encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
+    command = f"pwsh.exe -enc {encoded}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert decoded not in result.stdout
+    assert decoded not in result.stderr
+    assert encoded not in result.stdout
+    assert encoded not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
 
 
 @pytest.mark.parametrize("operator", [";", "&&", "|"])
