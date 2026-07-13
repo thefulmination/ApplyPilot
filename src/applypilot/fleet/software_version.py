@@ -6,6 +6,7 @@ spot stale boxes before they behave differently from the rest of the fleet.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -81,4 +82,13 @@ def build_sw_version(identity: GitIdentity | None = None) -> str:
 
 
 def current_sw_version(*, repo: Path | None = None) -> str:
+    configured = os.environ.get("APPLYPILOT_RELEASE_VERSION", "").strip()
+    if configured:
+        expected = rf"{re.escape(__version__)}\+git\.tree\.[0-9a-f]{{7}}"
+        if not re.fullmatch(expected, configured):
+            raise RuntimeError(
+                "APPLYPILOT_RELEASE_VERSION must match "
+                f"{__version__}+git.tree.<7 lowercase hex characters>"
+            )
+        return configured
     return build_sw_version(git_identity(repo=repo))

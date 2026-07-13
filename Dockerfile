@@ -40,6 +40,9 @@ ENV CLAUDE_PATH=/usr/local/bin/claude \
     IS_SANDBOX=1 \
     PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
-# Sealed in Railway, NOT baked into the image: DEEPSEEK_API_KEY, DATABASE_URL.
-# PII (profile.json + resume.pdf) mounts from a Railway volume at /data/applypilot.
+# Required Railway variables: DATABASE_URL, DEEPSEEK_API_KEY, unique
+# APPLYPILOT_WORKER_ID, and APPLYPILOT_RELEASE_VERSION. The release value must be
+# the exact fleet pin (for example 0.3.0+git.tree.840f17b) because .git is excluded
+# from the image. PII (profile.json + resume.pdf) mounts from a Railway volume at
+# /data/applypilot. The entrypoint refuses to start if any contract item is absent.
 CMD ["/app/entrypoint.sh"]

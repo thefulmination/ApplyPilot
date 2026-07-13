@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from applypilot.fleet import software_version
 from applypilot.fleet.software_version import GitIdentity, build_sw_version, git_identity
 from applypilot.fleet.worker import WorkerLoop
 
@@ -117,3 +120,16 @@ def test_worker_loop_defaults_to_current_software_version(monkeypatch) -> None:
     )
 
     assert loop.sw_version == "0.3.0+git.tree.abc1234"
+
+
+def test_current_sw_version_uses_valid_release_override(monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_RELEASE_VERSION", "0.3.0+git.tree.abc1234")
+
+    assert software_version.current_sw_version() == "0.3.0+git.tree.abc1234"
+
+
+def test_current_sw_version_rejects_invalid_release_override(monkeypatch) -> None:
+    monkeypatch.setenv("APPLYPILOT_RELEASE_VERSION", "main-latest")
+
+    with pytest.raises(RuntimeError, match="APPLYPILOT_RELEASE_VERSION must match"):
+        software_version.current_sw_version()
