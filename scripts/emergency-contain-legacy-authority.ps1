@@ -252,6 +252,10 @@ function Get-StartProcessTargetText($Command) {
     }
   }
   if ($elements.Count -gt 1 -and
+      $elements[1].Extent.Text -match '(?i)^-FilePath(?::|=)(?<value>.*)$') {
+    return $Matches.value
+  }
+  if ($elements.Count -gt 1 -and
       $elements[1] -isnot [Management.Automation.Language.CommandParameterAst]) {
     return $elements[1].Extent.Text
   }
@@ -269,7 +273,12 @@ function Test-IsIndirectPowerShellAcquisition($Command) {
   if ($commandName -in @('start-process', 'saps', 'start')) {
     $targetText = Get-StartProcessTargetText $Command
     if ($targetText) {
-      return Test-TextContainsBoundedAcquisitionIndicator $targetText
+      if ($targetText.Length -ge 2 -and
+          (($targetText.StartsWith("'") -and $targetText.EndsWith("'")) -or
+           ($targetText.StartsWith('"') -and $targetText.EndsWith('"')))) {
+        $targetText = $targetText.Substring(1, $targetText.Length - 2)
+      }
+      return Test-IsAcquisitionWrapperToken $targetText
     }
     $argumentText = @($Command.CommandElements | Select-Object -Skip 1 | ForEach-Object {
       $_.Extent.Text
@@ -292,17 +301,34 @@ function Get-IndirectPowerShellTokenClassification([string[]]$PayloadTokens) {
   if ($commandName -notin @('start-process', 'saps', 'start')) { return '' }
 
   $targetToken = ''
+  $attachedFilePath = $false
   for ($index = 1; $index -lt $payload.Count; $index++) {
     if ($payload[$index] -ieq '-FilePath') {
       if ($index + 1 -lt $payload.Count) { $targetToken = $payload[$index + 1] }
+      break
+    }
+    if ($payload[$index] -match '(?i)^-FilePath(?::|=)(?<value>.*)$') {
+      $targetToken = $Matches.value
+      $attachedFilePath = $true
       break
     }
   }
   if (-not $targetToken -and -not $payload[1].StartsWith('-')) {
     $targetToken = $payload[1]
   }
+  if ($targetToken.Length -ge 2 -and
+      (($targetToken.StartsWith("'") -and $targetToken.EndsWith("'")) -or
+       ($targetToken.StartsWith('"') -and $targetToken.EndsWith('"')))) {
+    $targetToken = $targetToken.Substring(1, $targetToken.Length - 2)
+  }
   if ($targetToken -and (Test-IsAcquisitionWrapperToken $targetToken)) {
     return 'ambiguous'
+  }
+  if ($attachedFilePath) {
+    foreach ($token in $payload) {
+      if ($token -match '(?:&&|\|\||[;&|<>`\r\n])') { return '' }
+    }
+    return 'benign'
   }
   return ''
 }
