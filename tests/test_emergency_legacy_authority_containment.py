@@ -704,6 +704,8 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         'pwsh -Command "run-fleet-workers.ps1 &"',
         'pwsh -Command "run-fleet-workers.ps1 -Count 2" ; Write-Output done',
         'pwsh -Command "run-fleet-workers.ps1 -Count 2" && Write-Output done',
+        'pwsh -Command "Invoke-Expression \'run-fleet-workers.ps1\'"',
+        'pwsh -Command "Start-Process run-fleet-workers.ps1"',
         f"pwsh -EncodedCommand {encoded}",
         "pwsh -EncodedCommand not-valid-base64!",
     ]
@@ -1058,6 +1060,14 @@ def test_each_injected_seam_marks_receipt_non_operational(
         ('pwsh.exe -Command run-fleet-workers.ps1', "acquisition"),
         ('pwsh.exe -Command "run-fleet-workers.ps1 -Count 2"', "acquisition"),
         ('pwsh.exe -Command "run-fleet-workers.ps1" -Count 2', "acquisition"),
+        (
+            'pwsh.exe -Command "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "acquisition",
+        ),
+        (
+            'pwsh.exe -Command & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"',
+            "acquisition",
+        ),
         ('pwsh.exe -Command "& run-fleet-workers.ps1"', "acquisition"),
         ('pwsh.exe -Command "& \'run-fleet-workers.ps1\'"', "acquisition"),
         ('pwsh.exe -Command "& \\"run-fleet-workers.ps1\\""', "acquisition"),
@@ -1074,6 +1084,15 @@ def test_each_injected_seam_marks_receipt_non_operational(
         (
             'pwsh.exe -EncodedCommand '
             + base64.b64encode('& "run-fleet-workers.ps1"'.encode("utf-16le")).decode("ascii"),
+            "acquisition",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                '& "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1"'.encode(
+                    "utf-16le"
+                )
+            ).decode("ascii"),
             "acquisition",
         ),
         ('"C:\\Python312\\python.exe" "C:\\Program Files\\ApplyPilot\\src\\applypilot\\fleet\\workday_rollout_main.py" canary', "acquisition"),
@@ -1115,6 +1134,14 @@ def test_each_injected_seam_marks_receipt_non_operational(
             'pwsh.exe -Command "run-fleet-workers.ps1 -Count 2" && Write-Output done',
             "ambiguous",
         ),
+        (
+            'pwsh.exe -Command & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1" && Write-Output done',
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -Command "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1" ; Write-Output done',
+            "ambiguous",
+        ),
         ('pwsh.exe -Command "run-fleet-workers.ps1.backup"', "benign"),
         ('pwsh.exe -Command "& \'run-fleet-workers.ps1.backup\'"', "benign"),
         (
@@ -1129,6 +1156,31 @@ def test_each_injected_seam_marks_receipt_non_operational(
         ),
         (
             'pwsh.exe -Command "run-fleet-workers.ps1.backup" && Write-Output done',
+            "benign",
+        ),
+        (
+            'pwsh.exe -Command & "C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1.backup"',
+            "benign",
+        ),
+        ('pwsh.exe -Command "Invoke-Expression \'run-fleet-workers.ps1\'"', "ambiguous"),
+        ('pwsh.exe -Command "iex \'run-fleet-workers.ps1\'"', "ambiguous"),
+        ('pwsh.exe -Command "Start-Process run-fleet-workers.ps1"', "ambiguous"),
+        ('pwsh.exe -Command "saps -FilePath run-fleet-workers.ps1"', "ambiguous"),
+        (
+            'pwsh.exe -Command "Start-Process -FilePath \'C:\\Program Files\\ApplyPilot\\run-fleet-workers.ps1\'"',
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -Command "Invoke-Command -ScriptBlock { run-fleet-workers.ps1 }"',
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -Command "Start-Process notepad.exe -ArgumentList \'run-fleet-workers.ps1\'"',
+            "benign",
+        ),
+        ('pwsh.exe -Command "iex \'run-fleet-workers.ps1.backup\'"', "benign"),
+        (
+            'pwsh.exe -Command "Start-Process run-fleet-workers.ps1.backup"',
             "benign",
         ),
         (
@@ -1168,6 +1220,20 @@ def test_each_injected_seam_marks_receipt_non_operational(
                 "& 'run-fleet-workers.ps1.backup' && Write-Output done".encode("utf-16le")
             ).decode("ascii"),
             "benign",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                "Invoke-Expression 'run-fleet-workers.ps1'".encode("utf-16le")
+            ).decode("ascii"),
+            "ambiguous",
+        ),
+        (
+            'pwsh.exe -EncodedCommand '
+            + base64.b64encode(
+                "Start-Process run-fleet-workers.ps1".encode("utf-16le")
+            ).decode("ascii"),
+            "ambiguous",
         ),
         ('pwsh.exe -EncodedCommand not-valid-base64!', "ambiguous"),
         ('pwsh.exe -EncodedCommand YQ==', "ambiguous"),
@@ -1241,6 +1307,29 @@ def test_plain_command_probe_never_emits_raw_payload():
     command = (
         'pwsh -Command "run-fleet-workers.ps1 -Count 2" '
         f"&& Write-Output {marker}"
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker not in result.stdout
+    assert marker not in result.stderr
+    assert command not in result.stdout
+    assert command not in result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+def test_indirect_command_probe_never_emits_raw_payload():
+    marker = "SECRET_INDIRECT_COMMAND_MARKER"
+    command = (
+        "pwsh -Command \"Invoke-Expression "
+        f"'run-fleet-workers.ps1; Write-Output {marker}'\""
     )
 
     result = subprocess.run(

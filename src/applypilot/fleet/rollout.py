@@ -5,7 +5,7 @@ import json
 import hashlib
 import secrets
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 from urllib.parse import urlparse
@@ -229,7 +229,8 @@ def run_workday_shadow(jobs: Iterable[dict], executor: Callable, *, limit: int =
         result = executor(job, submit=False)
         record = _record("workday_shadow", job, result)
         records.append(record)
-        if record_fn: record_fn(record)
+        if record_fn:
+            record_fn(record)
     return records
 
 
@@ -249,7 +250,8 @@ def run_supervised_canary(jobs: Iterable[dict], executor: Callable, *,
         else:
             record = _record("workday_canary", job, executor(job, submit=True), observed=True)
         records.append(record)
-        if record_fn: record_fn(record)
+        if record_fn:
+            record_fn(record)
     return records
 
 
@@ -266,7 +268,8 @@ def run_canary_prepare(jobs: Iterable[dict], executor: Callable, *, limit: int =
             result = executor(job, submit=False)
             record = _record("workday_canary_prepare", job, result)
         records.append(record)
-        if record_fn: record_fn(record)
+        if record_fn:
+            record_fn(record)
     return records
 
 
@@ -290,14 +293,22 @@ def evaluate_expansion(records: Iterable[RolloutRecord],
     exception_rate = exceptions / len(rows) if rows else 1.0
     average_cost = sum(row.cost_usd for row in rows) / len(rows) if rows else float("inf")
     reasons = []
-    if len(shadow) < thresholds.min_shadow: reasons.append("insufficient_shadow_count")
-    if len(canary) < thresholds.min_canary: reasons.append("insufficient_canary_count")
-    if any(not row.observed for row in canary): reasons.append("unobserved_canary")
-    if false_success > thresholds.max_false_success: reasons.append("false_success_threshold")
-    if duplicates > thresholds.max_duplicates: reasons.append("duplicate_threshold")
-    if unsupported > thresholds.max_unsupported_claims: reasons.append("unsupported_claim_threshold")
-    if exception_rate > thresholds.max_exception_rate: reasons.append("exception_rate_threshold")
-    if average_cost > thresholds.max_average_cost_usd: reasons.append("cost_threshold")
+    if len(shadow) < thresholds.min_shadow:
+        reasons.append("insufficient_shadow_count")
+    if len(canary) < thresholds.min_canary:
+        reasons.append("insufficient_canary_count")
+    if any(not row.observed for row in canary):
+        reasons.append("unobserved_canary")
+    if false_success > thresholds.max_false_success:
+        reasons.append("false_success_threshold")
+    if duplicates > thresholds.max_duplicates:
+        reasons.append("duplicate_threshold")
+    if unsupported > thresholds.max_unsupported_claims:
+        reasons.append("unsupported_claim_threshold")
+    if exception_rate > thresholds.max_exception_rate:
+        reasons.append("exception_rate_threshold")
+    if average_cost > thresholds.max_average_cost_usd:
+        reasons.append("cost_threshold")
     metrics = {
         "shadow_count": len(shadow), "canary_count": len(canary),
         "false_success": false_success, "duplicates": duplicates,

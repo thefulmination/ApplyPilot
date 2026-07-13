@@ -226,6 +226,59 @@ function Test-IsSafePowerShellCommandElement($Element) {
     $Element.Argument -is [Management.Automation.Language.ConstantExpressionAst]
 }
 
+function Test-IsSimplePowerShellTokenAcquisition([string[]]$PayloadTokens) {
+  $payload = @($PayloadTokens)
+  if ($payload.Count -eq 0) { return $false }
+  $targetIndex = if ($payload[0] -ceq '&') { 1 } else { 0 }
+  if ($targetIndex -ge $payload.Count -or
+      -not (Test-IsAcquisitionWrapperToken $payload[$targetIndex])) {
+    return $false
+  }
+  foreach ($token in $payload[$targetIndex..($payload.Count - 1)]) {
+    if ($token -match '(?:&&|\|\||[;&|<>`\r\n]|\$\(|[{}])') { return $false }
+  }
+  return $true
+}
+
+function Get-StartProcessTargetText($Command) {
+  $elements = @($Command.CommandElements)
+  for ($index = 1; $index -lt $elements.Count; $index++) {
+    $element = $elements[$index]
+    if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+        $element.ParameterName -ieq 'FilePath') {
+      if ($null -ne $element.Argument) { return $element.Argument.Extent.Text }
+      if ($index + 1 -lt $elements.Count) { return $elements[$index + 1].Extent.Text }
+      return ''
+    }
+  }
+  if ($elements.Count -gt 1 -and
+      $elements[1] -isnot [Management.Automation.Language.CommandParameterAst]) {
+    return $elements[1].Extent.Text
+  }
+  return ''
+}
+
+function Test-IsIndirectPowerShellAcquisition($Command) {
+  $commandName = ([string]$Command.GetCommandName()).ToLowerInvariant()
+  if ($commandName -in @('invoke-expression', 'iex')) {
+    $argumentText = @($Command.CommandElements | Select-Object -Skip 1 | ForEach-Object {
+      $_.Extent.Text
+    }) -join ' '
+    return Test-TextContainsBoundedAcquisitionIndicator $argumentText
+  }
+  if ($commandName -in @('start-process', 'saps', 'start')) {
+    $targetText = Get-StartProcessTargetText $Command
+    if ($targetText) {
+      return Test-TextContainsBoundedAcquisitionIndicator $targetText
+    }
+    $argumentText = @($Command.CommandElements | Select-Object -Skip 1 | ForEach-Object {
+      $_.Extent.Text
+    }) -join ' '
+    return Test-TextContainsBoundedAcquisitionIndicator $argumentText
+  }
+  return $false
+}
+
 function Get-PowerShellCommandTextClassification([string]$CommandText) {
   $parseTokens = $null
   $parseErrors = $null
@@ -261,6 +314,7 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
       $node -is [Management.Automation.Language.CommandAst]
     }, $true))
     foreach ($parsedCommand in $commands) {
+      if (Test-IsIndirectPowerShellAcquisition $parsedCommand) { return 'ambiguous' }
       $commandName = $parsedCommand.GetCommandName()
       $commandPositionText = if ($commandName) {
         $commandName
@@ -282,6 +336,7 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
 function Get-PowerShellCommandPayloadClassification([string[]]$PayloadTokens) {
   $payload = @($PayloadTokens)
   if ($payload.Count -eq 0) { return 'benign' }
+  if (Test-IsSimplePowerShellTokenAcquisition $payload) { return 'acquisition' }
   $commandText = $payload -join ' '
   return Get-PowerShellCommandTextClassification $commandText
 }

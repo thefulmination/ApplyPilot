@@ -41,8 +41,6 @@ import os
 import re
 from typing import Any, Callable, Optional
 
-import psycopg.errors as _pg_errors
-
 from applypilot.fleet import captcha as _captcha
 from applypilot.fleet import config as fleet_config
 from applypilot.fleet import governor

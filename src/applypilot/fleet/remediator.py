@@ -139,6 +139,51 @@ def select_backfill_candidates(conn, *, max_per_job: int = 2,
                 for r in cur.fetchall()]
 
 
+_PRE_TOUCH_BACKFILL_SQL = """
+SELECT q.url, q.worker_id, q.dedup_key, q.status::text AS status, q.attempts,
+       q.apply_error, 'pre_touch_backfill' AS reason
+FROM apply_queue q
+JOIN LATERAL (
+    SELECT e.application_tool_calls
+    FROM apply_result_events e
+    WHERE e.queue_name = 'apply_queue' AND e.url = q.url
+    ORDER BY e.created_at DESC, e.id DESC
+    LIMIT 1
+) latest_event ON TRUE
+WHERE q.lane = 'ats'
+  AND q.status = 'failed'
+  AND q.apply_error ILIKE '%%no_browser_tool%%'
+  AND q.dedup_key IS NOT NULL
+  AND latest_event.application_tool_calls = 0
+  AND (SELECT count(*) FROM remediation_actions ra
+       WHERE ra.url = q.url AND ra.action = 'requeue') < %(maxperjob)s
+ORDER BY q.updated_at ASC
+LIMIT %(hardlimit)s
+"""
+
+
+def select_pre_touch_backfill_candidates(conn, *, max_per_job: int = 2,
+                                         hard_limit: int = 500) -> list[Candidate]:
+    """Select failed no-browser-tool jobs only when their latest durable event proves zero touches."""
+    with conn.cursor() as cur:
+        cur.execute(
+            _PRE_TOUCH_BACKFILL_SQL,
+            {"maxperjob": max_per_job, "hardlimit": hard_limit},
+        )
+        return [
+            Candidate(
+                url=row["url"],
+                worker_id=row["worker_id"],
+                dedup_key=row["dedup_key"],
+                status=row["status"],
+                attempts=row["attempts"],
+                apply_error=row["apply_error"],
+                reason=row["reason"],
+            )
+            for row in cur.fetchall()
+        ]
+
+
 def requeue_job(conn, c: Candidate, *, apply_error_tag: str = REQUEUE_TAG) -> bool:
     """Reverse the reclaim park for ONE proven-never-submitted job: status -> 'queued', attempts
     -> 0, lease cleared, apply_error tagged. Race-guarded on the prior status. Writes a reversal
