@@ -134,6 +134,7 @@ def test_indeed_resolve_apply_urls_rejects_negative_limit(monkeypatch):
 
 
 def test_boost_output_resolves_urls_and_generates_until_ready_target(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_MIN_SCORE", raising=False)
     calls = {"pipeline": 0, "liveness": 0, "company": 0, "indeed": 0}
     ready_values = [10, 80, 120, 150]
 
