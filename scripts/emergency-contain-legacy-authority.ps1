@@ -574,6 +574,7 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
       if (Test-TextContainsBoundedAcquisitionIndicator $scriptToken) { return 'ambiguous' }
       return 'benign'
     }
+    if ($token -ceq '-') { return 'ambiguous' }
     if ($token -ceq '-c' -or $token -cmatch '^-c.+$') { return 'ambiguous' }
     if ($token -cin @('-h', '--help', '-V', '--version')) { return 'benign' }
     if ($token -cmatch '^-b{1,2}$') { continue }
@@ -604,45 +605,98 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
   return 'benign'
 }
 
-function Test-IsPowerShellOptionPrefix(
-  [string]$Token,
-  [string]$CanonicalName,
-  [int]$MinimumLength = 1
+function Get-PowerShellOptionMetadata([string]$Token) {
+  if (-not $Token.StartsWith('-') -or $Token.StartsWith('--')) { return $null }
+  $name = $Token.Substring(1).ToLowerInvariant()
+  $specifications = @(
+    [pscustomobject]@{ name = 'commandwithargs'; minimum = 15; kind = 'command'; aliases = @('cwa') },
+    [pscustomobject]@{ name = 'encodedcommand'; minimum = 1; kind = 'encoded'; aliases = @('ec') },
+    [pscustomobject]@{ name = 'command'; minimum = 1; kind = 'command'; aliases = @() },
+    [pscustomobject]@{ name = 'file'; minimum = 1; kind = 'file'; aliases = @() },
+    [pscustomobject]@{ name = 'noprofile'; minimum = 3; kind = 'switch'; aliases = @('nop') },
+    [pscustomobject]@{ name = 'nologo'; minimum = 3; kind = 'switch'; aliases = @() },
+    [pscustomobject]@{ name = 'noexit'; minimum = 3; kind = 'switch'; aliases = @() },
+    [pscustomobject]@{ name = 'noninteractive'; minimum = 4; kind = 'switch'; aliases = @() },
+    [pscustomobject]@{ name = 'sta'; minimum = 1; kind = 'switch'; aliases = @() },
+    [pscustomobject]@{ name = 'mta'; minimum = 1; kind = 'switch'; aliases = @() },
+    [pscustomobject]@{ name = 'executionpolicy'; minimum = 2; kind = 'value'; aliases = @('ep', 'ex') },
+    [pscustomobject]@{ name = 'inputformat'; minimum = 2; kind = 'value'; aliases = @() },
+    [pscustomobject]@{ name = 'outputformat'; minimum = 2; kind = 'value'; aliases = @() },
+    [pscustomobject]@{ name = 'windowstyle'; minimum = 2; kind = 'value'; aliases = @() },
+    [pscustomobject]@{ name = 'workingdirectory'; minimum = 2; kind = 'value'; aliases = @() },
+    [pscustomobject]@{ name = 'configurationname'; minimum = 3; kind = 'value'; aliases = @() }
+  )
+  foreach ($specification in $specifications) {
+    if ($specification.aliases -contains $name) { return $specification }
+    if ($name.Length -ge $specification.minimum -and
+        $name.Length -le $specification.name.Length -and
+        $specification.name.StartsWith($name, [StringComparison]::OrdinalIgnoreCase)) {
+      return $specification
+    }
+  }
+  return $null
+}
+
+function Get-PowerShellTerminalClassification(
+  [string]$Kind,
+  [string[]]$Tokens,
+  [int]$ValueIndex
 ) {
-  if (-not $Token.StartsWith('-') -or $Token.StartsWith('--')) { return $false }
-  $name = $Token.Substring(1)
-  return $name.Length -ge $MinimumLength -and
-    $name.Length -le $CanonicalName.Length -and
-    $CanonicalName.StartsWith($name, [StringComparison]::OrdinalIgnoreCase)
+  if ($ValueIndex -ge $Tokens.Count) {
+    if ($Kind -eq 'encoded') { return 'ambiguous' }
+    return 'benign'
+  }
+  if ($Kind -eq 'encoded') {
+    return Get-PowerShellEncodedCommandClassification $Tokens[$ValueIndex]
+  }
+  if ($Kind -eq 'command') {
+    $payload = @($Tokens[$ValueIndex..($Tokens.Count - 1)])
+    if ($payload.Count -gt 0 -and $payload[0] -ceq '-') { return 'ambiguous' }
+    return Get-PowerShellCommandPayloadClassification $payload
+  }
+  $target = $Tokens[$ValueIndex]
+  if ($target -ceq '-') { return 'ambiguous' }
+  if (Test-IsAcquisitionWrapperToken $target) { return 'acquisition' }
+  return 'benign'
+}
+
+function Get-LatePowerShellTerminalClassification([string[]]$Tokens, [int]$StartIndex) {
+  for ($scanIndex = $StartIndex; $scanIndex -lt $Tokens.Count; $scanIndex++) {
+    $metadata = Get-PowerShellOptionMetadata $Tokens[$scanIndex]
+    if ($null -eq $metadata) { continue }
+    if ($metadata.kind -in @('command', 'encoded', 'file')) {
+      return Get-PowerShellTerminalClassification `
+        -Kind $metadata.kind `
+        -Tokens $Tokens `
+        -ValueIndex ($scanIndex + 1)
+    }
+    if ($metadata.kind -eq 'value') { $scanIndex++ }
+  }
+  return $null
 }
 
 function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
-  $continuingOptions = @('-nologo', '-noprofile', '-nop', '-noexit', '-noninteractive', '-sta', '-mta')
-  $valuedOptions = @('-executionpolicy', '-windowstyle', '-workingdirectory', '-inputformat', '-outputformat', '-configurationname')
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
-    $token = $Tokens[$index].ToLowerInvariant()
-    if ($token -in @('-file', '-fil', '-fi', '-f')) {
-      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
-      if (Test-IsAcquisitionWrapperToken $Tokens[$index + 1]) { return 'acquisition' }
-      return 'benign'
-    }
+    $token = $Tokens[$index]
     if ($token -eq '--') { return 'benign' }
-    if (Test-IsPowerShellOptionPrefix -Token $token -CanonicalName 'command') {
-      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
-      return Get-PowerShellCommandPayloadClassification $Tokens[($index + 1)..($Tokens.Count - 1)]
+    $metadata = Get-PowerShellOptionMetadata $token
+    if ($null -ne $metadata -and $metadata.kind -in @('command', 'encoded', 'file')) {
+      return Get-PowerShellTerminalClassification `
+        -Kind $metadata.kind `
+        -Tokens $Tokens `
+        -ValueIndex ($index + 1)
     }
-    if ((Test-IsPowerShellOptionPrefix -Token $token -CanonicalName 'encodedcommand') -or
-        $token -eq '-ec') {
-      if ($index + 1 -ge $Tokens.Count) { return 'ambiguous' }
-      return Get-PowerShellEncodedCommandClassification $Tokens[$index + 1]
-    }
-    if ($continuingOptions -contains $token) { continue }
-    if ($valuedOptions -contains $token) {
+    if ($null -ne $metadata -and $metadata.kind -eq 'switch') { continue }
+    if ($null -ne $metadata -and $metadata.kind -eq 'value') {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
       $index++
       continue
     }
     if ($token.StartsWith('-')) {
+      $lateClassification = Get-LatePowerShellTerminalClassification `
+        -Tokens $Tokens `
+        -StartIndex ($index + 1)
+      if ($lateClassification -in @('acquisition', 'ambiguous')) { return 'ambiguous' }
       return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
     }
     if (Test-IsAcquisitionWrapperToken $Tokens[$index]) { return 'acquisition' }
@@ -661,6 +715,12 @@ function Test-CmdTokensContainControlSyntax([string[]]$Tokens) {
 function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
   $payload = @($PayloadTokens)
   if ($payload.Count -eq 0) { return 'benign' }
+  $payloadText = $payload -join ' '
+  if ($payloadText -match '(?:%[^%\r\n]+%|![^!\r\n]+!)') { return 'ambiguous' }
+  if (Test-CmdTokensContainControlSyntax $payload) {
+    $unescapedPayload = @($payload | ForEach-Object { $_ -replace '\^(.)', '$1' })
+    if (Test-TokensContainExactAcquisitionIndicator $unescapedPayload) { return 'ambiguous' }
+  }
   $containsExactIndicator = Test-TokensContainExactAcquisitionIndicator $payload
 
   $index = 0
@@ -690,8 +750,6 @@ function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
   } else {
     $candidate = $current
   }
-
-  if ($candidate -match '(?:%[^%\r\n]+%|![^!\r\n]+!)') { return 'ambiguous' }
 
   $trailingTokens = if ($index + 1 -lt $payload.Count) {
     @($payload[($index + 1)..($payload.Count - 1)])
@@ -724,8 +782,14 @@ function Get-CmdSwitchTokenParse([string]$RawToken) {
         payload = $RawToken.Substring($position + 1)
       }
     }
-    if ($option -in @('d', 's', 'q', 'a', 'u')) {
+    if ($option -in @('d', 's', 'q', 'a', 'u', 'x', 'y')) {
       $position++
+    } elseif ($option -eq 't') {
+      $remaining = $RawToken.Substring($position)
+      if ($remaining -notmatch '^(?i:t:[0-9a-f]{2})') {
+        return [ordered]@{ state = 'unfamiliar'; payload = $null }
+      }
+      $position += $Matches[0].Length
     } elseif ($option -in @('e', 'f', 'v')) {
       $remaining = $RawToken.Substring($position)
       if ($remaining -notmatch '^(?i:(?:e|f|v):(?:on|off))') {
@@ -744,6 +808,12 @@ function Get-CmdSwitchTokenParse([string]$RawToken) {
 }
 
 function Get-CmdUnfamiliarClassification([string[]]$Tokens) {
+  $tokenText = @($Tokens) -join ' '
+  if ($tokenText -match '(?:%[^%\r\n]+%|![^!\r\n]+!)') { return 'ambiguous' }
+  if (Test-CmdTokensContainControlSyntax $Tokens) {
+    $unescapedTokens = @($Tokens | ForEach-Object { $_ -replace '\^(.)', '$1' })
+    if (Test-TokensContainExactAcquisitionIndicator $unescapedTokens) { return 'ambiguous' }
+  }
   if ((Get-AmbiguousOrBenignClassification $Tokens) -eq 'ambiguous') { return 'ambiguous' }
   foreach ($token in @($Tokens)) {
     foreach ($match in [regex]::Matches($token, '(?i)/(?:c|k|r)(?<payload>[^/]*)')) {
@@ -1100,13 +1170,14 @@ function Read-KnownWrapperStreamBytes($Stream) {
   $buffer = [IO.MemoryStream]::new()
   try {
     $Stream.CopyTo($buffer)
-    return $buffer.ToArray()
+    return ,$buffer.ToArray()
   } finally {
     $buffer.Dispose()
   }
 }
 
 function ConvertFrom-KnownWrapperBytes([byte[]]$Content) {
+  if ($Content.Length -eq 0) { return '' }
   $buffer = [IO.MemoryStream]::new($Content, $false)
   $reader = [IO.StreamReader]::new(
     $buffer,
@@ -1115,6 +1186,8 @@ function ConvertFrom-KnownWrapperBytes([byte[]]$Content) {
   )
   try {
     return $reader.ReadToEnd()
+  } catch [Text.DecoderFallbackException] {
+    return [Text.Encoding]::Latin1.GetString($Content)
   } finally {
     $reader.Dispose()
     $buffer.Dispose()
@@ -1132,6 +1205,18 @@ function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {
   $Stream.SetLength(0)
   $Stream.Write($Content, 0, $Content.Length)
   $Stream.Flush($true)
+}
+
+function Restore-KnownWrapperBytes($Stream, [byte[]]$Content) {
+  $Stream.Position = 0
+  $Stream.SetLength(0)
+  if ($Content.Length -gt 0) { $Stream.Write($Content, 0, $Content.Length) }
+  $Stream.Flush($true)
+  $restored = Read-KnownWrapperStreamBytes $Stream
+  if ($restored.Length -ne $Content.Length -or
+      (Get-KnownWrapperByteDigest $restored) -cne (Get-KnownWrapperByteDigest $Content)) {
+    throw 'wrapper restoration verification failed'
+  }
 }
 
 function Get-KnownWrapperDenyStubBytes([string]$Extension) {
@@ -1159,18 +1244,20 @@ function Get-KnownWrapperEvidenceFiles($Wrapper) {
 
 function Test-KnownDenyStubEvidence($Wrapper) {
   $evidenceFiles = @(Get-KnownWrapperEvidenceFiles $Wrapper)
-  if ($evidenceFiles.Count -ne 1) { return $false }
-  $expectedDigest = $evidenceFiles[0].Name.Substring($evidenceFiles[0].Name.Length - 64)
-  $evidenceStream = $null
-  try {
-    $evidenceStream = Open-KnownExistingEvidenceExclusive $evidenceFiles[0].FullName
-    Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $expectedDigest
-    return $true
-  } catch {
-    return $false
-  } finally {
-    if ($null -ne $evidenceStream) { $evidenceStream.Dispose() }
+  if ($evidenceFiles.Count -eq 0) { return $false }
+  foreach ($evidenceFile in $evidenceFiles) {
+    $expectedDigest = $evidenceFile.Name.Substring($evidenceFile.Name.Length - 64)
+    $evidenceStream = $null
+    try {
+      $evidenceStream = Open-KnownExistingEvidenceExclusive $evidenceFile.FullName
+      Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $expectedDigest
+    } catch {
+      return $false
+    } finally {
+      if ($null -ne $evidenceStream) { $evidenceStream.Dispose() }
+    }
   }
+  return $true
 }
 
 function Open-KnownEvidenceExclusive([string]$Path) {
@@ -1526,7 +1613,9 @@ function Get-UnresolvedAfterState($Snapshot) {
   foreach ($wrapper in @($Snapshot.wrapper_hashes)) {
     $conditions = [Collections.Generic.List[string]]::new()
     if ([bool]$wrapper.embedded_dsn) { $conditions.Add('embedded_dsn_present') }
-    if ([bool]$wrapper.deny_stub -and -not [bool]$wrapper.evidence_verified) {
+    if (-not [bool]$wrapper.deny_stub) {
+      $conditions.Add('exact_deny_stub_absent')
+    } elseif (-not [bool]$wrapper.evidence_verified) {
       $conditions.Add('preserved_evidence_unverified')
     }
     if ($conditions.Count -gt 0) {
@@ -1619,22 +1708,12 @@ function Remove-EmbeddedWrapperDsns {
       $evidenceStream = $null
       try {
         $preimageBytes = Read-KnownWrapperStreamBytes $stream
-        $content = ConvertFrom-KnownWrapperBytes $preimageBytes
         if (Test-KnownWrapperDenyStub -Content $preimageBytes -Extension $wrapper.Extension) {
-          $evidenceFiles = @(Get-KnownWrapperEvidenceFiles $wrapper)
-          if ($evidenceFiles.Count -ne 1) {
-            throw 'deny stub requires exactly one preserved evidence artifact'
+          if (-not (Test-KnownDenyStubEvidence $wrapper)) {
+            throw 'deny stub requires verified preserved evidence artifacts'
           }
-          $expectedDigest = $evidenceFiles[0].Name.Substring(
-            $evidenceFiles[0].Name.Length - 64
-          )
-          $evidenceStream = Open-KnownExistingEvidenceExclusive $evidenceFiles[0].FullName
-          Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $expectedDigest
           return
         }
-        $containsSensitiveContent = $content -match $script:SensitiveIdentifier -or
-          $content -match $script:SensitiveUri
-        if (-not $containsSensitiveContent) { return }
 
         $preimageDigest = Get-KnownWrapperByteDigest $preimageBytes
         $evidencePath = "{0}.emergency-containment-evidence-{1}" -f $wrapper.FullName, $preimageDigest
@@ -1643,14 +1722,31 @@ function Remove-EmbeddedWrapperDsns {
         if ($evidenceLease.created) {
           Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
           Flush-KnownEvidenceStream $evidenceStream
+        } else {
+          try {
+            Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
+          } catch {
+            Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
+            Flush-KnownEvidenceStream $evidenceStream
+          }
         }
         Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
 
         $denyBytes = Get-KnownWrapperDenyStubBytes $wrapper.Extension
-        Write-KnownWrapperDenyStub -Stream $stream -Content $denyBytes
-        $writtenBytes = Read-KnownWrapperStreamBytes $stream
-        if (-not (Test-KnownWrapperDenyStub -Content $writtenBytes -Extension $wrapper.Extension)) {
-          throw 'wrapper deny stub verification failed'
+        try {
+          Write-KnownWrapperDenyStub -Stream $stream -Content $denyBytes
+          $writtenBytes = Read-KnownWrapperStreamBytes $stream
+          if (-not (Test-KnownWrapperDenyStub -Content $writtenBytes -Extension $wrapper.Extension)) {
+            throw 'wrapper deny stub verification failed'
+          }
+        } catch {
+          $writeFailure = $_
+          try {
+            Restore-KnownWrapperBytes -Stream $stream -Content $preimageBytes
+          } catch {
+            throw 'wrapper deny stub write failed and original restoration failed'
+          }
+          throw $writeFailure
         }
         Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
       } finally {

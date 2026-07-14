@@ -783,6 +783,121 @@ def test_idempotent_deny_stub_with_verified_evidence_remains_stable(tmp_path):
     assert "stable-secret" not in second_result.stderr
 
 
+@pytest.mark.parametrize(
+    ("name", "fragment"),
+    [
+        ("apply-cycle-task.ps1", b"Write-Output 'benign fragment'\n"),
+        ("apply-worker-m2.cmd", b"@echo off\r\necho incomplete\r\n"),
+        ("linkedin-m2.bat", b""),
+        ("fleet-agent-task.ps1", b"\xff\xfe\x00partial"),
+    ],
+)
+def test_every_existing_authorized_wrapper_converges_to_exact_deny_stub(
+    tmp_path, name, fragment
+):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / name
+    wrapper.write_bytes(fragment)
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["failures"] == []
+    assert payload["unresolved"] == []
+    assert payload["wrappers"][0]["deny_stub"] is True
+    evidence = list(wrappers.glob(f"{name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == fragment
+
+
+def test_partial_wrapper_write_is_rolled_back_through_same_handle(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'nonsensitive original'\n"
+    wrapper.write_bytes(preimage)
+    overrides = "\n".join(
+        [
+            "function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {",
+            "  $Stream.Position = 0; $Stream.SetLength(0)",
+            "  $Stream.Write($Content, 0, 11); $Stream.Flush($true)",
+            "  throw 'partial stub write'",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
+    assert wrapper.read_bytes() == preimage
+    assert payload["wrappers"][0]["deny_stub"] is False
+    assert payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+
+
+def test_restore_failure_stays_unresolved_and_clean_retry_preserves_fragment(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'original bytes'\n"
+    wrapper.write_bytes(preimage)
+    overrides = "\n".join(
+        [
+            "function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {",
+            "  $Stream.Position = 0; $Stream.SetLength(0)",
+            "  $Stream.Write($Content, 0, 9); $Stream.Flush($true)",
+            "  throw 'partial stub write'",
+            "}",
+            "function Restore-KnownWrapperBytes($Stream, [byte[]]$Content) { throw 'restore failed' }",
+        ]
+    )
+
+    first_result, first_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert first_result.returncode == 0, first_result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in first_payload["failures"])
+    fragment = wrapper.read_bytes()
+    assert fragment != preimage
+    assert first_payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
+
+    second_result, second_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert second_result.returncode == 0, second_result.stderr
+    assert second_payload["failures"] == []
+    assert second_payload["unresolved"] == []
+    assert second_payload["wrappers"][0]["deny_stub"] is True
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert sorted(item.read_bytes() for item in evidence) == sorted([preimage, fragment])
+
+
+def test_failed_evidence_creation_is_retryable_and_never_accepts_fragment(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'retryable evidence'\n"
+    wrapper.write_bytes(preimage)
+    overrides = "function Flush-KnownEvidenceStream($Stream) { throw 'flush failed' }"
+
+    first_result, first_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+    assert first_result.returncode == 0, first_result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in first_payload["failures"])
+    assert wrapper.read_bytes() == preimage
+    assert first_payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
+
+    second_result, second_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert second_result.returncode == 0, second_result.stderr
+    assert second_payload["failures"] == []
+    assert second_payload["unresolved"] == []
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+
+
 def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp_path):
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()
@@ -1132,6 +1247,10 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         "python -c \"import runpy; runpy.run_module('applypilot.fleet.apply_worker_main')\"",
         'python -c "print(\'opaque but apparently benign\')"',
         "python -cpass",
+        "python -",
+        "pwsh -File -",
+        "pwsh -Command -",
+        "pwsh -Unknown benign -Command -",
         'pwsh -Command "run-fleet-workers.ps1; Write-Output done"',
         'pwsh -Command "run-fleet-workers.ps1 && Write-Output done"',
         'pwsh -Command "run-fleet-workers.ps1 &"',
@@ -1154,6 +1273,8 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         'cmd /c"run-fleet-worker.cmd & echo done"',
         "cmd /c %APPLYPILOT_COMMAND%",
         "cmd /v:on/k!APPLYPILOT_COMMAND!",
+        "cmd /c echo first & %APPLYPILOT_COMMAND%",
+        "cmd /c echo first & run-fleet-^worker.cmd",
     ]
     process_rows = ",".join(
         (
@@ -1878,10 +1999,37 @@ def test_cmd_switch_grammar_finds_terminal_mode_and_exact_wrapper(command):
         ("cmd /v:on/cworkday-monitor.cmd", "benign"),
         ("cmd /c %APPLYPILOT_COMMAND%", "ambiguous"),
         ("cmd /v:on/k!APPLYPILOT_COMMAND!", "ambiguous"),
-        ("cmd /c echo %APPLYPILOT_COMMAND%", "benign"),
+        ("cmd /c echo %APPLYPILOT_COMMAND%", "ambiguous"),
     ],
 )
 def test_cmd_switch_grammar_is_fail_closed_and_bounded(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cmd /c echo first & %TARGET%", "ambiguous"),
+        ("cmd /v:on /c echo first & !TARGET!", "ambiguous"),
+        ("cmd /c echo first & run-fleet-^worker.cmd", "ambiguous"),
+        ("cmd /z /c %TARGET%", "ambiguous"),
+        ("cmd /z /c run-fleet-worker.cmd", "ambiguous"),
+        ("cmd /x /y /t:0A /d /c run-fleet-worker.cmd", "acquisition"),
+        ("cmd /x/y/t:0a/crun-fleet-worker.cmd", "acquisition"),
+        ("cmd /c echo first & run-fleet-^worker-report.cmd", "benign"),
+        ("cmd /t:GG /c run-fleet-worker.cmd", "ambiguous"),
+    ],
+)
+def test_cmd_whole_payload_and_canonical_switch_invariants(command, expected):
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
         cwd=ROOT,
@@ -1906,6 +2054,58 @@ def test_python_code_execution_is_always_opaque_and_ambiguous(command):
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -",
+        "python -I -",
+        "pwsh -File -",
+        "pwsh -F -",
+        "pwsh -Command -",
+        "pwsh -C -",
+    ],
+)
+def test_interpreter_stdin_execution_modes_are_ambiguous(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("pwsh -nopr -ex Bypass -c run-fleet-workers.ps1", "acquisition"),
+        ("pwsh -nol -noe -noni -c run-fleet-workers.ps1", "acquisition"),
+        ("pwsh -inp Text -out Text -c run-fleet-workers.ps1", "acquisition"),
+        ("pwsh -cwa run-fleet-workers.ps1", "acquisition"),
+        ("pwsh -CommandWithArgs run-fleet-workers.ps1", "acquisition"),
+        ("pwsh -Unknown benign -Command -", "ambiguous"),
+        ("pwsh -Unknown benign -File -", "ambiguous"),
+        ("pwsh -Unknown benign -File run-fleet-workers.ps1", "ambiguous"),
+        ("pwsh -Unknown benign -Command Write-Output safe", "benign"),
+        ("pwsh -executor benign.ps1", "benign"),
+    ],
+)
+def test_powershell_option_metadata_and_late_terminal_invariants(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
 
 
 @pytest.mark.parametrize("mode", ["c", "k"])
