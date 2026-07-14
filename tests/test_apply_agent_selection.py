@@ -206,7 +206,7 @@ def test_build_apply_agent_canary_command_uses_selected_agent(monkeypatch) -> No
     assert "Reply with the single word READY." in codex_cmd
 
 
-def test_worker_loop_passes_selected_agent_to_run_job(monkeypatch) -> None:
+def test_worker_loop_passes_selected_agent_to_run_job(monkeypatch, acquisition_admitted) -> None:
     from applypilot.apply import launcher
 
     launcher._stop_event.clear()
