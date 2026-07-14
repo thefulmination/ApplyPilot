@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import runpy
@@ -656,6 +657,9 @@ def test_evidence_delete_and_replace_are_blocked_until_wrapper_and_reverify_fini
     preimage = b"$env:FLEET_PG_DSN = 'held-evidence-secret'\n# evidence lock\n"
     wrapper.write_bytes(preimage)
     marker = tmp_path / "evidence-race.txt"
+    evidence_path = wrappers / (
+        f"{wrapper.name}.emergency-containment-evidence-{hashlib.sha256(preimage).hexdigest()}"
+    )
     replacement = base64.b64encode(b"unverified replacement bytes").decode("ascii")
     overrides = "\n".join(
         [
@@ -665,10 +669,10 @@ def test_evidence_delete_and_replace_are_blocked_until_wrapper_and_reverify_fini
             "  if ((Get-KnownWrapperByteDigest $bytes) -cne $ExpectedDigest) { throw 'digest mismatch' }",
             "  $script:EvidenceVerificationCount++",
             "  if ($script:EvidenceVerificationCount -eq 1) {",
-            "    try { [IO.File]::Delete($Stream.Name); Add-Content "
+            f"    try {{ [IO.File]::Delete('{_ps_quote(evidence_path)}'); Add-Content "
             f"-LiteralPath '{_ps_quote(marker)}' -Value 'delete_succeeded' }} "
             f"catch {{ Add-Content -LiteralPath '{_ps_quote(marker)}' -Value 'delete_blocked' }}",
-            "    try { [IO.File]::WriteAllBytes($Stream.Name, "
+            f"    try {{ [IO.File]::WriteAllBytes('{_ps_quote(evidence_path)}', "
             f"[Convert]::FromBase64String('{replacement}')); Add-Content "
             f"-LiteralPath '{_ps_quote(marker)}' -Value 'replace_succeeded' }} "
             f"catch {{ Add-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replace_blocked' }}",
@@ -896,6 +900,95 @@ def test_failed_evidence_creation_is_retryable_and_never_accepts_fragment(tmp_pa
     evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
     assert len(evidence) == 1
     assert evidence[0].read_bytes() == preimage
+
+
+def test_preexisting_corrupt_evidence_is_immutable_and_blocks_rewrite(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'immutable evidence preimage'\n"
+    corrupt = b"preexisting corrupt evidence"
+    wrapper.write_bytes(preimage)
+    digest = hashlib.sha256(preimage).hexdigest()
+    evidence = wrappers / f"{wrapper.name}.emergency-containment-evidence-{digest}"
+    evidence.write_bytes(corrupt)
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert result.returncode == 0, result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
+    assert wrapper.read_bytes() == preimage
+    assert evidence.read_bytes() == corrupt
+    assert payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
+
+
+@pytest.mark.parametrize("failure_stage", ["partial_write", "flush", "verify"])
+def test_new_partial_evidence_is_removed_through_held_handle(tmp_path, failure_stage):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'cleanup new evidence'\n"
+    wrapper.write_bytes(preimage)
+    overrides_by_stage = {
+        "partial_write": "\n".join(
+            [
+                "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
+                "  $Stream.Write($Content, 0, 7)",
+                "  throw 'partial evidence write'",
+                "}",
+            ]
+        ),
+        "flush": "function Flush-KnownEvidenceStream($Stream) { throw 'evidence flush failed' }",
+        "verify": (
+            "function Assert-KnownEvidenceStreamDigest($Stream, [string]$ExpectedDigest) "
+            "{ throw 'evidence verify failed' }"
+        ),
+    }
+
+    result, payload = _run_wrapper_rewrite_harness(
+        tmp_path, wrapper, overrides_by_stage[failure_stage]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
+    assert wrapper.read_bytes() == preimage
+    assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == []
+    assert payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
+
+
+def test_failed_new_evidence_cleanup_is_preserved_and_permanently_immutable(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'cleanup failure preimage'\n"
+    wrapper.write_bytes(preimage)
+    overrides = "\n".join(
+        [
+            "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
+            "  $Stream.Write($Content, 0, 9)",
+            "  throw 'partial evidence write'",
+            "}",
+            "function Remove-NewKnownEvidenceByHandle($Stream) { throw 'cleanup failed' }",
+        ]
+    )
+
+    first_result, first_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert first_result.returncode == 0, first_result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in first_payload["failures"])
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    corrupt = evidence[0].read_bytes()
+    assert corrupt == preimage[:9]
+    assert wrapper.read_bytes() == preimage
+
+    second_result, second_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert second_result.returncode == 0, second_result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in second_payload["failures"])
+    assert evidence[0].read_bytes() == corrupt
+    assert wrapper.read_bytes() == preimage
+    assert second_payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
 
 
 def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp_path):
@@ -1248,6 +1341,8 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         'python -c "print(\'opaque but apparently benign\')"',
         "python -cpass",
         "python -",
+        "pwsh -",
+        "powershell.exe -",
         "pwsh -File -",
         "pwsh -Command -",
         "pwsh -Unknown benign -Command -",
@@ -2061,6 +2156,8 @@ def test_python_code_execution_is_always_opaque_and_ambiguous(command):
     [
         "python -",
         "python -I -",
+        "pwsh -",
+        "powershell.exe -",
         "pwsh -File -",
         "pwsh -F -",
         "pwsh -Command -",

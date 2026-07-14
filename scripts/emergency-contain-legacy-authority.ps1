@@ -678,6 +678,7 @@ function Get-LatePowerShellTerminalClassification([string[]]$Tokens, [int]$Start
 function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
     $token = $Tokens[$index]
+    if ($token -ceq '-') { return 'ambiguous' }
     if ($token -eq '--') { return 'benign' }
     $metadata = Get-PowerShellOptionMetadata $token
     if ($null -ne $metadata -and $metadata.kind -in @('command', 'encoded', 'file')) {
@@ -1260,31 +1261,118 @@ function Test-KnownDenyStubEvidence($Wrapper) {
   return $true
 }
 
+function Initialize-KnownEvidenceNativeApi {
+  if ('ApplyPilot.KnownEvidenceNativeApi' -as [type]) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace ApplyPilot
+{
+    public static class KnownEvidenceNativeApi
+    {
+        private const uint GenericRead = 0x80000000;
+        private const uint GenericWrite = 0x40000000;
+        private const uint Delete = 0x00010000;
+        private const uint CreateNew = 1;
+        private const uint FileAttributeNormal = 0x00000080;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInfo
+        {
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool DeleteFile;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(
+            SafeFileHandle file,
+            int informationClass,
+            ref FileDispositionInfo information,
+            uint bufferSize);
+
+        public static SafeFileHandle CreateEvidence(string path)
+        {
+            SafeFileHandle handle = CreateFileW(
+                path,
+                GenericRead | GenericWrite | Delete,
+                0,
+                IntPtr.Zero,
+                CreateNew,
+                FileAttributeNormal,
+                IntPtr.Zero);
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(error);
+            }
+            return handle;
+        }
+
+        public static void MarkDelete(SafeFileHandle handle)
+        {
+            var information = new FileDispositionInfo { DeleteFile = true };
+            uint size = (uint)Marshal.SizeOf<FileDispositionInfo>();
+            if (!SetFileInformationByHandle(handle, 4, ref information, size))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+    }
+}
+'@
+}
+
 function Open-KnownEvidenceExclusive([string]$Path) {
+  Initialize-KnownEvidenceNativeApi
+  $handle = $null
   try {
-    $stream = [IO.FileStream]::new(
-      $Path,
-      [IO.FileMode]::CreateNew,
-      [IO.FileAccess]::ReadWrite,
-      [IO.FileShare]::None
-    )
-    return [pscustomobject]@{ stream = $stream; created = $true }
-  } catch [IO.IOException] {
+    $handle = [ApplyPilot.KnownEvidenceNativeApi]::CreateEvidence($Path)
+    try {
+      $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::ReadWrite)
+      $handle = $null
+      return [pscustomobject]@{ stream = $stream; created = $true }
+    } catch {
+      try { [ApplyPilot.KnownEvidenceNativeApi]::MarkDelete($handle) } finally { $handle.Dispose() }
+      throw
+    }
+  } catch [ComponentModel.Win32Exception] {
+    if ($_.Exception.NativeErrorCode -notin @(80, 183)) { throw }
     $stream = [IO.FileStream]::new(
       $Path,
       [IO.FileMode]::Open,
-      [IO.FileAccess]::ReadWrite,
+      [IO.FileAccess]::Read,
       [IO.FileShare]::None
     )
     return [pscustomobject]@{ stream = $stream; created = $false }
+  } finally {
+    if ($null -ne $handle) { $handle.Dispose() }
   }
+}
+
+function Remove-NewKnownEvidenceByHandle($Stream) {
+  Initialize-KnownEvidenceNativeApi
+  [ApplyPilot.KnownEvidenceNativeApi]::MarkDelete($Stream.SafeFileHandle)
 }
 
 function Open-KnownExistingEvidenceExclusive([string]$Path) {
   return [IO.FileStream]::new(
     $Path,
     [IO.FileMode]::Open,
-    [IO.FileAccess]::ReadWrite,
+    [IO.FileAccess]::Read,
     [IO.FileShare]::None
   )
 }
@@ -1720,17 +1808,22 @@ function Remove-EmbeddedWrapperDsns {
         $evidenceLease = Open-KnownEvidenceExclusive $evidencePath
         $evidenceStream = $evidenceLease.stream
         if ($evidenceLease.created) {
-          Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
-          Flush-KnownEvidenceStream $evidenceStream
-        } else {
           try {
-            Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
-          } catch {
             Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
             Flush-KnownEvidenceStream $evidenceStream
+            Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
+          } catch {
+            $initializationFailure = $_
+            try {
+              Remove-NewKnownEvidenceByHandle $evidenceStream
+            } catch {
+              throw 'wrapper evidence initialization and same-handle cleanup failed'
+            }
+            throw $initializationFailure
           }
+        } else {
+          Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
         }
-        Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
 
         $denyBytes = Get-KnownWrapperDenyStubBytes $wrapper.Extension
         try {
