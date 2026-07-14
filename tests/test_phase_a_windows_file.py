@@ -4,14 +4,21 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
+import sys
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "PhaseAWindowsFile.psm1"
-PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Phase A native file-handle tests require Windows",
+)
+PWSH = shutil.which("pwsh") or shutil.which("powershell")
 
 
 def _ps_literal(value: os.PathLike[str] | str) -> str:
@@ -19,6 +26,7 @@ def _ps_literal(value: os.PathLike[str] | str) -> str:
 
 
 def _run_ps(body: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    assert PWSH is not None, "PowerShell is required for Windows handle tests"
     script = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Import-Module {_ps_literal(MODULE_PATH)} -Force\n"
@@ -72,6 +80,8 @@ def test_regular_file_identity_and_exported_surface(tmp_path: Path):
     assert opened["Ok"] is True
     identity = opened["Identity"]
     assert identity["NumberOfLinks"] == 1
+    assert 0 <= identity["VolumeSerialNumber"] <= 0xFFFFFFFFFFFFFFFF
+    assert re.fullmatch(r"[0-9A-F]{32}", identity["FileId"])
     assert identity["FinalPath"].casefold() == str(wrapper).casefold()
     result = _run_ps(
         "(Get-Module PhaseAWindowsFile).ExportedCommands.Keys | "
@@ -125,6 +135,30 @@ def test_file_handle_holds_and_releases_directory_leases(tmp_path: Path):
     assert json.loads(result.stdout) == {"Held": True, "Released": True}
 
 
+def test_disposal_is_synchronous_and_does_not_poll(tmp_path: Path):
+    wrapper = tmp_path / "wrapper.ps1"
+    wrapper.write_text("target", encoding="utf-8")
+    result = _run_ps(
+        "$types = [Collections.Generic.HashSet[string]]::new()\n"
+        "for ($index = 0; $index -lt 100; $index++) {\n"
+        f"  $handle = Open-PhaseAValidatedFile -Path {_ps_literal(wrapper)} "
+        f"-Access Read -AuthorizedRoot {_ps_literal(tmp_path)} "
+        f"-AuthorizedBasename {_ps_literal(wrapper.name)}\n"
+        "  $null = $types.Add($handle.GetType().FullName)\n"
+        "  $handle.Dispose()\n"
+        "  $handle.Dispose()\n"
+        f"  $probe = [IO.File]::Open({_ps_literal(wrapper)}, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::ReadWrite, [IO.FileShare]::None)\n"
+        "  $probe.Dispose()\n"
+        "}\n"
+        "$types | ConvertTo-Json -Compress\n"
+    )
+    assert json.loads(result.stdout) == "ApplyPilot.PhaseA.ValidatedHandle"
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "ThreadPool.QueueUserWorkItem" not in source
+    assert "Thread.Sleep" not in source
+
+
 def test_rejects_leaf_symlink(tmp_path: Path):
     target = tmp_path / "target.ps1"
     target.write_text("target", encoding="utf-8")
@@ -156,6 +190,28 @@ def test_rejects_leaf_hardlink_count_greater_than_one(tmp_path: Path):
     os.link(wrapper, tmp_path / "second-name.ps1")
 
     assert _open_result(wrapper, tmp_path, wrapper.name)["Ok"] is False
+
+
+def test_validation_failure_does_not_leak_exclusive_target_handle(tmp_path: Path):
+    wrapper = tmp_path / "wrapper.ps1"
+    second_name = tmp_path / "second-name.ps1"
+    wrapper.write_text("target", encoding="utf-8")
+    os.link(wrapper, second_name)
+    result = _run_ps(
+        "$rejected = $false\n"
+        "try {\n"
+        f"  $failed = Open-PhaseAValidatedFile -Path {_ps_literal(wrapper)} "
+        f"-Access Read -AuthorizedRoot {_ps_literal(tmp_path)} "
+        f"-AuthorizedBasename {_ps_literal(wrapper.name)}\n"
+        "} catch { $rejected = $true }\n"
+        f"Remove-Item -LiteralPath {_ps_literal(second_name)} -Force\n"
+        f"$retry = Open-PhaseAValidatedFile -Path {_ps_literal(wrapper)} "
+        f"-Access Read -AuthorizedRoot {_ps_literal(tmp_path)} "
+        f"-AuthorizedBasename {_ps_literal(wrapper.name)}\n"
+        "try { [pscustomobject]@{ Rejected = $rejected; Retry = $true } | "
+        "ConvertTo-Json -Compress } finally { $retry.Dispose() }\n"
+    )
+    assert json.loads(result.stdout) == {"Rejected": True, "Retry": True}
 
 
 def test_rejects_alternate_data_stream(tmp_path: Path):

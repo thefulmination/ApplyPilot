@@ -6,10 +6,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace ApplyPilot.PhaseA
@@ -30,11 +28,13 @@ namespace ApplyPilot.PhaseA
         ReadWriteDelete
     }
 
-    internal sealed class ValidatedState
+    public sealed class ValidatedHandle : IDisposable
     {
-        private int leasesDisposed;
+        private SafeFileHandle fileHandle;
+        private List<SafeFileHandle> leases;
 
-        internal ValidatedState(
+        internal ValidatedHandle(
+            SafeFileHandle fileHandle,
             ValidatedAccess access,
             string authorizedRoot,
             string validatedPath,
@@ -42,11 +42,12 @@ namespace ApplyPilot.PhaseA
             List<SafeFileHandle> leases,
             FileIdentity identity)
         {
+            this.fileHandle = fileHandle;
             Access = access;
             AuthorizedRoot = authorizedRoot;
             ValidatedPath = validatedPath;
             IsDirectory = isDirectory;
-            Leases = leases;
+            this.leases = leases;
             Identity = identity;
         }
 
@@ -54,20 +55,66 @@ namespace ApplyPilot.PhaseA
         internal string AuthorizedRoot { get; private set; }
         internal string ValidatedPath { get; set; }
         internal bool IsDirectory { get; private set; }
-        internal List<SafeFileHandle> Leases { get; private set; }
         internal FileIdentity Identity { get; set; }
 
-        internal void DisposeLeases()
+        public SafeFileHandle FileHandle
         {
-            if (Interlocked.Exchange(ref leasesDisposed, 1) != 0)
+            get
+            {
+                EnsureOpen();
+                return fileHandle;
+            }
+        }
+
+        public bool IsDisposed
+        {
+            get { return fileHandle == null || fileHandle.IsClosed; }
+        }
+
+        internal void EnsureOpen()
+        {
+            if (IsDisposed || fileHandle.IsInvalid)
+            {
+                throw new InvalidOperationException("Handle is not an open module-validated handle.");
+            }
+        }
+
+        public void Dispose()
+        {
+            SafeFileHandle target;
+            List<SafeFileHandle> ancestors;
+            lock (this)
+            {
+                target = fileHandle;
+                ancestors = leases;
+                fileHandle = null;
+                leases = null;
+            }
+            if (target == null)
             {
                 return;
             }
-            for (int index = Leases.Count - 1; index >= 0; index--)
+            try
             {
-                Leases[index].Dispose();
+                target.Dispose();
             }
-            Leases.Clear();
+            finally
+            {
+                if (ancestors != null)
+                {
+                    for (int index = ancestors.Count - 1; index >= 0; index--)
+                    {
+                        ancestors[index].Dispose();
+                    }
+                    ancestors.Clear();
+                }
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~ValidatedHandle()
+        {
+            Dispose();
         }
     }
 
@@ -87,25 +134,23 @@ namespace ApplyPilot.PhaseA
         internal static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
 
         [StructLayout(LayoutKind.Sequential)]
-        internal struct FileTime
+        internal struct FileIdInformation
         {
-            internal uint LowDateTime;
-            internal uint HighDateTime;
+            internal ulong VolumeSerialNumber;
+            internal ulong FileIdLow;
+            internal ulong FileIdHigh;
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        internal struct ByHandleFileInformation
+        internal struct FileStandardInformation
         {
-            internal uint FileAttributes;
-            internal FileTime CreationTime;
-            internal FileTime LastAccessTime;
-            internal FileTime LastWriteTime;
-            internal uint VolumeSerialNumber;
-            internal uint FileSizeHigh;
-            internal uint FileSizeLow;
+            internal long AllocationSize;
+            internal long EndOfFile;
             internal uint NumberOfLinks;
-            internal uint FileIndexHigh;
-            internal uint FileIndexLow;
+            [MarshalAs(UnmanagedType.U1)]
+            internal bool DeletePending;
+            [MarshalAs(UnmanagedType.U1)]
+            internal bool Directory;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -132,18 +177,28 @@ namespace ApplyPilot.PhaseA
             uint flagsAndAttributes,
             IntPtr templateFile);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool GetFileInformationByHandle(
-            SafeFileHandle file,
-            out ByHandleFileInformation information);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool GetFileInformationByHandleEx(
+        internal static extern bool GetFileAttributeTagInformationByHandleEx(
             SafeFileHandle file,
             int informationClass,
             out FileAttributeTagInformation information,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetFileIdInformationByHandleEx(
+            SafeFileHandle file,
+            int informationClass,
+            out FileIdInformation information,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetFileStandardInformationByHandleEx(
+            SafeFileHandle file,
+            int informationClass,
+            out FileStandardInformation information,
             uint bufferSize);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -177,13 +232,13 @@ namespace ApplyPilot.PhaseA
     {
         private static readonly StringComparison PathComparison =
             StringComparison.OrdinalIgnoreCase;
-        private static readonly ConditionalWeakTable<SafeFileHandle, ValidatedState> States =
-            new ConditionalWeakTable<SafeFileHandle, ValidatedState>();
 
-        public static SafeFileHandle OpenValidatedDirectoryLease(string path)
+        public static ValidatedHandle OpenValidatedDirectoryLease(string path)
         {
             string fullPath = NormalizeLocalPath(path);
             List<SafeFileHandle> ancestors = new List<SafeFileHandle>();
+            SafeFileHandle target = null;
+            bool transferred = false;
             try
             {
                 List<string> components = GetComponents(fullPath);
@@ -192,28 +247,34 @@ namespace ApplyPilot.PhaseA
                     ancestors.Add(OpenAndValidate(components[index], 0, true));
                 }
 
-                SafeFileHandle target = OpenAndValidate(
+                target = OpenAndValidate(
                     components[components.Count - 1], 0, true);
                 FileIdentity identity = ReadIdentity(target);
-                ValidatedState state = new ValidatedState(
+                ValidatedHandle owner = new ValidatedHandle(
+                    target,
                     ValidatedAccess.Directory,
                     fullPath,
                     fullPath,
                     true,
                     ancestors,
                     identity);
-                States.Add(target, state);
-                MonitorLeaseLifetime(target, state);
-                return target;
+                transferred = true;
+                return owner;
             }
-            catch
+            finally
             {
-                DisposeAll(ancestors);
-                throw;
+                if (!transferred)
+                {
+                    if (target != null)
+                    {
+                        target.Dispose();
+                    }
+                    DisposeAll(ancestors);
+                }
             }
         }
 
-        public static SafeFileHandle OpenValidatedFile(
+        public static ValidatedHandle OpenValidatedFile(
             string path,
             string access,
             string authorizedRoot,
@@ -255,6 +316,8 @@ namespace ApplyPilot.PhaseA
             }
 
             List<SafeFileHandle> leases = new List<SafeFileHandle>();
+            SafeFileHandle target = null;
+            bool transferred = false;
             try
             {
                 List<string> components = GetComponents(fullPath);
@@ -263,42 +326,47 @@ namespace ApplyPilot.PhaseA
                     leases.Add(OpenAndValidate(components[index], 0, true));
                 }
 
-                SafeFileHandle target = OpenAndValidate(
+                target = OpenAndValidate(
                     components[components.Count - 1], desiredAccess, false);
                 FileIdentity identity = ReadIdentity(target);
                 if (identity.NumberOfLinks != 1)
                 {
-                    target.Dispose();
                     throw new InvalidOperationException("Validated files must have exactly one hard link.");
                 }
-                ValidatedState state = new ValidatedState(
+                ValidatedHandle owner = new ValidatedHandle(
+                    target,
                     validatedAccess,
                     root,
                     fullPath,
                     false,
                     leases,
                     identity);
-                States.Add(target, state);
-                MonitorLeaseLifetime(target, state);
-                return target;
+                transferred = true;
+                return owner;
             }
-            catch
+            finally
             {
-                DisposeAll(leases);
-                throw;
+                if (!transferred)
+                {
+                    if (target != null)
+                    {
+                        target.Dispose();
+                    }
+                    DisposeAll(leases);
+                }
             }
         }
 
-        public static FileIdentity GetIdentity(SafeFileHandle handle)
+        public static FileIdentity GetIdentity(ValidatedHandle handle)
         {
-            ValidatedState validated = RequireValidated(handle);
-            FileIdentity current = ReadIdentity(handle);
+            ValidatedHandle validated = RequireValidated(handle);
+            FileIdentity current = ReadIdentity(validated.FileHandle);
             EnsureIdentityMatches(current, validated.Identity);
             return current;
         }
 
         public static void AssertIdentity(
-            SafeFileHandle handle,
+            ValidatedHandle handle,
             ulong expectedVolumeSerialNumber,
             string expectedFileId,
             uint expectedNumberOfLinks,
@@ -315,9 +383,9 @@ namespace ApplyPilot.PhaseA
                 });
         }
 
-        public static void RenameNoReplace(SafeFileHandle handle, string destination)
+        public static void RenameNoReplace(ValidatedHandle handle, string destination)
         {
-            ValidatedState validated = RequireValidated(handle);
+            ValidatedHandle validated = RequireValidated(handle);
             if (validated.IsDirectory || validated.Access != ValidatedAccess.ReadWriteDelete)
             {
                 throw new InvalidOperationException(
@@ -356,7 +424,7 @@ namespace ApplyPilot.PhaseA
                 Marshal.WriteInt32(buffer, nameLengthOffset, name.Length);
                 Marshal.Copy(name, 0, IntPtr.Add(buffer, nameOffset), name.Length);
                 if (!NativeMethods.SetFileInformationByHandle(
-                    handle,
+                    validated.FileHandle,
                     NativeMethods.FileRenameInfo,
                     buffer,
                     (uint)size))
@@ -370,16 +438,16 @@ namespace ApplyPilot.PhaseA
             }
 
             validated.ValidatedPath = target;
-            validated.Identity = ReadIdentity(handle);
+            validated.Identity = ReadIdentity(validated.FileHandle);
             if (!String.Equals(validated.Identity.FinalPath, target, PathComparison))
             {
                 throw new InvalidOperationException("Renamed handle final path does not match destination.");
             }
         }
 
-        public static void SetDeletionDisposition(SafeFileHandle handle)
+        public static void SetDeletionDisposition(ValidatedHandle handle)
         {
-            ValidatedState validated = RequireValidated(handle);
+            ValidatedHandle validated = RequireValidated(handle);
             if (validated.IsDirectory || validated.Access != ValidatedAccess.ReadWriteDelete)
             {
                 throw new InvalidOperationException(
@@ -389,7 +457,7 @@ namespace ApplyPilot.PhaseA
             NativeMethods.FileDispositionInformation information =
                 new NativeMethods.FileDispositionInformation { DeleteFile = true };
             if (!NativeMethods.SetFileInformationByHandle(
-                handle,
+                validated.FileHandle,
                 NativeMethods.FileDispositionInfo,
                 ref information,
                 (uint)Marshal.SizeOf(typeof(NativeMethods.FileDispositionInformation))))
@@ -398,37 +466,14 @@ namespace ApplyPilot.PhaseA
             }
         }
 
-        private static ValidatedState RequireValidated(SafeFileHandle handle)
+        private static ValidatedHandle RequireValidated(ValidatedHandle handle)
         {
-            ValidatedState validated;
-            if (handle == null || !States.TryGetValue(handle, out validated))
+            if (handle == null)
             {
                 throw new InvalidOperationException("Handle is not an open module-validated handle.");
             }
-            if (handle.IsInvalid || handle.IsClosed)
-            {
-                validated.DisposeLeases();
-                throw new InvalidOperationException("Handle is not an open module-validated handle.");
-            }
-            return validated;
-        }
-
-        private static void MonitorLeaseLifetime(
-            SafeFileHandle handle,
-            ValidatedState state)
-        {
-            WeakReference<SafeFileHandle> weakHandle =
-                new WeakReference<SafeFileHandle>(handle);
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                SafeFileHandle current;
-                while (weakHandle.TryGetTarget(out current) && !current.IsClosed)
-                {
-                    current = null;
-                    Thread.Sleep(25);
-                }
-                state.DisposeLeases();
-            });
+            handle.EnsureOpen();
+            return handle;
         }
 
         private static SafeFileHandle OpenAndValidate(
@@ -458,7 +503,7 @@ namespace ApplyPilot.PhaseA
             try
             {
                 NativeMethods.FileAttributeTagInformation tag;
-                if (!NativeMethods.GetFileInformationByHandleEx(
+                if (!NativeMethods.GetFileAttributeTagInformationByHandleEx(
                     handle,
                     9,
                     out tag,
@@ -497,17 +542,36 @@ namespace ApplyPilot.PhaseA
 
         private static FileIdentity ReadIdentity(SafeFileHandle handle)
         {
-            NativeMethods.ByHandleFileInformation information;
-            if (!NativeMethods.GetFileInformationByHandle(handle, out information))
+            NativeMethods.FileIdInformation id;
+            if (!NativeMethods.GetFileIdInformationByHandleEx(
+                handle,
+                18,
+                out id,
+                (uint)Marshal.SizeOf(typeof(NativeMethods.FileIdInformation))))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
-            ulong fileIndex = ((ulong)information.FileIndexHigh << 32) |
-                information.FileIndexLow;
+            NativeMethods.FileStandardInformation standard;
+            if (!NativeMethods.GetFileStandardInformationByHandleEx(
+                handle,
+                1,
+                out standard,
+                (uint)Marshal.SizeOf(typeof(NativeMethods.FileStandardInformation))))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            byte[] identifier = new byte[16];
+            Array.Copy(BitConverter.GetBytes(id.FileIdLow), 0, identifier, 0, 8);
+            Array.Copy(BitConverter.GetBytes(id.FileIdHigh), 0, identifier, 8, 8);
+            StringBuilder fileId = new StringBuilder(32);
+            foreach (byte value in identifier)
+            {
+                fileId.Append(value.ToString("X2"));
+            }
             return new FileIdentity {
-                VolumeSerialNumber = information.VolumeSerialNumber,
-                FileId = fileIndex.ToString("X16"),
-                NumberOfLinks = information.NumberOfLinks,
+                VolumeSerialNumber = id.VolumeSerialNumber,
+                FileId = fileId.ToString(),
+                NumberOfLinks = standard.NumberOfLinks,
                 FinalPath = GetFinalPath(handle)
             };
         }
@@ -669,7 +733,7 @@ function Open-PhaseAValidatedFile {
 }
 
 function Get-PhaseAFileIdentity {
-  param([Parameter(Mandatory)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle)
+  param([Parameter(Mandatory)][ApplyPilot.PhaseA.ValidatedHandle]$Handle)
   $identity = [ApplyPilot.PhaseA.WindowsFile]::GetIdentity($Handle)
   return [pscustomobject]@{
     VolumeSerialNumber = [uint64]$identity.VolumeSerialNumber
@@ -681,7 +745,7 @@ function Get-PhaseAFileIdentity {
 
 function Assert-PhaseAFileIdentity {
   param(
-    [Parameter(Mandatory)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle,
+    [Parameter(Mandatory)][ApplyPilot.PhaseA.ValidatedHandle]$Handle,
     [Parameter(Mandatory)][pscustomobject]$Expected
   )
   [ApplyPilot.PhaseA.WindowsFile]::AssertIdentity(
@@ -695,14 +759,14 @@ function Assert-PhaseAFileIdentity {
 
 function Rename-PhaseAFileNoReplace {
   param(
-    [Parameter(Mandatory)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle,
+    [Parameter(Mandatory)][ApplyPilot.PhaseA.ValidatedHandle]$Handle,
     [Parameter(Mandatory)][string]$Destination
   )
   [ApplyPilot.PhaseA.WindowsFile]::RenameNoReplace($Handle, $Destination)
 }
 
 function Set-PhaseAFileDeletionDisposition {
-  param([Parameter(Mandatory)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle)
+  param([Parameter(Mandatory)][ApplyPilot.PhaseA.ValidatedHandle]$Handle)
   [ApplyPilot.PhaseA.WindowsFile]::SetDeletionDisposition($Handle)
 }
 
