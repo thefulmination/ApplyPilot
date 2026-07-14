@@ -176,6 +176,19 @@ namespace ApplyPilot.PhaseA
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
 
+        private static string ToExtendedLengthPath(string normalizedPath)
+        {
+            if (String.IsNullOrWhiteSpace(normalizedPath) || normalizedPath.Length < 3 ||
+                !Char.IsLetter(normalizedPath[0]) || normalizedPath[1] != ':' ||
+                normalizedPath[2] != '\\' || normalizedPath.IndexOf('/') >= 0 ||
+                normalizedPath.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Native paths must be normalized local drive paths.");
+            }
+            return @"\\?\" + normalizedPath;
+        }
+
         public static byte[] GetFileSecurityDescriptor(SafeFileHandle handle)
         {
             IntPtr owner, group, dacl, sacl, descriptor;
@@ -199,7 +212,8 @@ namespace ApplyPilot.PhaseA
             uint access = directory ? ReadControl : GenericRead;
             uint flags = FileFlagOpenReparsePoint | (directory ? FileFlagBackupSemantics : 0);
             uint share = directory ? FileShareRead | FileShareDelete : 0U;
-            IntPtr raw = CreateFileW(full, access, share, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+            IntPtr raw = CreateFileW(ToExtendedLengthPath(full), access, share, IntPtr.Zero,
+                OpenExisting, flags, IntPtr.Zero);
             if (raw == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
             var handle = new SafeFileHandle(raw, true);
             try
@@ -339,11 +353,13 @@ namespace ApplyPilot.PhaseA
                     Length=Marshal.SizeOf<SecurityAttributes>(),
                     SecurityDescriptor=pin.AddrOfPinnedObject(), InheritHandle=false
                 };
-                if (!CreateDirectoryW(full, ref attributes)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (!CreateDirectoryW(ToExtendedLengthPath(full), ref attributes))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
             }
             finally { pin.Free(); }
-            IntPtr raw = CreateFileW(full, ReadControl | Delete, 7, IntPtr.Zero, OpenExisting,
-                FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            IntPtr raw = CreateFileW(ToExtendedLengthPath(full), ReadControl | Delete, 7,
+                IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                IntPtr.Zero);
             if (raw == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
             var handle = new SafeFileHandle(raw, true);
             try
@@ -507,8 +523,9 @@ namespace ApplyPilot.PhaseA
             {
                 foreach (string ancestor in paths)
                 {
-                    IntPtr raw = CreateFileW(ancestor, 0, 0, IntPtr.Zero, OpenExisting,
-                        FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+                    IntPtr raw = CreateFileW(ToExtendedLengthPath(ancestor), 0, 0, IntPtr.Zero,
+                        OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                        IntPtr.Zero);
                     if (raw == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
                     var handle = new SafeFileHandle(raw, true);
                     FileAttributeTagInformation tag = ReadTag(handle);
@@ -549,8 +566,10 @@ namespace ApplyPilot.PhaseA
 
         private static SafeFileHandle OpenDeleteHandle(string path)
         {
-            IntPtr raw = CreateFileW(path, GenericRead | Delete, 3, IntPtr.Zero, OpenExisting,
-                FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            string full = Path.GetFullPath(path);
+            IntPtr raw = CreateFileW(ToExtendedLengthPath(full), GenericRead | Delete, 3,
+                IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+                IntPtr.Zero);
             if (raw == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
             var handle = new SafeFileHandle(raw, true);
             try { ReadTag(handle); return handle; }

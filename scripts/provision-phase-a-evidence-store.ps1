@@ -33,12 +33,29 @@ function Get-PhaseAManifestMaterial([string]$Path,[string]$CanonicalRootPath) {
   [pscustomobject]@{Value=$value;Bytes=$bytes;Sha256=(& $module {param($b)Get-PhaseASha256 $b} $bytes)}
 }
 
-function Get-PhaseANativeWin32ErrorCode([Exception]$Exception) {
-  $current=$Exception
-  $seen=[Collections.Generic.HashSet[int]]::new()
-  while($null-ne $current-and $seen.Add([Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($current))){
+function Get-PhaseANativeWin32ErrorCode([object]$InputObject) {
+  $pending=[Collections.Generic.Stack[object]]::new()
+  $seen=[Collections.Generic.List[object]]::new()
+  if($null-ne $InputObject){$pending.Push($InputObject)}
+  while($pending.Count-gt 0){
+    $current=$pending.Pop()
+    $alreadySeen=$false
+    foreach($candidate in $seen){
+      if([object]::ReferenceEquals($candidate,$current)){$alreadySeen=$true;break}
+    }
+    if($alreadySeen){continue}
+    $seen.Add($current)
     if($current-is [ComponentModel.Win32Exception]){return [int]$current.NativeErrorCode}
-    $current=$current.InnerException
+    if($current-is [Management.Automation.ErrorRecord]-and $null-ne $current.Exception){
+      $pending.Push($current.Exception)
+    }
+    if($current-is [Exception]-and $null-ne $current.InnerException){
+      $pending.Push($current.InnerException)
+    }
+    if($current-is [Management.Automation.IContainsErrorRecord]){
+      $record=$current.ErrorRecord
+      if($null-ne $record){$pending.Push($record)}
+    }
   }
   $null
 }
@@ -48,7 +65,7 @@ function Assert-PhaseACleanupStagingPathAbsent([string]$StagingPath) {
   try {
     try{$handle=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($StagingPath,$true)}
     catch {
-      $code=Get-PhaseANativeWin32ErrorCode $_.Exception
+      $code=Get-PhaseANativeWin32ErrorCode $_
       if($code-eq 2-or $code-eq 3){return}
       throw
     }
@@ -82,7 +99,7 @@ function Get-PhaseAPostCleanupManifestMaterial {
       if(([int64](& $getElapsedMilliseconds))-ge $maxElapsedMilliseconds){
         throw [InvalidOperationException]::new('Post-cleanup parent manifest deadline exceeded.',$failure.Exception)
       }
-      $code=Get-PhaseANativeWin32ErrorCode $failure.Exception
+      $code=Get-PhaseANativeWin32ErrorCode $failure
       if($code-ne 2-and $code-ne 3){throw}
       if($attempt-ge $maxAttempts){
         throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
@@ -288,8 +305,7 @@ function Invoke-PhaseAProvisioningCleanup {
         -OperatorSigningSpkiPath $OperatorSigningSpkiPath -ExpectedOperatorSigningKeySpkiSha256 $ExpectedOperatorSigningKeySpkiSha256 `
         -ApprovedCommit $ExpectedCommit -OperationId $auth.operationId -AuthorizationReceiptSha256 $pair.Receipt.Sha256 `
         -ActualAfterManifestSha256 $actual.Sha256 -ExpectedAfterManifestSha256 $auth.expectedAfterManifestSha256 `
-        -CreatedAtUtc $created -CreateUnsigned -OutputDirectory $operationRequests
-      & $module {param($p,$s)Set-PhaseAProtectedAcl $p $s -File} $request $operator
+        -CreatedAtUtc $created -CreateUnsigned -OutputDirectory $operationRequests -ProtectedOperatorSid $operator
       return [pscustomobject]@{State='COMPLETION_REQUIRED';CompletionRequestPath=$request;ActualAfterManifestSha256=$actual.Sha256}
     }
     if(-not $CompletionReceiptPath-or-not $CompletionSignaturePath-or-not $CompletionRequestPath){throw 'Resume requires the request and complete signed pair.'}

@@ -47,6 +47,7 @@ param(
   [string]$CreatedAtUtc,
   [Parameter(Mandatory, ParameterSetName='Unsigned')][switch]$CreateUnsigned,
   [Parameter(Mandatory, ParameterSetName='Unsigned')][string]$OutputDirectory,
+  [Parameter(ParameterSetName='Unsigned')][string]$ProtectedOperatorSid,
   [Parameter(Mandatory, ParameterSetName='Verify')][switch]$VerifyReturnedSignature,
   [Parameter(Mandatory, ParameterSetName='Verify')][string]$ReceiptPath,
   [Parameter(Mandatory, ParameterSetName='Verify')][string]$SignaturePath
@@ -220,8 +221,25 @@ if ($PSCmdlet.ParameterSetName -eq 'Verify') {
 }
 
 $output = [IO.Path]::GetFullPath($OutputDirectory)
-if (-not (Test-Path -LiteralPath $output -PathType Container)) { $null = New-Item -ItemType Directory -Path $output }
+$protectedOutput = $PSBoundParameters.ContainsKey('ProtectedOperatorSid')
+if ($protectedOutput) {
+  if ([string]::IsNullOrWhiteSpace($ProtectedOperatorSid)) {
+    throw 'Protected unsigned creation requires an operator SID.'
+  }
+  if (-not (Test-Path -LiteralPath $output -PathType Container)) {
+    throw 'Protected unsigned output directory must already exist.'
+  }
+} elseif (-not (Test-Path -LiteralPath $output -PathType Container)) {
+  $null = New-Item -ItemType Directory -Path $output
+}
 $destination = Join-Path $output "$digest.json"
-$stream = [IO.FileStream]::new($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-try { $stream.Write($bytes); $stream.Flush($true) } finally { $stream.Dispose() }
+if ($protectedOutput) {
+  $null = & $module {
+    param($Path, $Bytes, $Sid)
+    Write-PhaseACreateNew $Path $Bytes $Sid
+  } $destination $bytes $ProtectedOperatorSid
+} else {
+  $stream = [IO.FileStream]::new($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+  try { $stream.Write($bytes); $stream.Flush($true) } finally { $stream.Dispose() }
+}
 $destination

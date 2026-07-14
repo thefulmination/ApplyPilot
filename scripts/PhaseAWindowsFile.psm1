@@ -805,7 +805,7 @@ namespace ApplyPilot.PhaseA
                 flags |= NativeMethods.FileFlagBackupSemantics;
             }
             IntPtr native = NativeMethods.CreateFileW(
-                path,
+                ToExtendedLengthPath(path),
                 desiredAccess,
                 0,
                 IntPtr.Zero,
@@ -842,7 +842,7 @@ namespace ApplyPilot.PhaseA
                     InheritHandle = false
                 };
                 IntPtr native = NativeMethods.CreateFileWithSecurityW(
-                    path,
+                    ToExtendedLengthPath(path),
                     NativeMethods.GenericRead | NativeMethods.GenericWrite | NativeMethods.Delete |
                         NativeMethods.WriteDac,
                     0,
@@ -1255,6 +1255,17 @@ namespace ApplyPilot.PhaseA
                 throw new InvalidOperationException("Path is not on a fixed local drive.");
             }
             return fullPath;
+        }
+
+        private static string ToExtendedLengthPath(string normalizedPath)
+        {
+            string canonical = NormalizeLocalPath(normalizedPath);
+            if (!String.Equals(canonical, normalizedPath, PathComparison))
+            {
+                throw new InvalidOperationException(
+                    "Native paths must already be normalized local drive paths.");
+            }
+            return @"\\?\" + canonical;
         }
 
         private static void ValidateExactBasename(string basename)

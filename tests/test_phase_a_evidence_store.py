@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE = REPO_ROOT / "scripts" / "PhaseAEvidenceStore.psm1"
+WINDOWS_FILE_MODULE = REPO_ROOT / "scripts" / "PhaseAWindowsFile.psm1"
 PROVISION = REPO_ROOT / "scripts" / "provision-phase-a-evidence-store.ps1"
 NEW_RECEIPT = REPO_ROOT / "scripts" / "New-PhaseASignedReceipt.ps1"
 PWSH = shutil.which("pwsh") or shutil.which("powershell")
@@ -140,6 +141,26 @@ namespace ApplyPilot.PhaseA.Tests
 }
 """
 
+WRAPPED_EXCEPTION_THROWER_TYPE = r"""
+using System;
+
+namespace ApplyPilot.PhaseA.Tests
+{
+    public sealed class Win32ExceptionPlaceholder : Exception
+    {
+        public Win32ExceptionPlaceholder(string message, int hresult) : base(message)
+        {
+            HResult = hresult;
+        }
+    }
+
+    public static class ExceptionThrower
+    {
+        public static void Throw(Exception exception) { throw exception; }
+    }
+}
+"""
+
 
 def _ps(value: os.PathLike[str] | str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
@@ -151,6 +172,22 @@ def _run_ps(body: str, *, check: bool = True, timeout: int = 45):
     ).decode("ascii")
     result = subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if check and result.returncode:
+        raise AssertionError(
+            f"PowerShell failed ({result.returncode})\n{result.stdout}\n{result.stderr}"
+        )
+    return result
+
+
+def _run_ps_file(body: str, root: Path, *, check: bool = True, timeout: int = 45):
+    script = root / f"phase-a-test-{uuid.uuid4()}.ps1"
+    script.write_text("$ErrorActionPreference='Stop'\n" + body, encoding="utf-8")
+    result = subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-File", str(script)],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -351,6 +388,7 @@ def test_review_corrections_are_structural_contracts():
 
 def test_production_receipt_staging_uses_only_validated_handle_primitives():
     module = MODULE.read_text(encoding="utf-8")
+    windows_file = WINDOWS_FILE_MODULE.read_text(encoding="utf-8")
     writer = module.split("function Write-PhaseACreateNew", 1)[1].split(
         "function Open-PhaseAExpectedProtectedFile", 1
     )[0]
@@ -368,6 +406,15 @@ def test_production_receipt_staging_uses_only_validated_handle_primitives():
     assert "-AuthorizedRenameBasename" in installer
     assert "Rename-PhaseAFileNoReplace" in installer
     assert "[ApplyPilot.PhaseA.EvidenceNative]::RenameFileNoReplace" not in installer
+    assert "private static string ToExtendedLengthPath(string normalizedPath)" in module
+    assert "private static string ToExtendedLengthPath(string normalizedPath)" in windows_file
+    assert "CreateFileW(ToExtendedLengthPath(full)" in module
+    assert "CreateFileW(ToExtendedLengthPath(ancestor)" in module
+    assert "CreateFileW(\n                ToExtendedLengthPath(path)" in windows_file
+    assert "CreateFileWithSecurityW(\n                    ToExtendedLengthPath(path)" in windows_file
+    assert "String.Equals(final, full, StringComparison.OrdinalIgnoreCase)" in module
+    assert "String.Equals(identity.FinalPath, full, StringComparison.OrdinalIgnoreCase)" in module
+    assert "String.Equals(after.FinalPath, target, PathComparison)" in windows_file
 
 
 def test_production_stage_writer_creates_protected_file_and_writes_via_duplicate(
@@ -666,13 +713,67 @@ def test_quality_contract_other_schema_independent_canonical_bytes(tmp_path: Pat
     ]
     for index, (receipt_type, arguments, expected) in enumerate(cases):
         case_output = output / str(index)
+        protected_arguments = ""
+        if receipt_type == "applypilot.phase-a.provisioning-cleanup-completion":
+            padding_length = max(1, 200 - len(str(output)) - 1)
+            assert padding_length < 240
+            case_output = output / ("p" * padding_length)
+            case_output.mkdir()
+            _protect(case_output, sid)
+            protected_arguments = f" -ProtectedOperatorSid {_ps(sid)}"
+            missing_output = output / "missing-protected"
+            missing = _run_ps(
+                "try{" + authenticator + f"& {_ps(NEW_RECEIPT)} -ReceiptType {_ps(receipt_type)} "
+                f"-OperatorSigningSpkiPath {_ps(public)} "
+                f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} {arguments} "
+                f"-CreatedAtUtc {_ps(created)} -CreateUnsigned "
+                f"-OutputDirectory {_ps(missing_output)}{protected_arguments}|Out-Null;'missed'"
+                "}catch{'rejected'}"
+            )
+            assert missing.stdout.strip() == "rejected"
+            assert not missing_output.exists()
         result = _run_ps(
             authenticator + f"& {_ps(NEW_RECEIPT)} -ReceiptType {_ps(receipt_type)} "
             f"-OperatorSigningSpkiPath {_ps(public)} "
             f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} {arguments} "
             f"-CreatedAtUtc {_ps(created)} -CreateUnsigned -OutputDirectory {_ps(case_output)}"
+            f"{protected_arguments}"
         )
-        assert Path(result.stdout.strip()).read_bytes() == expected.encode("ascii")
+        destination = result.stdout.strip()
+        assert result.stdout.splitlines() == [destination]
+        receipt = Path(destination)
+        if protected_arguments:
+            assert len(str(receipt)) > 260
+            actual_bytes = base64.b64decode(
+                _module(
+                    "$m=Get-Module PhaseAEvidenceStore;"
+                    f"& $m {{param($p)[Convert]::ToBase64String((Read-PhaseAValidatedBytes $p).Bytes)}} "
+                    f"{_ps(receipt)}"
+                ).stdout.strip()
+            )
+        else:
+            actual_bytes = receipt.read_bytes()
+        assert actual_bytes == expected.encode("ascii")
+        if protected_arguments:
+            protected = _module(
+                "$m=Get-Module PhaseAEvidenceStore;"
+                f"& $m {{param($p,$s)Assert-PhaseAProtectedAcl $p $s -File}} "
+                f"{_ps(receipt)} {_ps(sid)};'protected'"
+            )
+            assert protected.stdout.strip() == "protected"
+            reopened = _module(
+                "$m=Get-Module PhaseAEvidenceStore;"
+                "& $m {param($p,$r)$h=Open-PhaseAValidatedFile -Path $p -Access Read "
+                "-AuthorizedRoot $r -AuthorizedBasename ([IO.Path]::GetFileName($p));"
+                "try{(Get-PhaseAFileIdentity -Handle $h).FinalPath}finally{$h.Dispose()}} "
+                f"{_ps(receipt)} {_ps(case_output)}"
+            )
+            assert os.path.normcase(reopened.stdout.strip()) == os.path.normcase(str(receipt))
+            replay_sha = _module(
+                "$m=Get-Module PhaseAEvidenceStore;"
+                f"& $m {{param($p)(Read-PhaseACanonicalJson $p).Sha256}} {_ps(receipt)}"
+            )
+            assert replay_sha.stdout.strip() == receipt.stem
 
 
 def test_quality_contract_verify_uses_caller_bindings_and_completion_authority(tmp_path: Path):
@@ -1113,11 +1214,20 @@ def test_provisioning_uses_protected_creation_and_same_handle_publication_only()
 
 def test_cleanup_is_two_phase_and_secure_handle_bound_only():
     source = PROVISION.read_text(encoding="utf-8")
+    generator = NEW_RECEIPT.read_text(encoding="utf-8")
+    cleanup = source.split("function Invoke-PhaseAProvisioningCleanup", 1)[1]
+    request_creation = cleanup.split("$request=&", 1)[1].split(
+        "return [pscustomobject]@{State='COMPLETION_REQUIRED'", 1
+    )[0]
     assert "Completion cannot predate mutation." in source
     assert "State='COMPLETION_REQUIRED'" in source
     assert "DeleteTreeNoFollow" in source
     assert "Remove-Item" not in source
     assert source.index("DeleteTreeNoFollow") < source.index("COMPLETION_REQUIRED")
+    assert "[string]$ProtectedOperatorSid" in generator
+    assert "Write-PhaseACreateNew $Path $Bytes $Sid" in generator
+    assert "-ProtectedOperatorSid $operator" in request_creation
+    assert "Set-PhaseAProtectedAcl" not in request_creation
 
 
 def test_definition_provision_validates_before_publish_is_idempotent_and_crash_safe(tmp_path: Path):
@@ -1366,9 +1476,81 @@ def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path:
     pre_read_stage = parent / ".provisioning-33333333-3333-4333-8333-333333333333"
     failure_stage = parent / ".provisioning-44444444-4444-4444-8444-444444444444"
     body = (
-        f". {_ps(PROVISION)} -DefinitionImport;"
+        "Add-Type -TypeDefinition @'\n"
+        + WRAPPED_EXCEPTION_THROWER_TYPE
+        + "\n'@\n"
+        + f". {_ps(PROVISION)} -DefinitionImport;"
         f"[IO.Directory]::CreateDirectory({_ps(pre_read_stage)})|Out-Null;"
         f"$expectedSha=(Get-PhaseAManifestMaterial {_ps(parent)}).Sha256;"
+        "$newWrappedNative={param($path,[int]$code)try{"
+        "if($code-eq 5){[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw("
+        "[ComponentModel.Win32Exception]::new(5))}else{"
+        "$missing=if($code-eq 2){Join-Path $path 'wrapped-missing-leaf'}else{"
+        "Join-Path (Join-Path $path 'wrapped-missing-parent') 'leaf'};"
+        "[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($missing,$false)|Out-Null}"
+        "}catch{$record=$_;$native=$record.Exception;"
+        "while($null-ne $native.InnerException){$native=$native.InnerException};"
+        "if($native-isnot [ComponentModel.Win32Exception]-or $native.NativeErrorCode-ne $code){"
+        "throw 'Wrapped native fixture did not produce the requested Win32 code.'};"
+        "$wrapped=[Management.Automation.RuntimeException]::new("
+        "\"wrapped native $code\",$null,$record);"
+        "if($null-ne $wrapped.InnerException-or -not "
+        "[object]::ReferenceEquals($wrapped.ErrorRecord,$record)){"
+        "throw 'Wrapped native fixture did not retain the requested ErrorRecord.'};"
+        "return $wrapped};throw 'Wrapped native fixture did not throw'};"
+        "$script:wrappedTransient2Attempts=0;$wrappedTransient2={param($path,$canonicalRootPath)"
+        "$script:wrappedTransient2Attempts++;if($script:wrappedTransient2Attempts-eq 1){"
+        "[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw((& $newWrappedNative $path 2))};"
+        "Get-PhaseAManifestMaterial $path $canonicalRootPath};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-ExpectedSha256 $expectedSha -TestManifestReader $wrappedTransient2 -DefinitionImport|Out-Null;"
+        "$wrappedTransient2Error=$null}catch{$wrappedTransient2Error=$_.Exception.Message};"
+        "$script:wrappedTransient3Attempts=0;$wrappedTransient3={param($path,$canonicalRootPath)"
+        "$script:wrappedTransient3Attempts++;if($script:wrappedTransient3Attempts-eq 1){"
+        "[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw((& $newWrappedNative $path 3))};"
+        "Get-PhaseAManifestMaterial $path $canonicalRootPath};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-ExpectedSha256 $expectedSha -TestManifestReader $wrappedTransient3 -DefinitionImport|Out-Null;"
+        "$wrappedTransient3Error=$null}catch{$wrappedTransient3Error=$_.Exception.Message};"
+        "$script:wrappedExhausted2Attempts=0;$wrappedExhausted2={param($path)"
+        "$script:wrappedExhausted2Attempts++;"
+        "[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw((& $newWrappedNative $path 2))};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-ExpectedSha256 $expectedSha -TestManifestReader $wrappedExhausted2 -DefinitionImport|Out-Null;"
+        "$wrappedExhausted2Error='missed'}catch{$wrappedExhausted2Error=$_.Exception.Message};"
+        "$script:wrappedExhausted3Attempts=0;$wrappedExhausted3={param($path)"
+        "$script:wrappedExhausted3Attempts++;"
+        "[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw((& $newWrappedNative $path 3))};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-ExpectedSha256 $expectedSha -TestManifestReader $wrappedExhausted3 -DefinitionImport|Out-Null;"
+        "$wrappedExhausted3Error='missed'}catch{$wrappedExhausted3Error=$_.Exception.Message};"
+        "$script:wrappedDeniedAttempts=0;$wrappedDenied={param($path)"
+        "$script:wrappedDeniedAttempts++;"
+        "[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw((& $newWrappedNative $path 5))};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-ExpectedSha256 $expectedSha -TestManifestReader $wrappedDenied -DefinitionImport|Out-Null;"
+        "$wrappedDeniedError='missed'}catch{$wrappedDeniedError=$_.Exception.Message};"
+        "$placeholderException=[ApplyPilot.PhaseA.Tests.Win32ExceptionPlaceholder]::new("
+        "'The system cannot find the file specified. NativeErrorCode 2.',-2147024894);"
+        "$placeholderRecord=[Management.Automation.ErrorRecord]::new($placeholderException,"
+        "'ParentContainsErrorRecordException,NativeErrorCode2',"
+        "[Management.Automation.ErrorCategory]::ObjectNotFound,$null);"
+        "$placeholderWrapped=[Management.Automation.RuntimeException]::new("
+        "'wrapped placeholder',$null,$placeholderRecord);"
+        "try{$placeholderCode=Get-PhaseANativeWin32ErrorCode $placeholderRecord;"
+        "if($null-eq $placeholderCode){$placeholderCode=-1}}catch{$placeholderCode=-2};"
+        "$script:placeholderAttempts=0;$placeholderReader={param($path)"
+        "$script:placeholderAttempts++;"
+        "[ApplyPilot.PhaseA.Tests.ExceptionThrower]::Throw($placeholderWrapped)};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-ExpectedSha256 $expectedSha -TestManifestReader $placeholderReader -DefinitionImport|Out-Null;"
+        "$placeholderError='missed'}catch{$placeholderError=$_.Exception.Message};"
         "$script:preReadAttempts=0;$preRead={param($path,$canonicalRootPath)"
         "$script:preReadAttempts++;Get-PhaseAManifestMaterial $path $canonicalRootPath};"
         "try{Get-PhaseAPostCleanupManifestMaterial "
@@ -1451,7 +1633,20 @@ def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path:
         f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
         "-ExpectedSha256 $expectedSha -TestManifestReader $reappeared -DefinitionImport|Out-Null;"
         "$reappearedError='missed'}catch{$reappearedError=$_.Exception.Message};"
-        "[pscustomobject]@{PreReadAttempts=$script:preReadAttempts;PreReadError=$preReadError;"
+        "[pscustomobject]@{WrappedTransient2Attempts=$script:wrappedTransient2Attempts;"
+        "WrappedTransient2Error=$wrappedTransient2Error;"
+        "WrappedTransient3Attempts=$script:wrappedTransient3Attempts;"
+        "WrappedTransient3Error=$wrappedTransient3Error;"
+        "WrappedExhausted2Attempts=$script:wrappedExhausted2Attempts;"
+        "WrappedExhausted2Error=$wrappedExhausted2Error;"
+        "WrappedExhausted3Attempts=$script:wrappedExhausted3Attempts;"
+        "WrappedExhausted3Error=$wrappedExhausted3Error;"
+        "WrappedDeniedAttempts=$script:wrappedDeniedAttempts;WrappedDeniedError=$wrappedDeniedError;"
+        "PlaceholderCode=$placeholderCode;PlaceholderAttempts=$script:placeholderAttempts;"
+        "PlaceholderHResult=$placeholderException.HResult;"
+        "PlaceholderFqid=$placeholderRecord.FullyQualifiedErrorId;"
+        "PlaceholderType=$placeholderException.GetType().Name;PlaceholderError=$placeholderError;"
+        "PreReadAttempts=$script:preReadAttempts;PreReadError=$preReadError;"
         "LateAttempts=$script:lateAttempts;LateError=$lateError;"
         "PathMissingAttempts=$script:pathMissingAttempts;"
         "ExhaustedAttempts=$script:exhaustedAttempts;"
@@ -1464,8 +1659,24 @@ def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path:
         "SuccessReappearedError=$successReappearedError;ReappearedAttempts=$script:reappearedAttempts;"
         "ReappearedError=$reappearedError}|ConvertTo-Json -Compress"
     )
-    result = json.loads(_run_ps(body).stdout)
+    result = json.loads(_run_ps_file(body, tmp_path).stdout)
     assert result == {
+        "WrappedTransient2Attempts": 2,
+        "WrappedTransient2Error": None,
+        "WrappedTransient3Attempts": 2,
+        "WrappedTransient3Error": None,
+        "WrappedExhausted2Attempts": 4,
+        "WrappedExhausted2Error": "Post-cleanup parent manifest retries exhausted.",
+        "WrappedExhausted3Attempts": 4,
+        "WrappedExhausted3Error": "Post-cleanup parent manifest retries exhausted.",
+        "WrappedDeniedAttempts": 1,
+        "WrappedDeniedError": "Exception calling \"Throw\" with \"1\" argument(s): \"wrapped native 5\"",
+        "PlaceholderCode": -1,
+        "PlaceholderAttempts": 1,
+        "PlaceholderHResult": -2147024894,
+        "PlaceholderFqid": "ParentContainsErrorRecordException,NativeErrorCode2",
+        "PlaceholderType": "Win32ExceptionPlaceholder",
+        "PlaceholderError": "Exception calling \"Throw\" with \"1\" argument(s): \"wrapped placeholder\"",
         "PreReadAttempts": 0,
         "PreReadError": "Cleanup staging path reappeared during post-mutation verification.",
         "LateAttempts": 1,
