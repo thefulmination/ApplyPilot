@@ -259,6 +259,38 @@ def _run_wrapper_rewrite_harness(
     return result, json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def _run_wrapper_snapshot_harness(
+    tmp_path: Path,
+    wrapper_root: Path,
+    overrides: str = "",
+) -> tuple[subprocess.CompletedProcess[str], dict]:
+    harness = tmp_path / "wrapper-snapshot-harness.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrapper_root)}'",
+                overrides,
+                "$snapshot = @()",
+                "$available = $true",
+                "$errorType = $null",
+                "try { $snapshot = @(Get-WrapperSnapshot) } catch { "
+                "$available = $false; $errorType = $_.Exception.GetType().Name }",
+                "[ordered]@{available=$available; error_type=$errorType; wrappers=$snapshot} | "
+                "ConvertTo-Json -Depth 8 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, json.loads(result.stdout.strip().splitlines()[-1])
+
+
 def _run_orchestration(
     mode: str,
     fixture: dict[str, Path],
@@ -337,7 +369,11 @@ def test_injected_seams_are_rejected_without_touching_fixture(mode, tmp_path):
         "mode": "test",
         "operation": mode.lower(),
         "operational": False,
-        "non_operational_reasons": ["adapter_injected", "console_command_injected"],
+        "non_operational_reasons": [
+            "adapter_injected",
+            "console_command_injected",
+            "wrapper_root_injected",
+        ],
         "success": False,
         "rejection": "injected_execution_seam_disabled",
         "evidence_deleted": False,
@@ -593,7 +629,7 @@ def test_wrapper_replacement_before_exclusive_open_is_the_preserved_preimage(tmp
     overrides = "\n".join(
         [
             "$script:WrapperOpenCount = 0",
-            "function Open-KnownWrapperExclusive([string]$Path) {",
+            "function Open-KnownWrapperMutationExclusive([string]$Path) {",
             "  $script:WrapperOpenCount++",
             "  if ($script:WrapperOpenCount -eq 1) {",
             f"    [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String('{replacement_b64}'))",
@@ -648,6 +684,225 @@ def test_wrapper_replacement_attempt_is_blocked_while_exclusive_handle_is_held(t
     assert len(evidence) == 1
     assert evidence[0].read_bytes() == preimage
     assert b"emergency containment" in wrapper.read_bytes().lower()
+
+
+def test_hardlink_creation_during_mutation_is_detected_and_preimage_is_unchanged(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'held-hardlink-secret'\n"
+    wrapper.write_bytes(preimage)
+    hardlink = tmp_path / "outside-hardlink.ps1"
+    marker = tmp_path / "hardlink-attempt.txt"
+    overrides = "\n".join(
+        [
+            "$script:WrapperReadCount = 0",
+            "function Read-KnownWrapperStreamBytes($Stream) {",
+            "  $script:WrapperReadCount++",
+            "  if ($script:WrapperReadCount -eq 1) {",
+            f"    try {{ New-Item -ItemType HardLink -Path '{_ps_quote(hardlink)}' "
+            f"-Target '{_ps_quote(wrapper)}' -ErrorAction Stop | Out-Null; "
+            f"Set-Content -LiteralPath '{_ps_quote(marker)}' -Value 'hardlink_succeeded' }} "
+            f"catch {{ Set-Content -LiteralPath '{_ps_quote(marker)}' -Value 'hardlink_blocked' }}",
+            "  }",
+            "  $Stream.Position = 0",
+            "  $buffer = [IO.MemoryStream]::new()",
+            "  try { $Stream.CopyTo($buffer); return ,$buffer.ToArray() } finally { $buffer.Dispose() }",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert [item["action"] for item in payload["failures"]] == ["rewrite_wrapper"]
+    assert marker.read_text(encoding="utf-8").strip() == "hardlink_succeeded"
+    assert hardlink.read_bytes() == preimage
+    assert wrapper.read_bytes() == preimage
+    assert payload["snapshot_available"] is False
+
+
+def test_wrapper_leaf_symlink_is_rejected_without_reading_target(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    secret = "leaf-symlink-target-secret"
+    target = tmp_path / "outside.ps1"
+    target.write_text(f"$env:FLEET_PG_DSN = '{secret}'\n", encoding="utf-8")
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    try:
+        wrapper.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlink creation unavailable: {exc}")
+
+    result, payload = _run_wrapper_snapshot_harness(tmp_path, wrappers)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert secret not in result.stdout
+    assert str(target) not in result.stdout
+
+
+def test_wrapper_root_junction_is_rejected_without_reading_target(tmp_path):
+    real_root = tmp_path / "outside-root"
+    real_root.mkdir()
+    secret = "junction-target-secret"
+    (real_root / "apply-cycle-task.ps1").write_text(
+        f"$env:FLEET_PG_DSN = '{secret}'\n", encoding="utf-8"
+    )
+    junction = tmp_path / "wrappers"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(real_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {created.stderr or created.stdout}")
+
+    result, payload = _run_wrapper_snapshot_harness(tmp_path, junction)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert secret not in result.stdout
+    assert str(real_root) not in result.stdout
+
+
+def test_wrapper_hardlink_substitution_is_rejected_without_reading_target(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    secret = "hardlink-target-secret"
+    target = tmp_path / "outside.ps1"
+    target.write_text(f"$env:FLEET_PG_DSN = '{secret}'\n", encoding="utf-8")
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    os.link(target, wrapper)
+
+    result, payload = _run_wrapper_snapshot_harness(tmp_path, wrappers)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert secret not in result.stdout
+    assert str(target) not in result.stdout
+
+
+def test_read_only_wrapper_is_inspected_but_mutation_remains_unresolved(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'read-only-secret'\n"
+    wrapper.write_bytes(preimage)
+    wrapper.chmod(0o444)
+    try:
+        snapshot_result, snapshot = _run_wrapper_snapshot_harness(tmp_path, wrappers)
+        rewrite_result, rewritten = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+    finally:
+        wrapper.chmod(0o666)
+
+    assert snapshot_result.returncode == 0, snapshot_result.stderr
+    assert snapshot["available"] is True
+    assert snapshot["wrappers"][0]["embedded_dsn"] is True
+    assert rewrite_result.returncode == 0, rewrite_result.stderr
+    assert rewritten["snapshot_available"] is True
+    assert [item["action"] for item in rewritten["failures"]] == ["rewrite_wrapper"]
+    assert rewritten["unresolved"][0]["conditions"] == [
+        "embedded_dsn_present",
+        "exact_deny_stub_absent",
+    ]
+    assert wrapper.read_bytes() == preimage
+
+
+def test_acl_read_only_wrapper_is_inspected_but_mutation_remains_unresolved(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'acl-secret'\n"
+    wrapper.write_bytes(preimage)
+    whoami = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if whoami.returncode != 0:
+        pytest.skip("current Windows SID unavailable")
+    sid = whoami.stdout.strip().split(",")[-1].strip().strip('"')
+    denied = subprocess.run(
+        ["icacls", str(wrapper), "/deny", f"*{sid}:(WD,AD,WEA,WA)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if denied.returncode != 0:
+        pytest.skip(f"ACL deny unavailable: {denied.stderr or denied.stdout}")
+    try:
+        snapshot_result, snapshot = _run_wrapper_snapshot_harness(tmp_path, wrappers)
+        rewrite_result, rewritten = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+    finally:
+        subprocess.run(
+            ["icacls", str(wrapper), "/remove:d", f"*{sid}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert snapshot_result.returncode == 0, snapshot_result.stderr
+    assert snapshot["available"] is True
+    assert rewrite_result.returncode == 0, rewrite_result.stderr
+    assert rewritten["snapshot_available"] is True
+    assert [item["action"] for item in rewritten["failures"]] == ["rewrite_wrapper"]
+    assert rewritten["unresolved"]
+    assert wrapper.read_bytes() == preimage
+
+
+def test_exclusively_locked_wrapper_fails_snapshot_closed_and_redacts_path(tmp_path):
+    wrappers = tmp_path / "locked-wrapper-root-secret"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    wrapper.write_text("$env:FLEET_PG_DSN = 'locked-content-secret'\n", encoding="utf-8")
+    ready = tmp_path / "lock-ready"
+    release = tmp_path / "lock-release"
+    locker = tmp_path / "locker.ps1"
+    locker.write_text(
+        "\n".join(
+            [
+                f"$stream = [IO.FileStream]::new('{_ps_quote(wrapper)}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)",
+                f"Set-Content -LiteralPath '{_ps_quote(ready)}' -Value ready",
+                f"while (-not (Test-Path -LiteralPath '{_ps_quote(release)}')) {{ Start-Sleep -Milliseconds 20 }}",
+                "$stream.Dispose()",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        ["pwsh", "-NoProfile", "-File", str(locker)],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(250):
+            if ready.exists():
+                break
+            if process.poll() is not None:
+                pytest.fail(f"locker exited early: {process.communicate()}")
+            import time
+
+            time.sleep(0.02)
+        else:
+            pytest.fail("locker did not acquire wrapper handle")
+        result, payload = _run_wrapper_snapshot_harness(tmp_path, wrappers)
+    finally:
+        release.write_text("release", encoding="utf-8")
+        process.communicate(timeout=10)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert "locked-wrapper-root-secret" not in result.stdout
+    assert "locked-content-secret" not in result.stdout
 
 
 def test_evidence_delete_and_replace_are_blocked_until_wrapper_and_reverify_finish(tmp_path):
@@ -1052,7 +1307,7 @@ def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp
 @pytest.mark.parametrize(
     "overrides",
     [
-        "function Open-KnownWrapperExclusive([string]$Path) { throw 'open failed' }",
+        "function Open-KnownWrapperMutationExclusive([string]$Path) { throw 'open failed' }",
         "function Read-KnownWrapperStreamBytes($Stream) { throw 'read failed' }",
         "function Open-KnownEvidenceExclusive([string]$Path) { throw 'evidence open failed' }",
         "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) { throw 'evidence write failed' }",
@@ -1310,6 +1565,34 @@ def test_generated_wrapper_inventory_uses_only_exact_authorized_basenames(tmp_pa
 
     assert result.returncode == 0, result.stderr
     assert sorted(json.loads(result.stdout.strip())) == sorted(authorized)
+
+
+@pytest.mark.parametrize("mode", ["Inspect", "Contain"])
+def test_operational_wrapper_root_is_rejected_before_enumeration(mode, tmp_path):
+    secret = "wrapper-root-must-not-be-enumerated"
+    wrapper_root = tmp_path / secret
+    wrapper_root.mkdir()
+    (wrapper_root / "apply-cycle-task.ps1").write_text(
+        "$env:FLEET_PG_DSN = 'must-not-be-read'\n", encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), f"-{mode}", "-WrapperRoot", str(wrapper_root)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert len(result.stdout.strip().splitlines()) == 1
+    assert secret not in result.stdout
+    assert "must-not-be-read" not in result.stdout
+    payload = json.loads(result.stdout.strip())
+    assert payload["operational"] is False
+    assert payload["success"] is False
+    assert payload["rejection"] == "injected_execution_seam_disabled"
+    assert payload["non_operational_reasons"] == ["wrapper_root_injected"]
 
 
 def test_ambiguous_authorities_remain_unresolved_and_are_never_acted_on(tmp_path):
@@ -1723,7 +2006,7 @@ def test_each_injected_seam_marks_receipt_non_operational(
     assert payload["mode"] == "test"
     assert payload["operational"] is False
     assert payload["success"] is False
-    assert payload["non_operational_reasons"] == [reason]
+    assert payload["non_operational_reasons"] == [reason, "wrapper_root_injected"]
     assert payload["rejection"] == "injected_execution_seam_disabled"
 
 
@@ -2077,6 +2360,71 @@ def test_acquisition_command_line_matching_is_bounded_and_quote_aware(command_li
         "classification": expected,
         "matched": expected == "acquisition",
     }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"%APPLYPILOT_WRAPPER% --limit 1",
+        r"!APPLYPILOT_WRAPPER! --limit 1",
+        r"%APPLYPILOT_WRAPPER --limit 1",
+        r"$env:APPLYPILOT_WRAPPER --limit 1",
+        r"${env:APPLYPILOT_WRAPPER} --limit 1",
+        r"$env:APPLYPILOT_WRAPPER.ps1 --limit 1",
+        r"pwsh -File $env:APPLYPILOT_WRAPPER",
+        r"cmd /c %APPLYPILOT_WRAPPER%",
+        r"cmd /k !APPLYPILOT_WRAPPER!",
+    ],
+)
+def test_environment_selected_executable_basename_is_ambiguous_and_not_expanded(command):
+    secret = "expanded-wrapper-secret"
+    env = os.environ.copy()
+    env["APPLYPILOT_WRAPPER"] = f"run-fleet-workers.ps1-{secret}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert secret not in result.stdout
+    assert command not in result.stdout
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"%APPLYPILOT_ROOT%\run-fleet-workers.ps1 --limit 1",
+        r"!APPLYPILOT_ROOT!\run-fleet-workers.ps1 --limit 1",
+        r"$env:APPLYPILOT_ROOT\run-fleet-workers.ps1 --limit 1",
+        r"${env:APPLYPILOT_ROOT}\run-fleet-workers.ps1 --limit 1",
+        r"pwsh -File $env:APPLYPILOT_ROOT\run-fleet-workers.ps1",
+        r"cmd /c %APPLYPILOT_ROOT%\run-fleet-worker.cmd",
+    ],
+)
+def test_environment_reference_in_directory_retains_literal_basename_classification(command):
+    secret = "directory-expansion-must-not-occur"
+    env = os.environ.copy()
+    env["APPLYPILOT_ROOT"] = rf"C:\sensitive\{secret}"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert secret not in result.stdout
+    assert command not in result.stdout
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
 
 
 @pytest.mark.parametrize(
@@ -3284,7 +3632,7 @@ def test_hostile_adapter_is_rejected_before_execution(mode, tmp_path):
         "mode": "test",
         "operation": mode.lower(),
         "operational": False,
-        "non_operational_reasons": ["adapter_injected"],
+        "non_operational_reasons": ["adapter_injected", "wrapper_root_injected"],
         "success": False,
         "rejection": "injected_execution_seam_disabled",
         "evidence_deleted": False,
