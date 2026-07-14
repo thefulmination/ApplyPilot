@@ -23,6 +23,67 @@ NEW_RECEIPT = REPO_ROOT / "scripts" / "New-PhaseASignedReceipt.ps1"
 PWSH = shutil.which("pwsh") or shutil.which("powershell")
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 
+REPARSE_MUTATOR_TYPE = r"""
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace ApplyPilot.PhaseA.Tests
+{
+    public static class ReparseMutator
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFileW(string path, uint access, uint share,
+            IntPtr security, uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(IntPtr handle, uint code, byte[] input,
+            uint inputSize, IntPtr output, uint outputSize, out uint returned, IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static void Put(byte[] buffer, int offset, byte[] value)
+        {
+            Buffer.BlockCopy(value, 0, buffer, offset, value.Length);
+        }
+
+        public static int TrySetJunction(string path, string target)
+        {
+            IntPtr handle = CreateFileW(Path.GetFullPath(path), 0x40000000, 7,
+                IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+            if (handle == new IntPtr(-1)) return Marshal.GetLastWin32Error();
+            try
+            {
+                string print = Path.GetFullPath(target).TrimEnd('\\');
+                string substitute = "\\??\\" + print;
+                byte[] substituteBytes = Encoding.Unicode.GetBytes(substitute);
+                byte[] printBytes = Encoding.Unicode.GetBytes(print);
+                int pathBytes = substituteBytes.Length + 2 + printBytes.Length + 2;
+                byte[] buffer = new byte[16 + pathBytes];
+                Put(buffer, 0, BitConverter.GetBytes(0xA0000003U));
+                Put(buffer, 4, BitConverter.GetBytes(checked((ushort)(8 + pathBytes))));
+                Put(buffer, 8, BitConverter.GetBytes((ushort)0));
+                Put(buffer, 10, BitConverter.GetBytes(checked((ushort)substituteBytes.Length)));
+                Put(buffer, 12, BitConverter.GetBytes(checked((ushort)(substituteBytes.Length + 2))));
+                Put(buffer, 14, BitConverter.GetBytes(checked((ushort)printBytes.Length)));
+                Put(buffer, 16, substituteBytes);
+                Put(buffer, 18 + substituteBytes.Length, printBytes);
+                uint returned;
+                if (!DeviceIoControl(handle, 0x000900A4, buffer, (uint)buffer.Length,
+                    IntPtr.Zero, 0, out returned, IntPtr.Zero))
+                    return Marshal.GetLastWin32Error();
+                return 0;
+            }
+            finally { CloseHandle(handle); }
+        }
+    }
+}
+"""
+
 
 def _ps(value: os.PathLike[str] | str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
@@ -675,6 +736,68 @@ def test_directory_reparse_with_exact_acl_fails_closed(tmp_path: Path):
         f"{_ps(junction)} {_ps(sid)};'missed'}}catch{{'rejected'}}"
     )
     assert result.stdout.strip() == "rejected"
+
+
+def test_directory_reparse_race_cannot_be_accepted(tmp_path: Path):
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    _protect(protected)
+    sid = _current_sid()
+    body = (
+        "Add-Type -TypeDefinition @'\n"
+        + REPARSE_MUTATOR_TYPE
+        + "\n'@\n"
+        + f"$target={_ps(target)};"
+        "$state=[pscustomobject]@{MutationError=-1};"
+        "$hook={param($p,$h)$state.MutationError="
+        "[ApplyPilot.PhaseA.Tests.ReparseMutator]::TrySetJunction($p,$target)}.GetNewClosure();"
+        "$accepted=$true;$m=Get-Module PhaseAEvidenceStore;"
+        "try{& $m {param($p,$s,$h)Assert-PhaseAProtectedAcl -Path $p -OperatorSid $s "
+        "-BeforeFinalObjectRevalidation $h -DefinitionImport} "
+        f"{_ps(protected)} {_ps(sid)} $hook}}catch{{$accepted=$false}};"
+        f"$item=Get-Item -LiteralPath {_ps(protected)} -Force;"
+        "[pscustomobject]@{Accepted=$accepted;MutationError=$state.MutationError;"
+        "MutationSucceeded=($state.MutationError -eq 0);"
+        "Reparse=(($item.Attributes-band [IO.FileAttributes]::ReparsePoint)-ne 0)}"
+        "|ConvertTo-Json -Compress"
+    )
+    result = json.loads(_module(body).stdout)
+    assert result == {
+        "Accepted": False,
+        "MutationError": 0,
+        "MutationSucceeded": True,
+        "Reparse": True,
+    }
+
+
+def test_directory_acl_validation_preserves_delete_share_and_revalidates_handle(tmp_path: Path):
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    moved = tmp_path / "moved"
+    _protect(protected)
+    sid = _current_sid()
+    body = (
+        f"$destination={_ps(moved)};"
+        "$state=[pscustomobject]@{Moved=$false};"
+        "$hook={param($p,$h)try{Move-Item -LiteralPath $p -Destination $destination -ErrorAction Stop;"
+        "$state.Moved=$true}catch{}}.GetNewClosure();"
+        "$accepted=$true;$m=Get-Module PhaseAEvidenceStore;"
+        "try{& $m {param($p,$s,$h)Assert-PhaseAProtectedAcl -Path $p -OperatorSid $s "
+        "-BeforeFinalObjectRevalidation $h -DefinitionImport} "
+        f"{_ps(protected)} {_ps(sid)} $hook}}catch{{$accepted=$false}};"
+        f"[pscustomobject]@{{Accepted=$accepted;Moved=$state.Moved;"
+        f"OriginalExists=(Test-Path -LiteralPath {_ps(protected)});"
+        f"DestinationExists=(Test-Path -LiteralPath {_ps(moved)})}}|ConvertTo-Json -Compress"
+    )
+    result = json.loads(_module(body).stdout)
+    assert result == {
+        "Accepted": False,
+        "Moved": True,
+        "OriginalExists": False,
+        "DestinationExists": True,
+    }
 
 
 @pytest.mark.parametrize("key_form", ["rsa2048", "trailing_der", "replacement"])

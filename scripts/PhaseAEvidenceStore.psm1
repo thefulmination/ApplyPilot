@@ -75,6 +75,8 @@ namespace ApplyPilot.PhaseA
         private const uint GenericWrite = 0x40000000;
         private const uint Delete = 0x00010000;
         private const uint ReadControl = 0x00020000;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareDelete = 0x00000004;
         private const uint OpenExisting = 3;
         private const uint FileFlagBackupSemantics = 0x02000000;
         private const uint FileFlagOpenReparsePoint = 0x00200000;
@@ -196,26 +198,34 @@ namespace ApplyPilot.PhaseA
             string full = Path.GetFullPath(path);
             uint access = directory ? ReadControl : GenericRead;
             uint flags = FileFlagOpenReparsePoint | (directory ? FileFlagBackupSemantics : 0);
-            uint share = directory ? 3U : 0U;
+            uint share = directory ? FileShareRead | FileShareDelete : 0U;
             IntPtr raw = CreateFileW(full, access, share, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
             if (raw == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
             var handle = new SafeFileHandle(raw, true);
             try
             {
-                FileAttributeTagInformation tag;
-                if (!GetFileAttributeTagInformationByHandleEx(handle, 9, out tag,
-                    (uint)Marshal.SizeOf<FileAttributeTagInformation>()))
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
-                if ((tag.FileAttributes & FileAttributeReparsePoint) != 0 || tag.ReparseTag != 0)
-                    throw new InvalidOperationException("Manifest objects cannot be reparse points.");
-                bool actualDirectory = (tag.FileAttributes & FileAttributeDirectory) != 0;
-                if (actualDirectory != directory) throw new InvalidOperationException("Manifest object kind changed.");
-                string final = NormalizeFinalPath(GetFinalPathName(handle));
-                if (!String.Equals(final, full.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidOperationException("Manifest object final path changed.");
+                AssertManifestObject(handle, full, directory);
                 return handle;
             }
             catch { handle.Dispose(); throw; }
+        }
+
+        public static void AssertManifestObject(SafeFileHandle handle, string path, bool directory)
+        {
+            if (handle == null || handle.IsClosed || handle.IsInvalid)
+                throw new ArgumentException("Manifest object handle is not valid.", "handle");
+            string full = Path.GetFullPath(path).TrimEnd('\\');
+            FileAttributeTagInformation tag;
+            if (!GetFileAttributeTagInformationByHandleEx(handle, 9, out tag,
+                (uint)Marshal.SizeOf<FileAttributeTagInformation>()))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((tag.FileAttributes & FileAttributeReparsePoint) != 0 || tag.ReparseTag != 0)
+                throw new InvalidOperationException("Manifest objects cannot be reparse points.");
+            bool actualDirectory = (tag.FileAttributes & FileAttributeDirectory) != 0;
+            if (actualDirectory != directory) throw new InvalidOperationException("Manifest object kind changed.");
+            string final = NormalizeFinalPath(GetFinalPathName(handle));
+            if (!String.Equals(final, full, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Manifest object final path changed.");
         }
 
         public static RawFileIdentity GetRawFileIdentity(SafeFileHandle handle)
@@ -886,7 +896,16 @@ function Get-PhaseASecurityDescriptorHash {
   return Get-PhaseASha256 $bytes
 }
 
-function Assert-PhaseAProtectedAcl([string]$Path, [string]$OperatorSid, [switch]$File) {
+function Assert-PhaseAProtectedAcl(
+  [string]$Path,
+  [string]$OperatorSid,
+  [switch]$File,
+  [scriptblock]$BeforeFinalObjectRevalidation,
+  [switch]$DefinitionImport
+) {
+  if ($BeforeFinalObjectRevalidation -and -not $DefinitionImport) {
+    throw 'Protected ACL race injection requires DefinitionImport.'
+  }
   $handle = [ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($Path, -not $File)
   try {
     $bytes = [ApplyPilot.PhaseA.EvidenceNative]::GetFileSecurityDescriptor($handle)
@@ -919,6 +938,10 @@ function Assert-PhaseAProtectedAcl([string]$Path, [string]$OperatorSid, [switch]
         throw 'Evidence DACL ACE rights, inheritance, or propagation are not exact.'
       }
     }
+    if ($BeforeFinalObjectRevalidation) {
+      & $BeforeFinalObjectRevalidation $Path $handle
+    }
+    [ApplyPilot.PhaseA.EvidenceNative]::AssertManifestObject($handle, $Path, -not $File)
   } finally { $handle.Dispose() }
 }
 
