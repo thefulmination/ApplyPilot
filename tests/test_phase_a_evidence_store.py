@@ -1312,7 +1312,7 @@ def test_cleanup_retries_whole_manifest_after_native_entry_disappearance(tmp_pat
         f"-AuthorizationSignaturePath {_ps(authorization_sig)} "
         "-ExpectedAuthorizationBindings $expected "
         f"-ExpectedAfterManifestPath {_ps(expected_after)} "
-        f"-TestBootstrapRoot {_ps(bootstrap)} -TestPostCleanupManifestReader $reader"
+        f"-TestBootstrapRoot {_ps(bootstrap)}"
     )
     body = (
         f". {_ps(PROVISION)} -DefinitionImport;"
@@ -1331,12 +1331,19 @@ def test_cleanup_retries_whole_manifest_after_native_entry_disappearance(tmp_pat
         "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
         "$script:nativeCode=$e.NativeErrorCode;throw}};"
         "Get-PhaseAManifestMaterial $path $canonicalRootPath};"
-        f"try{{{invoke}|Out-Null;$blocked='missed'}}"
+        f"try{{{invoke} -TestPostCleanupManifestReader $reader|Out-Null;$blocked='missed'}}"
         "catch{$blocked=$_.Exception.Message};"
-        f"$out={invoke} -DefinitionImport;"
+        "$mismatchReader={param($path,$canonicalRootPath)"
+        "$material=Get-PhaseAManifestMaterial $path $canonicalRootPath;"
+        "$material.Sha256=('f'*64 -join '');$material};"
+        f"try{{{invoke} -TestPostCleanupManifestReader $mismatchReader -DefinitionImport|Out-Null;"
+        "$mismatchError='missed'}catch{$mismatchError=$_.Exception.Message};"
+        f"$stageAbsentAfterMismatch=-not(Test-Path -LiteralPath {_ps(stage)});"
+        f"$out={invoke} -TestPostCleanupManifestReader $reader -DefinitionImport;"
         "[pscustomobject]@{State=$out.State;Attempts=$script:attempts;"
         "NativeCode=$script:nativeCode;StageAbsent=-not(Test-Path -LiteralPath "
-        f"{_ps(stage)});Blocked=$blocked}}|ConvertTo-Json -Compress"
+        f"{_ps(stage)});Blocked=$blocked;MismatchError=$mismatchError;"
+        "StageAbsentAfterMismatch=$stageAbsentAfterMismatch}|ConvertTo-Json -Compress"
     )
     result = json.loads(_run_ps(body, timeout=120).stdout)
     assert result == {
@@ -1345,6 +1352,8 @@ def test_cleanup_retries_whole_manifest_after_native_entry_disappearance(tmp_pat
         "NativeCode": 2,
         "StageAbsent": True,
         "Blocked": "Post-cleanup manifest override requires DefinitionImport.",
+        "MismatchError": "Actual-after manifest differs from authorization.",
+        "StageAbsentAfterMismatch": True,
     }
 
 
@@ -1353,8 +1362,23 @@ def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path:
     parent.mkdir()
     stage = parent / ".provisioning-11111111-1111-4111-8111-111111111111"
     success_stage = parent / ".provisioning-22222222-2222-4222-8222-222222222222"
+    pre_read_stage = parent / ".provisioning-33333333-3333-4333-8333-333333333333"
     body = (
         f". {_ps(PROVISION)} -DefinitionImport;"
+        f"[IO.Directory]::CreateDirectory({_ps(pre_read_stage)})|Out-Null;"
+        "$script:preReadAttempts=0;$preRead={param($path,$canonicalRootPath)"
+        "$script:preReadAttempts++;Get-PhaseAManifestMaterial $path $canonicalRootPath};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(pre_read_stage)} "
+        "-TestManifestReader $preRead -DefinitionImport|Out-Null;$preReadError='missed'}"
+        "catch{$preReadError=$_.Exception.Message};"
+        "$script:lateAttempts=0;$late={param($path,$canonicalRootPath)"
+        "$script:lateAttempts++;Start-Sleep -Milliseconds 900;"
+        "Get-PhaseAManifestMaterial $path $canonicalRootPath};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-TestManifestReader $late -DefinitionImport|Out-Null;$lateError='missed'}"
+        "catch{$lateError=$_.Exception.Message};"
         "$script:pathMissingAttempts=0;$pathMissing={param($path,$canonicalRootPath)"
         "$script:pathMissingAttempts++;if($script:pathMissingAttempts -eq 1){"
         "$missing=Join-Path (Join-Path $path 'missing-parent') 'leaf';"
@@ -1394,7 +1418,9 @@ def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path:
         f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
         "-TestManifestReader $reappeared -DefinitionImport|Out-Null;"
         "$reappearedError='missed'}catch{$reappearedError=$_.Exception.Message};"
-        "[pscustomobject]@{PathMissingAttempts=$script:pathMissingAttempts;"
+        "[pscustomobject]@{PreReadAttempts=$script:preReadAttempts;PreReadError=$preReadError;"
+        "LateAttempts=$script:lateAttempts;LateError=$lateError;"
+        "PathMissingAttempts=$script:pathMissingAttempts;"
         "ExhaustedAttempts=$script:exhaustedAttempts;"
         "ExhaustedError=$exhaustedError;DeniedAttempts=$script:deniedAttempts;"
         "DeniedCode=$deniedCode;SuccessReappearedAttempts=$script:successReappearedAttempts;"
@@ -1403,6 +1429,10 @@ def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path:
     )
     result = json.loads(_run_ps(body).stdout)
     assert result == {
+        "PreReadAttempts": 0,
+        "PreReadError": "Cleanup staging path reappeared during post-mutation verification.",
+        "LateAttempts": 1,
+        "LateError": "Post-cleanup parent manifest deadline exceeded.",
         "PathMissingAttempts": 2,
         "ExhaustedAttempts": 4,
         "ExhaustedError": "Post-cleanup parent manifest retries exhausted.",

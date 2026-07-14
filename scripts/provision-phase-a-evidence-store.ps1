@@ -70,6 +70,9 @@ function Get-PhaseAPostCleanupManifestMaterial {
     try {
       $material=if($TestManifestReader){& $TestManifestReader $ParentPath $null}else{Get-PhaseAManifestMaterial $ParentPath}
       Assert-PhaseACleanupStagingPathAbsent $StagingPath
+      if($timer.ElapsedMilliseconds-ge $maxElapsedMilliseconds){
+        throw [InvalidOperationException]::new('Post-cleanup parent manifest deadline exceeded.')
+      }
       return $material
     } catch {
       $failure=$_
