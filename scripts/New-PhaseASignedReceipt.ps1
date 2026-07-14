@@ -39,8 +39,6 @@ $value = & $module {
   elseif ($Host) { throw 'Host-provisioning binding is not part of this receipt schema.' }
   if ($needsSource) { Assert-PhaseAHexDigest $Source 'Source-approval receipt binding' }
   elseif ($Source) { throw 'Source-approval binding is not part of this receipt schema.' }
-  $spki = Read-PhaseAValidatedBytes $SpkiPath
-  if ((Get-PhaseASha256 $spki.Bytes) -cne $SpkiHash) { throw 'SPKI hash does not match the expected committed anchor.' }
   $rsa = Import-PhaseASpki $SpkiPath $SpkiHash; $rsa.Dispose()
   $receipt = [ordered]@{
     schema='applypilot.phase-a.signed-receipt.v1'; receiptType=$Type; commit=$ApprovedCommit;

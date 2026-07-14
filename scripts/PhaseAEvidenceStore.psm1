@@ -194,13 +194,9 @@ namespace ApplyPilot.PhaseA
             finally { Marshal.FreeHGlobal(buffer); }
         }
 
-        public static bool VerifyPssSha256ExactSalt(byte[] spki, byte[] content, byte[] signature)
+        public static bool VerifyPssSha256ExactSalt(RSA rsa, byte[] content, byte[] signature)
         {
-            using (RSA rsa = RSA.Create())
-            {
-                int read;
-                rsa.ImportSubjectPublicKeyInfo(spki, out read);
-                if (read != spki.Length || rsa.KeySize != 3072 || signature.Length != 384) return false;
+                if (rsa == null || rsa.KeySize != 3072 || signature.Length != 384) return false;
                 RSAParameters p = rsa.ExportParameters(false);
                 BigInteger s = new BigInteger(signature, true, true);
                 BigInteger n = new BigInteger(p.Modulus, true, true);
@@ -230,7 +226,6 @@ namespace ApplyPilot.PhaseA
                 Buffer.BlockCopy(db, psLen + 1, prime, 8 + hLen, sLen);
                 byte[] expected = SHA256.HashData(prime);
                 return CryptographicOperations.FixedTimeEquals(h, expected);
-            }
         }
 
         private static byte[] Mgf1(byte[] seed, int length)
@@ -814,23 +809,33 @@ function Get-PhaseADirectoryManifest {
   return [ordered]@{ schema='applypilot.phase-a.directory-manifest.v1'; entries=@($entries) }
 }
 
-function Import-PhaseASpki([string]$Path, [string]$ExpectedHash) {
-  $bytes = (Read-PhaseAValidatedBytes $Path).Bytes
-  if ($ExpectedHash) {
-    Assert-PhaseAHexDigest $ExpectedHash 'SPKI hash'
-    if ((Get-PhaseASha256 $bytes) -cne $ExpectedHash) { throw 'Signing SPKI hash does not match the committed anchor.' }
-  }
+function Import-PhaseASpkiBytes([byte[]]$Bytes, [string]$ExpectedHash) {
+  Assert-PhaseAHexDigest $ExpectedHash 'SPKI hash'
+  if ((Get-PhaseASha256 $Bytes) -cne $ExpectedHash) { throw 'Signing SPKI hash does not match the committed anchor.' }
   $rsa = [Security.Cryptography.RSA]::Create()
   try {
     $read = 0
-    $rsa.ImportSubjectPublicKeyInfo($bytes, [ref]$read)
-    if ($read -ne $bytes.Length -or $rsa.KeySize -ne 3072) { throw 'Signing key must be exact RSA-3072 SPKI.' }
+    $rsa.ImportSubjectPublicKeyInfo($Bytes, [ref]$read)
+    if ($read -ne $Bytes.Length -or $rsa.KeySize -ne 3072) { throw 'Signing key must be exact RSA-3072 SPKI.' }
     $canonical = $rsa.ExportSubjectPublicKeyInfo()
-    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($bytes, $canonical)) {
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($Bytes, $canonical)) {
       throw 'Signing SPKI is not canonical DER.'
     }
     return $rsa
   } catch { $rsa.Dispose(); throw }
+}
+
+function Import-PhaseASpki([string]$Path, [string]$ExpectedHash) {
+  $full = Assert-PhaseALocalNtfsPath $Path
+  $root = Split-Path -Parent $full
+  $handle = Open-PhaseAValidatedFile -Path $full -Access Read -AuthorizedRoot $root `
+    -AuthorizedBasename ([IO.Path]::GetFileName($full))
+  try {
+    $read = Read-PhaseABytesFromHeldHandle $handle $full
+    $rsa = Import-PhaseASpkiBytes $read.Bytes $ExpectedHash
+    Assert-PhaseAFileIdentity -Handle $handle -Expected $read.Identity
+    return $rsa
+  } finally { $handle.Dispose() }
 }
 
 function Test-PhaseASignedReceiptCore {
@@ -850,9 +855,17 @@ function Test-PhaseASignedReceiptCore {
     [Parameter(Mandatory)][string]$ExpectedManifestAfterSha256,
     [Parameter(Mandatory)][string]$ExpectedStoreConfigSha256,
     [string]$ExpectedHostProvisioningReceiptSha256,
-    [string]$ExpectedSourceApprovalReceiptSha256
+    [string]$ExpectedSourceApprovalReceiptSha256,
+    [scriptblock]$BeforeSpkiRevalidation
   )
-  $spkiRead = Read-PhaseAValidatedBytes $SigningSpkiPath
+  $spkiFull = Assert-PhaseALocalNtfsPath $SigningSpkiPath
+  $spkiRoot = Split-Path -Parent $spkiFull
+  $spkiHandle = Open-PhaseAValidatedFile -Path $spkiFull -Access Read -AuthorizedRoot $spkiRoot `
+    -AuthorizedBasename ([IO.Path]::GetFileName($spkiFull))
+  $rsa = $null
+  try {
+  $spkiRead = Read-PhaseABytesFromHeldHandle $spkiHandle $spkiFull
+  if ($BeforeSpkiRevalidation) { & $BeforeSpkiRevalidation $spkiFull }
   if ((Split-Path -Parent $receipt.Path) -ine (Split-Path -Parent $signatureRead.Path)) {
     throw 'Receipt and signature must be adjacent.'
   }
@@ -881,10 +894,10 @@ function Test-PhaseASignedReceiptCore {
   $spkiBytes = $spkiRead.Bytes
   $spkiHash = Get-PhaseASha256 $spkiBytes
   if ($receipt.Value.signingKeySpkiSha256 -cne $spkiHash) { throw 'Receipt signing-key binding is wrong.' }
-  $rsa = Import-PhaseASpki $SigningSpkiPath $ExpectedSigningSpkiSha256
-  $rsa.Dispose()
+  $rsa = Import-PhaseASpkiBytes $spkiBytes $ExpectedSigningSpkiSha256
+  Assert-PhaseAFileIdentity -Handle $spkiHandle -Expected $spkiRead.Identity
   if (-not [ApplyPilot.PhaseA.EvidenceNative]::VerifyPssSha256ExactSalt(
-      $spkiBytes, $receipt.Bytes, $signatureRead.Bytes)) { throw 'Receipt signature or PSS salt length is invalid.' }
+      $rsa, $receipt.Bytes, $signatureRead.Bytes)) { throw 'Receipt signature or PSS salt length is invalid.' }
   $bindings = @{
     receiptType=$ExpectedReceiptType; commit=$ExpectedCommit; operationId=$ExpectedOperationId;
     targetDigest=$ExpectedTargetDigest; operatorSidDigest=$ExpectedOperatorSidDigest;
@@ -899,7 +912,12 @@ function Test-PhaseASignedReceiptCore {
       throw "Receipt $($binding.Key) binding is wrong."
     }
   }
+  Assert-PhaseAFileIdentity -Handle $spkiHandle -Expected $spkiRead.Identity
   return $true
+  } finally {
+    if ($rsa) { $rsa.Dispose() }
+    $spkiHandle.Dispose()
+  }
 }
 
 function Test-PhaseASignedReceipt {
@@ -920,12 +938,16 @@ function Test-PhaseASignedReceipt {
     [Parameter(Mandatory)][string]$ExpectedStoreConfigSha256,
     [string]$ExpectedHostProvisioningReceiptSha256,
     [string]$ExpectedSourceApprovalReceiptSha256,
-    [string]$ProtectedReceiptFileOwnerSid
+    [string]$ProtectedReceiptFileOwnerSid,
+    [scriptblock]$BeforeSpkiRevalidation,
+    [switch]$DefinitionImport
   )
+  if ($BeforeSpkiRevalidation -and -not $DefinitionImport) { throw 'SPKI race injection requires DefinitionImport.' }
   $arguments = @{} + $PSBoundParameters
   $arguments.Remove('ReceiptPath')
   $arguments.Remove('SignaturePath')
   $arguments.Remove('ProtectedReceiptFileOwnerSid')
+  $arguments.Remove('DefinitionImport')
   if ($ProtectedReceiptFileOwnerSid) {
     $pair = Open-PhaseAProtectedReceiptPair $ReceiptPath $SignaturePath $ProtectedReceiptFileOwnerSid
     try {

@@ -61,11 +61,11 @@ def _canonical(value) -> bytes:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
 
 
-def _new_keypair(root: Path, name: str) -> tuple[Path, Path, str]:
+def _new_keypair(root: Path, name: str, key_size: int = 3072) -> tuple[Path, Path, str]:
     private = root / f"{name}.private.pem"
     public = root / f"{name}.public.der"
     _run_ps(
-        "$rsa=[Security.Cryptography.RSA]::Create(3072)\n"
+        f"$rsa=[Security.Cryptography.RSA]::Create({key_size})\n"
         f"[IO.File]::WriteAllText({_ps(private)},$rsa.ExportPkcs8PrivateKeyPem(),"
         "[Text.UTF8Encoding]::new($false))\n"
         f"[IO.File]::WriteAllBytes({_ps(public)},$rsa.ExportSubjectPublicKeyInfo())\n"
@@ -570,6 +570,54 @@ def test_wrong_signing_key_and_malformed_digest_fail_closed(tmp_path: Path):
         f"{_validation_args(malformed)}; "
         "'missed' } catch { 'rejected' }"
     ).stdout.strip() == "rejected"
+
+
+def test_spki_replacement_cannot_split_hash_import_and_signature_key(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "receipt-key")
+    _, replacement, replacement_hash = _new_keypair(tmp_path, "anchor-key")
+    receipt = _receipt("operation-authorization", key_hash)
+    content = _canonical(receipt)
+    receipt_path = tmp_path / f"{_sha(content)}.json"
+    receipt_path.write_bytes(content)
+    receipt_path.with_suffix(".sig").write_bytes(_sign(private, content))
+    moved = tmp_path / "original-key.der"
+    marker = tmp_path / "race-entered.txt"
+    split_args = _validation_args(
+        receipt, ExpectedSigningSpkiSha256=replacement_hash
+    )
+    command = (
+        f"$swap={{param($path) Set-Content -LiteralPath {_ps(marker)} -Value entered;"
+        f"Move-Item -LiteralPath $path -Destination {_ps(moved)};"
+        f"Copy-Item -LiteralPath {_ps(replacement)} -Destination $path}};"
+        "try { Test-PhaseASignedReceipt "
+        f"-ReceiptPath {_ps(receipt_path)} -SignaturePath {_ps(receipt_path.with_suffix('.sig'))} "
+        f"-SigningSpkiPath {_ps(public)} {split_args} "
+        "-BeforeSpkiRevalidation $swap -DefinitionImport; 'missed' } catch { 'rejected' }"
+    )
+    result = _module(command)
+    assert marker.is_file(), "race hook must execute between held-byte read and final identity check"
+    assert result.stdout.strip() == "rejected"
+    assert public.is_file()
+
+
+@pytest.mark.parametrize("key_form", ["rsa-2048", "trailing-der"])
+def test_spki_requires_exact_rsa3072_canonical_der(tmp_path: Path, key_form: str):
+    key_size = 2048 if key_form == "rsa-2048" else 3072
+    private, public, _ = _new_keypair(tmp_path, key_form, key_size)
+    if key_form == "trailing-der":
+        public.write_bytes(public.read_bytes() + b"\x00")
+    key_hash = _sha(public.read_bytes())
+    receipt = _receipt("host-provisioning", key_hash)
+    content = _canonical(receipt)
+    receipt_path = tmp_path / f"{_sha(content)}.json"
+    receipt_path.write_bytes(content)
+    receipt_path.with_suffix(".sig").write_bytes(_sign(private, content))
+    result = _module(
+        f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(receipt_path)} "
+        f"-SignaturePath {_ps(receipt_path.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)} "
+        f"{_validation_args(receipt)}; 'missed' }} catch {{ 'rejected' }}"
+    )
+    assert result.stdout.strip() == "rejected"
 
 
 def test_receipt_generator_never_accepts_private_key_and_verifies_returned_signature(tmp_path: Path):
