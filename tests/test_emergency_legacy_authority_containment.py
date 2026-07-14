@@ -805,6 +805,79 @@ def test_wrapper_root_junction_is_rejected_without_reading_target(tmp_path):
     assert str(real_root) not in result.stdout
 
 
+def test_higher_ancestor_junction_above_wrapper_root_is_rejected(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    wrappers = real_parent / "ApplyPilot" / ".fleet-logs" / "_task-wrappers"
+    wrappers.mkdir(parents=True)
+    secret = "higher-junction-target-secret"
+    (wrappers / "apply-cycle-task.ps1").write_text(
+        f"$env:FLEET_PG_DSN = '{secret}'\n", encoding="utf-8"
+    )
+    junction_parent = tmp_path / "junction-parent"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction_parent), str(real_parent)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {created.stderr or created.stdout}")
+    redirected_root = (
+        junction_parent / "ApplyPilot" / ".fleet-logs" / "_task-wrappers"
+    )
+
+    result, payload = _run_wrapper_snapshot_harness(tmp_path, redirected_root)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert secret not in result.stdout
+    assert str(real_parent) not in result.stdout
+
+
+def test_higher_ancestor_substitution_during_component_open_fails_closed(tmp_path):
+    container = tmp_path / "container"
+    original_parent = container / "ApplyPilot"
+    wrappers = original_parent / ".fleet-logs" / "_task-wrappers"
+    wrappers.mkdir(parents=True)
+    original = wrappers / "apply-cycle-task.ps1"
+    original_bytes = b"$env:FLEET_PG_DSN = 'higher-original-secret'\n"
+    original.write_bytes(original_bytes)
+
+    replacement_staging = container / "replacement-staging"
+    replacement_root = replacement_staging / ".fleet-logs" / "_task-wrappers"
+    replacement_root.mkdir(parents=True)
+    replacement = replacement_root / original.name
+    replacement_bytes = b"$env:FLEET_PG_DSN = 'higher-replacement-secret'\n"
+    replacement.write_bytes(replacement_bytes)
+    moved_parent = container / "moved-original"
+    marker = tmp_path / "higher-ancestor-hook-ran"
+    overrides = "\n".join(
+        [
+            "$script:WrapperAfterComponentOpenHook = {",
+            "  param([string]$ComponentPath)",
+            f"  if ($ComponentPath -ieq '{_ps_quote(original_parent)}') {{",
+            "    $script:WrapperAfterComponentOpenHook = $null",
+            f"    Move-Item -LiteralPath '{_ps_quote(original_parent)}' -Destination '{_ps_quote(moved_parent)}'",
+            f"    Move-Item -LiteralPath '{_ps_quote(replacement_staging)}' -Destination '{_ps_quote(original_parent)}'",
+            f"    Set-Content -LiteralPath '{_ps_quote(marker)}' -Value ran",
+            "  }",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_snapshot_harness(tmp_path, wrappers, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert (moved_parent / ".fleet-logs" / "_task-wrappers" / original.name).read_bytes() == original_bytes
+    assert (original_parent / ".fleet-logs" / "_task-wrappers" / original.name).read_bytes() == replacement_bytes
+    assert "higher-original-secret" not in result.stdout
+    assert "higher-replacement-secret" not in result.stdout
+
+
 def test_wrapper_root_substitution_during_open_fails_closed_with_held_ancestor(tmp_path):
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()

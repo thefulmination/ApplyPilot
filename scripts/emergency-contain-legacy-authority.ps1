@@ -51,6 +51,7 @@ $script:Failures = [Collections.Generic.List[object]]::new()
 $script:SkippedActions = [Collections.Generic.List[object]]::new()
 $script:DefinitionImportMode = $PSCmdlet.ParameterSetName -eq 'DefinitionImport'
 $script:WrapperBeforeLeafOpenHook = $null
+$script:WrapperAfterComponentOpenHook = $null
 $script:ActiveWrapperMutationLease = $null
 
 $adapterInjected = $PSBoundParameters.ContainsKey('AdapterPath')
@@ -1242,6 +1243,7 @@ namespace ApplyPilot
         private const uint FileFlagOpenReparsePoint = 0x00200000;
         private const uint FileAttributeDirectory = 0x00000010;
         private const uint FileAttributeReparsePoint = 0x00000400;
+        private const uint DriveFixed = 3;
         private const int FileStandardInfoClass = 1;
         private const int FileAttributeTagInfoClass = 9;
         private const int FileIdInfoClass = 18;
@@ -1396,6 +1398,9 @@ namespace ApplyPilot
             IntPtr token,
             out IntPtr path);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint GetDriveTypeW(string rootPathName);
+
         private static T GetInformation<T>(SafeFileHandle handle, int informationClass)
             where T : struct
         {
@@ -1495,21 +1500,62 @@ namespace ApplyPilot
             return handle;
         }
 
-        private static List<HeldComponent> OpenComponentChain(string authorizedRoot, string parent)
+        private static string GetTrustedLocalVolumeRoot(string path)
         {
-            var paths = new List<string> { authorizedRoot };
-            string relative = Path.GetRelativePath(authorizedRoot, parent);
-            if (!String.Equals(relative, ".", StringComparison.Ordinal))
+            if (path.StartsWith(@"\\", StringComparison.Ordinal) ||
+                path.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+                path.StartsWith(@"\\.\", StringComparison.Ordinal))
+                throw new IOException("wrapper volume path is not local");
+            string root = Path.GetPathRoot(path);
+            if (String.IsNullOrEmpty(root) || root.Length != 3 ||
+                root[1] != ':' || root[2] != '\\' ||
+                !Char.IsLetter(root[0]))
+                throw new IOException("wrapper volume root is ambiguous");
+            if (GetDriveTypeW(root) != DriveFixed)
+                throw new IOException("wrapper volume is not a fixed local drive");
+            return Char.ToUpperInvariant(root[0]) + @":\";
+        }
+
+        private static void ValidateHeldChain(List<HeldComponent> held)
+        {
+            for (int index = 0; index < held.Count; index++)
             {
-                string current = authorizedRoot;
-                foreach (string segment in relative.Split(Path.DirectorySeparatorChar))
+                HandleIdentity current = ReadIdentity(held[index].Handle, true);
+                RequireSameIdentity(held[index].Identity, current);
+                if (index > 0)
                 {
-                    if (String.IsNullOrEmpty(segment) || segment == "." || segment == "..")
-                        throw new IOException("wrapper component path is not canonical");
-                    current = Path.Combine(current, segment);
-                    paths.Add(current);
+                    string actualParent = Path.GetDirectoryName(current.FinalPath).TrimEnd('\\');
+                    string heldParent = held[index - 1].Identity.FinalPath.TrimEnd('\\');
+                    if (!String.Equals(actualParent, heldParent, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("wrapper component parent identity changed");
                 }
             }
+        }
+
+        private static List<HeldComponent> OpenComponentChain(
+            string authorizedRoot,
+            string parent,
+            Action<string> afterComponentOpen)
+        {
+            string volumeRoot = GetTrustedLocalVolumeRoot(authorizedRoot);
+            if (!String.Equals(
+                    volumeRoot,
+                    GetTrustedLocalVolumeRoot(parent),
+                    StringComparison.OrdinalIgnoreCase))
+                throw new IOException("wrapper root crosses a local volume boundary");
+            var paths = new List<string> { volumeRoot };
+            string relative = Path.GetRelativePath(volumeRoot, parent);
+            string current = volumeRoot;
+            foreach (string segment in relative.Split(Path.DirectorySeparatorChar))
+            {
+                if (String.IsNullOrEmpty(segment) || segment == "." || segment == "..")
+                    throw new IOException("wrapper component path is not canonical");
+                current = Path.Combine(current, segment);
+                paths.Add(current);
+            }
+            if (!String.Equals(current.TrimEnd('\\'), authorizedRoot.TrimEnd('\\'),
+                    StringComparison.OrdinalIgnoreCase))
+                throw new IOException("wrapper authorized root is ambiguous");
 
             var held = new List<HeldComponent>();
             try
@@ -1519,11 +1565,21 @@ namespace ApplyPilot
                     SafeFileHandle handle = OpenDirectoryComponent(componentPath);
                     try
                     {
+                        HandleIdentity identity = ReadIdentity(handle, true);
+                        if (held.Count == 0)
+                        {
+                            string expectedVolumePath = @"\\?\" + volumeRoot.TrimEnd('\\');
+                            if (!String.Equals(identity.FinalPath, expectedVolumePath,
+                                    StringComparison.OrdinalIgnoreCase))
+                                throw new IOException("wrapper volume root is redirected");
+                        }
                         held.Add(new HeldComponent
                         {
                             Handle = handle,
-                            Identity = ReadIdentity(handle, true)
+                            Identity = identity
                         });
+                        if (afterComponentOpen != null) afterComponentOpen(componentPath);
+                        ValidateHeldChain(held);
                     }
                     catch
                     {
@@ -1567,6 +1623,7 @@ namespace ApplyPilot
             string[] authorizedBasenames,
             bool writable,
             string expectedIdentityToken,
+            Action<string> afterComponentOpen,
             Action beforeLeafOpen)
         {
             string fullPath = Path.GetFullPath(path);
@@ -1599,7 +1656,8 @@ namespace ApplyPilot
             if (writable && String.IsNullOrWhiteSpace(expectedIdentityToken))
                 throw new IOException("wrapper mutation identity is required");
 
-            List<HeldComponent> components = OpenComponentChain(authorizedRoot, parent);
+            List<HeldComponent> components = OpenComponentChain(
+                authorizedRoot, parent, afterComponentOpen);
             SafeFileHandle leafHandle = null;
             try
             {
@@ -1675,7 +1733,16 @@ function Open-KnownWrapperNative(
   [string]$ExpectedIdentityToken = $null
 ) {
   Initialize-KnownWrapperNativeApi
+  $afterComponentOpen = $null
   $beforeLeafOpen = $null
+  if ($script:DefinitionImportMode -and $null -ne $script:WrapperAfterComponentOpenHook) {
+    $afterComponentOpen = [Action[string]]{
+      param([string]$ComponentPath)
+      if ($null -ne $script:WrapperAfterComponentOpenHook) {
+        & $script:WrapperAfterComponentOpenHook $ComponentPath
+      }
+    }
+  }
   if ($script:DefinitionImportMode -and $null -ne $script:WrapperBeforeLeafOpenHook) {
     $beforeLeafOpen = [Action]{ & $script:WrapperBeforeLeafOpenHook }
   }
@@ -1685,6 +1752,7 @@ function Open-KnownWrapperNative(
     [string[]]$script:GeneratedAcquisitionWrapperBasenames,
     $Writable,
     $ExpectedIdentityToken,
+    $afterComponentOpen,
     $beforeLeafOpen
   )
 }
