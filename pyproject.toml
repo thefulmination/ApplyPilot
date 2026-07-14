@@ -44,7 +44,7 @@ dependencies = [
     ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+dev = ["pytest>=7.0", "ruff>=0.1", "google-auth-oauthlib", "google-api-python-client"]
 
 [project.scripts]
 applypilot-workday-rollout = "applypilot.fleet.workday_rollout_main:main"
