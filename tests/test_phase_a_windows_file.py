@@ -228,7 +228,9 @@ def test_regular_file_identity_and_exported_surface(tmp_path: Path):
     )
 
 
-def test_force_reload_rejects_incompatible_loaded_type_and_accepts_current_type():
+def test_force_reload_rejects_incompatible_loaded_type_and_accepts_current_type(
+    tmp_path: Path,
+):
     incompatible = _run_raw_ps(
         "$ErrorActionPreference = 'Stop'\n"
         "Add-Type -TypeDefinition 'namespace ApplyPilot.PhaseA { "
@@ -242,13 +244,36 @@ def test_force_reload_rejects_incompatible_loaded_type_and_accepts_current_type(
     assert "restart" in message
     assert "incompatible" in message
 
+    probe = tmp_path / "reload-probe.txt"
+    probe.write_bytes(b"reload")
     compatible = _run_raw_ps(
         "$ErrorActionPreference = 'Stop'\n"
         f"Import-Module {_ps_literal(MODULE_PATH)} -Force\n"
         f"Import-Module {_ps_literal(MODULE_PATH)} -Force\n"
-        "[ApplyPilot.PhaseA.WindowsFile]::ContractVersion\n"
+        f"$lease = Open-PhaseAValidatedDirectoryLease -Path {_ps_literal(tmp_path)}\n"
+        "$lease.Dispose()\n"
+        f"$handle = Open-PhaseAValidatedFile -Path {_ps_literal(probe)} "
+        f"-AuthorizedRoot {_ps_literal(tmp_path)} -AuthorizedBasename {_ps_literal(probe.name)} "
+        "-Access Read\n"
+        "try {\n"
+        "  $identity = Get-PhaseAFileIdentity -Handle $handle\n"
+        "  $material = Get-PhaseAFileIdentityMaterial -Handle $handle\n"
+        "  Assert-PhaseAFileIdentity -Handle $handle -Expected $identity\n"
+        "  [pscustomobject]@{\n"
+        "    ContractVersion = [ApplyPilot.PhaseA.WindowsFile]::ContractVersion\n"
+        "    ExportCount = (Get-Module PhaseAWindowsFile).ExportedCommands.Count\n"
+        "    FileIdLength = $material.FileId.Length\n"
+        "    FinalPath = $identity.FinalPath\n"
+        "  } | ConvertTo-Json -Compress\n"
+        "} finally { $handle.Dispose() }\n"
     )
-    assert compatible.stdout.strip()
+    reloaded = json.loads(compatible.stdout)
+    assert reloaded == {
+        "ContractVersion": "3",
+        "ExportCount": 9,
+        "FileIdLength": 16,
+        "FinalPath": str(probe),
+    }
 
 
 def test_existing_stage_open_authorizes_only_explicit_publish_basename(tmp_path: Path):

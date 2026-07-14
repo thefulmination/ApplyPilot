@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 
 REPARSE_MUTATOR_TYPE = r"""
 using System;
+using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -33,6 +34,12 @@ namespace ApplyPilot.PhaseA.Tests
 {
     public static class ReparseMutator
     {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInformation
+        {
+            [MarshalAs(UnmanagedType.U1)] public bool DeleteFile;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateFileW(string path, uint access, uint share,
             IntPtr security, uint disposition, uint flags, IntPtr template);
@@ -45,6 +52,21 @@ namespace ApplyPilot.PhaseA.Tests
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(IntPtr handle, int informationClass,
+            ref FileDispositionInformation information, uint size);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetSecurityDescriptorDacl(IntPtr descriptor,
+            [MarshalAs(UnmanagedType.Bool)] out bool present, out IntPtr dacl,
+            [MarshalAs(UnmanagedType.Bool)] out bool defaulted);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint SetNamedSecurityInfoW(string path, int objectType,
+            uint securityInfo, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
 
         private static void Put(byte[] buffer, int offset, byte[] value)
         {
@@ -79,6 +101,40 @@ namespace ApplyPilot.PhaseA.Tests
                 return 0;
             }
             finally { CloseHandle(handle); }
+        }
+
+        public static void MarkDirectoryDeletePending(string path)
+        {
+            IntPtr handle = CreateFileW(Path.GetFullPath(path), 0x00010000, 5,
+                IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+            if (handle == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            try
+            {
+                var information = new FileDispositionInformation { DeleteFile = true };
+                if (!SetFileInformationByHandle(handle, 4, ref information,
+                    (uint)Marshal.SizeOf<FileDispositionInformation>()))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            finally { CloseHandle(handle); }
+        }
+
+        public static void SetPathDacl(string path, byte[] securityDescriptor)
+        {
+            GCHandle pinned = GCHandle.Alloc(securityDescriptor, GCHandleType.Pinned);
+            try
+            {
+                bool present, defaulted;
+                IntPtr dacl;
+                if (!GetSecurityDescriptorDacl(pinned.AddrOfPinnedObject(), out present,
+                    out dacl, out defaulted))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (!present || dacl == IntPtr.Zero)
+                    throw new InvalidOperationException("Test descriptor has no DACL.");
+                uint error = SetNamedSecurityInfoW(Path.GetFullPath(path), 1,
+                    0x80000004, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+                if (error != 0) throw new Win32Exception((int)error);
+            }
+            finally { pinned.Free(); }
         }
     }
 }
@@ -170,6 +226,60 @@ def _protect(path: Path, sid: str | None = None) -> None:
     )
 
 
+def _production_writer_failure_probe(
+    temp_root: Path,
+    failure_point: str,
+    *,
+    cleanup_fails: bool = False,
+) -> tuple[Path, dict[str, object]]:
+    root = temp_root / f"writer-{failure_point}"
+    root.mkdir()
+    _protect(root)
+    stage = root / f".{failure_point}.receipt-stage"
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;"
+        "& $m {param($stage,$root,$sid,$point,$cleanupFails)"
+        "$state=[pscustomobject]@{Point=$point;CleanupFails=$cleanupFails;DeleteCalls=0};"
+        "$streamCommand={param($Handle)"
+        "$inner=$Handle.OpenWriteStream();"
+        "$wrapper=[pscustomobject]@{Inner=$inner;Point=$state.Point};"
+        "$wrapper|Add-Member ScriptMethod Write {param($data)"
+        "if($this.Point -ceq 'write'){throw [IO.IOException]::new('injected write failure')}"
+        "$this.Inner.Write([byte[]]$data)};"
+        "$wrapper|Add-Member ScriptMethod Flush {param($toDisk)"
+        "if($this.Point -ceq 'flush'){throw [IO.IOException]::new('injected flush failure')}"
+        "$this.Inner.Flush([bool]$toDisk)};"
+        "$wrapper|Add-Member ScriptMethod Dispose {"
+        "$this.Inner.Dispose();if($this.Point -ceq 'close'){"
+        "throw [IO.IOException]::new('injected close failure')}};"
+        "return $wrapper}.GetNewClosure();"
+        "$aclCommand={param($Handle,$OperatorSid)throw 'injected acl failure'}.GetNewClosure();"
+        "$readCommand={param($Handle,$Path)throw 'injected validation failure'}.GetNewClosure();"
+        "$deleteCommand={param($Handle)"
+        "$state.DeleteCalls++;if($state.CleanupFails){"
+        "throw 'injected cleanup failure'}"
+        "[ApplyPilot.PhaseA.WindowsFile]::SetDeletionDisposition($Handle)}.GetNewClosure();"
+        "$writerArgs=@{OpenWriteStreamCommand=$streamCommand;DeleteFileCommand=$deleteCommand};"
+        "if($state.Point -ceq 'acl'){$writerArgs.AssertFileAclCommand=$aclCommand};"
+        "if($state.Point -ceq 'validation'){$writerArgs.ReadHeldFileCommand=$readCommand};"
+        "$bytes=[Text.Encoding]::UTF8.GetBytes('production-stage');$caught=$null;"
+        "try{Write-PhaseACreateNew $stage $bytes $sid @writerArgs;"
+        "$caught='missed'}"
+        "catch{$caught=$_.Exception;};"
+        "$messages=@();if($caught -is [AggregateException]){"
+        "$messages=@($caught.Flatten().InnerExceptions|ForEach-Object Message)}"
+        "elseif($caught -is [Exception]){$messages=@($caught.Message)}"
+        "elseif($caught){$messages=@([string]$caught)};"
+        "[pscustomobject]@{Type=if($caught){$caught.GetType().FullName}else{'none'};"
+        "Message=if($caught -is [Exception]){$caught.Message}else{[string]$caught};Messages=$messages;"
+        "DeleteCalls=$state.DeleteCalls;Exists=(Test-Path -LiteralPath $stage)}"
+        "|ConvertTo-Json -Depth 6 -Compress} "
+        f"{_ps(stage)} {_ps(root)} {_ps(_current_sid())} {_ps(failure_point)} "
+        + ("$true" if cleanup_fails else "$false")
+    )
+    return stage, json.loads(_module(body).stdout)
+
+
 def _anchor_fixture(root: Path) -> dict[str, Path | str]:
     signing_private, signing_spki, signing_hash = _new_keypair(root, "operator-signing")
     recovery_private, recovery_spki, recovery_hash = _new_keypair(root, "recovery-encryption")
@@ -237,6 +347,108 @@ def test_review_corrections_are_structural_contracts():
     assert "DestinationDirectory" not in "\n".join(
         line for line in module.splitlines() if "Install-PhaseASignedReceipt" in line or "param(" in line
     )
+
+
+def test_production_receipt_staging_uses_only_validated_handle_primitives():
+    module = MODULE.read_text(encoding="utf-8")
+    writer = module.split("function Write-PhaseACreateNew", 1)[1].split(
+        "function Open-PhaseAExpectedProtectedFile", 1
+    )[0]
+    installer = module.split("function Install-PhaseASignedReceipt", 1)[1].split(
+        "function Get-PhaseAReceiptInventory", 1
+    )[0]
+
+    assert "New-PhaseAValidatedFile" in writer
+    assert "Open-PhaseAValidatedFileWriteStream" in writer
+    assert "Set-PhaseAFileDeletionDisposition" in writer
+    assert "Assert-PhaseAProtectedFileHandleAcl" in writer
+    assert "Set-PhaseAProtectedAcl" not in writer
+    assert "[IO.FileStream]::new" not in writer
+    assert "-AuthorizedBasenamePattern" not in writer + installer
+    assert "-AuthorizedRenameBasename" in installer
+    assert "Rename-PhaseAFileNoReplace" in installer
+    assert "[ApplyPilot.PhaseA.EvidenceNative]::RenameFileNoReplace" not in installer
+
+
+def test_production_stage_writer_creates_protected_file_and_writes_via_duplicate(
+    tmp_path: Path,
+):
+    root = tmp_path / "writer"
+    root.mkdir()
+    _protect(root)
+    stage = root / f".{'a' * 64}.receipt-stage"
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;"
+        "& $m {param($stage,$root,$sid)"
+        "$calls=[pscustomobject]@{New=0;Stream=0;DescriptorExact=$false};"
+        "$expected=Get-PhaseAProtectedSecurityDescriptorBytes $sid -File;"
+        "$newCommand={param($arguments)"
+        "$calls.New++;"
+        "$calls.DescriptorExact="
+        "[Security.Cryptography.CryptographicOperations]::FixedTimeEquals("
+        "[byte[]]$arguments.SecurityDescriptor,[byte[]]$expected);"
+        "[ApplyPilot.PhaseA.WindowsFile]::NewValidatedFile("
+        "[string]$arguments.Path,[string]$arguments.Access,[string]$arguments.AuthorizedRoot,"
+        "[string]$arguments.AuthorizedBasename,$null,[byte[]]$arguments.SecurityDescriptor)}"
+        ".GetNewClosure();"
+        "$streamCommand={param($Handle)"
+        "$calls.Stream++;"
+        "$Handle.OpenWriteStream()}.GetNewClosure();"
+        "$bytes=[Text.Encoding]::UTF8.GetBytes('production-stage');"
+        "Write-PhaseACreateNew $stage $bytes $sid -NewFileCommand $newCommand "
+        "-OpenWriteStreamCommand $streamCommand;"
+        "$held=Open-PhaseAValidatedFile $stage Read $root ([IO.Path]::GetFileName($stage));"
+        "try{Assert-PhaseAProtectedFileHandleAcl $held $sid;"
+        "$read=Read-PhaseABytesFromHeldHandle $held $stage;"
+        "[pscustomobject]@{New=$calls.New;Stream=$calls.Stream;"
+        "DescriptorExact=$calls.DescriptorExact;"
+        "Bytes=[Text.Encoding]::UTF8.GetString($read.Bytes)}|ConvertTo-Json -Compress}"
+        "finally{$held.Dispose()}} "
+        f"{_ps(stage)} {_ps(root)} {_ps(_current_sid())}"
+    )
+    result = json.loads(_module(body).stdout)
+    assert result == {
+        "New": 1,
+        "Stream": 1,
+        "DescriptorExact": True,
+        "Bytes": "production-stage",
+    }
+
+
+@pytest.mark.parametrize("failure_point", ["write", "flush", "close", "validation", "acl"])
+def test_production_stage_writer_failure_deletes_by_handle(
+    tmp_path: Path,
+    failure_point: str,
+):
+    stage, result = _production_writer_failure_probe(tmp_path, failure_point)
+    assert result["DeleteCalls"] == 1
+    assert result["Exists"] is False
+    assert f"injected {failure_point} failure" in " ".join(result["Messages"])
+    assert not stage.exists()
+
+
+def test_production_stage_writer_cleanup_failure_preserves_both_errors_and_residue(
+    tmp_path: Path,
+):
+    stage, result = _production_writer_failure_probe(
+        tmp_path,
+        "flush",
+        cleanup_fails=True,
+    )
+    assert result["Type"] == "System.AggregateException"
+    assert result["DeleteCalls"] == 1
+    assert result["Exists"] is True
+    assert "injected flush failure" in " ".join(result["Messages"])
+    assert "injected cleanup failure" in " ".join(result["Messages"])
+
+    retry = _module(
+        "$m=Get-Module PhaseAEvidenceStore;"
+        f"& $m {{param($p,$s)try{{Write-PhaseACreateNew $p "
+        "([Text.Encoding]::UTF8.GetBytes('retry')) $s;'missed'}catch{'rejected'}} "
+        f"{_ps(stage)} {_ps(_current_sid())}"
+    )
+    assert retry.stdout.strip() == "rejected"
+    assert stage.is_file()
 
 
 def test_production_entrypoint_has_no_root_override():
@@ -772,6 +984,75 @@ def test_directory_reparse_race_cannot_be_accepted(tmp_path: Path):
     }
 
 
+def test_directory_acl_drift_after_initial_read_is_rejected(tmp_path: Path):
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    _protect(protected)
+    sid = _current_sid()
+    body = (
+        "Add-Type -TypeDefinition @'\n"
+        + REPARSE_MUTATOR_TYPE
+        + "\n'@\n"
+        + "$m=Get-Module PhaseAEvidenceStore;"
+        "$mutated=[byte[]](& $m {param($s)$acl=New-PhaseAProtectedSecurity $s;"
+        "$inheritance=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor "
+        "[Security.AccessControl.InheritanceFlags]::ObjectInherit;"
+        "$rule=[Security.AccessControl.FileSystemAccessRule]::new("
+        "[Security.Principal.SecurityIdentifier]::new('S-1-1-0'),"
+        "[Security.AccessControl.FileSystemRights]::FullControl,$inheritance,"
+        "[Security.AccessControl.PropagationFlags]::None,"
+        "[Security.AccessControl.AccessControlType]::Allow);"
+        "$null=$acl.AddAccessRule($rule);return ,$acl.GetSecurityDescriptorBinaryForm()} "
+        + _ps(sid)
+        + ");"
+        "$state=[pscustomobject]@{Mutated=$false};"
+        "$hook={param($p,$h)[ApplyPilot.PhaseA.Tests.ReparseMutator]::SetPathDacl($p,$mutated);"
+        "$state.Mutated=$true}.GetNewClosure();"
+        "$accepted=$true;$errorMessage=$null;"
+        "try{& $m {param($p,$s,$h)Assert-PhaseAProtectedAcl -Path $p -OperatorSid $s "
+        "-BeforeFinalObjectRevalidation $h -DefinitionImport} "
+        f"{_ps(protected)} {_ps(sid)} $hook}}catch{{$accepted=$false;$errorMessage=$_.Exception.Message}};"
+        f"$acl=Get-Acl -LiteralPath {_ps(protected)};"
+        "$everyoneCount=@($acl.GetAccessRules($true,$true,"
+        "[Security.Principal.SecurityIdentifier])|Where-Object{"
+        "$_.IdentityReference.Value -ceq 'S-1-1-0'}).Count;"
+        "[pscustomobject]@{Accepted=$accepted;Mutated=$state.Mutated;Error=$errorMessage;"
+        "EveryoneAceCount=$everyoneCount}|ConvertTo-Json -Compress"
+    )
+    result = json.loads(_module(body).stdout)
+    assert result["Accepted"] is False
+    assert result["Mutated"] is True
+    assert result["EveryoneAceCount"] == 1
+    assert "DACL" in result["Error"]
+
+
+def test_directory_delete_pending_before_final_acceptance_is_rejected(tmp_path: Path):
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    _protect(protected)
+    sid = _current_sid()
+    body = (
+        "Add-Type -TypeDefinition @'\n"
+        + REPARSE_MUTATOR_TYPE
+        + "\n'@\n"
+        + "$state=[pscustomobject]@{Marked=$false};"
+        "$hook={param($p,$h)[ApplyPilot.PhaseA.Tests.ReparseMutator]::"
+        "MarkDirectoryDeletePending($p);$state.Marked=$true}.GetNewClosure();"
+        "$accepted=$true;$m=Get-Module PhaseAEvidenceStore;"
+        "try{& $m {param($p,$s,$h)Assert-PhaseAProtectedAcl -Path $p -OperatorSid $s "
+        "-BeforeFinalObjectRevalidation $h -DefinitionImport} "
+        f"{_ps(protected)} {_ps(sid)} $hook}}catch{{$accepted=$false}};"
+        f"[pscustomobject]@{{Accepted=$accepted;Marked=$state.Marked;"
+        f"Exists=(Test-Path -LiteralPath {_ps(protected)})}}|ConvertTo-Json -Compress"
+    )
+    result = json.loads(_module(body).stdout)
+    assert result == {
+        "Accepted": False,
+        "Marked": True,
+        "Exists": False,
+    }
+
+
 def test_directory_acl_validation_preserves_delete_share_and_revalidates_handle(tmp_path: Path):
     protected = tmp_path / "protected"
     protected.mkdir()
@@ -1063,7 +1344,8 @@ def test_cleanup_requires_post_mutation_completion_then_resumes(tmp_path: Path):
     ).stdout.strip())
     second_signature = second_authorization.with_suffix(".sig")
     second_signature.write_bytes(_sign(private, second_authorization.read_bytes()))
-    _protect(second_authorization); _protect(second_signature)
+    _protect(second_authorization)
+    _protect(second_signature)
     second_common = common.replace(str(stage), str(second_stage)).replace(
         str(authorization), str(second_authorization)
     ).replace(str(authorization_sig), str(second_signature))
@@ -1227,7 +1509,7 @@ def test_adjudication_install_rejects_changed_authenticated_candidate_set(tmp_pa
         _protect(path)
         return path
 
-    first = add_bundle(preimage_a)
+    add_bundle(preimage_a)
     second = add_bundle(preimage_b) if mutation == "remove" else None
     authenticator = (
         "$auth={param($c)$candidate=if($c.PreimageSha256 -ceq '" + preimage_a + "'){'"
@@ -1291,7 +1573,8 @@ def test_adjudication_install_revalidates_after_publication_race(tmp_path: Path)
     ).stdout.strip())
     signature = receipt.with_suffix(".sig")
     signature.write_bytes(_sign(private, receipt.read_bytes()))
-    _protect(receipt); _protect(signature)
+    _protect(receipt)
+    _protect(signature)
     expected = receipt.read_text(encoding="utf-8").replace("'", "''")
     added = store / "bundles" / f"{source}-{'e'*64}.apeb"
     race = (
@@ -1312,9 +1595,11 @@ def test_empty_bundle_store_is_enumerable_but_cannot_create_adjudication(tmp_pat
     _, public, key_hash = _new_keypair(tmp_path, "empty-adjudication")
     sid = _current_sid()
     store = tmp_path / "store"
-    store.mkdir(); _protect(store)
+    store.mkdir()
+    _protect(store)
     for leaf in ("bundles", "adjudications", "operations"):
-        (store / leaf).mkdir(); _protect(store / leaf)
+        (store / leaf).mkdir()
+        _protect(store / leaf)
     count = _module(
         f"@(Get-PhaseAAuthenticatedBundleCandidates -StoreRoot {_ps(store)} "
         f"-CanonicalOperatorSid {_ps(sid)} -SourceIdentityDigest {_ps('a'*64)}).Count"

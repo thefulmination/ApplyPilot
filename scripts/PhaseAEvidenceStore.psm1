@@ -223,6 +223,14 @@ namespace ApplyPilot.PhaseA
                 throw new InvalidOperationException("Manifest objects cannot be reparse points.");
             bool actualDirectory = (tag.FileAttributes & FileAttributeDirectory) != 0;
             if (actualDirectory != directory) throw new InvalidOperationException("Manifest object kind changed.");
+            FileStandardInformation standard;
+            if (!GetFileStandardInformationByHandleEx(handle, 1, out standard,
+                (uint)Marshal.SizeOf<FileStandardInformation>()))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (standard.DeletePending)
+                throw new InvalidOperationException("Manifest objects cannot be delete-pending.");
+            if (standard.Directory != directory)
+                throw new InvalidOperationException("Manifest object standard kind changed.");
             string final = NormalizeFinalPath(GetFinalPathName(handle));
             if (!String.Equals(final, full, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Manifest object final path changed.");
@@ -688,7 +696,7 @@ function Read-PhaseABytesFromHeldHandle($Handle, [string]$Path) {
     $Handle.FileHandle.DangerousGetHandle(), $false)
   $stream = [IO.FileStream]::new($borrowed, [IO.FileAccess]::Read)
   $buffer = [IO.MemoryStream]::new()
-  try { $stream.CopyTo($buffer); $bytes = $buffer.ToArray() }
+  try { $stream.Position = 0; $stream.CopyTo($buffer); $bytes = $buffer.ToArray() }
   finally { $buffer.Dispose(); $stream.Dispose(); $borrowed.Dispose() }
   Assert-PhaseAFileIdentity -Handle $Handle -Expected $identity
   return [pscustomobject]@{ Bytes=$bytes; Identity=$identity; Path=$Path }
@@ -896,6 +904,41 @@ function Get-PhaseASecurityDescriptorHash {
   return Get-PhaseASha256 $bytes
 }
 
+function Assert-PhaseAProtectedSecurityDescriptorBytes(
+  [byte[]]$Bytes,
+  [string]$OperatorSid,
+  [switch]$File
+) {
+  $actual = [Security.AccessControl.RawSecurityDescriptor]::new($Bytes, 0)
+  $expectedBytes = Get-PhaseAProtectedSecurityDescriptorBytes $OperatorSid -File:$File
+  $expected = [Security.AccessControl.RawSecurityDescriptor]::new($expectedBytes, 0)
+  if ($null -eq $actual.Owner -or $null -eq $actual.Group -or
+      $null -eq $actual.DiscretionaryAcl) {
+    throw 'Protected security descriptor is incomplete.'
+  }
+  $autoInheritedControl = $expected.ControlFlags -bor
+    [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited
+  $controlIsExact = $actual.ControlFlags -eq $autoInheritedControl -or
+    (-not $File -and $actual.ControlFlags -eq $expected.ControlFlags)
+  if (-not $controlIsExact) {
+    throw 'Protected security descriptor control flags are not exact.'
+  }
+  if ($actual.Owner.Value -cne $expected.Owner.Value) {
+    throw 'Unexpected evidence owner.'
+  }
+  if ($actual.Group.Value -cne $expected.Group.Value) {
+    throw 'Unexpected evidence primary group.'
+  }
+  [byte[]]$actualDacl = [byte[]]::new($actual.DiscretionaryAcl.BinaryLength)
+  [byte[]]$expectedDacl = [byte[]]::new($expected.DiscretionaryAcl.BinaryLength)
+  $actual.DiscretionaryAcl.GetBinaryForm($actualDacl, 0)
+  $expected.DiscretionaryAcl.GetBinaryForm($expectedDacl, 0)
+  if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+      $actualDacl, $expectedDacl)) {
+    throw 'Evidence DACL is not exact.'
+  }
+}
+
 function Assert-PhaseAProtectedAcl(
   [string]$Path,
   [string]$OperatorSid,
@@ -909,37 +952,16 @@ function Assert-PhaseAProtectedAcl(
   $handle = [ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($Path, -not $File)
   try {
     $bytes = [ApplyPilot.PhaseA.EvidenceNative]::GetFileSecurityDescriptor($handle)
-    $acl = if ($File) {
-      [Security.AccessControl.FileSecurity]::new()
-    } else {
-      [Security.AccessControl.DirectorySecurity]::new()
-    }
-    $acl.SetSecurityDescriptorBinaryForm($bytes)
-    if (-not $acl.AreAccessRulesProtected) { throw 'DACL inheritance must be disabled.' }
-    $actualOwner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($actualOwner -cne $OperatorSid) {
-      throw 'Unexpected evidence owner.'
-    }
-    $trusted = @($OperatorSid, 'S-1-5-18', 'S-1-5-32-544')
-    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    if ($rules.Count -ne 3) { throw 'Evidence DACL must contain exactly three ACEs.' }
-    $expectedInheritance = if ($File) { [Security.AccessControl.InheritanceFlags]::None } else {
-      [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-    }
-    foreach ($sid in $trusted) {
-      $matching = @($rules | Where-Object { $_.IdentityReference.Value -ceq $sid })
-      if ($matching.Count -ne 1) { throw 'Evidence DACL must contain one ACE per trusted principal.' }
-      $rule = $matching[0]
-      if ($rule.IsInherited -or
-          $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
-          $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or
-          $rule.InheritanceFlags -ne $expectedInheritance -or
-          $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
-        throw 'Evidence DACL ACE rights, inheritance, or propagation are not exact.'
-      }
-    }
+    Assert-PhaseAProtectedSecurityDescriptorBytes $bytes $OperatorSid -File:$File
     if ($BeforeFinalObjectRevalidation) {
       & $BeforeFinalObjectRevalidation $Path $handle
+    }
+    [ApplyPilot.PhaseA.EvidenceNative]::AssertManifestObject($handle, $Path, -not $File)
+    $finalBytes = [ApplyPilot.PhaseA.EvidenceNative]::GetFileSecurityDescriptor($handle)
+    Assert-PhaseAProtectedSecurityDescriptorBytes $finalBytes $OperatorSid -File:$File
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+        $bytes, $finalBytes)) {
+      throw 'Protected security descriptor drifted during same-handle validation.'
     }
     [ApplyPilot.PhaseA.EvidenceNative]::AssertManifestObject($handle, $Path, -not $File)
   } finally { $handle.Dispose() }
@@ -947,34 +969,7 @@ function Assert-PhaseAProtectedAcl(
 
 function Assert-PhaseAProtectedFileHandleAcl($Handle, [string]$OperatorSid) {
   $bytes = [ApplyPilot.PhaseA.EvidenceNative]::GetFileSecurityDescriptor($Handle.FileHandle)
-  $raw = [Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0)
-  if ($null -eq $raw.Owner -or $null -eq $raw.Group -or $null -eq $raw.DiscretionaryAcl) {
-    throw 'Protected receipt file security descriptor is incomplete.'
-  }
-  $expectedControl = [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent -bor
-    [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor
-    [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected -bor
-    [Security.AccessControl.ControlFlags]::SelfRelative
-  if ($raw.ControlFlags -ne $expectedControl) {
-    throw 'Protected receipt file security descriptor control flags are not exact.'
-  }
-  if ($raw.Owner.Value -cne $OperatorSid) { throw 'Unexpected protected receipt file owner.' }
-  if ($raw.Group.Value -cne $OperatorSid) { throw 'Unexpected protected receipt file primary group.' }
-  $trusted = @($OperatorSid, 'S-1-5-18', 'S-1-5-32-544')
-  $aces = @($raw.DiscretionaryAcl | ForEach-Object { $_ })
-  if ($aces.Count -ne 3) { throw 'Protected receipt file DACL must contain exactly three ACEs.' }
-  foreach ($sid in $trusted) {
-    $matching = @($aces | Where-Object {
-      $_ -is [Security.AccessControl.CommonAce] -and $_.SecurityIdentifier.Value -ceq $sid
-    })
-    if ($matching.Count -ne 1) { throw 'Protected receipt file DACL must contain one ACE per trusted principal.' }
-    $ace = $matching[0]
-    if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed -or
-        $ace.AccessMask -ne [int][Security.AccessControl.FileSystemRights]::FullControl -or
-        $ace.AceFlags -ne [Security.AccessControl.AceFlags]::None) {
-      throw 'Protected receipt file ACE rights and flags are not exact.'
-    }
-  }
+  Assert-PhaseAProtectedSecurityDescriptorBytes $bytes $OperatorSid -File
 }
 
 function Open-PhaseAProtectedReceiptPair {
@@ -1325,15 +1320,85 @@ function Test-PhaseASignedReceipt {
   return Test-PhaseASignedReceiptCore @args
 }
 
-function Write-PhaseACreateNew([string]$Path, [byte[]]$Bytes, [string]$OperatorSid) {
-  $stream = [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-  try { $stream.Write($Bytes); $stream.Flush($true) } finally { $stream.Dispose() }
-  Set-PhaseAProtectedAcl -Path $Path -OperatorSid $OperatorSid -File
+function Write-PhaseACreateNew {
+  param(
+    [string]$Path,
+    [byte[]]$Bytes,
+    [string]$OperatorSid,
+    [scriptblock]$NewFileCommand,
+    [scriptblock]$OpenWriteStreamCommand,
+    [scriptblock]$AssertFileAclCommand,
+    [scriptblock]$ReadHeldFileCommand,
+    [scriptblock]$DeleteFileCommand
+  )
+  $handle = $null
+  $stream = $null
+  try {
+    $descriptor = Get-PhaseAProtectedSecurityDescriptorBytes $OperatorSid -File
+    $createArgs = @{Path=$Path;AuthorizedRoot=Split-Path -Parent $Path;
+      AuthorizedBasename=[IO.Path]::GetFileName($Path);SecurityDescriptor=$descriptor;
+      Access='ReadWriteDelete'}
+    $handle = if($NewFileCommand){& $NewFileCommand $createArgs}else{
+      New-PhaseAValidatedFile @createArgs
+    }
+    $writeErrors = [Collections.Generic.List[Exception]]::new()
+    try {
+      $stream = if($OpenWriteStreamCommand){& $OpenWriteStreamCommand $handle}else{
+        Open-PhaseAValidatedFileWriteStream -Handle $handle
+      }
+      $stream.Write($Bytes)
+      $stream.Flush($true)
+    } catch {
+      $writeErrors.Add($_.Exception)
+    } finally {
+      if ($stream) {
+        try { $stream.Dispose() } catch { $writeErrors.Add($_.Exception) }
+        $stream = $null
+      }
+    }
+    if ($writeErrors.Count -eq 1) { throw $writeErrors[0] }
+    if ($writeErrors.Count -gt 1) {
+      throw [AggregateException]::new(
+        'Protected staging write and stream close both failed.',
+        [Exception[]]$writeErrors.ToArray())
+    }
+    if($AssertFileAclCommand){& $AssertFileAclCommand $handle $OperatorSid}else{
+      Assert-PhaseAProtectedFileHandleAcl $handle $OperatorSid
+    }
+    $read = if($ReadHeldFileCommand){& $ReadHeldFileCommand $handle $Path}else{
+      Read-PhaseABytesFromHeldHandle $handle $Path
+    }
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+        $read.Bytes, $Bytes)) {
+      throw 'Protected staging file bytes do not match the requested content.'
+    }
+  } catch {
+    $primary = $_.Exception
+    if ($handle) {
+      try {
+        if($DeleteFileCommand){& $DeleteFileCommand $handle}else{
+          Set-PhaseAFileDeletionDisposition -Handle $handle
+        }
+      } catch {
+        throw [AggregateException]::new(
+          'Protected staging operation failed and delete-by-handle cleanup failed; residue was retained.',
+          [Exception[]]@($primary, $_.Exception))
+      }
+    }
+    throw $primary
+  } finally {
+    if ($stream) { $stream.Dispose() }
+    if ($handle) { $handle.Dispose() }
+  }
 }
 
 function Open-PhaseAExpectedProtectedFile {
-  param([string]$Path,[string]$Root,[string]$OwnerSid,[byte[]]$ExpectedBytes,[string]$Access='Read')
-  $handle=Open-PhaseAValidatedFile $Path $Access $Root ([IO.Path]::GetFileName($Path))
+  param([string]$Path,[string]$Root,[string]$OwnerSid,[byte[]]$ExpectedBytes,
+    [string]$Access='Read',[string]$AuthorizedRenameBasename)
+  $openArgs=@{Path=$Path;Access=$Access;AuthorizedRoot=$Root;
+    AuthorizedBasename=[IO.Path]::GetFileName($Path)}
+  if($AuthorizedRenameBasename){$openArgs.AuthorizedRenameBasename=$AuthorizedRenameBasename}
+  $handle=Open-PhaseAValidatedFile @openArgs
   try{
     Assert-PhaseAProtectedFileHandleAcl $handle $OwnerSid
     $read=Read-PhaseABytesFromHeldHandle $handle $Path
@@ -1394,15 +1459,14 @@ function Install-PhaseASignedReceipt {
         if(-not (Test-Path -LiteralPath $part.Stage)){Write-PhaseACreateNew $part.Stage $part.Bytes $operator}
         $stage=$null
         try{
-          $stage=Open-PhaseAExpectedProtectedFile $part.Stage $destination $operator $part.Bytes ReadWriteDelete
+          $stage=Open-PhaseAExpectedProtectedFile -Path $part.Stage -Root $destination `
+            -OwnerSid $operator -ExpectedBytes $part.Bytes -Access ReadWriteDelete `
+            -AuthorizedRenameBasename ([IO.Path]::GetFileName($part.Final))
           if($part.Kind -eq 'receipt' -and $CrashAfter -eq 'after-receipt-stage'){throw 'Injected crash after receipt stage.'}
           if($part.Kind -eq 'signature' -and $CrashAfter -eq 'after-signature-stage'){throw 'Injected crash after signature stage.'}
-          $beforeIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stage.Handle.FileHandle)
-          [ApplyPilot.PhaseA.EvidenceNative]::RenameFileNoReplace($stage.Handle.FileHandle,$part.Final)
-          $afterIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stage.Handle.FileHandle)
-          if($afterIdentity.VolumeSerialNumber -ne $beforeIdentity.VolumeSerialNumber -or $afterIdentity.FileId -cne $beforeIdentity.FileId){throw 'Receipt publication identity changed during rename.'}
+          Rename-PhaseAFileNoReplace -Handle $stage.Handle -Destination $part.Final
+          $afterIdentity=Get-PhaseAFileIdentity -Handle $stage.Handle
           $stage.Read.Path=$part.Final;$stage.Read.Identity=$afterIdentity
-          $stage|Add-Member -NotePropertyName NativeIdentity -NotePropertyValue $true
           $published=$stage;$stage=$null
         }finally{if($stage){$stage.Handle.Dispose()}}
       }
@@ -1417,9 +1481,7 @@ function Install-PhaseASignedReceipt {
     if($CrashAfter -eq 'before-pair-revalidation'){throw 'Injected crash before pair revalidation.'}
     if($BeforeFinalPairRevalidation){& $BeforeFinalPairRevalidation ([pscustomobject]@{ReceiptPath=$receiptFinalPath;SignaturePath=$signatureFinalPath})}
     foreach($published in @($finalReceipt,$finalSignature)){
-      if($published.PSObject.Properties.Name -contains 'NativeIdentity'){
-        [ApplyPilot.PhaseA.EvidenceNative]::AssertRawFileIdentity($published.Handle.FileHandle,$published.Read.Identity)
-      }else{Assert-PhaseAFileIdentity $published.Handle $published.Read.Identity}
+      Assert-PhaseAFileIdentity $published.Handle $published.Read.Identity
     }
     Assert-PhaseAProtectedFileHandleAcl $finalReceipt.Handle $operator
     Assert-PhaseAProtectedFileHandleAcl $finalSignature.Handle $operator
