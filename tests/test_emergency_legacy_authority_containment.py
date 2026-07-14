@@ -956,39 +956,77 @@ def test_new_partial_evidence_is_removed_through_held_handle(tmp_path, failure_s
     assert payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
 
 
-def test_failed_new_evidence_cleanup_is_preserved_and_permanently_immutable(tmp_path):
+def test_failed_evidence_publication_deletes_partial_and_allows_clean_retry(tmp_path):
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()
     wrapper = wrappers / "apply-cycle-task.ps1"
     preimage = b"Write-Output 'cleanup failure preimage'\n"
     wrapper.write_bytes(preimage)
-    overrides = "\n".join(
-        [
-            "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
-            "  $Stream.Write($Content, 0, 9)",
-            "  throw 'partial evidence write'",
-            "}",
-            "function Remove-NewKnownEvidenceByHandle($Stream) { throw 'cleanup failed' }",
-        ]
-    )
+    overrides = "function Publish-NewKnownEvidenceByHandle($Stream) { throw 'publish failed' }"
 
     first_result, first_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
 
     assert first_result.returncode == 0, first_result.stderr
     assert any(item["action"] == "rewrite_wrapper" for item in first_payload["failures"])
     evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
-    assert len(evidence) == 1
-    corrupt = evidence[0].read_bytes()
-    assert corrupt == preimage[:9]
+    assert evidence == []
     assert wrapper.read_bytes() == preimage
 
     second_result, second_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
 
     assert second_result.returncode == 0, second_result.stderr
-    assert any(item["action"] == "rewrite_wrapper" for item in second_payload["failures"])
-    assert evidence[0].read_bytes() == corrupt
+    assert second_payload["failures"] == []
+    assert second_payload["unresolved"] == []
+    assert b"emergency containment" in wrapper.read_bytes().lower()
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+
+
+def test_process_termination_during_partial_evidence_write_leaves_no_final_artifact(
+    tmp_path,
+):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'crash-idempotent evidence'\n"
+    wrapper.write_bytes(preimage)
+    crash_harness = tmp_path / "crash-evidence-write.ps1"
+    crash_harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrappers)}'",
+                "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
+                "  $Stream.Write($Content, 0, 8)",
+                "  $Stream.Flush($true)",
+                "  Stop-Process -Id $PID -Force",
+                "}",
+                "Remove-EmbeddedWrapperDsns",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    crashed = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(crash_harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert crashed.returncode != 0
     assert wrapper.read_bytes() == preimage
-    assert second_payload["unresolved"][0]["conditions"] == ["exact_deny_stub_absent"]
+    assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == []
+
+    retry_result, retry_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert retry_result.returncode == 0, retry_result.stderr
+    assert retry_payload["failures"] == []
+    assert retry_payload["unresolved"] == []
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
 
 
 def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp_path):
@@ -1340,9 +1378,18 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         "python -c \"import runpy; runpy.run_module('applypilot.fleet.apply_worker_main')\"",
         'python -c "print(\'opaque but apparently benign\')"',
         "python -cpass",
+        "python",
+        "python.exe",
+        "py",
         "python -",
+        "pwsh",
+        "powershell.exe",
         "pwsh -",
         "powershell.exe -",
+        "pwsh -SSHServerMode",
+        "powershell.exe -sshs",
+        "cmd",
+        "cmd.exe /d",
         "pwsh -File -",
         "pwsh -Command -",
         "pwsh -Unknown benign -Command -",
@@ -2137,6 +2184,35 @@ def test_cmd_whole_payload_and_canonical_switch_invariants(command, expected):
     assert json.loads(result.stdout.strip())["classification"] == expected
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cmd /c cmd /c run-fleet-worker.cmd", "acquisition"),
+        ("cmd /c cmd.exe /d /c run-fleet-worker.cmd", "acquisition"),
+        ("cmd /c cmd /c run-fleet-^^worker.cmd", "ambiguous"),
+        ("cmd /c cmd /c cmd /c run-fleet-^^^^worker.cmd", "ambiguous"),
+        ("cmd /c cmd /c run-fleet-worker-report.cmd", "benign"),
+        ("cmd /c cmd /c run-fleet-^^worker-report.cmd", "benign"),
+        ("cmd /c cmd /c %TARGET%", "ambiguous"),
+        (
+            "cmd /c cmd /c cmd /c cmd /c cmd /c cmd /c run-fleet-worker-report.cmd",
+            "ambiguous",
+        ),
+    ],
+)
+def test_nested_cmd_interpreters_are_bounded_and_apply_one_caret_layer(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
 @pytest.mark.parametrize("command", ["python -c pass", "python -cpass", "python -c print(1)"])
 def test_python_code_execution_is_always_opaque_and_ambiguous(command):
     result = subprocess.run(
@@ -2154,14 +2230,23 @@ def test_python_code_execution_is_always_opaque_and_ambiguous(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "python",
+        "python.exe",
+        "py",
         "python -",
         "python -I -",
+        "pwsh",
+        "powershell.exe",
         "pwsh -",
         "powershell.exe -",
+        "pwsh -SSHServerMode",
+        "powershell.exe -sshs",
         "pwsh -File -",
         "pwsh -F -",
         "pwsh -Command -",
         "pwsh -C -",
+        "cmd",
+        "cmd.exe /d",
     ],
 )
 def test_interpreter_stdin_execution_modes_are_ambiguous(command):

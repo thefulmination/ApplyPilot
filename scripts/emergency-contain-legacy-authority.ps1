@@ -602,7 +602,7 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
     if (Test-IsAcquisitionPythonScript $token) { return 'acquisition' }
     return 'benign'
   }
-  return 'benign'
+  return 'ambiguous'
 }
 
 function Get-PowerShellOptionMetadata([string]$Token) {
@@ -617,6 +617,7 @@ function Get-PowerShellOptionMetadata([string]$Token) {
     [pscustomobject]@{ name = 'nologo'; minimum = 3; kind = 'switch'; aliases = @() },
     [pscustomobject]@{ name = 'noexit'; minimum = 3; kind = 'switch'; aliases = @() },
     [pscustomobject]@{ name = 'noninteractive'; minimum = 4; kind = 'switch'; aliases = @() },
+    [pscustomobject]@{ name = 'sshservermode'; minimum = 4; kind = 'opaque'; aliases = @() },
     [pscustomobject]@{ name = 'sta'; minimum = 1; kind = 'switch'; aliases = @() },
     [pscustomobject]@{ name = 'mta'; minimum = 1; kind = 'switch'; aliases = @() },
     [pscustomobject]@{ name = 'executionpolicy'; minimum = 2; kind = 'value'; aliases = @('ep', 'ex') },
@@ -670,6 +671,7 @@ function Get-LatePowerShellTerminalClassification([string[]]$Tokens, [int]$Start
         -Tokens $Tokens `
         -ValueIndex ($scanIndex + 1)
     }
+    if ($metadata.kind -eq 'opaque') { return 'ambiguous' }
     if ($metadata.kind -eq 'value') { $scanIndex++ }
   }
   return $null
@@ -687,6 +689,7 @@ function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
         -Tokens $Tokens `
         -ValueIndex ($index + 1)
     }
+    if ($null -ne $metadata -and $metadata.kind -eq 'opaque') { return 'ambiguous' }
     if ($null -ne $metadata -and $metadata.kind -eq 'switch') { continue }
     if ($null -ne $metadata -and $metadata.kind -eq 'value') {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
@@ -703,7 +706,7 @@ function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
     if (Test-IsAcquisitionWrapperToken $Tokens[$index]) { return 'acquisition' }
     return 'benign'
   }
-  return 'benign'
+  return 'ambiguous'
 }
 
 function Test-CmdTokensContainControlSyntax([string[]]$Tokens) {
@@ -713,7 +716,21 @@ function Test-CmdTokensContainControlSyntax([string[]]$Tokens) {
   return $false
 }
 
-function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
+function ConvertFrom-CmdCaretLayer([string]$Token) {
+  $result = [Text.StringBuilder]::new()
+  for ($index = 0; $index -lt $Token.Length; $index++) {
+    if ($Token[$index] -eq '^' -and $index + 1 -lt $Token.Length) {
+      $index++
+    }
+    [void]$result.Append($Token[$index])
+  }
+  return $result.ToString()
+}
+
+function Get-CmdPostModeClassification(
+  [string[]]$PayloadTokens,
+  [int]$Depth = 0
+) {
   $payload = @($PayloadTokens)
   if ($payload.Count -eq 0) { return 'benign' }
   $payloadText = $payload -join ' '
@@ -750,6 +767,14 @@ function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
     $candidate = $Matches.target.Trim()
   } else {
     $candidate = $current
+  }
+
+  if ((Get-CommandTokenStem $candidate) -eq 'cmd') {
+    if ($Depth -ge 4) { return 'ambiguous' }
+    $nestedTokens = @($payload[$index..($payload.Count - 1)] | ForEach-Object {
+      ConvertFrom-CmdCaretLayer $_
+    })
+    return Get-CmdAcquisitionClassification -Tokens $nestedTokens -Depth ($Depth + 1)
   }
 
   $trailingTokens = if ($index + 1 -lt $payload.Count) {
@@ -826,7 +851,7 @@ function Get-CmdUnfamiliarClassification([string[]]$Tokens) {
   return 'benign'
 }
 
-function Get-CmdAcquisitionClassification([string[]]$Tokens) {
+function Get-CmdAcquisitionClassification([string[]]$Tokens, [int]$Depth = 0) {
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
     $rawToken = $Tokens[$index]
     if (-not $rawToken.StartsWith('/')) {
@@ -840,11 +865,11 @@ function Get-CmdAcquisitionClassification([string[]]$Tokens) {
       if ($index + 1 -lt $Tokens.Count) {
         $payload += $Tokens[($index + 1)..($Tokens.Count - 1)]
       }
-      return Get-CmdPostModeClassification -PayloadTokens $payload
+      return Get-CmdPostModeClassification -PayloadTokens $payload -Depth $Depth
     }
     return Get-CmdUnfamiliarClassification $Tokens[$index..($Tokens.Count - 1)]
   }
-  return 'benign'
+  return 'ambiguous'
 }
 
 function Get-AcquisitionTokenClassification([string[]]$Tokens) {
@@ -1319,12 +1344,21 @@ namespace ApplyPilot
                 handle.Dispose();
                 throw new Win32Exception(error);
             }
+            try
+            {
+                SetDeleteDisposition(handle, true);
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
             return handle;
         }
 
-        public static void MarkDelete(SafeFileHandle handle)
+        public static void SetDeleteDisposition(SafeFileHandle handle, bool deleteFile)
         {
-            var information = new FileDispositionInfo { DeleteFile = true };
+            var information = new FileDispositionInfo { DeleteFile = deleteFile };
             uint size = (uint)Marshal.SizeOf<FileDispositionInfo>();
             if (!SetFileInformationByHandle(handle, 4, ref information, size))
             {
@@ -1346,7 +1380,7 @@ function Open-KnownEvidenceExclusive([string]$Path) {
       $handle = $null
       return [pscustomobject]@{ stream = $stream; created = $true }
     } catch {
-      try { [ApplyPilot.KnownEvidenceNativeApi]::MarkDelete($handle) } finally { $handle.Dispose() }
+      $handle.Dispose()
       throw
     }
   } catch [ComponentModel.Win32Exception] {
@@ -1363,9 +1397,9 @@ function Open-KnownEvidenceExclusive([string]$Path) {
   }
 }
 
-function Remove-NewKnownEvidenceByHandle($Stream) {
+function Publish-NewKnownEvidenceByHandle($Stream) {
   Initialize-KnownEvidenceNativeApi
-  [ApplyPilot.KnownEvidenceNativeApi]::MarkDelete($Stream.SafeFileHandle)
+  [ApplyPilot.KnownEvidenceNativeApi]::SetDeleteDisposition($Stream.SafeFileHandle, $false)
 }
 
 function Open-KnownExistingEvidenceExclusive([string]$Path) {
@@ -1808,19 +1842,10 @@ function Remove-EmbeddedWrapperDsns {
         $evidenceLease = Open-KnownEvidenceExclusive $evidencePath
         $evidenceStream = $evidenceLease.stream
         if ($evidenceLease.created) {
-          try {
-            Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
-            Flush-KnownEvidenceStream $evidenceStream
-            Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
-          } catch {
-            $initializationFailure = $_
-            try {
-              Remove-NewKnownEvidenceByHandle $evidenceStream
-            } catch {
-              throw 'wrapper evidence initialization and same-handle cleanup failed'
-            }
-            throw $initializationFailure
-          }
+          Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
+          Flush-KnownEvidenceStream $evidenceStream
+          Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
+          Publish-NewKnownEvidenceByHandle $evidenceStream
         } else {
           Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
         }
