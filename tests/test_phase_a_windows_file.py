@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,112 @@ def _run_ps(body: str, *, check: bool = True) -> subprocess.CompletedProcess[str
     return result
 
 
+def _start_ps(body: str) -> subprocess.Popen[str]:
+    assert PWSH is not None
+    encoded = base64.b64encode(body.encode("utf-16-le")).decode("ascii")
+    return subprocess.Popen(
+        [PWSH, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _protected_descriptor_script(variable: str = "$descriptor") -> str:
+    return (
+        "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+        "$raw = [Security.AccessControl.RawSecurityDescriptor]::new("
+        "\"O:${sid}G:${sid}D:P(A;;FA;;;${sid})\")\n"
+        f"[byte[]]{variable} = [byte[]]::new($raw.BinaryLength)\n"
+        f"$raw.GetBinaryForm({variable}, 0)\n"
+    )
+
+
+def _new_file_script(
+    path: Path,
+    root: Path,
+    *,
+    basename: str | None = None,
+    pattern: str | None = None,
+) -> str:
+    authorization = (
+        f"-AuthorizedBasename {_ps_literal(basename)}"
+        if basename is not None
+        else f"-AuthorizedBasenamePattern {_ps_literal(pattern or '')}"
+    )
+    return (
+        _protected_descriptor_script()
+        + f"$handle = New-PhaseAValidatedFile -Path {_ps_literal(path)} "
+        f"-AuthorizedRoot {_ps_literal(root)} {authorization} "
+        "-SecurityDescriptor $descriptor -Access ReadWriteDelete\n"
+    )
+
+
+def _probe_identity_material(path: Path) -> dict[str, object]:
+    from ctypes import wintypes
+
+    class FILE_ID_128(ctypes.Structure):
+        _fields_ = [("Identifier", ctypes.c_ubyte * 16)]
+
+    class FILE_ID_INFO(ctypes.Structure):
+        _fields_ = [
+            ("VolumeSerialNumber", ctypes.c_ulonglong),
+            ("FileId", FILE_ID_128),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_info = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    get_final_path.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(path),
+        0x80000000,
+        0x1 | 0x2 | 0x4,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    assert handle not in (None, wintypes.HANDLE(-1).value)
+    try:
+        info = FILE_ID_INFO()
+        assert get_info(
+            handle, 18, ctypes.byref(info), ctypes.sizeof(info)
+        )
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_final_path(handle, buffer, len(buffer), 0x1)
+        assert 0 < length < len(buffer)
+        return {
+            "Volume": int(info.VolumeSerialNumber),
+            "FileId": bytes(info.FileId.Identifier).hex().upper(),
+            "Path": buffer.value.replace("/", "\\"),
+        }
+    finally:
+        assert close_handle(handle)
+
+
 def _open_result(
     path: Path | str,
     root: Path,
@@ -91,12 +198,251 @@ def test_regular_file_identity_and_exported_surface(tmp_path: Path):
         [
             "Assert-PhaseAFileIdentity",
             "Get-PhaseAFileIdentity",
+            "Get-PhaseAFileIdentityMaterial",
+            "New-PhaseAValidatedFile",
             "Open-PhaseAValidatedDirectoryLease",
             "Open-PhaseAValidatedFile",
             "Rename-PhaseAFileNoReplace",
             "Set-PhaseAFileDeletionDisposition",
         ]
     )
+
+
+def test_new_file_uses_protected_descriptor_at_creation_and_create_new(tmp_path: Path):
+    staged = tmp_path / "receipt.stage"
+    result = _run_ps(
+        _new_file_script(staged, tmp_path, basename=staged.name)
+        + "try {\n"
+        f"  $acl = Get-Acl -LiteralPath {_ps_literal(staged)}\n"
+        "  $duplicateRejected = $false\n"
+        "  try {\n"
+        f"    $duplicate = New-PhaseAValidatedFile -Path {_ps_literal(staged)} "
+        f"-AuthorizedRoot {_ps_literal(tmp_path)} -AuthorizedBasename {_ps_literal(staged.name)} "
+        "-SecurityDescriptor $descriptor -Access ReadWriteDelete\n"
+        "  } catch { $duplicateRejected = $true }\n"
+        "  [pscustomobject]@{ Protected = $acl.AreAccessRulesProtected; "
+        "Owner = $acl.Owner; DuplicateRejected = $duplicateRejected } | "
+        "ConvertTo-Json -Compress\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    payload = json.loads(result.stdout)
+    assert payload["Protected"] is True
+    assert payload["DuplicateRejected"] is True
+    assert staged.read_bytes() == b""
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "CreateNew" in source
+    assert "Set-Acl" not in source
+
+
+def test_second_process_observes_only_protected_acl_while_creation_handle_is_held(
+    tmp_path: Path,
+):
+    staged = tmp_path / "watched.stage"
+    marker = tmp_path / "created.marker"
+    observed = tmp_path / "observed.json"
+    watcher = _start_ps(
+        "$ErrorActionPreference = 'SilentlyContinue'\n"
+        f"$marker = {_ps_literal(marker)}\n"
+        f"$path = {_ps_literal(staged)}\n"
+        f"$observed = {_ps_literal(observed)}\n"
+        "$deadline = [DateTime]::UtcNow.AddSeconds(10)\n"
+        "while ([DateTime]::UtcNow -lt $deadline) {\n"
+        "  if (Test-Path -LiteralPath $marker) {\n"
+        "    try {\n"
+        "      $acl = Get-Acl -LiteralPath $path -ErrorAction Stop\n"
+        "      [pscustomobject]@{ Protected = $acl.AreAccessRulesProtected; "
+        "Owner = $acl.Owner } | ConvertTo-Json -Compress | "
+        "Set-Content -LiteralPath $observed -Encoding utf8\n"
+        "      exit 0\n"
+        "    } catch {}\n"
+        "  }\n"
+        "  Start-Sleep -Milliseconds 5\n"
+        "}\n"
+        "exit 3\n"
+    )
+    creator = _run_ps(
+        _new_file_script(staged, tmp_path, basename=staged.name)
+        + "try {\n"
+        f"  Set-Content -LiteralPath {_ps_literal(marker)} -Value ready -NoNewline\n"
+        "$deadline = [DateTime]::UtcNow.AddSeconds(5)\n"
+        f"  while (-not (Test-Path -LiteralPath {_ps_literal(observed)}) -and "
+        "[DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 5 }\n"
+        f"  (Test-Path -LiteralPath {_ps_literal(observed)}).ToString().ToLowerInvariant()\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    stdout, stderr = watcher.communicate(timeout=10)
+    assert creator.stdout.strip() == "true"
+    assert watcher.returncode == 0, (stdout, stderr)
+    assert json.loads(observed.read_text(encoding="utf-8-sig"))["Protected"] is True
+
+
+def test_new_file_rejects_invalid_names_and_wrong_descriptor(tmp_path: Path):
+    invalid_paths = [
+        tmp_path / "wild*.stage",
+        f"{tmp_path / 'ads.stage'}:stream",
+        f"{tmp_path / 'alias.stage'}.",
+    ]
+    for path in invalid_paths:
+        result = _run_ps(
+            _protected_descriptor_script()
+            + "try {\n"
+            f"  $h = New-PhaseAValidatedFile -Path {_ps_literal(path)} "
+            f"-AuthorizedRoot {_ps_literal(tmp_path)} "
+            "-AuthorizedBasenamePattern '\\A[a-z]+\\.stage\\z' "
+            "-SecurityDescriptor $descriptor -Access ReadWriteDelete\n"
+            "  try { 'missed' } finally { $h.Dispose() }\n"
+            "} catch { 'rejected' }\n"
+        )
+        assert result.stdout.strip() == "rejected"
+
+    weak = tmp_path / "weak.stage"
+    result = _run_ps(
+        "$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value\n"
+        "$raw = [Security.AccessControl.RawSecurityDescriptor]::new("
+        "\"O:${sid}G:${sid}D:(A;;FA;;;${sid})\")\n"
+        "$bytes = [byte[]]::new($raw.BinaryLength)\n"
+        "$raw.GetBinaryForm($bytes, 0)\n"
+        "try {\n"
+        f"  $h = New-PhaseAValidatedFile -Path {_ps_literal(weak)} "
+        f"-AuthorizedRoot {_ps_literal(tmp_path)} -AuthorizedBasename {_ps_literal(weak.name)} "
+        "-SecurityDescriptor $bytes -Access ReadWriteDelete\n"
+        "  try { 'missed' } finally { $h.Dispose() }\n"
+        "} catch { 'rejected' }\n"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert not weak.exists()
+
+
+def test_identity_material_matches_independent_win32_probe_and_is_copied(tmp_path: Path):
+    staged = tmp_path / "identity.stage"
+    result = _run_ps(
+        _new_file_script(staged, tmp_path, basename=staged.name)
+        + "try {\n"
+        "  $first = Get-PhaseAFileIdentityMaterial -Handle $handle\n"
+        "  $original = [Convert]::ToHexString($first.FileId)\n"
+        "  $first.FileId[0] = $first.FileId[0] -bxor 255\n"
+        "  $second = Get-PhaseAFileIdentityMaterial -Handle $handle\n"
+        "  [pscustomobject]@{ Volume = $second.VolumeSerialNumber; "
+        "FileId = [Convert]::ToHexString($second.FileId); Original = $original; "
+        "Path = $second.VolumeGuidPath; Length = $second.FileId.Length } | "
+        "ConvertTo-Json -Compress\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    payload = json.loads(result.stdout)
+    independent = _probe_identity_material(staged)
+    assert payload["Length"] == 16
+    assert payload["FileId"] == payload["Original"]
+    assert payload["Volume"] == independent["Volume"]
+    assert payload["FileId"] == independent["FileId"]
+    assert payload["Path"] == independent["Path"]
+    assert re.fullmatch(
+        r"\\\\\?\\Volume\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}\\.+",
+        payload["Path"],
+    )
+
+
+def test_new_handle_pattern_authorizes_same_handle_no_replace_rename(tmp_path: Path):
+    source = tmp_path / "receipt.0123456789abcdef.stage"
+    destination = tmp_path / "receipt.json"
+    occupied = tmp_path / "occupied.json"
+    result = _run_ps(
+        _new_file_script(
+            source,
+            tmp_path,
+            pattern=r"\A(?:receipt\.(?:[0-9a-f]{16}\.stage|json)|occupied\.json)\z",
+        )
+        + "try {\n"
+        "  $before = Get-PhaseAFileIdentityMaterial -Handle $handle\n"
+        f"  Rename-PhaseAFileNoReplace -Handle $handle -Destination {_ps_literal(destination)}\n"
+        "  $after = Get-PhaseAFileIdentityMaterial -Handle $handle\n"
+        "  $stream = [IO.FileStream]::new($handle.FileHandle, [IO.FileAccess]::Write)\n"
+        "  try { $bytes = [Text.Encoding]::UTF8.GetBytes('payload'); "
+        "$stream.Write($bytes, 0, $bytes.Length); $stream.Flush() } finally { $stream.Dispose() }\n"
+        "  [pscustomobject]@{ Same = ([Convert]::ToHexString($before.FileId) -eq "
+        "[Convert]::ToHexString($after.FileId)); Path = $after.VolumeGuidPath } | "
+        "ConvertTo-Json -Compress\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    payload = json.loads(result.stdout)
+    assert payload["Same"] is True
+    assert destination.read_text(encoding="utf-8") == "payload"
+
+    occupied.write_text("occupied", encoding="utf-8")
+    failed = _run_ps(
+        _new_file_script(
+            source,
+            tmp_path,
+            pattern=r"\A(?:receipt\.(?:[0-9a-f]{16}\.stage|json)|occupied\.json)\z",
+        )
+        + "try {\n"
+        f"  try {{ Rename-PhaseAFileNoReplace -Handle $handle -Destination {_ps_literal(occupied)}; 'missed' }} "
+        "catch { 'rejected' }\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    assert failed.stdout.strip() == "rejected"
+    assert occupied.read_text(encoding="utf-8") == "occupied"
+
+
+def test_new_file_handle_retains_ancestor_leases_and_releases_synchronously(
+    tmp_path: Path,
+):
+    parent = tmp_path / "active"
+    parent.mkdir()
+    staged = parent / "lease.stage"
+    renamed = tmp_path / "released"
+    result = _run_ps(
+        _new_file_script(staged, parent, basename=staged.name)
+        + "$held = $false\n"
+        f"try {{ Rename-Item -LiteralPath {_ps_literal(parent)} -NewName {_ps_literal(renamed.name)} }} "
+        "catch { $held = $true }\n"
+        "$handle.Dispose()\n"
+        f"Rename-Item -LiteralPath {_ps_literal(parent)} -NewName {_ps_literal(renamed.name)}\n"
+        "[pscustomobject]@{ Held = $held; Released = (Test-Path -LiteralPath "
+        f"{_ps_literal(renamed)}) }} | ConvertTo-Json -Compress\n"
+    )
+    assert json.loads(result.stdout) == {"Held": True, "Released": True}
+
+
+def test_creation_exception_stress_does_not_leak_handles_or_delete_existing_leaf(
+    tmp_path: Path,
+):
+    staged = tmp_path / "stress.stage"
+    staged.write_text("original", encoding="utf-8")
+    result = _run_ps(
+        _protected_descriptor_script()
+        + "$rejected = 0\n"
+        "for ($index = 0; $index -lt 50; $index++) {\n"
+        "  try {\n"
+        f"    $h = New-PhaseAValidatedFile -Path {_ps_literal(staged)} "
+        f"-AuthorizedRoot {_ps_literal(tmp_path)} -AuthorizedBasename {_ps_literal(staged.name)} "
+        "-SecurityDescriptor $descriptor -Access ReadWriteDelete\n"
+        "  } catch { $rejected++ }\n"
+        "}\n"
+        f"$probe = [IO.File]::Open({_ps_literal(staged)}, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::ReadWrite, [IO.FileShare]::None)\n"
+        "$probe.Dispose()\n"
+        "$rejected\n"
+    )
+    assert result.stdout.strip() == "50"
+    assert staged.read_text(encoding="utf-8") == "original"
+
+
+def test_rename_rejects_cross_volume_destination_before_native_mutation(tmp_path: Path):
+    source = tmp_path / "cross.stage"
+    result = _run_ps(
+        _new_file_script(
+            source,
+            tmp_path,
+            pattern=r"\A(?:cross\.stage|destination\.stage)\z",
+        )
+        + "try {\n"
+        "  try { Rename-PhaseAFileNoReplace -Handle $handle "
+        "-Destination 'D:\\destination.stage'; 'missed' } catch { 'rejected' }\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert source.exists()
 
 
 def test_directory_lease_accepts_regular_directory(tmp_path: Path):
@@ -282,11 +628,15 @@ def test_identity_assertion_detects_replacement_before_mutation(tmp_path: Path):
 def test_rename_is_same_handle_and_does_not_replace(tmp_path: Path):
     source = tmp_path / "source.ps1"
     destination = tmp_path / "renamed.ps1"
-    source.write_text("source", encoding="utf-8")
     result = _run_ps(
-        f"$handle = Open-PhaseAValidatedFile -Path {_ps_literal(source)} "
-        f"-Access ReadWriteDelete -AuthorizedRoot {_ps_literal(tmp_path)} "
-        f"-AuthorizedBasename {_ps_literal(source.name)}\n"
+        _new_file_script(
+            source,
+            tmp_path,
+            pattern=r"\A(?:source|renamed|occupied)\.ps1\z",
+        )
+        + "$stream = [IO.FileStream]::new($handle.FileHandle, [IO.FileAccess]::Write)\n"
+        "$bytes = [Text.Encoding]::UTF8.GetBytes('source')\n"
+        "$stream.Write($bytes, 0, $bytes.Length); $stream.Flush()\n"
         "$before = Get-PhaseAFileIdentity -Handle $handle\n"
         "try {\n"
         f"  Rename-PhaseAFileNoReplace -Handle $handle -Destination {_ps_literal(destination)}\n"
@@ -295,18 +645,22 @@ def test_rename_is_same_handle_and_does_not_replace(tmp_path: Path):
         "  [pscustomobject]@{ Same = ($before.VolumeSerialNumber -eq $after.VolumeSerialNumber "
         "-and $before.FileId -eq $after.FileId); FinalPath = $after.FinalPath } | "
         "ConvertTo-Json -Compress\n"
-        "} finally { $handle.Dispose() }\n"
+        "} finally { $stream.Dispose(); $handle.Dispose() }\n"
     )
     payload = json.loads(result.stdout)
     assert payload == {"Same": True, "FinalPath": str(destination)}
     assert destination.read_text(encoding="utf-8") == "source"
 
     occupied = tmp_path / "occupied.ps1"
+    second = tmp_path / "second.ps1"
     occupied.write_text("occupied", encoding="utf-8")
     assert _run_ps(
-        f"$handle = Open-PhaseAValidatedFile -Path {_ps_literal(destination)} "
-        f"-Access ReadWriteDelete -AuthorizedRoot {_ps_literal(tmp_path)} "
-        f"-AuthorizedBasename {_ps_literal(destination.name)}\n"
+        _new_file_script(
+            second,
+            tmp_path,
+            pattern=r"\A(?:second|occupied)\.ps1\z",
+        )
+        +
         "try {\n"
         f"  try {{ Rename-PhaseAFileNoReplace -Handle $handle -Destination {_ps_literal(occupied)}; 'missed' }} "
         "catch { 'rejected' }\n"
