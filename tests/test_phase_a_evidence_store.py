@@ -166,6 +166,13 @@ def _ps(value: os.PathLike[str] | str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _io_path(path: os.PathLike[str] | str) -> Path:
+    value = os.path.abspath(os.fspath(path))
+    if os.name == "nt" and not value.startswith("\\\\?\\"):
+        value = "\\\\?\\" + value
+    return Path(value)
+
+
 def _run_ps(body: str, *, check: bool = True, timeout: int = 45):
     encoded = base64.b64encode(
         ("$ErrorActionPreference='Stop'\n" + body).encode("utf-16-le")
@@ -1761,7 +1768,7 @@ def test_cleanup_requires_post_mutation_completion_then_resumes(tmp_path: Path):
     assert not stage.exists()
     request = Path(first["CompletionRequestPath"])
     request_sig = request.with_suffix(".sig")
-    request_sig.write_bytes(_sign(private, request.read_bytes()))
+    _io_path(request_sig).write_bytes(_sign(private, _io_path(request).read_bytes()))
     _protect(request_sig)
     resume = common + (
         f" -CompletionReceiptPath {_ps(request)} -CompletionSignaturePath {_ps(request_sig)} "
@@ -1800,10 +1807,10 @@ def test_cleanup_requires_post_mutation_completion_then_resumes(tmp_path: Path):
     second_request = Path(second_result["CompletionRequestPath"])
     assert second_result["State"] == "COMPLETION_REQUIRED"
     assert second_request.parent.name == second_operation
-    assert request.exists() and second_request.exists()
+    assert _io_path(request).exists() and _io_path(second_request).exists()
 
     conflict = request.parent / f"{'0'*64}.json"
-    conflict.write_bytes(b"{}")
+    _io_path(conflict).write_bytes(b"{}")
     _protect(conflict)
     conflicting = _run_ps("try{" + common + "|Out-Null;'missed'}catch{'rejected'}", timeout=120)
     assert conflicting.stdout.strip() == "rejected"
