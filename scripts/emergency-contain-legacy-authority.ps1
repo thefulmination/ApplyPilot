@@ -153,7 +153,7 @@ function Get-CommandTokenStem([string]$Token) {
 }
 
 function Test-IsPythonLauncherStem([string]$Stem) {
-  return $Stem -match '^(?:pyw?|pythonw?(?:[23](?:\.\d+)?)?)$'
+  return $Stem -match '^(?:pyw?|pythonw?(?:\d(?:\.\d+)?t?)?)$'
 }
 
 function Test-ExecutableTokenHasEnvironmentSelectedBasename([string]$Token) {
@@ -628,7 +628,7 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
       $index++
       continue
     }
-    if ($LauncherStem -in @('py', 'pyw') -and $token -match '^-(?:[23](?:\.\d+)?|V:.+)$') { continue }
+    if ($LauncherStem -in @('py', 'pyw') -and $token -match '^-(?:\d(?:\.\d+)?t?|V:.+)$') { continue }
     if ($token.StartsWith('-')) {
       return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
     }

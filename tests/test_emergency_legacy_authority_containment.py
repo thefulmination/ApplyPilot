@@ -2793,6 +2793,89 @@ def test_environment_selected_python_launcher_alias_remains_ambiguous(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "python3.13t.exe -m applypilot.fleet.apply_worker_main",
+        "pythonw3.13t.exe -m applypilot.fleet.linkedin_worker_main",
+        r"python3.14t.exe C:\ApplyPilot\apply_worker_main.py",
+        "python4.0.exe -m applypilot.fleet.apply_worker_main",
+        r"python4.1t.exe C:\ApplyPilot\linkedin_worker_main.py",
+        "cmd /c python3.13t.exe -m applypilot.fleet.apply_worker_main",
+        "cmd /k python4.0.exe -m applypilot.fleet.linkedin_worker_main",
+        'pwsh.exe -Command "pythonw3.13t.exe -m applypilot.fleet.apply_worker_main"',
+        'powershell.exe -Command "python4.1t.exe C:\\ApplyPilot\\apply_worker_main.py"',
+        "py.exe -3.13t -m applypilot.fleet.apply_worker_main",
+        r"pyw.exe -3.13t C:\ApplyPilot\linkedin_worker_main.py",
+        "cmd /c pyw.exe -3.13t -m applypilot.fleet.apply_worker_main",
+        'pwsh.exe -Command "py.exe -3.13t -m applypilot.fleet.linkedin_worker_main"',
+    ],
+)
+def test_exact_acquisition_payloads_are_authoritative_after_safe_parsing(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3.13t.exe -m http.server",
+        "pythonw3.13t.exe C:\\tools\\report.py",
+        "py.exe -3.13t -m unrelated.worker",
+        "pyw.exe -3.13t C:\\tools\\report.py",
+        "python4.0.exe -m unrelated.worker",
+        r"future-python.exe C:\tools\report.py",
+        "cmd /c python3.13t.exe -m unrelated.worker",
+        'pwsh.exe -Command "pythonw3.13t.exe C:\\tools\\report.py"',
+        "python3.13t.exe -m applypilot.fleet.apply_worker_main_extra",
+        r"pythonw3.13t.exe C:\ApplyPilot\apply_worker_main.py.bak",
+        "py.exe -3.13t -m applypilot.fleet.linkedin_worker_main_extra",
+    ],
+)
+def test_free_threaded_and_future_launchers_without_exact_payloads_are_benign(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "benign"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"%PYTHON313T% -m applypilot.fleet.apply_worker_main",
+        r"cmd /c %PYTHON313T% -m applypilot.fleet.apply_worker_main",
+        r"$env:PYTHON313T -m applypilot.fleet.apply_worker_main",
+        'pwsh.exe -Command "& $env:PYTHON313T -m applypilot.fleet.apply_worker_main"',
+        'python3.13t.exe -m "applypilot.fleet.apply_worker_main',
+    ],
+)
+def test_free_threaded_environment_and_malformed_targets_remain_ambiguous(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "cmd /rrun-fleet-worker.cmd",
         "cmd /d/crun-fleet-worker.cmd",
         "cmd /q/krun-fleet-worker.cmd",
