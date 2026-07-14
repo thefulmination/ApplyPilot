@@ -4,9 +4,9 @@ param(
     'applypilot.phase-a.evidence-adjudication',
     'applypilot.phase-a.credential-revocation',
     'applypilot.phase-a.provisioning-cleanup-authorization',
-    'applypilot.phase-a.legacy-authority-destruction-authorization',
+    'applypilot.phase-a.legacy-sidecar-destruction-authorization',
     'applypilot.phase-a.provisioning-cleanup-completion',
-    'applypilot.phase-a.legacy-authority-destruction-completion',
+    'applypilot.phase-a.legacy-sidecar-destruction-completion',
     'applypilot.phase-a.host-provisioning')][string]$ReceiptType,
   [Parameter(Mandatory)][string]$OperatorSigningSpkiPath,
   [Parameter(Mandatory)][string]$ExpectedOperatorSigningKeySpkiSha256,
@@ -20,7 +20,7 @@ param(
   [string]$SelectedBundleSha256,
   [string]$StoreRoot,
   [string]$CanonicalOperatorSid,
-  [scriptblock]$BundleAuthenticator,
+  [scriptblock]$DefinitionBundleAuthenticator,
   [switch]$DefinitionImport,
   [string]$CredentialReferenceDigest,
   [string]$ProviderClass,
@@ -106,8 +106,8 @@ $value = & $module {
         StoreRoot=$P.StoreRoot;CanonicalOperatorSid=$P.CanonicalOperatorSid;
         SourceIdentityDigest=$P.SourceIdentityDigest
       }
-      if($P.DefinitionImport){$candidateArguments.DefinitionImport=$true;$candidateArguments.BundleAuthenticator=$P.BundleAuthenticator}
-      elseif($P.BundleAuthenticator){throw 'Bundle authenticator override requires DefinitionImport.'}
+      if($P.DefinitionImport){$candidateArguments.DefinitionImport=$true;$candidateArguments.DefinitionBundleAuthenticator=$P.DefinitionBundleAuthenticator}
+      elseif($P.DefinitionBundleAuthenticator){throw 'Bundle authenticator override requires DefinitionImport.'}
       $candidates = @(Get-PhaseAAuthenticatedBundleCandidates @candidateArguments)
       if ($candidates.Count -eq 0) { throw 'Adjudication candidates are required.' }
       foreach ($candidate in $candidates) { Assert-PhaseAHexDigest $candidate 'candidateBundleSha256' }
@@ -128,7 +128,7 @@ $value = & $module {
       foreach ($item in @($P.CredentialReferenceDigest,$P.ProviderEvidenceSha256,$P.MachineIdentityDigest,$P.Nonce)) {
         Assert-PhaseAHexDigest $item 'Credential revocation digest'
       }
-      if ($P.ProviderClass -cnotin @('oauth-refresh-token','api-key','session-cookie','password')) {
+      if ($P.ProviderClass -cnotin @('postgres','llm-api','review-api','other')) {
         throw 'providerClass is not supported.'
       }
       Assert-PhaseAUtcSeconds $P.RevokedAtUtc 'revokedAtUtc'
@@ -142,7 +142,7 @@ $value = & $module {
         nonce=$P.Nonce
       }
     }
-    { $_ -in @('applypilot.phase-a.provisioning-cleanup-authorization','applypilot.phase-a.legacy-authority-destruction-authorization') } {
+    { $_ -in @('applypilot.phase-a.provisioning-cleanup-authorization','applypilot.phase-a.legacy-sidecar-destruction-authorization') } {
       if ($P.ApprovedCommit -cnotmatch $script:Hex40) { throw 'Authorization approvedCommit is invalid.' }
       foreach ($item in @($P.OperationId,$P.TargetIdentityDigest,$P.BeforeManifestSha256,
           $P.ExpectedAfterManifestSha256,$P.EvidenceBundleSha256,$P.CredentialInventoryRoot,
@@ -164,7 +164,7 @@ $value = & $module {
         operatorSid=$P.OperatorSid; createdAtUtc=$P.CreatedAtUtc
       }
     }
-    { $_ -in @('applypilot.phase-a.provisioning-cleanup-completion','applypilot.phase-a.legacy-authority-destruction-completion') } {
+    { $_ -in @('applypilot.phase-a.provisioning-cleanup-completion','applypilot.phase-a.legacy-sidecar-destruction-completion') } {
       if ($P.ApprovedCommit -cnotmatch $script:Hex40) { throw 'Completion approvedCommit is invalid.' }
       foreach ($item in @($P.OperationId,$P.AuthorizationReceiptSha256,$P.ActualAfterManifestSha256)) {
         Assert-PhaseAHexDigest $item 'Completion digest'

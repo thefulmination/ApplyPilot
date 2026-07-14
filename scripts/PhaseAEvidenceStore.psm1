@@ -14,14 +14,15 @@ $script:ProductionOperatorSigningMetadataPath = [IO.Path]::Combine($script:Repos
 $script:ProductionOperatorSigningSpkiPath = [IO.Path]::Combine($script:RepositoryRoot, 'config', 'phase-a', 'operator-signing-key.spki.der')
 $script:ProductionRecoveryEncryptionMetadataPath = [IO.Path]::Combine($script:RepositoryRoot, 'config', 'phase-a', 'recovery-encryption-key.json')
 $script:ProductionRecoveryEncryptionSpkiPath = [IO.Path]::Combine($script:RepositoryRoot, 'config', 'phase-a', 'recovery-encryption-key.spki.der')
+$script:PhaseABundleAuthenticator = $null
 $script:ReceiptTypes = @(
   'applypilot.phase-a.runtime-source-approval',
   'applypilot.phase-a.evidence-adjudication',
   'applypilot.phase-a.credential-revocation',
   'applypilot.phase-a.provisioning-cleanup-authorization',
-  'applypilot.phase-a.legacy-authority-destruction-authorization',
+  'applypilot.phase-a.legacy-sidecar-destruction-authorization',
   'applypilot.phase-a.provisioning-cleanup-completion',
-  'applypilot.phase-a.legacy-authority-destruction-completion',
+  'applypilot.phase-a.legacy-sidecar-destruction-completion',
   'applypilot.phase-a.host-provisioning'
 )
 $script:ReceiptFieldsByType = @{
@@ -36,14 +37,14 @@ $script:ReceiptFieldsByType = @{
     'operatorSigningKeySpkiSha256','operationId','targetIdentityDigest','beforeManifestSha256',
     'expectedAfterManifestSha256','evidenceBundleSha256','credentialInventoryRoot','credentialRevocationSetRoot',
     'operatorSid','createdAtUtc')
-  'applypilot.phase-a.legacy-authority-destruction-authorization' = @('schemaVersion','receiptType','approvedCommit',
+  'applypilot.phase-a.legacy-sidecar-destruction-authorization' = @('schemaVersion','receiptType','approvedCommit',
     'operatorSigningKeySpkiSha256','operationId','targetIdentityDigest','beforeManifestSha256',
     'expectedAfterManifestSha256','evidenceBundleSha256','credentialInventoryRoot','credentialRevocationSetRoot',
     'operatorSid','createdAtUtc')
   'applypilot.phase-a.provisioning-cleanup-completion' = @('schemaVersion','receiptType','approvedCommit',
     'operatorSigningKeySpkiSha256','operationId','authorizationReceiptSha256','actualAfterManifestSha256',
     'result','createdAtUtc')
-  'applypilot.phase-a.legacy-authority-destruction-completion' = @('schemaVersion','receiptType','approvedCommit',
+  'applypilot.phase-a.legacy-sidecar-destruction-completion' = @('schemaVersion','receiptType','approvedCommit',
     'operatorSigningKeySpkiSha256','operationId','authorizationReceiptSha256','actualAfterManifestSha256',
     'result','createdAtUtc')
   'applypilot.phase-a.host-provisioning' = @('schemaVersion','receiptType','approvedCommit',
@@ -246,21 +247,6 @@ namespace ApplyPilot.PhaseA
                 throw new InvalidOperationException("Manifest object identity drifted: expected " +
                     expected.FinalPath + " links=" + expected.NumberOfLinks + " size=" + expected.Size +
                     "; actual " + actual.FinalPath + " links=" + actual.NumberOfLinks + " size=" + actual.Size + ".");
-        }
-
-        public static string GetObjectIdentityDigest(RawFileIdentity identity, bool directory)
-        {
-            using (var stream = new MemoryStream())
-            {
-                byte[] domain = Encoding.ASCII.GetBytes("applypilot.phase-a.object-identity.v1\0");
-                stream.Write(domain, 0, domain.Length);
-                byte[] volume = BitConverter.GetBytes(identity.VolumeSerialNumber);
-                stream.Write(volume, 0, volume.Length);
-                byte[] fileId = Convert.FromHexString(identity.FileId);
-                stream.Write(fileId, 0, fileId.Length);
-                stream.WriteByte(directory ? (byte)1 : (byte)2);
-                return Convert.ToHexString(SHA256.HashData(stream.ToArray())).ToLowerInvariant();
-            }
         }
 
         public static string GetHandleSecurityDescriptorHash(SafeFileHandle handle)
@@ -772,6 +758,34 @@ function Get-PhaseAOperatorSidDigest {
   return Get-PhaseASha256 ($domain + $value)
 }
 
+function Get-PhaseATargetIdentityDigestFromParts([uint64]$VolumeSerialNumber,[string]$FileId,[string]$CanonicalVolumeGuidPath) {
+  if($FileId -cnotmatch '^[0-9A-Fa-f]{32}$'){throw 'FILE_ID_128 must contain exactly 16 bytes.'}
+  $pathBytes=$script:Utf8Strict.GetBytes($CanonicalVolumeGuidPath)
+  if($pathBytes.Length -gt [uint32]::MaxValue){throw 'Canonical volume-GUID path is too long.'}
+  $stream=[IO.MemoryStream]::new()
+  try{
+    $writer=[IO.BinaryWriter]::new($stream,[Text.Encoding]::ASCII,$true)
+    $writer.Write([Text.Encoding]::ASCII.GetBytes("applypilot.phase-a.target.v1`0"))
+    $writer.Write($VolumeSerialNumber)
+    $writer.Write([Convert]::FromHexString($FileId))
+    $writer.Write([uint32]$pathBytes.Length)
+    $writer.Write($pathBytes);$writer.Flush()
+    return Get-PhaseASha256 $stream.ToArray()
+  }finally{$stream.Dispose()}
+}
+
+function Get-PhaseARelativePathDigest([string]$RelativePath) {
+  if([string]::IsNullOrEmpty($RelativePath) -or $RelativePath.Contains('/') -or
+      $RelativePath.StartsWith('\') -or $RelativePath.EndsWith('\') -or
+      @($RelativePath.Split('\')) -contains '..'){throw 'Held relative path is not canonical.'}
+  $relativeBytes=$script:Utf8Strict.GetBytes($RelativePath)
+  $domain=[Text.Encoding]::ASCII.GetBytes("applypilot.phase-a.relative-path.v1`0")
+  $bytes=[byte[]]::new($domain.Length+$relativeBytes.Length)
+  [Array]::Copy($domain,0,$bytes,0,$domain.Length)
+  [Array]::Copy($relativeBytes,0,$bytes,$domain.Length,$relativeBytes.Length)
+  return Get-PhaseASha256 $bytes
+}
+
 function ConvertTo-PhaseAGuidBytes([string]$Value, [string]$Name) {
   $guid = [guid]::Empty
   if (-not [guid]::TryParseExact($Value, 'D', [ref]$guid) -or $guid -eq [guid]::Empty) {
@@ -849,22 +863,9 @@ function Get-PhaseATargetDigest {
       }
       $volumePath = $volumePath.Substring(0, $volumePath.Length - $leaf.Length) + $canonicalLeaf
     }
-    $pathBytes = $script:Utf8Strict.GetBytes($volumePath)
-    $stream = [IO.MemoryStream]::new()
-    try {
-      $writer = [IO.BinaryWriter]::new($stream, [Text.Encoding]::ASCII, $true)
-      $writer.Write([Text.Encoding]::ASCII.GetBytes("applypilot.phase-a.target.v1`0"))
-      $writer.Write([uint64]$identity.VolumeSerialNumber)
-      $writer.Write([Convert]::FromHexString([string]$identity.FileId))
-      $writer.Write([uint32]$pathBytes.Length)
-      $writer.Write($pathBytes)
-      $writer.Flush()
-      $digest = Get-PhaseASha256 $stream.ToArray()
-      if ($PassThru) {
-        return [pscustomobject]@{ Digest=$digest; Identity=$identity; CanonicalVolumePath=$volumePath }
-      }
-      return $digest
-    } finally { $stream.Dispose() }
+    $digest=Get-PhaseATargetIdentityDigestFromParts ([uint64]$identity.VolumeSerialNumber) ([string]$identity.FileId) $volumePath
+    if ($PassThru) {return [pscustomobject]@{ Digest=$digest; Identity=$identity; CanonicalVolumePath=$volumePath }}
+    return $digest
   } finally { $lease.Dispose() }
 }
 
@@ -1046,6 +1047,7 @@ function Get-PhaseADirectoryManifest {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$Root,
+    [string]$CanonicalRootPath,
     [uint64]$MaximumFileSize = 1073741824,
     [uint32]$MaximumEntries = 100000,
     [scriptblock]$BeforeObjectRevalidation,
@@ -1058,7 +1060,14 @@ function Get-PhaseADirectoryManifest {
   $entries = [Collections.Generic.List[object]]::new()
   try{
     $baseIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($baseHandle)
-    $baseDigest=[ApplyPilot.PhaseA.EvidenceNative]::GetObjectIdentityDigest($baseIdentity,$true)
+    $baseVolumePath=[ApplyPilot.PhaseA.EvidenceNative]::GetVolumeGuidPath($baseHandle).TrimEnd('\')
+    $canonicalBaseVolumePath=$baseVolumePath
+    if($CanonicalRootPath){
+      $actualLeaf=[IO.Path]::GetFileName($full.TrimEnd('\'));$canonicalLeaf=[IO.Path]::GetFileName([IO.Path]::GetFullPath($CanonicalRootPath).TrimEnd('\'))
+      if(-not $baseVolumePath.EndsWith($actualLeaf,[StringComparison]::OrdinalIgnoreCase)){throw 'Cannot derive canonical manifest root path.'}
+      $canonicalBaseVolumePath=$baseVolumePath.Substring(0,$baseVolumePath.Length-$actualLeaf.Length)+$canonicalLeaf
+    }
+    $baseDigest=Get-PhaseATargetIdentityDigestFromParts ([uint64]$baseIdentity.VolumeSerialNumber) ([string]$baseIdentity.FileId) $canonicalBaseVolumePath
     $walk={param([string]$Directory)
       foreach($item in @(Get-ChildItem -LiteralPath $Directory -Force | Sort-Object Name -CaseSensitive)){
         if($entries.Count -ge $MaximumEntries){throw 'Manifest entry count exceeds the configured bound.'}
@@ -1066,11 +1075,15 @@ function Get-PhaseADirectoryManifest {
         $handle=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($item.FullName,[bool]$item.PSIsContainer)
         try{
           $identity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($handle)
-          $relative=[IO.Path]::GetRelativePath($full,$identity.FinalPath).Replace('\','/')
-          if([IO.Path]::IsPathRooted($relative) -or $relative -eq '..' -or $relative.StartsWith('../') -or
-              $relative.Contains(':') -or @($relative.Split('/')) -contains '..'){throw 'Manifest relative path escaped or aliased the held base.'}
-          $relativeDigest=Get-PhaseASha256 $script:Utf8Strict.GetBytes($relative)
-          $objectDigest=[ApplyPilot.PhaseA.EvidenceNative]::GetObjectIdentityDigest($identity,[bool]$item.PSIsContainer)
+          $objectVolumePath=[ApplyPilot.PhaseA.EvidenceNative]::GetVolumeGuidPath($handle).TrimEnd('\')
+          $prefix=$baseVolumePath+'\'
+          if(-not $objectVolumePath.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)){throw 'Manifest held object escaped the held base volume-GUID path.'}
+          $relative=$objectVolumePath.Substring($prefix.Length).Replace('/','\')
+          if([string]::IsNullOrEmpty($relative) -or $relative.StartsWith('\') -or $relative.EndsWith('\') -or
+              $relative.Contains(':') -or @($relative.Split('\')) -contains '..'){throw 'Manifest relative path escaped or aliased the held base.'}
+          $relativeDigest=Get-PhaseARelativePathDigest $relative
+          $canonicalObjectVolumePath=$canonicalBaseVolumePath+'\'+$relative
+          $objectDigest=Get-PhaseATargetIdentityDigestFromParts ([uint64]$identity.VolumeSerialNumber) ([string]$identity.FileId) $canonicalObjectVolumePath
           $securityDigest=[ApplyPilot.PhaseA.EvidenceNative]::GetHandleSecurityDescriptorHash($handle)
           if($item.PSIsContainer){
             $content='0'*64;$size=[uint64]0
@@ -1215,7 +1228,7 @@ function Assert-PhaseAReceiptValue($Value, [string]$ExpectedReceiptType, $Expect
     'applypilot.phase-a.credential-revocation' {
       if([string]$Value.approvedCommit -cnotmatch $script:Hex40){throw 'Revocation commit is invalid.'}
       foreach($name in @('credentialReferenceDigest','providerEvidenceSha256','machineIdentityDigest','nonce')){Assert-PhaseAHexDigest ([string]$Value[$name]) $name}
-      if([string]$Value.providerClass -cnotin @('oauth-refresh-token','api-key','session-cookie','password') -or [string]$Value.staleProbeResult -cne 'DENIED'){throw 'Revocation provider or stale probe result is invalid.'}
+      if([string]$Value.providerClass -cnotin @('postgres','llm-api','review-api','other') -or [string]$Value.staleProbeResult -cne 'DENIED'){throw 'Revocation provider or stale probe result is invalid.'}
       Assert-PhaseAUtcSeconds ([string]$Value.revokedAtUtc) 'revokedAtUtc';Assert-PhaseAUtcSeconds ([string]$Value.staleProbeAtUtc) 'staleProbeAtUtc'
       if([DateTimeOffset]::Parse($Value.staleProbeAtUtc) -lt [DateTimeOffset]::Parse($Value.revokedAtUtc)){throw 'Stale probe predates revocation.'}
     }
@@ -1306,10 +1319,11 @@ function Install-PhaseASignedReceipt {
     [Parameter(Mandatory)][Alias('ExpectedSigningSpkiSha256')][string]$ExpectedOperatorSigningKeySpkiSha256,
     [Parameter(Mandatory)][string]$ExpectedReceiptType,[Parameter(Mandatory)]$ExpectedBindings,
     [string]$ExpectedAuthorizedAfterManifestSha256,[switch]$Bootstrap,[switch]$DefinitionImport,
-    [scriptblock]$BeforeFinalPairRevalidation,
+    [scriptblock]$DefinitionBundleAuthenticator,[scriptblock]$BeforeFinalPairRevalidation,
     [ValidateSet('after-receipt-stage','after-signature-stage','after-receipt-rename','after-signature-rename','before-pair-revalidation')][string]$CrashAfter
   )
   if($BeforeFinalPairRevalidation -and -not $DefinitionImport){throw 'Race injection requires DefinitionImport.'}
+  if($DefinitionBundleAuthenticator -and -not $DefinitionImport){throw 'Bundle authenticator override requires DefinitionImport.'}
   $operator=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   $root=Assert-PhaseALocalNtfsPath $StoreRoot
   if(-not $DefinitionImport){
@@ -1326,6 +1340,9 @@ function Install-PhaseASignedReceipt {
       ExpectedOperatorSigningKeySpkiSha256=$ExpectedOperatorSigningKeySpkiSha256;ExpectedReceiptType=$ExpectedReceiptType;
       ExpectedBindings=$ExpectedBindings;ExpectedAuthorizedAfterManifestSha256=$ExpectedAuthorizedAfterManifestSha256}
     $null=Test-PhaseASignedReceiptCore @validation
+    if($ExpectedReceiptType -ceq 'applypilot.phase-a.evidence-adjudication'){
+      Assert-PhaseAAdjudicationCurrentCandidates $source.Receipt.Value $root $operator $DefinitionBundleAuthenticator -DefinitionImport:$DefinitionImport
+    }
     Assert-PhaseAProtectedReceiptPairIdentity $source
     $hash=$source.Receipt.Sha256
     $receiptFinalPath=[IO.Path]::Combine($destination,"$hash.json")
@@ -1343,17 +1360,19 @@ function Install-PhaseASignedReceipt {
         $published=Open-PhaseAExpectedProtectedFile $part.Final $destination $operator $part.Bytes Read
       }else{
         if(-not (Test-Path -LiteralPath $part.Stage)){Write-PhaseACreateNew $part.Stage $part.Bytes $operator}
-        $stage=Open-PhaseAExpectedProtectedFile $part.Stage $destination $operator $part.Bytes ReadWriteDelete
-        if($part.Kind -eq 'receipt' -and $CrashAfter -eq 'after-receipt-stage'){throw 'Injected crash after receipt stage.'}
-        if($part.Kind -eq 'signature' -and $CrashAfter -eq 'after-signature-stage'){throw 'Injected crash after signature stage.'}
-        $beforeIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stage.Handle.FileHandle)
-        [ApplyPilot.PhaseA.EvidenceNative]::RenameFileNoReplace($stage.Handle.FileHandle,$part.Final)
-        $afterIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stage.Handle.FileHandle)
-        if($afterIdentity.VolumeSerialNumber -ne $beforeIdentity.VolumeSerialNumber -or $afterIdentity.FileId -cne $beforeIdentity.FileId){throw 'Receipt publication identity changed during rename.'}
-        $stage.Read.Path=$part.Final
-        $stage.Read.Identity=$afterIdentity
-        $stage|Add-Member -NotePropertyName NativeIdentity -NotePropertyValue $true
-        $published=$stage
+        $stage=$null
+        try{
+          $stage=Open-PhaseAExpectedProtectedFile $part.Stage $destination $operator $part.Bytes ReadWriteDelete
+          if($part.Kind -eq 'receipt' -and $CrashAfter -eq 'after-receipt-stage'){throw 'Injected crash after receipt stage.'}
+          if($part.Kind -eq 'signature' -and $CrashAfter -eq 'after-signature-stage'){throw 'Injected crash after signature stage.'}
+          $beforeIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stage.Handle.FileHandle)
+          [ApplyPilot.PhaseA.EvidenceNative]::RenameFileNoReplace($stage.Handle.FileHandle,$part.Final)
+          $afterIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stage.Handle.FileHandle)
+          if($afterIdentity.VolumeSerialNumber -ne $beforeIdentity.VolumeSerialNumber -or $afterIdentity.FileId -cne $beforeIdentity.FileId){throw 'Receipt publication identity changed during rename.'}
+          $stage.Read.Path=$part.Final;$stage.Read.Identity=$afterIdentity
+          $stage|Add-Member -NotePropertyName NativeIdentity -NotePropertyValue $true
+          $published=$stage;$stage=$null
+        }finally{if($stage){$stage.Handle.Dispose()}}
       }
       if($part.Kind -eq 'receipt'){
         $finalReceipt=$published
@@ -1375,6 +1394,9 @@ function Install-PhaseASignedReceipt {
     $finalReceiptValue=ConvertFrom-PhaseACanonicalJsonRead ([pscustomobject]@{Bytes=$finalReceipt.Read.Bytes;Identity=$finalReceipt.Read.Identity;Path=$receiptFinalPath})
     $validation.Receipt=$finalReceiptValue;$validation.SignatureRead=[pscustomobject]@{Bytes=$finalSignature.Read.Bytes;Identity=$finalSignature.Read.Identity;Path=$signatureFinalPath}
     $null=Test-PhaseASignedReceiptCore @validation
+    if($ExpectedReceiptType -ceq 'applypilot.phase-a.evidence-adjudication'){
+      Assert-PhaseAAdjudicationCurrentCandidates $finalReceiptValue.Value $root $operator $DefinitionBundleAuthenticator -DefinitionImport:$DefinitionImport
+    }
     Assert-PhaseAProtectedReceiptPairIdentity $source
     foreach($stagePath in @($receiptStage,$signatureStage)){
       if(Test-Path -LiteralPath $stagePath){$cleanup=Open-PhaseAValidatedFile $stagePath ReadWriteDelete $destination ([IO.Path]::GetFileName($stagePath));try{Set-PhaseAFileDeletionDisposition $cleanup}finally{$cleanup.Dispose()}}
@@ -1386,9 +1408,13 @@ function Install-PhaseASignedReceipt {
   }
 }
 
-function Get-PhaseAReceiptInventory([string]$Root, [string]$OperatorSid) {
+function Get-PhaseAReceiptInventory {
+  [CmdletBinding()]
+  param([Parameter(Mandatory,Position=0)][string]$Root,
+    [Parameter(Mandatory,Position=1)][string]$OperatorSid,[switch]$HoldPairs)
   $inventory = [Collections.Generic.List[object]]::new()
-  foreach ($leaf in @('bundles','adjudications','operations')) {
+  try{
+    foreach ($leaf in @('bundles','adjudications','operations')) {
     $directory = [IO.Path]::Combine($Root, $leaf)
     Assert-PhaseAProtectedAcl $directory $OperatorSid
     $files = @(Get-ChildItem -LiteralPath $directory -Force)
@@ -1436,8 +1462,14 @@ function Get-PhaseAReceiptInventory([string]$Root, [string]$OperatorSid) {
         SignaturePath=$signaturePath; Value=$pair.Receipt.Value; Pair=$pair
       })
     }
+    }
+    $result=@($inventory)
+    if(-not $HoldPairs){foreach($item in $result){if($item.Pair){Close-PhaseAProtectedReceiptPair $item.Pair;$item.Pair=$null}}}
+    return $result
+  }catch{
+    foreach($item in @($inventory)){if($item.Pair){Close-PhaseAProtectedReceiptPair $item.Pair}}
+    throw
   }
-  return @($inventory)
 }
 
 function Get-PhaseAAuthenticatedBundleCandidates {
@@ -1446,19 +1478,17 @@ function Get-PhaseAAuthenticatedBundleCandidates {
     [Parameter(Mandatory)][string]$StoreRoot,
     [Parameter(Mandatory)][string]$CanonicalOperatorSid,
     [Parameter(Mandatory)][string]$SourceIdentityDigest,
-    [scriptblock]$BundleAuthenticator,
+    [scriptblock]$DefinitionBundleAuthenticator,
     [switch]$DefinitionImport
   )
   Assert-PhaseAHexDigest $SourceIdentityDigest 'sourceIdentityDigest'
-  if (-not $DefinitionImport) {
-    throw 'Authenticated bundle candidate enumeration requires the Task4 bundle authenticator.'
-  }
-  if (-not $BundleAuthenticator) { throw 'DefinitionImport requires an explicit bundle authenticator.' }
+  if($DefinitionBundleAuthenticator -and -not $DefinitionImport){throw 'Bundle authenticator override requires DefinitionImport.'}
   $root=Assert-PhaseALocalNtfsPath $StoreRoot
   $operator=Assert-PhaseACurrentOperator $CanonicalOperatorSid
   $directory=[IO.Path]::Combine($root,'bundles')
   Assert-PhaseAProtectedAcl $directory $operator
   $result=[Collections.Generic.List[string]]::new()
+  $finals=[Collections.Generic.List[object]]::new()
   foreach($file in @(Get-ChildItem -LiteralPath $directory -Force | Sort-Object Name)) {
     if($file.PSIsContainer){throw 'Bundles cannot contain directories.'}
     Assert-PhaseAProtectedAcl $file.FullName $operator -File
@@ -1466,12 +1496,18 @@ function Get-PhaseAAuthenticatedBundleCandidates {
     if($file.Name -cnotmatch '^(?<source>[0-9a-f]{64})-(?<preimage>[0-9a-f]{64})\.apeb$'){
       throw 'Bundles contains an unexpected object.'
     }
-    if($Matches.source -cne $SourceIdentityDigest){continue}
-    $expectedPreimage=$Matches.preimage
+    $finals.Add([pscustomobject]@{File=$file;Source=$Matches.source;Preimage=$Matches.preimage})
+  }
+  if($finals.Count -eq 0){return @()}
+  $authenticator=if($DefinitionImport){$DefinitionBundleAuthenticator}else{$script:PhaseABundleAuthenticator}
+  if(-not $authenticator){throw 'Authenticated bundle candidate enumeration requires the Task4 bundle authenticator.'}
+  foreach($final in $finals){
+    if($final.Source -cne $SourceIdentityDigest){continue}
+    $file=$final.File;$expectedPreimage=$final.Preimage
     $handle=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($file.FullName,$false)
     try {
       $identity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($handle)
-      $authenticated=& $BundleAuthenticator ([pscustomobject]@{
+      $authenticated=& $authenticator ([pscustomobject]@{
         Handle=$handle;FileName=$file.Name;SourceIdentityDigest=$SourceIdentityDigest;
         PreimageSha256=$expectedPreimage;Identity=$identity
       })
@@ -1490,6 +1526,20 @@ function Get-PhaseAAuthenticatedBundleCandidates {
   return $sorted
 }
 
+function Assert-PhaseAAdjudicationCurrentCandidates {
+  param($ReceiptValue,[string]$StoreRoot,[string]$CanonicalOperatorSid,
+    [scriptblock]$DefinitionBundleAuthenticator,[switch]$DefinitionImport)
+  if([string]$ReceiptValue.receiptType -cne 'applypilot.phase-a.evidence-adjudication'){throw 'Current candidate validation requires an adjudication receipt.'}
+  $arguments=@{StoreRoot=$StoreRoot;CanonicalOperatorSid=$CanonicalOperatorSid;SourceIdentityDigest=[string]$ReceiptValue.sourceIdentityDigest}
+  if($DefinitionImport){$arguments.DefinitionImport=$true;$arguments.DefinitionBundleAuthenticator=$DefinitionBundleAuthenticator}
+  $current=@(Get-PhaseAAuthenticatedBundleCandidates @arguments)
+  $signed=@($ReceiptValue.candidateBundleSha256)
+  if($current.Count -eq 0 -or $current.Count -ne $signed.Count -or (Compare-Object $current $signed -SyncWindow 0)){
+    throw 'Signed adjudication candidates do not equal the current authenticated store candidate set.'
+  }
+  if($current -cnotcontains [string]$ReceiptValue.selectedBundleSha256){throw 'Selected bundle is not currently authenticated.'}
+}
+
 function Assert-PhaseAEvidenceStore {
   [CmdletBinding()]
   param(
@@ -1502,12 +1552,14 @@ function Assert-PhaseAEvidenceStore {
     [string]$RecoveryEncryptionMetadataPath=$script:ProductionRecoveryEncryptionMetadataPath,
     [string]$RecoveryEncryptionSpkiPath=$script:ProductionRecoveryEncryptionSpkiPath,
     [string]$ExpectedTargetIdentityDigest,[string]$ExpectedMachineIdentityDigest,
-    [string]$AncestorBoundary,[switch]$DefinitionImport
+    [string]$CanonicalStoreRoot,[string]$AncestorBoundary,[scriptblock]$DefinitionBundleAuthenticator,[switch]$DefinitionImport
   )
   $operator=Assert-PhaseACurrentOperator $CanonicalOperatorSid
   $root=Assert-PhaseALocalNtfsPath $StoreRoot
   if(-not $DefinitionImport -and $root -ine $script:ProductionStoreRoot){throw 'Production validation requires the exact native ProgramData evidence root.'}
   if($AncestorBoundary -and -not $DefinitionImport){throw 'Ancestor boundary override requires DefinitionImport.'}
+  if($CanonicalStoreRoot -and -not $DefinitionImport){throw 'Canonical store root override requires DefinitionImport.'}
+  if($DefinitionBundleAuthenticator -and -not $DefinitionImport){throw 'Bundle authenticator override requires DefinitionImport.'}
   $anchorArgs=@{OperatorSigningMetadataPath=$OperatorSigningMetadataPath;OperatorSigningSpkiPath=$OperatorSigningSpkiPath;
     RecoveryEncryptionMetadataPath=$RecoveryEncryptionMetadataPath;RecoveryEncryptionSpkiPath=$RecoveryEncryptionSpkiPath}
   if($DefinitionImport){$anchorArgs.DefinitionImport=$true}
@@ -1520,7 +1572,9 @@ function Assert-PhaseAEvidenceStore {
     $item=Get-Item -LiteralPath ([IO.Path]::Combine($root,$leaf)) -Force
     if(-not $item.PSIsContainer -or ($item.Attributes-band [IO.FileAttributes]::ReparsePoint)){throw 'Required evidence object is not a regular directory.'}
   }
-  $tree=Get-PhaseADirectoryManifest $root
+  $configHandle=$null;$inventory=@()
+  try{
+  $tree=Get-PhaseADirectoryManifest $root -CanonicalRootPath $CanonicalStoreRoot
   $configPath=[IO.Path]::Combine($root,'store.json')
   $configHandle=Open-PhaseAValidatedFile $configPath Read $root 'store.json'
   Assert-PhaseAProtectedFileHandleAcl $configHandle $operator
@@ -1540,7 +1594,7 @@ function Assert-PhaseAEvidenceStore {
       $config.Value.securityDescriptorSha256-cne (Get-PhaseASecurityDescriptorHash $root) -or
       $config.Value.operatorSigningKeySpkiSha256-cne $anchors.OperatorSigning.SpkiSha256 -or
       $config.Value.recoveryKeySpkiSha256-cne $anchors.RecoveryEncryption.SpkiSha256){throw 'Evidence store configuration is invalid.'}
-  $inventory=@(Get-PhaseAReceiptInventory $root $operator)
+  $inventory=@(Get-PhaseAReceiptInventory $root $operator -HoldPairs)
   $sources=@($inventory|Where-Object{$_.Value.receiptType-ceq 'applypilot.phase-a.runtime-source-approval'})
   $hosts=@($inventory|Where-Object{$_.Value.receiptType-ceq 'applypilot.phase-a.host-provisioning'})
   if($sources.Count-ne 1 -or $hosts.Count-ne 1 -or $sources[0].Leaf-cne 'operations' -or $hosts[0].Leaf-cne 'operations'){throw 'Store requires one source approval and one host provisioning pair.'}
@@ -1557,12 +1611,15 @@ function Assert-PhaseAEvidenceStore {
       $verify.ExpectedAuthorizedAfterManifestSha256=[string]$ExpectedReceiptBindingsByHash[$authorizationHash].expectedAfterManifestSha256
     }
     $null=Test-PhaseASignedReceiptCore @verify
+    if($type -ceq 'applypilot.phase-a.evidence-adjudication'){
+      Assert-PhaseAAdjudicationCurrentCandidates $item.Value $root $operator $DefinitionBundleAuthenticator -DefinitionImport:$DefinitionImport
+    }
     Assert-PhaseAProtectedReceiptPairIdentity $item.Pair
   }
   $hostReceiptValue=$hosts[0].Value
   $hostRelativeDigests=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-  foreach($relative in @("operations/$($hosts[0].Hash).json","operations/$($hosts[0].Hash).sig")){
-    $null=$hostRelativeDigests.Add((Get-PhaseASha256 $script:Utf8Strict.GetBytes($relative)))
+  foreach($relative in @("operations\$($hosts[0].Hash).json","operations\$($hosts[0].Hash).sig")){
+    $null=$hostRelativeDigests.Add((Get-PhaseARelativePathDigest $relative))
   }
   $preHost=[ordered]@{schemaVersion=1;manifestType='applypilot.phase-a.directory-manifest';baseRootIdentityDigest=$tree.baseRootIdentityDigest;
     entries=@($tree.entries|Where-Object{-not $hostRelativeDigests.Contains([string]$_.relativePathDigest)})}
@@ -1574,9 +1631,11 @@ function Assert-PhaseAEvidenceStore {
       $hostReceiptValue.operatorSidDigest-cne $config.Value.operatorSidDigest){throw 'Host provisioning receipt does not bind the validated store.'}
   Assert-PhaseAFileIdentity $configHandle $configRead.Identity
   Assert-PhaseAProtectedFileHandleAcl $configHandle $operator
-  $configHandle.Dispose()
-  foreach($item in $inventory){Close-PhaseAProtectedReceiptPair $item.Pair}
-  [pscustomobject]@{Valid=$true;StoreRoot=$root;StoreConfigSha256=$config.Sha256;TargetIdentityDigest=$target;HostProvisioningReceiptSha256=$hosts[0].Hash}
+  return [pscustomobject]@{Valid=$true;StoreRoot=$root;StoreConfigSha256=$config.Sha256;TargetIdentityDigest=$target;HostProvisioningReceiptSha256=$hosts[0].Hash}
+  }finally{
+    foreach($inventoryItem in @($inventory)){if($inventoryItem.Pair){Close-PhaseAProtectedReceiptPair $inventoryItem.Pair}}
+    if($configHandle){$configHandle.Dispose()}
+  }
 }
 
 Export-ModuleMember -Function @(

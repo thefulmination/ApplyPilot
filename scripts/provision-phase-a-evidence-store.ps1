@@ -26,8 +26,8 @@ function Write-PhaseAProtectedFile([string]$Path,[byte[]]$Bytes,[string]$Operato
   & $module {param($p,$s)Set-PhaseAProtectedAcl $p $s -File} $Path $OperatorSid
 }
 
-function Get-PhaseAManifestMaterial([string]$Path) {
-  $value=Get-PhaseADirectoryManifest $Path
+function Get-PhaseAManifestMaterial([string]$Path,[string]$CanonicalRootPath) {
+  $value=Get-PhaseADirectoryManifest $Path -CanonicalRootPath $CanonicalRootPath
   $module=Get-Module PhaseAEvidenceStore
   $bytes=& $module {param($v)ConvertTo-PhaseACanonicalJsonBytes $v} $value
   [pscustomobject]@{Value=$value;Bytes=$bytes;Sha256=(& $module {param($b)Get-PhaseASha256 $b} $bytes)}
@@ -46,12 +46,12 @@ function Invoke-PhaseAEvidenceStoreProvision {
     [Parameter(Mandatory)][string]$RecoveryEncryptionSpkiPath,
     [string]$SourceApprovalReceiptPath,[string]$SourceApprovalSignaturePath,
     [string]$HostProvisioningReceiptPath,[string]$HostProvisioningSignaturePath,
-    [scriptblock]$HostReceiptMaterializer,
+    [scriptblock]$HostReceiptMaterializer,[scriptblock]$DefinitionBundleAuthenticator,
     [string]$TestMachineGuid,[string]$TestSmbiosUuid,[string]$TestAncestorBoundary,
     [scriptblock]$BeforeStageValidation,[scriptblock]$BeforePublication,
     [switch]$CrashBeforePublication,[switch]$DefinitionImport
   )
-  if(-not $DefinitionImport -and ($HostReceiptMaterializer-or $TestMachineGuid-or $TestSmbiosUuid-or $TestAncestorBoundary-or $BeforeStageValidation-or $BeforePublication-or $CrashBeforePublication)){
+  if(-not $DefinitionImport -and ($HostReceiptMaterializer-or $DefinitionBundleAuthenticator-or $TestMachineGuid-or $TestSmbiosUuid-or $TestAncestorBoundary-or $BeforeStageValidation-or $BeforePublication-or $CrashBeforePublication)){
     throw 'Provisioning overrides require DefinitionImport.'
   }
   if(-not $DefinitionImport -and -not (Test-PhaseAElevatedToken)){throw 'Evidence-store provisioning requires elevation.'}
@@ -69,7 +69,7 @@ function Invoke-PhaseAEvidenceStoreProvision {
   $validate=@{CanonicalOperatorSid=$operator;ExpectedCommit=$ExpectedCommit;ExpectedReceiptBindingsByHash=$ExpectedReceiptBindingsByHash;
     OperatorSigningMetadataPath=$OperatorSigningMetadataPath;OperatorSigningSpkiPath=$OperatorSigningSpkiPath;
     RecoveryEncryptionMetadataPath=$RecoveryEncryptionMetadataPath;RecoveryEncryptionSpkiPath=$RecoveryEncryptionSpkiPath}
-  if($DefinitionImport){$validate.DefinitionImport=$true;$validate.ExpectedMachineIdentityDigest=$machine;if($TestAncestorBoundary){$validate.AncestorBoundary=$TestAncestorBoundary}}
+  if($DefinitionImport){$validate.DefinitionImport=$true;$validate.ExpectedMachineIdentityDigest=$machine;if($TestAncestorBoundary){$validate.AncestorBoundary=$TestAncestorBoundary};if($DefinitionBundleAuthenticator){$validate.DefinitionBundleAuthenticator=$DefinitionBundleAuthenticator}}
   if(Test-Path -LiteralPath $final){return Assert-PhaseAEvidenceStore -StoreRoot $final @validate}
   $parent=Split-Path -Parent $final
   if(-not (Test-Path -LiteralPath $parent -PathType Container)){[IO.Directory]::CreateDirectory($parent)|Out-Null}
@@ -79,7 +79,8 @@ function Invoke-PhaseAEvidenceStoreProvision {
   $stageHandle=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory($stage,$sd)
   try {
     foreach($leaf in @('bundles','adjudications','operations')){
-      $child=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory((Join-Path $stage $leaf),$sd);$child.Dispose()
+      $child=$null
+      try{$child=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory((Join-Path $stage $leaf),$sd)}finally{if($child){$child.Dispose()}}
     }
     if(-not $SourceApprovalReceiptPath-or-not $SourceApprovalSignaturePath){throw 'Provisioning requires a complete source-approval pair.'}
     $source=& $module {param($p)Read-PhaseACanonicalJson $p} $SourceApprovalReceiptPath
@@ -97,7 +98,7 @@ function Invoke-PhaseAEvidenceStoreProvision {
     $configBytes=& $module {param($v)ConvertTo-PhaseACanonicalJsonBytes $v} $config
     Write-PhaseAProtectedFile (Join-Path $stage 'store.json') $configBytes $operator
     $configHash=& $module {param($b)Get-PhaseASha256 $b} $configBytes
-    $tree=Get-PhaseAManifestMaterial $stage
+    $tree=Get-PhaseAManifestMaterial $stage $final
     if($HostReceiptMaterializer){
       $material=& $HostReceiptMaterializer ([pscustomobject]@{StoreRoot=$stage;ApprovedCommit=$ExpectedCommit;
         SourceApprovalReceiptSha256=$source.Sha256;OperatorSigningKeySpkiSha256=$anchors.OperatorSigning.SpkiSha256;
@@ -115,7 +116,7 @@ function Invoke-PhaseAEvidenceStoreProvision {
       -DefinitionImport:$DefinitionImport
     $stageIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($stageHandle)
     if($BeforeStageValidation){& $BeforeStageValidation $stage $stageHandle}
-    $validate.ExpectedTargetIdentityDigest=$target
+    $validate.ExpectedTargetIdentityDigest=$target;$validate.CanonicalStoreRoot=$final
     $null=Assert-PhaseAEvidenceStore -StoreRoot $stage @validate
     [ApplyPilot.PhaseA.EvidenceNative]::AssertRawFileIdentity($stageHandle,$stageIdentity)
     if($CrashBeforePublication){throw 'Injected crash before evidence-store publication.'}
@@ -126,6 +127,7 @@ function Invoke-PhaseAEvidenceStoreProvision {
     [ApplyPilot.PhaseA.EvidenceNative]::AssertRawFileIdentity($stageHandle,$stageIdentity)
   } finally {$stageHandle.Dispose()}
   $null=$validate.Remove('ExpectedTargetIdentityDigest')
+  $null=$validate.Remove('CanonicalStoreRoot')
   Assert-PhaseAEvidenceStore -StoreRoot $final @validate
 }
 
@@ -181,7 +183,10 @@ function Invoke-PhaseAProvisioningCleanup {
       $requests=Join-Path $bootstrap 'completion-requests'
       if(-not(Test-Path -LiteralPath $requests)){[IO.Directory]::CreateDirectory($requests)|Out-Null;& $module {param($p,$s)Set-PhaseAProtectedAcl $p $s} $requests $operator}
       else{& $module {param($p,$s)Assert-PhaseAProtectedAcl $p $s} $requests $operator}
-      $existing=@(Get-ChildItem -LiteralPath $requests -File -Filter '*.json')
+      $operationRequests=Join-Path $requests ([string]$auth.operationId)
+      if(-not(Test-Path -LiteralPath $operationRequests)){[IO.Directory]::CreateDirectory($operationRequests)|Out-Null;& $module {param($p,$s)Set-PhaseAProtectedAcl $p $s} $operationRequests $operator}
+      else{& $module {param($p,$s)Assert-PhaseAProtectedAcl $p $s} $operationRequests $operator}
+      $existing=@(Get-ChildItem -LiteralPath $operationRequests -File -Filter '*.json')
       if($existing.Count -gt 1){throw 'Multiple unsigned completion requests exist for cleanup resume.'}
       if($existing.Count -eq 1){
         & $module {param($p,$s)Assert-PhaseAProtectedAcl $p $s -File} $existing[0].FullName $operator
@@ -202,11 +207,13 @@ function Invoke-PhaseAProvisioningCleanup {
         -OperatorSigningSpkiPath $OperatorSigningSpkiPath -ExpectedOperatorSigningKeySpkiSha256 $ExpectedOperatorSigningKeySpkiSha256 `
         -ApprovedCommit $ExpectedCommit -OperationId $auth.operationId -AuthorizationReceiptSha256 $pair.Receipt.Sha256 `
         -ActualAfterManifestSha256 $actual.Sha256 -ExpectedAfterManifestSha256 $auth.expectedAfterManifestSha256 `
-        -CreatedAtUtc $created -CreateUnsigned -OutputDirectory $requests
+        -CreatedAtUtc $created -CreateUnsigned -OutputDirectory $operationRequests
       & $module {param($p,$s)Set-PhaseAProtectedAcl $p $s -File} $request $operator
       return [pscustomobject]@{State='COMPLETION_REQUIRED';CompletionRequestPath=$request;ActualAfterManifestSha256=$actual.Sha256}
     }
     if(-not $CompletionReceiptPath-or-not $CompletionSignaturePath-or-not $CompletionRequestPath){throw 'Resume requires the request and complete signed pair.'}
+    $expectedRequestDirectory=[IO.Path]::Combine($bootstrap,'completion-requests',[string]$auth.operationId)
+    if([IO.Path]::GetFullPath((Split-Path -Parent $CompletionRequestPath))-ine $expectedRequestDirectory){throw 'Completion request is not keyed to the authorized operationId.'}
     & $module {param($p,$s)Assert-PhaseAProtectedAcl $p $s -File} $CompletionRequestPath $operator
     $request=& $module {param($p)Read-PhaseACanonicalJson $p} $CompletionRequestPath
     $installed=Install-PhaseASignedReceipt -ReceiptPath $CompletionReceiptPath -SignaturePath $CompletionSignaturePath `

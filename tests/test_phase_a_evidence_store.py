@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import uuid
@@ -331,7 +332,7 @@ def test_quality_contract_other_schema_independent_canonical_bytes(tmp_path: Pat
             "applypilot.phase-a.evidence-adjudication",
             f"-SourceIdentityDigest {_ps(h['a'])} -SelectedBundleSha256 {_ps(h['b'])} "
             f"-StoreRoot {_ps(candidate_store)} -CanonicalOperatorSid {_ps(sid)} "
-            f"-BundleAuthenticator $auth -DefinitionImport -Nonce {_ps(h['d'])}",
+            f"-DefinitionBundleAuthenticator $auth -DefinitionImport -Nonce {_ps(h['d'])}",
             f'{{"candidateBundleSha256":["{h["b"]}","{h["c"]}"],"createdAtUtc":"{created}",'
             f'"nonce":"{h["d"]}","operatorSigningKeySpkiSha256":"{key_hash}",'
             f'"receiptType":"applypilot.phase-a.evidence-adjudication","schemaVersion":1,'
@@ -340,12 +341,12 @@ def test_quality_contract_other_schema_independent_canonical_bytes(tmp_path: Pat
         (
             "applypilot.phase-a.credential-revocation",
             f"-ApprovedCommit {_ps(commit)} -CredentialReferenceDigest {_ps(h['a'])} "
-            f"-ProviderClass api-key -RevokedAtUtc '2026-07-14T12:30:00Z' "
+            f"-ProviderClass postgres -RevokedAtUtc '2026-07-14T12:30:00Z' "
             f"-StaleProbeAtUtc '2026-07-14T12:31:00Z' -ProviderEvidenceSha256 {_ps(h['b'])} "
             f"-MachineIdentityDigest {_ps(h['c'])} -Nonce {_ps(h['d'])}",
             f'{{"approvedCommit":"{commit}","credentialReferenceDigest":"{h["a"]}",'
             f'"machineIdentityDigest":"{h["c"]}","nonce":"{h["d"]}",'
-            f'"operatorSigningKeySpkiSha256":"{key_hash}","providerClass":"api-key",'
+            f'"operatorSigningKeySpkiSha256":"{key_hash}","providerClass":"postgres",'
             f'"providerEvidenceSha256":"{h["b"]}","receiptType":"applypilot.phase-a.credential-revocation",'
             '"revokedAtUtc":"2026-07-14T12:30:00Z","schemaVersion":1,'
             '"staleProbeAtUtc":"2026-07-14T12:31:00Z","staleProbeResult":"DENIED"}',
@@ -460,7 +461,7 @@ def test_quality_install_holds_source_and_resumes_exact_half_pair(tmp_path: Path
         f"-ReceiptType applypilot.phase-a.credential-revocation "
         f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
         f"-ApprovedCommit {_ps('1'*40)} -CredentialReferenceDigest {_ps('a'*64)} "
-        f"-ProviderClass api-key -RevokedAtUtc '2026-07-14T12:30:00Z' "
+        f"-ProviderClass postgres -RevokedAtUtc '2026-07-14T12:30:00Z' "
         f"-StaleProbeAtUtc '2026-07-14T12:31:00Z' -ProviderEvidenceSha256 {_ps('b'*64)} "
         f"-MachineIdentityDigest {_ps('c'*64)} -Nonce {_ps('d'*64)}"
     )
@@ -560,7 +561,7 @@ def test_bundle_names_staging_residue_and_store_derived_adjudication(tmp_path: P
     derived = _module(
         auth + f"@(Get-PhaseAAuthenticatedBundleCandidates -StoreRoot {_ps(root)} "
         f"-CanonicalOperatorSid {_ps(_current_sid())} -SourceIdentityDigest {_ps(source)} "
-        "-BundleAuthenticator $auth -DefinitionImport) -join ','"
+        "-DefinitionBundleAuthenticator $auth -DefinitionImport) -join ','"
     )
     assert derived.stdout.strip() == candidate
     production = _module(
@@ -736,6 +737,51 @@ def test_definition_provision_validates_before_publish_is_idempotent_and_crash_s
         f"$hostBinding=Get-Content -LiteralPath {_ps(host_receipt)} -Raw|ConvertFrom-Json -AsHashtable -DateKind String;"
         f"$expected[{_ps(host_receipt.stem)}]=$hostBinding;"
     )
+    validation = (
+        f"Assert-PhaseAEvidenceStore -StoreRoot {_ps(final)} -CanonicalOperatorSid {_ps(sid)} "
+        f"-ExpectedCommit {_ps('1'*40)} -ExpectedReceiptBindingsByHash $expected "
+        f"-OperatorSigningMetadataPath {_ps(anchors['signing_meta'])} -OperatorSigningSpkiPath {_ps(anchors['signing_spki'])} "
+        f"-RecoveryEncryptionMetadataPath {_ps(anchors['recovery_meta'])} -RecoveryEncryptionSpkiPath {_ps(anchors['recovery_spki'])} "
+        "-ExpectedMachineIdentityDigest 'b78a83fa8a529aac1bcbc52961ea3d225e30b09ff5287fcdabf3589b0ca0b23e' "
+        f"-AncestorBoundary {_ps(base)} -DefinitionImport"
+    )
+    machine = _module(
+        "Get-PhaseAMachineDigest -MachineGuid '01234567-89ab-cdef-0123-456789abcdef' "
+        "-SmbiosUuid 'fedcba98-7654-3210-fedc-ba9876543210' -DefinitionImport"
+    ).stdout.strip()
+    validation = validation.replace("b78a83fa8a529aac1bcbc52961ea3d225e30b09ff5287fcdabf3589b0ca0b23e", machine)
+    host_signature = host_receipt.with_suffix(".sig")
+    valid_signature = host_signature.read_bytes()
+    host_signature.write_bytes(b"\x00" * len(valid_signature))
+    stress = _module(
+        f"$source=Get-Content {_ps(source_receipt)} -Raw|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"$hostBinding=Get-Content {_ps(host_receipt)} -Raw|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"$expected=@{{{_ps(source_receipt.stem)}=$source;{_ps(host_receipt.stem)}=$hostBinding}};"
+        f"for($i=0;$i -lt 20;$i++){{try{{{validation}|Out-Null}}catch{{}};"
+        f"$exclusive=[IO.FileStream]::new({_ps(host_signature)},[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);$exclusive.Dispose()}};"
+        f"Move-Item {_ps(host_signature)} {_ps(str(host_signature)+'.moved')};Move-Item {_ps(str(host_signature)+'.moved')} {_ps(host_signature)};'released'"
+    )
+    assert stress.stdout.strip() == "released"
+    host_signature.write_bytes(valid_signature)
+    missing = _module(
+        f"$source=Get-Content {_ps(source_receipt)} -Raw|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"$expected=@{{{_ps(source_receipt.stem)}=$source}};try{{{validation}|Out-Null}}catch{{}};"
+        f"Move-Item {_ps(host_receipt)} {_ps(str(host_receipt)+'.moved')};Move-Item {_ps(str(host_receipt)+'.moved')} {_ps(host_receipt)};"
+        f"Move-Item {_ps(final/'store.json')} {_ps(str(final/'store.json')+'.moved')};Move-Item {_ps(str(final/'store.json')+'.moved')} {_ps(final/'store.json')};'released'"
+    )
+    assert missing.stdout.strip() == "released"
+    residue = final / "bundles" / ".staging-33333333-3333-4333-8333-333333333333"
+    residue.write_bytes(b"host-tree-drift")
+    _protect(residue)
+    host_failure = _module(
+        f"$source=Get-Content {_ps(source_receipt)} -Raw|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"$hostBinding=Get-Content {_ps(host_receipt)} -Raw|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"$expected=@{{{_ps(source_receipt.stem)}=$source;{_ps(host_receipt.stem)}=$hostBinding}};"
+        f"try{{{validation}|Out-Null}}catch{{}};Move-Item {_ps(host_receipt)} {_ps(str(host_receipt)+'.moved')};"
+        f"Move-Item {_ps(str(host_receipt)+'.moved')} {_ps(host_receipt)};'released'"
+    )
+    assert host_failure.stdout.strip() == "released"
+    residue.unlink()
     second = json.loads(_run_ps(common + existing_authority + invoke + "|ConvertTo-Json -Compress", timeout=120).stdout)
     assert second["Valid"] is True
     crash_base = tmp_path / "crash-evidence"
@@ -823,3 +869,286 @@ def test_cleanup_requires_post_mutation_completion_then_resumes(tmp_path: Path):
     assert replay["State"] == "COMPLETION_REQUIRED"
     assert Path(replay["CompletionRequestPath"]) == request
     assert not stage.exists()
+    assert request.parent.name == operation
+
+    second_stage = parent / ".provisioning-22222222-2222-4222-8222-222222222222"
+    second_stage.mkdir()
+    (second_stage / "other.bin").write_bytes(b"other")
+    second_before = json.loads(_module(
+        f"Get-PhaseADirectoryManifest -Root {_ps(parent)}|ConvertTo-Json -Depth 12 -Compress"
+    ).stdout)
+    second_target = _module(f"Get-PhaseATargetDigest -Path {_ps(second_stage)}").stdout.strip()
+    second_operation = "b" * 64
+    second_args = auth_args.replace(operation, second_operation).replace(target, second_target).replace(
+        _sha(_canonical(before)), _sha(_canonical(second_before))
+    )
+    second_authorization = Path(_run_ps(
+        f"& {_ps(NEW_RECEIPT)} {second_args} -CreateUnsigned -OutputDirectory {_ps(bootstrap)}"
+    ).stdout.strip())
+    second_signature = second_authorization.with_suffix(".sig")
+    second_signature.write_bytes(_sign(private, second_authorization.read_bytes()))
+    _protect(second_authorization); _protect(second_signature)
+    second_common = common.replace(str(stage), str(second_stage)).replace(
+        str(authorization), str(second_authorization)
+    ).replace(str(authorization_sig), str(second_signature))
+    second_result = json.loads(_run_ps(second_common + "|ConvertTo-Json -Compress", timeout=120).stdout)
+    second_request = Path(second_result["CompletionRequestPath"])
+    assert second_result["State"] == "COMPLETION_REQUIRED"
+    assert second_request.parent.name == second_operation
+    assert request.exists() and second_request.exists()
+
+    conflict = request.parent / f"{'0'*64}.json"
+    conflict.write_bytes(b"{}")
+    _protect(conflict)
+    conflicting = _run_ps("try{" + common + "|Out-Null;'missed'}catch{'rejected'}", timeout=120)
+    assert conflicting.stdout.strip() == "rejected"
+
+
+def test_exact_sidecar_vocabulary_and_provider_interoperability(tmp_path: Path):
+    module = MODULE.read_text(encoding="utf-8")
+    generator = NEW_RECEIPT.read_text(encoding="utf-8")
+    assert "legacy-authority-destruction" not in module + generator
+    assert "applypilot.phase-a.legacy-sidecar-destruction-authorization" in module + generator
+    assert "applypilot.phase-a.legacy-sidecar-destruction-completion" in module + generator
+    exact_providers = ("postgres", "llm-api", "review-api", "other")
+    for old_provider in ("oauth-refresh-token", "api-key", "session-cookie", "password"):
+        assert f"'{old_provider}'" not in module + generator
+    _, public, key_hash = _new_keypair(tmp_path, "vocabulary")
+    output = tmp_path / "unsigned"
+    sid = _current_sid()
+    command = (
+        f"& {_ps(NEW_RECEIPT)} -ReceiptType applypilot.phase-a.legacy-sidecar-destruction-authorization "
+        f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ApprovedCommit {_ps('1'*40)} -OperationId {_ps('2'*64)} -TargetIdentityDigest {_ps('3'*64)} "
+        f"-BeforeManifestSha256 {_ps('4'*64)} -ExpectedAfterManifestSha256 {_ps('5'*64)} "
+        f"-EvidenceBundleSha256 {_ps('6'*64)} -CredentialInventoryRoot {_ps('7'*64)} "
+        f"-CredentialRevocationSetRoot {_ps('8'*64)} -OperatorSid {_ps(sid)} "
+        f"-CreatedAtUtc '2026-07-14T12:34:56Z' -CreateUnsigned -OutputDirectory {_ps(output)}"
+    )
+    receipt = Path(_run_ps(command).stdout.strip())
+    expected = (
+        f'{{"approvedCommit":"{"1"*40}","beforeManifestSha256":"{"4"*64}",'
+        f'"createdAtUtc":"2026-07-14T12:34:56Z","credentialInventoryRoot":"{"7"*64}",'
+        f'"credentialRevocationSetRoot":"{"8"*64}","evidenceBundleSha256":"{"6"*64}",'
+        f'"expectedAfterManifestSha256":"{"5"*64}","operationId":"{"2"*64}",'
+        f'"operatorSid":"{sid}","operatorSigningKeySpkiSha256":"{key_hash}",'
+        '"receiptType":"applypilot.phase-a.legacy-sidecar-destruction-authorization",'
+        f'"schemaVersion":1,"targetIdentityDigest":"{"3"*64}"}}'
+    ).encode("ascii")
+    assert receipt.read_bytes() == expected
+    completion = Path(_run_ps(
+        f"& {_ps(NEW_RECEIPT)} -ReceiptType applypilot.phase-a.legacy-sidecar-destruction-completion "
+        f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ApprovedCommit {_ps('1'*40)} -OperationId {_ps('2'*64)} -AuthorizationReceiptSha256 {_ps('6'*64)} "
+        f"-ActualAfterManifestSha256 {_ps('5'*64)} -ExpectedAfterManifestSha256 {_ps('5'*64)} "
+        f"-CreatedAtUtc '2026-07-14T12:35:00Z' -CreateUnsigned -OutputDirectory {_ps(output/'completion')}"
+    ).stdout.strip())
+    expected_completion = (
+        f'{{"actualAfterManifestSha256":"{"5"*64}","approvedCommit":"{"1"*40}",'
+        f'"authorizationReceiptSha256":"{"6"*64}","createdAtUtc":"2026-07-14T12:35:00Z",'
+        f'"operationId":"{"2"*64}","operatorSigningKeySpkiSha256":"{key_hash}",'
+        '"receiptType":"applypilot.phase-a.legacy-sidecar-destruction-completion",'
+        '"result":"COMPLETE","schemaVersion":1}'
+    ).encode("ascii")
+    assert completion.read_bytes() == expected_completion
+    revocation_common = (
+        f"-ReceiptType applypilot.phase-a.credential-revocation -OperatorSigningSpkiPath {_ps(public)} "
+        f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} -ApprovedCommit {_ps('1'*40)} "
+        f"-CredentialReferenceDigest {_ps('2'*64)} -RevokedAtUtc '2026-07-14T12:30:00Z' "
+        f"-StaleProbeAtUtc '2026-07-14T12:31:00Z' -ProviderEvidenceSha256 {_ps('3'*64)} "
+        f"-MachineIdentityDigest {_ps('4'*64)} -Nonce {_ps('5'*64)} "
+        f"-CreatedAtUtc '2026-07-14T12:35:00Z' -CreateUnsigned"
+    )
+    for provider in exact_providers:
+        provider_output = output / provider
+        provider_receipt = Path(_run_ps(
+            f"& {_ps(NEW_RECEIPT)} {revocation_common} -ProviderClass {_ps(provider)} "
+            f"-OutputDirectory {_ps(provider_output)}"
+        ).stdout.strip())
+        assert json.loads(provider_receipt.read_bytes())["providerClass"] == provider
+    for provider in ("oauth-refresh-token", "api-key", "session-cookie", "password"):
+        rejected = _run_ps(
+            "try{" + f"& {_ps(NEW_RECEIPT)} {revocation_common} -ProviderClass {_ps(provider)} "
+            f"-OutputDirectory {_ps(output / ('rejected-' + provider))}|Out-Null;'missed'" +
+            "}catch{'rejected'}"
+        )
+        assert rejected.stdout.strip() == "rejected"
+
+
+def test_manifest_digest_formulas_match_independent_fixed_vectors():
+    volume = 0x0102030405060708
+    file_id = bytes(range(16))
+    canonical_path = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Case\File.bin"
+    relative = r"Nested\File.bin"
+    expected_target = hashlib.sha256(
+        b"applypilot.phase-a.target.v1\0"
+        + struct.pack("<Q", volume)
+        + file_id
+        + struct.pack("<I", len(canonical_path.encode("utf-8")))
+        + canonical_path.encode("utf-8")
+    ).hexdigest()
+    expected_relative = hashlib.sha256(
+        b"applypilot.phase-a.relative-path.v1\0" + relative.encode("utf-8")
+    ).hexdigest()
+    result = json.loads(_module(
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param($v,$id,$path,$relative)"
+        "[pscustomobject]@{Target=Get-PhaseATargetIdentityDigestFromParts $v $id $path;"
+        "Relative=Get-PhaseARelativePathDigest $relative}} "
+        f"{volume} {_ps(file_id.hex())} {_ps(canonical_path)} {_ps(relative)}|ConvertTo-Json -Compress"
+    ).stdout)
+    assert result == {"Target": expected_target, "Relative": expected_relative}
+
+
+def test_manifest_uses_held_volume_guid_paths_and_preserves_relative_casing(tmp_path: Path):
+    root = tmp_path / "ManifestRoot"
+    nested = root / "NestedCase"
+    nested.mkdir(parents=True)
+    target = nested / "FileCase.bin"
+    target.write_bytes(b"content")
+    manifest = json.loads(_module(
+        f"Get-PhaseADirectoryManifest -Root {_ps(root)}|ConvertTo-Json -Depth 8 -Compress"
+    ).stdout)
+    held = json.loads(_module(
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param($p)"
+        "$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($p,$false);try{"
+        "$i=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h);"
+        "[pscustomobject]@{Volume=$i.VolumeSerialNumber;FileId=$i.FileId;Path=[ApplyPilot.PhaseA.EvidenceNative]::GetVolumeGuidPath($h)}}finally{$h.Dispose()}} "
+        f"{_ps(target)}|ConvertTo-Json -Compress"
+    ).stdout)
+    relative = r"NestedCase\FileCase.bin"
+    expected_relative = hashlib.sha256(
+        b"applypilot.phase-a.relative-path.v1\0" + relative.encode("utf-8")
+    ).hexdigest()
+    path_bytes = held["Path"].encode("utf-8")
+    expected_object = hashlib.sha256(
+        b"applypilot.phase-a.target.v1\0"
+        + struct.pack("<Q", held["Volume"])
+        + bytes.fromhex(held["FileId"])
+        + struct.pack("<I", len(path_bytes))
+        + path_bytes
+    ).hexdigest()
+    file_entry = next(entry for entry in manifest["entries"] if entry["kind"] == "file")
+    assert file_entry["relativePathDigest"] == expected_relative
+    assert file_entry["objectIdentityDigest"] == expected_object
+
+
+@pytest.mark.parametrize("mutation", ["add", "remove"])
+def test_adjudication_install_rejects_changed_authenticated_candidate_set(tmp_path: Path, mutation: str):
+    private, public, key_hash = _new_keypair(tmp_path, "adjudication")
+    sid = _current_sid()
+    store = tmp_path / "store"
+    store.mkdir()
+    _protect(store)
+    for leaf in ("bundles", "adjudications", "operations"):
+        (store / leaf).mkdir()
+        _protect(store / leaf)
+    source, preimage_a, preimage_b = "a" * 64, "b" * 64, "c" * 64
+    candidate_a, candidate_b = "d" * 64, "e" * 64
+
+    def add_bundle(preimage: str) -> Path:
+        path = store / "bundles" / f"{source}-{preimage}.apeb"
+        path.write_bytes(preimage.encode("ascii"))
+        _protect(path)
+        return path
+
+    first = add_bundle(preimage_a)
+    second = add_bundle(preimage_b) if mutation == "remove" else None
+    authenticator = (
+        "$auth={param($c)$candidate=if($c.PreimageSha256 -ceq '" + preimage_a + "'){'"
+        + candidate_a + "'}else{'" + candidate_b + "'};[ordered]@{"
+        "sourceIdentityDigest=$c.SourceIdentityDigest;preimageSha256=$c.PreimageSha256;"
+        "candidateBundleSha256=$candidate}};"
+    )
+    unsigned = tmp_path / "unsigned"
+    receipt = Path(_run_ps(
+        authenticator + f"& {_ps(NEW_RECEIPT)} -ReceiptType applypilot.phase-a.evidence-adjudication "
+        f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-SourceIdentityDigest {_ps(source)} -SelectedBundleSha256 {_ps(candidate_a)} "
+        f"-StoreRoot {_ps(store)} -CanonicalOperatorSid {_ps(sid)} -DefinitionBundleAuthenticator $auth "
+        f"-DefinitionImport -Nonce {_ps('f'*64)} -CreatedAtUtc '2026-07-14T12:34:56Z' "
+        f"-CreateUnsigned -OutputDirectory {_ps(unsigned)}"
+    ).stdout.strip())
+    signature = receipt.with_suffix(".sig")
+    signature.write_bytes(_sign(private, receipt.read_bytes()))
+    _protect(receipt)
+    _protect(signature)
+    if mutation == "add":
+        add_bundle(preimage_b)
+    else:
+        second.unlink()
+    expected = receipt.read_text(encoding="utf-8").replace("'", "''")
+    result = _module(
+        authenticator + f"$expected='{expected}'|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"try{{Install-PhaseASignedReceipt -ReceiptPath {_ps(receipt)} -SignaturePath {_ps(signature)} "
+        f"-StoreRoot {_ps(store)} -OperatorSigningSpkiPath {_ps(public)} "
+        f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        "-ExpectedReceiptType applypilot.phase-a.evidence-adjudication -ExpectedBindings $expected "
+        "-DefinitionBundleAuthenticator $auth -DefinitionImport|Out-Null;'missed'}catch{'rejected'}"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert list((store / "adjudications").iterdir()) == []
+
+
+def test_adjudication_install_revalidates_after_publication_race(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "adjudication-race")
+    sid = _current_sid()
+    store = tmp_path / "store"
+    store.mkdir()
+    _protect(store)
+    for leaf in ("bundles", "adjudications", "operations"):
+        (store / leaf).mkdir()
+        _protect(store / leaf)
+    source, preimage, candidate = "a" * 64, "b" * 64, "c" * 64
+    bundle = store / "bundles" / f"{source}-{preimage}.apeb"
+    bundle.write_bytes(b"one")
+    _protect(bundle)
+    authenticator = (
+        "$auth={param($c)[ordered]@{sourceIdentityDigest=$c.SourceIdentityDigest;"
+        "preimageSha256=$c.PreimageSha256;candidateBundleSha256='" + candidate + "'}};"
+    )
+    receipt = Path(_run_ps(
+        authenticator + f"& {_ps(NEW_RECEIPT)} -ReceiptType applypilot.phase-a.evidence-adjudication "
+        f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-SourceIdentityDigest {_ps(source)} -SelectedBundleSha256 {_ps(candidate)} -StoreRoot {_ps(store)} "
+        f"-CanonicalOperatorSid {_ps(sid)} -DefinitionBundleAuthenticator $auth -DefinitionImport "
+        f"-Nonce {_ps('d'*64)} -CreatedAtUtc '2026-07-14T12:34:56Z' -CreateUnsigned -OutputDirectory {_ps(tmp_path/'unsigned')}"
+    ).stdout.strip())
+    signature = receipt.with_suffix(".sig")
+    signature.write_bytes(_sign(private, receipt.read_bytes()))
+    _protect(receipt); _protect(signature)
+    expected = receipt.read_text(encoding="utf-8").replace("'", "''")
+    added = store / "bundles" / f"{source}-{'e'*64}.apeb"
+    race = (
+        f"$race={{param($pair)[IO.File]::WriteAllBytes({_ps(added)},[Text.Encoding]::ASCII.GetBytes('two'));"
+        f"$m=Get-Module PhaseAEvidenceStore;& $m {{param($p,$s)Set-PhaseAProtectedAcl $p $s -File}} {_ps(added)} {_ps(sid)}}};"
+    )
+    result = _module(
+        authenticator + race + f"$expected='{expected}'|ConvertFrom-Json -AsHashtable -DateKind String;"
+        f"try{{Install-PhaseASignedReceipt -ReceiptPath {_ps(receipt)} -SignaturePath {_ps(signature)} "
+        f"-StoreRoot {_ps(store)} -OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        "-ExpectedReceiptType applypilot.phase-a.evidence-adjudication -ExpectedBindings $expected "
+        "-DefinitionBundleAuthenticator $auth -BeforeFinalPairRevalidation $race -DefinitionImport|Out-Null;'missed'}catch{'rejected'}"
+    )
+    assert result.stdout.strip() == "rejected"
+
+
+def test_empty_bundle_store_is_enumerable_but_cannot_create_adjudication(tmp_path: Path):
+    _, public, key_hash = _new_keypair(tmp_path, "empty-adjudication")
+    sid = _current_sid()
+    store = tmp_path / "store"
+    store.mkdir(); _protect(store)
+    for leaf in ("bundles", "adjudications", "operations"):
+        (store / leaf).mkdir(); _protect(store / leaf)
+    count = _module(
+        f"@(Get-PhaseAAuthenticatedBundleCandidates -StoreRoot {_ps(store)} "
+        f"-CanonicalOperatorSid {_ps(sid)} -SourceIdentityDigest {_ps('a'*64)}).Count"
+    )
+    assert count.stdout.strip() == "0"
+    rejected = _run_ps(
+        f"try{{& {_ps(NEW_RECEIPT)} -ReceiptType applypilot.phase-a.evidence-adjudication "
+        f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-SourceIdentityDigest {_ps('a'*64)} -SelectedBundleSha256 {_ps('b'*64)} -StoreRoot {_ps(store)} "
+        f"-CanonicalOperatorSid {_ps(sid)} -Nonce {_ps('c'*64)} -CreatedAtUtc '2026-07-14T12:34:56Z' "
+        f"-CreateUnsigned -OutputDirectory {_ps(tmp_path/'unsigned')}|Out-Null;'missed'}}catch{{'rejected'}}"
+    )
+    assert rejected.stdout.strip() == "rejected"
