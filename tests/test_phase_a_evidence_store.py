@@ -11,6 +11,8 @@ import sys
 import uuid
 
 import pytest
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +106,16 @@ def _protect(path: Path, sid: str | None = None) -> None:
     )
 
 
+def _test_store(root: Path) -> tuple[Path, str]:
+    root.mkdir(parents=True)
+    for name in ("bundles", "adjudications", "operations"):
+        (root / name).mkdir()
+        _protect(root / name)
+    config = b"{}"
+    (root / "store.json").write_bytes(config)
+    return root, _sha(config)
+
+
 def _receipt(receipt_type: str, key_hash: str, **overrides):
     value = {
         "schema": "applypilot.phase-a.signed-receipt.v1",
@@ -115,13 +127,265 @@ def _receipt(receipt_type: str, key_hash: str, **overrides):
         "operatorSidDigest": "2" * 64,
         "machineDigest": "3" * 64,
         "storeConfigSha256": "4" * 64,
-        "hostProvisioningReceiptSha256": "5" * 64,
-        "sourceApprovalReceiptSha256": "6" * 64,
         "manifestBeforeSha256": "7" * 64,
         "manifestAfterSha256": "8" * 64,
     }
+    if receipt_type in {
+        "source-approval", "adjudication", "credential-revocation",
+        "operation-authorization", "operation-completion",
+    }:
+        value["hostProvisioningReceiptSha256"] = "5" * 64
+    if receipt_type in {"adjudication", "operation-authorization", "operation-completion"}:
+        value["sourceApprovalReceiptSha256"] = "6" * 64
     value.update(overrides)
     return value
+
+
+def _validation_args(receipt: dict[str, str], **overrides: str) -> str:
+    pairs = {
+        "ExpectedSigningSpkiSha256": receipt["signingKeySpkiSha256"],
+        "ExpectedReceiptType": receipt["receiptType"],
+        "ExpectedCommit": receipt["commit"],
+        "ExpectedOperationId": receipt["operationId"],
+        "ExpectedTargetDigest": receipt["targetDigest"],
+        "ExpectedOperatorSidDigest": receipt["operatorSidDigest"],
+        "ExpectedMachineDigest": receipt["machineDigest"],
+        "ExpectedStoreConfigSha256": receipt["storeConfigSha256"],
+        "ExpectedManifestBeforeSha256": receipt["manifestBeforeSha256"],
+        "ExpectedManifestAfterSha256": receipt["manifestAfterSha256"],
+    }
+    if "hostProvisioningReceiptSha256" in receipt:
+        pairs["ExpectedHostProvisioningReceiptSha256"] = receipt["hostProvisioningReceiptSha256"]
+    if "sourceApprovalReceiptSha256" in receipt:
+        pairs["ExpectedSourceApprovalReceiptSha256"] = receipt["sourceApprovalReceiptSha256"]
+    pairs.update(overrides)
+    return " ".join(f"-{name} {_ps(value)}" for name, value in pairs.items())
+
+
+def _generator_args(receipt: dict[str, str], public: Path) -> str:
+    names = {
+        "ReceiptType": receipt["receiptType"], "Commit": receipt["commit"],
+        "SigningSpkiPath": str(public),
+        "ExpectedSigningSpkiSha256": receipt["signingKeySpkiSha256"],
+        "OperationId": receipt["operationId"], "TargetDigest": receipt["targetDigest"],
+        "OperatorSidDigest": receipt["operatorSidDigest"], "MachineDigest": receipt["machineDigest"],
+        "StoreConfigSha256": receipt["storeConfigSha256"],
+        "ManifestBeforeSha256": receipt["manifestBeforeSha256"],
+        "ManifestAfterSha256": receipt["manifestAfterSha256"],
+    }
+    if "hostProvisioningReceiptSha256" in receipt:
+        names["HostProvisioningReceiptSha256"] = receipt["hostProvisioningReceiptSha256"]
+    if "sourceApprovalReceiptSha256" in receipt:
+        names["SourceApprovalReceiptSha256"] = receipt["sourceApprovalReceiptSha256"]
+    return " ".join(f"-{name} {_ps(value)}" for name, value in names.items())
+
+
+def _preprovisioned_store(tmp_path: Path) -> dict[str, object]:
+    base = tmp_path / "fixture"
+    base.mkdir(parents=True)
+    _protect(base)
+    signing_private, signing_public, signing_hash = _new_keypair(base, "signing")
+    recovery_private, recovery_public, recovery_hash = _new_keypair(base, "recovery")
+    root = base / "v1"
+    root.mkdir()
+    _protect(root)
+    for name in ("bundles", "adjudications", "operations"):
+        (root / name).mkdir()
+        _protect(root / name)
+    sid = _current_sid()
+    target = _module(f"Get-PhaseATargetDigest -Path {_ps(root)}").stdout.strip()
+    operator = _sha(b"applypilot.phase-a.operator-sid.v1\0" + sid.encode("ascii"))
+    machine_guid = "01234567-89ab-cdef-0123-456789abcdef"
+    smbios_uuid = "fedcba98-7654-3210-fedc-ba9876543210"
+    machine = _sha(
+        b"applypilot.phase-a.machine.v1\0"
+        + uuid.UUID(machine_guid).bytes_le
+        + uuid.UUID(smbios_uuid).bytes_le
+    )
+    security = _module(f"Get-PhaseASecurityDescriptorHash -Path {_ps(root)}").stdout.strip()
+    commit = "d3a08bf9fc7a9fa8b920c3e845a0ab978ab6cf57"
+    config = {
+        "schema": "applypilot.phase-a.evidence-store.v1",
+        "approvedCommit": commit,
+        "targetDigest": target,
+        "operatorSidDigest": operator,
+        "machineDigest": machine,
+        "securityDescriptorSha256": security,
+        "signingSpkiSha256": signing_hash,
+        "recoverySigningSpkiSha256": recovery_hash,
+    }
+    config_bytes = _canonical(config)
+    (root / "store.json").write_bytes(config_bytes)
+    _protect(root / "store.json")
+    config_hash = _sha(config_bytes)
+    operation = str(uuid.uuid4())
+    host = _receipt(
+        "host-provisioning",
+        recovery_hash,
+        commit=commit,
+        operationId=operation,
+        targetDigest=target,
+        operatorSidDigest=operator,
+        machineDigest=machine,
+        storeConfigSha256=config_hash,
+    )
+    host_bytes = _canonical(host)
+    host_path = root / "operations" / f"{_sha(host_bytes)}.json"
+    host_path.write_bytes(host_bytes)
+    host_path.with_suffix(".sig").write_bytes(_sign(recovery_private, host_bytes))
+    _protect(host_path)
+    _protect(host_path.with_suffix(".sig"))
+    return {
+        "root": root, "sid": sid, "target": target, "operator": operator,
+        "machine": machine, "machine_guid": machine_guid, "smbios_uuid": smbios_uuid,
+        "commit": commit, "config_hash": config_hash, "operation": operation,
+        "before": host["manifestBeforeSha256"], "after": host["manifestAfterSha256"],
+        "signing_private": signing_private, "signing_public": signing_public,
+        "signing_hash": signing_hash, "recovery_private": recovery_private,
+        "recovery_public": recovery_public, "recovery_hash": recovery_hash,
+        "host_path": host_path, "host_hash": host_path.stem,
+    }
+
+
+def _assert_store_body(fixture: dict[str, object]) -> str:
+    return (
+        f"Assert-PhaseAEvidenceStore -StoreRoot {_ps(fixture['root'])} "
+        f"-CanonicalOperatorSid {_ps(fixture['sid'])} -ExpectedCommit {_ps(fixture['commit'])} "
+        f"-SigningSpkiPath {_ps(fixture['signing_public'])} "
+        f"-RecoverySigningSpkiPath {_ps(fixture['recovery_public'])} "
+        f"-SigningSpkiSha256 {_ps(fixture['signing_hash'])} "
+        f"-RecoverySigningSpkiSha256 {_ps(fixture['recovery_hash'])} "
+        f"-CustodyOperationId {_ps(fixture['operation'])} "
+        f"-CustodyManifestBeforeSha256 {_ps(fixture['before'])} "
+        f"-CustodyManifestAfterSha256 {_ps(fixture['after'])} "
+        f"-ExpectedTargetDigest {_ps(fixture['target'])} "
+        f"-ExpectedMachineDigest {_ps(fixture['machine'])} -AncestorBoundary {_ps(fixture['root'].parent)} "
+        "-DefinitionImport | ConvertTo-Json -Compress"
+    )
+
+
+def _assert_store(fixture: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    return _module(_assert_store_body(fixture))
+
+
+def _cleanup_fixture(tmp_path: Path) -> dict[str, object]:
+    private, public, key_hash = _new_keypair(tmp_path, "cleanup")
+    parent = tmp_path / "evidence"
+    parent.mkdir()
+    stage = parent / f".provisioning-{uuid.uuid4()}"
+    (stage / "nested").mkdir(parents=True)
+    (stage / "nested" / "one.txt").write_text("one", encoding="utf-8")
+    (stage / "two.txt").write_text("two", encoding="utf-8")
+    bootstrap = tmp_path / "bootstrap-operations"
+    bootstrap.mkdir()
+    _protect(bootstrap)
+    before = json.loads(
+        _module(f"Get-PhaseADirectoryManifest -Root {_ps(parent)} | ConvertTo-Json -Depth 16 -Compress").stdout
+    )
+    before_bytes = _canonical(before)
+    stage_name = stage.name
+    after = {
+        "schema": "applypilot.phase-a.directory-manifest.v1",
+        "entries": [
+            entry for entry in before["entries"]
+            if entry["relativePath"] != stage_name
+            and not entry["relativePath"].startswith(stage_name + "/")
+        ],
+    }
+    after_bytes = _canonical(after)
+    after_path = tmp_path / "expected-after.json"
+    after_path.write_bytes(after_bytes)
+    target = _module(f"Get-PhaseATargetDigest -Path {_ps(stage)}").stdout.strip()
+    values = {
+        "commit": "d3a08bf9fc7a9fa8b920c3e845a0ab978ab6cf57",
+        "operation": str(uuid.uuid4()), "target": target,
+        "operator": "2" * 64, "machine": "3" * 64, "store": "4" * 64,
+        "host": "5" * 64, "source": "6" * 64,
+        "before": _sha(before_bytes), "after": _sha(after_bytes),
+    }
+    paths = {}
+    for receipt_type in ("operation-authorization", "operation-completion"):
+        receipt = _receipt(
+            receipt_type, key_hash, commit=values["commit"], operationId=values["operation"],
+            targetDigest=target, operatorSidDigest=values["operator"], machineDigest=values["machine"],
+            storeConfigSha256=values["store"], hostProvisioningReceiptSha256=values["host"],
+            sourceApprovalReceiptSha256=values["source"], manifestBeforeSha256=values["before"],
+            manifestAfterSha256=values["after"],
+        )
+        data = _canonical(receipt)
+        path = bootstrap / f"{_sha(data)}.json"
+        path.write_bytes(data)
+        path.with_suffix(".sig").write_bytes(_sign(private, data))
+        _protect(path)
+        _protect(path.with_suffix(".sig"))
+        paths[receipt_type] = path
+    return {
+        "stage": stage, "parent": parent, "bootstrap": bootstrap, "after_path": after_path,
+        "public": public, "key_hash": key_hash, **values,
+        "authorization": paths["operation-authorization"],
+        "completion": paths["operation-completion"],
+    }
+
+
+def _cleanup_body(f: dict[str, object], extra: str = "") -> str:
+    return (
+        f". {_ps(PROVISION)} -DefinitionImport; Invoke-PhaseAProvisioningCleanup "
+        f"-StagingPath {_ps(f['stage'])} -CanonicalOperatorSid {_ps(_current_sid())} "
+        f"-RecoverySigningSpkiPath {_ps(f['public'])} -RecoverySigningSpkiSha256 {_ps(f['key_hash'])} "
+        f"-ExpectedCommit {_ps(f['commit'])} -ExpectedOperationId {_ps(f['operation'])} "
+        f"-ExpectedTargetDigest {_ps(f['target'])} -ExpectedOperatorSidDigest {_ps(f['operator'])} "
+        f"-ExpectedMachineDigest {_ps(f['machine'])} -ExpectedStoreConfigSha256 {_ps(f['store'])} "
+        f"-ExpectedHostProvisioningReceiptSha256 {_ps(f['host'])} "
+        f"-ExpectedSourceApprovalReceiptSha256 {_ps(f['source'])} "
+        f"-ExpectedManifestBeforeSha256 {_ps(f['before'])} -ExpectedManifestAfterSha256 {_ps(f['after'])} "
+        f"-AuthorizationReceiptPath {_ps(f['authorization'])} "
+        f"-AuthorizationSignaturePath {_ps(f['authorization'].with_suffix('.sig'))} "
+        f"-CompletionReceiptPath {_ps(f['completion'])} "
+        f"-CompletionSignaturePath {_ps(f['completion'].with_suffix('.sig'))} "
+        f"-ExpectedAfterManifestPath {_ps(f['after_path'])} -TestBootstrapRoot {_ps(f['bootstrap'])} {extra}"
+    )
+
+
+def _provision_body(tmp_path: Path, mode: str, evidence_base: Path | None = None) -> tuple[str, Path]:
+    signing_private, signing_public, signing_hash = _new_keypair(tmp_path, "provision-signing")
+    recovery_private, recovery_public, recovery_hash = _new_keypair(tmp_path, "provision-recovery")
+    base = evidence_base or (tmp_path / "evidence")
+    base.mkdir()
+    _protect(base)
+    final = base / "v1"
+    material = tmp_path / "material"
+    operation = str(uuid.uuid4())
+    callback = (
+        "$materializer={param($ctx) "
+        f"$output={_ps(material)};"
+        f"$receipt=& {_ps(NEW_RECEIPT)} -ReceiptType host-provisioning -Commit $ctx.Commit "
+        f"-SigningSpkiPath {_ps(recovery_public)} -ExpectedSigningSpkiSha256 $ctx.RecoverySigningSpkiSha256 "
+        "-OperationId $ctx.OperationId -TargetDigest $ctx.TargetDigest -OperatorSidDigest $ctx.OperatorSidDigest "
+        "-MachineDigest $ctx.MachineDigest -StoreConfigSha256 $ctx.StoreConfigSha256 "
+        "-ManifestBeforeSha256 $ctx.ManifestBeforeSha256 -ManifestAfterSha256 $ctx.ManifestAfterSha256 "
+        "-CreateUnsigned -OutputDirectory $output;"
+        f"$rsa=[Security.Cryptography.RSA]::Create();$rsa.ImportFromPem([IO.File]::ReadAllText({_ps(recovery_private)}));"
+        "$bytes=[IO.File]::ReadAllBytes($receipt);"
+        "$signature=$rsa.SignData($bytes,[Security.Cryptography.HashAlgorithmName]::SHA256,"
+        "[Security.Cryptography.RSASignaturePadding]::Pss);$rsa.Dispose();"
+        "$sig=[IO.Path]::ChangeExtension($receipt,'sig');[IO.File]::WriteAllBytes($sig,$signature);"
+        + ("[IO.File]::WriteAllBytes($sig,[byte[]]::new(384));" if mode == "invalid" else "")
+        + "[pscustomobject]@{ReceiptPath=$receipt;SignaturePath=$sig}};"
+    )
+    invoke = (
+        f". {_ps(PROVISION)} -DefinitionImport;{callback}"
+        f"Invoke-PhaseAEvidenceStoreProvision -StoreRoot {_ps(final)} -CanonicalOperatorSid {_ps(_current_sid())} "
+        "-ExpectedCommit d3a08bf9fc7a9fa8b920c3e845a0ab978ab6cf57 "
+        f"-SigningSpkiPath {_ps(signing_public)} -RecoverySigningSpkiPath {_ps(recovery_public)} "
+        f"-SigningSpkiSha256 {signing_hash} -RecoverySigningSpkiSha256 {recovery_hash} "
+        f"-CustodyOperationId {operation} -CustodyManifestBeforeSha256 {'7' * 64} "
+        f"-CustodyManifestAfterSha256 {'8' * 64} -HostReceiptMaterializer $materializer "
+        "-TestMachineGuid 01234567-89ab-cdef-0123-456789abcdef "
+        "-TestSmbiosUuid fedcba98-7654-3210-fedc-ba9876543210 "
+        f"-TestAncestorBoundary {_ps(base)} -DefinitionImport "
+        + ("-CrashBeforePublication " if mode == "crash" else "")
+    )
+    return invoke, final
 
 
 def test_owned_files_and_exported_surface_exist():
@@ -142,6 +406,34 @@ def test_owned_files_and_exported_surface_exist():
             "Test-PhaseASignedReceipt",
         ]
     )
+
+
+def test_review_corrections_are_structural_contracts():
+    module = MODULE.read_text(encoding="utf-8")
+    provision = PROVISION.read_text(encoding="utf-8")
+    generator = NEW_RECEIPT.read_text(encoding="utf-8")
+
+    assert "$env:ProgramData" not in module + provision
+    assert "[Environment]::GetFolderPath" in module + provision
+    assert "Remove-Item -LiteralPath $stage -Recurse" not in provision
+    assert "[IO.File]::ReadAllBytes" not in module + generator
+    assert "[Parameter(Mandatory)][string]$ExpectedCommit" in module
+    assert "[Parameter(Mandatory)][string]$StoreRoot" not in provision.split(
+        "function Invoke-PhaseAEvidenceStoreProvision", 1
+    )[0]
+    assert "[Parameter(Mandatory)][string]$InputPath" not in generator
+    assert "[ValidateSet('source-approval'" in generator
+    assert "DestinationDirectory" not in "\n".join(
+        line for line in module.splitlines() if "Install-PhaseASignedReceipt" in line or "param(" in line
+    )
+
+
+def test_production_entrypoint_has_no_root_override():
+    result = _run_ps(
+        f"try {{ & {_ps(PROVISION)} -StoreRoot 'C:\\redirected' -CanonicalOperatorSid {_ps(_current_sid())}; "
+        "'missed' } catch { 'rejected' }"
+    )
+    assert result.stdout.strip() == "rejected"
 
 
 def test_operator_digest_domain_and_current_token_must_match():
@@ -197,7 +489,8 @@ def test_canonical_json_rejects_duplicate_unknown_and_noncanonical_receipts(tmp_
         candidate.with_suffix(".sig").write_bytes(b"x" * 384)
         result = _module(
             f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(candidate)} "
-            f"-SignaturePath {_ps(candidate.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)}; "
+            f"-SignaturePath {_ps(candidate.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)} "
+            f"{_validation_args(base)}; "
             "'missed' } catch { 'rejected' }"
         )
         assert result.stdout.strip() == "rejected"
@@ -214,10 +507,17 @@ def test_signed_receipt_signature_filename_and_binding_validation(tmp_path: Path
     result = _module(
         f"Test-PhaseASignedReceipt -ReceiptPath {_ps(receipt_path)} "
         f"-SignaturePath {_ps(sig_path)} -SigningSpkiPath {_ps(public)} "
-        f"-ExpectedReceiptType 'operation-authorization' -ExpectedOperationId {_ps(receipt['operationId'])} "
-        "-ExpectedTargetDigest ('1'*64) -ExpectedManifestAfterSha256 ('8'*64)"
+        f"{_validation_args(receipt)}"
     )
     assert result.stdout.strip() == "True"
+    missing_commit = _validation_args(receipt).replace(
+        f"-ExpectedCommit {_ps(receipt['commit'])}", ""
+    )
+    assert _module(
+        f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(receipt_path)} "
+        f"-SignaturePath {_ps(sig_path)} -SigningSpkiPath {_ps(public)} {missing_commit}; "
+        "'missed' } catch { 'rejected' }"
+    ).stdout.strip() == "rejected"
     for parameter, forged in [
         ("ExpectedOperationId", str(uuid.uuid4())),
         ("ExpectedTargetDigest", "a" * 64),
@@ -229,7 +529,7 @@ def test_signed_receipt_signature_filename_and_binding_validation(tmp_path: Path
         result = _module(
             f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(receipt_path)} "
             f"-SignaturePath {_ps(sig_path)} -SigningSpkiPath {_ps(public)} "
-            f"-{parameter} {_ps(forged)}; 'missed' }} catch {{ 'rejected' }}"
+            f"{_validation_args(receipt, **{parameter: forged})}; 'missed' }} catch {{ 'rejected' }}"
         )
         assert result.stdout.strip() == "rejected"
     mismatch = tmp_path / ("f" * 64 + ".json")
@@ -237,7 +537,8 @@ def test_signed_receipt_signature_filename_and_binding_validation(tmp_path: Path
     mismatch.with_suffix(".sig").write_bytes(sig_path.read_bytes())
     assert _module(
         f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(mismatch)} "
-        f"-SignaturePath {_ps(mismatch.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)}; "
+        f"-SignaturePath {_ps(mismatch.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)} "
+        f"{_validation_args(receipt)}; "
         "'missed' } catch { 'rejected' }"
     ).stdout.strip() == "rejected"
 
@@ -252,7 +553,8 @@ def test_wrong_signing_key_and_malformed_digest_fail_closed(tmp_path: Path):
     path.with_suffix(".sig").write_bytes(_sign(private, content))
     result = _module(
         f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(path)} "
-        f"-SignaturePath {_ps(path.with_suffix('.sig'))} -SigningSpkiPath {_ps(wrong_public)}; "
+        f"-SignaturePath {_ps(path.with_suffix('.sig'))} -SigningSpkiPath {_ps(wrong_public)} "
+        f"{_validation_args(receipt)}; "
         "'missed' } catch { 'rejected' }"
     )
     assert result.stdout.strip() == "rejected"
@@ -264,7 +566,8 @@ def test_wrong_signing_key_and_malformed_digest_fail_closed(tmp_path: Path):
     malformed_path.with_suffix(".sig").write_bytes(_sign(private, malformed_bytes))
     assert _module(
         f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(malformed_path)} "
-        f"-SignaturePath {_ps(malformed_path.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)}; "
+        f"-SignaturePath {_ps(malformed_path.with_suffix('.sig'))} -SigningSpkiPath {_ps(public)} "
+        f"{_validation_args(malformed)}; "
         "'missed' } catch { 'rejected' }"
     ).stdout.strip() == "rejected"
 
@@ -272,12 +575,10 @@ def test_wrong_signing_key_and_malformed_digest_fail_closed(tmp_path: Path):
 def test_receipt_generator_never_accepts_private_key_and_verifies_returned_signature(tmp_path: Path):
     private, public, key_hash = _new_keypair(tmp_path, "offhost")
     inputs = _receipt("credential-revocation", key_hash)
-    input_path = tmp_path / "inputs.json"
-    input_path.write_bytes(_canonical(inputs))
     unsigned = tmp_path / "unsigned"
     result = _run_ps(
-        f"& {_ps(NEW_RECEIPT)} -InputPath {_ps(input_path)} -OutputDirectory {_ps(unsigned)} "
-        f"-SigningSpkiPath {_ps(public)} -CreateUnsigned"
+        f"& {_ps(NEW_RECEIPT)} {_generator_args(inputs, public)} "
+        f"-OutputDirectory {_ps(unsigned)} -CreateUnsigned"
     )
     unsigned_path = Path(result.stdout.strip())
     assert unsigned_path.name == _sha(unsigned_path.read_bytes()) + ".json"
@@ -285,10 +586,65 @@ def test_receipt_generator_never_accepts_private_key_and_verifies_returned_signa
     signature = unsigned_path.with_suffix(".sig")
     signature.write_bytes(_sign(private, unsigned_path.read_bytes()))
     verified = _run_ps(
-        f"& {_ps(NEW_RECEIPT)} -InputPath {_ps(unsigned_path)} -SignaturePath {_ps(signature)} "
-        f"-SigningSpkiPath {_ps(public)} -VerifyReturnedSignature"
+        f"& {_ps(NEW_RECEIPT)} {_generator_args(inputs, public)} -ReceiptPath {_ps(unsigned_path)} "
+        f"-SignaturePath {_ps(signature)} -VerifyReturnedSignature"
     )
     assert verified.stdout.strip() == str(unsigned_path)
+
+
+def test_generator_constructs_all_six_closed_schemas(tmp_path: Path):
+    _, public, key_hash = _new_keypair(tmp_path, "schemas")
+    expected_fields = {
+        "host-provisioning": 11,
+        "source-approval": 12,
+        "adjudication": 13,
+        "credential-revocation": 12,
+        "operation-authorization": 13,
+        "operation-completion": 13,
+    }
+    for receipt_type, field_count in expected_fields.items():
+        receipt = _receipt(receipt_type, key_hash)
+        output = tmp_path / receipt_type
+        result = _run_ps(
+            f"& {_ps(NEW_RECEIPT)} {_generator_args(receipt, public)} "
+            f"-OutputDirectory {_ps(output)} -CreateUnsigned"
+        )
+        path = Path(result.stdout.strip())
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert len(payload) == field_count
+        assert payload == receipt
+
+
+def test_nonadjacent_pair_and_non_32_byte_pss_salt_rejected(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "pss")
+    receipt = _receipt("host-provisioning", key_hash)
+    content = _canonical(receipt)
+    receipt_path = tmp_path / f"{_sha(content)}.json"
+    receipt_path.write_bytes(content)
+    other = tmp_path / "other"
+    other.mkdir()
+    nonadjacent = other / f"{_sha(content)}.sig"
+    nonadjacent.write_bytes(_sign(private, content))
+    assert _module(
+        f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(receipt_path)} "
+        f"-SignaturePath {_ps(nonadjacent)} -SigningSpkiPath {_ps(public)} "
+        f"{_validation_args(receipt)}; 'missed' }} catch {{ 'rejected' }}"
+    ).stdout.strip() == "rejected"
+
+    key = serialization.load_pem_private_key(private.read_bytes(), password=None)
+    wrong_salt = key.sign(
+        content,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=20),
+        hashes.SHA256(),
+    )
+    signature = receipt_path.with_suffix(".sig")
+    signature.write_bytes(wrong_salt)
+    assert len(wrong_salt) == 384
+    assert _module(
+        f"try {{ Test-PhaseASignedReceipt -ReceiptPath {_ps(receipt_path)} "
+        f"-SignaturePath {_ps(signature)} -SigningSpkiPath {_ps(public)} "
+        f"{_validation_args(receipt)}; 'missed' }} catch {{ 'rejected' }}"
+    ).stdout.strip() == "rejected"
 
 
 @pytest.mark.parametrize(
@@ -303,18 +659,19 @@ def test_receipt_generator_never_accepts_private_key_and_verifies_returned_signa
 )
 def test_install_receipt_crash_boundaries_never_overwrite(tmp_path: Path, boundary: str):
     private, public, key_hash = _new_keypair(tmp_path, boundary)
-    destination = tmp_path / "operations"
-    destination.mkdir()
-    _protect(destination)
-    content = _canonical(_receipt("operation-completion", key_hash))
+    store, config_hash = _test_store(tmp_path / "store")
+    destination = store / "operations"
+    receipt = _receipt("operation-completion", key_hash, storeConfigSha256=config_hash)
+    content = _canonical(receipt)
     source = tmp_path / f"{_sha(content)}.json"
     source.write_bytes(content)
     signature = source.with_suffix(".sig")
     signature.write_bytes(_sign(private, content))
     result = _module(
         f"try {{ Install-PhaseASignedReceipt -ReceiptPath {_ps(source)} "
-        f"-SignaturePath {_ps(signature)} -DestinationDirectory {_ps(destination)} "
-        f"-SigningSpkiPath {_ps(public)} -CrashAfter {_ps(boundary)}; 'missed' }} "
+        f"-SignaturePath {_ps(signature)} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt)} -DefinitionImport "
+        f"-CrashAfter {_ps(boundary)}; 'missed' }} "
         "catch { 'crashed' }"
     )
     assert result.stdout.strip() == "crashed"
@@ -323,8 +680,9 @@ def test_install_receipt_crash_boundaries_never_overwrite(tmp_path: Path, bounda
     before = tuple(p.read_bytes() if p.exists() else None for p in (final_receipt, final_signature))
     retry = _module(
         f"try {{ Install-PhaseASignedReceipt -ReceiptPath {_ps(source)} "
-        f"-SignaturePath {_ps(signature)} -DestinationDirectory {_ps(destination)} "
-        f"-SigningSpkiPath {_ps(public)} | Out-Null; 'installed' }} catch {{ 'rejected:' + $_.Exception.Message }}"
+        f"-SignaturePath {_ps(signature)} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt)} -DefinitionImport | Out-Null; "
+        "'installed' } catch { 'rejected:' + $_.Exception.Message }"
     ).stdout.strip()
     if (before[0] is None and before[1] is None) or (before[0] is not None and before[1] is not None):
         assert retry == "installed", retry
@@ -335,22 +693,26 @@ def test_install_receipt_crash_boundaries_never_overwrite(tmp_path: Path, bounda
 
 def test_install_rejects_unprotected_acl_and_orphan_half_pair(tmp_path: Path):
     private, public, key_hash = _new_keypair(tmp_path, "install")
-    content = _canonical(_receipt("operation-completion", key_hash))
+    store, config_hash = _test_store(tmp_path / "store")
+    destination = store / "operations"
+    receipt = _receipt("operation-completion", key_hash, storeConfigSha256=config_hash)
+    content = _canonical(receipt)
     source = tmp_path / f"{_sha(content)}.json"
     source.write_bytes(content)
     source.with_suffix(".sig").write_bytes(_sign(private, content))
-    destination = tmp_path / "operations"
-    destination.mkdir()
+    _run_ps(f"& icacls.exe {_ps(destination)} /inheritance:e | Out-Null")
     assert _module(
         f"try {{ Install-PhaseASignedReceipt -ReceiptPath {_ps(source)} "
-        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -DestinationDirectory {_ps(destination)} "
-        f"-SigningSpkiPath {_ps(public)}; 'missed' }} catch {{ 'rejected' }}"
+        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt)} -DefinitionImport; "
+        "'missed' } catch { 'rejected' }"
     ).stdout.strip() == "rejected"
     _protect(destination)
     assert _module(
         f"try {{ Install-PhaseASignedReceipt -ReceiptPath {_ps(source)} "
-        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -DestinationDirectory {_ps(destination)} "
-        f"-SigningSpkiPath {_ps(public)} -ExpectedTargetDigest ('f'*64); 'missed' }} "
+        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt, ExpectedTargetDigest='f'*64)} "
+        "-DefinitionImport; 'missed' } "
         "catch { 'rejected' }"
     ).stdout.strip() == "rejected"
     assert not list(destination.iterdir())
@@ -358,10 +720,49 @@ def test_install_rejects_unprotected_acl_and_orphan_half_pair(tmp_path: Path):
     before = (destination / source.name).read_bytes()
     assert _module(
         f"try {{ Install-PhaseASignedReceipt -ReceiptPath {_ps(source)} "
-        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -DestinationDirectory {_ps(destination)} "
-        f"-SigningSpkiPath {_ps(public)}; 'missed' }} catch {{ 'rejected' }}"
+        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt)} -DefinitionImport; "
+        "'missed' } catch { 'rejected' }"
     ).stdout.strip() == "rejected"
     assert (destination / source.name).read_bytes() == before
+
+
+def test_install_detects_final_receipt_replacement_race(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "replace")
+    store, config_hash = _test_store(tmp_path / "store")
+    receipt = _receipt("operation-completion", key_hash, storeConfigSha256=config_hash)
+    content = _canonical(receipt)
+    source = tmp_path / f"{_sha(content)}.json"
+    source.write_bytes(content)
+    signature = source.with_suffix(".sig")
+    signature.write_bytes(_sign(private, content))
+    result = _module(
+        "$replace={param($pair) $bytes=[IO.File]::ReadAllBytes($pair.ReceiptPath);"
+        "Remove-Item -LiteralPath $pair.ReceiptPath -Force;"
+        "[IO.File]::WriteAllBytes($pair.ReceiptPath,$bytes)};"
+        "try { Install-PhaseASignedReceipt "
+        f"-ReceiptPath {_ps(source)} -SignaturePath {_ps(signature)} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt)} -DefinitionImport "
+        "-BeforeFinalPairRevalidation $replace; 'missed' } catch { 'rejected' }"
+    )
+    assert result.stdout.strip() == "rejected"
+
+
+def test_install_rejects_arbitrary_same_named_destination(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "destination")
+    store, config_hash = _test_store(tmp_path / "arbitrary" / "v1")
+    receipt = _receipt("operation-completion", key_hash, storeConfigSha256=config_hash)
+    content = _canonical(receipt)
+    source = tmp_path / f"{_sha(content)}.json"
+    source.write_bytes(content)
+    source.with_suffix(".sig").write_bytes(_sign(private, content))
+    assert _module(
+        f"try {{ Install-PhaseASignedReceipt -ReceiptPath {_ps(source)} "
+        f"-SignaturePath {_ps(source.with_suffix('.sig'))} -StoreRoot {_ps(store)} "
+        f"-SigningSpkiPath {_ps(public)} {_validation_args(receipt)}; 'missed' }} "
+        "catch { 'rejected' }"
+    ).stdout.strip() == "rejected"
+    assert not list((store / "operations").iterdir())
 
 
 def test_unc_nonfixed_and_reparse_inputs_are_rejected(tmp_path: Path):
@@ -371,6 +772,11 @@ def test_unc_nonfixed_and_reparse_inputs_are_rejected(tmp_path: Path):
     ).stdout.strip() == "rejected"
     assert _module(
         "try { Get-PhaseATargetDigest -Path 'A:\\phase-a-evidence'; 'missed' } "
+        "catch { 'rejected' }"
+    ).stdout.strip() == "rejected"
+    assert _module(
+        f"$m=Get-Module PhaseAEvidenceStore;try {{ & $m {{param($p) Assert-PhaseALocalNtfsPath "
+        f"$p -DefinitionDriveFormat FAT32 -DefinitionImport}} {_ps(tmp_path)}; 'missed' }} "
         "catch { 'rejected' }"
     ).stdout.strip() == "rejected"
     real = tmp_path / "real"
@@ -415,6 +821,144 @@ def test_directory_manifest_is_path_redacted_sorted_and_rejects_reparse(tmp_path
     ).stdout.strip() == "rejected"
 
 
+def test_valid_preprovisioned_store_passes_full_validator(tmp_path: Path):
+    fixture = _preprovisioned_store(tmp_path)
+    payload = json.loads(_assert_store(fixture).stdout)
+    assert payload["Valid"] is True
+    assert payload["HostProvisioningReceiptSha256"] == fixture["host_hash"]
+
+
+@pytest.mark.parametrize("mutation", ["unexpected-root", "store-acl", "missing-pair", "duplicate-host", "reparse", "duplicate-ace", "hardlink"])
+def test_full_store_tree_and_acl_mutations_fail_closed(tmp_path: Path, mutation: str):
+    fixture = _preprovisioned_store(tmp_path)
+    root = fixture["root"]
+    if mutation == "unexpected-root":
+        (root / "extra.txt").write_text("unexpected", encoding="utf-8")
+    elif mutation == "store-acl":
+        _run_ps(f"& icacls.exe {_ps(root / 'store.json')} /inheritance:e | Out-Null")
+    elif mutation == "missing-pair":
+        (fixture["host_path"].with_suffix(".sig")).unlink()
+    elif mutation == "duplicate-host":
+        host = json.loads(fixture["host_path"].read_text(encoding="utf-8"))
+        host["operationId"] = str(uuid.uuid4())
+        data = _canonical(host)
+        path = root / "operations" / f"{_sha(data)}.json"
+        path.write_bytes(data)
+        path.with_suffix(".sig").write_bytes(_sign(fixture["recovery_private"], data))
+        _protect(path)
+        _protect(path.with_suffix(".sig"))
+    elif mutation == "reparse":
+        os.symlink(root / "store.json", root / "operations" / "linked.json")
+    elif mutation == "duplicate-ace":
+        _run_ps(f"& icacls.exe {_ps(root / 'operations')} /grant '*{fixture['sid']}:(R)' | Out-Null")
+    else:
+        os.link(fixture["host_path"], fixture["root"].parent / "second-link.json")
+    result = _module("try { " + _assert_store_body(fixture) + "; 'missed' } catch { 'rejected' }")
+    assert result.stdout.strip() == "rejected"
+
+
+def test_untrusted_acl_and_ancestor_delete_child_fail_closed(tmp_path: Path):
+    fixture = _preprovisioned_store(tmp_path)
+    operations = fixture["root"] / "operations"
+    _run_ps(f"& icacls.exe {_ps(operations)} /grant '*S-1-1-0:(OI)(CI)(R)' | Out-Null")
+    with pytest.raises(AssertionError):
+        _assert_store(fixture)
+
+    fixture = _preprovisioned_store(tmp_path / "second")
+    parent = fixture["root"].parent
+    _run_ps(f"& icacls.exe {_ps(parent)} /grant '*S-1-1-0:(DC)' | Out-Null")
+    with pytest.raises(AssertionError):
+        _assert_store(fixture)
+
+
+def test_native_cleanup_rejects_wrong_identity(tmp_path: Path):
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "keep.txt").write_text("keep", encoding="utf-8")
+    result = _module(
+        f"$m=Get-Module PhaseAEvidenceStore;$identity=& $m {{param($p)"
+        "$lease=Open-PhaseAValidatedDirectoryLease $p;try{Get-PhaseAFileIdentity $lease}finally{$lease.Dispose()}} "
+        f"{_ps(root)};try {{ [ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow("
+        f"{_ps(root)},[uint64]$identity.VolumeSerialNumber,('0'*32),-1);'missed' }} catch {{ 'rejected' }}"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert (root / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_cleanup_authorization_and_partial_crash_do_not_replay(tmp_path: Path):
+    fixture = _cleanup_fixture(tmp_path)
+    wrong = _cleanup_body(fixture).replace(
+        f"-ExpectedTargetDigest {_ps(fixture['target'])}",
+        f"-ExpectedTargetDigest {_ps('f' * 64)}",
+    )
+    assert _run_ps("try { " + wrong + "; 'missed' } catch { 'rejected' }").stdout.strip() == "rejected"
+    assert fixture["stage"].exists()
+
+    assert _run_ps(
+        "try { " + _cleanup_body(fixture, "-CrashAfterEntries 1") + "; 'missed' } catch { 'crashed' }"
+    ).stdout.strip() == "crashed"
+    state = sorted(str(path.relative_to(fixture["stage"])) for path in fixture["stage"].rglob("*"))
+    assert _run_ps("try { " + _cleanup_body(fixture) + "; 'missed' } catch { 'rejected' }").stdout.strip() == "rejected"
+    assert state == sorted(str(path.relative_to(fixture["stage"])) for path in fixture["stage"].rglob("*"))
+
+
+def test_cleanup_post_mutation_crash_resumes_to_completion(tmp_path: Path):
+    fixture = _cleanup_fixture(tmp_path)
+    crash = _run_ps(
+        "try { " + _cleanup_body(fixture, "-CrashAfterMutation") + "; 'missed' } "
+        "catch { 'crashed:' + $_.Exception.Message }"
+    ).stdout.strip()
+    assert crash == "crashed:Injected cleanup crash after mutation.", crash
+    assert not fixture["stage"].exists()
+    result = _run_ps(_cleanup_body(fixture) + " | ConvertTo-Json -Compress")
+    payload = json.loads(result.stdout)
+    assert payload["OperationId"] == fixture["operation"]
+    assert payload["ManifestAfterSha256"] == fixture["after"]
+
+
+def test_cleanup_rejects_replacement_between_authorization_and_delete(tmp_path: Path):
+    fixture = _cleanup_fixture(tmp_path)
+    moved = fixture["parent"] / "moved-original"
+    prefix = (
+        f"$replace={{param($stage) Move-Item -LiteralPath $stage -Destination {_ps(moved)};"
+        "$null=New-Item -ItemType Directory -Path $stage;Set-Content -LiteralPath "
+        "(Join-Path $stage 'replacement.txt') -Value replacement};"
+    )
+    result = _run_ps(
+        prefix + "try { " + _cleanup_body(fixture, "-BeforeCleanupDelete $replace")
+        + "; 'missed' } catch { 'rejected' }"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert moved.is_dir()
+    assert (fixture["stage"] / "replacement.txt").is_file()
+
+
+def test_definition_provision_fully_validates_before_publish_and_is_idempotent(tmp_path: Path):
+    body, final = _provision_body(tmp_path, "valid")
+    result = _run_ps(body + "| ConvertTo-Json -Compress", timeout=90)
+    assert json.loads(result.stdout)["Valid"] is True
+    assert final.is_dir()
+    result = _run_ps(body + "| ConvertTo-Json -Compress", timeout=90)
+    assert json.loads(result.stdout)["Valid"] is True
+
+
+@pytest.mark.parametrize("mode", ["invalid", "crash"])
+def test_definition_provision_never_publishes_invalid_or_prepublication_crash(tmp_path: Path, mode: str):
+    body, final = _provision_body(tmp_path, mode)
+    result = _run_ps("try { " + body + "; 'missed' } catch { 'rejected' }", timeout=90)
+    assert result.stdout.strip() == "rejected"
+    assert not final.exists()
+
+
+def test_definition_provision_never_repairs_invalid_existing_v1(tmp_path: Path):
+    body, final = _provision_body(tmp_path, "valid")
+    final.mkdir()
+    marker = final / "invalid.marker"
+    marker.write_text("retain", encoding="utf-8")
+    result = _run_ps("try { " + body + "; 'missed' } catch { 'rejected' }", timeout=90)
+    assert result.stdout.strip() == "rejected"
+    assert marker.read_text(encoding="utf-8") == "retain"
+
 def _is_elevated() -> bool:
     return _run_ps(
         "$p=[Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent();"
@@ -423,24 +967,21 @@ def _is_elevated() -> bool:
 
 
 @pytest.mark.skipif(not _is_elevated(), reason="requires an elevated Windows token")
-def test_elevated_provision_idempotency_and_cleanup():
+def test_elevated_provision_idempotency_and_cleanup(tmp_path: Path):
     parent = Path(os.environ["ProgramData"]) / "ApplyPilot" / "EvidenceTest" / str(uuid.uuid4())
-    sid = _current_sid()
     try:
-        result = _run_ps(
-            f". {_ps(PROVISION)} -DefinitionImport\n"
-            f"Invoke-PhaseAEvidenceStoreProvision -StoreRoot {_ps(parent / 'v1')} "
-            f"-CanonicalOperatorSid {_ps(sid)} -TestIdentity"
-        )
+        body, final = _provision_body(tmp_path, "valid", parent)
+        result = _run_ps(body + "| ConvertTo-Json -Compress", timeout=90)
+        assert json.loads(result.stdout)["Valid"] is True
         assert (parent / "v1" / "store.json").is_file()
         assert sorted(p.name for p in (parent / "v1").iterdir() if p.is_dir()) == [
             "adjudications", "bundles", "operations"
         ]
-        _run_ps(
-            f". {_ps(PROVISION)} -DefinitionImport\n"
-            f"Invoke-PhaseAEvidenceStoreProvision -StoreRoot {_ps(parent / 'v1')} "
-            f"-CanonicalOperatorSid {_ps(sid)} -TestIdentity | Out-Null"
-        )
+        _run_ps(body + "| Out-Null", timeout=90)
+        _run_ps(f"& icacls.exe {_ps(final)} /setowner '*S-1-5-32-544' /T /C | Out-Null")
+        assert _run_ps(
+            "try { " + body + "; 'missed' } catch { 'rejected' }", timeout=90
+        ).stdout.strip() == "rejected"
     finally:
         if parent.exists():
             _run_ps(f"Remove-Item -LiteralPath {_ps(parent)} -Recurse -Force")

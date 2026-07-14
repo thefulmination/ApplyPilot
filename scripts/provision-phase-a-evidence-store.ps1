@@ -1,14 +1,13 @@
 [CmdletBinding(DefaultParameterSetName='Provision')]
 param(
   [Parameter(ParameterSetName='DefinitionImport', Mandatory)][switch]$DefinitionImport,
-  [Parameter(ParameterSetName='Provision')][string]$StoreRoot = (Join-Path $env:ProgramData 'ApplyPilot\Evidence\v1'),
   [Parameter(ParameterSetName='Provision', Mandatory)][string]$CanonicalOperatorSid,
-  [Parameter(ParameterSetName='Provision', Mandatory)][string]$SigningSpkiPath,
-  [Parameter(ParameterSetName='Provision', Mandatory)][string]$RecoverySigningSpkiPath,
-  [Parameter(ParameterSetName='Provision', Mandatory)][string]$SigningSpkiSha256,
-  [Parameter(ParameterSetName='Provision', Mandatory)][string]$RecoverySigningSpkiSha256,
+  [Parameter(ParameterSetName='Provision', Mandatory)][string]$ExpectedCommit,
   [Parameter(ParameterSetName='Provision', Mandatory)][string]$CustodyReceiptPath,
-  [Parameter(ParameterSetName='Provision', Mandatory)][string]$CustodySignaturePath
+  [Parameter(ParameterSetName='Provision', Mandatory)][string]$CustodySignaturePath,
+  [Parameter(ParameterSetName='Provision', Mandatory)][string]$CustodyOperationId,
+  [Parameter(ParameterSetName='Provision', Mandatory)][string]$CustodyManifestBeforeSha256,
+  [Parameter(ParameterSetName='Provision', Mandatory)][string]$CustodyManifestAfterSha256
 )
 
 Set-StrictMode -Version Latest
@@ -28,71 +27,63 @@ function Write-PhaseAStoreFile([string]$Path, [byte[]]$Bytes, [string]$OperatorS
   & $module { param($P,$S) Set-PhaseAProtectedAcl -Path $P -OperatorSid $S -File } $Path $OperatorSid
 }
 
-function Test-PhaseATestStore([string]$Root, [string]$OperatorSid, [string]$ExpectedTargetDigest) {
-  $module = Get-Module PhaseAEvidenceStore
-  & $module {
-    param($R,$S,$ExpectedTarget)
-    $null = Assert-PhaseALocalNtfsPath $R
-    Assert-PhaseAProtectedAcl $R $S
-    $names = @(Get-ChildItem -LiteralPath $R -Directory -Force | Sort-Object Name | ForEach-Object Name)
-    if ($names -join ',' -cne 'adjudications,bundles,operations') { throw 'Evidence subdirectory set is invalid.' }
-    foreach ($name in $names) { Assert-PhaseAProtectedAcl (Join-Path $R $name) $S }
-    $config = Read-PhaseACanonicalJson (Join-Path $R 'store.json')
-    Assert-PhaseAClosedFields $config.Value @('schema','targetDigest','operatorSidDigest','machineDigest','securityDescriptorSha256','signingSpkiSha256','recoverySigningSpkiSha256')
-    $actualTarget = if ($ExpectedTarget) { $ExpectedTarget } else { Get-PhaseATargetDigest $R }
-    if ($config.Value.schema -cne 'applypilot.phase-a.evidence-store.v1' -or
-        $config.Value.targetDigest -cne $actualTarget -or
-        $config.Value.operatorSidDigest -cne (Get-PhaseAOperatorSidDigest $S) -or
-        $config.Value.securityDescriptorSha256 -cne (Get-PhaseASecurityDescriptorHash $R)) {
-      throw 'Test evidence store configuration is invalid.'
-    }
-    return $config.Sha256
-  } $Root $OperatorSid $ExpectedTargetDigest
-}
-
 function Invoke-PhaseAEvidenceStoreProvision {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$StoreRoot,
     [Parameter(Mandatory)][string]$CanonicalOperatorSid,
-    [string]$SigningSpkiPath,
-    [string]$RecoverySigningSpkiPath,
-    [string]$SigningSpkiSha256,
-    [string]$RecoverySigningSpkiSha256,
+    [Parameter(Mandatory)][string]$ExpectedCommit,
+    [Parameter(Mandatory)][string]$SigningSpkiPath,
+    [Parameter(Mandatory)][string]$RecoverySigningSpkiPath,
+    [Parameter(Mandatory)][string]$SigningSpkiSha256,
+    [Parameter(Mandatory)][string]$RecoverySigningSpkiSha256,
+    [Parameter(Mandatory)][string]$CustodyOperationId,
+    [Parameter(Mandatory)][string]$CustodyManifestBeforeSha256,
+    [Parameter(Mandatory)][string]$CustodyManifestAfterSha256,
     [string]$CustodyReceiptPath,
     [string]$CustodySignaturePath,
-    [switch]$TestIdentity
+    [scriptblock]$HostReceiptMaterializer,
+    [string]$TestMachineGuid,
+    [string]$TestSmbiosUuid,
+    [string]$TestAncestorBoundary,
+    [switch]$CrashBeforePublication,
+    [switch]$DefinitionImport
   )
-  if (-not $DefinitionImport -and $TestIdentity) { throw 'Test identity overrides require -DefinitionImport.' }
-  if (-not (Test-PhaseAElevatedToken)) { throw 'Evidence-store provisioning requires an elevated token.' }
+  if (-not $DefinitionImport -and ($HostReceiptMaterializer -or $TestMachineGuid -or $TestSmbiosUuid -or $TestAncestorBoundary -or $CrashBeforePublication)) {
+    throw 'Provisioning overrides require DefinitionImport.'
+  }
+  if (-not $DefinitionImport -and -not (Test-PhaseAElevatedToken)) { throw 'Evidence-store provisioning requires an elevated token.' }
   $module = Get-Module PhaseAEvidenceStore
   $operator = & $module { param($S) Assert-PhaseACurrentOperator $S } $CanonicalOperatorSid
   $final = & $module { param($P) Assert-PhaseALocalNtfsPath $P -AllowMissingLeaf } $StoreRoot
-  if ([IO.Path]::GetFileName($final) -cne 'v1' -and -not $DefinitionImport) {
-    throw 'Production evidence store must end in the v1 path.'
+  $productionRoot = & $module { $script:ProductionStoreRoot }
+  if (-not $DefinitionImport -and $final -ine $productionRoot) {
+    throw 'Production evidence store root is not the exact native ProgramData path.'
+  }
+  $machine = if ($DefinitionImport -and $TestMachineGuid -and $TestSmbiosUuid) {
+    Get-PhaseAMachineDigest -MachineGuid $TestMachineGuid -SmbiosUuid $TestSmbiosUuid -DefinitionImport
+  } elseif ($TestMachineGuid -or $TestSmbiosUuid) { throw 'Both test machine identity values are required.' }
+  else { Get-PhaseAMachineDigest }
+  $assertArguments = @{
+    CanonicalOperatorSid=$operator; ExpectedCommit=$ExpectedCommit; SigningSpkiPath=$SigningSpkiPath;
+    RecoverySigningSpkiPath=$RecoverySigningSpkiPath; SigningSpkiSha256=$SigningSpkiSha256;
+    RecoverySigningSpkiSha256=$RecoverySigningSpkiSha256; CustodyOperationId=$CustodyOperationId;
+    CustodyManifestBeforeSha256=$CustodyManifestBeforeSha256; CustodyManifestAfterSha256=$CustodyManifestAfterSha256
+  }
+  if ($DefinitionImport) {
+    $assertArguments.DefinitionImport=$true; $assertArguments.ExpectedMachineDigest=$machine
+    if ($TestAncestorBoundary) { $assertArguments.AncestorBoundary=$TestAncestorBoundary }
   }
   if (Test-Path -LiteralPath $final) {
-    if ($TestIdentity) {
-      $hash = Test-PhaseATestStore $final $operator
-      return [pscustomobject]@{ StoreRoot=$final; StoreConfigSha256=$hash; Existing=$true }
-    }
-    return Assert-PhaseAEvidenceStore @PSBoundParameters
+    return Assert-PhaseAEvidenceStore -StoreRoot $final @assertArguments
   }
-  if (-not $TestIdentity) {
-    foreach ($required in @($SigningSpkiPath,$RecoverySigningSpkiPath,$SigningSpkiSha256,
-        $RecoverySigningSpkiSha256,$CustodyReceiptPath,$CustodySignaturePath)) {
-      if ([string]::IsNullOrWhiteSpace($required)) { throw 'Committed public anchors and custody receipt are required.' }
-    }
-    $signing = & $module { param($P,$H) Import-PhaseASpki $P $H } $SigningSpkiPath $SigningSpkiSha256
-    $signing.Dispose()
-    $recovery = & $module { param($P,$H) Import-PhaseASpki $P $H } $RecoverySigningSpkiPath $RecoverySigningSpkiSha256
-    $recovery.Dispose()
-  }
+  $signing = & $module { param($P,$H) Import-PhaseASpki $P $H } $SigningSpkiPath $SigningSpkiSha256; $signing.Dispose()
+  $recovery = & $module { param($P,$H) Import-PhaseASpki $P $H } $RecoverySigningSpkiPath $RecoverySigningSpkiSha256; $recovery.Dispose()
   $parent = Split-Path -Parent $final
   if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
     $null = New-Item -ItemType Directory -Path $parent
   }
-  & $module { param($P,$S) Assert-PhaseAAncestorDeleteChild $P $S } $final $operator
+  & $module { param($P,$S,$B) Assert-PhaseAAncestorDeleteChild $P $S $B } $final $operator $TestAncestorBoundary
   $stage = Join-Path $parent ".provisioning-$([guid]::NewGuid().ToString('D'))"
   $null = New-Item -ItemType Directory -Path $stage
   & $module { param($P,$S) Set-PhaseAProtectedAcl $P $S } $stage $operator
@@ -101,30 +92,46 @@ function Invoke-PhaseAEvidenceStoreProvision {
     & $module { param($P,$S) Set-PhaseAProtectedAcl $P $S } $directory.FullName $operator
   }
   $target = Get-PhaseATargetDigest -Path $stage -CanonicalPath $final
-  $machine = if ($TestIdentity) {
-    Get-PhaseAMachineDigest -MachineGuid '01234567-89ab-cdef-0123-456789abcdef' -SmbiosUuid 'fedcba98-7654-3210-fedc-ba9876543210' -DefinitionImport
-  } else { Get-PhaseAMachineDigest }
   $config = [ordered]@{
     schema='applypilot.phase-a.evidence-store.v1'
+    approvedCommit=$ExpectedCommit
     targetDigest=$target
     operatorSidDigest=(Get-PhaseAOperatorSidDigest $operator)
     machineDigest=$machine
     securityDescriptorSha256=(Get-PhaseASecurityDescriptorHash $stage)
-    signingSpkiSha256=if ($SigningSpkiSha256) { $SigningSpkiSha256 } else { '0' * 64 }
-    recoverySigningSpkiSha256=if ($RecoverySigningSpkiSha256) { $RecoverySigningSpkiSha256 } else { '0' * 64 }
+    signingSpkiSha256=$SigningSpkiSha256
+    recoverySigningSpkiSha256=$RecoverySigningSpkiSha256
   }
   $bytes = & $module { param($V) ConvertTo-PhaseACanonicalJsonBytes $V } $config
   Write-PhaseAStoreFile (Join-Path $stage 'store.json') $bytes $operator
-  $null = Test-PhaseATestStore $stage $operator $target
-  [ApplyPilot.PhaseA.EvidenceNative]::RenameDirectoryNoReplace($stage, $final)
-  if ($TestIdentity) {
-    $hash = Test-PhaseATestStore $final $operator
-    return [pscustomobject]@{ StoreRoot=$final; StoreConfigSha256=$hash; Existing=$false }
+  $configHash = & $module { param($B) Get-PhaseASha256 $B } $bytes
+  if ($HostReceiptMaterializer) {
+    $material = & $HostReceiptMaterializer ([pscustomobject]@{
+      StoreRoot=$stage; TargetDigest=$target; OperatorSidDigest=(Get-PhaseAOperatorSidDigest $operator);
+      MachineDigest=$machine; StoreConfigSha256=$configHash; RecoverySigningSpkiSha256=$RecoverySigningSpkiSha256;
+      Commit=$ExpectedCommit; OperationId=$CustodyOperationId; ManifestBeforeSha256=$CustodyManifestBeforeSha256;
+      ManifestAfterSha256=$CustodyManifestAfterSha256
+    })
+    $CustodyReceiptPath = [string]$material.ReceiptPath
+    $CustodySignaturePath = [string]$material.SignaturePath
   }
-  return Assert-PhaseAEvidenceStore -StoreRoot $final -CanonicalOperatorSid $operator `
-    -SigningSpkiPath $SigningSpkiPath -RecoverySigningSpkiPath $RecoverySigningSpkiPath `
-    -SigningSpkiSha256 $SigningSpkiSha256 -RecoverySigningSpkiSha256 $RecoverySigningSpkiSha256 `
-    -CustodyReceiptPath $CustodyReceiptPath -CustodySignaturePath $CustodySignaturePath
+  if ([string]::IsNullOrWhiteSpace($CustodyReceiptPath) -or [string]::IsNullOrWhiteSpace($CustodySignaturePath)) {
+    throw 'A complete host-provisioning receipt pair is required before publication.'
+  }
+  $null = Install-PhaseASignedReceipt -ReceiptPath $CustodyReceiptPath -SignaturePath $CustodySignaturePath `
+    -StoreRoot $stage -SigningSpkiPath $RecoverySigningSpkiPath `
+    -ExpectedSigningSpkiSha256 $RecoverySigningSpkiSha256 -ExpectedReceiptType host-provisioning `
+    -ExpectedCommit $ExpectedCommit -ExpectedOperationId $CustodyOperationId -ExpectedTargetDigest $target `
+    -ExpectedOperatorSidDigest (Get-PhaseAOperatorSidDigest $operator) -ExpectedMachineDigest $machine `
+    -ExpectedManifestBeforeSha256 $CustodyManifestBeforeSha256 -ExpectedManifestAfterSha256 $CustodyManifestAfterSha256 `
+    -ExpectedStoreConfigSha256 $configHash -DefinitionImport
+  $assertArguments.StoreRoot=$stage; $assertArguments.ExpectedTargetDigest=$target
+  $validatedStage = Assert-PhaseAEvidenceStore @assertArguments
+  if ($CrashBeforePublication) { throw 'Injected crash before evidence-store publication.' }
+  [ApplyPilot.PhaseA.EvidenceNative]::RenameDirectoryNoReplace($stage, $final)
+  $assertArguments.Remove('ExpectedTargetDigest')
+  $assertArguments.Remove('StoreRoot')
+  return Assert-PhaseAEvidenceStore -StoreRoot $final @assertArguments
 }
 
 function Install-PhaseABootstrapReceipt {
@@ -133,12 +140,26 @@ function Install-PhaseABootstrapReceipt {
     [Parameter(Mandatory)][string]$ReceiptPath,
     [Parameter(Mandatory)][string]$SignaturePath,
     [Parameter(Mandatory)][string]$SigningSpkiPath,
-    [string]$ExpectedSigningSpkiSha256
+    [Parameter(Mandatory)][string]$ExpectedSigningSpkiSha256,
+    [Parameter(Mandatory)][ValidateSet('credential-revocation','operation-authorization','operation-completion','host-provisioning')][string]$ExpectedReceiptType,
+    [Parameter(Mandatory)][string]$ExpectedCommit,
+    [Parameter(Mandatory)][string]$ExpectedOperationId,
+    [Parameter(Mandatory)][string]$ExpectedTargetDigest,
+    [Parameter(Mandatory)][string]$ExpectedOperatorSidDigest,
+    [Parameter(Mandatory)][string]$ExpectedMachineDigest,
+    [Parameter(Mandatory)][string]$ExpectedStoreConfigSha256,
+    [Parameter(Mandatory)][string]$ExpectedManifestBeforeSha256,
+    [Parameter(Mandatory)][string]$ExpectedManifestAfterSha256,
+    [string]$ExpectedHostProvisioningReceiptSha256,
+    [string]$ExpectedSourceApprovalReceiptSha256
   )
-  $root = Join-Path $env:LOCALAPPDATA 'ApplyPilot\phase-a-evidence\bootstrap-operations'
+  $root = [IO.Path]::Combine(
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData),
+    'ApplyPilot', 'phase-a-evidence', 'bootstrap-operations')
   $full = [IO.Path]::GetFullPath($root)
   $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-  $oneDrive = if ($env:OneDrive) { [IO.Path]::GetFullPath($env:OneDrive) } else { '' }
+  $oneDriveValue = [Environment]::GetEnvironmentVariable('OneDrive', 'User')
+  $oneDrive = if ($oneDriveValue) { [IO.Path]::GetFullPath($oneDriveValue) } else { '' }
   if ($full.StartsWith($repo, [StringComparison]::OrdinalIgnoreCase) -or
       ($oneDrive -and $full.StartsWith($oneDrive, [StringComparison]::OrdinalIgnoreCase))) {
     throw 'Bootstrap receipt root must be outside the repository and OneDrive.'
@@ -149,9 +170,17 @@ function Install-PhaseABootstrapReceipt {
     $module = Get-Module PhaseAEvidenceStore
     & $module { param($P,$S) Set-PhaseAProtectedAcl $P $S } $root $sid
   }
-  Install-PhaseASignedReceipt -ReceiptPath $ReceiptPath -SignaturePath $SignaturePath `
-    -DestinationDirectory $root -SigningSpkiPath $SigningSpkiPath `
-    -ExpectedSigningSpkiSha256 $ExpectedSigningSpkiSha256
+  $arguments = @{
+    ReceiptPath=$ReceiptPath; SignaturePath=$SignaturePath; StoreRoot=$root; Bootstrap=$true;
+    SigningSpkiPath=$SigningSpkiPath; ExpectedSigningSpkiSha256=$ExpectedSigningSpkiSha256;
+    ExpectedReceiptType=$ExpectedReceiptType; ExpectedCommit=$ExpectedCommit; ExpectedOperationId=$ExpectedOperationId;
+    ExpectedTargetDigest=$ExpectedTargetDigest; ExpectedOperatorSidDigest=$ExpectedOperatorSidDigest;
+    ExpectedMachineDigest=$ExpectedMachineDigest; ExpectedStoreConfigSha256=$ExpectedStoreConfigSha256;
+    ExpectedManifestBeforeSha256=$ExpectedManifestBeforeSha256; ExpectedManifestAfterSha256=$ExpectedManifestAfterSha256
+  }
+  if ($ExpectedHostProvisioningReceiptSha256) { $arguments.ExpectedHostProvisioningReceiptSha256=$ExpectedHostProvisioningReceiptSha256 }
+  if ($ExpectedSourceApprovalReceiptSha256) { $arguments.ExpectedSourceApprovalReceiptSha256=$ExpectedSourceApprovalReceiptSha256 }
+  Install-PhaseASignedReceipt @arguments
 }
 
 function Get-PhaseAManifestDigest([string]$Root) {
@@ -168,75 +197,128 @@ function Invoke-PhaseAProvisioningCleanup {
     [Parameter(Mandatory)][string]$CanonicalOperatorSid,
     [Parameter(Mandatory)][string]$RecoverySigningSpkiPath,
     [Parameter(Mandatory)][string]$RecoverySigningSpkiSha256,
+    [Parameter(Mandatory)][string]$ExpectedCommit,
+    [Parameter(Mandatory)][string]$ExpectedOperationId,
+    [Parameter(Mandatory)][string]$ExpectedTargetDigest,
+    [Parameter(Mandatory)][string]$ExpectedOperatorSidDigest,
+    [Parameter(Mandatory)][string]$ExpectedMachineDigest,
+    [Parameter(Mandatory)][string]$ExpectedStoreConfigSha256,
+    [Parameter(Mandatory)][string]$ExpectedHostProvisioningReceiptSha256,
+    [Parameter(Mandatory)][string]$ExpectedSourceApprovalReceiptSha256,
+    [Parameter(Mandatory)][string]$ExpectedManifestBeforeSha256,
+    [Parameter(Mandatory)][string]$ExpectedManifestAfterSha256,
     [Parameter(Mandatory)][string]$AuthorizationReceiptPath,
     [Parameter(Mandatory)][string]$AuthorizationSignaturePath,
     [Parameter(Mandatory)][string]$CompletionReceiptPath,
     [Parameter(Mandatory)][string]$CompletionSignaturePath,
-    [Parameter(Mandatory)][string]$ExpectedAfterManifestPath
+    [Parameter(Mandatory)][string]$ExpectedAfterManifestPath,
+    [int]$CrashAfterEntries = -1,
+    [switch]$CrashAfterMutation,
+    [string]$TestBootstrapRoot,
+    [scriptblock]$BeforeCleanupDelete
   )
-  if (-not (Test-PhaseAElevatedToken)) { throw 'Staging cleanup requires an elevated token.' }
+  if (-not $DefinitionImport -and -not (Test-PhaseAElevatedToken)) { throw 'Staging cleanup requires an elevated token.' }
+  if ($TestBootstrapRoot -and -not $DefinitionImport) { throw 'Bootstrap override requires DefinitionImport.' }
   $module = Get-Module PhaseAEvidenceStore
   $operator = & $module { param($S) Assert-PhaseACurrentOperator $S } $CanonicalOperatorSid
-  $stage = & $module { param($P) Assert-PhaseALocalNtfsPath $P } $StagingPath
+  $stage = & $module { param($P) Assert-PhaseALocalNtfsPath $P -AllowMissingLeaf } $StagingPath
   if ([IO.Path]::GetFileName($stage) -cnotmatch '^\.provisioning-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
     throw 'Cleanup target is not an exact provisioning-stage identity.'
   }
   $parent = Split-Path -Parent $stage
-  $validStore = Join-Path $parent 'v1'
-  if (-not (Test-Path -LiteralPath $validStore -PathType Container)) {
-    $bootstrap = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'ApplyPilot\phase-a-evidence\bootstrap-operations'))
-    foreach ($receipt in @($AuthorizationReceiptPath,$CompletionReceiptPath)) {
-      if ([IO.Path]::GetFullPath((Split-Path -Parent $receipt)) -ine $bootstrap) {
-        throw 'Before valid v1, cleanup receipts must be installed in bootstrap operations.'
-      }
+  $bootstrap = [IO.Path]::Combine(
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData),
+    'ApplyPilot', 'phase-a-evidence', 'bootstrap-operations')
+  if ($TestBootstrapRoot) { $bootstrap = [IO.Path]::GetFullPath($TestBootstrapRoot) }
+  foreach ($receipt in @($AuthorizationReceiptPath,$CompletionReceiptPath)) {
+    if ([IO.Path]::GetFullPath((Split-Path -Parent $receipt)) -ine $bootstrap) {
+      throw 'Cleanup receipts require the protected bootstrap operations root without a full validated-store context.'
     }
-    & $module { param($P,$S) Assert-PhaseAProtectedAcl $P $S } $bootstrap $operator
   }
-  $before = Get-PhaseAManifestDigest $parent
+  & $module { param($P,$S) Assert-PhaseAProtectedAcl $P $S } $bootstrap $operator
   $expected = & $module { param($P) Read-PhaseACanonicalJson $P } $ExpectedAfterManifestPath
   & $module { param($V) Assert-PhaseAClosedFields $V @('schema','entries') } $expected.Value
   if ($expected.Value.schema -cne 'applypilot.phase-a.directory-manifest.v1') {
     throw 'Expected-after manifest has the wrong schema.'
   }
-  $stageName = [IO.Path]::GetFileName($stage)
-  $calculatedEntries = @($before.Value.entries | Where-Object {
-    $_.relativePath -cne $stageName -and -not $_.relativePath.StartsWith("$stageName/", [StringComparison]::Ordinal)
-  })
-  $calculatedAfter = [ordered]@{ schema='applypilot.phase-a.directory-manifest.v1'; entries=$calculatedEntries }
-  $calculatedBytes = & $module { param($V) ConvertTo-PhaseACanonicalJsonBytes $V } $calculatedAfter
-  if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($calculatedBytes, $expected.Bytes)) {
-    throw 'Expected-after manifest removes more or less than the exact staging identity.'
-  }
-  $target = Get-PhaseATargetDigest $stage
-  $authorization = & $module { param($P) Read-PhaseACanonicalJson $P } $AuthorizationReceiptPath
-  $operationId = [string]$authorization.Value.operationId
   $null = Test-PhaseASignedReceipt -ReceiptPath $AuthorizationReceiptPath `
     -SignaturePath $AuthorizationSignaturePath -SigningSpkiPath $RecoverySigningSpkiPath `
     -ExpectedSigningSpkiSha256 $RecoverySigningSpkiSha256 -ExpectedReceiptType 'operation-authorization' `
-    -ExpectedOperationId $operationId -ExpectedTargetDigest $target `
-    -ExpectedManifestBeforeSha256 $before.Sha256 -ExpectedManifestAfterSha256 $expected.Sha256
+    -ExpectedCommit $ExpectedCommit -ExpectedOperationId $ExpectedOperationId `
+    -ExpectedTargetDigest $ExpectedTargetDigest -ExpectedOperatorSidDigest $ExpectedOperatorSidDigest `
+    -ExpectedMachineDigest $ExpectedMachineDigest -ExpectedStoreConfigSha256 $ExpectedStoreConfigSha256 `
+    -ExpectedHostProvisioningReceiptSha256 $ExpectedHostProvisioningReceiptSha256 `
+    -ExpectedSourceApprovalReceiptSha256 $ExpectedSourceApprovalReceiptSha256 `
+    -ExpectedManifestBeforeSha256 $ExpectedManifestBeforeSha256 `
+    -ExpectedManifestAfterSha256 $ExpectedManifestAfterSha256
+  if ($expected.Sha256 -cne $ExpectedManifestAfterSha256) { throw 'Expected-after manifest hash is not authorized.' }
+  if (Test-Path -LiteralPath $stage -PathType Container) {
+    $before = Get-PhaseAManifestDigest $parent
+    if ($before.Sha256 -cne $ExpectedManifestBeforeSha256) { throw 'Current cleanup manifest is not authorized.' }
+    $stageName = [IO.Path]::GetFileName($stage)
+    $calculatedEntries = @($before.Value.entries | Where-Object {
+      $_.relativePath -cne $stageName -and -not $_.relativePath.StartsWith("$stageName/", [StringComparison]::Ordinal)
+    })
+    $calculatedAfter = [ordered]@{ schema='applypilot.phase-a.directory-manifest.v1'; entries=$calculatedEntries }
+    $calculatedBytes = & $module { param($V) ConvertTo-PhaseACanonicalJsonBytes $V } $calculatedAfter
+    if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($calculatedBytes, $expected.Bytes)) {
+      throw 'Expected-after manifest removes more or less than the exact staging identity.'
+    }
+    $targetBinding = Get-PhaseATargetDigest $stage -PassThru
+    if ($targetBinding.Digest -cne $ExpectedTargetDigest) { throw 'Authorized staging target identity changed.' }
+    $identity = $targetBinding.Identity
+    if ($BeforeCleanupDelete) { & $BeforeCleanupDelete $stage }
+    $null = [ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow(
+      $stage, [uint64]$identity.VolumeSerialNumber, [string]$identity.FileId, $CrashAfterEntries)
+  } elseif (Test-Path -LiteralPath $stage) {
+    throw 'Cleanup target changed from a directory.'
+  }
+  $actualAfter = Get-PhaseAManifestDigest $parent
+  if ($actualAfter.Sha256 -cne $expected.Sha256) { throw 'Cleanup result does not match the authorized after manifest.' }
+  if ($CrashAfterMutation) { throw 'Injected cleanup crash after mutation.' }
   $null = Test-PhaseASignedReceipt -ReceiptPath $CompletionReceiptPath `
     -SignaturePath $CompletionSignaturePath -SigningSpkiPath $RecoverySigningSpkiPath `
     -ExpectedSigningSpkiSha256 $RecoverySigningSpkiSha256 -ExpectedReceiptType 'operation-completion' `
-    -ExpectedOperationId $operationId -ExpectedTargetDigest $target `
-    -ExpectedManifestBeforeSha256 $before.Sha256 -ExpectedManifestAfterSha256 $expected.Sha256
-  $identityLease = Open-PhaseAValidatedDirectoryLease -Path $stage
-  try { $identity = Get-PhaseAFileIdentity -Handle $identityLease } finally { $identityLease.Dispose() }
-  $confirmationLease = Open-PhaseAValidatedDirectoryLease -Path $stage
-  try { $confirmation = Get-PhaseAFileIdentity -Handle $confirmationLease } finally { $confirmationLease.Dispose() }
-  if ($confirmation.VolumeSerialNumber -ne $identity.VolumeSerialNumber -or $confirmation.FileId -cne $identity.FileId) {
-    throw 'Provisioning-stage identity changed before cleanup.'
+    -ExpectedCommit $ExpectedCommit -ExpectedOperationId $ExpectedOperationId `
+    -ExpectedTargetDigest $ExpectedTargetDigest -ExpectedOperatorSidDigest $ExpectedOperatorSidDigest `
+    -ExpectedMachineDigest $ExpectedMachineDigest -ExpectedStoreConfigSha256 $ExpectedStoreConfigSha256 `
+    -ExpectedHostProvisioningReceiptSha256 $ExpectedHostProvisioningReceiptSha256 `
+    -ExpectedSourceApprovalReceiptSha256 $ExpectedSourceApprovalReceiptSha256 `
+    -ExpectedManifestBeforeSha256 $ExpectedManifestBeforeSha256 `
+    -ExpectedManifestAfterSha256 $ExpectedManifestAfterSha256
+  $completionRoot = $bootstrap
+  $install = @{
+    ReceiptPath=$CompletionReceiptPath; SignaturePath=$CompletionSignaturePath; StoreRoot=$completionRoot;
+    SigningSpkiPath=$RecoverySigningSpkiPath; ExpectedSigningSpkiSha256=$RecoverySigningSpkiSha256;
+    ExpectedReceiptType='operation-completion'; ExpectedCommit=$ExpectedCommit; ExpectedOperationId=$ExpectedOperationId;
+    ExpectedTargetDigest=$ExpectedTargetDigest; ExpectedOperatorSidDigest=$ExpectedOperatorSidDigest;
+    ExpectedMachineDigest=$ExpectedMachineDigest; ExpectedStoreConfigSha256=$ExpectedStoreConfigSha256;
+    ExpectedHostProvisioningReceiptSha256=$ExpectedHostProvisioningReceiptSha256;
+    ExpectedSourceApprovalReceiptSha256=$ExpectedSourceApprovalReceiptSha256;
+    ExpectedManifestBeforeSha256=$ExpectedManifestBeforeSha256; ExpectedManifestAfterSha256=$ExpectedManifestAfterSha256
   }
-  Remove-Item -LiteralPath $stage -Recurse -Force
-  $actualAfter = Get-PhaseAManifestDigest $parent
-  if ($actualAfter.Sha256 -cne $expected.Sha256) { throw 'Cleanup result does not match the authorized after manifest.' }
-  return [pscustomobject]@{ RemovedTargetDigest=$target; OperationId=$operationId; ManifestAfterSha256=$actualAfter.Sha256 }
+  $install.Bootstrap=$true
+  if ($TestBootstrapRoot) { $install.DefinitionImport=$true }
+  $installed = Install-PhaseASignedReceipt @install
+  return [pscustomobject]@{ RemovedTargetDigest=$ExpectedTargetDigest; OperationId=$ExpectedOperationId; ManifestAfterSha256=$actualAfter.Sha256; CompletionReceiptPath=$installed.ReceiptPath }
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'DefinitionImport') { return }
 
-Invoke-PhaseAEvidenceStoreProvision -StoreRoot $StoreRoot `
-  -CanonicalOperatorSid $CanonicalOperatorSid -SigningSpkiPath $SigningSpkiPath `
-  -RecoverySigningSpkiPath $RecoverySigningSpkiPath -SigningSpkiSha256 $SigningSpkiSha256 `
-  -RecoverySigningSpkiSha256 $RecoverySigningSpkiSha256 -CustodyReceiptPath $CustodyReceiptPath `
-  -CustodySignaturePath $CustodySignaturePath
+$module = Get-Module PhaseAEvidenceStore
+$production = & $module {
+  [pscustomobject]@{
+    StoreRoot=$script:ProductionStoreRoot
+    SigningSpkiPath=$script:ProductionSigningSpkiPath
+    RecoverySigningSpkiPath=$script:ProductionRecoverySpkiPath
+    SigningSpkiSha256=$script:ProductionSigningSpkiSha256
+    RecoverySigningSpkiSha256=$script:ProductionRecoverySpkiSha256
+  }
+}
+Invoke-PhaseAEvidenceStoreProvision -StoreRoot $production.StoreRoot `
+  -CanonicalOperatorSid $CanonicalOperatorSid -ExpectedCommit $ExpectedCommit `
+  -SigningSpkiPath $production.SigningSpkiPath -RecoverySigningSpkiPath $production.RecoverySigningSpkiPath `
+  -SigningSpkiSha256 $production.SigningSpkiSha256 -RecoverySigningSpkiSha256 $production.RecoverySigningSpkiSha256 `
+  -CustodyReceiptPath $CustodyReceiptPath -CustodySignaturePath $CustodySignaturePath `
+  -CustodyOperationId $CustodyOperationId -CustodyManifestBeforeSha256 $CustodyManifestBeforeSha256 `
+  -CustodyManifestAfterSha256 $CustodyManifestAfterSha256
