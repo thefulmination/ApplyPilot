@@ -50,6 +50,8 @@ $script:SensitiveIdentifier = '(?i)(?<![a-z0-9_])(?:' +
 $script:Failures = [Collections.Generic.List[object]]::new()
 $script:SkippedActions = [Collections.Generic.List[object]]::new()
 $script:DefinitionImportMode = $PSCmdlet.ParameterSetName -eq 'DefinitionImport'
+$script:WrapperBeforeLeafOpenHook = $null
+$script:ActiveWrapperMutationLease = $null
 
 $adapterInjected = $PSBoundParameters.ContainsKey('AdapterPath')
 $consoleInjected = $PSBoundParameters.ContainsKey('ConsoleCommand')
@@ -1222,6 +1224,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
@@ -1242,6 +1245,8 @@ namespace ApplyPilot
         private const int FileStandardInfoClass = 1;
         private const int FileAttributeTagInfoClass = 9;
         private const int FileIdInfoClass = 18;
+        private static readonly Guid LocalAppDataFolderId =
+            new Guid("F1B32785-6FBA-4FCF-9D55-7B8E7F157091");
 
         [StructLayout(LayoutKind.Sequential)]
         private struct FileAttributeTagInfo
@@ -1274,6 +1279,92 @@ namespace ApplyPilot
             public FileId128 FileId;
         }
 
+        internal sealed class HandleIdentity
+        {
+            public ulong VolumeSerialNumber;
+            public ulong FileIdLow;
+            public ulong FileIdHigh;
+            public string FinalPath;
+            public string Token;
+        }
+
+        internal sealed class HeldComponent
+        {
+            public SafeFileHandle Handle;
+            public HandleIdentity Identity;
+        }
+
+        public sealed class WrapperOpenLease : IDisposable
+        {
+            private readonly List<HeldComponent> components;
+            private readonly HandleIdentity leafIdentity;
+            private bool disposed;
+
+            internal WrapperOpenLease(
+                List<HeldComponent> heldComponents,
+                SafeFileHandle leafHandle,
+                HandleIdentity identity,
+                bool writable)
+            {
+                components = heldComponents;
+                leafIdentity = identity;
+                IdentityToken = identity.Token;
+                try
+                {
+                    Stream = new FileStream(
+                        leafHandle,
+                        writable ? FileAccess.ReadWrite : FileAccess.Read);
+                }
+                catch
+                {
+                    leafHandle.Dispose();
+                    DisposeComponents();
+                    throw;
+                }
+            }
+
+            public FileStream Stream { get; private set; }
+            public string IdentityToken { get; private set; }
+
+            public void Validate()
+            {
+                if (disposed)
+                    throw new ObjectDisposedException(nameof(WrapperOpenLease));
+                foreach (HeldComponent component in components)
+                {
+                    HandleIdentity current = ReadIdentity(component.Handle, true);
+                    RequireSameIdentity(component.Identity, current);
+                }
+                HandleIdentity currentLeaf = ReadIdentity(Stream.SafeFileHandle, false);
+                RequireSameIdentity(leafIdentity, currentLeaf);
+                string parent = Path.GetDirectoryName(currentLeaf.FinalPath).TrimEnd('\\');
+                string heldParent = components[components.Count - 1].Identity.FinalPath.TrimEnd('\\');
+                if (!String.Equals(parent, heldParent, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("wrapper parent identity changed");
+            }
+
+            private void DisposeComponents()
+            {
+                for (int index = components.Count - 1; index >= 0; index--)
+                    components[index].Handle.Dispose();
+                components.Clear();
+            }
+
+            public void Dispose()
+            {
+                if (disposed) return;
+                disposed = true;
+                try
+                {
+                    if (Stream != null) Stream.Dispose();
+                }
+                finally
+                {
+                    DisposeComponents();
+                }
+            }
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern SafeFileHandle CreateFileW(
             string fileName,
@@ -1297,6 +1388,13 @@ namespace ApplyPilot
             StringBuilder filePath,
             uint filePathSize,
             uint flags);
+
+        [DllImport("shell32.dll", SetLastError = false)]
+        private static extern int SHGetKnownFolderPath(
+            ref Guid folderId,
+            uint flags,
+            IntPtr token,
+            out IntPtr path);
 
         private static T GetInformation<T>(SafeFileHandle handle, int informationClass)
             where T : struct
@@ -1331,21 +1429,57 @@ namespace ApplyPilot
             return buffer.ToString().TrimEnd('\\');
         }
 
-        private static void RejectReparseAncestors(string fullPath)
+        private static string ComputeIdentityToken(FileIdInfo fileId, string finalPath)
         {
-            DirectoryInfo current = new DirectoryInfo(Path.GetDirectoryName(fullPath));
-            while (current != null)
-            {
-                if ((File.GetAttributes(current.FullName) & FileAttributes.ReparsePoint) != 0)
-                    throw new IOException("wrapper ancestor is a reparse point");
-                current = current.Parent;
-            }
+            string material = String.Format(
+                "{0:X16}|{1:X16}{2:X16}|{3}",
+                fileId.VolumeSerialNumber,
+                fileId.FileId.Low,
+                fileId.FileId.High,
+                finalPath.ToUpperInvariant());
+            byte[] digest = SHA256.HashData(Encoding.UTF8.GetBytes(material));
+            return Convert.ToHexString(digest).ToLowerInvariant();
         }
 
-        private static SafeFileHandle OpenRoot(string root)
+        private static HandleIdentity ReadIdentity(SafeFileHandle handle, bool expectDirectory)
+        {
+            FileAttributeTagInfo tag = GetInformation<FileAttributeTagInfo>(
+                handle, FileAttributeTagInfoClass);
+            FileStandardInfo standard = GetInformation<FileStandardInfo>(
+                handle, FileStandardInfoClass);
+            FileIdInfo fileId = GetInformation<FileIdInfo>(handle, FileIdInfoClass);
+            bool isDirectory = standard.Directory != 0 ||
+                (tag.FileAttributes & FileAttributeDirectory) != 0;
+            if (isDirectory != expectDirectory ||
+                (tag.FileAttributes & FileAttributeReparsePoint) != 0 ||
+                tag.ReparseTag != 0 ||
+                (!expectDirectory && standard.NumberOfLinks != 1))
+                throw new IOException("wrapper handle identity is invalid");
+            string finalPath = GetFinalVolumePath(handle);
+            return new HandleIdentity
+            {
+                VolumeSerialNumber = fileId.VolumeSerialNumber,
+                FileIdLow = fileId.FileId.Low,
+                FileIdHigh = fileId.FileId.High,
+                FinalPath = finalPath,
+                Token = ComputeIdentityToken(fileId, finalPath)
+            };
+        }
+
+        private static void RequireSameIdentity(HandleIdentity expected, HandleIdentity actual)
+        {
+            if (expected.VolumeSerialNumber != actual.VolumeSerialNumber ||
+                expected.FileIdLow != actual.FileIdLow ||
+                expected.FileIdHigh != actual.FileIdHigh ||
+                !String.Equals(expected.FinalPath, actual.FinalPath, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(expected.Token, actual.Token, StringComparison.Ordinal))
+                throw new IOException("wrapper handle identity changed");
+        }
+
+        private static SafeFileHandle OpenDirectoryComponent(string path)
         {
             SafeFileHandle handle = CreateFileW(
-                root,
+                path,
                 0,
                 ShareRead | ShareWrite | ShareDelete,
                 IntPtr.Zero,
@@ -1361,14 +1495,90 @@ namespace ApplyPilot
             return handle;
         }
 
-        public static SafeFileHandle OpenValidated(
+        private static List<HeldComponent> OpenComponentChain(string authorizedRoot, string parent)
+        {
+            var paths = new List<string> { authorizedRoot };
+            string relative = Path.GetRelativePath(authorizedRoot, parent);
+            if (!String.Equals(relative, ".", StringComparison.Ordinal))
+            {
+                string current = authorizedRoot;
+                foreach (string segment in relative.Split(Path.DirectorySeparatorChar))
+                {
+                    if (String.IsNullOrEmpty(segment) || segment == "." || segment == "..")
+                        throw new IOException("wrapper component path is not canonical");
+                    current = Path.Combine(current, segment);
+                    paths.Add(current);
+                }
+            }
+
+            var held = new List<HeldComponent>();
+            try
+            {
+                foreach (string componentPath in paths)
+                {
+                    SafeFileHandle handle = OpenDirectoryComponent(componentPath);
+                    try
+                    {
+                        held.Add(new HeldComponent
+                        {
+                            Handle = handle,
+                            Identity = ReadIdentity(handle, true)
+                        });
+                    }
+                    catch
+                    {
+                        handle.Dispose();
+                        throw;
+                    }
+                }
+                return held;
+            }
+            catch
+            {
+                for (int index = held.Count - 1; index >= 0; index--)
+                    held[index].Handle.Dispose();
+                throw;
+            }
+        }
+
+        public static string GetLocalAppDataPath()
+        {
+            IntPtr value = IntPtr.Zero;
+            Guid folderId = LocalAppDataFolderId;
+            int result = SHGetKnownFolderPath(ref folderId, 0, IntPtr.Zero, out value);
+            if (result != 0)
+                Marshal.ThrowExceptionForHR(result);
+            try
+            {
+                string path = Marshal.PtrToStringUni(value);
+                if (String.IsNullOrWhiteSpace(path))
+                    throw new IOException("LocalAppData known folder is unavailable");
+                return Path.GetFullPath(path).TrimEnd('\\');
+            }
+            finally
+            {
+                if (value != IntPtr.Zero) Marshal.FreeCoTaskMem(value);
+            }
+        }
+
+        public static WrapperOpenLease OpenValidated(
             string path,
             string[] authorizedRoots,
             string[] authorizedBasenames,
-            bool writable)
+            bool writable,
+            string expectedIdentityToken,
+            Action beforeLeafOpen)
         {
             string fullPath = Path.GetFullPath(path);
-            string basename = Path.GetFileName(fullPath);
+            if (!String.Equals(path, fullPath, StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+                path.StartsWith(@"\\.\", StringComparison.Ordinal))
+                throw new IOException("wrapper path is not canonical");
+            string basename = Path.GetFileName(path);
+            if (basename.EndsWith(".", StringComparison.Ordinal) ||
+                basename.EndsWith(" ", StringComparison.Ordinal) ||
+                basename.IndexOf(':') >= 0)
+                throw new IOException("wrapper basename alias is not authorized");
             var basenames = new HashSet<string>(authorizedBasenames, StringComparer.OrdinalIgnoreCase);
             if (!basenames.Contains(basename))
                 throw new IOException("wrapper basename is not authorized");
@@ -1386,18 +1596,15 @@ namespace ApplyPilot
             }
             if (authorizedRoot == null)
                 throw new IOException("wrapper root is not authorized");
+            if (writable && String.IsNullOrWhiteSpace(expectedIdentityToken))
+                throw new IOException("wrapper mutation identity is required");
 
-            RejectReparseAncestors(fullPath);
-            using (SafeFileHandle rootHandle = OpenRoot(authorizedRoot))
+            List<HeldComponent> components = OpenComponentChain(authorizedRoot, parent);
+            SafeFileHandle leafHandle = null;
+            try
             {
-                FileAttributeTagInfo rootTag = GetInformation<FileAttributeTagInfo>(
-                    rootHandle, FileAttributeTagInfoClass);
-                if ((rootTag.FileAttributes & FileAttributeDirectory) == 0 ||
-                    (rootTag.FileAttributes & FileAttributeReparsePoint) != 0 ||
-                    rootTag.ReparseTag != 0)
-                    throw new IOException("wrapper root identity is invalid");
-
-                SafeFileHandle handle = CreateFileW(
+                if (beforeLeafOpen != null) beforeLeafOpen();
+                leafHandle = CreateFileW(
                     fullPath,
                     writable ? GenericRead | GenericWrite : GenericRead,
                     0,
@@ -1405,51 +1612,48 @@ namespace ApplyPilot
                     OpenExisting,
                     FileFlagOpenReparsePoint,
                     IntPtr.Zero);
-                if (handle.IsInvalid)
+                if (leafHandle.IsInvalid)
                 {
                     int error = Marshal.GetLastWin32Error();
-                    handle.Dispose();
+                    leafHandle.Dispose();
+                    leafHandle = null;
                     throw new Win32Exception(error);
                 }
+                HandleIdentity leafIdentity = ReadIdentity(leafHandle, false);
+                string heldParent = components[components.Count - 1].Identity.FinalPath.TrimEnd('\\');
+                string leafParent = Path.GetDirectoryName(leafIdentity.FinalPath).TrimEnd('\\');
+                if (!String.Equals(leafParent, heldParent, StringComparison.OrdinalIgnoreCase) ||
+                    !String.Equals(Path.GetFileName(leafIdentity.FinalPath), basename,
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("wrapper final path is not authorized");
+                foreach (HeldComponent component in components)
+                    RequireSameIdentity(component.Identity, ReadIdentity(component.Handle, true));
+                if (writable && !String.Equals(
+                        expectedIdentityToken, leafIdentity.Token, StringComparison.Ordinal))
+                    throw new IOException("wrapper snapshot identity changed");
+                var lease = new WrapperOpenLease(components, leafHandle, leafIdentity, writable);
+                leafHandle = null;
+                components = null;
                 try
                 {
-                    FileAttributeTagInfo tag = GetInformation<FileAttributeTagInfo>(
-                        handle, FileAttributeTagInfoClass);
-                    FileStandardInfo standard = GetInformation<FileStandardInfo>(
-                        handle, FileStandardInfoClass);
-                    GetInformation<FileIdInfo>(handle, FileIdInfoClass);
-                    if ((tag.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0 ||
-                        tag.ReparseTag != 0 || standard.Directory != 0 || standard.NumberOfLinks != 1)
-                        throw new IOException("wrapper file identity is invalid");
-
-                    string finalRoot = GetFinalVolumePath(rootHandle);
-                    string finalPath = GetFinalVolumePath(handle);
-                    if (!String.Equals(
-                            Path.GetDirectoryName(finalPath).TrimEnd('\\'),
-                            finalRoot,
-                            StringComparison.OrdinalIgnoreCase) ||
-                        !String.Equals(Path.GetFileName(finalPath), basename, StringComparison.OrdinalIgnoreCase))
-                        throw new IOException("wrapper final path is not authorized");
-                    return handle;
+                    lease.Validate();
+                    return lease;
                 }
                 catch
                 {
-                    handle.Dispose();
+                    lease.Dispose();
                     throw;
                 }
             }
-        }
-
-        public static void ValidateMutationHandle(SafeFileHandle handle)
-        {
-            FileAttributeTagInfo tag = GetInformation<FileAttributeTagInfo>(
-                handle, FileAttributeTagInfoClass);
-            FileStandardInfo standard = GetInformation<FileStandardInfo>(
-                handle, FileStandardInfoClass);
-            GetInformation<FileIdInfo>(handle, FileIdInfoClass);
-            if ((tag.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0 ||
-                tag.ReparseTag != 0 || standard.Directory != 0 || standard.NumberOfLinks != 1)
-                throw new IOException("wrapper mutation identity is invalid");
+            finally
+            {
+                if (leafHandle != null) leafHandle.Dispose();
+                if (components != null)
+                {
+                    for (int index = components.Count - 1; index >= 0; index--)
+                        components[index].Handle.Dispose();
+                }
+            }
         }
     }
 }
@@ -1458,42 +1662,52 @@ namespace ApplyPilot
 
 function Get-KnownAuthorizedWrapperRoots {
   if ($script:DefinitionImportMode -and $WrapperRoot) { return @($WrapperRoot) }
+  Initialize-KnownWrapperNativeApi
   return @(
     (Join-Path $PSScriptRoot '..\.fleet-logs\_task-wrappers'),
-    (Join-Path $env:LOCALAPPDATA 'ApplyPilot\_task-wrappers')
+    (Join-Path ([ApplyPilot.KnownWrapperNativeApi]::GetLocalAppDataPath()) 'ApplyPilot\_task-wrappers')
   )
 }
 
-function Open-KnownWrapperNative([string]$Path, [bool]$Writable) {
+function Open-KnownWrapperNative(
+  [string]$Path,
+  [bool]$Writable,
+  [string]$ExpectedIdentityToken = $null
+) {
   Initialize-KnownWrapperNativeApi
-  $handle = $null
-  try {
-    $handle = [ApplyPilot.KnownWrapperNativeApi]::OpenValidated(
-      $Path,
-      [string[]]@(Get-KnownAuthorizedWrapperRoots),
-      [string[]]$script:GeneratedAcquisitionWrapperBasenames,
-      $Writable
-    )
-    $access = if ($Writable) { [IO.FileAccess]::ReadWrite } else { [IO.FileAccess]::Read }
-    $stream = [IO.FileStream]::new($handle, $access)
-    $handle = $null
-    return $stream
-  } finally {
-    if ($null -ne $handle) { $handle.Dispose() }
+  $beforeLeafOpen = $null
+  if ($script:DefinitionImportMode -and $null -ne $script:WrapperBeforeLeafOpenHook) {
+    $beforeLeafOpen = [Action]{ & $script:WrapperBeforeLeafOpenHook }
   }
+  return [ApplyPilot.KnownWrapperNativeApi]::OpenValidated(
+    $Path,
+    [string[]]@(Get-KnownAuthorizedWrapperRoots),
+    [string[]]$script:GeneratedAcquisitionWrapperBasenames,
+    $Writable,
+    $ExpectedIdentityToken,
+    $beforeLeafOpen
+  )
 }
 
 function Open-KnownWrapperSnapshotExclusive([string]$Path) {
   return Open-KnownWrapperNative -Path $Path -Writable $false
 }
 
-function Open-KnownWrapperMutationExclusive([string]$Path) {
-  return Open-KnownWrapperNative -Path $Path -Writable $true
+function Open-KnownWrapperMutationExclusive(
+  [string]$Path,
+  [string]$ExpectedIdentityToken
+) {
+  return Open-KnownWrapperNative `
+    -Path $Path `
+    -Writable $true `
+    -ExpectedIdentityToken $ExpectedIdentityToken
 }
 
 function Assert-KnownWrapperMutationHandle($Stream) {
-  Initialize-KnownWrapperNativeApi
-  [ApplyPilot.KnownWrapperNativeApi]::ValidateMutationHandle($Stream.SafeFileHandle)
+  if ($null -eq $script:ActiveWrapperMutationLease) {
+    throw 'wrapper mutation lease is unavailable'
+  }
+  $script:ActiveWrapperMutationLease.Validate()
 }
 
 function Read-KnownWrapperStreamBytes($Stream) {
@@ -1792,14 +2006,17 @@ function Get-ServiceSnapshot {
 function Get-WrapperSnapshot {
   return @(Get-KnownWrapperPaths | ForEach-Object {
     $wrapper = $_
-    $stream = Open-KnownWrapperSnapshotExclusive ([string]$wrapper.FullName)
+    $lease = Open-KnownWrapperSnapshotExclusive ([string]$wrapper.FullName)
+    $stream = $lease.Stream
     try {
       $bytes = Read-KnownWrapperStreamBytes $stream
+      $lease.Validate()
       $content = ConvertFrom-KnownWrapperBytes $bytes
       $denyStub = Test-KnownWrapperDenyStub -Content $bytes -Extension $wrapper.Extension
       [ordered]@{
         name = $wrapper.Name
         path_digest = Get-TextDigest $wrapper.FullName
+        identity_token = $lease.IdentityToken
         sha256 = Get-KnownWrapperByteDigest $bytes
         embedded_dsn = [bool](
           $content -match $script:SensitiveIdentifier -or $content -match $script:SensitiveUri
@@ -1808,7 +2025,7 @@ function Get-WrapperSnapshot {
         evidence_verified = if ($denyStub) { Test-KnownDenyStubEvidence $wrapper } else { $null }
       }
     } finally {
-      $stream.Dispose()
+      $lease.Dispose()
     }
   })
 }
@@ -2124,9 +2341,32 @@ function Stop-LegacyAcquisitionProcesses {
 }
 
 function Remove-EmbeddedWrapperDsns {
-  foreach ($wrapper in @(Get-KnownWrapperPaths)) {
+  param(
+    [Parameter(Mandatory)]
+    [AllowEmptyCollection()]
+    [object[]]$ExpectedWrappers
+  )
+
+  $wrapperPaths = @(Get-KnownWrapperPaths)
+  $expectedDigests = @($ExpectedWrappers | ForEach-Object { [string]$_.path_digest } | Sort-Object)
+  $currentDigests = @($wrapperPaths | ForEach-Object { Get-TextDigest $_.FullName } | Sort-Object)
+  if (($expectedDigests -join '|') -cne ($currentDigests -join '|')) {
+    throw 'wrapper inventory changed after snapshot'
+  }
+
+  foreach ($wrapper in $wrapperPaths) {
+    $pathDigest = Get-TextDigest $wrapper.FullName
+    $expected = @($ExpectedWrappers | Where-Object { [string]$_.path_digest -ceq $pathDigest })
     Invoke-RecordedAction 'rewrite_wrapper' $wrapper.FullName {
-      $stream = Open-KnownWrapperMutationExclusive ([string]$wrapper.FullName)
+      if ($expected.Count -ne 1 -or [string]::IsNullOrWhiteSpace(
+          [string]$expected[0].identity_token)) {
+        throw 'wrapper snapshot identity is unavailable'
+      }
+      $lease = Open-KnownWrapperMutationExclusive `
+        -Path ([string]$wrapper.FullName) `
+        -ExpectedIdentityToken ([string]$expected[0].identity_token)
+      $stream = $lease.Stream
+      $script:ActiveWrapperMutationLease = $lease
       $evidenceStream = $null
       try {
         $preimageBytes = Read-KnownWrapperStreamBytes $stream
@@ -2168,8 +2408,9 @@ function Remove-EmbeddedWrapperDsns {
         }
         Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
       } finally {
+        $script:ActiveWrapperMutationLease = $null
         if ($null -ne $evidenceStream) { $evidenceStream.Dispose() }
-        $stream.Dispose()
+        $lease.Dispose()
       }
     }
   }
@@ -2190,7 +2431,7 @@ function Invoke-ContainmentOrchestration {
     try {
       Disable-LegacyTasksAndServices
       Stop-LegacyAcquisitionProcesses
-      Remove-EmbeddedWrapperDsns
+      Remove-EmbeddedWrapperDsns -ExpectedWrappers @($before.wrapper_hashes)
     } catch {
       $script:Failures.Add([ordered]@{
         action = 'containment_actions'

@@ -233,15 +233,16 @@ def _run_wrapper_rewrite_harness(
         "\n".join(
             [
                 f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrapper.parent)}'",
+                "$expectedWrappers = @(Get-WrapperSnapshot)",
                 overrides,
                 "$script:Failures.Clear()",
-                "Remove-EmbeddedWrapperDsns",
+                "Remove-EmbeddedWrapperDsns -ExpectedWrappers $expectedWrappers",
                 "$snapshotAvailable = $true",
                 "try { $wrappers = @(Get-WrapperSnapshot) } catch { "
                 "$wrappers = @(); $snapshotAvailable = $false }",
                 "$snapshot = [pscustomobject]@{scheduled_tasks=@(); services=@(); "
                 "process_identities=@(); wrapper_hashes=$wrappers}",
-                "[ordered]@{failures=@($script:Failures); wrappers=$wrappers; "
+                "[ordered]@{failures=@($script:Failures); expected_wrappers=$expectedWrappers; wrappers=$wrappers; "
                 "snapshot_available=$snapshotAvailable; "
                 "unresolved=@(Get-UnresolvedAfterState $snapshot)} | "
                 "ConvertTo-Json -Depth 8 -Compress",
@@ -277,6 +278,37 @@ def _run_wrapper_snapshot_harness(
                 "$available = $false; $errorType = $_.Exception.GetType().Name }",
                 "[ordered]@{available=$available; error_type=$errorType; wrappers=$snapshot} | "
                 "ConvertTo-Json -Depth 8 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _run_wrapper_candidate_harness(
+    tmp_path: Path,
+    wrapper_root: Path,
+    candidate: str,
+) -> tuple[subprocess.CompletedProcess[str], dict]:
+    harness = tmp_path / "wrapper-candidate-harness.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrapper_root)}'",
+                "$lease = $null",
+                "$opened = $false",
+                "$errorType = $null",
+                f"try {{ $lease = Open-KnownWrapperSnapshotExclusive '{_ps_quote(candidate)}'; "
+                "$opened = $true } catch { $errorType = $_.Exception.GetType().Name } finally { "
+                "if ($null -ne $lease) { $lease.Dispose() } }",
+                "[ordered]@{opened=$opened; error_type=$errorType} | ConvertTo-Json -Compress",
             ]
         ),
         encoding="utf-8",
@@ -551,7 +583,7 @@ def test_sensitive_wrapper_identifiers_force_evidence_backup_and_deny_stub(tmp_p
             [
                 f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrappers)}'",
                 "$before = @(Get-WrapperSnapshot)",
-                "Remove-EmbeddedWrapperDsns",
+                "Remove-EmbeddedWrapperDsns -ExpectedWrappers $before",
                 "$after = @(Get-WrapperSnapshot)",
                 "[ordered]@{before=$before; after=$after} | ConvertTo-Json -Depth 8 -Compress",
             ]
@@ -619,23 +651,22 @@ def test_sensitive_wrapper_identifiers_force_evidence_backup_and_deny_stub(tmp_p
         assert [(item.name, item.read_bytes()) for item in evidence] == [first_evidence[name]]
 
 
-def test_wrapper_replacement_before_exclusive_open_is_the_preserved_preimage(tmp_path):
+def test_wrapper_replacement_before_mutation_open_fails_identity_closed(tmp_path):
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()
     wrapper = wrappers / "apply-cycle-task.ps1"
-    wrapper.write_text("$env:FLEET_PG_DSN = 'original-secret'\n", encoding="utf-8")
+    original = b"$env:FLEET_PG_DSN = 'original-secret'\n"
+    wrapper.write_bytes(original)
     replacement = b"$env:FLEET_PG_DSN = 'replacement-secret'\n# replacement bytes\n"
-    replacement_b64 = base64.b64encode(replacement).decode("ascii")
+    replacement_path = wrappers / "replacement.tmp"
+    replacement_path.write_bytes(replacement)
+    displaced_path = wrappers / "original.displaced"
     overrides = "\n".join(
         [
-            "$script:WrapperOpenCount = 0",
-            "function Open-KnownWrapperMutationExclusive([string]$Path) {",
-            "  $script:WrapperOpenCount++",
-            "  if ($script:WrapperOpenCount -eq 1) {",
-            f"    [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String('{replacement_b64}'))",
-            "  }",
-            "  return [IO.FileStream]::new($Path, [IO.FileMode]::Open, "
-            "[IO.FileAccess]::ReadWrite, [IO.FileShare]::None)",
+            "$script:WrapperBeforeLeafOpenHook = {",
+            "  $script:WrapperBeforeLeafOpenHook = $null",
+            f"  Move-Item -LiteralPath '{_ps_quote(wrapper)}' -Destination '{_ps_quote(displaced_path)}'",
+            f"  Move-Item -LiteralPath '{_ps_quote(replacement_path)}' -Destination '{_ps_quote(wrapper)}'",
             "}",
         ]
     )
@@ -643,12 +674,17 @@ def test_wrapper_replacement_before_exclusive_open_is_the_preserved_preimage(tmp
     result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
 
     assert result.returncode == 0, result.stderr
-    assert payload["failures"] == []
-    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
-    assert len(evidence) == 1
-    assert evidence[0].read_bytes() == replacement
-    assert b"emergency containment" in wrapper.read_bytes().lower()
-    assert b"replacement-secret" not in wrapper.read_bytes()
+    assert [item["action"] for item in payload["failures"]] == ["rewrite_wrapper"]
+    assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == []
+    assert wrapper.read_bytes() == replacement
+    assert displaced_path.read_bytes() == original
+    assert payload["wrappers"][0]["embedded_dsn"] is True
+    assert payload["expected_wrappers"][0]["identity_token"]
+    assert payload["wrappers"][0]["identity_token"]
+    assert (
+        payload["expected_wrappers"][0]["identity_token"]
+        != payload["wrappers"][0]["identity_token"]
+    )
 
 
 def test_wrapper_replacement_attempt_is_blocked_while_exclusive_handle_is_held(tmp_path):
@@ -769,6 +805,41 @@ def test_wrapper_root_junction_is_rejected_without_reading_target(tmp_path):
     assert str(real_root) not in result.stdout
 
 
+def test_wrapper_root_substitution_during_open_fails_closed_with_held_ancestor(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    original = wrappers / "apply-cycle-task.ps1"
+    original_bytes = b"$env:FLEET_PG_DSN = 'original-ancestor-secret'\n"
+    original.write_bytes(original_bytes)
+    replacement_root = tmp_path / "replacement-root"
+    replacement_root.mkdir()
+    replacement = replacement_root / original.name
+    replacement_bytes = b"$env:FLEET_PG_DSN = 'replacement-ancestor-secret'\n"
+    replacement.write_bytes(replacement_bytes)
+    moved_root = tmp_path / "moved-original-root"
+    marker = tmp_path / "ancestor-hook-ran"
+    overrides = "\n".join(
+        [
+            "$script:WrapperBeforeLeafOpenHook = {",
+            f"  Move-Item -LiteralPath '{_ps_quote(wrappers)}' -Destination '{_ps_quote(moved_root)}'",
+            f"  Move-Item -LiteralPath '{_ps_quote(replacement_root)}' -Destination '{_ps_quote(wrappers)}'",
+            f"  Set-Content -LiteralPath '{_ps_quote(marker)}' -Value ran",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_snapshot_harness(tmp_path, wrappers, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
+    assert payload["available"] is False
+    assert payload["wrappers"] == []
+    assert (moved_root / original.name).read_bytes() == original_bytes
+    assert (wrappers / original.name).read_bytes() == replacement_bytes
+    assert "original-ancestor-secret" not in result.stdout
+    assert "replacement-ancestor-secret" not in result.stdout
+
+
 def test_wrapper_hardlink_substitution_is_rejected_without_reading_target(tmp_path):
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()
@@ -785,6 +856,34 @@ def test_wrapper_hardlink_substitution_is_rejected_without_reading_target(tmp_pa
     assert payload["wrappers"] == []
     assert secret not in result.stdout
     assert str(target) not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "alias_kind",
+    ["ads", "trailing_dot", "trailing_space", "dot_component", "extended_path"],
+)
+def test_wrapper_win32_aliases_are_rejected_before_open(alias_kind, tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    wrapper.write_text("Write-Output 'authorized wrapper'\n", encoding="utf-8")
+    if alias_kind == "ads":
+        candidate = f"{wrapper}:payload"
+        Path(candidate).write_text("alternate stream secret", encoding="utf-8")
+    elif alias_kind == "trailing_dot":
+        candidate = f"{wrapper}."
+    elif alias_kind == "trailing_space":
+        candidate = f"{wrapper} "
+    elif alias_kind == "dot_component":
+        candidate = f"{wrappers}\\.\\{wrapper.name}"
+    else:
+        candidate = rf"\\?\{wrapper}"
+
+    result, payload = _run_wrapper_candidate_harness(tmp_path, wrappers, candidate)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["opened"] is False
+    assert str(wrapper) not in result.stdout
 
 
 def test_read_only_wrapper_is_inspected_but_mutation_remains_unresolved(tmp_path):
@@ -1251,12 +1350,13 @@ def test_process_termination_during_partial_evidence_write_leaves_no_final_artif
         "\n".join(
             [
                 f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrappers)}'",
+                "$expectedWrappers = @(Get-WrapperSnapshot)",
                 "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
                 "  $Stream.Write($Content, 0, 8)",
                 "  $Stream.Flush($true)",
                 "  Stop-Process -Id $PID -Force",
                 "}",
-                "Remove-EmbeddedWrapperDsns",
+                "Remove-EmbeddedWrapperDsns -ExpectedWrappers $expectedWrappers",
             ]
         ),
         encoding="utf-8",
@@ -1307,7 +1407,7 @@ def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp
 @pytest.mark.parametrize(
     "overrides",
     [
-        "function Open-KnownWrapperMutationExclusive([string]$Path) { throw 'open failed' }",
+        "function Open-KnownWrapperMutationExclusive([string]$Path, [string]$ExpectedIdentityToken) { throw 'open failed' }",
         "function Read-KnownWrapperStreamBytes($Stream) { throw 'read failed' }",
         "function Open-KnownEvidenceExclusive([string]$Path) { throw 'evidence open failed' }",
         "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) { throw 'evidence write failed' }",
@@ -1593,6 +1693,48 @@ def test_operational_wrapper_root_is_rejected_before_enumeration(mode, tmp_path)
     assert payload["success"] is False
     assert payload["rejection"] == "injected_execution_seam_disabled"
     assert payload["non_operational_reasons"] == ["wrapper_root_injected"]
+
+
+def test_localappdata_environment_cannot_redirect_authorized_wrapper_root(tmp_path):
+    redirected_local = tmp_path / "mutable-localappdata-secret"
+    redirected_root = redirected_local / "ApplyPilot" / "_task-wrappers"
+    redirected_root.mkdir(parents=True)
+    (redirected_root / "apply-cycle-task.ps1").write_text(
+        "$env:FLEET_PG_DSN = 'redirected-wrapper-secret'\n", encoding="utf-8"
+    )
+    harness = tmp_path / "native-known-folder-root.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport",
+                "$roots = @(Get-KnownAuthorizedWrapperRoots)",
+                "$candidates = @(Get-KnownWrapperPaths)",
+                f"[ordered]@{{redirected_root_authorized=($roots -contains '{_ps_quote(redirected_root)}'); "
+                f"redirected_candidate=(@($candidates | Where-Object FullName -eq '{_ps_quote(redirected_root / 'apply-cycle-task.ps1')}').Count -gt 0)}} | "
+                "ConvertTo-Json -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["LOCALAPPDATA"] = str(redirected_local)
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip()) == {
+        "redirected_root_authorized": False,
+        "redirected_candidate": False,
+    }
+    assert "mutable-localappdata-secret" not in result.stdout
+    assert "redirected-wrapper-secret" not in result.stdout
 
 
 def test_ambiguous_authorities_remain_unresolved_and_are_never_acted_on(tmp_path):
