@@ -2671,6 +2671,128 @@ def test_compact_launcher_forms_are_bounded(command, expected):
 @pytest.mark.parametrize(
     "command",
     [
+        "python3.exe -m applypilot.fleet.apply_worker_main",
+        "python3.9.exe -m applypilot.fleet.apply_worker_main",
+        "python3.13.exe -m applypilot.fleet.apply_worker_main",
+        "python2.7 -m applypilot.fleet.apply_worker_main",
+        "pythonw3.exe -m applypilot.fleet.apply_worker_main",
+        "pythonw3.13.exe -m applypilot.fleet.apply_worker_main",
+        "pyw.exe -m applypilot.fleet.apply_worker_main",
+        "pyw.exe -3.13 -m applypilot.fleet.apply_worker_main",
+        r'"C:\Python313\python3.13.exe" -m applypilot.fleet.apply_worker_main',
+        r"python3.exe C:\ApplyPilot\apply_worker_main.py --worker-id m2-0",
+        r"pythonw3.13.exe -- C:\ApplyPilot\linkedin_worker_main.py",
+    ],
+)
+def test_valid_python_launcher_aliases_preserve_acquisition_markers(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cmd /c python3.exe -m applypilot.fleet.apply_worker_main",
+        "cmd /k pyw.exe -3.13 -m applypilot.fleet.apply_worker_main",
+        'pwsh.exe -Command "python3.13.exe -m applypilot.fleet.apply_worker_main"',
+        'powershell.exe -Command "pythonw3.13.exe C:\\ApplyPilot\\apply_worker_main.py"',
+    ],
+)
+def test_python_launcher_aliases_remain_authoritative_through_shell_wrappers(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3.exe -m http.server 8000",
+        "python3.13.exe --version",
+        "pythonw3.13.exe C:\\tools\\report.py",
+        "pyw.exe -3.13 -m unrelated.worker",
+        "cmd /c python3.exe -m unrelated.worker",
+        'pwsh.exe -Command "pythonw3.13.exe -m unrelated.worker"',
+    ],
+)
+def test_valid_python_launcher_aliases_without_acquisition_markers_are_benign(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "benign"
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        "python3x.exe",
+        "python3.13-helper.exe",
+        "python313.exe",
+        "pythonw3x.exe",
+        "pythonw3.13.old.exe",
+        "pywx.exe",
+    ],
+)
+def test_python_launcher_alias_normalization_rejects_near_match_stems(launcher):
+    command = f"{launcher} -m applypilot.fleet.apply_worker_main"
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "benign"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"%PYTHON_LAUNCHER% -m applypilot.fleet.apply_worker_main",
+        r"!PYTHON_LAUNCHER! -m applypilot.fleet.apply_worker_main",
+        r"$env:PYTHON_LAUNCHER -m applypilot.fleet.apply_worker_main",
+        r"${env:PYTHON_LAUNCHER}.exe -m applypilot.fleet.apply_worker_main",
+    ],
+)
+def test_environment_selected_python_launcher_alias_remains_ambiguous(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "cmd /rrun-fleet-worker.cmd",
         "cmd /d/crun-fleet-worker.cmd",
         "cmd /q/krun-fleet-worker.cmd",

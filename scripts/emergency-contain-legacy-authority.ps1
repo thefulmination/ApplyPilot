@@ -152,6 +152,10 @@ function Get-CommandTokenStem([string]$Token) {
   return $basename
 }
 
+function Test-IsPythonLauncherStem([string]$Stem) {
+  return $Stem -match '^(?:pyw?|pythonw?(?:[23](?:\.\d+)?)?)$'
+}
+
 function Test-ExecutableTokenHasEnvironmentSelectedBasename([string]$Token) {
   $basename = Get-CommandTokenBasename $Token
   return $basename -match '(?i)(?:%|!|\$(?:\{)?env:)'
@@ -507,9 +511,18 @@ function Get-PowerShellCommandTextClassification([string]$CommandText) {
       if ($command -is [Management.Automation.Language.CommandAst] -and
           $command.Redirections.Count -eq 0 -and
           $safeInvocationOperator -and
-          $safeElements -and
-          (Test-IsAcquisitionWrapperToken $command.GetCommandName())) {
-        return 'acquisition'
+          $safeElements) {
+        if (Test-IsAcquisitionWrapperToken $command.GetCommandName()) {
+          return 'acquisition'
+        }
+        $safeCommandTokens = @(Get-PowerShellAstCommandTokens $command)
+        if ($safeCommandTokens.Count -gt 0 -and
+            (Test-IsPythonLauncherStem (Get-CommandTokenStem $safeCommandTokens[0]))) {
+          $safeCommandClassification = Get-AcquisitionTokenClassification $safeCommandTokens
+          if ($safeCommandClassification -in @('acquisition', 'ambiguous')) {
+            return $safeCommandClassification
+          }
+        }
       }
     }
     $commands = @($ast.FindAll({
@@ -615,7 +628,7 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
       $index++
       continue
     }
-    if ($LauncherStem -eq 'py' -and $token -match '^-(?:[23](?:\.\d+)?|V:.+)$') { continue }
+    if ($LauncherStem -in @('py', 'pyw') -and $token -match '^-(?:[23](?:\.\d+)?|V:.+)$') { continue }
     if ($token.StartsWith('-')) {
       return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
     }
@@ -820,6 +833,12 @@ function Get-CmdPostModeClassification(
     if (Test-CmdTokensContainControlSyntax $trailingTokens) { return 'ambiguous' }
     return 'acquisition'
   }
+  $candidateStem = Get-CommandTokenStem $candidate
+  if (Test-IsPythonLauncherStem $candidateStem) {
+    return Get-PythonAcquisitionClassification `
+      -Tokens (@($candidate) + $trailingTokens) `
+      -LauncherStem $candidateStem
+  }
   if ($containsExactIndicator) { return 'ambiguous' }
   return 'benign'
 }
@@ -916,7 +935,7 @@ function Get-AcquisitionTokenClassification([string[]]$Tokens) {
     return 'benign'
   }
   if ($script:AcquisitionConsoleBasenames -contains $launcher) { return 'acquisition' }
-  if ($launcher -in @('python', 'pythonw', 'py')) {
+  if (Test-IsPythonLauncherStem $launcher) {
     return Get-PythonAcquisitionClassification -Tokens $tokens -LauncherStem $launcher
   }
   if ($launcher -in @('pwsh', 'powershell')) { return Get-PowerShellAcquisitionClassification $tokens }
