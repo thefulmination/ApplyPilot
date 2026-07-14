@@ -1412,7 +1412,9 @@ def apply(
     tenant: Optional[str] = typer.Option(None, "--tenant", help="With --auth-gated: scope this run to a single tenant host (e.g. acme.myworkdayjobs.com)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
-    _require_local_apply_admission(target_url=url)
+    utility_mode = bool(mark_applied or mark_failed or reset_failed or gen)
+    if not utility_mode:
+        _require_local_apply_admission(target_url=url)
     _bootstrap()
 
     from applypilot import config

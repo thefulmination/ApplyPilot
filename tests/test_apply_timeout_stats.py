@@ -49,7 +49,7 @@ def _job() -> dict:
     }
 
 
-def test_timeout_records_last_run_stats(monkeypatch, tmp_path: Path) -> None:
+def test_timeout_records_last_run_stats(monkeypatch, tmp_path: Path, acquisition_admitted) -> None:
     monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(launcher.config, "LOG_DIR", tmp_path)
     monkeypatch.setattr(launcher.config, "APP_DIR", tmp_path)

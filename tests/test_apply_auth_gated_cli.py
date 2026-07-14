@@ -21,9 +21,15 @@ runner = CliRunner()
 
 def _setup(monkeypatch, tmp_path: Path):
     from applypilot import database
+    from applypilot.fleet import emergency_admission
 
     conn = database.init_db(tmp_path / "applypilot.db")
     monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+    monkeypatch.setattr(
+        emergency_admission,
+        "local_apply_admission",
+        lambda **_kwargs: emergency_admission.allow("explicit auth-gated test admission"),
+    )
     monkeypatch.setattr(database, "get_connection", lambda *a, **k: conn)
     # cli.py's --auth-gated path writes os.environ directly (real usage needs
     # a persistent process env, not a monkeypatch-scoped one) -- delenv here

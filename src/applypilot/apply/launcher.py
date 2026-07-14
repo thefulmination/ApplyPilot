@@ -2425,9 +2425,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
-    from applypilot.fleet.emergency_admission import launcher_admission, require_allowed
-
-    require_allowed(launcher_admission())
+    _require_direct_launcher_admission()
     status, duration_ms = _run_job_impl(
         job, port, worker_id=worker_id, model=model, dry_run=dry_run,
         agent=agent, inbox_auth_hint=inbox_auth_hint, attempt_store=attempt_store,
@@ -2440,6 +2438,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         except Exception:
             logger.debug("supervised record_tenant_outcome failed", exc_info=True)
     return status, duration_ms
+
+
+def _require_direct_launcher_admission() -> None:
+    from applypilot.fleet import emergency_admission
+
+    admission = emergency_admission.launcher_admission()
+    if admission.allowed:
+        return
+    print(
+        f"{emergency_admission.denial_marker(admission)} {admission.reason}",
+        file=sys.stderr,
+    )
+    raise SystemExit(emergency_admission.DENIAL_EXIT_CODE)
 
 
 def _run_job_impl(job: dict, port: int, worker_id: int = 0,
@@ -3693,6 +3704,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     Returns:
         Tuple of (applied_count, failed_count).
     """
+    _require_direct_launcher_admission()
     applied = 0
     failed = 0
     continuous = limit == 0
