@@ -74,6 +74,13 @@ function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {
   if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
   [IO.File]::WriteAllBytes($Path, $Content)
 }
+function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {
+  if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
+  $Stream.Position = 0
+  $Stream.SetLength(0)
+  $Stream.Write($Content, 0, $Content.Length)
+  $Stream.Flush($true)
+}
 function Get-ControlEvidence {
   return [ordered]@{
     admission_state=[ordered]@{
@@ -211,6 +218,35 @@ def _run(
 
 def _ps_quote(value: Path | str) -> str:
     return str(value).replace("'", "''")
+
+
+def _run_wrapper_rewrite_harness(
+    tmp_path: Path,
+    wrapper: Path,
+    overrides: str = "",
+) -> tuple[subprocess.CompletedProcess[str], dict]:
+    harness = tmp_path / "wrapper-rewrite-harness.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrapper.parent)}'",
+                overrides,
+                "$script:Failures.Clear()",
+                "Remove-EmbeddedWrapperDsns",
+                "[ordered]@{failures=@($script:Failures); wrappers=@(Get-WrapperSnapshot)} | "
+                "ConvertTo-Json -Depth 8 -Compress",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, json.loads(result.stdout.strip().splitlines()[-1])
 
 
 def _run_orchestration(
@@ -537,6 +573,117 @@ def test_sensitive_wrapper_identifiers_force_evidence_backup_and_deny_stub(tmp_p
         assert [(item.name, item.read_bytes()) for item in evidence] == [first_evidence[name]]
 
 
+def test_wrapper_replacement_before_exclusive_open_is_the_preserved_preimage(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    wrapper.write_text("$env:FLEET_PG_DSN = 'original-secret'\n", encoding="utf-8")
+    replacement = b"$env:FLEET_PG_DSN = 'replacement-secret'\n# replacement bytes\n"
+    replacement_b64 = base64.b64encode(replacement).decode("ascii")
+    overrides = "\n".join(
+        [
+            "function Open-KnownWrapperExclusive([string]$Path) {",
+            f"  [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String('{replacement_b64}'))",
+            "  return [IO.FileStream]::new($Path, [IO.FileMode]::Open, "
+            "[IO.FileAccess]::ReadWrite, [IO.FileShare]::None)",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["failures"] == []
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == replacement
+    assert b"emergency containment" in wrapper.read_bytes().lower()
+    assert b"replacement-secret" not in wrapper.read_bytes()
+
+
+def test_wrapper_replacement_attempt_is_blocked_while_exclusive_handle_is_held(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'held-secret'\n# held preimage\n"
+    wrapper.write_bytes(preimage)
+    marker = tmp_path / "replacement-attempt.txt"
+    replacement = base64.b64encode(b"replacement-without-evidence").decode("ascii")
+    overrides = "\n".join(
+        [
+            "function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {",
+            "  try {",
+            f"    [IO.File]::WriteAllBytes('{_ps_quote(wrapper)}', [Convert]::FromBase64String('{replacement}'))",
+            f"    Set-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replacement_succeeded'",
+            "  } catch {",
+            f"    Set-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replacement_blocked'",
+            "  }",
+            "  [IO.File]::WriteAllBytes($Path, $Content)",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["failures"] == []
+    assert marker.read_text(encoding="utf-8").strip() == "replacement_blocked"
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+    assert b"emergency containment" in wrapper.read_bytes().lower()
+
+
+def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'write-failure-secret'\n# retain exactly\n"
+    wrapper.write_bytes(preimage)
+    overrides = "function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) { throw 'write failed' }"
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
+    assert wrapper.read_bytes() == preimage
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+    assert "write-failure-secret" not in result.stdout
+    assert "write-failure-secret" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        "function Open-KnownWrapperExclusive([string]$Path) { throw 'open failed' }",
+        "function Read-KnownWrapperStreamBytes($Stream) { throw 'read failed' }",
+        "function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) { "
+        "throw 'evidence failed' }",
+    ],
+    ids=["exclusive-open", "stream-read", "evidence-write"],
+)
+def test_wrapper_stream_stage_failure_is_recorded_without_destroying_preimage(
+    tmp_path, overrides
+):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'stage-failure-secret'\n# must survive\n"
+    wrapper.write_bytes(preimage)
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
+    assert payload["wrappers"][0]["embedded_dsn"] is True
+    assert wrapper.read_bytes() == preimage
+    assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == []
+    assert "stage-failure-secret" not in result.stdout
+    assert "stage-failure-secret" not in result.stderr
+
+
 def test_shared_orchestration_reports_action_failure(tmp_path):
     fixture = _fixture(tmp_path)
     result, payload = _run_orchestration("Contain", fixture, fail_action="disable_task")
@@ -702,7 +849,9 @@ def test_authority_inventory_enumerates_all_and_survivors_are_unresolved(tmp_pat
         "Neutral Task",
         "Program Files PowerShell Action",
         "Program Files Python Action",
+        "Program Files Python Benign",
     ]
+    assert payload["tasks"][-1]["classification"] == "ambiguous"
     assert [item["name"] for item in payload["services"]] == [
         "ApplyPilotWorkday",
         "NeutralService",
@@ -818,6 +967,8 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
     ).decode("ascii")
     commands = [
         "python -c \"import runpy; runpy.run_module('applypilot.fleet.apply_worker_main')\"",
+        'python -c "print(\'opaque but apparently benign\')"',
+        "python -cpass",
         'pwsh -Command "run-fleet-workers.ps1; Write-Output done"',
         'pwsh -Command "run-fleet-workers.ps1 && Write-Output done"',
         'pwsh -Command "run-fleet-workers.ps1 &"',
@@ -838,6 +989,8 @@ def test_interpreter_payload_ambiguity_blocks_containment_success(tmp_path):
         "cmd /c(run-fleet-worker.cmd)",
         "cmd /c^run-fleet-worker.cmd",
         'cmd /c"run-fleet-worker.cmd & echo done"',
+        "cmd /c %APPLYPILOT_COMMAND%",
+        "cmd /v:on/k!APPLYPILOT_COMMAND!",
     ]
     process_rows = ",".join(
         (
@@ -1230,8 +1383,8 @@ def test_each_injected_seam_marks_receipt_non_operational(
         ('"C:\\Program Files\\ApplyPilot\\applypilot-fleet-apply-home-helper.exe" status', "benign"),
         ('python -m applypilot.fleet.apply_home_main_helper run', "benign"),
         ('py.exe -m applypilot.fleet.apply_worker_main_helper --read-only', "benign"),
-        ('python -c pass -m applypilot.fleet.apply_worker_main', "benign"),
-        ('python -c "print(1)" -m applypilot apply --url https://example.invalid/job', "benign"),
+        ('python -c pass -m applypilot.fleet.apply_worker_main', "ambiguous"),
+        ('python -c "print(1)" -m applypilot apply --url https://example.invalid/job', "ambiguous"),
         ('python -- -m applypilot.fleet.apply_worker_main', "benign"),
         ('python -- benign.py applypilot.fleet.apply_worker_main', "benign"),
         ('python -- --unknown=apply_worker_main.py', "ambiguous"),
@@ -1241,7 +1394,7 @@ def test_each_injected_seam_marks_receipt_non_operational(
         ),
         (
             'python -c "import runpy; runpy.run_module(\'applypilot.fleet.apply_worker_main_helper\')"',
-            "benign",
+            "ambiguous",
         ),
         ('python --unknown-option -m applypilot.fleet.apply_worker_main', "ambiguous"),
         ('python --unknown=applypilot.fleet.apply_worker_main', "ambiguous"),
@@ -1526,6 +1679,72 @@ def test_compact_launcher_forms_are_bounded(command, expected):
     assert json.loads(result.stdout.strip())["classification"] == expected
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cmd /rrun-fleet-worker.cmd",
+        "cmd /d/crun-fleet-worker.cmd",
+        "cmd /q/krun-fleet-worker.cmd",
+        "cmd /v:on/crun-fleet-worker.cmd",
+        "cmd /d/s/rrun-fleet-worker.cmd",
+        "cmd /d /s /c run-fleet-worker.cmd",
+        "cmd /q /k @call run-fleet-worker.cmd",
+        'cmd /d/c"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"',
+    ],
+)
+def test_cmd_switch_grammar_finds_terminal_mode_and_exact_wrapper(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cmd /d/z/crun-fleet-worker.cmd", "ambiguous"),
+        ("cmd /v:maybe/crun-fleet-worker.cmd", "ambiguous"),
+        ("cmd /d/c(run-fleet-worker.cmd)", "ambiguous"),
+        ("cmd /d/crun-fleet-worker.cmd.backup", "benign"),
+        ("cmd /v:on/cworkday-monitor.cmd", "benign"),
+        ("cmd /c %APPLYPILOT_COMMAND%", "ambiguous"),
+        ("cmd /v:on/k!APPLYPILOT_COMMAND!", "ambiguous"),
+        ("cmd /c echo %APPLYPILOT_COMMAND%", "benign"),
+    ],
+)
+def test_cmd_switch_grammar_is_fail_closed_and_bounded(command, expected):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == expected
+
+
+@pytest.mark.parametrize("command", ["python -c pass", "python -cpass", "python -c print(1)"])
+def test_python_code_execution_is_always_opaque_and_ambiguous(command):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "ambiguous"
+
+
 @pytest.mark.parametrize("mode", ["c", "k"])
 def test_compact_quoted_cmd_preserves_single_wrapper_token(mode):
     command = f'cmd /{mode}"C:\\Program Files\\ApplyPilot\\run-fleet-worker.cmd"'
@@ -1780,7 +1999,11 @@ def test_encoded_powershell_filepath_quote_semantics_agree(decoded, expected):
     assert json.loads(result.stdout.strip())["classification"] == expected
 
 
-@pytest.mark.parametrize("option", ["-e", "-en", "-enc"])
+@pytest.mark.parametrize(
+    "option",
+    [f"-{('encodedcommand')[:length]}" for length in range(1, len("encodedcommand") + 1)]
+    + ["-ec"],
+)
 def test_encoded_command_unique_abbreviations_decode_and_classify(option):
     decoded = "run-fleet-workers.ps1 -Count 2"
     encoded = base64.b64encode(decoded.encode("utf-16le")).decode("ascii")
@@ -1800,6 +2023,44 @@ def test_encoded_command_unique_abbreviations_decode_and_classify(option):
     assert encoded not in result.stdout
     assert encoded not in result.stderr
     assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    "option",
+    [f"-{('command')[:length]}" for length in range(1, len("command") + 1)],
+)
+def test_command_unique_abbreviations_classify_complete_payload(option):
+    command = f"pwsh.exe {option} run-fleet-workers.ps1 -Count 2"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] == "acquisition"
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["-configurationname", "-executionpolicy", "-connect", "-encodedoutput"],
+)
+def test_powershell_unrelated_options_are_not_bound_as_command_prefixes(option):
+    command = f"pwsh.exe {option} run-fleet-workers.ps1"
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-CommandLineProbe", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip())["classification"] != "acquisition"
 
 
 def test_encoded_command_abbreviation_redacts_ambiguous_payload():

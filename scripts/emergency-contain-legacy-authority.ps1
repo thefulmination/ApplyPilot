@@ -574,11 +574,7 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
       if (Test-TextContainsBoundedAcquisitionIndicator $scriptToken) { return 'ambiguous' }
       return 'benign'
     }
-    if ($token -ceq '-c') {
-      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
-      if (Test-TextContainsBoundedAcquisitionIndicator $Tokens[$index + 1]) { return 'ambiguous' }
-      return 'benign'
-    }
+    if ($token -ceq '-c' -or $token -cmatch '^-c.+$') { return 'ambiguous' }
     if ($token -cin @('-h', '--help', '-V', '--version')) { return 'benign' }
     if ($token -cmatch '^-b{1,2}$') { continue }
     if ($token -cmatch '^-O{1,2}$') { continue }
@@ -608,6 +604,18 @@ function Get-PythonAcquisitionClassification([string[]]$Tokens, [string]$Launche
   return 'benign'
 }
 
+function Test-IsPowerShellOptionPrefix(
+  [string]$Token,
+  [string]$CanonicalName,
+  [int]$MinimumLength = 1
+) {
+  if (-not $Token.StartsWith('-') -or $Token.StartsWith('--')) { return $false }
+  $name = $Token.Substring(1)
+  return $name.Length -ge $MinimumLength -and
+    $name.Length -le $CanonicalName.Length -and
+    $CanonicalName.StartsWith($name, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
   $continuingOptions = @('-nologo', '-noprofile', '-nop', '-noexit', '-noninteractive', '-sta', '-mta')
   $valuedOptions = @('-executionpolicy', '-windowstyle', '-workingdirectory', '-inputformat', '-outputformat', '-configurationname')
@@ -619,11 +627,12 @@ function Get-PowerShellAcquisitionClassification([string[]]$Tokens) {
       return 'benign'
     }
     if ($token -eq '--') { return 'benign' }
-    if ($token -in @('-command', '-c')) {
+    if (Test-IsPowerShellOptionPrefix -Token $token -CanonicalName 'command') {
       if ($index + 1 -ge $Tokens.Count) { return 'benign' }
       return Get-PowerShellCommandPayloadClassification $Tokens[($index + 1)..($Tokens.Count - 1)]
     }
-    if ($token -in @('-encodedcommand', '-enc', '-en', '-e', '-ec')) {
+    if ((Test-IsPowerShellOptionPrefix -Token $token -CanonicalName 'encodedcommand') -or
+        $token -eq '-ec') {
       if ($index + 1 -ge $Tokens.Count) { return 'ambiguous' }
       return Get-PowerShellEncodedCommandClassification $Tokens[$index + 1]
     }
@@ -682,6 +691,8 @@ function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
     $candidate = $current
   }
 
+  if ($candidate -match '(?:%[^%\r\n]+%|![^!\r\n]+!)') { return 'ambiguous' }
+
   $trailingTokens = if ($index + 1 -lt $payload.Count) {
     @($payload[($index + 1)..($payload.Count - 1)])
   } else {
@@ -695,27 +706,72 @@ function Get-CmdPostModeClassification([string[]]$PayloadTokens) {
   return 'benign'
 }
 
+function Get-CmdSwitchTokenParse([string]$RawToken) {
+  $position = 0
+  while ($position -lt $RawToken.Length) {
+    if ($RawToken[$position] -ne '/') {
+      return [ordered]@{ state = 'unfamiliar'; payload = $null }
+    }
+    $position++
+    if ($position -ge $RawToken.Length) {
+      return [ordered]@{ state = 'unfamiliar'; payload = $null }
+    }
+
+    $option = [char]::ToLowerInvariant($RawToken[$position])
+    if ($option -in @('c', 'k', 'r')) {
+      return [ordered]@{
+        state = 'terminal'
+        payload = $RawToken.Substring($position + 1)
+      }
+    }
+    if ($option -in @('d', 's', 'q', 'a', 'u')) {
+      $position++
+    } elseif ($option -in @('e', 'f', 'v')) {
+      $remaining = $RawToken.Substring($position)
+      if ($remaining -notmatch '^(?i:(?:e|f|v):(?:on|off))') {
+        return [ordered]@{ state = 'unfamiliar'; payload = $null }
+      }
+      $position += $Matches[0].Length
+    } else {
+      return [ordered]@{ state = 'unfamiliar'; payload = $null }
+    }
+
+    if ($position -lt $RawToken.Length -and $RawToken[$position] -ne '/') {
+      return [ordered]@{ state = 'unfamiliar'; payload = $null }
+    }
+  }
+  return [ordered]@{ state = 'continuing'; payload = $null }
+}
+
+function Get-CmdUnfamiliarClassification([string[]]$Tokens) {
+  if ((Get-AmbiguousOrBenignClassification $Tokens) -eq 'ambiguous') { return 'ambiguous' }
+  foreach ($token in @($Tokens)) {
+    foreach ($match in [regex]::Matches($token, '(?i)/(?:c|k|r)(?<payload>[^/]*)')) {
+      if (Test-TextContainsBoundedAcquisitionIndicator $match.Groups['payload'].Value) {
+        return 'ambiguous'
+      }
+    }
+  }
+  return 'benign'
+}
+
 function Get-CmdAcquisitionClassification([string[]]$Tokens) {
   for ($index = 1; $index -lt $Tokens.Count; $index++) {
     $rawToken = $Tokens[$index]
-    $token = $rawToken.ToLowerInvariant()
-    if ($token -in @('/d', '/s', '/q', '/a', '/u') -or
-        $token -match '^/(?:e|f|v):(?:on|off)$') {
-      continue
+    if (-not $rawToken.StartsWith('/')) {
+      return Get-CmdUnfamiliarClassification $Tokens[$index..($Tokens.Count - 1)]
     }
-    if ($token -in @('/c', '/k', '/r')) {
-      if ($index + 1 -ge $Tokens.Count) { return 'benign' }
-      return Get-CmdPostModeClassification -PayloadTokens $Tokens[($index + 1)..($Tokens.Count - 1)]
-    }
-    if ($rawToken -match '(?i)^/(?<mode>[ck])(?<command>.+)$') {
-      $commandToken = $Matches.command
-      $payload = @($commandToken)
+    $parsed = Get-CmdSwitchTokenParse $rawToken
+    if ($parsed.state -eq 'continuing') { continue }
+    if ($parsed.state -eq 'terminal') {
+      $payload = @()
+      if ($parsed.payload) { $payload += [string]$parsed.payload }
       if ($index + 1 -lt $Tokens.Count) {
         $payload += $Tokens[($index + 1)..($Tokens.Count - 1)]
       }
       return Get-CmdPostModeClassification -PayloadTokens $payload
     }
-    return Get-AmbiguousOrBenignClassification $Tokens[$index..($Tokens.Count - 1)]
+    return Get-CmdUnfamiliarClassification $Tokens[$index..($Tokens.Count - 1)]
   }
   return 'benign'
 }
@@ -1030,8 +1086,52 @@ function Stop-LegacyProcess($Process) {
     $handle.Dispose()
   }
 }
-function Set-KnownWrapperContent([string]$Path, [string]$Content) {
-  [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+function Open-KnownWrapperExclusive([string]$Path) {
+  return [IO.FileStream]::new(
+    $Path,
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::ReadWrite,
+    [IO.FileShare]::None
+  )
+}
+
+function Read-KnownWrapperStreamBytes($Stream) {
+  $Stream.Position = 0
+  $buffer = [IO.MemoryStream]::new()
+  try {
+    $Stream.CopyTo($buffer)
+    return $buffer.ToArray()
+  } finally {
+    $buffer.Dispose()
+  }
+}
+
+function ConvertFrom-KnownWrapperBytes([byte[]]$Content) {
+  $buffer = [IO.MemoryStream]::new($Content, $false)
+  $reader = [IO.StreamReader]::new(
+    $buffer,
+    [Text.UTF8Encoding]::new($false, $true),
+    $true
+  )
+  try {
+    return $reader.ReadToEnd()
+  } finally {
+    $reader.Dispose()
+    $buffer.Dispose()
+  }
+}
+
+function Get-KnownWrapperByteDigest([byte[]]$Content) {
+  return [Convert]::ToHexString(
+    [Security.Cryptography.SHA256]::HashData($Content)
+  ).ToLowerInvariant()
+}
+
+function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {
+  $Stream.Position = 0
+  $Stream.SetLength(0)
+  $Stream.Write($Content, 0, $Content.Length)
+  $Stream.Flush($true)
 }
 
 function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {
@@ -1419,37 +1519,43 @@ function Stop-LegacyAcquisitionProcesses {
 function Remove-EmbeddedWrapperDsns {
   foreach ($wrapper in @(Get-KnownWrapperPaths)) {
     Invoke-RecordedAction 'rewrite_wrapper' $wrapper.FullName {
-      $preimageBytes = [IO.File]::ReadAllBytes($wrapper.FullName)
-      $content = [IO.File]::ReadAllText($wrapper.FullName)
-      $containsSensitiveContent = $content -match $script:SensitiveIdentifier -or
-        $content -match $script:SensitiveUri
-      if (-not $containsSensitiveContent) { return }
+      $stream = Open-KnownWrapperExclusive ([string]$wrapper.FullName)
+      try {
+        $preimageBytes = Read-KnownWrapperStreamBytes $stream
+        $content = ConvertFrom-KnownWrapperBytes $preimageBytes
+        $containsSensitiveContent = $content -match $script:SensitiveIdentifier -or
+          $content -match $script:SensitiveUri
+        if (-not $containsSensitiveContent) { return }
 
-      $preimageDigest = (Get-FileHash -LiteralPath $wrapper.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-      $evidencePath = "{0}.emergency-containment-evidence-{1}" -f $wrapper.FullName, $preimageDigest
-      if (Test-Path -LiteralPath $evidencePath -PathType Leaf) {
-        if ((Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-            $preimageDigest) {
-          throw 'wrapper evidence digest collision'
+        $preimageDigest = Get-KnownWrapperByteDigest $preimageBytes
+        $evidencePath = "{0}.emergency-containment-evidence-{1}" -f $wrapper.FullName, $preimageDigest
+        if (Test-Path -LiteralPath $evidencePath -PathType Leaf) {
+          if ((Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+              $preimageDigest) {
+            throw 'wrapper evidence digest collision'
+          }
+        } else {
+          Set-KnownWrapperEvidence -Path $evidencePath -Content $preimageBytes
         }
-      } else {
-        Set-KnownWrapperEvidence -Path $evidencePath -Content $preimageBytes
-      }
-      if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf) -or
-          (Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-          $preimageDigest) {
-        throw 'wrapper evidence preservation failed'
-      }
+        if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+            $preimageDigest) {
+          throw 'wrapper evidence preservation failed'
+        }
 
-      $denyStub = if ($wrapper.Extension -match '(?i)^\.(?:cmd|bat)$') {
-        "@echo off`r`necho ApplyPilot acquisition denied: emergency containment 1>&2`r`nexit /b 78`r`n"
-      } else {
-        "Write-Error 'ApplyPilot acquisition denied: emergency containment'`nexit 78`n"
-      }
-      Set-KnownWrapperContent -Path ([string]$wrapper.FullName) -Content $denyStub
-      $written = [IO.File]::ReadAllText($wrapper.FullName)
-      if ($written -match $script:SensitiveIdentifier -or $written -match $script:SensitiveUri) {
-        throw 'wrapper sensitive content remains after containment'
+        $denyStub = if ($wrapper.Extension -match '(?i)^\.(?:cmd|bat)$') {
+          "@echo off`r`necho ApplyPilot acquisition denied: emergency containment 1>&2`r`nexit /b 78`r`n"
+        } else {
+          "Write-Error 'ApplyPilot acquisition denied: emergency containment'`nexit 78`n"
+        }
+        $denyBytes = [Text.UTF8Encoding]::new($false).GetBytes($denyStub)
+        Write-KnownWrapperDenyStub -Stream $stream -Content $denyBytes
+        $written = ConvertFrom-KnownWrapperBytes (Read-KnownWrapperStreamBytes $stream)
+        if ($written -match $script:SensitiveIdentifier -or $written -match $script:SensitiveUri) {
+          throw 'wrapper sensitive content remains after containment'
+        }
+      } finally {
+        $stream.Dispose()
       }
     }
   }
