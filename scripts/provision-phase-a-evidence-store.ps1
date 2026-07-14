@@ -241,18 +241,33 @@ function Invoke-PhaseAProvisioningCleanup {
   if ($expected.Value.schema -cne 'applypilot.phase-a.directory-manifest.v1') {
     throw 'Expected-after manifest has the wrong schema.'
   }
-  $null = Test-PhaseASignedReceipt -ReceiptPath $AuthorizationReceiptPath `
-    -SignaturePath $AuthorizationSignaturePath -SigningSpkiPath $RecoverySigningSpkiPath `
-    -ExpectedSigningSpkiSha256 $RecoverySigningSpkiSha256 -ExpectedReceiptType 'operation-authorization' `
-    -ExpectedCommit $ExpectedCommit -ExpectedOperationId $ExpectedOperationId `
-    -ExpectedTargetDigest $ExpectedTargetDigest -ExpectedOperatorSidDigest $ExpectedOperatorSidDigest `
-    -ExpectedMachineDigest $ExpectedMachineDigest -ExpectedStoreConfigSha256 $ExpectedStoreConfigSha256 `
-    -ExpectedHostProvisioningReceiptSha256 $ExpectedHostProvisioningReceiptSha256 `
-    -ExpectedSourceApprovalReceiptSha256 $ExpectedSourceApprovalReceiptSha256 `
-    -ExpectedManifestBeforeSha256 $ExpectedManifestBeforeSha256 `
-    -ExpectedManifestAfterSha256 $ExpectedManifestAfterSha256
-  if ($expected.Sha256 -cne $ExpectedManifestAfterSha256) { throw 'Expected-after manifest hash is not authorized.' }
-  if (Test-Path -LiteralPath $stage -PathType Container) {
+  $authorizationPair = $null
+  $completionPair = $null
+  try {
+    $authorizationPair = & $module { param($R,$S,$O) Open-PhaseAProtectedReceiptPair $R $S $O } `
+      $AuthorizationReceiptPath $AuthorizationSignaturePath $operator
+    $completionPair = & $module { param($R,$S,$O) Open-PhaseAProtectedReceiptPair $R $S $O } `
+      $CompletionReceiptPath $CompletionSignaturePath $operator
+    $commonValidation = @{
+      SigningSpkiPath=$RecoverySigningSpkiPath; ExpectedSigningSpkiSha256=$RecoverySigningSpkiSha256;
+      ExpectedCommit=$ExpectedCommit; ExpectedOperationId=$ExpectedOperationId;
+      ExpectedTargetDigest=$ExpectedTargetDigest; ExpectedOperatorSidDigest=$ExpectedOperatorSidDigest;
+      ExpectedMachineDigest=$ExpectedMachineDigest; ExpectedStoreConfigSha256=$ExpectedStoreConfigSha256;
+      ExpectedHostProvisioningReceiptSha256=$ExpectedHostProvisioningReceiptSha256;
+      ExpectedSourceApprovalReceiptSha256=$ExpectedSourceApprovalReceiptSha256;
+      ExpectedManifestBeforeSha256=$ExpectedManifestBeforeSha256;
+      ExpectedManifestAfterSha256=$ExpectedManifestAfterSha256
+    }
+    $authorizationValidation = @{} + $commonValidation
+    $authorizationValidation.ExpectedReceiptType = 'operation-authorization'
+    $null = & $module { param($Pair,$Arguments)
+      $Arguments.Receipt=$Pair.Receipt; $Arguments.SignatureRead=$Pair.Signature
+      $result=Test-PhaseASignedReceiptCore @Arguments
+      Assert-PhaseAProtectedReceiptPairIdentity $Pair
+      return $result
+    } $authorizationPair $authorizationValidation
+    if ($expected.Sha256 -cne $ExpectedManifestAfterSha256) { throw 'Expected-after manifest hash is not authorized.' }
+    if (Test-Path -LiteralPath $stage -PathType Container) {
     $before = Get-PhaseAManifestDigest $parent
     if ($before.Sha256 -cne $ExpectedManifestBeforeSha256) { throw 'Current cleanup manifest is not authorized.' }
     $stageName = [IO.Path]::GetFileName($stage)
@@ -267,25 +282,27 @@ function Invoke-PhaseAProvisioningCleanup {
     $targetBinding = Get-PhaseATargetDigest $stage -PassThru
     if ($targetBinding.Digest -cne $ExpectedTargetDigest) { throw 'Authorized staging target identity changed.' }
     $identity = $targetBinding.Identity
-    if ($BeforeCleanupDelete) { & $BeforeCleanupDelete $stage }
-    $null = [ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow(
-      $stage, [uint64]$identity.VolumeSerialNumber, [string]$identity.FileId, $CrashAfterEntries)
-  } elseif (Test-Path -LiteralPath $stage) {
-    throw 'Cleanup target changed from a directory.'
+      if ($BeforeCleanupDelete) { & $BeforeCleanupDelete $stage }
+      $null = [ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow(
+        $stage, [uint64]$identity.VolumeSerialNumber, [string]$identity.FileId, $CrashAfterEntries)
+    } elseif (Test-Path -LiteralPath $stage) {
+      throw 'Cleanup target changed from a directory.'
+    }
+    $actualAfter = Get-PhaseAManifestDigest $parent
+    if ($actualAfter.Sha256 -cne $expected.Sha256) { throw 'Cleanup result does not match the authorized after manifest.' }
+    if ($CrashAfterMutation) { throw 'Injected cleanup crash after mutation.' }
+    $completionValidation = @{} + $commonValidation
+    $completionValidation.ExpectedReceiptType = 'operation-completion'
+    $null = & $module { param($Pair,$Arguments)
+      $Arguments.Receipt=$Pair.Receipt; $Arguments.SignatureRead=$Pair.Signature
+      $result=Test-PhaseASignedReceiptCore @Arguments
+      Assert-PhaseAProtectedReceiptPairIdentity $Pair
+      return $result
+    } $completionPair $completionValidation
+  } finally {
+    & $module { param($Pair) Close-PhaseAProtectedReceiptPair $Pair } $completionPair
+    & $module { param($Pair) Close-PhaseAProtectedReceiptPair $Pair } $authorizationPair
   }
-  $actualAfter = Get-PhaseAManifestDigest $parent
-  if ($actualAfter.Sha256 -cne $expected.Sha256) { throw 'Cleanup result does not match the authorized after manifest.' }
-  if ($CrashAfterMutation) { throw 'Injected cleanup crash after mutation.' }
-  $null = Test-PhaseASignedReceipt -ReceiptPath $CompletionReceiptPath `
-    -SignaturePath $CompletionSignaturePath -SigningSpkiPath $RecoverySigningSpkiPath `
-    -ExpectedSigningSpkiSha256 $RecoverySigningSpkiSha256 -ExpectedReceiptType 'operation-completion' `
-    -ExpectedCommit $ExpectedCommit -ExpectedOperationId $ExpectedOperationId `
-    -ExpectedTargetDigest $ExpectedTargetDigest -ExpectedOperatorSidDigest $ExpectedOperatorSidDigest `
-    -ExpectedMachineDigest $ExpectedMachineDigest -ExpectedStoreConfigSha256 $ExpectedStoreConfigSha256 `
-    -ExpectedHostProvisioningReceiptSha256 $ExpectedHostProvisioningReceiptSha256 `
-    -ExpectedSourceApprovalReceiptSha256 $ExpectedSourceApprovalReceiptSha256 `
-    -ExpectedManifestBeforeSha256 $ExpectedManifestBeforeSha256 `
-    -ExpectedManifestAfterSha256 $ExpectedManifestAfterSha256
   $completionRoot = $bootstrap
   $install = @{
     ReceiptPath=$CompletionReceiptPath; SignaturePath=$CompletionSignaturePath; StoreRoot=$completionRoot;

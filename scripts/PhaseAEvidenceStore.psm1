@@ -115,6 +115,34 @@ namespace ApplyPilot.PhaseA
         private static extern uint GetFinalPathNameByHandleW(SafeFileHandle file,
             StringBuilder path, uint size, uint flags);
 
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint GetSecurityInfo(SafeFileHandle handle, int objectType,
+            uint securityInfo, out IntPtr owner, out IntPtr group, out IntPtr dacl,
+            out IntPtr sacl, out IntPtr securityDescriptor);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint GetSecurityDescriptorLength(IntPtr securityDescriptor);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        public static byte[] GetFileSecurityDescriptor(SafeFileHandle handle)
+        {
+            IntPtr owner, group, dacl, sacl, descriptor;
+            uint error = GetSecurityInfo(handle, 1, 0x00000007, out owner, out group,
+                out dacl, out sacl, out descriptor);
+            if (error != 0) throw new Win32Exception((int)error);
+            try
+            {
+                uint length = GetSecurityDescriptorLength(descriptor);
+                if (length == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+                byte[] bytes = new byte[length];
+                Marshal.Copy(descriptor, bytes, 0, checked((int)length));
+                return bytes;
+            }
+            finally { LocalFree(descriptor); }
+        }
+
         public static string GetVolumeGuidPath(SafeFileHandle handle)
         {
             uint size = 512;
@@ -438,21 +466,36 @@ function Read-PhaseAValidatedBytes([string]$Path) {
   } finally { $handle.Dispose() }
 }
 
-function Read-PhaseACanonicalJson([string]$Path) {
-  $read = Read-PhaseAValidatedBytes $Path
-  $bytes = $read.Bytes
-  $canonical = [ApplyPilot.PhaseA.EvidenceNative]::Canonicalize($bytes)
-  if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($bytes, $canonical)) {
+function Read-PhaseABytesFromHeldHandle($Handle, [string]$Path) {
+  $identity = Get-PhaseAFileIdentity -Handle $Handle
+  $borrowed = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new(
+    $Handle.FileHandle.DangerousGetHandle(), $false)
+  $stream = [IO.FileStream]::new($borrowed, [IO.FileAccess]::Read)
+  $buffer = [IO.MemoryStream]::new()
+  try { $stream.CopyTo($buffer); $bytes = $buffer.ToArray() }
+  finally { $buffer.Dispose(); $stream.Dispose(); $borrowed.Dispose() }
+  Assert-PhaseAFileIdentity -Handle $Handle -Expected $identity
+  return [pscustomobject]@{ Bytes=$bytes; Identity=$identity; Path=$Path }
+}
+
+function ConvertFrom-PhaseACanonicalJsonRead($Read) {
+  $canonical = [ApplyPilot.PhaseA.EvidenceNative]::Canonicalize($Read.Bytes)
+  if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($Read.Bytes, $canonical)) {
     throw 'JSON is not RFC8785 canonical.'
   }
-  $text = $script:Utf8Strict.GetString($bytes)
+  $text = $script:Utf8Strict.GetString($Read.Bytes)
   return [pscustomobject]@{
-    Bytes = $bytes
-    Identity = $read.Identity
-    Path = $read.Path
+    Bytes = $Read.Bytes
+    Identity = $Read.Identity
+    Path = $Read.Path
     Value = ($text | ConvertFrom-Json -AsHashtable -Depth 32)
-    Sha256 = Get-PhaseASha256 $bytes
+    Sha256 = Get-PhaseASha256 $Read.Bytes
   }
+}
+
+function Read-PhaseACanonicalJson([string]$Path) {
+  $read = Read-PhaseAValidatedBytes $Path
+  return ConvertFrom-PhaseACanonicalJsonRead $read
 }
 
 function Assert-PhaseAHexDigest([string]$Value, [string]$Name) {
@@ -627,6 +670,84 @@ function Assert-PhaseAProtectedAcl([string]$Path, [string]$OperatorSid, [switch]
   }
 }
 
+function Assert-PhaseAProtectedFileHandleAcl($Handle, [string]$OperatorSid) {
+  $bytes = [ApplyPilot.PhaseA.EvidenceNative]::GetFileSecurityDescriptor($Handle.FileHandle)
+  $raw = [Security.AccessControl.RawSecurityDescriptor]::new($bytes, 0)
+  if ($null -eq $raw.Owner -or $null -eq $raw.Group -or $null -eq $raw.DiscretionaryAcl) {
+    throw 'Protected receipt file security descriptor is incomplete.'
+  }
+  $expectedControl = [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent -bor
+    [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor
+    [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected -bor
+    [Security.AccessControl.ControlFlags]::SelfRelative
+  if ($raw.ControlFlags -ne $expectedControl) {
+    throw 'Protected receipt file security descriptor control flags are not exact.'
+  }
+  if ($raw.Owner.Value -cne $OperatorSid) { throw 'Unexpected protected receipt file owner.' }
+  if ($raw.Group.Value -cne $OperatorSid) { throw 'Unexpected protected receipt file primary group.' }
+  $trusted = @($OperatorSid, 'S-1-5-18', 'S-1-5-32-544')
+  $aces = @($raw.DiscretionaryAcl | ForEach-Object { $_ })
+  if ($aces.Count -ne 3) { throw 'Protected receipt file DACL must contain exactly three ACEs.' }
+  foreach ($sid in $trusted) {
+    $matching = @($aces | Where-Object {
+      $_ -is [Security.AccessControl.CommonAce] -and $_.SecurityIdentifier.Value -ceq $sid
+    })
+    if ($matching.Count -ne 1) { throw 'Protected receipt file DACL must contain one ACE per trusted principal.' }
+    $ace = $matching[0]
+    if ($ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed -or
+        $ace.AccessMask -ne [int][Security.AccessControl.FileSystemRights]::FullControl -or
+        $ace.AceFlags -ne [Security.AccessControl.AceFlags]::None) {
+      throw 'Protected receipt file ACE rights and flags are not exact.'
+    }
+  }
+}
+
+function Open-PhaseAProtectedReceiptPair {
+  param(
+    [Parameter(Mandatory)][string]$ReceiptPath,
+    [Parameter(Mandatory)][string]$SignaturePath,
+    [Parameter(Mandatory)][string]$OperatorSid
+  )
+  $receiptFull = Assert-PhaseALocalNtfsPath $ReceiptPath
+  $signatureFull = Assert-PhaseALocalNtfsPath $SignaturePath
+  $root = Split-Path -Parent $receiptFull
+  if ((Split-Path -Parent $signatureFull) -ine $root) { throw 'Receipt and signature must be adjacent.' }
+  $receiptHandle = $null
+  $signatureHandle = $null
+  try {
+    $receiptHandle = Open-PhaseAValidatedFile -Path $receiptFull -Access Read `
+      -AuthorizedRoot $root -AuthorizedBasename ([IO.Path]::GetFileName($receiptFull))
+    $signatureHandle = Open-PhaseAValidatedFile -Path $signatureFull -Access Read `
+      -AuthorizedRoot $root -AuthorizedBasename ([IO.Path]::GetFileName($signatureFull))
+    Assert-PhaseAProtectedFileHandleAcl $receiptHandle $OperatorSid
+    Assert-PhaseAProtectedFileHandleAcl $signatureHandle $OperatorSid
+    $receiptRead = Read-PhaseABytesFromHeldHandle $receiptHandle $receiptFull
+    $signatureRead = Read-PhaseABytesFromHeldHandle $signatureHandle $signatureFull
+    return [pscustomobject]@{
+      ReceiptHandle=$receiptHandle; SignatureHandle=$signatureHandle
+      Receipt=(ConvertFrom-PhaseACanonicalJsonRead $receiptRead); Signature=$signatureRead
+      ReceiptOwnerSid=$OperatorSid
+    }
+  } catch {
+    if ($signatureHandle) { $signatureHandle.Dispose() }
+    if ($receiptHandle) { $receiptHandle.Dispose() }
+    throw
+  }
+}
+
+function Assert-PhaseAProtectedReceiptPairIdentity($Pair) {
+  Assert-PhaseAFileIdentity -Handle $Pair.ReceiptHandle -Expected $Pair.Receipt.Identity
+  Assert-PhaseAFileIdentity -Handle $Pair.SignatureHandle -Expected $Pair.Signature.Identity
+  Assert-PhaseAProtectedFileHandleAcl $Pair.ReceiptHandle $Pair.ReceiptOwnerSid
+  Assert-PhaseAProtectedFileHandleAcl $Pair.SignatureHandle $Pair.ReceiptOwnerSid
+}
+
+function Close-PhaseAProtectedReceiptPair($Pair) {
+  if ($null -eq $Pair) { return }
+  try { if ($Pair.SignatureHandle) { $Pair.SignatureHandle.Dispose() } }
+  finally { if ($Pair.ReceiptHandle) { $Pair.ReceiptHandle.Dispose() } }
+}
+
 function Set-PhaseAProtectedAcl([string]$Path, [string]$OperatorSid, [switch]$File) {
   $security = if ($File) { [Security.AccessControl.FileSecurity]::new() } else { [Security.AccessControl.DirectorySecurity]::new() }
   $security.SetAccessRuleProtection($true, $false)
@@ -712,11 +833,11 @@ function Import-PhaseASpki([string]$Path, [string]$ExpectedHash) {
   } catch { $rsa.Dispose(); throw }
 }
 
-function Test-PhaseASignedReceipt {
+function Test-PhaseASignedReceiptCore {
   [CmdletBinding()]
   param(
-    [Parameter(Mandatory)][string]$ReceiptPath,
-    [Parameter(Mandatory)][string]$SignaturePath,
+    [Parameter(Mandatory)]$Receipt,
+    [Parameter(Mandatory)]$SignatureRead,
     [Parameter(Mandatory)][string]$SigningSpkiPath,
     [Parameter(Mandatory)][string]$ExpectedSigningSpkiSha256,
     [Parameter(Mandatory)][ValidateSet('source-approval','adjudication','credential-revocation','operation-authorization','operation-completion','host-provisioning')][string]$ExpectedReceiptType,
@@ -731,14 +852,12 @@ function Test-PhaseASignedReceipt {
     [string]$ExpectedHostProvisioningReceiptSha256,
     [string]$ExpectedSourceApprovalReceiptSha256
   )
-  $receipt = Read-PhaseACanonicalJson $ReceiptPath
-  $signatureRead = Read-PhaseAValidatedBytes $SignaturePath
   $spkiRead = Read-PhaseAValidatedBytes $SigningSpkiPath
   if ((Split-Path -Parent $receipt.Path) -ine (Split-Path -Parent $signatureRead.Path)) {
     throw 'Receipt and signature must be adjacent.'
   }
-  if ([IO.Path]::GetFileName($ReceiptPath) -cne "$($receipt.Sha256).json") { throw 'Receipt filename is not its content SHA-256.' }
-  if ([IO.Path]::GetFileName($SignaturePath) -cne "$($receipt.Sha256).sig") { throw 'Signature filename does not match the receipt.' }
+  if ([IO.Path]::GetFileName($receipt.Path) -cne "$($receipt.Sha256).json") { throw 'Receipt filename is not its content SHA-256.' }
+  if ([IO.Path]::GetFileName($signatureRead.Path) -cne "$($receipt.Sha256).sig") { throw 'Signature filename does not match the receipt.' }
   if ($receipt.Value.receiptType -cne $ExpectedReceiptType -or
       $script:ReceiptTypes -cnotcontains $receipt.Value.receiptType) { throw 'Unsupported or unexpected receipt type.' }
   Assert-PhaseAClosedFields $receipt.Value $script:ReceiptFieldsByType[$ExpectedReceiptType]
@@ -783,6 +902,45 @@ function Test-PhaseASignedReceipt {
   return $true
 }
 
+function Test-PhaseASignedReceipt {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$ReceiptPath,
+    [Parameter(Mandatory)][string]$SignaturePath,
+    [Parameter(Mandatory)][string]$SigningSpkiPath,
+    [Parameter(Mandatory)][string]$ExpectedSigningSpkiSha256,
+    [Parameter(Mandatory)][ValidateSet('source-approval','adjudication','credential-revocation','operation-authorization','operation-completion','host-provisioning')][string]$ExpectedReceiptType,
+    [Parameter(Mandatory)][string]$ExpectedCommit,
+    [Parameter(Mandatory)][string]$ExpectedOperationId,
+    [Parameter(Mandatory)][string]$ExpectedTargetDigest,
+    [Parameter(Mandatory)][string]$ExpectedOperatorSidDigest,
+    [Parameter(Mandatory)][string]$ExpectedMachineDigest,
+    [Parameter(Mandatory)][string]$ExpectedManifestBeforeSha256,
+    [Parameter(Mandatory)][string]$ExpectedManifestAfterSha256,
+    [Parameter(Mandatory)][string]$ExpectedStoreConfigSha256,
+    [string]$ExpectedHostProvisioningReceiptSha256,
+    [string]$ExpectedSourceApprovalReceiptSha256,
+    [string]$ProtectedReceiptFileOwnerSid
+  )
+  $arguments = @{} + $PSBoundParameters
+  $arguments.Remove('ReceiptPath')
+  $arguments.Remove('SignaturePath')
+  $arguments.Remove('ProtectedReceiptFileOwnerSid')
+  if ($ProtectedReceiptFileOwnerSid) {
+    $pair = Open-PhaseAProtectedReceiptPair $ReceiptPath $SignaturePath $ProtectedReceiptFileOwnerSid
+    try {
+      $arguments.Receipt = $pair.Receipt
+      $arguments.SignatureRead = $pair.Signature
+      $result = Test-PhaseASignedReceiptCore @arguments
+      Assert-PhaseAProtectedReceiptPairIdentity $pair
+      return $result
+    } finally { Close-PhaseAProtectedReceiptPair $pair }
+  }
+  $arguments.Receipt = Read-PhaseACanonicalJson $ReceiptPath
+  $arguments.SignatureRead = Read-PhaseAValidatedBytes $SignaturePath
+  return Test-PhaseASignedReceiptCore @arguments
+}
+
 function Write-PhaseACreateNew([string]$Path, [byte[]]$Bytes, [string]$OperatorSid) {
   $stream = [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
   try { $stream.Write($Bytes); $stream.Flush($true) } finally { $stream.Dispose() }
@@ -825,6 +983,8 @@ function Install-PhaseASignedReceipt {
   foreach ($name in @('ExpectedHostProvisioningReceiptSha256','ExpectedSourceApprovalReceiptSha256')) {
     if ($PSBoundParameters.ContainsKey($name)) { $validation[$name] = $PSBoundParameters[$name] }
   }
+  $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  if ($Bootstrap) { $validation.ProtectedReceiptFileOwnerSid = $operatorSid }
   $null = Test-PhaseASignedReceipt @validation
   $root = Assert-PhaseALocalNtfsPath $StoreRoot
   $leaf = switch ($ExpectedReceiptType) {
@@ -853,10 +1013,18 @@ function Install-PhaseASignedReceipt {
     $destination = Assert-PhaseALocalNtfsPath ([IO.Path]::Combine($root, $leaf))
     if ((Split-Path -Parent $destination) -ine $root) { throw 'Receipt destination escaped the validated store root.' }
   }
-  $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   Assert-PhaseAProtectedAcl -Path $destination -OperatorSid $operatorSid
-  $receiptBytes = (Read-PhaseAValidatedBytes $ReceiptPath).Bytes
-  $signatureBytes = (Read-PhaseAValidatedBytes $SignaturePath).Bytes
+  if ($Bootstrap) {
+    $sourcePair = Open-PhaseAProtectedReceiptPair $ReceiptPath $SignaturePath $operatorSid
+    try {
+      $receiptBytes = $sourcePair.Receipt.Bytes
+      $signatureBytes = $sourcePair.Signature.Bytes
+      Assert-PhaseAProtectedReceiptPairIdentity $sourcePair
+    } finally { Close-PhaseAProtectedReceiptPair $sourcePair }
+  } else {
+    $receiptBytes = (Read-PhaseAValidatedBytes $ReceiptPath).Bytes
+    $signatureBytes = (Read-PhaseAValidatedBytes $SignaturePath).Bytes
+  }
   $finalReceipt = Join-Path $destination ([IO.Path]::GetFileName($ReceiptPath))
   $finalSignature = Join-Path $destination ([IO.Path]::GetFileName($SignaturePath))
   if ((Test-Path -LiteralPath $finalReceipt) -or (Test-Path -LiteralPath $finalSignature)) {

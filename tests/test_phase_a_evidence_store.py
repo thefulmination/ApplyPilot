@@ -933,6 +933,54 @@ def test_cleanup_rejects_replacement_between_authorization_and_delete(tmp_path: 
     assert (fixture["stage"] / "replacement.txt").is_file()
 
 
+@pytest.mark.parametrize(
+    "pair_name,suffix,mutation",
+    [
+        ("authorization", ".json", "untrusted"),
+        ("authorization", ".sig", "untrusted"),
+        ("completion", ".json", "untrusted"),
+        ("completion", ".sig", "untrusted"),
+        ("authorization", ".json", "duplicate"),
+        ("completion", ".sig", "duplicate"),
+    ],
+)
+def test_cleanup_rejects_bootstrap_pair_file_acl_before_mutation(
+    tmp_path: Path, pair_name: str, suffix: str, mutation: str
+):
+    fixture = _cleanup_fixture(tmp_path)
+    path = Path(fixture[pair_name]).with_suffix(suffix)
+    if mutation == "untrusted":
+        _run_ps(f"& icacls.exe {_ps(path)} /grant '*S-1-1-0:(F)' | Out-Null")
+    else:
+        _run_ps(f"& icacls.exe {_ps(path)} /deny '*{_current_sid()}:(R)' | Out-Null")
+
+    result = _run_ps(
+        "try { " + _cleanup_body(fixture) + "; 'missed' } catch { 'rejected' }"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert fixture["stage"].is_dir()
+    assert (fixture["stage"] / "two.txt").read_text(encoding="utf-8") == "two"
+
+
+def test_cleanup_rejects_bootstrap_receipt_replacement_before_mutation(tmp_path: Path):
+    fixture = _cleanup_fixture(tmp_path)
+    receipt = Path(fixture["authorization"])
+    moved = receipt.with_name("held-authorization.json")
+    prefix = (
+        "$replaceReceipt={param($stage) "
+        f"Move-Item -LiteralPath {_ps(receipt)} -Destination {_ps(moved)};"
+        f"Copy-Item -LiteralPath {_ps(moved)} -Destination {_ps(receipt)};"
+        f"& icacls.exe {_ps(receipt)} /grant '*S-1-1-0:(F)' | Out-Null}};"
+    )
+    result = _run_ps(
+        prefix + "try { " + _cleanup_body(fixture, "-BeforeCleanupDelete $replaceReceipt")
+        + "; 'missed' } catch { 'rejected' }"
+    )
+    assert result.stdout.strip() == "rejected"
+    assert fixture["stage"].is_dir()
+    assert (fixture["stage"] / "two.txt").is_file()
+
+
 def test_definition_provision_fully_validates_before_publish_and_is_idempotent(tmp_path: Path):
     body, final = _provision_body(tmp_path, "valid")
     result = _run_ps(body + "| ConvertTo-Json -Compress", timeout=90)
