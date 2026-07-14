@@ -52,7 +52,7 @@ $script:ReceiptFieldsByType = @{
     'storeTreeManifestSha256','recoveryKeySpkiSha256','operatorSidDigest','result','createdAtUtc')
 }
 
-$script:PhaseAEvidenceNativeContractVersion = '2'
+$script:PhaseAEvidenceNativeContractVersion = '3'
 $loadedEvidenceNativeType = 'ApplyPilot.PhaseA.EvidenceNative' -as [type]
 if ($loadedEvidenceNativeType) {
   $contractField = $loadedEvidenceNativeType.GetField(
@@ -84,7 +84,7 @@ namespace ApplyPilot.PhaseA
 {
     public static class EvidenceNative
     {
-        public const string ContractVersion = "2";
+        public const string ContractVersion = "3";
 
         private const uint GenericRead = 0x80000000;
         private const uint GenericWrite = 0x40000000;
@@ -191,7 +191,7 @@ namespace ApplyPilot.PhaseA
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
 
-        private static string NormalizeLocalPath(string path)
+        public static string NormalizeLocalPath(string path)
         {
             if (String.IsNullOrWhiteSpace(path))
             {
@@ -283,7 +283,7 @@ namespace ApplyPilot.PhaseA
 
         public static SafeFileHandle OpenManifestObject(string path, bool directory)
         {
-            string full = Path.GetFullPath(path);
+            string full = NormalizeLocalPath(path);
             uint access = directory ? ReadControl : GenericRead;
             uint flags = FileFlagOpenReparsePoint | (directory ? FileFlagBackupSemantics : 0);
             uint share = directory ? FileShareRead | FileShareDelete : 0U;
@@ -303,7 +303,7 @@ namespace ApplyPilot.PhaseA
         {
             if (handle == null || handle.IsClosed || handle.IsInvalid)
                 throw new ArgumentException("Manifest object handle is not valid.", "handle");
-            string full = Path.GetFullPath(path).TrimEnd('\\');
+            string full = NormalizeLocalPath(path);
             FileAttributeTagInformation tag;
             if (!GetFileAttributeTagInformationByHandleEx(handle, 9, out tag,
                 (uint)Marshal.SizeOf<FileAttributeTagInformation>()))
@@ -420,7 +420,7 @@ namespace ApplyPilot.PhaseA
 
         public static SafeFileHandle CreateProtectedDirectory(string path, byte[] securityDescriptor)
         {
-            string full = Path.GetFullPath(path).TrimEnd('\\');
+            string full = NormalizeLocalPath(path);
             GCHandle pin = GCHandle.Alloc(securityDescriptor, GCHandleType.Pinned);
             try
             {
@@ -457,7 +457,7 @@ namespace ApplyPilot.PhaseA
         public static void RenameDirectoryHandleNoReplace(SafeFileHandle handle, string destination)
         {
             RawFileIdentity before = GetRawFileIdentity(handle);
-            string target = Path.GetFullPath(destination).TrimEnd('\\');
+            string target = NormalizeLocalPath(destination);
             if (Directory.Exists(target) || File.Exists(target)) throw new IOException("Directory destination already exists.");
             byte[] name = Encoding.Unicode.GetBytes(ToExtendedLengthPath(target));
             int rootOffset = IntPtr.Size == 8 ? 8 : 4;
@@ -583,7 +583,7 @@ namespace ApplyPilot.PhaseA
 
         private static List<SafeFileHandle> OpenAncestorLeases(string path)
         {
-            string full = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+            string full = NormalizeLocalPath(path);
             string drive = Path.GetPathRoot(full);
             var paths = new List<string> { drive };
             string current = drive.TrimEnd(Path.DirectorySeparatorChar);
@@ -642,7 +642,7 @@ namespace ApplyPilot.PhaseA
 
         private static SafeFileHandle OpenDeleteHandle(string path)
         {
-            string full = Path.GetFullPath(path);
+            string full = NormalizeLocalPath(path);
             IntPtr raw = CreateFileW(ToExtendedLengthPath(full), GenericRead | Delete, 3,
                 IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint,
                 IntPtr.Zero);
@@ -933,7 +933,7 @@ function Assert-PhaseALocalNtfsPath(
   if ([string]::IsNullOrWhiteSpace($Path) -or $Path.StartsWith('\\') -or -not [IO.Path]::IsPathFullyQualified($Path)) {
     throw 'Only absolute local paths are allowed.'
   }
-  $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+  $full = [ApplyPilot.PhaseA.EvidenceNative]::NormalizeLocalPath($Path)
   $root = [IO.Path]::GetPathRoot($full)
   $drive = [IO.DriveInfo]::new($root)
   if ($drive.DriveType -ne [IO.DriveType]::Fixed) { throw 'Evidence path is not on a fixed drive.' }
@@ -970,7 +970,8 @@ function Get-PhaseATargetDigest {
     $volumePath = [ApplyPilot.PhaseA.EvidenceNative]::GetVolumeGuidPath($lease.FileHandle)
     if ($CanonicalPath) {
       $leaf = [IO.Path]::GetFileName($full)
-      $canonicalLeaf = [IO.Path]::GetFileName([IO.Path]::GetFullPath($CanonicalPath).TrimEnd('\'))
+      $canonicalLeaf = [IO.Path]::GetFileName(
+        [ApplyPilot.PhaseA.EvidenceNative]::NormalizeLocalPath($CanonicalPath))
       if (-not $volumePath.EndsWith($leaf, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Cannot derive canonical target path.'
       }
@@ -985,7 +986,8 @@ function Get-PhaseATargetDigest {
 function Get-PhaseASecurityDescriptorHash {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$Path)
-  $acl = Get-Acl -LiteralPath $Path
+  $full = Assert-PhaseALocalNtfsPath $Path
+  $acl = Get-Acl -LiteralPath $full
   $raw = [Security.AccessControl.RawSecurityDescriptor]::new(
     $acl.GetSecurityDescriptorBinaryForm(), 0)
   if ($null -eq $raw.Owner -or $null -eq $raw.Group -or $null -eq $raw.DiscretionaryAcl) {
@@ -1139,15 +1141,17 @@ function Get-PhaseAProtectedSecurityDescriptorBytes([string]$OperatorSid, [switc
 }
 
 function Set-PhaseAProtectedAcl([string]$Path, [string]$OperatorSid, [switch]$File) {
+  $full=Assert-PhaseALocalNtfsPath $Path
   $security=New-PhaseAProtectedSecurity $OperatorSid -File:$File
-  Set-Acl -LiteralPath $Path -AclObject $security
-  Assert-PhaseAProtectedAcl -Path $Path -OperatorSid $OperatorSid -File:$File
+  Set-Acl -LiteralPath $full -AclObject $security
+  Assert-PhaseAProtectedAcl -Path $full -OperatorSid $OperatorSid -File:$File
 }
 
 function Assert-PhaseAAncestorDeleteChild([string]$Path, [string]$OperatorSid, [string]$Boundary) {
   $trusted = @($OperatorSid, 'S-1-5-18', 'S-1-5-32-544')
-  $boundaryPath = if ($Boundary) { [IO.Path]::GetFullPath($Boundary).TrimEnd('\') } else { $null }
-  $current = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Path)).Parent
+  $full = Assert-PhaseALocalNtfsPath $Path -AllowMissingLeaf
+  $boundaryPath = if ($Boundary) { Assert-PhaseALocalNtfsPath $Boundary } else { $null }
+  $current = [IO.DirectoryInfo]::new($full).Parent
   while ($null -ne $current) {
     $acl = Get-Acl -LiteralPath $current.FullName
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
@@ -1185,7 +1189,8 @@ function Get-PhaseADirectoryManifest {
     $baseVolumePath=[ApplyPilot.PhaseA.EvidenceNative]::GetVolumeGuidPath($baseHandle).TrimEnd('\')
     $canonicalBaseVolumePath=$baseVolumePath
     if($CanonicalRootPath){
-      $actualLeaf=[IO.Path]::GetFileName($full.TrimEnd('\'));$canonicalLeaf=[IO.Path]::GetFileName([IO.Path]::GetFullPath($CanonicalRootPath).TrimEnd('\'))
+      $actualLeaf=[IO.Path]::GetFileName($full.TrimEnd('\'));$canonicalLeaf=[IO.Path]::GetFileName(
+        [ApplyPilot.PhaseA.EvidenceNative]::NormalizeLocalPath($CanonicalRootPath))
       if(-not $baseVolumePath.EndsWith($actualLeaf,[StringComparison]::OrdinalIgnoreCase)){throw 'Cannot derive canonical manifest root path.'}
       $canonicalBaseVolumePath=$baseVolumePath.Substring(0,$baseVolumePath.Length-$actualLeaf.Length)+$canonicalLeaf
     }

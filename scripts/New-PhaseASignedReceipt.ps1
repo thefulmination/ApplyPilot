@@ -216,11 +216,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Verify') {
     -ExpectedOperatorSigningKeySpkiSha256 $ExpectedOperatorSigningKeySpkiSha256 `
     -ExpectedReceiptType $ReceiptType -ExpectedBindings $value `
     -ExpectedAuthorizedAfterManifestSha256 $ExpectedAfterManifestSha256
-  [IO.Path]::GetFullPath($ReceiptPath)
+  $received.Path
   exit 0
 }
 
-$output = [IO.Path]::GetFullPath($OutputDirectory)
+$output = & $module { param($Path) Assert-PhaseALocalNtfsPath $Path -AllowMissingLeaf } $OutputDirectory
 $protectedOutput = $PSBoundParameters.ContainsKey('ProtectedOperatorSid')
 if ($protectedOutput) {
   if ([string]::IsNullOrWhiteSpace($ProtectedOperatorSid)) {

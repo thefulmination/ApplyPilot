@@ -206,8 +206,10 @@ def _run_ps_file(body: str, root: Path, *, check: bool = True, timeout: int = 45
     return result
 
 
-def _module(body: str, *, check: bool = True):
-    return _run_ps(f"Import-Module {_ps(MODULE)} -Force\n{body}", check=check)
+def _module(body: str, *, check: bool = True, timeout: int = 45):
+    return _run_ps(
+        f"Import-Module {_ps(MODULE)} -Force\n{body}", check=check, timeout=timeout
+    )
 
 
 def _current_sid() -> str:
@@ -396,17 +398,47 @@ def test_review_corrections_are_structural_contracts():
 def test_evidence_native_force_reload_rejects_stale_contract_and_accepts_current():
     stale = _run_ps(
         "Add-Type -TypeDefinition 'namespace ApplyPilot.PhaseA { "
-        "public static class EvidenceNative { public const string ContractVersion = \"1\"; } }';"
-        f"try{{Import-Module {_ps(MODULE)} -Force;'missed'}}catch{{$_.Exception.Message}}"
+        "public static class EvidenceNative { public const string ContractVersion = \"2\"; } }';"
+        f"try{{Import-Module {_ps(MODULE)} -Force;$message='missed'}}"
+        "catch{$message=$_.Exception.Message};"
+        "[pscustomobject]@{Message=$message;Loaded=@(Get-Module PhaseAEvidenceStore).Count;"
+        "Commands=@(Get-Command -Module PhaseAEvidenceStore -ErrorAction SilentlyContinue).Count}"
+        "|ConvertTo-Json -Compress"
     )
-    message = stale.stdout.strip().lower()
+    stale_result = json.loads(stale.stdout)
+    message = stale_result["Message"].lower()
     assert "incompatible" in message and "restart" in message
+    assert stale_result["Loaded"] == 0
+    assert stale_result["Commands"] == 0
 
     current = _run_ps(
         f"Import-Module {_ps(MODULE)} -Force;Import-Module {_ps(MODULE)} -Force;"
-        "[ApplyPilot.PhaseA.EvidenceNative]::ContractVersion"
+        "$bytes=ConvertTo-PhaseACanonicalJsonBytes ([ordered]@{a=1});"
+        "[pscustomobject]@{Contract=[ApplyPilot.PhaseA.EvidenceNative]::ContractVersion;"
+        "Canonical=[Text.Encoding]::UTF8.GetString($bytes);"
+        "Commands=@((Get-Module PhaseAEvidenceStore).ExportedCommands.Keys|Sort-Object)}"
+        "|ConvertTo-Json -Depth 3 -Compress"
     )
-    assert current.stdout.strip() == "2"
+    current_result = json.loads(current.stdout)
+    assert current_result == {
+        "Contract": "3",
+        "Canonical": '{"a":1}',
+        "Commands": sorted(
+            [
+                "Assert-PhaseAEvidenceStore",
+                "ConvertTo-PhaseACanonicalJsonBytes",
+                "Get-PhaseAAuthenticatedBundleCandidates",
+                "Get-PhaseADirectoryManifest",
+                "Get-PhaseAMachineDigest",
+                "Get-PhaseAOperatorSidDigest",
+                "Get-PhaseAProductionAnchors",
+                "Get-PhaseASecurityDescriptorHash",
+                "Get-PhaseATargetDigest",
+                "Install-PhaseASignedReceipt",
+                "Test-PhaseASignedReceipt",
+            ]
+        ),
+    }
 
 
 def test_production_receipt_staging_uses_only_validated_handle_primitives():
@@ -975,14 +1007,476 @@ def test_evidence_native_rejects_ads_and_reserved_device_paths(tmp_path: Path):
     result = json.loads(
         _module(
             "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
-            f"{_ps(ads)},$false);$h.Dispose();$adsResult='missed'}}catch{{$adsResult='rejected'}};"
+            f"{_ps(ads)},$false);$h.Dispose();$adsResult='missed'}}"
+            "catch{$adsResult=$_.Exception.GetBaseException().Message};"
             "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
             f"{_ps(reserved)},$false);$h.Dispose();$reservedResult='missed'}}"
-            "catch{$reservedResult='rejected'};"
+            "catch{$reservedResult=$_.Exception.GetBaseException().Message};"
             "[pscustomobject]@{Ads=$adsResult;Reserved=$reservedResult}|ConvertTo-Json -Compress"
         ).stdout
     )
-    assert result == {"Ads": "rejected", "Reserved": "rejected"}
+    assert result == {
+        "Ads": "Alternate data streams are not allowed.",
+        "Reserved": "Path contains an invalid or aliased component.",
+    }
+
+
+def test_evidence_native_open_rejects_trailing_dot_and_dotdot_aliases(tmp_path: Path):
+    carrier = tmp_path / "carrier.txt"
+    carrier.write_bytes(b"carrier")
+    original_identity = carrier.stat().st_ino
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.mkdir()
+    trailing_dot = f"{carrier}."
+    dotdot = alias_parent / ".." / carrier.name
+    result = json.loads(
+        _module(
+            "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
+            f"{_ps(trailing_dot)},$false);$h.Dispose();$trailingResult='missed'}}"
+            "catch{$trailingResult=$_.Exception.GetBaseException().Message};"
+            "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
+            f"{_ps(dotdot)},$false);$h.Dispose();$dotdotResult='missed'}}"
+            "catch{$dotdotResult=$_.Exception.GetBaseException().Message};"
+            "[pscustomobject]@{TrailingDot=$trailingResult;DotDot=$dotdotResult}"
+            "|ConvertTo-Json -Compress"
+        ).stdout
+    )
+    assert carrier.read_bytes() == b"carrier"
+    assert carrier.stat().st_ino == original_identity
+    assert result == {
+        "TrailingDot": "Path contains an invalid or aliased component.",
+        "DotDot": "Path contains an invalid or aliased component.",
+    }
+
+
+def test_evidence_native_create_rejects_trailing_dot_and_dotdot_aliases(tmp_path: Path):
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.mkdir()
+    canonical_trailing = tmp_path / "created-trailing"
+    canonical_dotdot = tmp_path / "created-dotdot"
+    trailing_dot = f"{canonical_trailing}."
+    dotdot = alias_parent / ".." / canonical_dotdot.name
+    sid = _current_sid()
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param($trailing,$dotdot,$sid)"
+        "$sd=Get-PhaseAProtectedSecurityDescriptorBytes $sid;"
+        "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory($trailing,$sd);"
+        "$h.Dispose();$trailingResult='missed'}"
+        "catch{$trailingResult=$_.Exception.GetBaseException().Message};"
+        "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory($dotdot,$sd);"
+        "$h.Dispose();$dotdotResult='missed'}"
+        "catch{$dotdotResult=$_.Exception.GetBaseException().Message};"
+        "[pscustomobject]@{TrailingDot=$trailingResult;DotDot=$dotdotResult}"
+        "|ConvertTo-Json -Compress} "
+        f"{_ps(trailing_dot)} {_ps(dotdot)} {_ps(sid)}"
+    )
+    result = json.loads(_module(body).stdout)
+    assert not canonical_trailing.exists()
+    assert not canonical_dotdot.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["alias-parent"]
+    assert result == {
+        "TrailingDot": "Path contains an invalid or aliased component.",
+        "DotDot": "Path contains an invalid or aliased component.",
+    }
+
+
+def test_evidence_native_directory_rename_rejects_alias_destinations(tmp_path: Path):
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.mkdir()
+    stage_trailing = tmp_path / "stage-trailing"
+    stage_dotdot = tmp_path / "stage-dotdot"
+    canonical_trailing = tmp_path / "final-trailing"
+    canonical_dotdot = tmp_path / "final-dotdot"
+    trailing_dot = f"{canonical_trailing}."
+    dotdot = alias_parent / ".." / canonical_dotdot.name
+    sid = _current_sid()
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param("
+        "$stageTrailing,$stageDotdot,$trailing,$dotdot,$sid)"
+        "$sd=Get-PhaseAProtectedSecurityDescriptorBytes $sid;"
+        "$h=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory($stageTrailing,$sd);"
+        "try{try{[ApplyPilot.PhaseA.EvidenceNative]::RenameDirectoryHandleNoReplace("
+        "$h,$trailing);$trailingResult='missed'}"
+        "catch{$trailingResult=$_.Exception.GetBaseException().Message}}"
+        "finally{$h.Dispose()};"
+        "$h=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory($stageDotdot,$sd);"
+        "try{try{[ApplyPilot.PhaseA.EvidenceNative]::RenameDirectoryHandleNoReplace("
+        "$h,$dotdot);$dotdotResult='missed'}"
+        "catch{$dotdotResult=$_.Exception.GetBaseException().Message}}"
+        "finally{$h.Dispose()};"
+        "[pscustomobject]@{TrailingDot=$trailingResult;DotDot=$dotdotResult}"
+        "|ConvertTo-Json -Compress} "
+        f"{_ps(stage_trailing)} {_ps(stage_dotdot)} {_ps(trailing_dot)} "
+        f"{_ps(dotdot)} {_ps(sid)}"
+    )
+    result = json.loads(_module(body).stdout)
+    assert stage_trailing.is_dir()
+    assert stage_dotdot.is_dir()
+    assert not canonical_trailing.exists()
+    assert not canonical_dotdot.exists()
+    assert result == {
+        "TrailingDot": "Path contains an invalid or aliased component.",
+        "DotDot": "Path contains an invalid or aliased component.",
+    }
+
+
+def test_evidence_native_cleanup_rejects_alias_roots_without_mutation(tmp_path: Path):
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.mkdir()
+    victim_trailing = tmp_path / "victim-trailing"
+    victim_dotdot = tmp_path / "victim-dotdot"
+    for victim in (victim_trailing, victim_dotdot):
+        victim.mkdir()
+        (victim / "child.txt").write_bytes(b"preserve")
+    trailing_dot = f"{victim_trailing}."
+    dotdot = alias_parent / ".." / victim_dotdot.name
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param("
+        "$victimTrailing,$victimDotdot,$trailing,$dotdot)"
+        "$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($victimTrailing,$true);"
+        "try{$trailingIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h)}"
+        "finally{$h.Dispose()};"
+        "$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($victimDotdot,$true);"
+        "try{$dotdotIdentity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h)}"
+        "finally{$h.Dispose()};"
+        "try{$null=[ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow($trailing,"
+        "[uint64]$trailingIdentity.VolumeSerialNumber,[string]$trailingIdentity.FileId,-1);"
+        "$trailingResult='missed'}"
+        "catch{$trailingResult=$_.Exception.GetBaseException().Message};"
+        "try{$null=[ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow($dotdot,"
+        "[uint64]$dotdotIdentity.VolumeSerialNumber,[string]$dotdotIdentity.FileId,-1);"
+        "$dotdotResult='missed'}"
+        "catch{$dotdotResult=$_.Exception.GetBaseException().Message};"
+        "[pscustomobject]@{TrailingDot=$trailingResult;DotDot=$dotdotResult}"
+        "|ConvertTo-Json -Compress} "
+        f"{_ps(victim_trailing)} {_ps(victim_dotdot)} {_ps(trailing_dot)} {_ps(dotdot)}"
+    )
+    result = json.loads(_module(body).stdout)
+    assert (victim_trailing / "child.txt").read_bytes() == b"preserve"
+    assert (victim_dotdot / "child.txt").read_bytes() == b"preserve"
+    assert result == {
+        "TrailingDot": "Path contains an invalid or aliased component.",
+        "DotDot": "Path contains an invalid or aliased component.",
+    }
+
+
+def test_powershell_path_validator_rejects_aliases_before_canonicalization(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.mkdir()
+    carrier = tmp_path / "carrier.txt"
+    carrier.write_bytes(b"carrier")
+    ads = f"{carrier}:secret"
+    Path(ads).write_bytes(b"secret")
+    missing = tmp_path / "missing"
+    cases = [
+        ("TrailingDot", f"{target}.", False),
+        ("TrailingSpace", f"{target} ", False),
+        ("DotComponent", f"{tmp_path}\\.\\{target.name}", False),
+        ("DotDot", f"{alias_parent}\\..\\{target.name}", False),
+        ("DuplicateSeparator", f"{tmp_path}\\\\{target.name}", False),
+        ("Ads", ads, False),
+        ("Reserved", str(tmp_path / "NUL.txt"), True),
+        ("Unc", r"\\localhost\C$\ApplyPilotAliasProbe", True),
+        ("Extended", f"\\\\?\\{target}", False),
+        ("Device", f"\\\\.\\{target}", False),
+        ("Relative", r"relative\target", True),
+        ("MissingDotDot", f"{alias_parent}\\..\\{missing.name}", True),
+        ("MissingControl", str(missing), True),
+    ]
+    case_literals = ",".join(
+        "[pscustomobject]@{Name="
+        f"{_ps(name)};Path={_ps(path)};Allow=${str(allow).lower()}}}"
+        for name, path, allow in cases
+    )
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param($cases)"
+        "$results=[ordered]@{};foreach($case in $cases){try{"
+        "if($case.Allow){$null=Assert-PhaseALocalNtfsPath $case.Path -AllowMissingLeaf}"
+        "else{$null=Assert-PhaseALocalNtfsPath $case.Path};$results[$case.Name]='accepted'}"
+        "catch{$results[$case.Name]=$_.Exception.GetBaseException().Message}};"
+        "$results|ConvertTo-Json -Compress} "
+        f"@({case_literals})"
+    )
+    result = json.loads(_module(body).stdout)
+    assert target.is_dir()
+    assert carrier.read_bytes() == b"carrier"
+    assert not missing.exists()
+    invalid = "Path contains an invalid or aliased component."
+    local_only = "Only absolute local paths are allowed."
+    assert result == {
+        "TrailingDot": invalid,
+        "TrailingSpace": invalid,
+        "DotComponent": invalid,
+        "DotDot": invalid,
+        "DuplicateSeparator": invalid,
+        "Ads": "Alternate data streams are not allowed.",
+        "Reserved": invalid,
+        "Unc": local_only,
+        "Extended": local_only,
+        "Device": local_only,
+        "Relative": local_only,
+        "MissingDotDot": invalid,
+        "MissingControl": "accepted",
+    }
+
+
+def test_evidence_native_assert_manifest_object_rejects_alias_path(tmp_path: Path):
+    carrier = tmp_path / "carrier.txt"
+    carrier.write_bytes(b"carrier")
+    result = json.loads(
+        _module(
+            f"$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject({_ps(carrier)},$false);"
+            "try{$before=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h);"
+            f"try{{[ApplyPilot.PhaseA.EvidenceNative]::AssertManifestObject($h,{_ps(f'{carrier}.')},$false);"
+            "$aliasError='missed'}catch{$aliasError=$_.Exception.GetBaseException().Message};"
+            "$after=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h);"
+            "[pscustomobject]@{Error=$aliasError;Before=$before.FileId;After=$after.FileId}"
+            "|ConvertTo-Json -Compress}finally{$h.Dispose()}"
+        ).stdout
+    )
+    assert carrier.read_bytes() == b"carrier"
+    assert result["Before"] == result["After"]
+    assert result["Error"] == "Path contains an invalid or aliased component."
+
+
+def test_powershell_canonical_acl_and_boundary_inputs_reject_aliases(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    child = root / "child"
+    child.mkdir()
+    carrier = root / "carrier.txt"
+    carrier.write_bytes(b"carrier")
+    ads = f"{carrier}:secret"
+    Path(ads).write_bytes(b"secret")
+    root_alias = f"{root}."
+    sid = _current_sid()
+    body = (
+        "$m=Get-Module PhaseAEvidenceStore;& $m {param($root,$child,$alias,$ads,$sid)"
+        "$results=[ordered]@{};"
+        "try{$null=Get-PhaseATargetDigest -Path $root -CanonicalPath $alias;"
+        "$results.TargetCanonical='missed'}catch{$results.TargetCanonical=$_.Exception.GetBaseException().Message};"
+        "try{$null=Get-PhaseADirectoryManifest -Root $root -CanonicalRootPath $alias;"
+        "$results.ManifestCanonical='missed'}catch{$results.ManifestCanonical=$_.Exception.GetBaseException().Message};"
+        "try{$null=Get-PhaseASecurityDescriptorHash -Path $alias;"
+        "$results.SecurityAlias='missed'}catch{$results.SecurityAlias=$_.Exception.GetBaseException().Message};"
+        "try{$null=Get-PhaseASecurityDescriptorHash -Path $ads;"
+        "$results.SecurityAds='missed'}catch{$results.SecurityAds=$_.Exception.GetBaseException().Message};"
+        "try{Assert-PhaseAAncestorDeleteChild $child $sid $alias;"
+        "$results.Boundary='missed'}catch{$results.Boundary=$_.Exception.GetBaseException().Message};"
+        "$results|ConvertTo-Json -Compress} "
+        f"{_ps(root)} {_ps(child)} {_ps(root_alias)} {_ps(ads)} {_ps(sid)}"
+    )
+    result = json.loads(_module(body).stdout)
+    assert child.is_dir()
+    assert carrier.read_bytes() == b"carrier"
+    invalid = "Path contains an invalid or aliased component."
+    assert result == {
+        "TargetCanonical": invalid,
+        "ManifestCanonical": invalid,
+        "SecurityAlias": invalid,
+        "SecurityAds": "Alternate data streams are not allowed.",
+        "Boundary": invalid,
+    }
+
+
+def test_aliased_acl_write_is_rejected_before_security_descriptor_mutation(tmp_path: Path):
+    target = tmp_path / "acl-target"
+    target.mkdir()
+    alias = f"{target}."
+    sid = _current_sid()
+    result = json.loads(
+        _module(
+            "$m=Get-Module PhaseAEvidenceStore;& $m {param($target,$alias,$sid)"
+            "$before=[Convert]::ToHexString((Get-Acl -LiteralPath $target).GetSecurityDescriptorBinaryForm());"
+            "try{Set-PhaseAProtectedAcl $alias $sid;$error='missed'}"
+            "catch{$error=$_.Exception.GetBaseException().Message};"
+            "$after=[Convert]::ToHexString((Get-Acl -LiteralPath $target).GetSecurityDescriptorBinaryForm());"
+            "[pscustomobject]@{Error=$error;Before=$before;After=$after}|ConvertTo-Json -Compress} "
+            f"{_ps(target)} {_ps(alias)} {_ps(sid)}"
+        ).stdout
+    )
+    assert target.is_dir()
+    assert result["Before"] == result["After"]
+    assert result["Error"] == "Path contains an invalid or aliased component."
+
+
+def test_generated_extended_alias_child_is_not_followed_or_deleted(tmp_path: Path):
+    root = tmp_path / "generated-child-root"
+    root.mkdir()
+    ordinary = root / "aaa.txt"
+    ordinary.write_bytes(b"authorized cleanup residue")
+    alias = root / "alias."
+    extended_alias = f"\\\\?\\{alias}"
+    os.mkdir(extended_alias)
+    try:
+        body = (
+            f"try{{$null=Get-PhaseADirectoryManifest -Root {_ps(root)};"
+            "$manifest='missed'}catch{$manifest=$_.Exception.GetBaseException().Message};"
+            f"$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject({_ps(root)},$true);"
+            "try{$identity=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h)}"
+            "finally{$h.Dispose()};"
+            f"try{{$null=[ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow({_ps(root)},"
+            "[uint64]$identity.VolumeSerialNumber,[string]$identity.FileId,-1);"
+            "$cleanup='missed'}catch{$cleanup=$_.Exception.GetBaseException().Message};"
+            "[pscustomobject]@{Manifest=$manifest;Cleanup=$cleanup}|ConvertTo-Json -Compress"
+        )
+        result = json.loads(_module(body).stdout)
+        assert os.path.isdir(extended_alias)
+        assert root.is_dir()
+        assert not ordinary.exists()
+        assert not (root / "alias").exists()
+        assert result == {
+            "Manifest": "Manifest object has an alias or ADS name.",
+            "Cleanup": "Path contains an invalid or aliased component.",
+        }
+    finally:
+        if os.path.isdir(extended_alias):
+            os.rmdir(extended_alias)
+
+
+def test_provisioning_rejects_aliased_store_before_parent_creation(tmp_path: Path):
+    anchors = _anchor_fixture(tmp_path)
+    parent = tmp_path / "provision-parent"
+    final = parent / "v1"
+    alias = f"{final}."
+    sid = _current_sid()
+    body = (
+        f". {_ps(PROVISION)} -DefinitionImport;"
+        "try{Invoke-PhaseAEvidenceStoreProvision "
+        f"-StoreRoot {_ps(alias)} -CanonicalOperatorSid {_ps(sid)} "
+        f"-ExpectedCommit {_ps('1' * 40)} -ExpectedReceiptBindingsByHash @{{}} "
+        f"-OperatorSigningMetadataPath {_ps(anchors['signing_meta'])} "
+        f"-OperatorSigningSpkiPath {_ps(anchors['signing_spki'])} "
+        f"-RecoveryEncryptionMetadataPath {_ps(anchors['recovery_meta'])} "
+        f"-RecoveryEncryptionSpkiPath {_ps(anchors['recovery_spki'])} "
+        "-TestMachineGuid '01234567-89ab-cdef-0123-456789abcdef' "
+        "-TestSmbiosUuid 'fedcba98-7654-3210-fedc-ba9876543210' "
+        "-DefinitionImport|Out-Null;$resultMessage='missed'}"
+        "catch{$resultMessage=$_.Exception.GetBaseException().Message};$resultMessage"
+    )
+    result = _run_ps(body)
+    assert not parent.exists()
+    assert result.stdout.strip() == "Path contains an invalid or aliased component."
+
+
+def test_cleanup_entrypoint_rejects_alias_before_deletion(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "cleanup-alias-entry")
+    sid = _current_sid()
+    parent = tmp_path / "stages"
+    parent.mkdir()
+    stage = tmp_path / ".provisioning-11111111-1111-4111-8111-111111111111"
+    stage = parent / stage.name
+    stage.mkdir()
+    child = stage / "child.txt"
+    child.write_bytes(b"preserve")
+    stage_identity = stage.stat().st_ino
+    child_identity = child.stat().st_ino
+    before = json.loads(
+        _module(
+            f"Get-PhaseADirectoryManifest -Root {_ps(parent)}|ConvertTo-Json -Depth 12 -Compress"
+        ).stdout
+    )
+    stage_manifest = json.loads(
+        _module(
+            f"Get-PhaseADirectoryManifest -Root {_ps(stage)}|ConvertTo-Json -Depth 12 -Compress"
+        ).stdout
+    )
+    removed = {stage_manifest["baseRootIdentityDigest"]} | {
+        entry["objectIdentityDigest"] for entry in stage_manifest["entries"]
+    }
+    after = {
+        "schemaVersion": 1,
+        "manifestType": "applypilot.phase-a.directory-manifest",
+        "baseRootIdentityDigest": before["baseRootIdentityDigest"],
+        "entries": [
+            entry for entry in before["entries"]
+            if entry["objectIdentityDigest"] not in removed
+        ],
+    }
+    expected_after = tmp_path / "expected-after.json"
+    expected_after.write_bytes(_canonical(after))
+    target = _module(f"Get-PhaseATargetDigest -Path {_ps(stage)}").stdout.strip()
+    bootstrap = tmp_path / "bootstrap"
+    bootstrap.mkdir()
+    _protect(bootstrap)
+    operation = "a" * 64
+    auth_args = (
+        "-ReceiptType applypilot.phase-a.provisioning-cleanup-authorization "
+        f"-OperatorSigningSpkiPath {_ps(public)} "
+        f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ApprovedCommit {_ps('1' * 40)} -OperationId {_ps(operation)} "
+        f"-TargetIdentityDigest {_ps(target)} "
+        f"-BeforeManifestSha256 {_ps(_sha(_canonical(before)))} "
+        f"-ExpectedAfterManifestSha256 {_ps(_sha(_canonical(after)))} "
+        f"-EvidenceBundleSha256 {_ps('0' * 64)} "
+        f"-CredentialInventoryRoot {_ps('0' * 64)} "
+        f"-CredentialRevocationSetRoot {_ps('0' * 64)} -OperatorSid {_ps(sid)} "
+        "-CreatedAtUtc '2026-07-14T12:00:00Z'"
+    )
+    authorization = Path(
+        _run_ps(
+            f"& {_ps(NEW_RECEIPT)} {auth_args} -CreateUnsigned "
+            f"-OutputDirectory {_ps(bootstrap)}"
+        ).stdout.strip()
+    )
+    authorization_sig = authorization.with_suffix(".sig")
+    authorization_sig.write_bytes(_sign(private, authorization.read_bytes()))
+    _protect(authorization)
+    _protect(authorization_sig)
+    alias = f"{stage}."
+    body = (
+        f". {_ps(PROVISION)} -DefinitionImport;"
+        f"$expected=Get-Content -LiteralPath {_ps(authorization)} -Raw|"
+        "ConvertFrom-Json -AsHashtable -DateKind String;"
+        "try{Invoke-PhaseAProvisioningCleanup "
+        f"-StagingPath {_ps(alias)} -CanonicalOperatorSid {_ps(sid)} "
+        f"-OperatorSigningSpkiPath {_ps(public)} "
+        f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ExpectedCommit {_ps('1' * 40)} "
+        f"-AuthorizationReceiptPath {_ps(authorization)} "
+        f"-AuthorizationSignaturePath {_ps(authorization_sig)} "
+        f"-ExpectedAuthorizationBindings $expected -ExpectedAfterManifestPath {_ps(expected_after)} "
+        f"-TestBootstrapRoot {_ps(bootstrap)} -DefinitionImport|Out-Null;"
+        "$resultMessage='missed'}"
+        "catch{$resultMessage=$_.Exception.GetBaseException().Message};$resultMessage"
+    )
+    result = _run_ps(body, timeout=120)
+    after_rejection = json.loads(
+        _module(
+            f"Get-PhaseADirectoryManifest -Root {_ps(parent)}|ConvertTo-Json -Depth 12 -Compress"
+        ).stdout
+    )
+    assert stage.stat().st_ino == stage_identity
+    assert child.stat().st_ino == child_identity
+    assert child.read_bytes() == b"preserve"
+    assert _canonical(after_rejection) == _canonical(before)
+    assert result.stdout.strip() == "Path contains an invalid or aliased component."
+
+
+def test_unsigned_receipt_rejects_alias_before_output_creation(tmp_path: Path):
+    _, public, key_hash = _new_keypair(tmp_path, "alias-output")
+    output = tmp_path / "unsigned"
+    alias = f"{output}."
+    extended_alias = f"\\\\?\\{alias}"
+    before = sorted(path.name for path in tmp_path.iterdir())
+    result = _run_ps(
+        f"try{{& {_ps(NEW_RECEIPT)} -ReceiptType applypilot.phase-a.runtime-source-approval "
+        f"-OperatorSigningSpkiPath {_ps(public)} -ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ApprovedCommit {_ps('1' * 40)} -ApprovedTree {_ps('2' * 40)} "
+        f"-PlanSha256 {_ps('3' * 64)} "
+        "-SpecReviewTaskId '11111111-1111-4111-8111-111111111111' "
+        "-QualityReviewTaskId '22222222-2222-4222-8222-222222222222' "
+        f"-CriticalFileSha256 @{{'scripts/a.ps1'={_ps('4' * 64)}}} "
+        f"-Nonce {_ps('5' * 64)} -CreatedAtUtc '2026-07-14T12:00:00Z' "
+        f"-CreateUnsigned -OutputDirectory {_ps(alias)}|Out-Null;$resultMessage='missed'}}"
+        "catch{$resultMessage=$_.Exception.GetBaseException().Message};$resultMessage"
+    )
+    assert not output.exists()
+    assert not os.path.exists(extended_alias)
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+    assert result.stdout.strip() == "Path contains an invalid or aliased component."
 
 
 def test_bundle_names_staging_residue_and_store_derived_adjudication(tmp_path: Path):
@@ -1402,7 +1896,8 @@ def test_definition_provision_validates_before_publish_is_idempotent_and_crash_s
         f"$expected=@{{{_ps(source_receipt.stem)}=$source;{_ps(host_receipt.stem)}=$hostBinding}};"
         f"for($i=0;$i -lt 20;$i++){{try{{{validation}|Out-Null}}catch{{}};"
         f"$exclusive=[IO.FileStream]::new({_ps(host_signature)},[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);$exclusive.Dispose()}};"
-        f"Move-Item {_ps(host_signature)} {_ps(str(host_signature)+'.moved')};Move-Item {_ps(str(host_signature)+'.moved')} {_ps(host_signature)};'released'"
+        f"Move-Item {_ps(host_signature)} {_ps(str(host_signature)+'.moved')};Move-Item {_ps(str(host_signature)+'.moved')} {_ps(host_signature)};'released'",
+        timeout=120,
     )
     assert stress.stdout.strip() == "released"
     host_signature.write_bytes(valid_signature)

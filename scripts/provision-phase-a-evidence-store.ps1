@@ -20,10 +20,11 @@ function Test-PhaseAElevatedToken {
 }
 
 function Write-PhaseAProtectedFile([string]$Path,[byte[]]$Bytes,[string]$OperatorSid) {
-  $stream=[IO.FileStream]::new($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-  try{$stream.Write($Bytes);$stream.Flush($true)}finally{$stream.Dispose()}
   $module=Get-Module PhaseAEvidenceStore
-  & $module {param($p,$s)Set-PhaseAProtectedAcl $p $s -File} $Path $OperatorSid
+  $full=& $module {param($p)Assert-PhaseALocalNtfsPath $p -AllowMissingLeaf} $Path
+  $stream=[IO.FileStream]::new($full,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+  try{$stream.Write($Bytes);$stream.Flush($true)}finally{$stream.Dispose()}
+  & $module {param($p,$s)Set-PhaseAProtectedAcl $p $s -File} $full $OperatorSid
 }
 
 function Get-PhaseAManifestMaterial([string]$Path,[string]$CanonicalRootPath) {
@@ -243,9 +244,12 @@ function Invoke-PhaseAProvisioningCleanup {
   $stage=& $module {param($p)Assert-PhaseALocalNtfsPath $p -AllowMissingLeaf} $StagingPath
   if([IO.Path]::GetFileName($stage)-cnotmatch '^\.provisioning-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'){throw 'Cleanup target name is invalid.'}
   $parent=Split-Path -Parent $stage
-  $bootstrap=if($TestBootstrapRoot){[IO.Path]::GetFullPath($TestBootstrapRoot)}else{[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData),'ApplyPilot','phase-a-evidence','bootstrap-operations')}
+  $bootstrap=if($TestBootstrapRoot){& $module {param($p)Assert-PhaseALocalNtfsPath $p} $TestBootstrapRoot}else{[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData),'ApplyPilot','phase-a-evidence','bootstrap-operations')}
   & $module {param($p,$s)Assert-PhaseAProtectedAcl $p $s} $bootstrap $operator
-  foreach($path in @($AuthorizationReceiptPath,$AuthorizationSignaturePath)){if([IO.Path]::GetFullPath((Split-Path -Parent $path))-ine $bootstrap){throw 'Authorization pair is outside bootstrap root.'}}
+  foreach($path in @($AuthorizationReceiptPath,$AuthorizationSignaturePath)){
+    $validated=& $module {param($p)Assert-PhaseALocalNtfsPath $p} $path
+    if((Split-Path -Parent $validated)-ine $bootstrap){throw 'Authorization pair is outside bootstrap root.'}
+  }
   $pair=& $module {param($r,$s,$o)Open-PhaseAProtectedReceiptPair $r $s $o} $AuthorizationReceiptPath $AuthorizationSignaturePath $operator
   try {
     $null=& $module {param($pair,$key,$hash,$expected)Test-PhaseASignedReceiptCore -Receipt $pair.Receipt -SignatureRead $pair.Signature `
@@ -310,7 +314,8 @@ function Invoke-PhaseAProvisioningCleanup {
     }
     if(-not $CompletionReceiptPath-or-not $CompletionSignaturePath-or-not $CompletionRequestPath){throw 'Resume requires the request and complete signed pair.'}
     $expectedRequestDirectory=[IO.Path]::Combine($bootstrap,'completion-requests',[string]$auth.operationId)
-    if([IO.Path]::GetFullPath((Split-Path -Parent $CompletionRequestPath))-ine $expectedRequestDirectory){throw 'Completion request is not keyed to the authorized operationId.'}
+    $validatedRequest=& $module {param($p)Assert-PhaseALocalNtfsPath $p} $CompletionRequestPath
+    if((Split-Path -Parent $validatedRequest)-ine $expectedRequestDirectory){throw 'Completion request is not keyed to the authorized operationId.'}
     & $module {param($p,$s)Assert-PhaseAProtectedAcl $p $s -File} $CompletionRequestPath $operator
     $request=& $module {param($p)Read-PhaseACanonicalJson $p} $CompletionRequestPath
     $installed=Install-PhaseASignedReceipt -ReceiptPath $CompletionReceiptPath -SignaturePath $CompletionSignaturePath `
