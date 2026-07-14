@@ -35,7 +35,7 @@ def _ins(conn, url, *, company="Acme", application_url=None, audit=8.0, title="C
     conn.execute(
         "INSERT INTO jobs (url, title, site, company, application_url, tailored_resume_path, "
         "fit_score, audit_score, liveness_status) VALUES (?, ?, 'X', ?, ?, 'x', 8, ?, 'live')",
-        (url, title, company, application_url or f"https://boards.greenhouse.io/acme/{url[-3:]}", audit),
+        (url, title, company, application_url or f"https://apply.acme.invalid/{url[-3:]}", audit),
     )
     conn.commit()
 

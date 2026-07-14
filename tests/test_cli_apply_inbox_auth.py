@@ -19,6 +19,7 @@ def test_apply_command_inbox_auth_true_sets_env(monkeypatch) -> None:
     from applypilot.apply import launcher as apply_launcher
 
     monkeypatch.setattr(apply_launcher, "mark_job", fake_mark_job)
+    monkeypatch.setenv("APPLYPILOT_INBOX_AUTH", "")
 
     result = CliRunner().invoke(
         cli.app,
