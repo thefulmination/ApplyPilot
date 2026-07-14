@@ -1134,8 +1134,89 @@ function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {
   $Stream.Flush($true)
 }
 
-function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {
-  [IO.File]::WriteAllBytes($Path, $Content)
+function Get-KnownWrapperDenyStubBytes([string]$Extension) {
+  $content = if ($Extension -match '(?i)^\.(?:cmd|bat)$') {
+    "@echo off`r`necho ApplyPilot acquisition denied: emergency containment 1>&2`r`nexit /b 78`r`n"
+  } else {
+    "Write-Error 'ApplyPilot acquisition denied: emergency containment'`nexit 78`n"
+  }
+  return [Text.UTF8Encoding]::new($false).GetBytes($content)
+}
+
+function Test-KnownWrapperDenyStub([byte[]]$Content, [string]$Extension) {
+  $expected = Get-KnownWrapperDenyStubBytes $Extension
+  return $Content.Length -eq $expected.Length -and
+    (Get-KnownWrapperByteDigest $Content) -ceq (Get-KnownWrapperByteDigest $expected)
+}
+
+function Get-KnownWrapperEvidenceFiles($Wrapper) {
+  $pattern = '^{0}\.emergency-containment-evidence-(?<digest>[0-9a-f]{{64}})$' -f
+    [regex]::Escape([string]$Wrapper.Name)
+  return @(Get-ChildItem -LiteralPath $Wrapper.DirectoryName -File -ErrorAction Stop |
+    Where-Object { $_.Name -cmatch $pattern } |
+    Sort-Object Name)
+}
+
+function Test-KnownDenyStubEvidence($Wrapper) {
+  $evidenceFiles = @(Get-KnownWrapperEvidenceFiles $Wrapper)
+  if ($evidenceFiles.Count -ne 1) { return $false }
+  $expectedDigest = $evidenceFiles[0].Name.Substring($evidenceFiles[0].Name.Length - 64)
+  $evidenceStream = $null
+  try {
+    $evidenceStream = Open-KnownExistingEvidenceExclusive $evidenceFiles[0].FullName
+    Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $expectedDigest
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $evidenceStream) { $evidenceStream.Dispose() }
+  }
+}
+
+function Open-KnownEvidenceExclusive([string]$Path) {
+  try {
+    $stream = [IO.FileStream]::new(
+      $Path,
+      [IO.FileMode]::CreateNew,
+      [IO.FileAccess]::ReadWrite,
+      [IO.FileShare]::None
+    )
+    return [pscustomobject]@{ stream = $stream; created = $true }
+  } catch [IO.IOException] {
+    $stream = [IO.FileStream]::new(
+      $Path,
+      [IO.FileMode]::Open,
+      [IO.FileAccess]::ReadWrite,
+      [IO.FileShare]::None
+    )
+    return [pscustomobject]@{ stream = $stream; created = $false }
+  }
+}
+
+function Open-KnownExistingEvidenceExclusive([string]$Path) {
+  return [IO.FileStream]::new(
+    $Path,
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::ReadWrite,
+    [IO.FileShare]::None
+  )
+}
+
+function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {
+  $Stream.Position = 0
+  $Stream.SetLength(0)
+  $Stream.Write($Content, 0, $Content.Length)
+}
+
+function Flush-KnownEvidenceStream($Stream) {
+  $Stream.Flush($true)
+}
+
+function Assert-KnownEvidenceStreamDigest($Stream, [string]$ExpectedDigest) {
+  $actualDigest = Get-KnownWrapperByteDigest (Read-KnownWrapperStreamBytes $Stream)
+  if ($actualDigest -cne $ExpectedDigest) {
+    throw 'wrapper evidence verification failed'
+  }
 }
 
 function Get-KnownWrapperPaths {
@@ -1201,14 +1282,24 @@ function Get-ServiceSnapshot {
 
 function Get-WrapperSnapshot {
   return @(Get-KnownWrapperPaths | ForEach-Object {
-    $content = [IO.File]::ReadAllText($_.FullName)
-    [ordered]@{
-      name = $_.Name
-      path_digest = Get-TextDigest $_.FullName
-      sha256 = Get-FileDigest $_.FullName
-      embedded_dsn = [bool](
-        $content -match $script:SensitiveIdentifier -or $content -match $script:SensitiveUri
-      )
+    $wrapper = $_
+    $stream = Open-KnownWrapperExclusive ([string]$wrapper.FullName)
+    try {
+      $bytes = Read-KnownWrapperStreamBytes $stream
+      $content = ConvertFrom-KnownWrapperBytes $bytes
+      $denyStub = Test-KnownWrapperDenyStub -Content $bytes -Extension $wrapper.Extension
+      [ordered]@{
+        name = $wrapper.Name
+        path_digest = Get-TextDigest $wrapper.FullName
+        sha256 = Get-KnownWrapperByteDigest $bytes
+        embedded_dsn = [bool](
+          $content -match $script:SensitiveIdentifier -or $content -match $script:SensitiveUri
+        )
+        deny_stub = $denyStub
+        evidence_verified = if ($denyStub) { Test-KnownDenyStubEvidence $wrapper } else { $null }
+      }
+    } finally {
+      $stream.Dispose()
     }
   })
 }
@@ -1433,11 +1524,16 @@ function Get-UnresolvedAfterState($Snapshot) {
     })
   }
   foreach ($wrapper in @($Snapshot.wrapper_hashes)) {
-    if ([bool]$wrapper.embedded_dsn) {
+    $conditions = [Collections.Generic.List[string]]::new()
+    if ([bool]$wrapper.embedded_dsn) { $conditions.Add('embedded_dsn_present') }
+    if ([bool]$wrapper.deny_stub -and -not [bool]$wrapper.evidence_verified) {
+      $conditions.Add('preserved_evidence_unverified')
+    }
+    if ($conditions.Count -gt 0) {
       $unresolved.Add([ordered]@{
         kind = 'wrapper'
         target_digest = $wrapper.path_digest
-        conditions = @('embedded_dsn_present')
+        conditions = @($conditions)
       })
     }
   }
@@ -1520,41 +1616,45 @@ function Remove-EmbeddedWrapperDsns {
   foreach ($wrapper in @(Get-KnownWrapperPaths)) {
     Invoke-RecordedAction 'rewrite_wrapper' $wrapper.FullName {
       $stream = Open-KnownWrapperExclusive ([string]$wrapper.FullName)
+      $evidenceStream = $null
       try {
         $preimageBytes = Read-KnownWrapperStreamBytes $stream
         $content = ConvertFrom-KnownWrapperBytes $preimageBytes
+        if (Test-KnownWrapperDenyStub -Content $preimageBytes -Extension $wrapper.Extension) {
+          $evidenceFiles = @(Get-KnownWrapperEvidenceFiles $wrapper)
+          if ($evidenceFiles.Count -ne 1) {
+            throw 'deny stub requires exactly one preserved evidence artifact'
+          }
+          $expectedDigest = $evidenceFiles[0].Name.Substring(
+            $evidenceFiles[0].Name.Length - 64
+          )
+          $evidenceStream = Open-KnownExistingEvidenceExclusive $evidenceFiles[0].FullName
+          Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $expectedDigest
+          return
+        }
         $containsSensitiveContent = $content -match $script:SensitiveIdentifier -or
           $content -match $script:SensitiveUri
         if (-not $containsSensitiveContent) { return }
 
         $preimageDigest = Get-KnownWrapperByteDigest $preimageBytes
         $evidencePath = "{0}.emergency-containment-evidence-{1}" -f $wrapper.FullName, $preimageDigest
-        if (Test-Path -LiteralPath $evidencePath -PathType Leaf) {
-          if ((Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-              $preimageDigest) {
-            throw 'wrapper evidence digest collision'
-          }
-        } else {
-          Set-KnownWrapperEvidence -Path $evidencePath -Content $preimageBytes
+        $evidenceLease = Open-KnownEvidenceExclusive $evidencePath
+        $evidenceStream = $evidenceLease.stream
+        if ($evidenceLease.created) {
+          Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
+          Flush-KnownEvidenceStream $evidenceStream
         }
-        if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf) -or
-            (Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-            $preimageDigest) {
-          throw 'wrapper evidence preservation failed'
-        }
+        Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
 
-        $denyStub = if ($wrapper.Extension -match '(?i)^\.(?:cmd|bat)$') {
-          "@echo off`r`necho ApplyPilot acquisition denied: emergency containment 1>&2`r`nexit /b 78`r`n"
-        } else {
-          "Write-Error 'ApplyPilot acquisition denied: emergency containment'`nexit 78`n"
-        }
-        $denyBytes = [Text.UTF8Encoding]::new($false).GetBytes($denyStub)
+        $denyBytes = Get-KnownWrapperDenyStubBytes $wrapper.Extension
         Write-KnownWrapperDenyStub -Stream $stream -Content $denyBytes
-        $written = ConvertFrom-KnownWrapperBytes (Read-KnownWrapperStreamBytes $stream)
-        if ($written -match $script:SensitiveIdentifier -or $written -match $script:SensitiveUri) {
-          throw 'wrapper sensitive content remains after containment'
+        $writtenBytes = Read-KnownWrapperStreamBytes $stream
+        if (-not (Test-KnownWrapperDenyStub -Content $writtenBytes -Extension $wrapper.Extension)) {
+          throw 'wrapper deny stub verification failed'
         }
+        Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
       } finally {
+        if ($null -ne $evidenceStream) { $evidenceStream.Dispose() }
         $stream.Dispose()
       }
     }

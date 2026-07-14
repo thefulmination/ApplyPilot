@@ -66,13 +66,15 @@ function Stop-LegacyProcess($Process) {
   if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
   $state=Read-FakeState; $state.processes=@($state.processes | Where-Object {$_.id -ne $Process.ProcessId}); Write-FakeState $state
 }
-function Set-KnownWrapperContent([string]$Path, [string]$Content) {
+function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {
   if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
-  [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+  $Stream.Position = 0
+  $Stream.SetLength(0)
+  $Stream.Write($Content, 0, $Content.Length)
 }
-function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {
+function Flush-KnownEvidenceStream($Stream) {
   if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
-  [IO.File]::WriteAllBytes($Path, $Content)
+  $Stream.Flush($true)
 }
 function Write-KnownWrapperDenyStub($Stream, [byte[]]$Content) {
   if ($env:FAKE_NOOP_ACTIONS -eq '1') { return }
@@ -233,7 +235,14 @@ def _run_wrapper_rewrite_harness(
                 overrides,
                 "$script:Failures.Clear()",
                 "Remove-EmbeddedWrapperDsns",
-                "[ordered]@{failures=@($script:Failures); wrappers=@(Get-WrapperSnapshot)} | "
+                "$snapshotAvailable = $true",
+                "try { $wrappers = @(Get-WrapperSnapshot) } catch { "
+                "$wrappers = @(); $snapshotAvailable = $false }",
+                "$snapshot = [pscustomobject]@{scheduled_tasks=@(); services=@(); "
+                "process_identities=@(); wrapper_hashes=$wrappers}",
+                "[ordered]@{failures=@($script:Failures); wrappers=$wrappers; "
+                "snapshot_available=$snapshotAvailable; "
+                "unresolved=@(Get-UnresolvedAfterState $snapshot)} | "
                 "ConvertTo-Json -Depth 8 -Compress",
             ]
         ),
@@ -582,8 +591,12 @@ def test_wrapper_replacement_before_exclusive_open_is_the_preserved_preimage(tmp
     replacement_b64 = base64.b64encode(replacement).decode("ascii")
     overrides = "\n".join(
         [
+            "$script:WrapperOpenCount = 0",
             "function Open-KnownWrapperExclusive([string]$Path) {",
-            f"  [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String('{replacement_b64}'))",
+            "  $script:WrapperOpenCount++",
+            "  if ($script:WrapperOpenCount -eq 1) {",
+            f"    [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String('{replacement_b64}'))",
+            "  }",
             "  return [IO.FileStream]::new($Path, [IO.FileMode]::Open, "
             "[IO.FileAccess]::ReadWrite, [IO.FileShare]::None)",
             "}",
@@ -611,14 +624,16 @@ def test_wrapper_replacement_attempt_is_blocked_while_exclusive_handle_is_held(t
     replacement = base64.b64encode(b"replacement-without-evidence").decode("ascii")
     overrides = "\n".join(
         [
-            "function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) {",
+            "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
             "  try {",
             f"    [IO.File]::WriteAllBytes('{_ps_quote(wrapper)}', [Convert]::FromBase64String('{replacement}'))",
             f"    Set-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replacement_succeeded'",
             "  } catch {",
             f"    Set-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replacement_blocked'",
             "  }",
-            "  [IO.File]::WriteAllBytes($Path, $Content)",
+            "  $Stream.Position = 0",
+            "  $Stream.SetLength(0)",
+            "  $Stream.Write($Content, 0, $Content.Length)",
             "}",
         ]
     )
@@ -632,6 +647,140 @@ def test_wrapper_replacement_attempt_is_blocked_while_exclusive_handle_is_held(t
     assert len(evidence) == 1
     assert evidence[0].read_bytes() == preimage
     assert b"emergency containment" in wrapper.read_bytes().lower()
+
+
+def test_evidence_delete_and_replace_are_blocked_until_wrapper_and_reverify_finish(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'held-evidence-secret'\n# evidence lock\n"
+    wrapper.write_bytes(preimage)
+    marker = tmp_path / "evidence-race.txt"
+    replacement = base64.b64encode(b"unverified replacement bytes").decode("ascii")
+    overrides = "\n".join(
+        [
+            "$script:EvidenceVerificationCount = 0",
+            "function Assert-KnownEvidenceStreamDigest($Stream, [string]$ExpectedDigest) {",
+            "  $bytes = Read-KnownWrapperStreamBytes $Stream",
+            "  if ((Get-KnownWrapperByteDigest $bytes) -cne $ExpectedDigest) { throw 'digest mismatch' }",
+            "  $script:EvidenceVerificationCount++",
+            "  if ($script:EvidenceVerificationCount -eq 1) {",
+            "    try { [IO.File]::Delete($Stream.Name); Add-Content "
+            f"-LiteralPath '{_ps_quote(marker)}' -Value 'delete_succeeded' }} "
+            f"catch {{ Add-Content -LiteralPath '{_ps_quote(marker)}' -Value 'delete_blocked' }}",
+            "    try { [IO.File]::WriteAllBytes($Stream.Name, "
+            f"[Convert]::FromBase64String('{replacement}')); Add-Content "
+            f"-LiteralPath '{_ps_quote(marker)}' -Value 'replace_succeeded' }} "
+            f"catch {{ Add-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replace_blocked' }}",
+            "  }",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert payload["failures"] == []
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "delete_blocked",
+        "replace_blocked",
+    ]
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+    assert b"emergency containment" in wrapper.read_bytes().lower()
+    assert "held-evidence-secret" not in result.stdout
+    assert "held-evidence-secret" not in result.stderr
+
+
+def test_post_wrapper_flush_evidence_reverification_failure_is_reported(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'reverify-secret'\n# preserved\n"
+    wrapper.write_bytes(preimage)
+    overrides = "\n".join(
+        [
+            "$script:EvidenceVerificationCount = 0",
+            "function Assert-KnownEvidenceStreamDigest($Stream, [string]$ExpectedDigest) {",
+            "  $script:EvidenceVerificationCount++",
+            "  if ($script:EvidenceVerificationCount -gt 1) { throw 'post-flush verify failed' }",
+            "  $bytes = Read-KnownWrapperStreamBytes $Stream",
+            "  if ((Get-KnownWrapperByteDigest $bytes) -cne $ExpectedDigest) { throw 'digest mismatch' }",
+            "}",
+        ]
+    )
+
+    result, payload = _run_wrapper_rewrite_harness(tmp_path, wrapper, overrides)
+
+    assert result.returncode == 0, result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
+    assert b"emergency containment" in wrapper.read_bytes().lower()
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == preimage
+    assert "reverify-secret" not in result.stdout
+    assert "reverify-secret" not in result.stderr
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_idempotent_deny_stub_requires_verified_preimage_evidence(tmp_path, damage):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'idempotent-secret'\n# original\n"
+    wrapper.write_bytes(preimage)
+
+    first_result, first_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+    assert first_result.returncode == 0, first_result.stderr
+    assert first_payload["failures"] == []
+    deny_stub = wrapper.read_bytes()
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+    if damage == "missing":
+        evidence[0].unlink()
+    else:
+        evidence[0].write_bytes(b"corrupt evidence without secret")
+
+    second_result, second_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert second_result.returncode == 0, second_result.stderr
+    assert any(item["action"] == "rewrite_wrapper" for item in second_payload["failures"])
+    assert second_payload["unresolved"] == [
+        {
+            "kind": "wrapper",
+            "target_digest": second_payload["wrappers"][0]["path_digest"],
+            "conditions": ["preserved_evidence_unverified"],
+        }
+    ]
+    assert wrapper.read_bytes() == deny_stub
+    assert "idempotent-secret" not in second_result.stdout
+    assert "idempotent-secret" not in second_result.stderr
+
+
+def test_idempotent_deny_stub_with_verified_evidence_remains_stable(tmp_path):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"$env:FLEET_PG_DSN = 'stable-secret'\n# stable\n"
+    wrapper.write_bytes(preimage)
+
+    first_result, first_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+    assert first_result.returncode == 0, first_result.stderr
+    assert first_payload["failures"] == []
+    deny_stub = wrapper.read_bytes()
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) == 1
+
+    second_result, second_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert second_result.returncode == 0, second_result.stderr
+    assert second_payload["failures"] == []
+    assert second_payload["unresolved"] == []
+    assert wrapper.read_bytes() == deny_stub
+    assert evidence[0].read_bytes() == preimage
+    assert "stable-secret" not in second_result.stdout
+    assert "stable-secret" not in second_result.stderr
 
 
 def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp_path):
@@ -659,10 +808,20 @@ def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp
     [
         "function Open-KnownWrapperExclusive([string]$Path) { throw 'open failed' }",
         "function Read-KnownWrapperStreamBytes($Stream) { throw 'read failed' }",
-        "function Set-KnownWrapperEvidence([string]$Path, [byte[]]$Content) { "
-        "throw 'evidence failed' }",
+        "function Open-KnownEvidenceExclusive([string]$Path) { throw 'evidence open failed' }",
+        "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) { throw 'evidence write failed' }",
+        "function Flush-KnownEvidenceStream($Stream) { throw 'evidence flush failed' }",
+        "function Assert-KnownEvidenceStreamDigest($Stream, [string]$ExpectedDigest) { "
+        "throw 'evidence verify failed' }",
     ],
-    ids=["exclusive-open", "stream-read", "evidence-write"],
+    ids=[
+        "exclusive-open",
+        "stream-read",
+        "evidence-open",
+        "evidence-write",
+        "evidence-flush",
+        "evidence-verify",
+    ],
 )
 def test_wrapper_stream_stage_failure_is_recorded_without_destroying_preimage(
     tmp_path, overrides
@@ -677,9 +836,13 @@ def test_wrapper_stream_stage_failure_is_recorded_without_destroying_preimage(
 
     assert result.returncode == 0, result.stderr
     assert any(item["action"] == "rewrite_wrapper" for item in payload["failures"])
-    assert payload["wrappers"][0]["embedded_dsn"] is True
+    if payload["snapshot_available"]:
+        assert payload["wrappers"][0]["embedded_dsn"] is True
     assert wrapper.read_bytes() == preimage
-    assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == []
+    evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
+    assert len(evidence) <= 1
+    if evidence and evidence[0].read_bytes() != preimage:
+        assert evidence[0].read_bytes() == b""
     assert "stage-failure-secret" not in result.stdout
     assert "stage-failure-secret" not in result.stderr
 
