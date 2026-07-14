@@ -60,34 +60,53 @@ function Get-PhaseAPostCleanupManifestMaterial {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$ParentPath,[Parameter(Mandatory)][string]$StagingPath,
-    [scriptblock]$TestManifestReader,[switch]$DefinitionImport
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedSha256,
+    [scriptblock]$TestManifestReader,[scriptblock]$TestElapsedMillisecondsProvider,
+    [switch]$DefinitionImport
   )
   if($TestManifestReader-and-not $DefinitionImport){throw 'Post-cleanup manifest override requires DefinitionImport.'}
+  if($TestElapsedMillisecondsProvider-and-not $DefinitionImport){throw 'Post-cleanup clock override requires DefinitionImport.'}
   $maxAttempts=4;$maxElapsedMilliseconds=750;$retryDelayMilliseconds=20
   $timer=[Diagnostics.Stopwatch]::StartNew()
+  $getElapsedMilliseconds={
+    if($TestElapsedMillisecondsProvider){[int64](& $TestElapsedMillisecondsProvider)}
+    else{[int64]$timer.ElapsedMilliseconds}
+  }
   for($attempt=1;$attempt-le $maxAttempts;$attempt++){
     Assert-PhaseACleanupStagingPathAbsent $StagingPath
     try {
       $material=if($TestManifestReader){& $TestManifestReader $ParentPath $null}else{Get-PhaseAManifestMaterial $ParentPath}
-      Assert-PhaseACleanupStagingPathAbsent $StagingPath
-      if($timer.ElapsedMilliseconds-ge $maxElapsedMilliseconds){
-        throw [InvalidOperationException]::new('Post-cleanup parent manifest deadline exceeded.')
-      }
-      return $material
     } catch {
       $failure=$_
+      Assert-PhaseACleanupStagingPathAbsent $StagingPath
+      if(([int64](& $getElapsedMilliseconds))-ge $maxElapsedMilliseconds){
+        throw [InvalidOperationException]::new('Post-cleanup parent manifest deadline exceeded.',$failure.Exception)
+      }
       $code=Get-PhaseANativeWin32ErrorCode $failure.Exception
       if($code-ne 2-and $code-ne 3){throw}
-      Assert-PhaseACleanupStagingPathAbsent $StagingPath
-      if($attempt-ge $maxAttempts-or $timer.ElapsedMilliseconds-ge $maxElapsedMilliseconds){
+      if($attempt-ge $maxAttempts){
         throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
       }
-      $remaining=$maxElapsedMilliseconds-$timer.ElapsedMilliseconds
-      Start-Sleep -Milliseconds ([int][Math]::Min($retryDelayMilliseconds,$remaining))
-      if($timer.ElapsedMilliseconds-ge $maxElapsedMilliseconds){
+      $remaining=[Math]::Max([int64]0,$maxElapsedMilliseconds-([int64](& $getElapsedMilliseconds)))
+      if($remaining-le 0){
         throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
       }
+      $sleepMilliseconds=[int][Math]::Min($retryDelayMilliseconds,$remaining)
+      if($sleepMilliseconds-le 0){
+        throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
+      }
+      Start-Sleep -Milliseconds $sleepMilliseconds
+      if(([int64](& $getElapsedMilliseconds))-ge $maxElapsedMilliseconds){
+        throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
+      }
+      continue
     }
+    Assert-PhaseACleanupStagingPathAbsent $StagingPath
+    if($material.Sha256-cne $ExpectedSha256){throw 'Actual-after manifest differs from authorization.'}
+    if(([int64](& $getElapsedMilliseconds))-ge $maxElapsedMilliseconds){
+      throw [InvalidOperationException]::new('Post-cleanup parent manifest deadline exceeded.')
+    }
+    return $material
   }
 }
 
@@ -237,7 +256,7 @@ function Invoke-PhaseAProvisioningCleanup {
       $null=[ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow($stage,[uint64]$target.Identity.VolumeSerialNumber,[string]$target.Identity.FileId,-1)
       if($CrashAfterMutation){throw 'Injected cleanup crash after mutation.'}
     }elseif(Test-Path -LiteralPath $stage){throw 'Cleanup target changed kind.'}
-    $postManifestArgs=@{ParentPath=$parent;StagingPath=$stage}
+    $postManifestArgs=@{ParentPath=$parent;StagingPath=$stage;ExpectedSha256=$auth.expectedAfterManifestSha256}
     if($TestPostCleanupManifestReader){$postManifestArgs.TestManifestReader=$TestPostCleanupManifestReader;$postManifestArgs.DefinitionImport=$true}
     $actual=Get-PhaseAPostCleanupManifestMaterial @postManifestArgs
     if($actual.Sha256-cne $auth.expectedAfterManifestSha256){throw 'Actual-after manifest differs from authorization.'}
