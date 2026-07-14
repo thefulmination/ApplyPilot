@@ -1,6 +1,19 @@
 Set-StrictMode -Version Latest
 
-if (-not ('ApplyPilot.PhaseA.WindowsFile' -as [type])) {
+$script:PhaseAWindowsFileContractVersion = '3'
+$loadedWindowsFileType = 'ApplyPilot.PhaseA.WindowsFile' -as [type]
+if ($loadedWindowsFileType) {
+  $contractField = $loadedWindowsFileType.GetField(
+    'ContractVersion',
+    [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static
+  )
+  $loadedContract = if ($contractField) { [string]$contractField.GetRawConstantValue() } else { $null }
+  if ($loadedContract -cne $script:PhaseAWindowsFileContractVersion) {
+    throw 'An incompatible ApplyPilot.PhaseA.WindowsFile type is already loaded. Restart PowerShell before importing this module.'
+  }
+}
+
+if (-not $loadedWindowsFileType) {
   Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -61,7 +74,8 @@ namespace ApplyPilot.PhaseA
             List<SafeFileHandle> leases,
             FileIdentity identity,
             string authorizedBasename,
-            string authorizedBasenamePattern)
+            string authorizedBasenamePattern,
+            string authorizedRenameBasename)
         {
             this.fileHandle = fileHandle;
             Access = access;
@@ -72,6 +86,7 @@ namespace ApplyPilot.PhaseA
             Identity = identity;
             AuthorizedBasename = authorizedBasename;
             AuthorizedBasenamePattern = authorizedBasenamePattern;
+            AuthorizedRenameBasename = authorizedRenameBasename;
         }
 
         internal ValidatedAccess Access { get; private set; }
@@ -81,6 +96,7 @@ namespace ApplyPilot.PhaseA
         internal FileIdentity Identity { get; set; }
         internal string AuthorizedBasename { get; private set; }
         internal string AuthorizedBasenamePattern { get; private set; }
+        internal string AuthorizedRenameBasename { get; private set; }
 
         public SafeFileHandle FileHandle
         {
@@ -94,6 +110,32 @@ namespace ApplyPilot.PhaseA
         public bool IsDisposed
         {
             get { return fileHandle == null || fileHandle.IsClosed; }
+        }
+
+        public FileStream OpenWriteStream()
+        {
+            SafeFileHandle duplicate;
+            lock (this)
+            {
+                EnsureOpen();
+                if (IsDirectory ||
+                    (Access != ValidatedAccess.ReadWrite &&
+                     Access != ValidatedAccess.ReadWriteDelete))
+                {
+                    throw new InvalidOperationException(
+                        "A write stream requires a validated writable file handle.");
+                }
+                duplicate = WindowsFile.DuplicateHandleForStream(fileHandle);
+            }
+            try
+            {
+                return new FileStream(duplicate, FileAccess.Write);
+            }
+            catch
+            {
+                duplicate.Dispose();
+                throw;
+            }
         }
 
         internal void EnsureOpen()
@@ -143,11 +185,18 @@ namespace ApplyPilot.PhaseA
         }
     }
 
+    internal static class WindowsFileTestHooks
+    {
+        internal static bool FailPostCreateValidation = false;
+        internal static bool FailCleanupDelete = false;
+    }
+
     internal static class NativeMethods
     {
         internal const uint GenericRead = 0x80000000;
         internal const uint GenericWrite = 0x40000000;
         internal const uint Delete = 0x00010000;
+        internal const uint WriteDac = 0x00040000;
         internal const uint CreateNew = 1;
         internal const uint OpenExisting = 3;
         internal const uint FileFlagBackupSemantics = 0x02000000;
@@ -162,6 +211,8 @@ namespace ApplyPilot.PhaseA
         internal const uint OwnerSecurityInformation = 0x00000001;
         internal const uint GroupSecurityInformation = 0x00000002;
         internal const uint DaclSecurityInformation = 0x00000004;
+        internal const uint ProtectedDaclSecurityInformation = 0x80000000;
+        internal const uint DuplicateSameAccess = 0x00000002;
         internal const int SeFileObject = 1;
         internal static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
 
@@ -273,11 +324,43 @@ namespace ApplyPilot.PhaseA
             out IntPtr sacl,
             out IntPtr securityDescriptor);
 
+        [DllImport("advapi32.dll", SetLastError = true)]
+        internal static extern uint SetSecurityInfo(
+            SafeFileHandle handle,
+            int objectType,
+            uint securityInfo,
+            IntPtr owner,
+            IntPtr group,
+            IntPtr dacl,
+            IntPtr sacl);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetSecurityDescriptorDacl(
+            IntPtr securityDescriptor,
+            [MarshalAs(UnmanagedType.Bool)] out bool daclPresent,
+            out IntPtr dacl,
+            [MarshalAs(UnmanagedType.Bool)] out bool daclDefaulted);
+
         [DllImport("advapi32.dll")]
         internal static extern uint GetSecurityDescriptorLength(IntPtr securityDescriptor);
 
         [DllImport("kernel32.dll")]
         internal static extern IntPtr LocalFree(IntPtr memory);
+
+        [DllImport("kernel32.dll")]
+        internal static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool DuplicateHandle(
+            IntPtr sourceProcess,
+            SafeFileHandle sourceHandle,
+            IntPtr targetProcess,
+            out SafeFileHandle targetHandle,
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            uint options);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -298,6 +381,8 @@ namespace ApplyPilot.PhaseA
 
     public static class WindowsFile
     {
+        public const string ContractVersion = "3";
+
         private static readonly StringComparison PathComparison =
             StringComparison.OrdinalIgnoreCase;
 
@@ -327,6 +412,7 @@ namespace ApplyPilot.PhaseA
                     ancestors,
                     identity,
                     null,
+                    null,
                     null);
                 transferred = true;
                 return owner;
@@ -348,11 +434,16 @@ namespace ApplyPilot.PhaseA
             string path,
             string access,
             string authorizedRoot,
-            string authorizedBasename)
+            string authorizedBasename,
+            string authorizedRenameBasename)
         {
             string fullPath = NormalizeLocalPath(path);
             string root = NormalizeLocalPath(authorizedRoot);
             ValidateExactBasename(authorizedBasename);
+            if (!String.IsNullOrEmpty(authorizedRenameBasename))
+            {
+                ValidateExactBasename(authorizedRenameBasename);
+            }
             if (!String.Equals(Path.GetFileName(fullPath), authorizedBasename, PathComparison))
             {
                 throw new InvalidOperationException("File basename does not match the authorization.");
@@ -407,7 +498,8 @@ namespace ApplyPilot.PhaseA
                     leases,
                     identity,
                     authorizedBasename,
-                    null);
+                    null,
+                    authorizedRenameBasename);
                 transferred = true;
                 return owner;
             }
@@ -443,7 +535,12 @@ namespace ApplyPilot.PhaseA
                 authorizedBasename,
                 authorizedBasenamePattern);
             EnsureWithinRoot(fullPath, root);
-            RawSecurityDescriptor expected = ValidateSecurityDescriptor(securityDescriptor);
+            RawSecurityDescriptor expected;
+            byte[] finalSecurityDescriptor;
+            byte[] creationSecurityDescriptor = PrepareFinalSecurityDescriptor(
+                securityDescriptor,
+                out expected,
+                out finalSecurityDescriptor);
 
             List<SafeFileHandle> leases = new List<SafeFileHandle>();
             SafeFileHandle target = null;
@@ -457,8 +554,9 @@ namespace ApplyPilot.PhaseA
                     leases.Add(OpenAndValidate(components[index], 0, true));
                 }
 
-                target = CreateProtectedFile(fullPath, securityDescriptor);
+                target = CreateProtectedFile(fullPath, creationSecurityDescriptor);
                 created = true;
+                FinalizeProtectedDacl(target, finalSecurityDescriptor);
                 ValidateOpenedObject(target, fullPath, false);
                 FileIdentity identity = ReadIdentity(target);
                 if (identity.NumberOfLinks != 1)
@@ -466,6 +564,16 @@ namespace ApplyPilot.PhaseA
                     throw new InvalidOperationException("Validated files must have exactly one hard link.");
                 }
                 ValidateSecurityDescriptor(target, expected);
+                SafeFileHandle restricted = DuplicateHandleWithAccess(
+                    target,
+                    NativeMethods.GenericRead | NativeMethods.GenericWrite | NativeMethods.Delete,
+                    0);
+                target.Dispose();
+                target = restricted;
+                if (WindowsFileTestHooks.FailPostCreateValidation)
+                {
+                    throw new InvalidOperationException("Injected post-create validation failure.");
+                }
                 ValidatedHandle owner = new ValidatedHandle(
                     target,
                     ValidatedAccess.ReadWriteDelete,
@@ -475,9 +583,28 @@ namespace ApplyPilot.PhaseA
                     leases,
                     identity,
                     authorizedBasename,
-                    authorizedBasenamePattern);
+                    authorizedBasenamePattern,
+                    null);
                 transferred = true;
                 return owner;
+            }
+            catch (Exception validationError)
+            {
+                if (created && target != null && !target.IsInvalid && !target.IsClosed)
+                {
+                    try
+                    {
+                        MarkDeleteByHandle(target);
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        throw new AggregateException(
+                            "Created file validation failed and delete-by-handle cleanup failed; residue was retained.",
+                            validationError,
+                            cleanupError);
+                    }
+                }
+                throw;
             }
             finally
             {
@@ -485,10 +612,6 @@ namespace ApplyPilot.PhaseA
                 {
                     if (target != null)
                     {
-                        if (created && !target.IsInvalid && !target.IsClosed)
-                        {
-                            TryMarkDeleteByHandle(target);
-                        }
                         target.Dispose();
                     }
                     DisposeAll(leases);
@@ -514,6 +637,32 @@ namespace ApplyPilot.PhaseA
                 id.VolumeSerialNumber,
                 FileIdBytes(id),
                 GetVolumeGuidPath(validated.FileHandle, validated.IsDirectory));
+        }
+
+        internal static SafeFileHandle DuplicateHandleForStream(SafeFileHandle source)
+        {
+            return DuplicateHandleWithAccess(source, 0, NativeMethods.DuplicateSameAccess);
+        }
+
+        private static SafeFileHandle DuplicateHandleWithAccess(
+            SafeFileHandle source,
+            uint desiredAccess,
+            uint options)
+        {
+            IntPtr process = NativeMethods.GetCurrentProcess();
+            SafeFileHandle duplicate;
+            if (!NativeMethods.DuplicateHandle(
+                process,
+                source,
+                process,
+                out duplicate,
+                desiredAccess,
+                false,
+                options))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return duplicate;
         }
 
         public static void AssertIdentity(
@@ -553,10 +702,24 @@ namespace ApplyPilot.PhaseA
                 throw new InvalidOperationException(
                     "Rename destination must use the validated source directory.");
             }
-            ValidateBasenameAuthorization(
-                Path.GetFileName(target),
-                validated.AuthorizedBasename,
-                validated.AuthorizedBasenamePattern);
+            if (!String.IsNullOrEmpty(validated.AuthorizedRenameBasename))
+            {
+                if (!String.Equals(
+                    Path.GetFileName(target),
+                    validated.AuthorizedRenameBasename,
+                    PathComparison))
+                {
+                    throw new InvalidOperationException(
+                        "Rename destination basename does not match the explicit authorization.");
+                }
+            }
+            else
+            {
+                ValidateBasenameAuthorization(
+                    Path.GetFileName(target),
+                    validated.AuthorizedBasename,
+                    validated.AuthorizedBasenamePattern);
+            }
 
             byte[] name = Encoding.Unicode.GetBytes(target);
             int rootOffset = IntPtr.Size == 8 ? 8 : 4;
@@ -680,7 +843,8 @@ namespace ApplyPilot.PhaseA
                 };
                 IntPtr native = NativeMethods.CreateFileWithSecurityW(
                     path,
-                    NativeMethods.GenericRead | NativeMethods.GenericWrite | NativeMethods.Delete,
+                    NativeMethods.GenericRead | NativeMethods.GenericWrite | NativeMethods.Delete |
+                        NativeMethods.WriteDac,
                     0,
                     ref attributes,
                     NativeMethods.CreateNew,
@@ -860,7 +1024,10 @@ namespace ApplyPilot.PhaseA
             return value;
         }
 
-        private static RawSecurityDescriptor ValidateSecurityDescriptor(byte[] descriptor)
+        private static byte[] PrepareFinalSecurityDescriptor(
+            byte[] descriptor,
+            out RawSecurityDescriptor finalDescriptor,
+            out byte[] finalBytes)
         {
             if (descriptor == null || descriptor.Length == 0)
             {
@@ -875,17 +1042,27 @@ namespace ApplyPilot.PhaseA
             {
                 throw new ArgumentException("Security descriptor bytes are invalid.", error);
             }
-            ControlFlags flags = parsed.ControlFlags;
-            if ((flags & ControlFlags.SelfRelative) == 0 ||
-                (flags & ControlFlags.DiscretionaryAclPresent) == 0 ||
-                (flags & ControlFlags.DiscretionaryAclProtected) == 0 ||
-                (flags & ControlFlags.SystemAclPresent) != 0 ||
+            ControlFlags baseFlags =
+                ControlFlags.DiscretionaryAclPresent |
+                ControlFlags.DiscretionaryAclProtected |
+                ControlFlags.SelfRelative;
+            ControlFlags finalFlags =
+                baseFlags | ControlFlags.DiscretionaryAclAutoInherited;
+            if ((parsed.ControlFlags != baseFlags && parsed.ControlFlags != finalFlags) ||
                 parsed.Owner == null || parsed.Group == null || parsed.DiscretionaryAcl == null)
             {
                 throw new InvalidOperationException(
-                    "Security descriptor must be self-relative with owner, group, and a protected DACL.");
+                    "Security descriptor must have exact protected file DACL control flags, owner, and group.");
             }
-            return parsed;
+            finalDescriptor = new RawSecurityDescriptor(
+                finalFlags,
+                parsed.Owner,
+                parsed.Group,
+                null,
+                parsed.DiscretionaryAcl);
+            finalBytes = new byte[finalDescriptor.BinaryLength];
+            finalDescriptor.GetBinaryForm(finalBytes, 0);
+            return (byte[])finalBytes.Clone();
         }
 
         private static void ValidateSecurityDescriptor(
@@ -958,15 +1135,63 @@ namespace ApplyPilot.PhaseA
             return difference == 0;
         }
 
-        private static void TryMarkDeleteByHandle(SafeFileHandle handle)
+        private static void MarkDeleteByHandle(SafeFileHandle handle)
         {
+            if (WindowsFileTestHooks.FailCleanupDelete)
+            {
+                throw new Win32Exception(5, "Injected delete-by-handle cleanup failure.");
+            }
             NativeMethods.FileDispositionInformation information =
                 new NativeMethods.FileDispositionInformation { DeleteFile = true };
-            NativeMethods.SetFileInformationByHandle(
+            if (!NativeMethods.SetFileInformationByHandle(
                 handle,
                 NativeMethods.FileDispositionInfo,
                 ref information,
-                (uint)Marshal.SizeOf(typeof(NativeMethods.FileDispositionInformation)));
+                (uint)Marshal.SizeOf(typeof(NativeMethods.FileDispositionInformation))))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+
+        private static void FinalizeProtectedDacl(
+            SafeFileHandle handle,
+            byte[] finalDescriptor)
+        {
+            // Object assignment clears the informational AUTO_INHERITED bit. Reassert the
+            // identical, already-protected DACL before exposing a restricted duplicate.
+            IntPtr buffer = Marshal.AllocHGlobal(finalDescriptor.Length);
+            try
+            {
+                Marshal.Copy(finalDescriptor, 0, buffer, finalDescriptor.Length);
+                bool present;
+                bool defaulted;
+                IntPtr dacl;
+                if (!NativeMethods.GetSecurityDescriptorDacl(
+                    buffer,
+                    out present,
+                    out dacl,
+                    out defaulted) || !present || dacl == IntPtr.Zero)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                uint status = NativeMethods.SetSecurityInfo(
+                    handle,
+                    NativeMethods.SeFileObject,
+                    NativeMethods.DaclSecurityInformation |
+                        NativeMethods.ProtectedDaclSecurityInformation,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    dacl,
+                    IntPtr.Zero);
+                if (status != 0)
+                {
+                    throw new Win32Exception((int)status);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
         }
 
         private static void EnsureIdentityMatches(FileIdentity actual, FileIdentity expected)
@@ -1152,14 +1377,21 @@ function Open-PhaseAValidatedFile {
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][ValidateSet('Read', 'ReadWrite', 'ReadWriteDelete')][string]$Access,
     [Parameter(Mandatory)][string]$AuthorizedRoot,
-    [Parameter(Mandatory)][string]$AuthorizedBasename
+    [Parameter(Mandatory)][string]$AuthorizedBasename,
+    [string]$AuthorizedRenameBasename
   )
   return [ApplyPilot.PhaseA.WindowsFile]::OpenValidatedFile(
     $Path,
     $Access,
     $AuthorizedRoot,
-    $AuthorizedBasename
+    $AuthorizedBasename,
+    $AuthorizedRenameBasename
   )
+}
+
+function Open-PhaseAValidatedFileWriteStream {
+  param([Parameter(Mandatory)][ApplyPilot.PhaseA.ValidatedHandle]$Handle)
+  return $Handle.OpenWriteStream()
 }
 
 function New-PhaseAValidatedFile {
@@ -1246,6 +1478,7 @@ function Set-PhaseAFileDeletionDisposition {
 Export-ModuleMember -Function @(
   'Open-PhaseAValidatedDirectoryLease',
   'Open-PhaseAValidatedFile',
+  'Open-PhaseAValidatedFileWriteStream',
   'New-PhaseAValidatedFile',
   'Get-PhaseAFileIdentity',
   'Get-PhaseAFileIdentityMaterial',
