@@ -234,7 +234,7 @@ def test_force_reload_rejects_incompatible_loaded_type_and_accepts_current_type(
     incompatible = _run_raw_ps(
         "$ErrorActionPreference = 'Stop'\n"
         "Add-Type -TypeDefinition 'namespace ApplyPilot.PhaseA { "
-        "public static class WindowsFile {} }'\n"
+        "public static class WindowsFile { public const string ContractVersion = \"3\"; } }'\n"
         "try {\n"
         f"  Import-Module {_ps_literal(MODULE_PATH)} -Force\n"
         "  'missed'\n"
@@ -269,7 +269,7 @@ def test_force_reload_rejects_incompatible_loaded_type_and_accepts_current_type(
     )
     reloaded = json.loads(compatible.stdout)
     assert reloaded == {
-        "ContractVersion": "3",
+        "ContractVersion": "4",
         "ExportCount": 9,
         "FileIdLength": 16,
         "FinalPath": str(probe),
@@ -302,6 +302,43 @@ def test_existing_stage_open_authorizes_only_explicit_publish_basename(tmp_path:
         "Final": str(final),
     }
     assert final.read_bytes() == b"receipt"
+
+
+def test_validated_file_rename_supports_extended_length_paths(tmp_path: Path):
+    padding_length = max(1, 200 - len(str(tmp_path)) - 1)
+    assert padding_length < 240
+    root = tmp_path / ("p" * padding_length)
+    root.mkdir()
+    source = root / ("s" * 80)
+    destination = root / ("d" * 80)
+    assert len(str(source)) > 260
+    assert len(str(destination)) > 260
+    pattern = rf"\A(?:{re.escape(source.name)}|{re.escape(destination.name)})\z"
+    result = _run_ps(
+        _new_file_script(source, root, pattern=pattern)
+        + "try {\n"
+        f"  Rename-PhaseAFileNoReplace -Handle $handle -Destination {_ps_literal(destination)}\n"
+        "  $identity = Get-PhaseAFileIdentity -Handle $handle\n"
+        "  Set-PhaseAFileDeletionDisposition -Handle $handle\n"
+        "  $identity | ConvertTo-Json -Compress\n"
+        "} finally { $handle.Dispose() }\n"
+    )
+    assert json.loads(result.stdout)["FinalPath"].casefold() == str(destination).casefold()
+    assert list(root.iterdir()) == []
+
+
+def test_rejects_reserved_dos_device_basename(tmp_path: Path):
+    reserved = tmp_path / "CON.txt"
+    result = _run_ps(
+        _protected_descriptor_script()
+        + "try {\n"
+        f"  $handle = New-PhaseAValidatedFile -Path {_ps_literal(reserved)} "
+        f"-AuthorizedRoot {_ps_literal(tmp_path)} -AuthorizedBasename 'CON.txt' "
+        "-SecurityDescriptor $descriptor -Access ReadWriteDelete\n"
+        "  try { 'missed' } finally { $handle.Dispose() }\n"
+        "} catch { 'rejected' }\n"
+    )
+    assert result.stdout.strip() == "rejected"
 
 
 def test_real_evidence_descriptor_is_final_acl_compatible_at_creation(tmp_path: Path):

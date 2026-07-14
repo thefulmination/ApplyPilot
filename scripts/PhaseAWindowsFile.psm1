@@ -1,6 +1,6 @@
 Set-StrictMode -Version Latest
 
-$script:PhaseAWindowsFileContractVersion = '3'
+$script:PhaseAWindowsFileContractVersion = '4'
 $loadedWindowsFileType = 'ApplyPilot.PhaseA.WindowsFile' -as [type]
 if ($loadedWindowsFileType) {
   $contractField = $loadedWindowsFileType.GetField(
@@ -381,7 +381,7 @@ namespace ApplyPilot.PhaseA
 
     public static class WindowsFile
     {
-        public const string ContractVersion = "3";
+        public const string ContractVersion = "4";
 
         private static readonly StringComparison PathComparison =
             StringComparison.OrdinalIgnoreCase;
@@ -721,7 +721,7 @@ namespace ApplyPilot.PhaseA
                     validated.AuthorizedBasenamePattern);
             }
 
-            byte[] name = Encoding.Unicode.GetBytes(target);
+            byte[] name = Encoding.Unicode.GetBytes(ToExtendedLengthPath(target));
             int rootOffset = IntPtr.Size == 8 ? 8 : 4;
             int nameLengthOffset = rootOffset + IntPtr.Size;
             int nameOffset = nameLengthOffset + sizeof(uint);
@@ -1237,7 +1237,7 @@ namespace ApplyPilot.PhaseA
                     continue;
                 }
                 if (segment.Length == 0 || segment == "." || segment == ".." ||
-                    EndsWithAliasCharacter(segment) ||
+                    EndsWithAliasCharacter(segment) || IsReservedDosDeviceName(segment) ||
                     segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
                 {
                     throw new InvalidOperationException("Path contains an invalid or aliased component.");
@@ -1273,7 +1273,7 @@ namespace ApplyPilot.PhaseA
             if (String.IsNullOrWhiteSpace(basename) || basename == "." || basename == ".." ||
                 basename.IndexOfAny(new char[] { '\\', '/', ':', '*', '?' }) >= 0 ||
                 basename.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
-                EndsWithAliasCharacter(basename))
+                EndsWithAliasCharacter(basename) || IsReservedDosDeviceName(basename))
             {
                 throw new InvalidOperationException("Authorized basename is invalid.");
             }
@@ -1330,6 +1330,19 @@ namespace ApplyPilot.PhaseA
         {
             return value.EndsWith(".", StringComparison.Ordinal) ||
                 value.EndsWith(" ", StringComparison.Ordinal);
+        }
+
+        private static bool IsReservedDosDeviceName(string value)
+        {
+            string stem = value.Split('.')[0].ToUpperInvariant();
+            if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL")
+            {
+                return true;
+            }
+            return stem.Length == 4 &&
+                (stem.StartsWith("COM", StringComparison.Ordinal) ||
+                    stem.StartsWith("LPT", StringComparison.Ordinal)) &&
+                stem[3] >= '1' && stem[3] <= '9';
         }
 
         private static void EnsureWithinRoot(string path, string root)

@@ -52,7 +52,20 @@ $script:ReceiptFieldsByType = @{
     'storeTreeManifestSha256','recoveryKeySpkiSha256','operatorSidDigest','result','createdAtUtc')
 }
 
-if (-not ('ApplyPilot.PhaseA.EvidenceNative' -as [type])) {
+$script:PhaseAEvidenceNativeContractVersion = '2'
+$loadedEvidenceNativeType = 'ApplyPilot.PhaseA.EvidenceNative' -as [type]
+if ($loadedEvidenceNativeType) {
+  $contractField = $loadedEvidenceNativeType.GetField(
+    'ContractVersion',
+    [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static
+  )
+  $loadedContract = if ($contractField) { [string]$contractField.GetRawConstantValue() } else { $null }
+  if ($loadedContract -cne $script:PhaseAEvidenceNativeContractVersion) {
+    throw 'An incompatible ApplyPilot.PhaseA.EvidenceNative type is already loaded. Restart PowerShell before importing this module.'
+  }
+}
+
+if (-not $loadedEvidenceNativeType) {
   Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -71,6 +84,8 @@ namespace ApplyPilot.PhaseA
 {
     public static class EvidenceNative
     {
+        public const string ContractVersion = "2";
+
         private const uint GenericRead = 0x80000000;
         private const uint GenericWrite = 0x40000000;
         private const uint Delete = 0x00010000;
@@ -176,17 +191,77 @@ namespace ApplyPilot.PhaseA
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
 
+        private static string NormalizeLocalPath(string path)
+        {
+            if (String.IsNullOrWhiteSpace(path))
+            {
+                throw new ArgumentException("Path is required.");
+            }
+            string candidate = path.Replace('/', '\\');
+            if (candidate.IndexOf('\0') >= 0 || candidate.IndexOfAny(new char[] { '*', '?' }) >= 0)
+            {
+                throw new InvalidOperationException("Wildcards and embedded NULs are not allowed.");
+            }
+            if (candidate.StartsWith(@"\\", StringComparison.Ordinal) || candidate.Length < 3 ||
+                !Char.IsLetter(candidate[0]) || candidate[1] != ':' || candidate[2] != '\\')
+            {
+                throw new InvalidOperationException("Only absolute local drive paths are allowed.");
+            }
+            if (candidate.IndexOf(':', 2) >= 0)
+            {
+                throw new InvalidOperationException("Alternate data streams are not allowed.");
+            }
+            string[] segments = candidate.Substring(3).Split('\\');
+            for (int index = 0; index < segments.Length; index++)
+            {
+                string segment = segments[index];
+                if (segment.Length == 0 && index == segments.Length - 1)
+                {
+                    continue;
+                }
+                if (segment.Length == 0 || segment == "." || segment == ".." ||
+                    EndsWithAliasCharacter(segment) || IsReservedDosDeviceName(segment) ||
+                    segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                {
+                    throw new InvalidOperationException("Path contains an invalid or aliased component.");
+                }
+            }
+            string full = Path.GetFullPath(candidate).TrimEnd('\\');
+            if (full.Length == 2)
+            {
+                full += "\\";
+            }
+            return full;
+        }
+
         private static string ToExtendedLengthPath(string normalizedPath)
         {
-            if (String.IsNullOrWhiteSpace(normalizedPath) || normalizedPath.Length < 3 ||
-                !Char.IsLetter(normalizedPath[0]) || normalizedPath[1] != ':' ||
-                normalizedPath[2] != '\\' || normalizedPath.IndexOf('/') >= 0 ||
-                normalizedPath.StartsWith(@"\\", StringComparison.Ordinal))
+            string canonical = NormalizeLocalPath(normalizedPath);
+            if (!String.Equals(canonical, normalizedPath, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(
-                    "Native paths must be normalized local drive paths.");
+                    "Native paths must already be normalized local drive paths.");
             }
-            return @"\\?\" + normalizedPath;
+            return @"\\?\" + canonical;
+        }
+
+        private static bool EndsWithAliasCharacter(string value)
+        {
+            return value.EndsWith(".", StringComparison.Ordinal) ||
+                value.EndsWith(" ", StringComparison.Ordinal);
+        }
+
+        private static bool IsReservedDosDeviceName(string value)
+        {
+            string stem = value.Split('.')[0].ToUpperInvariant();
+            if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL")
+            {
+                return true;
+            }
+            return stem.Length == 4 &&
+                (stem.StartsWith("COM", StringComparison.Ordinal) ||
+                    stem.StartsWith("LPT", StringComparison.Ordinal)) &&
+                stem[3] >= '1' && stem[3] <= '9';
         }
 
         public static byte[] GetFileSecurityDescriptor(SafeFileHandle handle)
@@ -384,7 +459,7 @@ namespace ApplyPilot.PhaseA
             RawFileIdentity before = GetRawFileIdentity(handle);
             string target = Path.GetFullPath(destination).TrimEnd('\\');
             if (Directory.Exists(target) || File.Exists(target)) throw new IOException("Directory destination already exists.");
-            byte[] name = Encoding.Unicode.GetBytes(target);
+            byte[] name = Encoding.Unicode.GetBytes(ToExtendedLengthPath(target));
             int rootOffset = IntPtr.Size == 8 ? 8 : 4;
             int lengthOffset = rootOffset + IntPtr.Size;
             int nameOffset = lengthOffset + sizeof(uint);
@@ -414,7 +489,8 @@ namespace ApplyPilot.PhaseA
 
         private static void RenameNoReplace(SafeFileHandle handle, string destination)
         {
-            byte[] name = Encoding.Unicode.GetBytes(destination);
+            string target = NormalizeLocalPath(destination);
+            byte[] name = Encoding.Unicode.GetBytes(ToExtendedLengthPath(target));
             int rootOffset = IntPtr.Size == 8 ? 8 : 4;
             int lengthOffset = rootOffset + IntPtr.Size;
             int nameOffset = lengthOffset + sizeof(uint);

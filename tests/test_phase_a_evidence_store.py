@@ -263,7 +263,7 @@ def _sign_with_salt(private: Path, content: bytes, salt_length: int) -> bytes:
 
 def _protect(path: Path, sid: str | None = None) -> None:
     sid = sid or _current_sid()
-    file_switch = "$true" if path.is_file() else "$false"
+    file_switch = "$true" if _io_path(path).is_file() else "$false"
     _module(
         "$m=Get-Module PhaseAEvidenceStore;"
         f"& $m {{param($p,$s,$f)Set-PhaseAProtectedAcl $p $s -File:$f}} {_ps(path)} {_ps(sid)} {file_switch}"
@@ -393,6 +393,22 @@ def test_review_corrections_are_structural_contracts():
     )
 
 
+def test_evidence_native_force_reload_rejects_stale_contract_and_accepts_current():
+    stale = _run_ps(
+        "Add-Type -TypeDefinition 'namespace ApplyPilot.PhaseA { "
+        "public static class EvidenceNative { public const string ContractVersion = \"1\"; } }';"
+        f"try{{Import-Module {_ps(MODULE)} -Force;'missed'}}catch{{$_.Exception.Message}}"
+    )
+    message = stale.stdout.strip().lower()
+    assert "incompatible" in message and "restart" in message
+
+    current = _run_ps(
+        f"Import-Module {_ps(MODULE)} -Force;Import-Module {_ps(MODULE)} -Force;"
+        "[ApplyPilot.PhaseA.EvidenceNative]::ContractVersion"
+    )
+    assert current.stdout.strip() == "2"
+
+
 def test_production_receipt_staging_uses_only_validated_handle_primitives():
     module = MODULE.read_text(encoding="utf-8")
     windows_file = WINDOWS_FILE_MODULE.read_text(encoding="utf-8")
@@ -419,6 +435,8 @@ def test_production_receipt_staging_uses_only_validated_handle_primitives():
     assert "CreateFileW(ToExtendedLengthPath(ancestor)" in module
     assert "CreateFileW(\n                ToExtendedLengthPath(path)" in windows_file
     assert "CreateFileWithSecurityW(\n                    ToExtendedLengthPath(path)" in windows_file
+    assert module.count("Encoding.Unicode.GetBytes(ToExtendedLengthPath(target))") >= 2
+    assert "Encoding.Unicode.GetBytes(ToExtendedLengthPath(target))" in windows_file
     assert "String.Equals(final, full, StringComparison.OrdinalIgnoreCase)" in module
     assert "String.Equals(identity.FinalPath, full, StringComparison.OrdinalIgnoreCase)" in module
     assert "String.Equals(after.FinalPath, target, PathComparison)" in windows_file
@@ -647,7 +665,7 @@ def test_quality_contract_other_schema_independent_canonical_bytes(tmp_path: Pat
         _protect(candidate_store / leaf)
     for preimage in (h["e"], h["f"]):
         bundle = candidate_store / "bundles" / f"{h['a']}-{preimage}.apeb"
-        bundle.write_bytes(preimage.encode("ascii"))
+        _io_path(bundle).write_bytes(preimage.encode("ascii"))
         _protect(bundle)
     authenticator = (
         "$auth={param($c)$candidate=if($c.PreimageSha256 -ceq '" + h["e"] + "'){'"
@@ -759,7 +777,7 @@ def test_quality_contract_other_schema_independent_canonical_bytes(tmp_path: Pat
                 ).stdout.strip()
             )
         else:
-            actual_bytes = receipt.read_bytes()
+            actual_bytes = _io_path(receipt).read_bytes()
         assert actual_bytes == expected.encode("ascii")
         if protected_arguments:
             protected = _module(
@@ -914,6 +932,57 @@ def test_quality_stage_created_protected_and_same_handle_renamed(tmp_path: Path)
     assert Path(payload["Final"]) == final
     assert final.is_dir()
     assert (stage / "replacement").is_file()
+
+
+def test_evidence_native_directory_rename_supports_extended_length_paths(tmp_path: Path):
+    padding_length = max(1, 200 - len(str(tmp_path)) - 1)
+    assert padding_length < 240
+    root = tmp_path / ("p" * padding_length)
+    root.mkdir()
+    _protect(root)
+    stage = root / ("s" * 80)
+    final = root / ("d" * 80)
+    assert len(str(stage)) > 260
+    assert len(str(final)) > 260
+    sid = _current_sid()
+    body = (
+        f"$m=Get-Module PhaseAEvidenceStore;& $m {{param($stage,$final,$sid)"
+        "$sd=Get-PhaseAProtectedSecurityDescriptorBytes $sid;"
+        "$h=[ApplyPilot.PhaseA.EvidenceNative]::CreateProtectedDirectory($stage,$sd);"
+        "try{$before=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h);"
+        "[ApplyPilot.PhaseA.EvidenceNative]::RenameDirectoryHandleNoReplace($h,$final);"
+        "$after=[ApplyPilot.PhaseA.EvidenceNative]::GetRawFileIdentity($h);"
+        "$h.Dispose();$h=$null;"
+        "$deleted=[ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow("
+        "$final,[uint64]$after.VolumeSerialNumber,[string]$after.FileId,-1);"
+        "[pscustomobject]@{Before=$before.FileId;After=$after.FileId;Final=$after.FinalPath;"
+        "Deleted=$deleted}|ConvertTo-Json -Compress}finally{if($h){$h.Dispose()}}} "
+        f"{_ps(stage)} {_ps(final)} {_ps(sid)}"
+    )
+    payload = json.loads(_module(body).stdout)
+    assert payload["Before"] == payload["After"]
+    assert payload["Final"] == str(final)
+    assert payload["Deleted"] == 0
+    assert list(root.iterdir()) == []
+
+
+def test_evidence_native_rejects_ads_and_reserved_device_paths(tmp_path: Path):
+    carrier = tmp_path / "carrier.txt"
+    carrier.write_bytes(b"carrier")
+    ads = f"{carrier}:secret"
+    Path(ads).write_bytes(b"secret")
+    reserved = tmp_path / "NUL.txt"
+    result = json.loads(
+        _module(
+            "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
+            f"{_ps(ads)},$false);$h.Dispose();$adsResult='missed'}}catch{{$adsResult='rejected'}};"
+            "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
+            f"{_ps(reserved)},$false);$h.Dispose();$reservedResult='missed'}}"
+            "catch{$reservedResult='rejected'};"
+            "[pscustomobject]@{Ads=$adsResult;Reserved=$reservedResult}|ConvertTo-Json -Compress"
+        ).stdout
+    )
+    assert result == {"Ads": "rejected", "Reserved": "rejected"}
 
 
 def test_bundle_names_staging_residue_and_store_derived_adjudication(tmp_path: Path):
