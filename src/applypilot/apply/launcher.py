@@ -2425,6 +2425,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    from applypilot.fleet.emergency_admission import launcher_admission, require_allowed
+
+    require_allowed(launcher_admission())
     status, duration_ms = _run_job_impl(
         job, port, worker_id=worker_id, model=model, dry_run=dry_run,
         agent=agent, inbox_auth_hint=inbox_auth_hint, attempt_store=attempt_store,
