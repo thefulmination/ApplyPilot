@@ -601,8 +601,8 @@ def test_manifest_is_redacted_streamed_and_detects_identity_race(tmp_path: Path)
     assert race.stdout.strip() == "rejected"
 
 
-@pytest.mark.parametrize("mutation", ["everyone", "duplicate", "owner", "reparse"])
-def test_exact_acl_owner_and_no_reparse_fail_closed(tmp_path: Path, mutation: str):
+@pytest.mark.parametrize("mutation", ["everyone", "duplicate", "owner"])
+def test_exact_acl_and_owner_fail_closed(tmp_path: Path, mutation: str):
     target = tmp_path / "protected"
     target.mkdir()
     _protect(target)
@@ -614,12 +614,65 @@ def test_exact_acl_owner_and_no_reparse_fail_closed(tmp_path: Path, mutation: st
         _run_ps(f"& icacls.exe {_ps(target)} /grant '*{sid}:(RX)' | Out-Null")
     elif mutation == "owner":
         expected_sid = "S-1-5-18"
-    else:
-        target.rmdir()
-        _run_ps(f"New-Item -ItemType SymbolicLink -Path {_ps(target)} -Target {_ps(tmp_path)}|Out-Null")
     result = _module(
         f"$m=Get-Module PhaseAEvidenceStore;try{{& $m {{param($p,$s)Assert-PhaseAProtectedAcl $p $s}} "
         f"{_ps(target)} {_ps(expected_sid)};'missed'}}catch{{'rejected'}}"
+    )
+    assert result.stdout.strip() == "rejected"
+
+
+def test_directory_reparse_with_exact_acl_fails_closed(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    junction = tmp_path / "protected"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sid = _current_sid()
+    fixture = json.loads(_module(
+        "$m=Get-Module PhaseAEvidenceStore;"
+        "& $m {param($p,$s)"
+        "$security=New-PhaseAProtectedSecurity $s;"
+        "Set-Acl -LiteralPath $p -AclObject $security;"
+        "$item=Get-Item -LiteralPath $p -Force;"
+        "$acl=Get-Acl -LiteralPath $p;"
+        "$rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));"
+        "$trusted=@($s,'S-1-5-18','S-1-5-32-544');"
+        "$inheritance=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor "
+        "[Security.AccessControl.InheritanceFlags]::ObjectInherit;"
+        "$exact=$rules.Count -eq 3;"
+        "foreach($trustedSid in $trusted){"
+        "$matching=@($rules|Where-Object{$_.IdentityReference.Value -ceq $trustedSid});"
+        "if($matching.Count -ne 1){$exact=$false;continue};"
+        "$rule=$matching[0];"
+        "if($rule.IsInherited -or "
+        "$rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or "
+        "$rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or "
+        "$rule.InheritanceFlags -ne $inheritance -or "
+        "$rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None){$exact=$false}"
+        "};"
+        "[pscustomobject]@{"
+        "Reparse=(($item.Attributes-band [IO.FileAttributes]::ReparsePoint)-ne 0);"
+        "Protected=$acl.AreAccessRulesProtected;"
+        "Owner=([Security.Principal.NTAccount]$acl.Owner).Translate("
+        "[Security.Principal.SecurityIdentifier]).Value;"
+        "ExactRules=$exact"
+        "}|ConvertTo-Json -Compress"
+        f"}} {_ps(junction)} {_ps(sid)}"
+    ).stdout)
+    assert fixture == {
+        "Reparse": True,
+        "Protected": True,
+        "Owner": sid,
+        "ExactRules": True,
+    }
+
+    result = _module(
+        f"$m=Get-Module PhaseAEvidenceStore;try{{& $m {{param($p,$s)Assert-PhaseAProtectedAcl $p $s}} "
+        f"{_ps(junction)} {_ps(sid)};'missed'}}catch{{'rejected'}}"
     )
     assert result.stdout.strip() == "rejected"
 

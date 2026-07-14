@@ -887,30 +887,39 @@ function Get-PhaseASecurityDescriptorHash {
 }
 
 function Assert-PhaseAProtectedAcl([string]$Path, [string]$OperatorSid, [switch]$File) {
-  $acl = Get-Acl -LiteralPath $Path
-  if (-not $acl.AreAccessRulesProtected) { throw 'DACL inheritance must be disabled.' }
-  $actualOwner = ([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
-  if ($actualOwner -cne $OperatorSid) {
-    throw 'Unexpected evidence owner.'
-  }
-  $trusted = @($OperatorSid, 'S-1-5-18', 'S-1-5-32-544')
-  $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-  if ($rules.Count -ne 3) { throw 'Evidence DACL must contain exactly three ACEs.' }
-  $expectedInheritance = if ($File) { [Security.AccessControl.InheritanceFlags]::None } else {
-    [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-  }
-  foreach ($sid in $trusted) {
-    $matching = @($rules | Where-Object { $_.IdentityReference.Value -ceq $sid })
-    if ($matching.Count -ne 1) { throw 'Evidence DACL must contain one ACE per trusted principal.' }
-    $rule = $matching[0]
-    if ($rule.IsInherited -or
-        $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
-        $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or
-        $rule.InheritanceFlags -ne $expectedInheritance -or
-        $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
-      throw 'Evidence DACL ACE rights, inheritance, or propagation are not exact.'
+  $handle = [ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($Path, -not $File)
+  try {
+    $bytes = [ApplyPilot.PhaseA.EvidenceNative]::GetFileSecurityDescriptor($handle)
+    $acl = if ($File) {
+      [Security.AccessControl.FileSecurity]::new()
+    } else {
+      [Security.AccessControl.DirectorySecurity]::new()
     }
-  }
+    $acl.SetSecurityDescriptorBinaryForm($bytes)
+    if (-not $acl.AreAccessRulesProtected) { throw 'DACL inheritance must be disabled.' }
+    $actualOwner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($actualOwner -cne $OperatorSid) {
+      throw 'Unexpected evidence owner.'
+    }
+    $trusted = @($OperatorSid, 'S-1-5-18', 'S-1-5-32-544')
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 3) { throw 'Evidence DACL must contain exactly three ACEs.' }
+    $expectedInheritance = if ($File) { [Security.AccessControl.InheritanceFlags]::None } else {
+      [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    }
+    foreach ($sid in $trusted) {
+      $matching = @($rules | Where-Object { $_.IdentityReference.Value -ceq $sid })
+      if ($matching.Count -ne 1) { throw 'Evidence DACL must contain one ACE per trusted principal.' }
+      $rule = $matching[0]
+      if ($rule.IsInherited -or
+          $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+          $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or
+          $rule.InheritanceFlags -ne $expectedInheritance -or
+          $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
+        throw 'Evidence DACL ACE rights, inheritance, or propagation are not exact.'
+      }
+    }
+  } finally { $handle.Dispose() }
 }
 
 function Assert-PhaseAProtectedFileHandleAcl($Handle, [string]$OperatorSid) {
