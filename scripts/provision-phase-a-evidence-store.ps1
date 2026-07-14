@@ -33,6 +33,61 @@ function Get-PhaseAManifestMaterial([string]$Path,[string]$CanonicalRootPath) {
   [pscustomobject]@{Value=$value;Bytes=$bytes;Sha256=(& $module {param($b)Get-PhaseASha256 $b} $bytes)}
 }
 
+function Get-PhaseANativeWin32ErrorCode([Exception]$Exception) {
+  $current=$Exception
+  $seen=[Collections.Generic.HashSet[int]]::new()
+  while($null-ne $current-and $seen.Add([Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($current))){
+    if($current-is [ComponentModel.Win32Exception]){return [int]$current.NativeErrorCode}
+    $current=$current.InnerException
+  }
+  $null
+}
+
+function Assert-PhaseACleanupStagingPathAbsent([string]$StagingPath) {
+  $handle=$null
+  try {
+    try{$handle=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($StagingPath,$true)}
+    catch {
+      $code=Get-PhaseANativeWin32ErrorCode $_.Exception
+      if($code-eq 2-or $code-eq 3){return}
+      throw
+    }
+  } finally {if($null-ne $handle){$handle.Dispose()}}
+  throw 'Cleanup staging path reappeared during post-mutation verification.'
+}
+
+function Get-PhaseAPostCleanupManifestMaterial {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$ParentPath,[Parameter(Mandatory)][string]$StagingPath,
+    [scriptblock]$TestManifestReader,[switch]$DefinitionImport
+  )
+  if($TestManifestReader-and-not $DefinitionImport){throw 'Post-cleanup manifest override requires DefinitionImport.'}
+  $maxAttempts=4;$maxElapsedMilliseconds=750;$retryDelayMilliseconds=20
+  $timer=[Diagnostics.Stopwatch]::StartNew()
+  for($attempt=1;$attempt-le $maxAttempts;$attempt++){
+    Assert-PhaseACleanupStagingPathAbsent $StagingPath
+    try {
+      $material=if($TestManifestReader){& $TestManifestReader $ParentPath $null}else{Get-PhaseAManifestMaterial $ParentPath}
+      Assert-PhaseACleanupStagingPathAbsent $StagingPath
+      return $material
+    } catch {
+      $failure=$_
+      $code=Get-PhaseANativeWin32ErrorCode $failure.Exception
+      if($code-ne 2-and $code-ne 3){throw}
+      Assert-PhaseACleanupStagingPathAbsent $StagingPath
+      if($attempt-ge $maxAttempts-or $timer.ElapsedMilliseconds-ge $maxElapsedMilliseconds){
+        throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
+      }
+      $remaining=$maxElapsedMilliseconds-$timer.ElapsedMilliseconds
+      Start-Sleep -Milliseconds ([int][Math]::Min($retryDelayMilliseconds,$remaining))
+      if($timer.ElapsedMilliseconds-ge $maxElapsedMilliseconds){
+        throw [InvalidOperationException]::new('Post-cleanup parent manifest retries exhausted.',$failure.Exception)
+      }
+    }
+  }
+}
+
 function Invoke-PhaseAEvidenceStoreProvision {
   [CmdletBinding()]
   param(
@@ -139,8 +194,10 @@ function Invoke-PhaseAProvisioningCleanup {
     [Parameter(Mandatory)][string]$ExpectedCommit,[Parameter(Mandatory)][string]$AuthorizationReceiptPath,
     [Parameter(Mandatory)][string]$AuthorizationSignaturePath,[Parameter(Mandatory)]$ExpectedAuthorizationBindings,
     [Parameter(Mandatory)][string]$ExpectedAfterManifestPath,[string]$CompletionReceiptPath,[string]$CompletionSignaturePath,
-    [string]$CompletionRequestPath,[string]$TestBootstrapRoot,[switch]$DefinitionImport,[switch]$CrashAfterMutation
+    [string]$CompletionRequestPath,[string]$TestBootstrapRoot,[scriptblock]$TestPostCleanupManifestReader,
+    [switch]$DefinitionImport,[switch]$CrashAfterMutation
   )
+  if($TestPostCleanupManifestReader-and-not $DefinitionImport){throw 'Post-cleanup manifest override requires DefinitionImport.'}
   if(-not $DefinitionImport -and -not (Test-PhaseAElevatedToken)){throw 'Staging cleanup requires elevation.'}
   if($TestBootstrapRoot-and-not $DefinitionImport){throw 'Bootstrap override requires DefinitionImport.'}
   $module=Get-Module PhaseAEvidenceStore;$operator=& $module {param($s)Assert-PhaseACurrentOperator $s} $CanonicalOperatorSid
@@ -177,7 +234,9 @@ function Invoke-PhaseAProvisioningCleanup {
       $null=[ApplyPilot.PhaseA.EvidenceNative]::DeleteTreeNoFollow($stage,[uint64]$target.Identity.VolumeSerialNumber,[string]$target.Identity.FileId,-1)
       if($CrashAfterMutation){throw 'Injected cleanup crash after mutation.'}
     }elseif(Test-Path -LiteralPath $stage){throw 'Cleanup target changed kind.'}
-    $actual=Get-PhaseAManifestMaterial $parent
+    $postManifestArgs=@{ParentPath=$parent;StagingPath=$stage}
+    if($TestPostCleanupManifestReader){$postManifestArgs.TestManifestReader=$TestPostCleanupManifestReader;$postManifestArgs.DefinitionImport=$true}
+    $actual=Get-PhaseAPostCleanupManifestMaterial @postManifestArgs
     if($actual.Sha256-cne $auth.expectedAfterManifestSha256){throw 'Actual-after manifest differs from authorization.'}
     if(-not $CompletionReceiptPath-and-not $CompletionSignaturePath){
       $requests=Join-Path $bootstrap 'completion-requests'

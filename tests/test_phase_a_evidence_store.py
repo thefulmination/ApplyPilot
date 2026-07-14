@@ -1254,6 +1254,167 @@ def test_definition_provision_validates_before_publish_is_idempotent_and_crash_s
     assert not crash_final.exists()
 
 
+def test_cleanup_retries_whole_manifest_after_native_entry_disappearance(tmp_path: Path):
+    private, public, key_hash = _new_keypair(tmp_path, "cleanup-transient")
+    sid = _current_sid()
+    parent = tmp_path / "stages"
+    parent.mkdir()
+    stage = parent / ".provisioning-11111111-1111-4111-8111-111111111111"
+    stage.mkdir()
+    (stage / "payload.bin").write_bytes(b"payload")
+    before = json.loads(
+        _module(f"Get-PhaseADirectoryManifest -Root {_ps(parent)}|ConvertTo-Json -Depth 12 -Compress").stdout
+    )
+    stage_manifest = json.loads(
+        _module(f"Get-PhaseADirectoryManifest -Root {_ps(stage)}|ConvertTo-Json -Depth 12 -Compress").stdout
+    )
+    removed = {stage_manifest["baseRootIdentityDigest"]} | {
+        entry["objectIdentityDigest"] for entry in stage_manifest["entries"]
+    }
+    after = {
+        "schemaVersion": 1,
+        "manifestType": "applypilot.phase-a.directory-manifest",
+        "baseRootIdentityDigest": before["baseRootIdentityDigest"],
+        "entries": [entry for entry in before["entries"] if entry["objectIdentityDigest"] not in removed],
+    }
+    expected_after = tmp_path / "expected-after.json"
+    expected_after.write_bytes(_canonical(after))
+    target = _module(f"Get-PhaseATargetDigest -Path {_ps(stage)}").stdout.strip()
+    bootstrap = tmp_path / "bootstrap"
+    bootstrap.mkdir()
+    _protect(bootstrap)
+    operation = "a" * 64
+    auth_args = (
+        "-ReceiptType applypilot.phase-a.provisioning-cleanup-authorization "
+        f"-OperatorSigningSpkiPath {_ps(public)} "
+        f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ApprovedCommit {_ps('1' * 40)} -OperationId {_ps(operation)} "
+        f"-TargetIdentityDigest {_ps(target)} "
+        f"-BeforeManifestSha256 {_ps(_sha(_canonical(before)))} "
+        f"-ExpectedAfterManifestSha256 {_ps(_sha(_canonical(after)))} "
+        f"-EvidenceBundleSha256 {_ps('0' * 64)} "
+        f"-CredentialInventoryRoot {_ps('0' * 64)} "
+        f"-CredentialRevocationSetRoot {_ps('0' * 64)} -OperatorSid {_ps(sid)} "
+        "-CreatedAtUtc '2026-07-14T12:00:00Z'"
+    )
+    authorization = Path(
+        _run_ps(f"& {_ps(NEW_RECEIPT)} {auth_args} -CreateUnsigned -OutputDirectory {_ps(bootstrap)}").stdout.strip()
+    )
+    authorization_sig = authorization.with_suffix(".sig")
+    authorization_sig.write_bytes(_sign(private, authorization.read_bytes()))
+    _protect(authorization)
+    _protect(authorization_sig)
+    invoke = (
+        f"Invoke-PhaseAProvisioningCleanup -StagingPath {_ps(stage)} "
+        f"-CanonicalOperatorSid {_ps(sid)} -OperatorSigningSpkiPath {_ps(public)} "
+        f"-ExpectedOperatorSigningKeySpkiSha256 {_ps(key_hash)} "
+        f"-ExpectedCommit {_ps('1' * 40)} -AuthorizationReceiptPath {_ps(authorization)} "
+        f"-AuthorizationSignaturePath {_ps(authorization_sig)} "
+        "-ExpectedAuthorizationBindings $expected "
+        f"-ExpectedAfterManifestPath {_ps(expected_after)} "
+        f"-TestBootstrapRoot {_ps(bootstrap)} -TestPostCleanupManifestReader $reader"
+    )
+    body = (
+        f". {_ps(PROVISION)} -DefinitionImport;"
+        f"$expected=Get-Content -LiteralPath {_ps(authorization)} -Raw|"
+        "ConvertFrom-Json -AsHashtable -DateKind String;"
+        "$script:attempts=0;$script:nativeCode=-1;"
+        "$reader={param($path,$canonicalRootPath) $script:attempts++;"
+        "if($script:attempts -eq 1){"
+        "$vanishing=Join-Path $path 'vanishing-entry.bin';"
+        "[IO.File]::WriteAllBytes($vanishing,[byte[]](1));"
+        "$entry=Get-ChildItem -LiteralPath $path -Force|"
+        "Where-Object Name -CEQ 'vanishing-entry.bin';"
+        "[IO.File]::Delete($vanishing);"
+        "try{$h=[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject("
+        "$entry.FullName,$false);$h.Dispose()}catch{"
+        "$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
+        "$script:nativeCode=$e.NativeErrorCode;throw}};"
+        "Get-PhaseAManifestMaterial $path $canonicalRootPath};"
+        f"try{{{invoke}|Out-Null;$blocked='missed'}}"
+        "catch{$blocked=$_.Exception.Message};"
+        f"$out={invoke} -DefinitionImport;"
+        "[pscustomobject]@{State=$out.State;Attempts=$script:attempts;"
+        "NativeCode=$script:nativeCode;StageAbsent=-not(Test-Path -LiteralPath "
+        f"{_ps(stage)});Blocked=$blocked}}|ConvertTo-Json -Compress"
+    )
+    result = json.loads(_run_ps(body, timeout=120).stdout)
+    assert result == {
+        "State": "COMPLETION_REQUIRED",
+        "Attempts": 2,
+        "NativeCode": 2,
+        "StageAbsent": True,
+        "Blocked": "Post-cleanup manifest override requires DefinitionImport.",
+    }
+
+
+def test_post_cleanup_manifest_retry_policy_is_bounded_and_fail_closed(tmp_path: Path):
+    parent = tmp_path / "retry-policy"
+    parent.mkdir()
+    stage = parent / ".provisioning-11111111-1111-4111-8111-111111111111"
+    success_stage = parent / ".provisioning-22222222-2222-4222-8222-222222222222"
+    body = (
+        f". {_ps(PROVISION)} -DefinitionImport;"
+        "$script:pathMissingAttempts=0;$pathMissing={param($path,$canonicalRootPath)"
+        "$script:pathMissingAttempts++;if($script:pathMissingAttempts -eq 1){"
+        "$missing=Join-Path (Join-Path $path 'missing-parent') 'leaf';"
+        "[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($missing,$false)|"
+        "Out-Null};Get-PhaseAManifestMaterial $path $canonicalRootPath};"
+        "$null=Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-TestManifestReader $pathMissing -DefinitionImport;"
+        "$script:exhaustedAttempts=0;$exhausted={param($path)"
+        "$script:exhaustedAttempts++;$missing=Join-Path $path 'missing-leaf';"
+        "[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($missing,$false)|"
+        "Out-Null};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-TestManifestReader $exhausted -DefinitionImport|Out-Null;"
+        "$exhaustedError='missed'}catch{$exhaustedError=$_.Exception.Message};"
+        "$script:deniedAttempts=0;$denied={param($path)"
+        "$script:deniedAttempts++;throw [ComponentModel.Win32Exception]::new(5)};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-TestManifestReader $denied -DefinitionImport|Out-Null;$deniedCode=-1}"
+        "catch{$e=$_.Exception;while($e.InnerException){$e=$e.InnerException};"
+        "$deniedCode=$e.NativeErrorCode};"
+        "$script:successReappearedAttempts=0;$successReappeared={param($path,$canonicalRootPath)"
+        "$script:successReappearedAttempts++;$material=Get-PhaseAManifestMaterial $path $canonicalRootPath;"
+        f"[IO.Directory]::CreateDirectory({_ps(success_stage)})|Out-Null;$material}};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(success_stage)} "
+        "-TestManifestReader $successReappeared -DefinitionImport|Out-Null;"
+        "$successReappearedError='missed'}catch{$successReappearedError=$_.Exception.Message};"
+        "$script:reappearedAttempts=0;$reappeared={param($path)"
+        "$script:reappearedAttempts++;[IO.Directory]::CreateDirectory("
+        f"{_ps(stage)})|Out-Null;$missing=Join-Path $path 'missing-leaf';"
+        "[ApplyPilot.PhaseA.EvidenceNative]::OpenManifestObject($missing,$false)|"
+        "Out-Null};"
+        "try{Get-PhaseAPostCleanupManifestMaterial "
+        f"-ParentPath {_ps(parent)} -StagingPath {_ps(stage)} "
+        "-TestManifestReader $reappeared -DefinitionImport|Out-Null;"
+        "$reappearedError='missed'}catch{$reappearedError=$_.Exception.Message};"
+        "[pscustomobject]@{PathMissingAttempts=$script:pathMissingAttempts;"
+        "ExhaustedAttempts=$script:exhaustedAttempts;"
+        "ExhaustedError=$exhaustedError;DeniedAttempts=$script:deniedAttempts;"
+        "DeniedCode=$deniedCode;SuccessReappearedAttempts=$script:successReappearedAttempts;"
+        "SuccessReappearedError=$successReappearedError;ReappearedAttempts=$script:reappearedAttempts;"
+        "ReappearedError=$reappearedError}|ConvertTo-Json -Compress"
+    )
+    result = json.loads(_run_ps(body).stdout)
+    assert result == {
+        "PathMissingAttempts": 2,
+        "ExhaustedAttempts": 4,
+        "ExhaustedError": "Post-cleanup parent manifest retries exhausted.",
+        "DeniedAttempts": 1,
+        "DeniedCode": 5,
+        "SuccessReappearedAttempts": 1,
+        "SuccessReappearedError": ("Cleanup staging path reappeared during post-mutation verification."),
+        "ReappearedAttempts": 1,
+        "ReappearedError": ("Cleanup staging path reappeared during post-mutation verification."),
+    }
+
+
 def test_cleanup_requires_post_mutation_completion_then_resumes(tmp_path: Path):
     private, public, key_hash = _new_keypair(tmp_path, "cleanup-signing")
     sid = _current_sid()
