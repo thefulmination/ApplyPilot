@@ -120,6 +120,12 @@ def _decode_manifest_object(value: dict) -> SourceManifest:
     return SourceManifest.from_canonical_json(payload, _sha256(payload))
 
 
+def _unchecked_integer_cursor(value: int) -> IntegerCursor:
+    cursor = object.__new__(IntegerCursor)
+    object.__setattr__(cursor, "value", value)
+    return cursor
+
+
 def test_manifest_fingerprints_explicit_backup_and_all_authority_domains(source_backup: Path):
     reader = _reader(source_backup)
     manifest = reader.capture_manifest()
@@ -247,6 +253,56 @@ def test_integer_and_composite_keyset_cursors(source_backup: Path):
     assert [(row["event_id"], row["job_url"]) for row in resumed_outcomes.rows] == [("mail-b", "job-a")]
 
 
+def test_cursor_integer_domain_accepts_only_javascript_safe_identity_values():
+    maximum = 2**53 - 1
+
+    assert IntegerCursor(maximum).value == maximum
+    assert IntegerCursor(-maximum).value == -maximum
+    assert CompositeCursor(("key", maximum)).values == ("key", maximum)
+    for value in (2**53, -(2**53), 2**60):
+        with pytest.raises(ValueError, match="safe integer") as raised:
+            IntegerCursor(value)
+        assert len(str(raised.value)) < 160
+        with pytest.raises(ValueError, match="safe integer"):
+            CompositeCursor(("key", value))
+
+
+def test_manifest_producer_safe_integer_upper_bound_round_trips_its_decoder(source_backup: Path):
+    maximum = 2**53 - 1
+    with closing(sqlite3.connect(source_backup)) as connection:
+        connection.execute("INSERT INTO applications(id, job_url) VALUES (?, ?)", (maximum, "job-max"))
+        connection.commit()
+
+    manifest = _reader(source_backup).capture_manifest()
+
+    assert manifest.table("applications").upper_bound == IntegerCursor(maximum)
+    assert SourceManifest.from_canonical_json(manifest.canonical_json, manifest.sha256) == manifest
+
+
+@pytest.mark.parametrize("unsafe_cursor", [2**53, 2**60])
+def test_manifest_rejects_unsafe_integer_key_before_upper_bound_materialization(
+    source_backup: Path,
+    monkeypatch,
+    unsafe_cursor: int,
+):
+    with closing(sqlite3.connect(source_backup)) as connection:
+        connection.execute("INSERT INTO applications(id, job_url) VALUES (?, ?)", (unsafe_cursor, "unsafe"))
+        connection.commit()
+    reader = _reader(source_backup)
+    original_cursor_from_values = reader._cursor_from_values
+
+    def must_not_materialize(table, values):
+        if table.name == "applications":
+            raise AssertionError("unsafe upper bound was materialized")
+        return original_cursor_from_values(table, values)
+
+    monkeypatch.setattr(reader, "_cursor_from_values", must_not_materialize)
+    with pytest.raises(ValueError, match="safe integer") as raised:
+        reader.capture_manifest()
+    assert len(str(raised.value)) < 160
+    assert str(unsafe_cursor) not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     ("table", "cursor"),
     [
@@ -365,6 +421,42 @@ def test_strict_cursor_decoder_rejects_hash_shape_type_and_noncanonical_json():
         cursor_from_canonical_json('{"value":"job-b", "kind":"text"}', _sha256(payload), "jobs")
     with pytest.raises(ValueError, match="SHA-256"):
         cursor_from_canonical_json(payload, "0" * 64, "jobs")
+
+
+@pytest.mark.parametrize("unsafe_cursor", [2**53, 2**60])
+def test_decoder_checkpoint_and_batch_inputs_reject_unsafe_integer_cursors(
+    source_backup: Path,
+    unsafe_cursor: int,
+):
+    payload = canonical_json({"kind": "integer", "value": unsafe_cursor})
+    with pytest.raises(ValueError, match="safe integer"):
+        cursor_from_canonical_json(payload, _sha256(payload), "applications")
+
+    reader = _reader(source_backup)
+    manifest = reader.capture_manifest()
+    forged = _unchecked_integer_cursor(unsafe_cursor)
+    with pytest.raises(ValueError, match="safe integer"):
+        BatchRequest(manifest.sha256, "applications", forged, 1)
+
+    request = BatchRequest(manifest.sha256, "applications", IntegerCursor(1), 1)
+    object.__setattr__(request, "after", forged)
+    with pytest.raises(ValueError, match="safe integer"):
+        reader.read_batch(manifest, request)
+
+    batch = reader.read_batch(
+        manifest,
+        BatchRequest(manifest.sha256, "applications", IntegerCursor(1), 1),
+    )
+    checkpoint = ImportCheckpoint.from_batch(batch)
+    object.__setattr__(checkpoint, "cursor", forged)
+    with pytest.raises(ValueError, match="safe integer"):
+        checkpoint.__post_init__()
+
+    checkpoint_value = json.loads(ImportCheckpoint.from_batch(batch).canonical_json)
+    checkpoint_value["cursor"] = {"kind": "integer", "value": unsafe_cursor}
+    checkpoint_payload = canonical_json(checkpoint_value)
+    with pytest.raises(ValueError, match="safe integer"):
+        ImportCheckpoint.from_canonical_json(checkpoint_payload, _sha256(checkpoint_payload))
 
 
 def test_strict_manifest_decoder_round_trip_and_schema_rejections(source_backup: Path):
