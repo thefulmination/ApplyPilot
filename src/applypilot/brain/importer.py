@@ -25,6 +25,7 @@ MANIFEST_VERSION = 2
 CHECKPOINT_VERSION = 1
 BATCH_VERSION = 1
 _MAX_BATCH_SIZE = 100_000
+_MAX_CURSOR_SAFE_INTEGER = 2**53 - 1
 DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
 SEALED_SNAPSHOT_VERSION = 1
 DEFAULT_MANIFEST_CURSOR_MAX_BYTES = 64 * 1024
@@ -116,6 +117,7 @@ class IntegerCursor:
     def __post_init__(self) -> None:
         if isinstance(self.value, bool) or not isinstance(self.value, int):
             raise TypeError("integer cursor value must be an integer")
+        _validate_cursor_integer(self.value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +129,9 @@ class CompositeCursor:
             raise TypeError("composite cursor values must be a non-empty tuple")
         if any(isinstance(value, bool) or not isinstance(value, (str, int)) for value in self.values):
             raise TypeError("composite cursor values must contain only strings or integers")
+        for value in self.values:
+            if isinstance(value, int):
+                _validate_cursor_integer(value)
 
 
 Cursor = TextCursor | IntegerCursor | CompositeCursor
@@ -160,6 +165,11 @@ SOURCE_TABLES: tuple[SourceTableSpec, ...] = (
 _TABLE_BY_NAME = {table.name: table for table in SOURCE_TABLES}
 
 
+def _validate_cursor_integer(value: int) -> None:
+    if abs(value) > _MAX_CURSOR_SAFE_INTEGER:
+        raise ValueError("cursor integer must be within the JavaScript safe integer range")
+
+
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
@@ -171,12 +181,16 @@ def _validate_cursor_value(table: SourceTableSpec, cursor: Cursor | None) -> Non
         expected = TextCursor if table.key_types == (str,) else IntegerCursor
         if not isinstance(cursor, expected):
             raise ValueError(f"cursor for {table.name} must be {expected.__name__}")
+        if isinstance(cursor, IntegerCursor):
+            _validate_cursor_integer(cursor.value)
         return
     if not isinstance(cursor, CompositeCursor) or len(cursor.values) != len(table.key_columns):
         raise ValueError(f"cursor for {table.name} must have {len(table.key_columns)} composite values")
     for value, expected_type in zip(cursor.values, table.key_types, strict=True):
         if isinstance(value, bool) or not isinstance(value, expected_type):
             raise ValueError(f"cursor for {table.name} has an invalid composite value type")
+        if isinstance(value, int):
+            _validate_cursor_integer(value)
 
 
 def _cursor_key(cursor: Cursor) -> tuple[str | int, ...]:
@@ -228,7 +242,29 @@ def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _strict_json(payload: str, expected_sha256: str) -> Any:
+def _prevalidate_encoded_cursors(value: Any) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _prevalidate_encoded_cursors(item)
+        return
+    if not isinstance(value, dict):
+        return
+    kind = value.get("kind")
+    if kind == "integer":
+        cursor_value = value.get("value")
+        if isinstance(cursor_value, int) and not isinstance(cursor_value, bool):
+            _validate_cursor_integer(cursor_value)
+    elif kind == "composite":
+        values = value.get("values")
+        if isinstance(values, list):
+            for item in values:
+                if isinstance(item, int) and not isinstance(item, bool):
+                    _validate_cursor_integer(item)
+    for item in value.values():
+        _prevalidate_encoded_cursors(item)
+
+
+def _strict_json(payload: str, expected_sha256: str, *, cursor_contract: bool = False) -> Any:
     if not isinstance(payload, str):
         raise TypeError("canonical JSON payload must be a string")
     if not _is_sha256(expected_sha256):
@@ -237,6 +273,8 @@ def _strict_json(payload: str, expected_sha256: str) -> Any:
         value = json.loads(payload, object_pairs_hook=_strict_object, parse_constant=_reject_constant)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("invalid canonical JSON") from exc
+    if cursor_contract:
+        _prevalidate_encoded_cursors(value)
     if canonical_json(value) != payload:
         raise ValueError("JSON payload is not in canonical encoding")
     actual_sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -295,7 +333,7 @@ def cursor_from_canonical_json(payload: str, expected_sha256: str, source_table:
     table = _TABLE_BY_NAME.get(source_table)
     if table is None:
         raise ValueError(f"unknown source table: {source_table}")
-    cursor = _decode_cursor_object(_strict_json(payload, expected_sha256))
+    cursor = _decode_cursor_object(_strict_json(payload, expected_sha256, cursor_contract=True))
     if cursor is None:
         raise ValueError("cursor payload cannot be null")
     _validate_cursor_value(table, cursor)
@@ -478,7 +516,7 @@ class SourceManifest:
     @classmethod
     def from_canonical_json(cls, payload: str, expected_sha256: str) -> SourceManifest:
         root = _require_fields(
-            _strict_json(payload, expected_sha256),
+            _strict_json(payload, expected_sha256, cursor_contract=True),
             {"version", "source", "tables", "manifest_cursor_max_bytes"},
             "source manifest",
         )
@@ -551,6 +589,9 @@ class BatchRequest:
             raise ValueError("manifest SHA-256 must be 64 lowercase hexadecimal characters")
         if not isinstance(self.source_table, str) or not self.source_table:
             raise ValueError("source table must be a non-empty string")
+        table = _TABLE_BY_NAME.get(self.source_table)
+        if table is not None:
+            _validate_cursor_value(table, self.after)
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
             raise ValueError("batch size must be an integer")
         if self.batch_size < 1 or self.batch_size > _MAX_BATCH_SIZE:
@@ -735,7 +776,7 @@ class ImportCheckpoint:
     @classmethod
     def from_canonical_json(cls, payload: str, expected_sha256: str) -> ImportCheckpoint:
         root = _require_fields(
-            _strict_json(payload, expected_sha256),
+            _strict_json(payload, expected_sha256, cursor_contract=True),
             {
                 "version",
                 "manifest_sha256",
@@ -1723,6 +1764,21 @@ class SnapshotReader:
         if count == 0:
             upper_bound = None
         else:
+            for column, value_type in zip(table.key_columns, table.key_types, strict=True):
+                if value_type is not int:
+                    continue
+                quoted_column = _quote_identifier(column)
+                unsafe = connection.execute(
+                    f"SELECT 1 FROM {quoted_table} "
+                    f"WHERE typeof({quoted_column}) = 'integer' "
+                    f"AND ({quoted_column} < ? OR {quoted_column} > ?) LIMIT 1",
+                    (-_MAX_CURSOR_SAFE_INTEGER, _MAX_CURSOR_SAFE_INTEGER),
+                ).fetchone()
+                if unsafe is not None:
+                    raise ValueError(
+                        f"integer cursor component for {table.name}.{column} is outside "
+                        "the JavaScript safe integer range"
+                    )
             key_bound_sql = self._manifest_key_bound_sql(table)
             maximum_key_bytes = int(
                 connection.execute(f"SELECT MAX({key_bound_sql}) FROM {quoted_table}").fetchone()[0]
