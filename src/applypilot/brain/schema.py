@@ -17,7 +17,7 @@ _SCHEMA_LOCK_KEY = "applypilot:brain:schema:v1"
 _MIGRATION_NAME = "brain schema v1"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
-_EXPECTED_CATALOG_HASH = "f9859ee91bda058a261a1fdc989cb314acb94a149f7ab333f0271631bdbd21a5"
+_EXPECTED_CATALOG_HASH = "8c3377fc210922a5583995f0e6981ed1f023432c51218a960e055030ae7e243a"
 
 _FUNCTIONS = {
     "brain_reject_mutation": "",

@@ -5,3 +5,4 @@ Dockerfile  text eol=lf
 deploy/**   text eol=lf
 *.yaml      text eol=lf
 *.yml       text eol=lf
+tests/fixtures/canonical-brain/*.json text eol=lf
