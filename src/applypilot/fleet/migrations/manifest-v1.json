@@ -1,7 +1,19 @@
 {
   "manifest_id": "applypilot-fleet-migrations-v1",
   "migration_role": "applypilot_fleet_migrator",
-  "migrations": [],
+  "migrations": [
+    {
+      "id": "20260715_001_application_authority",
+      "sha256": "65d10d1a16e9829a7995f48776697e3200daf7a5074147a9a3ed8c0293f56bea",
+      "path": "src/applypilot/fleet/migrations/20260715_001_application_authority.sql",
+      "predecessor_id": null,
+      "predecessor_sha256": null,
+      "transaction_mode": "transactional",
+      "minimum_schema_contract": "fleet-v3",
+      "maximum_schema_contract": "fleet-v3",
+      "forward_recovery_command": "applypilot-fleet-migrate --through 20260715_001_application_authority"
+    }
+  ],
   "predecessor": {
     "files": [
       {

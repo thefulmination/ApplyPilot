@@ -98,7 +98,9 @@ def test_repository_manifest_pins_the_exact_legacy_predecessor():
         "src/applypilot/apply/fleet_schema.sql": "6eb4a84dcc05568233ee32551b28c75f13b0a17f",
         "src/applypilot/fleet/schema.py": "5637001b6457f9fc8f0c22f4220fe2e1249ff9c0",
     }
-    assert manifest.migrations == ()
+    assert tuple(item.id for item in manifest.migrations) == (
+        "20260715_001_application_authority",
+    )
     migrator.verify_predecessor(manifest, REPO_ROOT)
 
 
@@ -210,3 +212,39 @@ def test_failed_migration_rolls_back_sql_and_ledger(migration_pg, tmp_path):
         conn.rollback()
         assert conn.execute("SELECT to_regclass('public.must_rollback') AS oid").fetchone()["oid"] is None
         assert conn.execute("SELECT count(*) AS n FROM applypilot_fleet_schema_migrations").fetchone()["n"] == 0
+
+
+def test_application_authority_is_single_owner_and_crash_conservative(migration_pg):
+    manifest = migrator.load_manifest(MANIFEST_PATH)
+    with psycopg.connect(migration_pg, row_factory=dict_row) as conn:
+        conn.execute("SET ROLE applypilot_fleet_migrator")
+        migrator.apply_manifest(conn, manifest, REPO_ROOT)
+        op = "00000000-0000-0000-0000-000000000001"
+        first = conn.execute(
+            "SELECT * FROM fleet_worker_authorize_lease(%s,%s,%s,%s,%s::uuid,%s,%s)",
+            ("app-1", "https://jobs.example/a", "worker-a", "ats", op, "hash-a", 60),
+        ).fetchone()
+        assert first["authority_epoch"] == 1
+        assert conn.execute(
+            "SELECT fleet_worker_mark_browser_interaction(%s,%s,%s)",
+            ("app-1", "worker-a", 1),
+        ).fetchone()["fleet_worker_mark_browser_interaction"]
+        conn.commit()
+        with pytest.raises(psycopg.errors.RaiseException, match="not claimable"):
+            conn.execute(
+                "SELECT * FROM fleet_worker_authorize_lease(%s,%s,%s,%s,%s::uuid,%s,%s)",
+                ("app-1", "https://jobs.example/a?alias=1", "worker-b", "linkedin", op, "hash-a", 60),
+            )
+        conn.rollback()
+        assert not conn.execute(
+            "SELECT fleet_worker_requeue(%s,%s,%s)", ("app-1", "worker-a", 1)
+        ).fetchone()["fleet_worker_requeue"]
+        assert conn.execute(
+            "SELECT fleet_worker_terminalize(%s,%s,%s,%s,%s::jsonb)",
+            ("app-1", "worker-a", 1, "applied", '{"receipt":"r1"}'),
+        ).fetchone()["fleet_worker_terminalize"]
+        row = conn.execute(
+            "SELECT state, terminal_status, terminal_evidence->>'receipt' AS receipt "
+            "FROM fleet_application_authority WHERE canonical_application_id='app-1'"
+        ).fetchone()
+        assert (row["state"], row["terminal_status"], row["receipt"]) == ("terminal", "applied", "r1")
