@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "applypilot_canonical_hash_fixture_v1",
+  "input": {
+    "unicode": {
+      "composed": "café",
+      "decomposed": "café",
+      "astral": "𐀀",
+      "snow": "雪",
+      "escaped": "line\n\"\\"
+    },
+    "propertyNameOrder": {
+      "": "bmp-private-use",
+      "😀": "grinning-face",
+      "𐀀": "linear-b-syllable",
+      "a": "ascii"
+    },
+    "numbers": [
+      -9007199254740991,
+      9007199254740991,
+      100000000000000000000,
+      1e+21,
+      0.000001,
+      1e-7,
+      5e-324,
+      1.7976931348623157e+308,
+      333333333.3333333,
+      1.25,
+      0
+    ],
+    "timestamps": {
+      "policyCreatedAt": "2026-07-10T12:00:00.000Z",
+      "decisionCreatedAt": "2026-07-10T12:00:00.001Z",
+      "decisionExpiresAt": "2026-07-17T12:00:00.001Z",
+      "replayObservedAt": "2026-07-13T05:04:03.002Z"
+    },
+    "policy": {
+      "policyVersion": "policy-雪-v1",
+      "lane": "ats",
+      "status": "draft",
+      "threshold": 7.25
+    },
+    "decision": {
+      "decisionId": "decision-fixture-v1",
+      "jobUrl": "https://jobs.example/é",
+      "action": "apply",
+      "qualificationVerdict": "qualified",
+      "finalScore": 7.6,
+      "inputHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "replayInput": {
+      "schemaVersion": "canonical_replay_v4",
+      "policyVersion": "policy-雪-v1",
+      "applicationBudget": 30,
+      "validationFraction": 0.2,
+      "selectedDecisionIds": ["decision-fixture-v1"]
+    }
+  },
+  "canonicalJson": "{\"decision\":{\"action\":\"apply\",\"decisionId\":\"decision-fixture-v1\",\"finalScore\":7.6,\"inputHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"jobUrl\":\"https://jobs.example/é\",\"qualificationVerdict\":\"qualified\"},\"numbers\":[-9007199254740991,9007199254740991,100000000000000000000,1e+21,0.000001,1e-7,5e-324,1.7976931348623157e+308,333333333.3333333,1.25,0],\"policy\":{\"lane\":\"ats\",\"policyVersion\":\"policy-雪-v1\",\"status\":\"draft\",\"threshold\":7.25},\"propertyNameOrder\":{\"a\":\"ascii\",\"𐀀\":\"linear-b-syllable\",\"😀\":\"grinning-face\",\"\":\"bmp-private-use\"},\"replayInput\":{\"applicationBudget\":30,\"policyVersion\":\"policy-雪-v1\",\"schemaVersion\":\"canonical_replay_v4\",\"selectedDecisionIds\":[\"decision-fixture-v1\"],\"validationFraction\":0.2},\"timestamps\":{\"decisionCreatedAt\":\"2026-07-10T12:00:00.001Z\",\"decisionExpiresAt\":\"2026-07-17T12:00:00.001Z\",\"policyCreatedAt\":\"2026-07-10T12:00:00.000Z\",\"replayObservedAt\":\"2026-07-13T05:04:03.002Z\"},\"unicode\":{\"astral\":\"𐀀\",\"composed\":\"café\",\"decomposed\":\"café\",\"escaped\":\"line\\n\\\"\\\\\",\"snow\":\"雪\"}}",
+  "sha256": "0109ae5db819c0d16fd993c65a93ae1e512ed77e06bb0716a6656a47ce141fdd"
+}
