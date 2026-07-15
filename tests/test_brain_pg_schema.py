@@ -1551,12 +1551,12 @@ def test_atomic_activation_and_retirement_leave_leased_rows_untouched(brain_pg):
             "(url,application_url,score,status,lane,approved_batch,decision_id,policy_version,decision_action,"
             "qualification_verdict,qualification_score,qualification_floor,preference_score,outcome_score,"
             "final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash,lease_owner,"
-            "lease_expires_at,worker_lease_id) VALUES "
+            "lease_expires_at) VALUES "
             "('https://jobs/3','https://apply/3',0.8,'leased','ats','v1:leased','decision-ats-v1','ats-v1','apply',"
             "'qualified',0.8,0.6,0.7,0.9,0.8,0.8,now(),now()+interval '1 day',%s,'worker-1',"
-            "now()+interval '5 minutes',gen_random_uuid()),"
+            "now()+interval '5 minutes'),"
             "('https://jobs/1','https://apply/1',0.8,'queued','ats','v1:queued','queued-v1','ats-v1','apply',"
-            "'qualified',0.8,0.6,0.7,0.9,0.8,0.8,now(),now()+interval '1 day',%s,NULL,NULL,NULL)",
+            "'qualified',0.8,0.6,0.7,0.9,0.8,0.8,now(),now()+interval '1 day',%s,NULL,NULL)",
             (HASHES[1], HASHES[1]),
         )
         leased_before = conn.execute(

@@ -985,7 +985,7 @@ BEGIN
             preference_score=NULL,outcome_score=NULL,final_score=NULL,decision_confidence=NULL,
             decision_created_at=NULL,decision_expires_at=NULL,input_hash=NULL
             WHERE lane=$1 AND status=''queued'' AND lease_owner IS NULL AND lease_expires_at IS NULL
-              AND worker_lease_id IS NULL AND policy_version=$2',queue_name)
+              AND policy_version=$2',queue_name)
             USING policy_row.lane,requested_policy_version;
         GET DIAGNOSTICS invalidated=ROW_COUNT;
         UPDATE public.fleet_decision_policies SET status='retired',retired_at=now()
@@ -1027,8 +1027,8 @@ BEGIN
             decision_action=NULL,qualification_verdict=NULL,qualification_score=NULL,qualification_floor=NULL,
             preference_score=NULL,outcome_score=NULL,final_score=NULL,decision_confidence=NULL,
             decision_created_at=NULL,decision_expires_at=NULL,input_hash=NULL
-            WHERE lane=$1 AND status=''queued'' AND lease_owner IS NULL AND lease_expires_at IS NULL
-              AND worker_lease_id IS NULL',queue_name) USING policy_row.lane;
+            WHERE lane=$1 AND status=''queued'' AND lease_owner IS NULL AND lease_expires_at IS NULL',queue_name)
+            USING policy_row.lane;
         GET DIAGNOSTICS invalidated=ROW_COUNT;
         EXECUTE format('UPDATE public.%I q SET approved_batch=$1||'':activation'',decision_id=d.decision_id,
             policy_version=d.policy_version,decision_action=d.action,qualification_verdict=d.qualification_verdict,
@@ -1038,7 +1038,7 @@ BEGIN
             decision_expires_at=d.expires_at,input_hash=d.input_hash
             FROM public.brain_job_decisions d JOIN public.brain_jobs j ON j.job_id=d.job_id
             WHERE q.url=j.canonical_url AND q.lane=$2 AND q.status=''queued'' AND q.lease_owner IS NULL
-              AND q.lease_expires_at IS NULL AND q.worker_lease_id IS NULL AND d.policy_version=$1
+              AND q.lease_expires_at IS NULL AND d.policy_version=$1
               AND d.action=''apply'' AND d.qualification_verdict=''qualified'' AND d.expires_at>now()',queue_name)
             USING requested_policy_version,policy_row.lane;
         GET DIAGNOSTICS projected=ROW_COUNT;
