@@ -10,6 +10,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 
 
+def _production_shells() -> list[str]:
+    windows_powershell = shutil.which("powershell.exe")
+    assert windows_powershell, "Windows PowerShell 5.1 is required"
+    shells = [windows_powershell]
+    pwsh = shutil.which("pwsh")
+    if pwsh:
+        shells.append(pwsh)
+    return shells
+
+
 def _powershell_function(script: str, name: str) -> str:
     start = script.index(f"function {name}")
     opening = script.index("{", start)
@@ -130,7 +140,7 @@ def _run_update_harness(
 ) -> tuple[subprocess.CompletedProcess, Path]:
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
     update_function = _powershell_function(script, "Invoke-AutoUpdate")
-    declarations_start = script.index("$selfFiles = @")
+    declarations_start = script.index("$recoveryFiles = @")
     declarations_end = script.index("\n$script:lastUpdateCheck", declarations_start)
     declarations = script[declarations_start:declarations_end]
     mutation_marker = tmp_path / "worker-mutation.txt"
@@ -146,6 +156,7 @@ def _run_update_harness(
     harness.write_text(
         "$Label = 'm4'\n"
         f"$py = '{_ps_quote(py_shim)}'\n"
+        f"$updateRestartMarker = '{_ps_quote(tmp_path / 'missing-restart-marker.sha')}'\n"
         "$UpdateEverySec = 0\n"
         "$script:lastUpdateCheck = [datetime]::MinValue\n"
         "$script:updatePending = $false\n"
@@ -189,6 +200,135 @@ def _run_update_harness(
         timeout=30,
     )
     return result, mutation_marker
+
+
+def _run_restart_sequence_harness(
+    tmp_path: Path,
+    shell: str,
+    *,
+    post_merge_state: str = "KEEP",
+    complete_later: bool = False,
+    restart_surviving_marker: bool = False,
+    fail_merge: bool = False,
+    gate: str = "IDLE",
+) -> subprocess.CompletedProcess:
+    script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
+    functions = "\n".join(
+        _powershell_function(script, name)
+        for name in (
+            "Get-UpdateRestartTarget",
+            "Write-UpdateRestartMarker",
+            "Clear-UpdateRestartMarker",
+            "Complete-PendingUpdateRestart",
+            "Invoke-AutoUpdate",
+        )
+    )
+    declarations_start = script.index("$recoveryFiles = @")
+    declarations_end = script.index("\n$script:lastUpdateCheck", declarations_start)
+    declarations = script[declarations_start:declarations_end]
+    marker = tmp_path / "fleet-agent-update-restart.sha"
+    events = tmp_path / "events.txt"
+    gate_counter = tmp_path / "gate-counter.txt"
+    py_shim = tmp_path / "python-shim.ps1"
+    py_shim.write_text(
+        "param([string]$ScriptName)\n"
+        "if ($ScriptName -eq 'fleet-agent-version.py') { "
+        "Write-Output 'OK|0.3.0+git.tree.aaaaaaa|0.3.0+git.tree.ccccccc|'; exit 0 }\n"
+        "if ($ScriptName -eq 'fleet-agent-update-gate.py') {\n"
+        "  $count = if (Test-Path -LiteralPath $env:GATE_COUNT_FILE) { "
+        "[int](Get-Content -LiteralPath $env:GATE_COUNT_FILE) } else { 0 }\n"
+        "  Set-Content -LiteralPath $env:GATE_COUNT_FILE -Value ($count + 1)\n"
+        f"  if ($count -eq 0) {{ Write-Output 'IDLE' }} else {{ Write-Output '{gate}' }}\n"
+        "  exit 0\n"
+        "}\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    target = "b" * 40
+    local = "a" * 40
+    initial_head = target if restart_surviving_marker else local
+    agent_start = target if restart_surviving_marker else local
+    setup_marker = (
+        f"Set-Content -LiteralPath '{_ps_quote(marker)}' -Value '{target}' -NoNewline\n"
+        if restart_surviving_marker
+        else ""
+    )
+    operation = (
+        "$policy = [pscustomobject]@{ State='OK'; Line='OK|m4|all|||' }\n"
+        "$action = Complete-PendingUpdateRestart -MachinePolicy $policy\n"
+        "Write-Output \"restart action=$action marker=$(Test-Path -LiteralPath $updateRestartMarker) stops=$script:stops\"\n"
+        if restart_surviving_marker
+        else (
+            "$expected = [pscustomobject]@{ State='OK'; Line='OK|m4|all|||' }\n"
+            "$result = Invoke-AutoUpdate -ExpectedMachinePolicy $expected\n"
+            "Write-Output \"after-update result=$result marker=$(Test-Path -LiteralPath $updateRestartMarker) stops=$script:stops head=$script:head\"\n"
+            + (
+                "$later = [pscustomobject]@{ State='OK'; Line='OK|m4|all|||' }\n"
+                "$action = Complete-PendingUpdateRestart -MachinePolicy $later\n"
+                "Write-Output \"later action=$action marker=$(Test-Path -LiteralPath $updateRestartMarker) stops=$script:stops\"\n"
+                if complete_later
+                else ""
+            )
+        )
+    )
+    harness = tmp_path / "restart-sequence-harness.ps1"
+    harness.write_text(
+        "$Label = 'm4'\n"
+        f"$py = '{_ps_quote(py_shim)}'\n"
+        f"$updateRestartMarker = '{_ps_quote(marker)}'\n"
+        f"$agentStartHead = '{agent_start}'\n"
+        "$UpdateEverySec = 0\n"
+        "$script:lastUpdateCheck = [datetime]::MinValue\n"
+        "$script:updatePending = $false\n"
+        "$script:updBranch = $null\n"
+        "$script:updRemote = $null\n"
+        f"$script:head = '{initial_head}'\n"
+        "$script:policyCalls = 0\n"
+        "$script:stops = 0\n"
+        f"{declarations}\n"
+        "function Log-Update { param([string]$msg, [string]$color = 'Gray') }\n"
+        "function Get-ShortSha([string]$sha) { $sha }\n"
+        "function Slot-Of($proc) { 0 }\n"
+        "function Start-Sleep { param([int]$Seconds) }\n"
+        f"function Get-LocalWorkers {{ Add-Content '{_ps_quote(events)}' 'enumerate'; "
+        "@([pscustomobject]@{ ProcessId=123; CommandLine='--worker-id m4-0' }) }\n"
+        f"function Stop-Process {{ param($Id, [switch]$Force, $ErrorAction); "
+        f"$script:stops++; Add-Content '{_ps_quote(events)}' 'stop' }}\n"
+        "function Get-MachineBlackoutStatus {\n"
+        "  $script:policyCalls++\n"
+        "  if ($script:policyCalls -eq 1) { return [pscustomobject]@{ State='OK'; Line='OK|m4|all|||' } }\n"
+        f"  return [pscustomobject]@{{ State='{post_merge_state}'; Line='post-merge' }}\n"
+        "}\n"
+        "function git {\n"
+        "  param([Parameter(ValueFromRemainingArguments=$true)][string[]]$GitArgs)\n"
+        "  $key = $GitArgs -join ' '\n"
+        "  $global:LASTEXITCODE = 0\n"
+        "  switch ($key) {\n"
+        "    'rev-parse --abbrev-ref HEAD' { 'main' }\n"
+        "    'config branch.main.remote' { 'origin' }\n"
+        f"    'rev-parse origin/main' {{ '{target}' }}\n"
+        f"    'rev-parse {target}^{{tree}}' {{ '{'c' * 40}' }}\n"
+        "    'rev-parse HEAD' { $script:head }\n"
+        f"    'diff --name-only {local} {target}' {{ 'fleet-blackout-query.py' }}\n"
+        f"    'merge --ff-only --quiet {target}' {{ "
+        + ("$global:LASTEXITCODE = 17" if fail_merge else f"$script:head = '{target}'")
+        + " }\n"
+        "  }\n"
+        "}\n"
+        f"{functions}\n"
+        f"{setup_marker}"
+        f"{operation}",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["GATE_COUNT_FILE"] = str(gate_counter)
+    return subprocess.run(
+        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
 
 
 @pytest.mark.parametrize(
@@ -483,7 +623,9 @@ def test_fleet_agent_keep_only_attempts_allowlisted_recovery_before_skipping_tic
         '"fleet-blackout-query.py"',
         '"src/applypilot/fleet/machine_blackout.py"',
     ):
-        assert dependency in script[script.index("$selfFiles = @") : script.index("$script:lastUpdateCheck")]
+        assert dependency in script[
+            script.index("$recoveryFiles = @") : script.index("$script:lastUpdateCheck")
+        ]
 
 
 def test_fleet_agent_applies_allowlisted_recovery_without_worker_mutation(tmp_path):
@@ -491,6 +633,13 @@ def test_fleet_agent_applies_allowlisted_recovery_without_worker_mutation(tmp_pa
 
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "recovery\n"
+
+
+def test_fleet_agent_recovery_can_deliver_task_registration_fix(tmp_path):
+    result, worker = _run_recovery_update(tmp_path, "register-fleet-tasks.ps1")
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert (worker / "register-fleet-tasks.ps1").read_text(encoding="utf-8") == "recovery\n"
 
 
 def test_fleet_agent_recovery_rejects_unpinned_target(tmp_path):
@@ -502,6 +651,85 @@ def test_fleet_agent_recovery_rejects_unpinned_target(tmp_path):
 
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "old\n"
+
+
+def test_normal_update_rejects_unpinned_target(tmp_path):
+    result, marker = _run_update_harness(tmp_path, pinned_version="   ")
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not marker.exists()
+    assert "result=False" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_post_merge_keep_preserves_workers_and_later_tick_completes_restart(
+    tmp_path,
+    shell,
+):
+    result = _run_restart_sequence_harness(
+        tmp_path,
+        shell,
+        post_merge_state="KEEP",
+        complete_later=True,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "after-update result=False marker=True stops=0" in result.stdout
+    assert "later action=EXIT marker=False stops=1" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_restart_surviving_marker_reconciles_under_current_agent(tmp_path, shell):
+    result = _run_restart_sequence_harness(
+        tmp_path,
+        shell,
+        restart_surviving_marker=True,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "restart action=RECONCILE marker=False stops=1" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+@pytest.mark.parametrize("post_merge_state", ["OK", "BLOCKED"])
+def test_old_agent_exits_after_immediate_controlled_restart(
+    tmp_path,
+    shell,
+    post_merge_state,
+):
+    result = _run_restart_sequence_harness(
+        tmp_path,
+        shell,
+        post_merge_state=post_merge_state,
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert (tmp_path / "events.txt").read_text(encoding="utf-8").splitlines() == [
+        "enumerate",
+        "stop",
+    ]
+    assert not (tmp_path / "fleet-agent-update-restart.sha").exists()
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_post_merge_non_idle_gate_retains_marker_and_workers(tmp_path, shell):
+    result = _run_restart_sequence_harness(
+        tmp_path,
+        shell,
+        post_merge_state="OK",
+        gate="BUSY",
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "after-update result=False marker=True stops=0" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_merge_failure_clears_marker_without_stopping_workers(tmp_path, shell):
+    result = _run_restart_sequence_harness(tmp_path, shell, fail_merge=True)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "after-update result=False marker=False stops=0" in result.stdout
 
 
 @pytest.mark.parametrize(

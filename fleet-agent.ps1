@@ -14,11 +14,11 @@
 #   -AutoUpdate (worker boxes ONLY, never home -- home is the dev origin and pushes, never pulls):
 #   every -UpdateEverySec git-fetch the current branch's upstream; if behind and fast-forwardable
 #   with a clean tree, wait for a BETWEEN-JOBS window (fleet-agent-update-gate.py: no fresh
-#   non-idle heartbeat + no live lease for this Label; fail-closed), then stop local workers,
-#   ff-only pull, pip reinstall only if pyproject.toml changed, and let the next reconcile respawn
-#   workers on the new code. If the agent's own files changed it exits 1 so the FleetAgent
-#   scheduled task (RestartCount budget) relaunches it fresh -- manual foreground runs must
-#   relaunch by hand. Spec: docs/superpowers/specs/2026-07-03-fleet-pull-updater-design.md
+#   non-idle heartbeat + no live lease for this Label; fail-closed), merge the captured pinned
+#   target while workers remain running, and persist a target-SHA restart marker. A valid
+#   post-merge policy plus a still-IDLE gate completes the controlled worker restart. The old
+#   in-memory agent exits 1 for scheduled-task relaunch; a new agent reconciles directly.
+#   Dependency-changing updates are deferred. Spec: docs/superpowers/specs/2026-07-03-fleet-pull-updater-design.md
 #
 #   Fail-safe: on any DB blip the agent leaves local workers untouched (never kills on a transient error).
 param([Parameter(Mandatory = $true)][string]$Label, [int]$PollSec = 20,
@@ -26,6 +26,10 @@ param([Parameter(Mandatory = $true)][string]$Label, [int]$PollSec = 20,
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $repo
+$agentStartHead = "$(& git rev-parse HEAD 2>$null)".Trim()
+if ($LASTEXITCODE -ne 0 -or $agentStartHead -cnotmatch '^[0-9a-fA-F]{40}$') {
+  $agentStartHead = $null
+}
 
 # ---- host-identity guard: never run another machine's workers on this box ----
 # A box declares its OWN fleet label in APPLYPILOT_FLEET_LABEL (home/m2/m4). Running this
@@ -173,6 +177,7 @@ function Get-MachineBlackoutStatus([string]$Role) {
 
 # ---- auto-update (spec: 2026-07-03-fleet-pull-updater-design.md) ----
 $updateLog = Join-Path $repo ".fleet-logs\fleet-agent-update.log"
+$updateRestartMarker = Join-Path $repo ".fleet-logs\fleet-agent-update-restart.sha"
 function Log-Update([string]$msg, [string]$color = "Gray") {
   $line = "[{0}] [fleet-agent:{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Label, $msg
   Write-Host $line -ForegroundColor $color
@@ -186,13 +191,89 @@ function Log-Update([string]$msg, [string]$color = "Gray") {
 }
 function Get-ShortSha([string]$sha) { if ($sha -and $sha.Length -ge 9) { $sha.Substring(0, 9) } else { "$sha" } }
 
-# Files whose change requires the agent itself to restart (exit 1 -> scheduled-task relaunch).
-$selfFiles = @("fleet-agent.ps1", "fleet-agent-query.py", "fleet-agent-update-gate.py",
-                "fleet-agent-version.py", "fleet-blackout-query.py",
-                "src/applypilot/fleet/update_gate.py", "src/applypilot/fleet/machine_blackout.py")
+function Get-UpdateRestartTarget {
+  if (-not (Test-Path -LiteralPath $updateRestartMarker -PathType Leaf)) { return $null }
+  try {
+    $lines = @(Get-Content -LiteralPath $updateRestartMarker -ErrorAction Stop)
+    if ($lines.Count -ne 1) { throw "expected one line, got $($lines.Count)" }
+    $target = "$($lines[0])".Trim()
+    if ($target -cnotmatch '^[0-9a-fA-F]{40}$') { throw "target SHA is invalid" }
+    return $target
+  } catch {
+    Log-Update "restart marker invalid; retaining it and preserving workers: $_" "Red"
+    return $null
+  }
+}
+
+function Write-UpdateRestartMarker([string]$Target) {
+  $dir = Split-Path -Parent $updateRestartMarker
+  $tempMarker = "$updateRestartMarker.tmp.$PID"
+  try {
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath $tempMarker -Value $Target -Encoding Ascii -NoNewline -ErrorAction Stop
+    Move-Item -LiteralPath $tempMarker -Destination $updateRestartMarker -Force -ErrorAction Stop
+    return $true
+  } catch {
+    Remove-Item -LiteralPath $tempMarker -Force -ErrorAction SilentlyContinue
+    Log-Update "UPDATE BLOCKED: could not persist restart marker for $(Get-ShortSha $Target): $_" "Red"
+    return $false
+  }
+}
+
+function Clear-UpdateRestartMarker {
+  if (-not (Test-Path -LiteralPath $updateRestartMarker -PathType Leaf)) { return $true }
+  try {
+    Remove-Item -LiteralPath $updateRestartMarker -Force -ErrorAction Stop
+    return $true
+  } catch {
+    Log-Update "controlled restart marker could not be cleared; supervisor relaunch required: $_" "Red"
+    return $false
+  }
+}
+
+function Complete-PendingUpdateRestart([pscustomobject]$MachinePolicy) {
+  if (-not (Test-Path -LiteralPath $updateRestartMarker -PathType Leaf)) { return "NONE" }
+  $target = Get-UpdateRestartTarget
+  if (-not $target) { return "WAIT" }
+
+  $currentHead = "$(& git rev-parse HEAD 2>$null)".Trim()
+  $headExit = $LASTEXITCODE
+  if ($headExit -ne 0 -or $currentHead -cnotmatch '^[0-9a-fA-F]{40}$') {
+    Log-Update "restart marker deferred: current HEAD is unavailable or invalid" "Red"
+    return "WAIT"
+  }
+  if ($currentHead -cne $target) {
+    Log-Update "discarding pre-merge restart marker for $(Get-ShortSha $target); HEAD remains $(Get-ShortSha $currentHead)" "Yellow"
+    if (-not (Clear-UpdateRestartMarker)) { return "WAIT" }
+    return "NONE"
+  }
+  if ($null -eq $MachinePolicy -or @("OK", "BLOCKED") -cnotcontains $MachinePolicy.State) {
+    Log-Update "post-merge restart deferred: machine blackout policy is not a valid OK/BLOCKED verdict" "Yellow"
+    return "WAIT"
+  }
+
+  $gate = (& $py "fleet-agent-update-gate.py" $Label 2>$null | Select-Object -Last 1)
+  if ("$gate" -cne "IDLE") {
+    Log-Update "post-merge restart deferred: update gate is not IDLE (got '$gate')" "Yellow"
+    return "WAIT"
+  }
+
+  Log-Update "post-merge policy and IDLE gate valid -- restarting workers for $(Get-ShortSha $target)" "Cyan"
+  Get-LocalWorkers | ForEach-Object {
+    Log-Update "-stop $Label-$(Slot-Of $_) (controlled post-update restart)" "Yellow"
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 2
+  if (-not (Clear-UpdateRestartMarker)) { return "EXIT" }
+
+  if (-not $agentStartHead -or $agentStartHead -cne $target) { return "EXIT" }
+  return "RECONCILE"
+}
+
 # KEEP recovery is deliberately limited to the agent, blackout query/policy, and their focused tests.
 # Any other target path must wait for the normal between-jobs updater after a valid policy verdict.
 $recoveryFiles = @("fleet-agent.ps1", "fleet-blackout-query.py",
+                   "register-fleet-tasks.ps1",
                    "src/applypilot/fleet/machine_blackout.py",
                    "tests/test_fleet_agent_autoupdate_script.py",
                    "tests/test_fleet_machine_blackout.py",
@@ -203,8 +284,9 @@ $script:updBranch = $null
 $script:updRemote = $null
 
 function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$RecoveryOnly) {
-  # Normal mode returns $true when it stopped workers so the caller can respawn immediately.
+  # Normal mode merges with workers running, then completes a marker-controlled restart.
   # Recovery mode never mutates workers and exits after an allowlisted update is applied.
+  if (Test-Path -LiteralPath $updateRestartMarker -PathType Leaf) { return $false }
   $due = ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -ge $UpdateEverySec
   if (-not ($due -or $script:updatePending)) { return $false }
 
@@ -238,8 +320,8 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
   }
   $currentVersion = $vf[1]
   $pinnedVersion = $vf[2]
-  if ($RecoveryOnly -and [string]::IsNullOrWhiteSpace($pinnedVersion)) {
-    Log-Update "KEEP recovery blocked: pinned_worker_version is missing or blank" "Red"
+  if ([string]::IsNullOrWhiteSpace($pinnedVersion)) {
+    Log-Update "UPDATE BLOCKED: pinned_worker_version is missing or blank" "Red"
     $script:updatePending = $false; return $false
   }
   $packageVersion = $currentVersion
@@ -325,6 +407,11 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
     exit 1
   }
 
+  if ($targetChanges -contains "pyproject.toml") {
+    Log-Update "pyproject.toml changed; automatic update deferred because dependency mutation is not restart-safe" "Yellow"
+    $script:updatePending = $false; return $false
+  }
+
   if (-not $script:updatePending) { Log-Update "update available: $(Get-ShortSha $local) -> $(Get-ShortSha $target) (waiting for between-jobs window)" "Cyan" }
   $script:updatePending = $true
 
@@ -340,46 +427,51 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
     return $false
   }
 
-  Log-Update "between-jobs window open -- updating" "Cyan"
-  Get-LocalWorkers | ForEach-Object {
-    Log-Update "-stop $Label-$(Slot-Of $_) (pre-update)" "Yellow"
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  if (-not (Write-UpdateRestartMarker $target)) {
+    $script:updatePending = $false; return $false
   }
-  Start-Sleep -Seconds 2
 
+  Log-Update "between-jobs window open -- merging captured target while current workers remain running" "Cyan"
   & git merge --ff-only --quiet $target 2>$null
   if ($LASTEXITCODE -ne 0) {
-    Log-Update "UPDATE FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local); workers respawn on old code" "Red"
-    $script:updatePending = $false; return $true
+    Clear-UpdateRestartMarker | Out-Null
+    Log-Update "UPDATE FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local); workers remain running" "Red"
+    $script:updatePending = $false; return $false
   }
   $mergedHead = (& git rev-parse HEAD 2>$null)
   $mergedHeadExit = $LASTEXITCODE
   $mergedHead = "$mergedHead".Trim()
   if ($mergedHeadExit -ne 0 -or $mergedHead -cne $target) {
-    Log-Update "UPDATE FAILED: HEAD verification did not match captured target $(Get-ShortSha $target); workers respawn conservatively" "Red"
-    $script:updatePending = $false; return $true
+    Clear-UpdateRestartMarker | Out-Null
+    Log-Update "UPDATE FAILED: HEAD verification did not match captured target $(Get-ShortSha $target); workers remain running" "Red"
+    $script:updatePending = $false; return $false
   }
   $script:updatePending = $false
   $changed = $targetChanges
   Log-Update "updated $(Get-ShortSha $local) -> $(Get-ShortSha $target) ($($changed.Count) files)" "Green"
 
-  if ($changed -contains "pyproject.toml") {
-    Log-Update "pyproject.toml changed -> pip install -e ." "Cyan"
-    & $py -m pip install -e . --quiet
-    if ($LASTEXITCODE -ne 0) { Log-Update "PIP INSTALL FAILED -- new code + old deps; fix by hand ASAP" "Red" }
-  }
-  $selfChanged = @($changed | Where-Object { $selfFiles -contains ($_ -replace '\\', '/') })
-  if ($selfChanged.Count -gt 0) {
-    Log-Update "agent's own files changed ($($selfChanged -join ', ')) -- exiting for supervisor relaunch (manual runs: restart fleet-agent.ps1 yourself)" "Yellow"
+  $postMergePolicy = Get-MachineBlackoutStatus "all"
+  $restartAction = Complete-PendingUpdateRestart -MachinePolicy $postMergePolicy
+  if ($restartAction -eq "EXIT") {
+    Log-Update "controlled restart complete under old agent code -- exiting for supervisor relaunch" "Yellow"
     exit 1
   }
-  return $true
+  return ($restartAction -eq "RECONCILE")
 }
 
 $lastGen = $null
 Write-Host "[fleet-agent:$Label] online -- reconciling LOCAL workers to fleet_desired_state every ${PollSec}s (Ctrl-C to stop)" -ForegroundColor Cyan
 while ($true) {
   $machinePolicy = Get-MachineBlackoutStatus "all"
+  $restartAction = Complete-PendingUpdateRestart -MachinePolicy $machinePolicy
+  if ($restartAction -eq "EXIT") {
+    Log-Update "pending controlled restart complete under old agent code -- exiting for supervisor relaunch" "Yellow"
+    exit 1
+  }
+  if ($restartAction -eq "WAIT") {
+    Start-Sleep -Seconds $PollSec
+    continue
+  }
   if ($machinePolicy.State -eq "KEEP") {
     Write-Host "[fleet-agent:$Label] blackout status unavailable or invalid; preserving existing workers for this tick. $($machinePolicy.Line)" -ForegroundColor Yellow
     if ($AutoUpdate) { Invoke-AutoUpdate -RecoveryOnly | Out-Null }
@@ -391,6 +483,15 @@ while ($true) {
   if ($AutoUpdate) {
     Invoke-AutoUpdate -ExpectedMachinePolicy $machinePolicy | Out-Null
     $machinePolicy = Get-MachineBlackoutStatus "all"
+    $restartAction = Complete-PendingUpdateRestart -MachinePolicy $machinePolicy
+    if ($restartAction -eq "EXIT") {
+      Log-Update "post-update controlled restart complete under old agent code -- exiting for supervisor relaunch" "Yellow"
+      exit 1
+    }
+    if ($restartAction -eq "WAIT") {
+      Start-Sleep -Seconds $PollSec
+      continue
+    }
     if ($machinePolicy.State -eq "KEEP") {
       Write-Host "[fleet-agent:$Label] blackout status changed or became uncertain after update check; preserving existing workers for this tick. $($machinePolicy.Line)" -ForegroundColor Yellow
       Start-Sleep -Seconds $PollSec
