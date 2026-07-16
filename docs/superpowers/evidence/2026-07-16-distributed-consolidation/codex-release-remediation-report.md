@@ -4,7 +4,7 @@ Run date: 2026-07-16
 
 Branch: `codex/cloud-cutover-runtime-integration`
 Plan: `docs/superpowers/plans/2026-07-16-parallel-release-remediation.md`
-Verified candidate head: `5f75b7cb3e150cf6bf96b4664de80c3c20dac393`
+Verified candidate head: `ef39c9b4e821392f01e332266328b744a2a7b03d`
 
 ## Integrated Work
 
@@ -54,20 +54,24 @@ Claude C1 source commit: `fdf16af`. The commit was pushed to `claude/resbuild-po
 
 ## Final CI Evidence
 
-Final workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29516416588
+Final workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29523654026
 
-- Python 3.11: `2230 passed, 982 skipped in 103.45s`.
-- Python 3.12: `2230 passed, 982 skipped in 95.00s`.
+- Python 3.11: `3088 passed, 124 skipped in 250.85s` against disposable PostgreSQL 18.
+- Python 3.12: `3088 passed, 124 skipped in 282.58s` against disposable PostgreSQL 18.
 - Python 3.12 wheel and source distribution: passed.
-- Windows-native contracts: `894 passed, 1 skipped in 984.51s`.
+- Windows-native contracts, partitioned into four independent lanes: `894 passed, 1 skipped` total.
+  - Phase A evidence: `99 passed`.
+  - Legacy containment: `531 passed, 1 skipped`.
+  - Fleet script contracts: `163 passed`.
+  - Browser and OTP contracts: `101 passed`.
 - Container candidate build: passed without registry login or push.
 - Deterministic container smoke check: passed.
 - Overall workflow conclusion: `success`.
 
-The skipped CI tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. They remain explicit release-environment follow-up gates, not silent passes.
+The remaining 124 skipped tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. They remain explicit release-environment follow-up gates, not silent passes.
 
 ## Scope Decision
 
-Codex-owned X1, X2, and X3 integration/release-gate work are complete, including Claude C1. The parallel remediation plan is complete through code integration and CI verification. Production deployment, staging validation, and canary approval remain separate operational steps.
+Codex-owned X1, X2, and X3 integration/release-gate work are complete, including Claude C1. The parallel remediation plan is complete through code integration and service-backed CI verification. Production deployment, staging validation, and canary approval remain separate operational steps.
 
 No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched. Production application lanes remain paused pending separate staging validation and canary approval.
