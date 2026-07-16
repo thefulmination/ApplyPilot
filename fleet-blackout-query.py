@@ -64,17 +64,41 @@ _AUTHORITY_IDENTITY_FIELDS = frozenset(
         "oauth_scope",
     }
 )
+_SENSITIVE_AUTHORITY_FIELDS = frozenset(
+    {
+        "password",
+        "sslpassword",
+        "passfile",
+        "sslkey",
+        "oauth_client_secret",
+        "scram_client_key",
+        "scram_server_key",
+    }
+)
+_SENSITIVE_KEY_PATTERN = "|".join(
+    re.escape(key) for key in sorted(_SENSITIVE_AUTHORITY_FIELDS, key=len, reverse=True)
+)
 
 
 def _normalized_dsn(dsn: str) -> dict[str, str]:
-    normalized = {
+    defaults = {
         option.keyword.decode(): option.val.decode()
         for option in pq.Conninfo.get_defaults()
         if option.val is not None
     }
+    normalized = dict(defaults)
     normalized.update(conninfo_to_dict(dsn))
-    if "dbname" not in normalized and "user" in normalized:
+    for key in ("host", "hostaddr"):
+        if normalized.get(key) == "":
+            normalized.pop(key)
+    if normalized.get("port") == "":
+        if "port" in defaults:
+            normalized["port"] = defaults["port"]
+        else:
+            normalized.pop("port")
+    if not normalized.get("dbname") and normalized.get("user"):
         normalized["dbname"] = normalized["user"]
+    normalized.setdefault("sslcertmode", "allow")
     return {key: value for key, value in normalized.items() if key in _AUTHORITY_IDENTITY_FIELDS}
 
 
@@ -89,7 +113,7 @@ def _sanitized_error(exc: Exception, *dsns: str) -> str:
             parsed = _normalized_dsn(dsn)
         except Exception:
             parsed = {}
-        for key in ("password", "sslpassword"):
+        for key in _SENSITIVE_AUTHORITY_FIELDS:
             secret = parsed.get(key)
             if secret:
                 message = message.replace(secret, "***")
@@ -99,8 +123,8 @@ def _sanitized_error(exc: Exception, *dsns: str) -> str:
         message,
     )
     message = re.sub(
-        r"(?i)\b(password|sslpassword|passfile)\s*=\s*(?:'[^']*'|\S+)",
-        r"\1=***",
+        rf"(?i)\b({_SENSITIVE_KEY_PATTERN})\s*=\s*(?:'[^']*'|\"[^\"]*\"|\S+)",
+        lambda match: f"{match.group(1)}=***",
         message,
     )
     return _safe_field(message)
