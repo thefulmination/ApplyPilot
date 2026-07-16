@@ -20,6 +20,17 @@ require_file() {
   fi
 }
 
+wait_for_file() {
+  local path="$1"
+  local timeout="${APPLYPILOT_ASSET_WAIT_SECONDS:-0}"
+  local started=$SECONDS
+  while [ ! -s "$path" ] && [ "$((SECONDS - started))" -lt "$timeout" ]; do
+    echo "[entrypoint] waiting for mounted asset: $path"
+    sleep 5
+  done
+  require_file "$path"
+}
+
 forbidden_database_vars=(
   APPLYPILOT_FLEET_DSN
   APPLYPILOT_ADMIN_PG_DSN
@@ -92,8 +103,8 @@ require_env DEEPSEEK_API_KEY
 require_env APPLYPILOT_WORKER_ID
 require_env APPLYPILOT_WORKER_CONTRACT
 require_env APPLYPILOT_RELEASE_VERSION
-require_file "${APPLYPILOT_DIR:-/data/applypilot}/profile.json"
-require_file "${APPLYPILOT_DIR:-/data/applypilot}/resume.pdf"
+wait_for_file "${APPLYPILOT_DIR:-/data/applypilot}/profile.json"
+wait_for_file "${APPLYPILOT_DIR:-/data/applypilot}/resume.pdf"
 
 export FLEET_MACHINE_OWNER="${FLEET_MACHINE_OWNER:-railway}"
 export APPLYPILOT_FLEET_LABEL="${APPLYPILOT_FLEET_LABEL:-$FLEET_MACHINE_OWNER}"
