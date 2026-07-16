@@ -70,6 +70,7 @@ jobs:
           tests/test_chrome_reservation.py
           tests/test_linkedin_login.py
           tests/test_otp_runbooks_and_bootstrap.py
+          tests/test_mapped_role_deployment_contract.py::test_abrupt_committed_receipt_finalization_leaves_prior_in_doubt_receipt_intact
 
   test:
     runs-on: ubuntu-latest

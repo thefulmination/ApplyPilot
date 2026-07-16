@@ -500,6 +500,7 @@ def test_apply_cleanup_false_persists_fault_and_escapes_without_result(monkeypat
 
     monkeypatch.setattr(chrome, "launch_chrome", fake_launch)
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: False)
+    monkeypatch.setattr(awm, "_should_launch_chrome_headless", lambda: False)
     monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: False)
     monkeypatch.setattr(launcher, "run_job", lambda *args, **kwargs: (run_calls.append(1) or "expired", 1.0))

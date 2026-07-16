@@ -1418,11 +1418,29 @@ def _read_ready_marker(marker: Path, destination: Path) -> tuple[str, _FileIdent
 
 
 def _validate_recovery_file(path: Path, identity: _FileIdentity, receipt: SealedSnapshotReceipt) -> None:
+    def same_published_file(current: _FileIdentity) -> bool:
+        # Removing the source hard link after publication legitimately changes
+        # ctime on POSIX. The remaining fields bind the marker to the same file;
+        # the digest and SQLite check below bind its contents.
+        return (
+            current.device,
+            current.inode,
+            current.size,
+            current.mtime_ns,
+        ) == (
+            identity.device,
+            identity.inode,
+            identity.size,
+            identity.mtime_ns,
+        )
+
     if not _is_single_regular_file(path):
         raise SnapshotChangedError(f"published sealed destination is not an owned regular file: {path}")
-    if _FileIdentity.read(path) != identity:
+    if not same_published_file(_FileIdentity.read(path)):
         raise SnapshotChangedError(f"published sealed destination identity mismatch: {path}")
     sha256, current_identity = _hash_file(path)
+    if not same_published_file(current_identity):
+        raise SnapshotChangedError(f"published sealed destination identity mismatch: {path}")
     if sha256 != receipt.sha256 or current_identity.size != receipt.size:
         raise SnapshotChangedError(f"published sealed destination fingerprint mismatch: {path}")
     if _quick_check_path(path) != receipt.quick_check:

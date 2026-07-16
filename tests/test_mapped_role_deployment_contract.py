@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -295,6 +297,7 @@ def test_hba_post_write_failure_restores_hba_and_outputs_byte_exact(tmp_path: Pa
         assert path.read_bytes() == data
 
 
+@pytest.mark.skipif(os.name != "nt", reason="forced self-termination and durable temp semantics are Windows-native")
 def test_abrupt_committed_receipt_finalization_leaves_prior_in_doubt_receipt_intact(
     tmp_path: Path,
 ) -> None:
