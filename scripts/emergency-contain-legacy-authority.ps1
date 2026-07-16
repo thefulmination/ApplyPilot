@@ -1910,14 +1910,8 @@ namespace ApplyPilot
         private const uint GenericWrite = 0x40000000;
         private const uint Delete = 0x00010000;
         private const uint CreateNew = 1;
-        private const uint FileAttributeNormal = 0x00000080;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct FileDispositionInfo
-        {
-            [MarshalAs(UnmanagedType.Bool)]
-            public bool DeleteFile;
-        }
+        private const uint FileAttributeTemporary = 0x00000100;
+        private const uint FileFlagDeleteOnClose = 0x04000000;
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern SafeFileHandle CreateFileW(
@@ -1929,14 +1923,14 @@ namespace ApplyPilot
             uint flagsAndAttributes,
             IntPtr templateFile);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetFileInformationByHandle(
-            SafeFileHandle file,
-            int informationClass,
-            ref FileDispositionInfo information,
-            uint bufferSize);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateHardLinkW(
+            string newFileName,
+            string existingFileName,
+            IntPtr securityAttributes);
 
-        public static SafeFileHandle CreateEvidence(string path)
+        public static SafeFileHandle CreateEvidenceStage(string path)
         {
             SafeFileHandle handle = CreateFileW(
                 path,
@@ -1944,7 +1938,7 @@ namespace ApplyPilot
                 0,
                 IntPtr.Zero,
                 CreateNew,
-                FileAttributeNormal,
+                FileAttributeTemporary | FileFlagDeleteOnClose,
                 IntPtr.Zero);
             if (handle.IsInvalid)
             {
@@ -1952,23 +1946,12 @@ namespace ApplyPilot
                 handle.Dispose();
                 throw new Win32Exception(error);
             }
-            try
-            {
-                SetDeleteDisposition(handle, true);
-            }
-            catch
-            {
-                handle.Dispose();
-                throw;
-            }
             return handle;
         }
 
-        public static void SetDeleteDisposition(SafeFileHandle handle, bool deleteFile)
+        public static void PublishEvidence(string finalPath, string stagePath)
         {
-            var information = new FileDispositionInfo { DeleteFile = deleteFile };
-            uint size = (uint)Marshal.SizeOf<FileDispositionInfo>();
-            if (!SetFileInformationByHandle(handle, 4, ref information, size))
+            if (!CreateHardLinkW(finalPath, stagePath, IntPtr.Zero))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
@@ -1978,36 +1961,61 @@ namespace ApplyPilot
 '@
 }
 
+function New-KnownEvidenceStagePath([string]$FinalPath) {
+  $directory = [IO.Path]::GetDirectoryName($FinalPath)
+  $name = '.applypilot-emergency-containment-stage-{0}.tmp' -f [guid]::NewGuid().ToString('N')
+  return [IO.Path]::Combine($directory, $name)
+}
+
 function Open-KnownEvidenceExclusive([string]$Path) {
   Initialize-KnownEvidenceNativeApi
+  try {
+    $stream = Open-KnownExistingEvidenceExclusive $Path
+    return [pscustomobject]@{
+      stream = $stream
+      created = $false
+      final_path = $Path
+      stage_path = $null
+    }
+  } catch [IO.FileNotFoundException] {
+  }
+
   $handle = $null
   try {
-    $handle = [ApplyPilot.KnownEvidenceNativeApi]::CreateEvidence($Path)
-    try {
-      $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::ReadWrite)
-      $handle = $null
-      return [pscustomobject]@{ stream = $stream; created = $true }
-    } catch {
-      $handle.Dispose()
-      throw
+    $stagePath = $null
+    for ($attempt = 0; $attempt -lt 16; $attempt++) {
+      $stagePath = New-KnownEvidenceStagePath $Path
+      try {
+        $handle = [ApplyPilot.KnownEvidenceNativeApi]::CreateEvidenceStage($stagePath)
+        break
+      } catch [ComponentModel.Win32Exception] {
+        if ($_.Exception.NativeErrorCode -notin @(80, 183) -or $attempt -eq 15) { throw }
+      }
     }
-  } catch [ComponentModel.Win32Exception] {
-    if ($_.Exception.NativeErrorCode -notin @(80, 183)) { throw }
-    $stream = [IO.FileStream]::new(
-      $Path,
-      [IO.FileMode]::Open,
-      [IO.FileAccess]::Read,
-      [IO.FileShare]::None
-    )
-    return [pscustomobject]@{ stream = $stream; created = $false }
-  } finally {
+    if ($null -eq $handle) { throw 'failed to create unique evidence staging file' }
+    $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::ReadWrite)
+    $handle = $null
+    return [pscustomobject]@{
+      stream = $stream
+      created = $true
+      final_path = $Path
+      stage_path = $stagePath
+    }
+  } catch {
     if ($null -ne $handle) { $handle.Dispose() }
+    throw
   }
 }
 
-function Publish-NewKnownEvidenceByHandle($Stream) {
+function Publish-NewKnownEvidenceByHandle($Lease) {
   Initialize-KnownEvidenceNativeApi
-  [ApplyPilot.KnownEvidenceNativeApi]::SetDeleteDisposition($Stream.SafeFileHandle, $false)
+  if (-not $Lease.created -or [string]::IsNullOrWhiteSpace([string]$Lease.stage_path)) {
+    throw 'only newly staged evidence can be published'
+  }
+  [ApplyPilot.KnownEvidenceNativeApi]::PublishEvidence(
+    [string]$Lease.final_path,
+    [string]$Lease.stage_path
+  )
 }
 
 function Open-KnownExistingEvidenceExclusive([string]$Path) {
@@ -2472,7 +2480,7 @@ function Remove-EmbeddedWrapperDsns {
           Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
           Flush-KnownEvidenceStream $evidenceStream
           Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
-          Publish-NewKnownEvidenceByHandle $evidenceStream
+          Publish-NewKnownEvidenceByHandle $evidenceLease
         } else {
           Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
         }
