@@ -43,9 +43,27 @@ concurrency:
 jobs:
   phase-a-windows-file:
     runs-on: windows-latest
-    # The native evidence-store and browser-contract tests are intentionally
-    # serialized on Windows; a cold hosted runner can take ~16 minutes.
-    timeout-minutes: 30
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: phase-a-evidence
+            tests: >-
+              tests/test_phase_a_windows_file.py
+              tests/test_phase_a_evidence_store.py
+          - name: legacy-containment
+            tests: tests/test_emergency_legacy_authority_containment.py
+          - name: fleet-script-contracts
+            tests: >-
+              tests/test_fleet_machine_blackout_scripts.py
+              tests/test_fleet_agent_autoupdate_script.py
+          - name: browser-and-otp-contracts
+            tests: >-
+              tests/test_chrome_reservation.py
+              tests/test_linkedin_login.py
+              tests/test_otp_runbooks_and_bootstrap.py
+              tests/test_mapped_role_deployment_contract.py::test_abrupt_committed_receipt_finalization_leaves_prior_in_doubt_receipt_intact
 
     steps:
       - name: Checkout
@@ -62,17 +80,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Test Windows-native runtime contracts
-        run: >-
-          python -m pytest -q
-          tests/test_phase_a_windows_file.py
-          tests/test_phase_a_evidence_store.py
-          tests/test_emergency_legacy_authority_containment.py
-          tests/test_fleet_machine_blackout_scripts.py
-          tests/test_fleet_agent_autoupdate_script.py
-          tests/test_chrome_reservation.py
-          tests/test_linkedin_login.py
-          tests/test_otp_runbooks_and_bootstrap.py
-          tests/test_mapped_role_deployment_contract.py::test_abrupt_committed_receipt_finalization_leaves_prior_in_doubt_receipt_intact
+        run: python -m pytest -q ${{ matrix.tests }}
 
   test:
     runs-on: ubuntu-latest
