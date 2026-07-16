@@ -80,9 +80,27 @@ def test_blackout_poll_rejects_database_url_without_fleet_dsn(monkeypatch, capsy
     assert "No fleet Postgres DSN" in captured.err
 
 
-def test_blackout_poll_rejects_conflicting_fleet_dsns(monkeypatch, capsys):
-    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://fleet-one.invalid/app")
-    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://fleet-two.invalid/app")
+@pytest.mark.parametrize(
+    "applypilot_fleet_dsn",
+    [
+        "postgresql://worker:other-secret@fleet-two.invalid:5432/applypilot",
+        "postgresql://worker:other-secret@fleet-one.invalid:5433/applypilot",
+        "postgresql://worker:other-secret@fleet-one.invalid:5432/other_database",
+        "postgresql://other-user:other-secret@fleet-one.invalid:5432/applypilot",
+        "postgresql://worker:different-secret@fleet-one.invalid:5432/applypilot",
+    ],
+)
+def test_blackout_poll_rejects_conflicting_fleet_dsns(
+    applypilot_fleet_dsn,
+    monkeypatch,
+    capsys,
+):
+    fleet_secret = "fleet-secret"
+    monkeypatch.setenv(
+        "FLEET_PG_DSN",
+        f"postgresql://worker:{fleet_secret}@fleet-one.invalid:5432/applypilot",
+    )
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", applypilot_fleet_dsn)
     monkeypatch.setattr(
         pgqueue,
         "connect",
@@ -95,6 +113,39 @@ def test_blackout_poll_rejects_conflicting_fleet_dsns(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
     assert "Inconsistent fleet Postgres DSN references" in captured.err
+    assert fleet_secret not in captured.out
+    assert fleet_secret not in captured.err
+    assert "other-secret" not in captured.out
+    assert "other-secret" not in captured.err
+    assert "different-secret" not in captured.out
+    assert "different-secret" not in captured.err
+
+
+def test_blackout_poll_does_not_equate_omitted_host_with_localhost(monkeypatch, capsys):
+    secret = "socket-secret"
+    monkeypatch.delenv("PGHOST", raising=False)
+    monkeypatch.setenv(
+        "FLEET_PG_DSN",
+        f"port=5432 dbname=applypilot user=worker password={secret}",
+    )
+    monkeypatch.setenv(
+        "APPLYPILOT_FLEET_DSN",
+        f"postgresql://worker:{secret}@localhost:5432/applypilot",
+    )
+    monkeypatch.setattr(
+        pgqueue,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("different destinations reached connector"),
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert "Inconsistent fleet Postgres DSN references" in captured.err
+    assert secret not in captured.out
+    assert secret not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -108,6 +159,17 @@ def test_blackout_poll_rejects_conflicting_fleet_dsns(monkeypatch, capsys):
             "postgresql://worker:secret@fleet.example:5432/applypilot?connect_timeout=5",
             "host=fleet.example port=5432 dbname=applypilot user=worker password=secret connect_timeout=5",
         ),
+        (
+            "host=fleet.example dbname=applypilot user=worker password=secret",
+            "postgresql://worker:secret@fleet.example:5432/applypilot",
+        ),
+        (
+            "host=fleet.example dbname=applypilot user=worker password=secret",
+            (
+                "host=fleet.example port=5432 dbname=applypilot user=worker password=secret "
+                "sslmode=prefer target_session_attrs=any"
+            ),
+        ),
     ],
 )
 def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
@@ -117,6 +179,8 @@ def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
     capsys,
 ):
     conn = _ReadOnlyConnection()
+    for variable in ("PGPORT", "PGSSLMODE", "PGTARGETSESSIONATTRS"):
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("FLEET_PG_DSN", fleet_dsn)
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", applypilot_fleet_dsn)
     monkeypatch.setattr(pgqueue, "connect", lambda dsn: conn if dsn == fleet_dsn else None)
