@@ -75,6 +75,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: applypilot_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: applypilot-ci-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applypilot_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
@@ -99,6 +113,8 @@ jobs:
         run: ruff check src/
 
       - name: Test
+        env:
+          APPLYPILOT_PGTEST_DSN: postgresql://postgres:applypilot-ci-test-only@127.0.0.1:5432/applypilot_test
         run: >-
           pytest tests/ -v
           --ignore=tests/test_emergency_legacy_authority_containment.py

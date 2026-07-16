@@ -1,7 +1,7 @@
 """Shared pytest fixtures for the distributed fleet v3 tests.
 
-Provides a DISPOSABLE local Postgres (from the ``applypilot-pgtest`` conda env) and
-a clean-schema ``fleet_db`` fixture. Mirrors the disposable cluster in
+Provides a DISPOSABLE local Postgres (from the ``applypilot-pgtest`` conda env, or
+an explicitly supplied test DSN) and a clean-schema ``fleet_db`` fixture. Mirrors the disposable cluster in
 tests/test_fleet_pgqueue.py but is kept separate (distinct fixture names) so the
 existing pgqueue tests are untouched.
 """
@@ -116,6 +116,13 @@ def _free_port() -> int:
 @pytest.fixture(scope="session")
 def fleet_pg():
     global _FLEET_PG_LOGFILE
+
+    # CI supplies a disposable service-container DSN. This path deliberately
+    # never starts or stops the server: ownership remains with the CI job.
+    external_dsn = os.environ.get("APPLYPILOT_PGTEST_DSN")
+    if external_dsn:
+        yield external_dsn
+        return
 
     binp = _find_pg_bin()
     if binp is None:
