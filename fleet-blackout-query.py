@@ -16,10 +16,10 @@ dsn = os.environ.get("FLEET_PG_DSN") or os.environ.get("APPLYPILOT_FLEET_DSN") o
 
 try:
     from applypilot.apply import pgqueue
-    from applypilot.fleet import machine_blackout, schema
+    from applypilot.fleet import machine_blackout
 
     conn = pgqueue.connect(dsn)
-    schema.ensure_schema_v3(conn)
+    conn.read_only = True
     print(machine_blackout.status_line(conn, label, role=role))
 except Exception as exc:
     print(f"fleet-blackout-query: {type(exc).__name__}: {exc}", file=sys.stderr)

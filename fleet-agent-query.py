@@ -17,6 +17,7 @@ try:
     from applypilot.apply import pgqueue
     dsn = require_fleet_pg_dsn(os.environ)
     conn = pgqueue.connect(dsn)
+    conn.read_only = True
     with conn.cursor() as cur:
         cur.execute("SELECT public.fleet_worker_admission_snapshot() AS state")
         r = cur.fetchone()["state"] or {}

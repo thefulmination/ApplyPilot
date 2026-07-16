@@ -74,6 +74,7 @@ applypilot-fleet-reconcile-email = "applypilot.fleet.email_reconcile_main:main"
 applypilot-fleet-otp-home = "applypilot.fleet.otp_responder_main:main"
 applypilot-fleet-deadman = "applypilot.fleet.deadman:main"
 applypilot-fleet-control = "applypilot.fleet.machine_blackout_main:main"
+applypilot-fleet-migrate-schema = "applypilot.fleet.schema_main:main"
 applypilot-greenhouse-shadow = "applypilot.apply.greenhouse_shadow_main:main"
 
 [project.urls]
