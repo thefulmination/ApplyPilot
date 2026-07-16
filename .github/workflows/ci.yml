@@ -77,7 +77,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           # The database-backed security tests intentionally exercise database
           # ACLs and CREATE DATABASE behavior against the default postgres DB.

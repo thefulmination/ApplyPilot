@@ -189,6 +189,7 @@ def fleet_db(fleet_pg, monkeypatch):
         # canonical v3 schema, so remove it before each clean-schema test rather
         # than allowing one test's shape to leak into the next.
         conn.execute("DROP TABLE IF EXISTS fleet_desired_state CASCADE;")
+        conn.commit()
         fleet_schema.ensure_schema_v3(conn)
         with conn.cursor() as cur:
             cur.execute("TRUNCATE apply_queue CASCADE;")
