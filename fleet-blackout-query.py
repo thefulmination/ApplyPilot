@@ -24,6 +24,8 @@ def _normalized_dsn(dsn: str) -> dict[str, str]:
         if option.val is not None
     }
     normalized.update(conninfo_to_dict(dsn))
+    if "dbname" not in normalized and "user" in normalized:
+        normalized["dbname"] = normalized["user"]
     return normalized
 
 

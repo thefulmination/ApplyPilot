@@ -170,6 +170,14 @@ def test_blackout_poll_does_not_equate_omitted_host_with_localhost(monkeypatch, 
                 "sslmode=prefer target_session_attrs=any"
             ),
         ),
+        (
+            "host=fleet.example user=worker password=secret",
+            "host=fleet.example user=worker password=secret dbname=worker",
+        ),
+        (
+            "postgresql://worker:secret@fleet.example",
+            "postgresql://worker:secret@fleet.example/worker",
+        ),
     ],
 )
 def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
