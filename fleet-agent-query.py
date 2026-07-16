@@ -9,8 +9,13 @@ On any error it prints "STOP|||" so stale desired state cannot preserve acquisit
 """
 import os
 import sys
+from pathlib import Path
 
-from fleet_agent_env import require_fleet_pg_dsn
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from fleet_agent_env import require_fleet_pg_dsn  # noqa: E402
 
 label = sys.argv[1] if len(sys.argv) > 1 else "home"
 try:

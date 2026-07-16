@@ -2706,6 +2706,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+    mcp_config_path.parent.mkdir(parents=True, exist_ok=True)
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
     agent = _normalize_agent(agent)

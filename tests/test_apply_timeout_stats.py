@@ -58,6 +58,7 @@ def test_timeout_records_last_run_stats(monkeypatch, tmp_path: Path, acquisition
     monkeypatch.setattr(launcher, "_maybe_lever_shadow", lambda *a, **k: None)
     monkeypatch.setattr(launcher, "reset_worker_dir", lambda worker_id: tmp_path / f"worker-{worker_id}")
     monkeypatch.setattr(launcher.prompt_mod, "build_prompt", lambda **kwargs: "prompt")
+    monkeypatch.setattr(launcher, "build_apply_agent_command", lambda **kwargs: ["agent"])
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **k: _FakeProc())
     monkeypatch.setattr(launcher.threading, "Thread", _FakeThread)
     monkeypatch.setattr(

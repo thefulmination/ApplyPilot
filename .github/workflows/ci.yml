@@ -48,6 +48,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -57,8 +59,17 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      - name: Test Phase A Windows handles and evidence store
-        run: python -m pytest -q tests/test_phase_a_windows_file.py tests/test_phase_a_evidence_store.py
+      - name: Test Windows-native runtime contracts
+        run: >-
+          python -m pytest -q
+          tests/test_phase_a_windows_file.py
+          tests/test_phase_a_evidence_store.py
+          tests/test_emergency_legacy_authority_containment.py
+          tests/test_fleet_machine_blackout_scripts.py
+          tests/test_fleet_agent_autoupdate_script.py
+          tests/test_chrome_reservation.py
+          tests/test_linkedin_login.py
+          tests/test_otp_runbooks_and_bootstrap.py
 
   test:
     runs-on: ubuntu-latest
@@ -70,6 +81,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -85,7 +98,14 @@ jobs:
         run: ruff check src/
 
       - name: Test
-        run: pytest tests/ -v --ignore=tests/test_fleet_machine_blackout_scripts.py
+        run: >-
+          pytest tests/ -v
+          --ignore=tests/test_emergency_legacy_authority_containment.py
+          --ignore=tests/test_fleet_machine_blackout_scripts.py
+          --ignore=tests/test_fleet_agent_autoupdate_script.py
+          --ignore=tests/test_chrome_reservation.py
+          --ignore=tests/test_linkedin_login.py
+          --ignore=tests/test_otp_runbooks_and_bootstrap.py
 
       - name: Install package build tools
         if: matrix.python-version == '3.12'
