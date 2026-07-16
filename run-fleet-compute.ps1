@@ -72,8 +72,16 @@ $pyGuard = @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe") | Where-Ob
 if (-not $pyGuard) { $pyGuard = "python" }
 
 function Test-MachineBlackout([string]$Role) {
-  $lines = @(& $pyGuard (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null)
-  $queryExit = $LASTEXITCODE
+  $stderrPath = [IO.Path]::GetTempFileName()
+  try {
+    $lines = @(& $pyGuard (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2> $stderrPath)
+    $queryExit = $LASTEXITCODE
+    Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue | ForEach-Object {
+      if (-not [string]::IsNullOrWhiteSpace("$_")) { [Console]::Error.WriteLine("$_") }
+    }
+  } finally {
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+  }
   if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
   if ($lines.Count -eq 0) { return "ERROR|empty-blackout-status" }
   if ($lines.Count -ne 1) { return "ERROR|multiline-blackout-status" }
