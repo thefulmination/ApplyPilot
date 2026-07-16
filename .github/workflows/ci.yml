@@ -43,7 +43,9 @@ concurrency:
 jobs:
   phase-a-windows-file:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # The native evidence-store and browser-contract tests are intentionally
+    # serialized on Windows; a cold hosted runner can take ~16 minutes.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
