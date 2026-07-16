@@ -13,11 +13,18 @@ import os
 import re
 import sys
 
+from psycopg import pq
 from psycopg.conninfo import conninfo_to_dict
 
 
 def _normalized_dsn(dsn: str) -> dict[str, str]:
-    return dict(conninfo_to_dict(dsn))
+    normalized = {
+        option.keyword.decode(): option.val.decode()
+        for option in pq.Conninfo.get_defaults()
+        if option.val is not None
+    }
+    normalized.update(conninfo_to_dict(dsn))
+    return normalized
 
 
 def _safe_field(value: object) -> str:
