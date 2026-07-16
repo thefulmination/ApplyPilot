@@ -721,6 +721,19 @@ CREATE TABLE IF NOT EXISTS command_acks (
     PRIMARY KEY (command_id, worker_id)
 );
 
+-- Admission is SECURITY DEFINER and is created by the migration principal.
+-- Grant that principal read access to its snapshot inputs; worker login roles
+-- never receive direct table access and continue to use the function boundary.
+DO $$
+BEGIN
+    EXECUTE format(
+        'GRANT SELECT ON public.fleet_worker_principals, public.fleet_desired_state, '
+        'public.workers, public.worker_heartbeat, public.fleet_config, public.apply_queue TO %I',
+        current_user
+    );
+END
+$$;
+
 -- ===========================================================================
 -- FLEET DOCTOR v1 (this file's only auto-remediation layer).
 --
