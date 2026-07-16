@@ -1899,6 +1899,7 @@ function Initialize-KnownEvidenceNativeApi {
   Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
@@ -1923,13 +1924,6 @@ namespace ApplyPilot
             uint flagsAndAttributes,
             IntPtr templateFile);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreateHardLinkW(
-            string newFileName,
-            string existingFileName,
-            IntPtr securityAttributes);
-
         public static SafeFileHandle CreateEvidenceStage(string path)
         {
             SafeFileHandle handle = CreateFileW(
@@ -1949,11 +1943,54 @@ namespace ApplyPilot
             return handle;
         }
 
-        public static void PublishEvidence(string finalPath, string stagePath)
+        public static FileStream PublishEvidence(string finalPath, byte[] content)
         {
-            if (!CreateHardLinkW(finalPath, stagePath, IntPtr.Zero))
+            SafeFileHandle handle = null;
+            FileStream stream = null;
+            try
             {
-                throw new Win32Exception(Marshal.GetLastWin32Error());
+                handle = CreateFileW(
+                    finalPath,
+                    GenericRead | GenericWrite | Delete,
+                    0,
+                    IntPtr.Zero,
+                    CreateNew,
+                    0,
+                    IntPtr.Zero);
+                if (handle.IsInvalid)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    handle.Dispose();
+                    handle = null;
+                    throw new Win32Exception(error);
+                }
+                stream = new FileStream(handle, FileAccess.ReadWrite);
+                handle = null;
+                stream.Write(content, 0, content.Length);
+                stream.Flush(true);
+                stream.Position = 0;
+                var copied = new byte[content.Length];
+                var offset = 0;
+                while (offset < copied.Length)
+                {
+                    var read = stream.Read(copied, offset, copied.Length - offset);
+                    if (read == 0) { break; }
+                    offset += read;
+                }
+                if (stream.Length != content.Length || offset != content.Length ||
+                    !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(copied, content))
+                {
+                    throw new IOException("evidence publication verification failed");
+                }
+                stream.Position = 0;
+                return stream;
+            }
+            catch
+            {
+                if (stream != null) { stream.Dispose(); }
+                else if (handle != null) { handle.Dispose(); }
+                try { System.IO.File.Delete(finalPath); } catch { }
+                throw;
             }
         }
     }
@@ -2012,10 +2049,20 @@ function Publish-NewKnownEvidenceByHandle($Lease) {
   if (-not $Lease.created -or [string]::IsNullOrWhiteSpace([string]$Lease.stage_path)) {
     throw 'only newly staged evidence can be published'
   }
-  [ApplyPilot.KnownEvidenceNativeApi]::PublishEvidence(
-    [string]$Lease.final_path,
-    [string]$Lease.stage_path
-  )
+  $stageStream = $Lease.stream
+  $publishedStream = $null
+  try {
+    $content = Read-KnownWrapperStreamBytes $stageStream
+    $publishedStream = [ApplyPilot.KnownEvidenceNativeApi]::PublishEvidence(
+      [string]$Lease.final_path,
+      $content
+    )
+  } finally {
+    $stageStream.Dispose()
+  }
+  $Lease.stream = $publishedStream
+  $Lease.stage_path = $null
+  return $publishedStream
 }
 
 function Open-KnownExistingEvidenceExclusive([string]$Path) {
@@ -2480,7 +2527,7 @@ function Remove-EmbeddedWrapperDsns {
           Write-KnownEvidenceBytes -Stream $evidenceStream -Content $preimageBytes
           Flush-KnownEvidenceStream $evidenceStream
           Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
-          Publish-NewKnownEvidenceByHandle $evidenceLease
+          $evidenceStream = Publish-NewKnownEvidenceByHandle $evidenceLease
         } else {
           Assert-KnownEvidenceStreamDigest -Stream $evidenceStream -ExpectedDigest $preimageDigest
         }

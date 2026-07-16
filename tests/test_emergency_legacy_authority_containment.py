@@ -327,8 +327,9 @@ def _run_evidence_crash_harness(
         "\n".join(
             [
                 f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrapper.parent)}'",
+                "$expectedWrappers = @(Get-WrapperSnapshot)",
                 overrides[boundary],
-                "Remove-EmbeddedWrapperDsns",
+                "Remove-EmbeddedWrapperDsns -ExpectedWrappers $expectedWrappers",
             ]
         ),
         encoding="utf-8",
@@ -4135,13 +4136,16 @@ def test_script_has_no_destructive_evidence_deletion_and_matches_installed_workd
     assert "-Recurse" not in text
 
 
-def test_evidence_publication_uses_delete_on_close_staging_and_no_replace_hardlink():
+def test_evidence_publication_uses_delete_on_close_staging_and_verified_final_copy():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "FileAttributeTemporary = 0x00000100" in text
     assert "FileFlagDeleteOnClose = 0x04000000" in text
     assert "GenericRead | GenericWrite | Delete" in text
     assert "CreateNew" in text
-    assert "CreateHardLinkW(finalPath, stagePath, IntPtr.Zero)" in text
+    assert "public static FileStream PublishEvidence(string finalPath, byte[] content)" in text
+    assert "stream.Flush(true)" in text
+    assert "CryptographicOperations.FixedTimeEquals(copied, content)" in text
+    assert "CreateHardLinkW" not in text
     assert "FileAttributeTemporary | FileFlagDeleteOnClose" in text
     assert "[guid]::NewGuid().ToString('N')" in text
     assert ".applypilot-emergency-containment-stage-" in text
