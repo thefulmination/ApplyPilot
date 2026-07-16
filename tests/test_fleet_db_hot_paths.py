@@ -271,6 +271,14 @@ def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypa
                 "sslmode=prefer target_session_attrs=any"
             ),
         ),
+        (
+            "host=fleet.example user=worker password=secret",
+            "host=fleet.example user=worker password=secret dbname=worker",
+        ),
+        (
+            "postgresql://worker:secret@fleet.example",
+            "postgresql://worker:secret@fleet.example/worker",
+        ),
     ],
 )
 def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
