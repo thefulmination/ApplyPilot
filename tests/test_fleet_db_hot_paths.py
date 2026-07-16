@@ -90,6 +90,34 @@ def test_blackout_poll_query_runs_in_read_only_transaction(fleet_db, monkeypatch
     assert transaction_modes == ["on"]
 
 
+def test_control_status_query_runs_in_read_only_transaction_without_migration(
+    fleet_db,
+    monkeypatch,
+    capsys,
+):
+    transaction_modes: list[str] = []
+    original = machine_blackout.status_line
+    monkeypatch.setattr(
+        fleet_schema,
+        "ensure_schema_v3",
+        lambda *_args, **_kwargs: pytest.fail("control status attempted schema migration"),
+    )
+
+    def checked_status_line(conn, label, *, role):
+        with conn.cursor() as cur:
+            cur.execute("SHOW transaction_read_only")
+            transaction_modes.append(cur.fetchone()["transaction_read_only"])
+        return original(conn, label, role=role)
+
+    monkeypatch.setattr(machine_blackout, "status_line", checked_status_line)
+
+    rc = machine_blackout_main.main(["status", "--label", "m4", "--role", "compute"])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "OK|m4|compute|||"
+    assert transaction_modes == ["on"]
+
+
 def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypatch, capsys):
     conn = _ReadOnlyConnection()
     monkeypatch.setattr(pgqueue, "connect", lambda: conn)
@@ -110,6 +138,26 @@ def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypa
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == "OK|m4|compute|||"
+
+
+def test_blackout_poll_returns_keep_when_status_query_fails(monkeypatch, capsys):
+    conn = _ReadOnlyConnection()
+    monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
+
+    def fail_status_query(status_conn, _label, *, role):
+        assert status_conn.read_only is True
+        assert role == "compute"
+        raise RuntimeError("status query failed")
+
+    monkeypatch.setattr(machine_blackout, "status_line", fail_status_query)
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "KEEP|m4|compute|||error"
+    assert "status query failed" in captured.err
 
 
 def test_desired_state_poll_marks_connection_read_only(monkeypatch, capsys):
@@ -144,3 +192,38 @@ def test_desired_state_poll_marks_connection_read_only(monkeypatch, capsys):
     runpy.run_path(str(ROOT / "fleet-agent-query.py"), run_name="__main__")
 
     assert capsys.readouterr().out.strip() == "STOP|||"
+
+
+def test_desired_state_poll_returns_stop_when_query_fails(monkeypatch, capsys):
+    class Cursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args):
+            assert self.conn.read_only is True
+            raise RuntimeError("desired-state query failed")
+
+    class Connection:
+        def __init__(self):
+            self.read_only = False
+
+        def cursor(self):
+            return Cursor(self)
+
+    monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
+    monkeypatch.setattr(sys, "argv", ["fleet-agent-query.py", "m4"])
+
+    runpy.run_path(str(ROOT / "fleet-agent-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "STOP|||"
+    assert "control state unavailable" in captured.err
+    assert "desired-state query failed" not in captured.err
