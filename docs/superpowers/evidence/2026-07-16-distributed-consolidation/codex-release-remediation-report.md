@@ -70,4 +70,4 @@ The skipped CI tests require external services, credentials, or integration infr
 
 Codex-owned X1, X2, and X3 integration/release-gate work are complete, including Claude C1. The parallel remediation plan is complete through code integration and CI verification. Production deployment, staging validation, and canary approval remain separate operational steps.
 
-No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched. Production application lanes remain paused pending separate staging/canary approval after C1 is integrated and verified.
+No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched. Production application lanes remain paused pending separate staging validation and canary approval.
