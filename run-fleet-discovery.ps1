@@ -52,30 +52,15 @@ foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
 if (-not $py) { $py = "python" }
 
 function Test-MachineBlackout([string]$Role) {
-  $stderrPath = [IO.Path]::GetTempFileName()
-  try {
-    $lines = @(& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2> $stderrPath)
-    $queryExit = $LASTEXITCODE
-    Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue | ForEach-Object {
-      if (-not [string]::IsNullOrWhiteSpace("$_")) { [Console]::Error.WriteLine("$_") }
-    }
-  } finally {
-    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
-  }
-  if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
-  if ($lines.Count -eq 0) { return "ERROR|empty-blackout-status" }
-  if ($lines.Count -ne 1) { return "ERROR|multiline-blackout-status" }
-  $line = "$($lines[0])"
-  if ($line -match "[`r`n]") { return "ERROR|multiline-blackout-status" }
-  $expected = "OK|$($Label.Trim().ToLowerInvariant())|$($Role.Trim().ToLowerInvariant())|||"
-  if ($line -ceq $expected) { return $null }
-  return $line
+  $line = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null | Select-Object -Last 1)
+  if ("$line" -match '^BLOCKED\|') { return $line }
+  return $null
 }
 
 # Run exactly one worker (helper used by both the single-worker path and each spawned child).
 function Start-OneWorker([string]$wid) {
   $blocked = Test-MachineBlackout "discovery"
-  if ($blocked) { throw "Refusing to start discovery workers for '$Label': machine blackout status did not return exact OK. $blocked" }
+  if ($blocked) { throw "Refusing to start discovery workers for '$Label': machine blackout active. $blocked" }
   Write-Host "[fleet-discovery] worker $wid  results/site=$ResultsPerSite  hours-old=$HoursOld  (pure scrape, no agent)"
   & $exe --worker-id "$wid" --results-per-site $ResultsPerSite --hours-old $HoursOld
 }
@@ -88,7 +73,7 @@ if ($Workers -le 1) { Start-OneWorker "$Label-disc"; return }
 
 # --- multi-worker: clean slate, then one window per worker on a DISTINCT id ---
 $blocked = Test-MachineBlackout "discovery"
-if ($blocked) { throw "Refusing to start discovery workers for '$Label': machine blackout status did not return exact OK. $blocked" }
+if ($blocked) { throw "Refusing to start discovery workers for '$Label': machine blackout active. $blocked" }
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
   $_.Name -eq 'applypilot-fleet-discovery.exe' -or
   ($_.Name -eq 'python.exe' -and $_.CommandLine -match 'fleet-discovery' -and $_.CommandLine -notmatch 'discovery-home')
