@@ -146,9 +146,22 @@ function Get-MachineBlackoutStatus([string]$Role) {
     return [pscustomobject]@{ State = "OK"; Line = $line }
   }
 
-  $parts = $line -split '\|', 6
+  $parts = $line -split '\|', 7
+  $expiration = [datetimeoffset]::MinValue
+  $expirationHasTimezone = $parts.Count -eq 6 -and $parts[4] -cmatch '(?:Z|[+-]\d{2}:\d{2})$'
+  $expirationValid = $false
+  if ($expirationHasTimezone) {
+    $expirationValid = [datetimeoffset]::TryParse(
+      $parts[4],
+      [Globalization.CultureInfo]::InvariantCulture,
+      [Globalization.DateTimeStyles]::AllowWhiteSpaces,
+      [ref]$expiration
+    )
+  }
   if ($parts.Count -eq 6 -and $parts[0] -ceq "BLOCKED" -and
-      $parts[1] -ceq $expectedLabel -and $parts[2] -ceq $expectedRole) {
+      $parts[1] -ceq $expectedLabel -and $parts[2] -ceq $expectedRole -and
+      $parts[3].Trim().Length -gt 0 -and $expirationValid -and
+      $expiration -gt [datetimeoffset]::UtcNow) {
     return [pscustomobject]@{ State = "BLOCKED"; Line = $line }
   }
   return [pscustomobject]@{ State = "KEEP"; Line = $line }
@@ -171,14 +184,23 @@ function Get-ShortSha([string]$sha) { if ($sha -and $sha.Length -ge 9) { $sha.Su
 
 # Files whose change requires the agent itself to restart (exit 1 -> scheduled-task relaunch).
 $selfFiles = @("fleet-agent.ps1", "fleet-agent-query.py", "fleet-agent-update-gate.py",
-               "fleet-agent-version.py", "src/applypilot/fleet/update_gate.py")
+                "fleet-agent-version.py", "fleet-blackout-query.py",
+                "src/applypilot/fleet/update_gate.py", "src/applypilot/fleet/machine_blackout.py")
+# KEEP recovery is deliberately limited to the agent, blackout query/policy, and their focused tests.
+# Any other target path must wait for the normal between-jobs updater after a valid policy verdict.
+$recoveryFiles = @("fleet-agent.ps1", "fleet-blackout-query.py",
+                   "src/applypilot/fleet/machine_blackout.py",
+                   "tests/test_fleet_agent_autoupdate_script.py",
+                   "tests/test_fleet_machine_blackout.py",
+                   "tests/test_fleet_machine_blackout_scripts.py")
 $script:lastUpdateCheck = [datetime]::MinValue
 $script:updatePending = $false
 $script:updBranch = $null
 $script:updRemote = $null
 
-function Invoke-AutoUpdate {
-  # Returns $true when it stopped workers (update applied) so the caller can respawn immediately.
+function Invoke-AutoUpdate([switch]$RecoveryOnly) {
+  # Normal mode returns $true when it stopped workers so the caller can respawn immediately.
+  # Recovery mode never mutates workers and exits after an allowlisted update is applied.
   $due = ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -ge $UpdateEverySec
   if (-not ($due -or $script:updatePending)) { return $false }
 
@@ -241,6 +263,31 @@ function Invoke-AutoUpdate {
     $script:updatePending = $false; return $false
   }
 
+  $targetChanges = @(& git diff --name-only $local "$remote/$branch" 2>$null |
+    ForEach-Object { $_ -replace '\\', '/' })
+  if ($LASTEXITCODE -ne 0) {
+    Log-Update "UPDATE BLOCKED: could not inspect target changes for $remote/$branch" "Red"
+    $script:updatePending = $false; return $false
+  }
+
+  if ($RecoveryOnly) {
+    $broaderChanges = @($targetChanges | Where-Object { $recoveryFiles -notcontains $_ })
+    if ($broaderChanges.Count -gt 0) {
+      Log-Update "KEEP recovery deferred: target includes non-recovery files ($($broaderChanges -join ', '))" "Yellow"
+      $script:updatePending = $false; return $false
+    }
+
+    Log-Update "KEEP recovery update: $(Get-ShortSha $local) -> $(Get-ShortSha $target) ($($targetChanges.Count) allowlisted files); workers remain running" "Cyan"
+    & git merge --ff-only --quiet "$remote/$branch" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      Log-Update "KEEP RECOVERY FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local)" "Red"
+      $script:updatePending = $false; return $false
+    }
+    $script:updatePending = $false
+    Log-Update "KEEP recovery applied -- exiting for supervisor relaunch before the next policy verdict" "Yellow"
+    exit 1
+  }
+
   if (-not $script:updatePending) { Log-Update "update available: $(Get-ShortSha $local) -> $(Get-ShortSha $target) (waiting for between-jobs window)" "Cyan" }
   $script:updatePending = $true
 
@@ -261,7 +308,7 @@ function Invoke-AutoUpdate {
     $script:updatePending = $false; return $true
   }
   $script:updatePending = $false
-  $changed = @(& git diff --name-only $local HEAD 2>$null)
+  $changed = $targetChanges
   Log-Update "updated $(Get-ShortSha $local) -> $(Get-ShortSha (& git rev-parse HEAD)) ($($changed.Count) files)" "Green"
 
   if ($changed -contains "pyproject.toml") {
@@ -283,6 +330,7 @@ while ($true) {
   $machinePolicy = Get-MachineBlackoutStatus "all"
   if ($machinePolicy.State -eq "KEEP") {
     Write-Host "[fleet-agent:$Label] blackout status unavailable or invalid; preserving existing workers for this tick. $($machinePolicy.Line)" -ForegroundColor Yellow
+    if ($AutoUpdate) { Invoke-AutoUpdate -RecoveryOnly | Out-Null }
     Start-Sleep -Seconds $PollSec
     continue
   }
