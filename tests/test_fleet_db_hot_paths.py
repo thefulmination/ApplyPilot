@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import runpy
 import sys
 from pathlib import Path
@@ -347,3 +348,114 @@ def test_blackout_poll_redacts_every_sensitive_authority_value(
     for secret in (parsed_secret, diagnostic_secret):
         assert secret not in captured.out
         assert secret not in captured.err
+
+
+def test_blackout_poll_import_failure_still_emits_sanitized_blocked_line(
+    monkeypatch,
+    capsys,
+):
+    secret = "import-hook-secret"
+    dsn = f"postgresql://worker:{secret}@fleet.invalid/applypilot"
+    real_import = builtins.__import__
+
+    def fail_psycopg_import(name, *args, **kwargs):
+        if name == "psycopg" or name.startswith("psycopg."):
+            raise ImportError(f"psycopg unavailable for password={secret} using {dsn}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_psycopg_import)
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert len(captured.out.splitlines()) == 1
+    assert "Traceback" not in captured.err
+    assert secret not in captured.out
+    assert secret not in captured.err
+
+
+def test_blackout_poll_sanitizes_blocked_policy_name_protocol(monkeypatch, capsys):
+    conn = _ReadOnlyConnection()
+    dsn_secret = "policy-dsn-secret"
+    policy_secret = "policy-name-secret"
+    dsn = f"postgresql://worker:{dsn_secret}@fleet.invalid/applypilot"
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
+    monkeypatch.setattr(
+        machine_blackout,
+        "status_line",
+        lambda *_args, **_kwargs: (
+            f"BLOCKED|m4|compute|policy|injected\npassword={policy_secret}||safe reason"
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    line = captured.out.rstrip("\r\n")
+    assert line.startswith("BLOCKED|")
+    assert len(line.split("|")) == 6
+    assert "\n" not in line
+    assert "\r" not in line
+    assert policy_secret not in line
+    assert dsn_secret not in line
+
+
+def test_blackout_poll_sanitizes_blocked_policy_reason_credentials(monkeypatch, capsys):
+    conn = _ReadOnlyConnection()
+    dsn_secret = "reason-dsn-secret"
+    passfile_secret = "reason-passfile-secret"
+    uri_secret = "reason-uri-secret"
+    password_secret = "reason-password-secret"
+    oauth_secret = "reason-oauth-secret"
+    scram_secret = "reason-scram-secret"
+    server_key_secret = "reason-server-key-secret"
+    dsn = make_conninfo(
+        host="fleet.invalid",
+        dbname="applypilot",
+        user="worker",
+        password=dsn_secret,
+        passfile=passfile_secret,
+    )
+    reason = (
+        f"raw {dsn_secret} {passfile_secret}\n"
+        f"password={password_secret} passfile={passfile_secret} "
+        f"oauth_client_secret={oauth_secret} scram_client_key={scram_secret} "
+        f"scram_server_key={server_key_secret} "
+        f"postgresql://worker:{uri_secret}@fleet.invalid/applypilot|tail"
+    )
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
+    monkeypatch.setattr(
+        machine_blackout,
+        "status_line",
+        lambda *_args, **_kwargs: f"BLOCKED|m4|compute|policy||{reason}",
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    line = captured.out.rstrip("\r\n")
+    assert line.startswith("BLOCKED|")
+    assert len(line.split("|")) == 6
+    assert "\n" not in line
+    assert "\r" not in line
+    assert "***" in line
+    for secret in (
+        dsn_secret,
+        passfile_secret,
+        uri_secret,
+        password_secret,
+        oauth_secret,
+        scram_secret,
+        server_key_secret,
+    ):
+        assert secret not in line

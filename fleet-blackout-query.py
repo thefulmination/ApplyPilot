@@ -12,10 +12,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-
-from psycopg import pq
-from psycopg.conninfo import conninfo_to_dict
-
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 # Endpoint, database/role, credentials, TLS/auth, and routing define authority.
 # Client tuning such as timeouts, application names, and keepalives is excluded.
@@ -78,9 +75,13 @@ _SENSITIVE_AUTHORITY_FIELDS = frozenset(
 _SENSITIVE_KEY_PATTERN = "|".join(
     re.escape(key) for key in sorted(_SENSITIVE_AUTHORITY_FIELDS, key=len, reverse=True)
 )
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    rf"(?i)\b({_SENSITIVE_KEY_PATTERN})\s*=\s*('(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\"|\S+)"
+)
+_POSTGRES_USERINFO_RE = re.compile(r"(?i)\b(postgres(?:ql)?://)([^@\s/]+)@")
 
 
-def _normalized_dsn(dsn: str) -> dict[str, str]:
+def _normalized_dsn(dsn: str, *, pq, conninfo_to_dict) -> dict[str, str]:
     defaults = {
         option.keyword.decode(): option.val.decode()
         for option in pq.Conninfo.get_defaults()
@@ -106,42 +107,76 @@ def _safe_field(value: object) -> str:
     return " ".join(str(value).replace("|", "/").split())[:300]
 
 
-def _sanitized_error(exc: Exception, *dsns: str) -> str:
-    message = str(exc)
+def _unquote_conninfo_value(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+        value = re.sub(r"\\(.)", r"\1", value)
+    return value
+
+
+def _sensitive_values_from_dsn(dsn: str) -> set[str]:
+    values = {
+        _unquote_conninfo_value(match.group(2))
+        for match in _SENSITIVE_ASSIGNMENT_RE.finditer(dsn)
+    }
+    try:
+        parsed = urlsplit(dsn)
+        if parsed.scheme.lower() in {"postgres", "postgresql"}:
+            if parsed.password:
+                values.add(unquote(parsed.password))
+            values.update(
+                value
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                if key.lower() in _SENSITIVE_AUTHORITY_FIELDS and value
+            )
+    except ValueError:
+        pass
+    return {value for value in values if value}
+
+
+def _sanitize_text(value: object, *dsns: str) -> str:
+    message = str(value)
     for dsn in dsns:
-        try:
-            parsed = _normalized_dsn(dsn)
-        except Exception:
-            parsed = {}
-        for key in _SENSITIVE_AUTHORITY_FIELDS:
-            secret = parsed.get(key)
-            if secret:
-                message = message.replace(secret, "***")
-    message = re.sub(
-        r"(?i)\b(postgres(?:ql)?://)(?:[^@\s]+@)?([^\s]+)",
-        r"\1***@\2",
-        message,
-    )
-    message = re.sub(
-        rf"(?i)\b({_SENSITIVE_KEY_PATTERN})\s*=\s*(?:'[^']*'|\"[^\"]*\"|\S+)",
-        lambda match: f"{match.group(1)}=***",
-        message,
+        for secret in sorted(_sensitive_values_from_dsn(dsn), key=len, reverse=True):
+            message = message.replace(secret, "***")
+        if dsn:
+            message = message.replace(dsn, "***")
+    message = _POSTGRES_USERINFO_RE.sub(r"\1***@", message)
+    message = _SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}=***", message
     )
     return _safe_field(message)
 
+
+def _sanitize_status_line(line: object, *dsns: str) -> str:
+    parts = str(line).split("|", 5)
+    if len(parts) != 6 or parts[0] not in {"OK", "BLOCKED"}:
+        raise RuntimeError("Invalid machine blackout status protocol")
+    if parts[0] == "OK" and parts[3:] != ["", "", ""]:
+        raise RuntimeError("Invalid machine blackout OK status protocol")
+    return "|".join([parts[0], *(_sanitize_text(part, *dsns) for part in parts[1:])])
+
 label = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("APPLYPILOT_FLEET_LABEL", "home")
 role = sys.argv[2] if len(sys.argv) > 2 else "fleet"
+fleet_dsn = (os.environ.get("FLEET_PG_DSN") or "").strip()
+applypilot_fleet_dsn = (os.environ.get("APPLYPILOT_FLEET_DSN") or "").strip()
 
 try:
+    from psycopg import pq
+    from psycopg.conninfo import conninfo_to_dict
+
     from applypilot.apply import pgqueue
     from applypilot.fleet import machine_blackout
 
-    fleet_dsn = (os.environ.get("FLEET_PG_DSN") or "").strip()
-    applypilot_fleet_dsn = (os.environ.get("APPLYPILOT_FLEET_DSN") or "").strip()
     if (
         fleet_dsn
         and applypilot_fleet_dsn
-        and _normalized_dsn(fleet_dsn) != _normalized_dsn(applypilot_fleet_dsn)
+        and _normalized_dsn(fleet_dsn, pq=pq, conninfo_to_dict=conninfo_to_dict)
+        != _normalized_dsn(
+            applypilot_fleet_dsn,
+            pq=pq,
+            conninfo_to_dict=conninfo_to_dict,
+        )
     ):
         raise RuntimeError("Inconsistent fleet Postgres DSN references")
     dsn = fleet_dsn or applypilot_fleet_dsn
@@ -149,14 +184,20 @@ try:
         raise RuntimeError("No fleet Postgres DSN: set FLEET_PG_DSN or APPLYPILOT_FLEET_DSN")
     conn = pgqueue.connect(dsn)
     conn.read_only = True
-    print(machine_blackout.status_line(conn, label, role=role))
+    print(
+        _sanitize_status_line(
+            machine_blackout.status_line(conn, label, role=role),
+            fleet_dsn,
+            applypilot_fleet_dsn,
+        )
+    )
 except Exception as exc:
-    diagnostic = _sanitized_error(
-        exc,
+    diagnostic = _sanitize_text(
+        f"{type(exc).__name__}: {exc}",
         os.environ.get("FLEET_PG_DSN", ""),
         os.environ.get("APPLYPILOT_FLEET_DSN", ""),
     )
     safe_label = _safe_field(label).lower()
     safe_role = _safe_field(role).lower()
-    print(f"fleet-blackout-query: {type(exc).__name__}: {diagnostic}", file=sys.stderr)
+    print(f"fleet-blackout-query: {diagnostic}", file=sys.stderr)
     print(f"BLOCKED|{safe_label}|{safe_role}|blackout-query-error||{diagnostic}")
