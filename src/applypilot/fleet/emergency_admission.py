@@ -30,7 +30,17 @@ EMERGENCY_HOLD_REASON = (
 )
 
 _READ_ONLY_HOME_COMMANDS = frozenset(
-    {"status", "readiness", "canary-readiness", "challenges", "crash-review", "dedup-review"}
+    {
+        "status",
+        "readiness",
+        "canary-readiness",
+        "challenges",
+        "crash-review",
+        "dedup-review",
+        # This command only refreshes public-posting evidence for parked rows;
+        # it never acquires a browser or changes an apply outcome.
+        "crash-liveness",
+    }
 )
 
 
