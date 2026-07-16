@@ -9,6 +9,10 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 
 
+def _supported_powershells() -> list[str]:
+    return [shell for name in ("powershell.exe", "pwsh") if (shell := shutil.which(name))]
+
+
 def _powershell_function(script: str, name: str) -> str:
     start = script.index(f"function {name}")
     opening = script.index("{", start)
@@ -50,6 +54,7 @@ def _ps_quote(value) -> str:
         ("OK|m4|{role}|||", 7, False),
     ],
 )
+@pytest.mark.parametrize("powershell", _supported_powershells())
 def test_new_worker_launcher_requires_exact_successful_ok_status(
     tmp_path,
     script_name,
@@ -57,15 +62,14 @@ def test_new_worker_launcher_requires_exact_successful_ok_status(
     output,
     exit_code,
     allowed,
+    powershell,
 ):
-    pwsh = shutil.which("pwsh")
-    if not pwsh:
-        pytest.skip("pwsh is required for launcher guard tests")
     script = (REPO / script_name).read_text(encoding="utf-8")
     function = _powershell_function(script, "Test-MachineBlackout")
     shim = tmp_path / "blackout-shim.ps1"
     shim.write_text(
         "param([Parameter(ValueFromRemainingArguments=$true)]$Ignored)\n"
+        "Write-Error $env:BLACKOUT_DIAGNOSTIC -ErrorAction Continue\n"
         "if ($env:BLACKOUT_OUTPUT) { $env:BLACKOUT_OUTPUT -split '\\r?\\n' | Write-Output }\n"
         "exit [int]$env:BLACKOUT_EXIT\n",
         encoding="utf-8",
@@ -86,9 +90,10 @@ def test_new_worker_launcher_requires_exact_successful_ok_status(
     env = os.environ.copy()
     env["BLACKOUT_OUTPUT"] = output.format(role=role)
     env["BLACKOUT_EXIT"] = str(exit_code)
+    env["BLACKOUT_DIAGNOSTIC"] = "blackout query diagnostic"
 
     result = subprocess.run(
-        [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
         text=True,
         env=env,
@@ -96,8 +101,17 @@ def test_new_worker_launcher_requires_exact_successful_ok_status(
     )
 
     assert (result.returncode == 0) is allowed, (result.stdout, result.stderr)
+    assert "blackout query diagnostic" in result.stderr
     if not allowed:
         assert result.returncode == 42, (result.stdout, result.stderr)
+
+
+def test_launcher_guard_matrix_includes_every_available_supported_shell():
+    shells = {Path(shell).stem.lower() for shell in _supported_powershells()}
+
+    for name in ("powershell.exe", "pwsh"):
+        if shutil.which(name):
+            assert Path(name).stem.lower() in shells
 
 
 def test_fleet_agent_honors_machine_blackout():

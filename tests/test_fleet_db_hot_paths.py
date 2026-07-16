@@ -69,7 +69,7 @@ def test_blackout_poll_returns_keep_when_read_only_setup_fails(monkeypatch, caps
     runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == "KEEP|m4|compute|||error"
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
     assert "read-only unavailable" in captured.err
 
 
@@ -106,7 +106,7 @@ def test_blackout_poll_rejects_database_url_without_fleet_dsn(monkeypatch, capsy
     runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == "KEEP|m4|compute|||error"
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
     assert "No fleet Postgres DSN" in captured.err
 
 
@@ -123,13 +123,15 @@ def test_blackout_poll_rejects_conflicting_fleet_dsns(monkeypatch, capsys):
     runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == "KEEP|m4|compute|||error"
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
     assert "Inconsistent fleet Postgres DSN references" in captured.err
 
 
 def test_blackout_poll_query_runs_in_read_only_transaction(fleet_db, monkeypatch, capsys):
     transaction_modes: list[str] = []
     original = machine_blackout.status_line
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_db)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
 
     def checked_status_line(conn, label, *, role):
         with conn.cursor() as cur:
@@ -196,16 +198,68 @@ def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypa
     assert capsys.readouterr().out.strip() == "OK|m4|compute|||"
 
 
-def test_blackout_poll_returns_keep_when_status_query_fails(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("fleet_dsn", "applypilot_fleet_dsn"),
+    [
+        (
+            "host=fleet.example port=5432 dbname=applypilot user=worker password=secret connect_timeout=5",
+            "connect_timeout=5 password=secret user=worker dbname=applypilot port=5432 host=fleet.example",
+        ),
+        (
+            "postgresql://worker:secret@fleet.example:5432/applypilot?connect_timeout=5",
+            "host=fleet.example port=5432 dbname=applypilot user=worker password=secret connect_timeout=5",
+        ),
+    ],
+)
+def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
+    fleet_dsn,
+    applypilot_fleet_dsn,
+    monkeypatch,
+    capsys,
+):
     conn = _ReadOnlyConnection()
-    monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_dsn)
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", applypilot_fleet_dsn)
+    monkeypatch.setattr(pgqueue, "connect", lambda dsn: conn if dsn == fleet_dsn else None)
+    monkeypatch.setattr(
+        machine_blackout,
+        "status_line",
+        lambda status_conn, label, *, role: f"OK|{label}|{role}|||",
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "OK|m4|compute|||"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("failure_point", ["connect", "query", "schema"])
+def test_blackout_poll_returns_sanitized_blocked_when_database_access_fails(
+    failure_point,
+    monkeypatch,
+    capsys,
+):
+    conn = _ReadOnlyConnection()
+    secret = "super-secret-password"
+    dsn = f"postgresql://worker:{secret}@fleet.invalid/applypilot"
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
     monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
-    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
+
+    def connect(_dsn):
+        if failure_point == "connect":
+            raise RuntimeError(f"could not connect using {dsn} password={secret}")
+        return conn
+
+    monkeypatch.setattr(pgqueue, "connect", connect)
 
     def fail_status_query(status_conn, _label, *, role):
         assert status_conn.read_only is True
         assert role == "compute"
-        raise RuntimeError("status query failed")
+        if failure_point in {"query", "schema"}:
+            raise RuntimeError(f"{failure_point} access failed for password={secret}")
+        return "OK|m4|compute|||"
 
     monkeypatch.setattr(machine_blackout, "status_line", fail_status_query)
     monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
@@ -213,8 +267,11 @@ def test_blackout_poll_returns_keep_when_status_query_fails(monkeypatch, capsys)
     runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
 
     captured = capsys.readouterr()
-    assert captured.out.strip() == "KEEP|m4|compute|||error"
-    assert "status query failed" in captured.err
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert "RuntimeError" in captured.err
+    assert "***" in captured.err
+    assert secret not in captured.out
+    assert secret not in captured.err
 
 
 def test_desired_state_poll_marks_connection_read_only(monkeypatch, capsys):
