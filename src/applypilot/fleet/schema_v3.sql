@@ -1033,10 +1033,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_fleet_worker_principals_worker_contract
 DO $$
 BEGIN
     EXECUTE format(
-        'GRANT SELECT ON public.fleet_worker_principals, public.fleet_desired_state, '
-        'public.workers, public.worker_heartbeat, public.fleet_config, public.apply_queue TO %I',
+        'GRANT SELECT ON public.fleet_worker_principals, public.workers, '
+        'public.worker_heartbeat, public.fleet_config, public.apply_queue TO %I',
         current_user
     );
+    EXECUTE format('GRANT SELECT, UPDATE ON public.fleet_desired_state TO %I', current_user);
 END
 $$;
 
