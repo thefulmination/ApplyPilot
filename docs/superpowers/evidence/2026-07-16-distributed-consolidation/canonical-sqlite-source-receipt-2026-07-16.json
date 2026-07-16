@@ -1,0 +1,29 @@
+{
+  "path": "C:\\Users\\JStal\\AppData\\Local\\ApplyPilot\\applypilot.db",
+  "sha256": "02344457781051085c43ade3e55cadd2e0497f849183560272449a505f6afd2c",
+  "byte_length": 7813488640,
+  "quick_check": "ok",
+  "page_count": 1907590,
+  "page_size": 4096,
+  "schema_version": 64,
+  "user_version": 0,
+  "table_counts": {
+    "jobs": 101679,
+    "applications": 1077,
+    "application_events": 1088,
+    "email_events": 2109,
+    "email_event_reviews": 93,
+    "reviewed_outcomes": 42,
+    "research_labels": 2167,
+    "research_label_confidence": 2023,
+    "research_pairwise_labels": 133,
+    "research_kg_artifacts": 1,
+    "research_kg_runs": 0,
+    "research_scores": 0,
+    "decision_policy_versions": 14,
+    "job_decisions": 701658
+  },
+  "wal_size": 0,
+  "shm_size": 32768,
+  "source_unchanged_during_capture": true
+}

@@ -33,6 +33,30 @@
     "embeddingModel": "text-embedding-3-large"
   },
   "artifacts": {
+    "canonicalSqliteSource": {
+      "receiptPath": "docs/superpowers/evidence/2026-07-16-distributed-consolidation/canonical-sqlite-source-receipt-2026-07-16.json",
+      "path": "C:\\Users\\JStal\\AppData\\Local\\ApplyPilot\\applypilot.db",
+      "bytes": 7813488640,
+      "sha256": "02344457781051085c43ade3e55cadd2e0497f849183560272449a505f6afd2c",
+      "quickCheck": "ok",
+      "schemaVersion": 64,
+      "tableCounts": {
+        "jobs": 101679,
+        "applications": 1077,
+        "application_events": 1088,
+        "email_events": 2109,
+        "email_event_reviews": 93,
+        "reviewed_outcomes": 42,
+        "research_labels": 2167,
+        "research_label_confidence": 2023,
+        "research_pairwise_labels": 133,
+        "research_kg_artifacts": 1,
+        "research_kg_runs": 0,
+        "research_scores": 0,
+        "decision_policy_versions": 14,
+        "job_decisions": 701658
+      }
+    },
     "knowledgeGraph": [
       {"path":"data/applypilot_kg/knowledge_graph.json","bytes":3766105,"sha256":"9201805479FEE6510D0F9F1973C0B7A453AF76752828988F4DE690AB68DDFD9E"},
       {"path":"data/applypilot_kg/compact/compact_knowledge_graph.json","bytes":485869,"sha256":"91345970988CC8B99EA6D7E8340E976F414C14FD092BA6973C81946D566BD10E"},
