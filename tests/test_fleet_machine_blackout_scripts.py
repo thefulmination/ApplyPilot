@@ -77,7 +77,12 @@ def _recovery_update_fixture(tmp_path: Path, changed_path: str) -> tuple[Path, s
     return worker, f"0.3.0+git.tree.{target_tree[:7]}"
 
 
-def _run_recovery_update(tmp_path: Path, changed_path: str) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_recovery_update(
+    tmp_path: Path,
+    changed_path: str,
+    *,
+    pinned_version: str | None = None,
+) -> tuple[subprocess.CompletedProcess, Path]:
     worker, target_version = _recovery_update_fixture(tmp_path, changed_path)
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
     update_function = _powershell_function(script, "Invoke-AutoUpdate")
@@ -106,7 +111,8 @@ def _run_recovery_update(tmp_path: Path, changed_path: str) -> tuple[subprocess.
         encoding="utf-8",
     )
     env = os.environ.copy()
-    env["VERSION_LINE"] = f"OK|0.3.0+git.tree.0000000|{target_version}|"
+    effective_pin = target_version if pinned_version is None else pinned_version
+    env["VERSION_LINE"] = f"OK|0.3.0+git.tree.0000000|{effective_pin}|"
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
@@ -116,6 +122,77 @@ def _run_recovery_update(tmp_path: Path, changed_path: str) -> tuple[subprocess.
     )
     assert not mutation_marker.exists(), (result.stdout, result.stderr)
     return result, worker
+
+
+def _run_update_harness(
+    tmp_path: Path,
+    *,
+    pinned_version: str = "0.3.0+git.tree.ccccccc",
+    fresh_policy_state: str = "OK",
+    fresh_policy_line: str = "OK|m4|all|||",
+    fail_git_command: str = "",
+) -> tuple[subprocess.CompletedProcess, Path]:
+    script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
+    update_function = _powershell_function(script, "Invoke-AutoUpdate")
+    declarations_start = script.index("$selfFiles = @")
+    declarations_end = script.index("\n$script:lastUpdateCheck", declarations_start)
+    declarations = script[declarations_start:declarations_end]
+    mutation_marker = tmp_path / "worker-mutation.txt"
+    py_shim = tmp_path / "python-shim.ps1"
+    py_shim.write_text(
+        "param([string]$ScriptName)\n"
+        "if ($ScriptName -eq 'fleet-agent-version.py') { Write-Output $env:VERSION_LINE; exit 0 }\n"
+        "if ($ScriptName -eq 'fleet-agent-update-gate.py') { Write-Output 'IDLE'; exit 0 }\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    harness = tmp_path / "update-harness.ps1"
+    harness.write_text(
+        "$Label = 'm4'\n"
+        f"$py = '{_ps_quote(py_shim)}'\n"
+        "$UpdateEverySec = 0\n"
+        "$script:lastUpdateCheck = [datetime]::MinValue\n"
+        "$script:updatePending = $false\n"
+        "$script:updBranch = $null\n"
+        "$script:updRemote = $null\n"
+        f"{declarations}\n"
+        "function Log-Update { param([string]$msg, [string]$color = 'Gray') }\n"
+        "function Get-ShortSha([string]$sha) { $sha }\n"
+        "function git {\n"
+        "  param([Parameter(ValueFromRemainingArguments=$true)][string[]]$GitArgs)\n"
+        "  $key = $GitArgs -join ' '\n"
+        "  $global:LASTEXITCODE = if ($key -eq $env:FAIL_GIT_COMMAND) { 17 } else { 0 }\n"
+        "  if ($global:LASTEXITCODE -ne 0) { return }\n"
+        "  switch ($key) {\n"
+        "    'rev-parse --abbrev-ref HEAD' { 'main' }\n"
+        "    'config branch.main.remote' { 'origin' }\n"
+        "    'rev-parse origin/main' { 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }\n"
+        "    'rev-parse bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb^{tree}' { 'cccccccccccccccccccccccccccccccccccccccc' }\n"
+        "    'rev-parse HEAD' { 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }\n"
+        "    'diff --name-only aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' { 'fleet-blackout-query.py' }\n"
+        "  }\n"
+        "}\n"
+        "function Get-MachineBlackoutStatus {\n"
+        f"  [pscustomobject]@{{ State = '{fresh_policy_state}'; Line = '{fresh_policy_line}' }}\n"
+        "}\n"
+        f"function Get-LocalWorkers {{ Add-Content '{_ps_quote(mutation_marker)}' 'workers'; @() }}\n"
+        f"{update_function}\n"
+        "$expected = [pscustomobject]@{ State = 'OK'; Line = 'OK|m4|all|||' }\n"
+        "$result = Invoke-AutoUpdate -ExpectedMachinePolicy $expected\n"
+        "Write-Output \"result=$result\"\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["VERSION_LINE"] = f"OK|0.3.0+git.tree.aaaaaaa|{pinned_version}|"
+    env["FAIL_GIT_COMMAND"] = fail_git_command
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    return result, mutation_marker
 
 
 @pytest.mark.parametrize(
@@ -206,17 +283,20 @@ def test_launcher_guard_matrix_includes_every_available_supported_shell():
     ("output", "exit_code", "expected_state"),
     [
         ("OK|m4|all|||", 0, "OK"),
-        ("BLOCKED|m4|all|policy|2099-01-01T00:00:00Z|", 0, "BLOCKED"),
         ("BLOCKED|m4|all|policy|2099-01-01T00:00:00+00:00|reason", 0, "BLOCKED"),
+        ("BLOCKED|m4|all|policy|2099-01-01T00:00:00.123456+05:30|reason", 0, "BLOCKED"),
         ("BLOCKED|m4|all|policy||reason", 0, "KEEP"),
-        ("BLOCKED|m4|all| |2099-01-01T00:00:00Z|reason", 0, "KEEP"),
+        ("BLOCKED|m4|all| |2099-01-01T00:00:00+00:00|reason", 0, "KEEP"),
         ("BLOCKED|m4|all|policy|2099-01-01T00:00:00|reason", 0, "KEEP"),
+        ("BLOCKED|m4|all|policy|2099-01-01T00:00:00Z|reason", 0, "KEEP"),
+        ("BLOCKED|m4|all|policy|January 1, 2099 12:00 AM +00:00|reason", 0, "KEEP"),
+        ("BLOCKED|m4|all|policy|01/01/2099 00:00:00 +00:00|reason", 0, "KEEP"),
         ("BLOCKED|m4|all|policy|not-a-date|reason", 0, "KEEP"),
-        ("BLOCKED|m4|all|policy|2020-01-01T00:00:00Z|reason", 0, "KEEP"),
-        ("BLOCKED|m4|all|policy|2099-01-01T00:00:00Z|reason|extra", 0, "KEEP"),
-        ("blocked|m4|all|policy|2099-01-01T00:00:00Z|reason", 0, "KEEP"),
-        ("BLOCKED|M4|all|policy|2099-01-01T00:00:00Z|reason", 0, "KEEP"),
-        ("BLOCKED|m4|apply|policy|2099-01-01T00:00:00Z|reason", 0, "KEEP"),
+        ("BLOCKED|m4|all|policy|2020-01-01T00:00:00+00:00|reason", 0, "KEEP"),
+        ("BLOCKED|m4|all|policy|2099-01-01T00:00:00+00:00|reason|extra", 0, "KEEP"),
+        ("blocked|m4|all|policy|2099-01-01T00:00:00+00:00|reason", 0, "KEEP"),
+        ("BLOCKED|M4|all|policy|2099-01-01T00:00:00+00:00|reason", 0, "KEEP"),
+        ("BLOCKED|m4|apply|policy|2099-01-01T00:00:00+00:00|reason", 0, "KEEP"),
         ("", 0, "KEEP"),
         ("KEEP|m4|all|||error", 0, "KEEP"),
         ("malformed", 0, "KEEP"),
@@ -345,6 +425,68 @@ def test_fleet_agent_uncertain_blackout_guard_precedes_all_reconciliation_mutati
         assert skip_tick < script.index(mutation, guard)
 
 
+@pytest.mark.parametrize(
+    ("fresh_state", "fresh_line", "expected_mutations", "expected_want"),
+    [
+        ("KEEP", "ERROR|blackout-query-exit=7", 0, -1),
+        (
+            "BLOCKED",
+            "BLOCKED|m4|all|policy|2099-01-01T00:00:00+00:00|reason",
+            1,
+            0,
+        ),
+    ],
+)
+def test_fleet_agent_requeries_policy_after_update_before_reconciliation(
+    tmp_path,
+    fresh_state,
+    fresh_line,
+    expected_mutations,
+    expected_want,
+):
+    script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
+    block_start = script.index("  $machinePolicy = Get-MachineBlackoutStatus")
+    block_end = script.index("  $blackout =", block_start)
+    block = script[block_start:block_end]
+    query_shim = tmp_path / "fleet-query-shim.ps1"
+    query_shim.write_text("Write-Output '2|codex|model|1'\n", encoding="utf-8")
+    harness = tmp_path / "fresh-policy-harness.ps1"
+    harness.write_text(
+        "$Label = 'm4'\n"
+        "$PollSec = 0\n"
+        "$AutoUpdate = $true\n"
+        f"$py = '{_ps_quote(query_shim)}'\n"
+        "$script:policyCalls = 0\n"
+        "$mutations = 0\n"
+        "$want = -1\n"
+        "function Start-Sleep { param([int]$Seconds) }\n"
+        "function Invoke-AutoUpdate { param($ExpectedMachinePolicy) return $false }\n"
+        "function Get-MachineBlackoutStatus {\n"
+        "  $script:policyCalls++\n"
+        "  if ($script:policyCalls -eq 1) { return [pscustomobject]@{ State='OK'; Line='OK|m4|all|||' } }\n"
+        f"  return [pscustomobject]@{{ State='{fresh_state}'; Line='{fresh_line}' }}\n"
+        "}\n"
+        "for ($tick = 0; $tick -lt 1; $tick++) {\n"
+        f"{block}"
+        "  $mutations++\n"
+        "}\n"
+        "Write-Output \"mutations=$mutations want=$want calls=$script:policyCalls\"\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout.splitlines()[-1] == (
+        f"mutations={expected_mutations} want={expected_want} calls=2"
+    )
+
+
 def test_fleet_agent_keep_only_attempts_allowlisted_recovery_before_skipping_tick():
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
     guard = script.index('if ($machinePolicy.State -eq "KEEP")')
@@ -364,6 +506,53 @@ def test_fleet_agent_applies_allowlisted_recovery_without_worker_mutation(tmp_pa
 
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "recovery\n"
+
+
+def test_fleet_agent_recovery_rejects_unpinned_target(tmp_path):
+    result, worker = _run_recovery_update(
+        tmp_path,
+        "fleet-blackout-query.py",
+        pinned_version="   ",
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.parametrize(
+    ("fresh_state", "fresh_line"),
+    [
+        ("KEEP", "ERROR|blackout-query-exit=1"),
+        ("BLOCKED", "BLOCKED|m4|all|policy|2099-01-01T00:00:00+00:00|reason"),
+    ],
+)
+def test_normal_update_revalidates_policy_before_worker_mutation(tmp_path, fresh_state, fresh_line):
+    result, marker = _run_update_harness(
+        tmp_path,
+        fresh_policy_state=fresh_state,
+        fresh_policy_line=fresh_line,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not marker.exists()
+    assert "result=False" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "failed_command",
+    [
+        "rev-parse origin/main",
+        "rev-parse bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb^{tree}",
+        "status --porcelain",
+        "diff --name-only aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ],
+)
+def test_normal_update_fails_closed_on_git_command_failure(tmp_path, failed_command):
+    result, marker = _run_update_harness(tmp_path, fail_git_command=failed_command)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not marker.exists()
+    assert "result=False" in result.stdout
 
 
 def test_fleet_agent_rejects_broader_recovery_update(tmp_path):

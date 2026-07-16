@@ -37,6 +37,11 @@ def _matches(label: str, patterns: Iterable[str] | None) -> bool:
     return False
 
 
+def _protocol_field(value: str | None, *, limit: int | None = None) -> str:
+    sanitized = "".join(" " if char in "\r\n|" else char for char in (value or ""))
+    return sanitized[:limit] if limit is not None else sanitized
+
+
 def active_blackouts(conn, *, now: datetime | None = None) -> list[dict]:
     """Return active, non-expired blackout policies ordered newest first."""
     current = now or _utcnow()
@@ -157,5 +162,6 @@ def status_line(conn, machine_label: str, *, role: str = "fleet", now: datetime 
     if verdict.allowed:
         return f"OK|{verdict.machine}|{verdict.role}|||"
     expires = verdict.expires_at.isoformat() if verdict.expires_at else ""
-    reason = (verdict.reason or "").replace("\n", " ")[:300]
-    return f"BLOCKED|{verdict.machine}|{verdict.role}|{verdict.policy_name or ''}|{expires}|{reason}"
+    policy_name = _protocol_field(verdict.policy_name)
+    reason = _protocol_field(verdict.reason, limit=300)
+    return f"BLOCKED|{verdict.machine}|{verdict.role}|{policy_name}|{expires}|{reason}"

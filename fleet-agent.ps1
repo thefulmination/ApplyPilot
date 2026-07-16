@@ -148,13 +148,17 @@ function Get-MachineBlackoutStatus([string]$Role) {
 
   $parts = $line -split '\|', 7
   $expiration = [datetimeoffset]::MinValue
-  $expirationHasTimezone = $parts.Count -eq 6 -and $parts[4] -cmatch '(?:Z|[+-]\d{2}:\d{2})$'
+  [string[]]$expirationFormats = @(
+    "yyyy-MM-dd'T'HH:mm:sszzz",
+    "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFzzz"
+  )
   $expirationValid = $false
-  if ($expirationHasTimezone) {
-    $expirationValid = [datetimeoffset]::TryParse(
+  if ($parts.Count -eq 6) {
+    $expirationValid = [datetimeoffset]::TryParseExact(
       $parts[4],
+      $expirationFormats,
       [Globalization.CultureInfo]::InvariantCulture,
-      [Globalization.DateTimeStyles]::AllowWhiteSpaces,
+      [Globalization.DateTimeStyles]::None,
       [ref]$expiration
     )
   }
@@ -198,7 +202,7 @@ $script:updatePending = $false
 $script:updBranch = $null
 $script:updRemote = $null
 
-function Invoke-AutoUpdate([switch]$RecoveryOnly) {
+function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$RecoveryOnly) {
   # Normal mode returns $true when it stopped workers so the caller can respawn immediately.
   # Recovery mode never mutates workers and exits after an allowlisted update is applied.
   $due = ((Get-Date) - $script:lastUpdateCheck).TotalSeconds -ge $UpdateEverySec
@@ -207,7 +211,8 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
   if ($due) {
     $script:lastUpdateCheck = Get-Date
     $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
-    if (-not $branch -or $branch -eq "HEAD") { Log-Update "skip: not on a branch ('$branch')" "Yellow"; $script:updatePending = $false; return $false }
+    $branchExit = $LASTEXITCODE
+    if ($branchExit -ne 0 -or -not $branch -or $branch -eq "HEAD") { Log-Update "skip: could not resolve a branch ('$branch', exit=$branchExit)" "Yellow"; $script:updatePending = $false; return $false }
     $remote = (& git config "branch.$branch.remote" 2>$null); if (-not $remote) { $remote = "origin" }
     & git fetch $remote --quiet 2>$null
     if ($LASTEXITCODE -ne 0) { Log-Update "skip: git fetch $remote failed (offline?)" "Yellow"; $script:updatePending = $false; return $false }
@@ -215,6 +220,13 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
   }
   $branch = $script:updBranch; $remote = $script:updRemote
   if (-not $branch -or -not $remote) { $script:updatePending = $false; return $false }
+  $target = (& git rev-parse "$remote/$branch" 2>$null)
+  $targetExit = $LASTEXITCODE
+  $target = "$target".Trim()
+  if ($targetExit -ne 0 -or $target -cnotmatch '^[0-9a-fA-F]{40}$') {
+    Log-Update "UPDATE BLOCKED: could not capture a valid target commit for $remote/$branch (exit=$targetExit)" "Red"
+    $script:updatePending = $false; return $false
+  }
   # Pin-aware guard: branch heads are transport; fleet_config.pinned_worker_version is
   # the release contract. This prevents a clean worker from pulling an unpinned branch
   # tip just because someone pushed ahead of the fleet pin.
@@ -226,14 +238,20 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
   }
   $currentVersion = $vf[1]
   $pinnedVersion = $vf[2]
+  if ($RecoveryOnly -and [string]::IsNullOrWhiteSpace($pinnedVersion)) {
+    Log-Update "KEEP recovery blocked: pinned_worker_version is missing or blank" "Red"
+    $script:updatePending = $false; return $false
+  }
   $packageVersion = $currentVersion
   if ($packageVersion -match '^(.+)\+git\.') { $packageVersion = $matches[1] } else { $packageVersion = "0.3.0" }
-  $targetTree = (& git rev-parse "$remote/$branch^{tree}" 2>$null)
-  $targetVersion = $null
-  if ($targetTree) {
-    $targetTree = "$targetTree".Trim()
-    if ($targetTree.Length -ge 7) { $targetVersion = "$packageVersion+git.tree.$($targetTree.Substring(0, 7))" }
+  $targetTree = (& git rev-parse "$target^{tree}" 2>$null)
+  $targetTreeExit = $LASTEXITCODE
+  $targetTree = "$targetTree".Trim()
+  if ($targetTreeExit -ne 0 -or $targetTree -cnotmatch '^[0-9a-fA-F]{40}$') {
+    Log-Update "UPDATE BLOCKED: could not resolve a valid tree for captured target $(Get-ShortSha $target) (exit=$targetTreeExit)" "Red"
+    $script:updatePending = $false; return $false
   }
+  $targetVersion = "$packageVersion+git.tree.$($targetTree.Substring(0, 7))"
   if ($pinnedVersion) {
     if (-not $targetVersion) {
       Log-Update "UPDATE BLOCKED: pinned version $pinnedVersion but could not resolve remote tree for $remote/$branch" "Red"
@@ -249,21 +267,32 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
     }
   }
   $local = (& git rev-parse HEAD 2>$null)
-  $target = (& git rev-parse "$remote/$branch" 2>$null)
-  if (-not $target -or $local -eq $target) { $script:updatePending = $false; return $false }
+  $localExit = $LASTEXITCODE
+  $local = "$local".Trim()
+  if ($localExit -ne 0 -or $local -cnotmatch '^[0-9a-fA-F]{40}$') {
+    Log-Update "UPDATE BLOCKED: could not resolve a valid local HEAD (exit=$localExit)" "Red"
+    $script:updatePending = $false; return $false
+  }
+  if ($local -ceq $target) { $script:updatePending = $false; return $false }
 
   # guards: worker boxes must never own local commits or edits
-  if (@(& git status --porcelain 2>$null).Count -gt 0) {
+  $statusLines = @(& git status --porcelain 2>$null)
+  $statusExit = $LASTEXITCODE
+  if ($statusExit -ne 0) {
+    Log-Update "UPDATE BLOCKED: git status failed (exit=$statusExit)" "Red"
+    $script:updatePending = $false; return $false
+  }
+  if ($statusLines.Count -gt 0) {
     Log-Update "UPDATE BLOCKED: working tree dirty -- this box must be a clean clone" "Red"
     $script:updatePending = $false; return $false
   }
-  & git merge-base --is-ancestor HEAD "$remote/$branch" 2>$null
+  & git merge-base --is-ancestor $local $target 2>$null
   if ($LASTEXITCODE -ne 0) {
-    Log-Update "UPDATE BLOCKED: history diverged from $remote/$branch -- fix by hand" "Red"
+    Log-Update "UPDATE BLOCKED: history diverged from captured target $(Get-ShortSha $target) -- fix by hand" "Red"
     $script:updatePending = $false; return $false
   }
 
-  $targetChanges = @(& git diff --name-only $local "$remote/$branch" 2>$null |
+  $targetChanges = @(& git diff --name-only $local $target 2>$null |
     ForEach-Object { $_ -replace '\\', '/' })
   if ($LASTEXITCODE -ne 0) {
     Log-Update "UPDATE BLOCKED: could not inspect target changes for $remote/$branch" "Red"
@@ -278,10 +307,18 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
     }
 
     Log-Update "KEEP recovery update: $(Get-ShortSha $local) -> $(Get-ShortSha $target) ($($targetChanges.Count) allowlisted files); workers remain running" "Cyan"
-    & git merge --ff-only --quiet "$remote/$branch" 2>$null
+    & git merge --ff-only --quiet $target 2>$null
     if ($LASTEXITCODE -ne 0) {
       Log-Update "KEEP RECOVERY FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local)" "Red"
       $script:updatePending = $false; return $false
+    }
+    $mergedHead = (& git rev-parse HEAD 2>$null)
+    $mergedHeadExit = $LASTEXITCODE
+    $mergedHead = "$mergedHead".Trim()
+    if ($mergedHeadExit -ne 0 -or $mergedHead -cne $target) {
+      Log-Update "KEEP RECOVERY FAILED: HEAD verification did not match captured target $(Get-ShortSha $target)" "Red"
+      $script:updatePending = $false
+      exit 1
     }
     $script:updatePending = $false
     Log-Update "KEEP recovery applied -- exiting for supervisor relaunch before the next policy verdict" "Yellow"
@@ -295,6 +332,14 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
   $gate = (& $py "fleet-agent-update-gate.py" $Label 2>$null | Select-Object -Last 1)
   if ("$gate" -ne "IDLE") { return $false }
 
+  $freshMachinePolicy = Get-MachineBlackoutStatus "all"
+  if ($null -eq $ExpectedMachinePolicy -or
+      $freshMachinePolicy.State -cne $ExpectedMachinePolicy.State -or
+      $freshMachinePolicy.Line -cne $ExpectedMachinePolicy.Line) {
+    Log-Update "update deferred: machine blackout policy changed before worker mutation" "Yellow"
+    return $false
+  }
+
   Log-Update "between-jobs window open -- updating" "Cyan"
   Get-LocalWorkers | ForEach-Object {
     Log-Update "-stop $Label-$(Slot-Of $_) (pre-update)" "Yellow"
@@ -302,14 +347,21 @@ function Invoke-AutoUpdate([switch]$RecoveryOnly) {
   }
   Start-Sleep -Seconds 2
 
-  & git merge --ff-only --quiet "$remote/$branch" 2>$null
+  & git merge --ff-only --quiet $target 2>$null
   if ($LASTEXITCODE -ne 0) {
     Log-Update "UPDATE FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local); workers respawn on old code" "Red"
     $script:updatePending = $false; return $true
   }
+  $mergedHead = (& git rev-parse HEAD 2>$null)
+  $mergedHeadExit = $LASTEXITCODE
+  $mergedHead = "$mergedHead".Trim()
+  if ($mergedHeadExit -ne 0 -or $mergedHead -cne $target) {
+    Log-Update "UPDATE FAILED: HEAD verification did not match captured target $(Get-ShortSha $target); workers respawn conservatively" "Red"
+    $script:updatePending = $false; return $true
+  }
   $script:updatePending = $false
   $changed = $targetChanges
-  Log-Update "updated $(Get-ShortSha $local) -> $(Get-ShortSha (& git rev-parse HEAD)) ($($changed.Count) files)" "Green"
+  Log-Update "updated $(Get-ShortSha $local) -> $(Get-ShortSha $target) ($($changed.Count) files)" "Green"
 
   if ($changed -contains "pyproject.toml") {
     Log-Update "pyproject.toml changed -> pip install -e ." "Cyan"
@@ -336,7 +388,15 @@ while ($true) {
   }
 
   # auto-update runs BEFORE reconcile so a post-update respawn happens in this same tick
-  if ($AutoUpdate) { Invoke-AutoUpdate | Out-Null }
+  if ($AutoUpdate) {
+    Invoke-AutoUpdate -ExpectedMachinePolicy $machinePolicy | Out-Null
+    $machinePolicy = Get-MachineBlackoutStatus "all"
+    if ($machinePolicy.State -eq "KEEP") {
+      Write-Host "[fleet-agent:$Label] blackout status changed or became uncertain after update check; preserving existing workers for this tick. $($machinePolicy.Line)" -ForegroundColor Yellow
+      Start-Sleep -Seconds $PollSec
+      continue
+    }
+  }
 
   $line = (& $py "fleet-agent-query.py" $Label 2>$null | Select-Object -Last 1)
   $f = "$line" -split '\|'
