@@ -359,14 +359,17 @@ def test_push_home_threads_explicit_approved_batch(fleet_db, monkeypatch):
 
 def test_apply_home_resolve_challenge(fleet_db):
     from applypilot.fleet import apply_home_main as hm
-    from applypilot.fleet import queue
     from applypilot.apply import pgqueue
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO apply_queue (url, application_url, score, status, lane, apply_domain, lease_owner) "
-                    "VALUES ('p1','http://x','9','leased','ats','x.com','w1')")
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, status, lane, apply_domain, lease_owner, "
+            "lease_expires_at, apply_status, worker_id) "
+            "VALUES ('p1','http://x','9','leased','ats','x.com','w1',"
+            "now() + interval '3650 days','challenge_pending','w1')"
+        )
         cur.execute("INSERT INTO auth_challenge (url, worker_id, kind, route) VALUES ('p1','w1','captcha','owner_inbox')")
         conn.commit()
-        queue.park_challenge(conn, "w1", "p1")  # freeze (sets apply_status, 3650d lease)
         hm.resolve_challenge_cmd(conn, "p1", skip=False)
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT status FROM apply_queue WHERE url='p1'")

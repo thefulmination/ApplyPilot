@@ -16,9 +16,9 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import console_app
-from applypilot.fleet import queue
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import console_app  # noqa: E402
+from applypilot.fleet import queue  # noqa: E402
 
 
 def _canonical(conn, url, score, lane):
@@ -76,26 +76,24 @@ def _seed_li(conn, url, *, score=9.0, company="Co", title="Role", batch="b1"):
 
 
 def _park_apply(conn, url, *, worker="w1"):
-    """Lease (by url, lease_apply always takes the top score so we can't assume order)
-    + park an apply_queue row so it looks like a real frozen auth wall."""
+    """Seed the already-parked state consumed by controller resolution."""
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE apply_queue SET status='leased', lease_owner=%s, "
-            "lease_expires_at=now() + interval '20 minutes', attempts=attempts+1, updated_at=now() "
-            "WHERE url=%s AND status='queued'", (worker, url))
+            "lease_expires_at=now() + interval '3650 days', attempts=attempts+1, "
+            "apply_status='challenge_pending', worker_id=%s, updated_at=now() "
+            "WHERE url=%s AND status='queued'", (worker, worker, url))
         assert cur.rowcount == 1
     conn.commit()
-    assert queue.park_challenge(conn, worker, url) is True
 
 
 def _park_li(conn, url, *, worker="w1"):
-    leased = queue.lease_linkedin(conn, worker, public_ip="2.2.2.2", owner_ip="2.2.2.2", min_gap_seconds=0)
-    assert leased and leased["url"] == url
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE linkedin_queue SET apply_status='challenge_pending', "
-            "lease_expires_at = now() + interval '3650 days', updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s", (url, worker))
+            "UPDATE linkedin_queue SET status='leased', lease_owner=%s, "
+            "lease_expires_at=now() + interval '3650 days', attempts=attempts+1, "
+            "apply_status='challenge_pending', worker_id=%s, updated_at=now() "
+            "WHERE url=%s AND status='queued'", (worker, worker, url))
         assert cur.rowcount == 1
     conn.commit()
 
