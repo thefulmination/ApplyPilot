@@ -140,8 +140,9 @@ plus `test_inbox_auth_redaction.py::test_run_job_redacts_magic_link_from_every_p
 **Test or production stale? — TEST IS STALE. Production is correct and deliberate.**
 
 Evidence, not inference:
-- `tests/test_apply_execution_evidence.py:36-39` is a *currently passing* test that explicitly
-  asserts this exact fail-closed behavior:
+- `tests/test_apply_execution_evidence.py:36`
+  (`test_execution_evidence_fails_closed_without_lease_marker`) is a *currently passing* test that
+  explicitly asserts this exact fail-closed behavior at `:39-40`:
   `with pytest.raises(RuntimeError, match="not bound to the active lease")`. The invariant is
   specified, intended, and covered.
 - `tests/test_apply_usage_limit_requeue.py:161, 218, 280` show the *updated* fake pattern —
@@ -152,7 +153,7 @@ Evidence, not inference:
 This is a fail-closed lease-authority guard. Per the shared baseline it must **not** be weakened
 to make an old test pass.
 
-**One nuance Codex should decide explicitly, not by default.** The guard at `launcher.py:2117`
+**One nuance Codex should decide explicitly, not by default.** The guard at `launcher.py:2117-2119`
 fires in **shadow** mode too (`test_greenhouse_shadow_result_records_adapter_route_stats` calls
 `_maybe_greenhouse_apply` with the default `attempt_store=None` and `submit_enabled -> False`).
 Shadow mode has no attempt ledger by design, yet it *does* drive a real page via
@@ -165,7 +166,7 @@ owner should be told about rather than discover in the field.
 **Smallest safe repair (test-side only).** Give each failing double a
 `mark_browser_interaction()` no-op, matching `tests/test_apply_usage_limit_requeue.py:161`. For
 the shadow test, pass a minimal store exposing only that method. Do not touch
-`launcher.py:2117` or `:2760`.
+`launcher.py:2117-2119` or `:2760`.
 
 **Codex lane: X1** (`launcher.py` + `greenhouse_submit.py` + directly associated tests).
 
@@ -286,8 +287,11 @@ AND NOT EXISTS (
        OR COALESCE(prior.apply_error, '') ILIKE 'requeued_by_%%' )
 )
 ```
-**`_LEASE_APPLY` is now dead code.** `grep -rn "_LEASE_APPLY" src/ tests/` returns only its own
-definition at `queue.py:173` and a comment at `queue.py:1060`. Nothing executes it. That is the
+**`_LEASE_APPLY` is now dead code.** `grep -rn "_LEASE_APPLY" src/ tests/` returns three matches:
+its own definition at `queue.py:173`, a comment at `queue.py:1060`, and a binary match in a stale
+build artifact (`src/applypilot/fleet/__pycache__/queue.cpython-312.pyc`, which is compiled from
+that same definition and is not a separate reference). No call site exists in `src/` or `tests/`;
+nothing executes it. That is the
 tell: the clause was not deliberately removed and replaced — it was left behind in an orphaned
 string when the lease moved into the SQL function.
 
@@ -385,7 +389,7 @@ intact and removes the unrelated coupling. Do not remove the min-gap from produc
 
 ---
 
-### G6 — PRODUCTION REGRESSION: infrastructure park lost the attempt refund and the failure counter (1 test)
+### G6 — PRODUCTION REGRESSION: infrastructure park lost the attempt refund, the failure counter, and the failure timestamp — parked jobs are now permanently stranded (1 test)
 
 **Failing:** `tests/test_browser_readiness_preflight.py::test_worker_requeues_untouched_browser_preflight_failure`.
 Observed: `assert 1 == 0` on `row["attempts"]`.
@@ -424,12 +428,67 @@ never came up (`worker.py:759` gates on `infrastructure_preflight_failure and no
 res.get("application_tool_calls")` — i.e. the job was provably *never touched*). Burning a retry
 attempt for a local infrastructure fault penalizes the *job* for a fault of the *machine*, and
 over repeated preflight failures it walks good jobs into their attempt ceiling and out of the
-queue permanently. The lost `infrastructure_failure_count` is worse in a subtler way: there is a
-partial index built specifically on it (`schema_v3.sql:61-63`,
-`idx_apply_queue_infrastructure_pending`), so an operator surface exists that is now reading a
-column nothing increments — it will silently report zero infrastructure failures forever.
+queue permanently.
 
-**Smallest safe repair.** Restore the three writes on the infrastructure-park branch. Cleanest
+**The lost `infrastructure_last_failure_at` write is worse than the attempt refund, and is the
+reason this finding must not be deprioritized: infrastructure-parked jobs are now permanently
+stranded and are never recovered.** This is an operator-visible outage, not an accounting
+blemish. Verified chain:
+
+1. **No writer exists.** `grep -rn "infrastructure_last_failure_at" src/` returns exactly four
+   hits, none of which is a write:
+   ```
+   src/applypilot/fleet/apply_home_main.py:1160:  AND q.infrastructure_last_failure_at <= now() - make_interval(hours => %s)
+   src/applypilot/fleet/apply_home_main.py:1168:  ORDER BY q.infrastructure_last_failure_at ASC, q.url
+   src/applypilot/fleet/schema_v3.sql:35:         ALTER TABLE apply_queue ADD COLUMN IF NOT EXISTS infrastructure_last_failure_at TIMESTAMPTZ;
+   src/applypilot/fleet/schema_v3.sql:62:          ON apply_queue (infrastructure_last_failure_at DESC)
+   ```
+   Two reads in one SELECT, one `ADD COLUMN`, one index. The column is declared `TIMESTAMPTZ`
+   with **no `DEFAULT`** (`schema_v3.sql:35`), so every parked row's value is `NULL`.
+2. **The only consumer is the recovery sweep**, `retry_infrastructure_pending()` at
+   `apply_home_main.py:1138`, whose SELECT filters on
+   `AND q.infrastructure_last_failure_at <= now() - make_interval(hours => %s)`
+   (`apply_home_main.py:1160`).
+3. **`NULL <= anything` is `NULL`, not `TRUE`**, so that predicate is never satisfied. The sweep
+   matches zero rows, `urls` is empty, and `requeued` stays 0 — permanently, for every parked row,
+   regardless of cooldown or `--execute`.
+
+So the branch at `worker.py:759-773` parks untouched jobs into
+`status='failed' / apply_status='infrastructure_pending'`, and the one mechanism built to bring
+them back out can no longer see them. Jobs parked by a transient local Chrome fault are dead in
+the queue forever, with no operator surface reporting it — the sweep reports "0 candidates" and
+looks healthy. Note that the sibling count predicate at `apply_home_main.py:1159` uses
+`COALESCE(q.infrastructure_failure_count,0)`, which tolerates the missing counter write; the
+timestamp predicate has no such `COALESCE`, which is why the timestamp is the fatal one.
+
+The lost `infrastructure_failure_count` is the milder, subtler harm: there is a partial index
+built specifically on it (`schema_v3.sql:61-63`, `idx_apply_queue_infrastructure_pending`), so an
+operator surface exists that is now reading a column nothing increments — it will silently report
+zero infrastructure failures forever.
+
+**A second, silent consumer breakage on the same path.** The dropped counter also broke the
+worker's own event payload, independently of the database. `park_infrastructure_failure` now
+returns a two-key dict:
+```
+queue.py:505:  return {"status": "failed", "apply_status": "infrastructure_pending"} if landed else None
+```
+It contains `status` and `apply_status` only. But the worker reads a third key off it:
+```
+worker.py:772:  "failure_count": (parked or {}).get("infrastructure_failure_count"),
+```
+`infrastructure_failure_count` is not in the returned dict, so `.get()` returns `None` — silently,
+because `.get()` does not raise. The `infrastructure_parked` action dict returned at
+`worker.py:767-773` therefore now always carries `"failure_count": None`. Before `d486d4a` the
+park path did the counter arithmetic itself and returned it; the `_terminalize` swap dropped both
+the write and the return value, and `worker.py:772` was never updated to match. This is a
+degraded observability signal rather than a stranding bug, but it is on the same branch, has the
+same root cause, and would otherwise be missed — **it belongs in G6's repair scope.**
+
+**Smallest safe repair.** Restore the three writes on the infrastructure-park branch, **and**
+repair the return-value contract so `worker.py:772` gets a real count (have
+`park_infrastructure_failure` return the post-update `infrastructure_failure_count` — e.g. via
+`RETURNING` on the restored write — or, if the count is not plumbed back, drop the dead
+`failure_count` key from the worker payload rather than leaving it silently `None`). Cleanest
 placement is inside the `p_lane='ats'` terminal branch of `fleet_worker_terminalize`, conditional
 on `p_apply_status='infrastructure_pending'` (so the ordinary terminal path is untouched);
 alternatively re-add a dedicated guarded `UPDATE` in `park_infrastructure_failure` after
@@ -511,7 +570,8 @@ signature is intentional. X2 should not open `tests/test_apply_channel.py`.
 
 **No other file is contended.** G3/G4/G5/G6/G7 are confined to
 `src/applypilot/fleet/queue.py`, `src/applypilot/fleet/schema_v3.sql`,
-`src/applypilot/fleet/otp_relay.py` and their tests — all X2. G1's production sites are
+`src/applypilot/fleet/otp_relay.py`, `src/applypilot/fleet/worker.py` (G6's `failure_count` key
+only) and their tests — all X2. G1's production sites are
 `launcher.py` and `greenhouse_submit.py` — both X1, and both read-only for this remediation.
 
 ---
@@ -528,7 +588,8 @@ Which groups must be fixed before others, and why.
   then re-run clusters 3, 4, and 5 before touching anything else in X2.
 
 **Tier 1 — independent of each other; safe in parallel once Tier 0 lands.**
-- **G6** (infrastructure park refund) — `fleet_worker_terminalize` / `park_infrastructure_failure`.
+- **G6** (infrastructure park refund + counter + timestamp) — `fleet_worker_terminalize` /
+  `park_infrastructure_failure`, plus the `failure_count` key the worker reads at `worker.py:772`.
   Independent of G4's predicates, but its test leases first, so sequence it after G4.
 - **G3** (test-side ledger lease helper). If the fix takes the recommended form — call the real
   `queue.lease_apply()` instead of forging a lease — then G3 **depends on G4**, because the rows
@@ -551,12 +612,12 @@ collide with X2's critical path.
 
 | Group | Failing | Root cause | Verdict | Production change needed? | Lane |
 |---|---|---|---|---|---|
-| G1 | 6 | Browser interaction not lease-bound (`launcher.py:2117`, `:2760`) | Test stale | **No** | **X1** |
+| G1 | 6 | Browser interaction not lease-bound (`launcher.py:2117-2119`, `:2760`) | Test stale | **No** | **X1** |
 | G2 | 7 | `_prearm_inbox_auth_request(conn=)` (`launcher.py:3312`) | Test stale | **No** | **X1** |
 | G3 | 6 | `fleet_worker_park` needs ledger lease + GUC (`schema_v3.sql:1842-1849`) | Test stale | **No** | **X2** |
 | G4 | 1 | `fleet_worker_lease_ats` dropped double-apply blocker (`schema_v3.sql:1330-1378`) | **Production wrong** | **Yes** | **X2** |
 | G5 | 1 | Lease-time governor stamp vs host min-gap (`schema_v3.sql:1395-1399`) | Test stale (setup) | **No** | **X2** |
-| G6 | 1 | Infra park lost attempt refund + counter (`queue.py:493-505`) | **Production wrong** | **Yes** | **X2** |
+| G6 | 1 | Infra park lost refund + counter + **failure timestamp → parked jobs never recovered** (`queue.py:493-505`) | **Production wrong** | **Yes** | **X2** |
 | G7 | 1 | `fleet_controller_otp_pending` (`otp_relay.py:245`) | Test stale | **No** | **X2** |
 
 **X1 total: 13 failures, zero production changes** — all thirteen are stale test doubles that
@@ -569,6 +630,13 @@ tightening of lease authority. **The 2 that are not — G4 and G6 — are both s
 regressions introduced by the same migration commit `d486d4a`, and both weaken exactly the
 properties the shared baseline forbids weakening** (double-apply protection; honest attempt
 accounting). Those two should be treated as release-gating. The other 21 are hygiene.
+
+**Do not let G6's single failing test understate it.** One red test is the whole visible surface
+of a defect whose real consequence is that every infrastructure-parked job is now permanently
+stranded — the recovery sweep at `apply_home_main.py:1160` filters on a column
+(`infrastructure_last_failure_at`) that no code in `src/` writes, so it is always `NULL`, the
+predicate is never true, and the sweep matches zero rows forever. G6 is an operator-visible
+outage in waiting, not an accounting blemish, and should be prioritized on that basis.
 
 ---
 
