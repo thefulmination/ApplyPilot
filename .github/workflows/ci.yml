@@ -79,13 +79,15 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_DB: applypilot_test
+          # The database-backed security tests intentionally exercise database
+          # ACLs and CREATE DATABASE behavior against the default postgres DB.
+          POSTGRES_DB: postgres
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: applypilot-ci-test-only
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d applypilot_test"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -114,7 +116,7 @@ jobs:
 
       - name: Test
         env:
-          APPLYPILOT_PGTEST_DSN: postgresql://postgres:applypilot-ci-test-only@127.0.0.1:5432/applypilot_test
+          APPLYPILOT_PGTEST_DSN: postgresql://postgres:applypilot-ci-test-only@127.0.0.1:5432/postgres
         run: >-
           pytest tests/ -v
           --ignore=tests/test_emergency_legacy_authority_containment.py
