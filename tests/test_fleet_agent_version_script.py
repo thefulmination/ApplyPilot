@@ -5,6 +5,7 @@ import sys
 
 from applypilot.apply import pgqueue
 from applypilot.fleet.software_version import current_sw_version
+from fleet_agent_env import FORBIDDEN_DATABASE_ENV_VARS
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -12,6 +13,8 @@ REPO = Path(__file__).resolve().parents[1]
 
 def _run_version_script(fleet_db: str) -> str:
     env = os.environ.copy()
+    for name in FORBIDDEN_DATABASE_ENV_VARS:
+        env.pop(name, None)
     env["FLEET_PG_DSN"] = fleet_db
     result = subprocess.run(
         [sys.executable, str(REPO / "fleet-agent-version.py")],
