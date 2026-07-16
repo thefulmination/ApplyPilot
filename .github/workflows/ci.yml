@@ -13,6 +13,9 @@ on:
       - "config/phase-a/**"
       - "tests/**"
       - "pyproject.toml"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "deploy/**"
       - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
@@ -25,6 +28,9 @@ on:
       - "config/phase-a/**"
       - "tests/**"
       - "pyproject.toml"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "deploy/**"
       - ".github/workflows/ci.yml"
 
 permissions:
@@ -86,3 +92,46 @@ jobs:
       - name: Build wheel and source distribution
         if: matrix.python-version == '3.12'
         run: python -m build
+
+  container-build:
+    # Non-publishing build gate: proves the cloud apply-fleet worker image
+    # (Dockerfile) still builds and exposes its expected runtime surface.
+    # This job must never gain a registry login or push step, and must never
+    # reference repository environments or secrets — it only builds locally
+    # on the runner and inspects the result. See tests/test_container_build_contract.py
+    # for a static regression guard on that boundary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build candidate image (no push, no registry login)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: applypilot-worker:ci-candidate
+
+      - name: Deterministic image smoke check
+        run: |
+          set -euo pipefail
+          IMG=applypilot-worker:ci-candidate
+
+          # No network, no secrets, no live services, no timestamps: this only
+          # checks that the image was built with the expected runtime surface
+          # (package importable on the expected Python, entrypoint script
+          # present and executable, LiteLLM config shipped, Chrome shim
+          # linked). It intentionally does NOT invoke CMD (deploy/entrypoint.sh)
+          # -- that script requires FLEET_PG_DSN, DEEPSEEK_API_KEY, and mounted
+          # PII (profile.json, resume.pdf) before it will start anything.
+          docker run --rm --entrypoint python3 "$IMG" -c "import sys, applypilot, psycopg, litellm; assert sys.version_info[:2] == (3, 12), sys.version_info; print('python', sys.version.split()[0], 'applypilot', applypilot.__version__)"
+          docker run --rm --entrypoint test "$IMG" -x /app/entrypoint.sh
+          docker run --rm --entrypoint test "$IMG" -f /app/litellm_config.yaml
+          docker run --rm --entrypoint sh "$IMG" -c "test -x /usr/bin/google-chrome"
+          echo "container smoke check ok"
