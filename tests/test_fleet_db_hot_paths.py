@@ -30,7 +30,8 @@ class _ReadOnlyConnection:
 def test_blackout_poll_does_not_migrate_and_marks_connection_read_only(monkeypatch, capsys):
     conn = _ReadOnlyConnection()
     monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
-    monkeypatch.setattr(pgqueue, "connect", lambda: conn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda dsn: conn if dsn == "fleet-test-dsn" else None)
     monkeypatch.setattr(
         fleet_schema,
         "ensure_schema_v3",
@@ -61,7 +62,8 @@ def test_blackout_poll_returns_keep_when_read_only_setup_fails(monkeypatch, caps
             raise RuntimeError("read-only unavailable")
 
     monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
-    monkeypatch.setattr(pgqueue, "connect", lambda: Connection())
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
     monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
 
     runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
@@ -71,12 +73,31 @@ def test_blackout_poll_returns_keep_when_read_only_setup_fails(monkeypatch, caps
     assert "read-only unavailable" in captured.err
 
 
+@pytest.mark.parametrize("variable", ["FLEET_PG_DSN", "APPLYPILOT_FLEET_DSN"])
+def test_blackout_poll_accepts_each_fleet_dsn(variable, monkeypatch, capsys):
+    conn = _ReadOnlyConnection()
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setenv(variable, "fleet-test-dsn")
+    monkeypatch.setattr(pgqueue, "connect", lambda dsn: conn if dsn == "fleet-test-dsn" else None)
+    monkeypatch.setattr(
+        machine_blackout,
+        "status_line",
+        lambda status_conn, label, *, role: f"OK|{label}|{role}|||",
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    assert capsys.readouterr().out.strip() == "OK|m4|compute|||"
+
+
 def test_blackout_poll_rejects_database_url_without_fleet_dsn(monkeypatch, capsys):
     monkeypatch.delenv("FLEET_PG_DSN", raising=False)
     monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://wrong-database.invalid/app")
     monkeypatch.setattr(
-        pgqueue.psycopg,
+        pgqueue,
         "connect",
         lambda *_args, **_kwargs: pytest.fail("DATABASE_URL reached the fleet connector"),
     )
@@ -93,7 +114,7 @@ def test_blackout_poll_rejects_conflicting_fleet_dsns(monkeypatch, capsys):
     monkeypatch.setenv("FLEET_PG_DSN", "postgresql://fleet-one.invalid/app")
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://fleet-two.invalid/app")
     monkeypatch.setattr(
-        pgqueue.psycopg,
+        pgqueue,
         "connect",
         lambda *_args, **_kwargs: pytest.fail("conflicting fleet DSNs reached connector"),
     )
@@ -178,7 +199,8 @@ def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypa
 def test_blackout_poll_returns_keep_when_status_query_fails(monkeypatch, capsys):
     conn = _ReadOnlyConnection()
     monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
-    monkeypatch.setattr(pgqueue, "connect", lambda: conn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
 
     def fail_status_query(status_conn, _label, *, role):
         assert status_conn.read_only is True

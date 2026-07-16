@@ -1,5 +1,5 @@
-from pathlib import Path
 import os
+from pathlib import Path
 import shutil
 import subprocess
 
@@ -19,7 +19,7 @@ def _powershell_function(script: str, name: str) -> str:
         elif script[index] == "}":
             depth -= 1
             if depth == 0:
-                return script[start:index + 1]
+                return script[start : index + 1]
     raise AssertionError(f"unterminated PowerShell function {name}")
 
 
@@ -40,8 +40,11 @@ def _ps_quote(value) -> str:
     [
         ("OK|m4|{role}|||", 0, True),
         ("KEEP|m4|{role}|||error", 0, False),
+        ("BLOCKED|m4|{role}|policy||reason", 0, False),
         ("", 0, False),
         ("malformed", 0, False),
+        ("OK|wrong-label|{role}|||", 0, False),
+        ("OK|m4|wrong-role|||", 0, False),
         ("OK|m4|{role}|||", 7, False),
     ],
 )

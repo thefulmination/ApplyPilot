@@ -17,7 +17,14 @@ try:
     from applypilot.apply import pgqueue
     from applypilot.fleet import machine_blackout
 
-    conn = pgqueue.connect()
+    fleet_dsn = (os.environ.get("FLEET_PG_DSN") or "").strip()
+    applypilot_fleet_dsn = (os.environ.get("APPLYPILOT_FLEET_DSN") or "").strip()
+    if fleet_dsn and applypilot_fleet_dsn and fleet_dsn != applypilot_fleet_dsn:
+        raise RuntimeError("Inconsistent fleet Postgres DSN references")
+    dsn = fleet_dsn or applypilot_fleet_dsn
+    if not dsn:
+        raise RuntimeError("No fleet Postgres DSN: set FLEET_PG_DSN or APPLYPILOT_FLEET_DSN")
+    conn = pgqueue.connect(dsn)
     conn.read_only = True
     print(machine_blackout.status_line(conn, label, role=role))
 except Exception as exc:
