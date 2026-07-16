@@ -4097,24 +4097,29 @@ def test_control_database_failure_returns_stop_not_keep(monkeypatch, capsys):
     assert "postgresql://" not in captured.err
 
 
-def test_healthy_control_database_still_returns_stop_during_hold(monkeypatch, capsys):
+def test_healthy_mapped_control_database_returns_desired_worker_contract(monkeypatch, capsys):
     from applypilot.apply import pgqueue
 
     class Cursor:
         def __enter__(self): return self
         def __exit__(self, *_args): return False
         def execute(self, *_args): return None
-        def fetchone(self): return {"desired_workers": 8, "agent": "codex", "model": "", "generation": 39}
+        def fetchone(self):
+            return {"state": {
+                "machine_owner": "m2", "desired_workers": 8, "desired_agent": "codex",
+                "desired_model": "", "generation": 39, "admission_allowed": True,
+            }}
 
     class Connection:
         def cursor(self): return Cursor()
+        def rollback(self): return None
 
     monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
     monkeypatch.setattr(sys, "argv", ["fleet-agent-query.py", "m2"])
     monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
     monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
     runpy.run_path(str(ROOT / "fleet-agent-query.py"), run_name="__main__")
-    assert capsys.readouterr().out.strip() == "STOP|||"
+    assert capsys.readouterr().out.strip() == "8|codex||39"
 
 
 def test_worker_admission_denies_unenrolled_worker_without_mutation():
@@ -4125,15 +4130,7 @@ def test_worker_admission_denies_unenrolled_worker_without_mutation():
         def __enter__(self): return self
         def __exit__(self, *_args): return False
         def execute(self, statement, params=None): self.statements.append((statement, params))
-        def fetchone(self):
-            statement = self.statements[-1][0]
-            if "to_regclass" in statement:
-                return {"desired_state_table": "fleet_desired_state"}
-            if "FROM fleet_desired_state" in statement:
-                return {"desired_workers": 1, "generation": 1, "updated_at": datetime.now(timezone.utc)}
-            if "FROM workers" in statement:
-                return None
-            raise AssertionError(f"unexpected query after missing enrollment: {statement}")
+        def fetchone(self): return {"snapshot": None}
 
     class Connection:
         def __init__(self): self.cursor_value = Cursor()
@@ -4142,7 +4139,7 @@ def test_worker_admission_denies_unenrolled_worker_without_mutation():
     conn = Connection()
     result = emergency_admission.worker_admission(conn, machine_label="m2", machine_owner="m2", worker_id="m2-1")
     assert result.decision.value == "deny"
-    assert "worker-id is not enrolled" in result.reason
+    assert "does not match worker identity" in result.reason
     assert all(
         not statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"))
         for statement, _params in conn.cursor_value.statements
@@ -4152,18 +4149,17 @@ def test_worker_admission_denies_unenrolled_worker_without_mutation():
 def test_worker_admission_denies_stale_desired_state():
     from applypilot.fleet import emergency_admission
 
-    rows = iter([
-        {"desired_state_table": "fleet_desired_state"},
-        {"desired_workers": 1, "generation": 7, "updated_at": datetime.now(timezone.utc) - timedelta(minutes=6)},
-        {"machine_owner": "m2", "validated": True, "revoked_at": None},
-        {"paused": False, "ats_paused": False},
-    ])
-
     class Cursor:
         def __enter__(self): return self
         def __exit__(self, *_args): return False
         def execute(self, *_args): return None
-        def fetchone(self): return next(rows)
+        def fetchone(self):
+            return {"snapshot": {
+                "worker_id": "m2-1", "machine_owner": "m2", "validated": True,
+                "revoked_at": None, "desired_workers": 1, "generation": 7,
+                "desired_updated_at": datetime.now(timezone.utc) - timedelta(minutes=6),
+                "admission_allowed": False, "admission_reason": "desired_state_stale",
+            }}
 
     class Connection:
         def cursor(self): return Cursor()
@@ -4173,13 +4169,28 @@ def test_worker_admission_denies_stale_desired_state():
     assert "stale" in result.reason
 
 
-def test_worker_tick_denies_before_control_or_queue_access():
+def test_worker_tick_denial_stops_before_worker_loop_access():
     from applypilot.fleet import apply_worker_main
 
-    def forbidden_connection():
-        raise AssertionError("worker touched control or queue state before admission")
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, statement, params=None):
+            assert "fleet_worker_admission_snapshot" in statement
+        def fetchone(self):
+            return {"snapshot": {"contract": "apply", "admission_allowed": False,
+                                  "admission_reason": "ats_stopped"}}
 
-    result = apply_worker_main.run_apply(forbidden_connection, object(), max_iterations=1, idle_sleep=0)
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+        def rollback(self): return None
+
+    class Loop:
+        def run_once(self): raise AssertionError("denied worker reached queue lease")
+
+    result = apply_worker_main.run_apply(lambda: Connection(), Loop(), max_iterations=1, idle_sleep=0)
     assert result == {"applied": 0, "halted": 1, "idle": 0, "error": 0}
 
 

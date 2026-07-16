@@ -78,14 +78,15 @@ def test_local_apply_url_is_rejected_while_emergency_hold_is_active(monkeypatch)
 def test_direct_launcher_entry_is_denied_before_queue_mutation(monkeypatch):
     from applypilot.apply import launcher
 
-    monkeypatch.setattr(
-        launcher,
-        "reclaim_stale_leases",
-        lambda: pytest.fail("queue mutation reached before emergency admission"),
+    monkeypatch.setenv(
+        "FLEET_PG_DSN",
+        "postgresql://fleet_worker:wrong@127.0.0.1:1/unavailable?connect_timeout=1",
     )
 
-    with pytest.raises(SystemExit, match="emergency acquisition hold"):
+    with pytest.raises(SystemExit) as exc_info:
         launcher.main(target_url="https://example.invalid/job")
+
+    assert "control database unavailable" in str(exc_info.value)
 
 
 def test_database_url_is_not_a_fleet_dsn_fallback(monkeypatch):
@@ -95,15 +96,26 @@ def test_database_url_is_not_a_fleet_dsn_fallback(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://ambiguous.invalid/db")
 
-    with pytest.raises(RuntimeError, match="APPLYPILOT_FLEET_DSN"):
+    with pytest.raises(RuntimeError, match="FLEET_PG_DSN"):
         pgqueue.get_dsn()
 
 
-def test_inconsistent_fleet_dsn_fallbacks_are_rejected(monkeypatch):
+def test_applypilot_fleet_dsn_alias_is_not_accepted(monkeypatch):
+    from applypilot.apply import pgqueue
+
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://retired.invalid/control")
+
+    with pytest.raises(RuntimeError, match="FLEET_PG_DSN") as exc_info:
+        pgqueue.get_dsn()
+
+    assert "APPLYPILOT_FLEET_DSN" not in str(exc_info.value)
+
+
+def test_explicit_positional_fleet_dsn_wins_without_reading_ambiguous_environment(monkeypatch):
     from applypilot.apply import pgqueue
 
     monkeypatch.setenv("FLEET_PG_DSN", "postgresql://fleet.invalid/control")
-    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://other.invalid/control")
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://retired.invalid/control")
 
-    with pytest.raises(RuntimeError, match="Inconsistent fleet Postgres DSN"):
-        pgqueue.get_dsn()
+    assert pgqueue.get_dsn("host=localhost dbname=fleet") == "host=localhost dbname=fleet"

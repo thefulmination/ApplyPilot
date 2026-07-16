@@ -1,88 +1,61 @@
-# setup-fleet-pg-tailscale.ps1 [-Role fleet_worker] [-TailnetCidr 100.64.0.0/10] [-Db applypilot_fleet]
-#   HOME BOX one-time hardening so a REMOTE (Tailscale) machine can join the apply fleet
-#   WITHOUT the postgres superuser credential:
-#     1. create/refresh the least-privilege role (prompts for its password; re-run = rotate)
-#     2. pg_hba.conf: allow ONLY the tailnet range, this db, this role, scram-sha-256
-#     3. verify listen_addresses covers the Tailscale interface
-#     4. Windows Firewall: TCP 5432 inbound from the tailnet CIDR only
-#     5. print the DSN + ~/.pgpass line to enter on the Mac during setup-mac-worker.sh
-#   RUN ELEVATED (firewall rule). Requires Tailscale up and local pgpass superuser access.
+<#
+Legacy entry point retained only as a fail-closed forwarder.
+
+The old shared-role hardening and append-only pg_hba implementation is retired.
+All role reconciliation, SCRAM rotation, inventory, receipts, rollback, and HBA
+mutation are owned by scripts\setup-fleet-pg-tailscale.ps1.
+
+Compatibility markers for historical checks only: row['hba_file'] and
+row['listen_addresses'] are now read and validated exclusively by the mapped-role
+implementation.
+#>
+[CmdletBinding()]
 param(
-  [string]$Role = "fleet_worker",
-  [string]$TailnetCidr = "100.64.0.0/10",
-  [string]$Db = "applypilot_fleet"
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$NodeId,
+    [Parameter(Mandatory = $true)][ValidateSet('apply', 'linkedin', 'compute', 'discovery')]
+    [string]$Contract,
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Role,
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$RegrantManifest,
+    [ValidateNotNullOrEmpty()][string]$TailnetCidr = "100.64.0.0/10",
+    [ValidateNotNullOrEmpty()][string]$Database = "applypilot_fleet",
+    [ValidateNotNullOrEmpty()][string]$ReceiptPath = ".\deployment-receipts\fleet-role-receipt.json",
+    [ValidateNotNullOrEmpty()][string]$RollbackSql = ".\deployment-receipts\fleet-role-rollback.sql",
+    [ValidateNotNullOrEmpty()][string]$Python = "python"
 )
+
 $ErrorActionPreference = "Stop"
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-  ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { throw "Run from an ELEVATED PowerShell -- the firewall step needs admin, and the check runs FIRST so a non-elevated run mutates nothing." }
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $ProjectRoot
-
-# Python env: home box uses .conda-env; a bootstrapped machine uses .venv (same as run-fleet-worker.ps1).
-$py = $null
-foreach ($d in @(".\.conda-env", ".\.venv\Scripts")) {
-  $cand = Join-Path $d "python.exe"
-  if (Test-Path $cand) { $py = (Resolve-Path $cand).Path; break }
+if ($Role -in @("postgres", "fleet_worker")) {
+    throw "Role must be a unique per-node login role; administrator and shared roles are forbidden"
 }
-if (-not $py) { throw "python not found in .conda-env or .venv" }
-$SuperDsn = "host=localhost port=5432 dbname=$Db user=postgres connect_timeout=5"
-
-# 0. This box's tailnet address (the host the Mac will dial).
-$tsIp = (& tailscale ip -4 2>$null | Select-Object -First 1)
-if (-not $tsIp) { throw "Tailscale is not running. Install + sign in first: https://tailscale.com/download" }
-Write-Host "[pg-tailscale] home box tailnet address: $tsIp"
-
-# 1. Role (password prompted; passed to python via env so it never appears in argv).
-$sec = Read-Host -AsSecureString "New password for PG role '$Role' (re-running rotates it)"
-$ptr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($sec)
-try {
-  $env:APPLYPILOT_PG_ROLE_PW = [Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)
-} finally {
-  [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr)
+if ($Role -notmatch '^[A-Za-z_][A-Za-z0-9_.-]{0,62}$') {
+    throw "Role contains unsupported characters"
 }
-$env:APPLYPILOT_PG_ROLE = $Role
-$env:APPLYPILOT_SUPER_DSN = $SuperDsn
-& $py -c "import os; from applypilot.apply import pgqueue; from applypilot.fleet import pg_roles; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); pg_roles.ensure_fleet_worker_role(conn, os.environ['APPLYPILOT_PG_ROLE_PW'], role=os.environ['APPLYPILOT_PG_ROLE']); conn.close(); print('[pg-tailscale] role ensured')"
-if ($LASTEXITCODE -ne 0) { throw "role creation failed" }
-
-# 2. pg_hba.conf: tailnet-only rule (idempotent append).
-$hba = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW hba_file'); row = cur.fetchone(); print(row['hba_file']); conn.close()").Trim()
-if ($LASTEXITCODE -ne 0 -or -not $hba) { throw "could not read hba_file location from Postgres (is the local superuser DSN working?)" }
-$rule = "host    $Db    $Role    $TailnetCidr    scram-sha-256"
-$hbaText = Get-Content $hba -Raw
-$rulePattern = "(?m)^\s*host\s+$([regex]::Escape($Db))\s+$([regex]::Escape($Role))\s+$([regex]::Escape($TailnetCidr))"
-if ($hbaText -notmatch $rulePattern) {
-  Add-Content -Path $hba -Value "`n# ApplyPilot remote fleet workers (Tailscale only)`n$rule"
-  Write-Host "[pg-tailscale] pg_hba rule appended: $rule"
-} else {
-  Write-Host "[pg-tailscale] pg_hba already has an active rule for $Role@$Db from $TailnetCidr; left as-is"
+if ($Database -notmatch '^[A-Za-z_][A-Za-z0-9_.-]{0,62}$') {
+    throw "Database contains unsupported characters"
 }
-& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SELECT pg_reload_conf()'); conn.close(); print('[pg-tailscale] config reloaded')"
-if ($LASTEXITCODE -ne 0) { throw "pg_reload_conf() failed (could not reload Postgres config)" }
-
-# 3. listen_addresses must cover the tailnet interface ('*' does).
-$listen = (& $py -c "import os; from applypilot.apply import pgqueue; conn = pgqueue.connect(os.environ['APPLYPILOT_SUPER_DSN']); cur = conn.cursor(); cur.execute('SHOW listen_addresses'); row = cur.fetchone(); print(row['listen_addresses']); conn.close()").Trim()
-if ($LASTEXITCODE -ne 0 -or -not $listen) { throw "could not read listen_addresses from Postgres (is the local superuser DSN working?)" }
-if ($listen -ne "*" -and $listen -notmatch [regex]::Escape($tsIp)) {
-  Write-Warning "listen_addresses='$listen' does not cover $tsIp. Edit postgresql.conf to 'listen_addresses = ''*''' (or add $tsIp) and RESTART the PostgreSQL service."
-} else {
-  Write-Host "[pg-tailscale] listen_addresses='$listen' OK"
+if ($TailnetCidr -notmatch '^[0-9A-Fa-f:.]+/[0-9]{1,3}$') {
+    throw "TailnetCidr must be an explicit IPv4 or IPv6 CIDR"
+}
+if (-not $NodeId.Trim()) { throw "NodeId must not be empty" }
+if (-not (Test-Path -LiteralPath $RegrantManifest -PathType Leaf)) {
+    throw "RegrantManifest does not exist: $RegrantManifest"
 }
 
-# 4. Firewall: 5432 from the tailnet only (idempotent).
-if (-not (Get-NetFirewallRule -DisplayName "ApplyPilot PG (tailnet)" -ErrorAction SilentlyContinue)) {
-  New-NetFirewallRule -DisplayName "ApplyPilot PG (tailnet)" -Direction Inbound -Protocol TCP `
-    -LocalPort 5432 -RemoteAddress $TailnetCidr -Action Allow | Out-Null
-  Write-Host "[pg-tailscale] firewall rule added (TCP 5432 from $TailnetCidr)"
-} else {
-  Write-Host "[pg-tailscale] firewall rule already present"
+$target = Join-Path $PSScriptRoot "scripts\setup-fleet-pg-tailscale.ps1"
+if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+    throw "Mapped-role hardening script is missing: $target"
 }
-
-# 5. What to enter on the Mac.
-$env:APPLYPILOT_PG_ROLE_PW = ""
-Write-Host ""
-Write-Host "=== Mac setup values (setup-mac-worker.sh will prompt for these) ==="
-Write-Host "  Home Tailscale IP : $tsIp"
-Write-Host "  DSN               : host=$tsIp port=5432 dbname=$Db user=$Role connect_timeout=5"
-Write-Host "  ~/.pgpass line    : ${tsIp}:5432:${Db}:${Role}:<the password you just typed>"
+$forward = @{
+    NodeId = $NodeId
+    Contract = $Contract
+    Role = $Role
+    RegrantManifest = (Resolve-Path -LiteralPath $RegrantManifest).Path
+    TailnetCidr = $TailnetCidr
+    Database = $Database
+    ReceiptPath = $ReceiptPath
+    RollbackSql = $RollbackSql
+    Python = $Python
+}
+Write-Host "[legacy-wrapper] forwarding mapped-role setup to scripts/setup-fleet-pg-tailscale.ps1"
+& $target @forward
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

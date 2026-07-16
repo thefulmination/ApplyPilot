@@ -16,9 +16,9 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import queue as fleet_queue
-from applypilot.fleet import sync
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import queue as fleet_queue  # noqa: E402
+from applypilot.fleet import sync  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -681,6 +681,12 @@ def test_pull_apply_results_maps_applied_and_idempotent(fleet_db, tmp_path):
             pg, "w1", url, status="applied", target_host="boards.greenhouse.io",
             home_ip="1.2.3.4", apply_status="applied", est_cost_usd=0.6)
         assert ok is True
+        assert pg.execute(
+            "SELECT public.fleet_controller_verify_submission"
+            "('ats',%s,'independent-receipt','email_receipt') AS ok",
+            (url,),
+        ).fetchone()["ok"] is True
+        pg.commit()
 
         assert sync.pull_apply_results(sqlite_conn=sq, pg_conn=pg).get("applied") == 1
         brain = sq.execute("SELECT apply_status, applied_at FROM jobs WHERE url=?", (url,)).fetchone()

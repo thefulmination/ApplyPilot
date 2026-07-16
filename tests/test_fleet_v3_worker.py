@@ -327,7 +327,10 @@ def test_apply_preflight_non_dead_statuses_fall_through(
             "SELECT status::text, apply_status FROM apply_queue WHERE url=%s",
             (queue_url,),
         ).fetchone()
-    assert row == {"status": "applied", "apply_status": "applied"}
+    assert row == {
+        "status": "crash_unconfirmed",
+        "apply_status": "submission_claimed_unverified",
+    }
 
 
 def test_apply_preflight_exception_falls_through(fleet_db):
@@ -360,7 +363,10 @@ def test_apply_preflight_exception_falls_through(fleet_db):
             "SELECT status::text, apply_status FROM apply_queue WHERE url=%s",
             (queue_url,),
         ).fetchone()
-    assert row == {"status": "applied", "apply_status": "applied"}
+    assert row == {
+        "status": "crash_unconfirmed",
+        "apply_status": "submission_claimed_unverified",
+    }
 
 
 def test_apply_preflight_dead_closes_without_calling_apply_fn(fleet_db):
@@ -543,12 +549,13 @@ def test_worker_apply_clear_marks_applied(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT status, apply_status, worker_id FROM apply_queue WHERE url='a2'")
         q = cur.fetchone()
-        assert q["status"] == "applied" and q["apply_status"] == "applied"
+        assert q["status"] == "crash_unconfirmed"
+        assert q["apply_status"] == "submission_claimed_unverified"
         assert q["worker_id"] == "w-apply-ok"  # core stamps the closing worker
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url='a2'")
         assert cur.fetchone()["n"] == 0  # no wall -> no challenge
         cur.execute("SELECT success_24h FROM rate_governor WHERE scope_key='global'")
-        assert cur.fetchone()["success_24h"] == 1
+        assert cur.fetchone()["success_24h"] == 0
         cur.execute(
             "SELECT application_tool_calls, final_result_source, result_metadata "
             "FROM apply_result_events WHERE url='a2' ORDER BY id DESC LIMIT 1"
@@ -619,71 +626,7 @@ def test_canary_source_version_only_unblocks_the_declared_worker(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT status, worker_id FROM apply_queue WHERE url='a-canary-version'")
         q = cur.fetchone()
-        assert q["status"] == "applied"
-        assert q["worker_id"] == "w-canary"
-
-
-def test_worker_refuses_to_lease_when_source_version_is_stale(fleet_db):
-    with pgqueue.connect(fleet_db) as conn:
-        _seed_one_apply(conn, "a-stale-version")
-        fleet_config.set_pinned_version(conn, "2.0.0")
-
-    calls = []
-    loop = WorkerLoop(
-        _factory(fleet_db), "w-stale", home_ip="6.6.6.6", role="apply",
-        apply_fn=lambda job: calls.append(job) or _CLEAR_HTML,
-        machine_owner="jon", on_owner_machine=True, sw_version="1.0.0",
-    )
-
-    res = loop.run_once()
-    assert res["action"] == "version_mismatch"
-    assert res["expected_version"] == "2.0.0"
-    assert res["sw_version"] == "1.0.0"
-    assert calls == []
-
-    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT status, lease_owner FROM apply_queue WHERE url='a-stale-version'")
-        q = cur.fetchone()
-        assert q["status"] == "queued"
-        assert q["lease_owner"] is None
-        cur.execute("SELECT state, sw_version FROM worker_heartbeat WHERE worker_id='w-stale'")
-        hb = cur.fetchone()
-        assert hb["state"] == "version_mismatch"
-        assert hb["sw_version"] == "1.0.0"
-
-
-def test_canary_source_version_only_unblocks_the_declared_worker(fleet_db):
-    with pgqueue.connect(fleet_db) as conn:
-        _seed_one_apply(conn, "a-canary-version", host="canary.example")
-        fleet_config.set_pinned_version(
-            conn,
-            "1.0.0",
-            canary_version="2.0.0-rc1",
-            canary_worker_id="w-canary",
-        )
-
-    non_canary_calls = []
-    non_canary = WorkerLoop(
-        _factory(fleet_db), "w-other", home_ip="6.6.6.6", role="apply",
-        apply_fn=lambda job: non_canary_calls.append(job) or _CLEAR_HTML,
-        machine_owner="jon", on_owner_machine=True, sw_version="2.0.0-rc1",
-    )
-    assert non_canary.run_once()["action"] == "version_mismatch"
-    assert non_canary_calls == []
-
-    canary = WorkerLoop(
-        _factory(fleet_db), "w-canary", home_ip="6.6.6.6", role="apply",
-        apply_fn=lambda job: _CLEAR_HTML,
-        machine_owner="jon", on_owner_machine=True, sw_version="2.0.0-rc1",
-    )
-    res = canary.run_once()
-    assert res["action"] == "applied"
-    assert res["url"] == "a-canary-version"
-
-    with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        cur.execute("SELECT status, worker_id FROM apply_queue WHERE url='a-canary-version'")
-        q = cur.fetchone()
-        assert q["status"] == "applied"
+        assert q["status"] == "crash_unconfirmed"
         assert q["worker_id"] == "w-canary"
 
 
@@ -782,7 +725,7 @@ def test_greenhouse_adapter_no_confirmation_is_crash_unconfirmed(fleet_db):
         assert q["apply_status"] == "crash_unconfirmed"
         assert q["apply_error"] == "failed:no_confirmation"
         cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-gh-no-confirm'")
-        assert cur.fetchone()["n"] == 1
+        assert cur.fetchone()["n"] == 0
         cur.execute(
             "SELECT route, failure_class, last_tool FROM apply_result_events "
             "WHERE url='gh-no-confirm' ORDER BY id DESC LIMIT 1"
@@ -936,9 +879,9 @@ def test_tick_apply_status_passthrough(fleet_db):
     assert loop.run_once()["action"] == "applied"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT status FROM apply_queue WHERE url='ja'")
-        assert cur.fetchone()["status"] == "applied"
+        assert cur.fetchone()["status"] == "crash_unconfirmed"
         cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ja'")
-        assert cur.fetchone()["n"] == 1
+        assert cur.fetchone()["n"] == 0
 
     # A zero-tool no-result proves the application was untouched, so it is safely requeued.
     with pgqueue.connect(fleet_db) as conn:
@@ -1122,9 +1065,9 @@ def test_tick_linkedin_routes(fleet_db):
     assert loop.run_once()["action"] == "applied"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT status FROM linkedin_queue WHERE url='ka'")
-        assert cur.fetchone()["status"] == "applied"
+        assert cur.fetchone()["status"] == "crash_unconfirmed"
         cur.execute("SELECT count(*) AS n FROM applied_set WHERE dedup_key='dk-ka'")
-        assert cur.fetchone()["n"] == 1
+        assert cur.fetchone()["n"] == 0
 
     # failed:no_result_line -> crash_unconfirmed (never phantom-applied)
     with pgqueue.connect(fleet_db) as conn:
@@ -1151,9 +1094,7 @@ def test_tick_linkedin_routes(fleet_db):
         assert cur.fetchone()["n"] == 1
 
 
-def test_linkedin_challenge_insert_failure_rolls_back_park_transaction(fleet_db, monkeypatch):
-    from applypilot.fleet import worker as worker_module
-
+def test_linkedin_challenge_insert_failure_rolls_back_park_transaction(fleet_db):
     url = "linkedin-atomic-park"
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute(
@@ -1183,17 +1124,22 @@ def test_linkedin_challenge_insert_failure_rolls_back_park_transaction(fleet_db,
         )
         conn.commit()
 
-    def fail_challenge_insert(*args, **kwargs):
-        raise RuntimeError("simulated challenge insert failure")
-
-    monkeypatch.setattr(worker_module, "_insert_challenge", fail_challenge_insert)
+        cur.execute(
+            "CREATE FUNCTION public.test_fail_challenge_insert() RETURNS trigger LANGUAGE plpgsql "
+            "AS $$BEGIN RAISE EXCEPTION 'simulated challenge insert failure'; END$$"
+        )
+        cur.execute(
+            "CREATE TRIGGER test_fail_challenge_insert BEFORE INSERT ON auth_challenge "
+            "FOR EACH ROW EXECUTE FUNCTION public.test_fail_challenge_insert()"
+        )
+        conn.commit()
     loop = WorkerLoop(
         lambda: pgqueue.connect(fleet_db), "linkedin-atomic-worker",
         home_ip="1.1.1.1", role="linkedin", public_ip="1.1.1.1", owner_ip="1.1.1.1",
         apply_fn=lambda job: {"run_status": "captcha", "est_cost_usd": 0.0},
     )
 
-    with pytest.raises(RuntimeError, match="simulated challenge insert failure"):
+    with pytest.raises(Exception, match="simulated challenge insert failure"):
         loop.run_once()
 
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
@@ -1208,3 +1154,6 @@ def test_linkedin_challenge_insert_failure_rolls_back_park_transaction(fleet_db,
         assert row["ordinary_lease"] is True
         cur.execute("SELECT count(*) AS n FROM auth_challenge WHERE url=%s", (url,))
         assert cur.fetchone()["n"] == 0
+        cur.execute("DROP TRIGGER test_fail_challenge_insert ON auth_challenge")
+        cur.execute("DROP FUNCTION public.test_fail_challenge_insert()")
+        conn.commit()

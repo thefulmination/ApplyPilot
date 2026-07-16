@@ -8,6 +8,40 @@ def _factory(dsn):
     return lambda: pgqueue.connect(dsn)
 
 
+def test_compute_entrypoint_requires_server_admission_before_context(monkeypatch):
+    from applypilot.fleet import compute_worker_main as cwm
+    from applypilot.fleet import emergency_admission
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(cwm.pgqueue, "connect", lambda _dsn: Conn())
+    monkeypatch.setattr(cwm.fleet_schema, "require_apply_result_event_schema", lambda _conn: None)
+    monkeypatch.setattr(cwm.fleet_schema, "require_apply_attempt_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        cwm,
+        "build_compute_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("compute context loaded before admission")
+        ),
+    )
+    monkeypatch.setattr(
+        cwm,
+        "compute_worker_admission",
+        lambda _conn: emergency_admission.deny("compute denied by server"),
+        raising=False,
+    )
+
+    import pytest
+
+    with pytest.raises(SystemExit, match="compute denied by server"):
+        cwm.main(["--dsn", "test", "--worker-id", "worker-a"])
+
+
 def test_compute_worker_routes_audit_task_and_records_provider(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         queue.push_compute_jobs(conn, [{"url": "c-audit", "task": "audit",
@@ -22,14 +56,17 @@ def test_compute_worker_routes_audit_task_and_records_provider(fleet_db):
                                    "provider": "deepseek", "status": "done"}, 0.0003),
     }
     loop = WorkerLoop(_factory(fleet_db), "w-c", home_ip="1.1.1.1", role="compute", compute_fns=fns)
-    a1 = loop.run_once(); a2 = loop.run_once()
+    a1 = loop.run_once()
+    a2 = loop.run_once()
     assert {a1["action"], a2["action"]} == {"compute_done"}
 
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("SELECT status, result FROM compute_queue WHERE url='c-audit'")
-        r = cur.fetchone(); assert r["status"] == "done" and r["result"]["research_decision"] == "qualified"
+        r = cur.fetchone()
+        assert r["status"] == "done" and r["result"]["research_decision"] == "qualified"
         cur.execute("SELECT provider, model FROM llm_usage WHERE task='score'")
-        u = cur.fetchone(); assert u["provider"] == "deepseek" and u["model"] == "deepseek-v4-flash"
+        u = cur.fetchone()
+        assert u["provider"] == "deepseek" and u["model"] == "deepseek-v4-flash"
 
 
 def test_build_compute_loop_wires_both_handlers(fleet_db):

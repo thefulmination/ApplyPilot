@@ -4,6 +4,7 @@ on a version change; the brain never lands on a worker disk persistently."""
 from __future__ import annotations
 
 import json
+import base64
 
 from applypilot.apply import pgqueue
 from applypilot.fleet.compute_adapters import ComputeContext
@@ -23,19 +24,24 @@ def publish_context(conn, *, resume_text, preference_profile, kg_prompt, search_
     pgqueue.put_asset(conn, _VER, _b(version))
 
 
-def _txt(conn, name) -> str:
-    raw = pgqueue.get_asset(conn, name)
-    return raw.decode("utf-8") if raw else ""
-
-
 def load_context(conn, *, providers, fallback=(), ensemble=False) -> tuple[ComputeContext, str]:
-    version = _txt(conn, _VER)
-    pref = _txt(conn, _PREF)
-    cfg = _txt(conn, _CFG)
+    with conn.cursor() as cur:
+        cur.execute("SELECT public.fleet_worker_runtime_state('') AS state")
+        state = cur.fetchone()["state"] or {}
+    conn.rollback()
+    assets = state.get("compute_context") or {}
+
+    def text(name: str) -> str:
+        encoded = assets.get(name)
+        return base64.b64decode(encoded).decode("utf-8") if encoded else ""
+
+    version = text(_VER)
+    pref = text(_PREF)
+    cfg = text(_CFG)
     ctx = ComputeContext(
-        resume_text=_txt(conn, _RESUME),
+        resume_text=text(_RESUME),
         preference_profile=json.loads(pref) if pref else None,
-        kg_prompt=_txt(conn, _KG) or None,
+        kg_prompt=text(_KG) or None,
         search_cfg=json.loads(cfg) if cfg else None,
         ctx_version=version,
         providers=list(providers), fallback=list(fallback), ensemble=bool(ensemble),

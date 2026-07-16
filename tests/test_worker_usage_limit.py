@@ -68,7 +68,6 @@ def test_requeue_apply_returns_leased_job_to_queued(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         job = queue.lease_apply(conn, "w-req", home_ip="1.1.1.1")
         assert job["url"] == "ru"
-    with pgqueue.connect(fleet_db) as conn:
         landed = queue.requeue_apply(conn, "w-req", "ru", apply_error="failed:usage_limit")
         assert landed is True
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:

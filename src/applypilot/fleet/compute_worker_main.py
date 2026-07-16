@@ -10,6 +10,7 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import compute_context as cc
 from applypilot.fleet import schema as fleet_schema
 from applypilot.fleet.compute_adapters import make_audit_fn, make_score_fn
+from applypilot.fleet.emergency_admission import compute_worker_admission, require_allowed
 from applypilot.fleet.worker import WorkerLoop
 
 # How many run_once iterations between context-version checks. Keep low enough
@@ -75,6 +76,7 @@ def main(argv=None) -> int:
     with pgqueue.connect(args.dsn) as conn:
         fleet_schema.require_apply_result_event_schema(conn)
         fleet_schema.require_apply_attempt_schema(conn)
+        require_allowed(compute_worker_admission(conn))
         loop, ctx_version = build_compute_loop(
             conn, dsn=args.dsn, worker_id=args.worker_id, home_ip=args.home_ip,
             providers=providers, fallback=fallback, ensemble=args.ensemble,

@@ -19,6 +19,8 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _LOCAL_SRC = (_REPO_ROOT / "src").resolve()
+_FLEET_PG_LOGFILE: Path | None = None
+_TEST_PG_PASSWORD = "applypilot-disposable-test-only"
 
 
 def _pin_local_src() -> None:
@@ -66,6 +68,7 @@ def acquisition_admitted(monkeypatch):
 
 # Tables truncated between tests (in addition to apply_queue / fleet_config).
 _V3_TABLES = [
+    "fleet_worker_principals", "fleet_worker_lease_ledger", "fleet_worker_blocklist",
     "compute_queue", "search_tasks", "linkedin_queue", "rate_governor", "llm_usage",
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
     "inbox_outcomes",
@@ -112,6 +115,8 @@ def _free_port() -> int:
 
 @pytest.fixture(scope="session")
 def fleet_pg():
+    global _FLEET_PG_LOGFILE
+
     binp = _find_pg_bin()
     if binp is None:
         pytest.skip("applypilot-pgtest Postgres env not found "
@@ -120,12 +125,18 @@ def fleet_pg():
     initdb, pg_ctl = binp / f"initdb{ext}", binp / f"pg_ctl{ext}"
     datadir = Path(tempfile.mkdtemp(prefix="ap_fleetpg_"))
     logfile = datadir / "server.log"
+    pwfile = datadir.parent / f"{datadir.name}.pwfile"
     port = _free_port()
     try:
+        pwfile.write_text(_TEST_PG_PASSWORD + "\n", encoding="utf-8")
         subprocess.run(
-            [str(initdb), "-D", str(datadir), "-U", "postgres", "-A", "trust", "-E", "UTF8"],
+            [
+                str(initdb), "-D", str(datadir), "-U", "postgres", "-E", "UTF8",
+                "--auth-local=trust", "--auth-host=scram-sha-256", f"--pwfile={pwfile}",
+            ],
             check=True, capture_output=True, text=True,
         )
+        pwfile.unlink(missing_ok=True)
         subprocess.run(
             [str(pg_ctl), "-D", str(datadir), "-l", str(logfile),
              "-o", f"-p {port} -c listen_addresses=127.0.0.1 -c fsync=off",
@@ -133,30 +144,44 @@ def fleet_pg():
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except subprocess.CalledProcessError as e:
+        pwfile.unlink(missing_ok=True)
         log = logfile.read_text(encoding="utf-8", errors="replace") if logfile.exists() else ""
         shutil.rmtree(datadir, ignore_errors=True)
         pytest.skip(f"could not start test Postgres (exit {e.returncode}):\n{log}")
 
-    dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+    dsn = f"postgresql://postgres:{_TEST_PG_PASSWORD}@127.0.0.1:{port}/postgres"
+    _FLEET_PG_LOGFILE = logfile
     try:
         yield dsn
     finally:
-        subprocess.run([str(pg_ctl), "-D", str(datadir), "-m", "immediate", "-w", "stop"],
-                       capture_output=True, text=True)
+        _FLEET_PG_LOGFILE = None
+        try:
+            subprocess.run(
+                [str(pg_ctl), "-D", str(datadir), "-m", "immediate", "-w", "stop"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            pass
         shutil.rmtree(datadir, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def fleet_pg_log(fleet_pg):
+    """Server log for security probes against the disposable cluster."""
+    assert _FLEET_PG_LOGFILE is not None
+    return _FLEET_PG_LOGFILE
 
 
 @pytest.fixture
 def fleet_db(fleet_pg, monkeypatch):
     """Clean v3 schema for each test; yields the DSN."""
     monkeypatch.setenv("FLEET_PG_DSN", fleet_pg)
-    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_pg)
     with pgqueue.connect(fleet_pg) as conn:
         fleet_schema.ensure_schema_v3(conn)
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE apply_queue;")
+            cur.execute("TRUNCATE apply_queue CASCADE;")
             for t in _V3_TABLES:
-                cur.execute(f"TRUNCATE {t};")
+                cur.execute(f"TRUNCATE {t} CASCADE;")
             cur.execute("UPDATE fleet_config SET spend_cap_usd=0, paused=FALSE, "
                         "cost_cap_daily_usd=0, cost_cap_total_usd=0, "
                         "last_window_roll_at=NULL, agent_timeout_override=NULL, "

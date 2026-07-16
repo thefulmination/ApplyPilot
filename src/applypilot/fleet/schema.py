@@ -143,27 +143,10 @@ _REQUIRED_COLUMNS = {
 def _verify_schema_v3(conn) -> None:
     """Read-only compatibility check for least-privilege fleet connections."""
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_name = ANY(%s)",
-            (sorted(_REQUIRED_TABLES),),
-        )
-        present_tables = {row["table_name"] for row in cur.fetchall()}
-        cur.execute(
-            "SELECT table_name, column_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name = ANY(%s)",
-            (sorted(_REQUIRED_COLUMNS),),
-        )
-        present_columns: dict[str, set[str]] = {}
-        for row in cur.fetchall():
-            present_columns.setdefault(row["table_name"], set()).add(row["column_name"])
-
-    missing_tables = sorted(_REQUIRED_TABLES - present_tables)
-    missing_columns = sorted(
-        f"{table}.{column}"
-        for table, required in _REQUIRED_COLUMNS.items()
-        for column in required - present_columns.get(table, set())
-    )
+        cur.execute("SELECT public.fleet_worker_schema_contract() AS contract")
+        contract = cur.fetchone()["contract"] or {}
+    missing_tables = list(contract.get("missing_tables") or [])
+    missing_columns = list(contract.get("missing_columns") or [])
     if missing_tables or missing_columns:
         details = []
         if missing_tables:
@@ -203,6 +186,19 @@ def ensure_schema_v3(conn, *, lock_timeout_seconds: float = _SCHEMA_LOCK_TIMEOUT
     ``pgqueue.ensure_schema`` and the v3 migration under an advisory lock.
     Least-privilege workers perform a read-only compatibility check instead.
     """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_schema_contract() AS contract")
+            contract = cur.fetchone()["contract"] or {}
+        conn.rollback()
+    except Exception:
+        conn.rollback()
+        contract = {}
+    if contract.get("contract"):
+        if not contract.get("ready"):
+            _verify_schema_v3(conn)
+        return
+
     with conn.cursor() as cur:
         cur.execute(
             "WITH existing AS (SELECT to_regclass('public.apply_queue') AS oid) "
@@ -257,6 +253,17 @@ def _table_columns(conn, table_name: str) -> set[str]:
 
 def require_apply_result_event_schema(conn) -> None:
     """Fail closed when a worker cannot persist complete result evidence."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT public.fleet_worker_schema_contract() AS contract")
+        contract = cur.fetchone()["contract"] or {}
+    conn.rollback()
+    if contract.get("contract"):
+        if contract.get("apply_result_event_ready"):
+            return
+        raise RuntimeError(
+            "fleet schema is missing the apply-result worker contract; run "
+            "applypilot-fleet-apply-home with the owner/home DSN once to migrate"
+        )
     missing = sorted(
         _APPLY_RESULT_EVENT_REQUIRED_COLUMNS - _table_columns(conn, "apply_result_events")
     )
@@ -281,6 +288,17 @@ def require_apply_result_event_schema(conn) -> None:
 
 def require_apply_attempt_schema(conn) -> None:
     """Fail closed before adapter submit ownership when its ledger is incomplete."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT public.fleet_worker_schema_contract() AS contract")
+        contract = cur.fetchone()["contract"] or {}
+    conn.rollback()
+    if contract.get("contract"):
+        if contract.get("apply_attempt_ready"):
+            return
+        raise RuntimeError(
+            "fleet schema is missing the apply-attempt worker contract; run "
+            "applypilot-fleet-apply-home with the owner/home DSN once to migrate"
+        )
     missing = sorted(
         _APPLY_ATTEMPT_REQUIRED_COLUMNS - _table_columns(conn, "apply_attempts")
     )

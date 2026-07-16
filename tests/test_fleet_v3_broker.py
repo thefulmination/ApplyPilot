@@ -24,9 +24,9 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
-from applypilot.apply import pgqueue
-from applypilot.fleet import answer_bank, broker as broker_mod, config as fleet_config, heartbeat, queue
-from applypilot.fleet.broker import AuthError, Broker, CapabilityError
+from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import answer_bank, broker as broker_mod, config as fleet_config, heartbeat, queue  # noqa: E402
+from applypilot.fleet.broker import AuthError, Broker, CapabilityError  # noqa: E402
 
 OWNER_IP = "203.0.113.7"
 FRIEND_IP = "198.51.100.4"
@@ -290,10 +290,23 @@ def test_write_result_routes_linkedin_to_linkedin_queue(fleet_db):
         assert job is not None
         assert b.write_result(conn, owid, otok, lane="linkedin", url=job["url"], status="applied") is True
         with conn.cursor() as cur:
-            cur.execute("SELECT status FROM linkedin_queue WHERE url=%s", (job["url"],))
-            assert cur.fetchone()["status"] == "applied"  # closed in linkedin_queue
+            cur.execute("SELECT status,apply_status FROM linkedin_queue WHERE url=%s", (job["url"],))
+            assert cur.fetchone() == {
+                "status": "crash_unconfirmed",
+                "apply_status": "submission_claimed_unverified",
+            }
             cur.execute("SELECT success_24h FROM rate_governor WHERE scope_key='account:linkedin'")
-            assert cur.fetchone()["success_24h"] == 1  # account governor advanced
+            assert cur.fetchone()["success_24h"] == 0
+            cur.execute(
+                "SELECT public.fleet_controller_verify_submission"
+                "('linkedin',%s,'independent-receipt','email_receipt') AS ok",
+                (job["url"],),
+            )
+            assert cur.fetchone()["ok"] is True
+            cur.execute("SELECT status FROM linkedin_queue WHERE url=%s", (job["url"],))
+            assert cur.fetchone()["status"] == "applied"
+            cur.execute("SELECT success_24h FROM rate_governor WHERE scope_key='account:linkedin'")
+            assert cur.fetchone()["success_24h"] == 1
         # lease-owner guarded: a worker that doesn't hold the lease cannot close it
         assert queue.write_linkedin_result(conn, "intruder-worker", job["url"], status="applied") is False
 
