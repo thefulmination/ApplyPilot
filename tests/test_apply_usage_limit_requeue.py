@@ -157,6 +157,10 @@ def test_classified_usage_limit_stats_are_available_for_worker_metadata(monkeypa
 
 
 def test_launcher_metadata_counts_total_tool_calls_separately(monkeypatch, tmp_path):
+    class AttemptStore:
+        def mark_browser_interaction(self):
+            return None
+
     stdout_text = "".join(
         [
             _stream_line(
@@ -188,13 +192,131 @@ def test_launcher_metadata_counts_total_tool_calls_separately(monkeypatch, tmp_p
     )
     _patch_launcher_agent_io(monkeypatch, tmp_path, stdout_text=stdout_text)
 
-    status, _duration_ms = launcher._run_job_impl(_job(), port=9222, worker_id=44)
+    status, _duration_ms = launcher._run_job_impl(
+        _job(), port=9222, worker_id=44, attempt_store=AttemptStore()
+    )
 
     stats = launcher._last_run_stats[44]
     assert status == "failed:no_result_line"
     assert stats["tool_calls_total"] == 2
     assert stats["application_tool_calls"] == 1
     assert stats["last_tool"] == "browser_click"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__playwright__browser_click",
+        "mcp__codex__browser_click",
+        "mcp__codex_apps__browser_click",
+    ],
+)
+def test_codex_browser_click_marks_before_completed_event(monkeypatch, tmp_path, tool_name):
+    events = []
+
+    class AttemptStore:
+        def mark_browser_interaction(self):
+            events.append("marked")
+
+    stdout_text = "".join(
+        [
+            _stream_line(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "id": "call-1",
+                        "type": "mcp_tool_call",
+                        "name": tool_name,
+                    },
+                }
+            ),
+            _stream_line(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "call-1",
+                        "type": "mcp_tool_call",
+                        "name": tool_name,
+                    },
+                }
+            ),
+            _stream_line(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "result": "RESULT:FAILED:no_result_line",
+                }
+            ),
+        ]
+    )
+    _patch_launcher_agent_io(monkeypatch, tmp_path, stdout_text=stdout_text)
+
+    original_note = launcher._ExecutionEvidence.note_action
+
+    def note_after_dispatch(self, *args, **kwargs):
+        events.append("completed")
+        return original_note(self, *args, **kwargs)
+
+    monkeypatch.setattr(launcher._ExecutionEvidence, "note_action", note_after_dispatch)
+    launcher._run_job_impl(
+        _job(), port=9222, worker_id=48, attempt_store=AttemptStore()
+    )
+
+    assert events == ["marked", "completed"]
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__playwright__browser_click",
+        "mcp__codex__browser_click",
+        "mcp__codex_apps__browser_click",
+    ],
+)
+def test_marker_failure_stops_browser_tool_before_completion(monkeypatch, tmp_path, tool_name):
+    completed = []
+
+    class AttemptStore:
+        def mark_browser_interaction(self):
+            raise RuntimeError("marker unavailable")
+
+    stdout_text = "".join(
+        [
+            _stream_line(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "id": "call-2",
+                        "type": "mcp_tool_call",
+                        "name": tool_name,
+                    },
+                }
+            ),
+            _stream_line(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "call-2",
+                        "type": "mcp_tool_call",
+                        "name": tool_name,
+                    },
+                }
+            ),
+        ]
+    )
+    _patch_launcher_agent_io(monkeypatch, tmp_path, stdout_text=stdout_text)
+    monkeypatch.setattr(
+        launcher._ExecutionEvidence,
+        "note_action",
+        lambda *args, **kwargs: completed.append(True),
+    )
+
+    status, _ = launcher._run_job_impl(
+        _job(), port=9222, worker_id=49, attempt_store=AttemptStore()
+    )
+
+    assert status == "failed:marker unavailable"
+    assert completed == []
 
 
 def test_launcher_zero_tool_terminal_failure_keeps_last_tool_empty(monkeypatch, tmp_path):

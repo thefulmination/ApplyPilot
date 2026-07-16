@@ -41,9 +41,9 @@ import os
 import re
 from typing import Any, Callable, Optional
 
+from psycopg.types.json import Jsonb
+
 from applypilot.fleet import captcha as _captcha
-from applypilot.fleet import config as fleet_config
-from applypilot.fleet import governor
 from applypilot.fleet import queue
 from applypilot.apply.lifecycle_fault import enforce_no_lifecycle_faults
 
@@ -125,23 +125,6 @@ def _scrub(text: Optional[str]) -> str:
         return ""
 
 
-def _insert_challenge(conn, *, url, worker_id, machine_owner, home_ip, kind, route,
-                      screenshot_url=None, commit=True) -> int:
-    """Raise an ``auth_challenge`` row (captcha inbox, spec §7.3). Surrogate ``id``
-    PK so the SAME url can wall on a friend box AND be re-attempted on the owner
-    box without colliding (C4). Returns the new challenge id."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO auth_challenge (url, worker_id, machine_owner, home_ip, kind, route, screenshot_url) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (url, worker_id, machine_owner, home_ip, kind, route, screenshot_url),
-        )
-        cid = cur.fetchone()["id"]
-    if commit:
-        conn.commit()
-    return cid
-
-
 def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_job=None,
                sw_version=None, last_error=None, recent_log=None, current_agent=None,
                current_model=None, agent_chain=None, last_agent_switch_at=None,
@@ -153,24 +136,26 @@ def _heartbeat(conn, *, worker_id, machine_owner, home_ip, role, state, current_
     ``last_error`` / ``recent_log`` (crash-visibility, scrubbed by the caller) OVERWRITE
     on every beat (set ...=EXCLUDED.x), unlike ``sw_version`` which COALESCEs to keep a
     previously reported version when a beat omits it."""
+    telemetry = {
+        "worker_id": worker_id,
+        "machine_owner": machine_owner,
+        "home_ip": home_ip,
+        "role": role,
+        "state": state,
+        "current_job": current_job,
+        "sw_version": sw_version,
+        "last_error": last_error,
+        "recent_log": recent_log,
+        "current_agent": current_agent,
+        "current_model": current_model,
+        "agent_chain": agent_chain,
+        "last_agent_switch_at": (
+            last_agent_switch_at.isoformat() if hasattr(last_agent_switch_at, "isoformat") else None
+        ),
+        "last_agent_switch_reason": last_agent_switch_reason,
+    }
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO worker_heartbeat (worker_id, machine_owner, home_ip, role, state, current_job, "
-            "sw_version, last_error, recent_log, current_agent, current_model, agent_chain, "
-            "last_agent_switch_at, last_agent_switch_reason, last_beat) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
-            "ON CONFLICT (worker_id) DO UPDATE SET machine_owner=EXCLUDED.machine_owner, home_ip=EXCLUDED.home_ip, "
-            "role=EXCLUDED.role, state=EXCLUDED.state, current_job=EXCLUDED.current_job, "
-            "sw_version=COALESCE(EXCLUDED.sw_version, worker_heartbeat.sw_version), "
-            "last_error=EXCLUDED.last_error, recent_log=EXCLUDED.recent_log, "
-            "current_agent=EXCLUDED.current_agent, current_model=EXCLUDED.current_model, "
-            "agent_chain=EXCLUDED.agent_chain, last_agent_switch_at=COALESCE(EXCLUDED.last_agent_switch_at, worker_heartbeat.last_agent_switch_at), "
-            "last_agent_switch_reason=COALESCE(EXCLUDED.last_agent_switch_reason, worker_heartbeat.last_agent_switch_reason), "
-            "last_beat=now()",
-            (worker_id, machine_owner, home_ip, role, state, current_job, sw_version,
-             last_error, recent_log, current_agent, current_model, agent_chain,
-             last_agent_switch_at, last_agent_switch_reason),
-        )
+        cur.execute("SELECT public.fleet_worker_heartbeat(%s)", (Jsonb(telemetry),))
     if commit:
         conn.commit()
 
@@ -303,10 +288,10 @@ class WorkerLoop:
             with self._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT state, last_agent_switch_reason FROM worker_heartbeat WHERE worker_id=%s",
+                        "SELECT public.fleet_worker_runtime_state(%s) AS state",
                         (self.worker_id,),
                     )
-                    row = cur.fetchone()
+                    row = cur.fetchone()["state"]
                 conn.rollback()
             if row is None or row.get("state") != "paused":
                 return False
@@ -340,16 +325,32 @@ class WorkerLoop:
         scheduled task -- respawns it); self_update is acked as a no-op (superseded
         by the fleet-agent pull-updater, spec 2026-07-03). Fail-safe: a poll error
         returns None and the tick proceeds -- a DB blip must never stop a worker."""
-        from applypilot.fleet import heartbeat as _hb
         try:
-            cmds = _hb.poll_commands(conn, self.worker_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT public.fleet_worker_runtime_state(%s) AS state",
+                    (self.worker_id,),
+                )
+                runtime = cur.fetchone()["state"] or {}
+            cmds = runtime.get("commands") or []
         except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             return None
         stop: Optional[str] = None
         for c in cmds:
             cmd = c.get("command")
             try:
-                _hb.ack_command(conn, c["id"], self.worker_id)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT public.fleet_worker_ack_command(%s,%s) AS ok",
+                        (c["id"], self.worker_id),
+                    )
+                    if not cur.fetchone()["ok"]:
+                        continue
+                conn.commit()
             except Exception:
                 continue  # never acked -> re-delivered next tick; do not act twice
             if cmd == "pause":
@@ -360,6 +361,13 @@ class WorkerLoop:
                 self._record_event("command: resume")
             elif cmd in ("restart", "drain"):
                 issued_at = c.get("issued_at")
+                if isinstance(issued_at, str):
+                    try:
+                        issued_at = _dt.datetime.fromisoformat(
+                            issued_at.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        issued_at = None
                 if c.get("worker_id") == self.worker_id and issued_at and issued_at < self._started_at:
                     self._record_event(f"command: stale {cmd} ignored")
                     continue
@@ -400,15 +408,19 @@ class WorkerLoop:
             if self._paused:
                 self._beat(conn, state="paused")
                 return {"action": "paused"}
-            version_status = fleet_config.version_status_for_worker(
-                conn,
-                self.worker_id,
-                sw_version=self.sw_version,
-            )
+            self._beat(conn, state="starting")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT public.fleet_worker_version_status(%s,%s) AS status",
+                    (self.worker_id, self.sw_version),
+                )
+                version_status = cur.fetchone()["status"]
             if not version_status["matches"]:
                 expected = version_status["expected_version"]
                 actual = version_status["sw_version"]
-                self._record_event(f"version mismatch: running {actual or '(unreported)'} expected {expected}")
+                self._record_event(
+                    f"version mismatch: running {actual or '(unreported)'} expected {expected}"
+                )
                 self._beat(conn, state="version_mismatch")
                 return {
                     "action": "version_mismatch",
@@ -465,16 +477,11 @@ class WorkerLoop:
             postings = self.search_fn(task) or []
         except Exception:  # a scrape-block / transport error parks the task (RF3)
             error = "blocked"
-        staged = 0
-        if not error and postings:
-            staged = queue.push_discovered(
-                conn, task_id=task["task_id"],
-                source_label=task.get("query") or task.get("board"),
-                worker_id=self.worker_id, postings=postings, commit=False,
-            )
+        staged = len(postings) if not error else 0
         queue.complete_search(
             conn, self.worker_id, task["task_id"],
             result_count=len(postings), board=task.get("board"), error=error,
+            postings=postings,
         )
         self._record_event(
             f"wrote search {('error:' + error) if error else 'ok'} "
@@ -707,11 +714,10 @@ class WorkerLoop:
         if run_status in self._WALL_STATUSES:
             queue.park_linkedin_challenge(
                 conn, self.worker_id, url,
-                halt_seconds=self._linkedin_halt_seconds(), commit=False,
+                halt_seconds=self._linkedin_halt_seconds(),
+                kind="visible_captcha" if run_status == "captcha" else "login_gate",
+                route="owner_inbox", evidence={"machine_owner": self.machine_owner}, commit=False,
             )
-            _insert_challenge(conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
-                              home_ip=self.home_ip, kind="visible_captcha" if run_status == "captcha" else "login_gate",
-                              route="owner_inbox", commit=False)
             conn.commit()
             self._record_event(f"parked linkedin challenge {url} ({run_status})")
             self._beat(conn, state="challenge_pending", current_job=url)
@@ -879,43 +885,17 @@ class WorkerLoop:
         written; the owner resolves the challenge from the trusted box. ``outcome`` may
         be None (e.g. a login wall) -> no governor outcome is recorded, so a non-bot
         wall doesn't pollute the breaker's challenge_rate (§6)."""
-        cid = _insert_challenge(
-            conn, url=url, worker_id=self.worker_id, machine_owner=self.machine_owner,
-            home_ip=self.home_ip, kind=kind, route=route, commit=False,
+        evidence = dict(telemetry or {})
+        evidence["machine_owner"] = self.machine_owner
+        evidence["outcome"] = outcome
+        evidence["target_host"] = target_host
+        landed = queue.park_challenge(
+            conn, self.worker_id, url, kind=kind, route=route, evidence=evidence, commit=False
         )
-        if outcome is not None:
-            scopes = [governor.GLOBAL, governor.home_ip_scope(self.home_ip)]
-            if target_host:
-                scopes.append(governor.host_scope(target_host))
-            governor.record_outcome(conn, scopes, outcome, commit=False)
-        queue.park_challenge(conn, self.worker_id, url, commit=False)
-        if telemetry is not None:
-            queue.record_apply_challenge_event(
-                conn,
-                self.worker_id,
-                url,
-                kind=kind,
-                target_host=target_host,
-                home_ip=self.home_ip,
-                est_cost_usd=telemetry.get("est_cost_usd", 0),
-                agent=telemetry.get("agent"),
-                agent_model=telemetry.get("agent_model"),
-                apply_duration_ms=telemetry.get("apply_duration_ms"),
-                route=telemetry.get("route"),
-                failure_class=telemetry.get("failure_class"),
-                tool_calls_total=telemetry.get("tool_calls_total"),
-                application_tool_calls=telemetry.get("application_tool_calls"),
-                last_tool=telemetry.get("last_tool"),
-                result_metadata=telemetry.get("result_metadata"),
-                job_log_path=telemetry.get("job_log_path"),
-                transcript_digest=telemetry.get("transcript_digest"),
-                final_result_source=telemetry.get("final_result_source"),
-                commit=False,
-            )
         conn.commit()
         self._record_event(f"parked challenge {url} ({kind}->{route})")
         self._beat(conn, state="challenge_pending", current_job=url)
-        return cid
+        return int(bool(landed))
 
     # -- heartbeat helper -----------------------------------------------------
     def _build_recent_log(self) -> Optional[str]:

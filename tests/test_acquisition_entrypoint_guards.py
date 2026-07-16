@@ -3,16 +3,34 @@ from __future__ import annotations
 import pytest
 
 
-def test_linkedin_worker_startup_denies_before_environment_or_schema(monkeypatch):
+def test_linkedin_worker_startup_denies_after_server_admission_before_schema(monkeypatch):
     from applypilot.fleet import linkedin_worker_main as worker
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import schema
 
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, statement, params=None):
+            assert "fleet_worker_admission_snapshot" in statement
+        def fetchone(self):
+            return {"snapshot": {"contract": "linkedin", "admission_allowed": False,
+                                  "admission_reason": "linkedin_stopped"}}
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+        def rollback(self): return None
+
+    monkeypatch.setattr(worker, "_setup_apply_env", lambda: None)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
     monkeypatch.setattr(
-        worker,
-        "_setup_apply_env",
-        lambda: pytest.fail("environment setup reached before startup admission"),
+        schema, "require_apply_result_event_schema",
+        lambda *_args: pytest.fail("schema validation reached after denied admission"),
     )
 
-    with pytest.raises(SystemExit, match="emergency acquisition hold"):
+    with pytest.raises(SystemExit, match="linkedin_stopped"):
         worker.main(
             [
                 "--dsn",
@@ -25,18 +43,30 @@ def test_linkedin_worker_startup_denies_before_environment_or_schema(monkeypatch
         )
 
 
-def test_linkedin_worker_tick_denies_before_control_or_lease():
+def test_linkedin_worker_tick_denies_from_control_contract_before_lease():
     from applypilot.fleet import linkedin_worker_main as worker
 
     class Loop:
         def run_once(self):
             pytest.fail("LinkedIn lease reached before tick admission")
 
-    def forbidden_connection():
-        pytest.fail("control database reached before tick admission")
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, statement, params=None):
+            assert "fleet_worker_admission_snapshot" in statement
+        def fetchone(self):
+            return {"snapshot": {"contract": "linkedin", "admission_allowed": False,
+                                  "admission_reason": "linkedin_stopped"}}
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def cursor(self): return Cursor()
+        def rollback(self): return None
 
     result = worker.run_linkedin(
-        forbidden_connection,
+        lambda: Connection(),
         Loop(),
         max_iterations=1,
         idle_sleep=0,

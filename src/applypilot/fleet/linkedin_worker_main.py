@@ -99,7 +99,7 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
     _setup_apply_env()
     from applypilot.apply import pgqueue
     from applypilot.fleet.worker import WorkerLoop
-    from applypilot.fleet.apply_worker_main import make_apply_fn, make_log_tail_fn
+    from applypilot.fleet.apply_worker_main import PgAttemptStore, make_apply_fn, make_log_tail_fn
 
     from applypilot.apply import launcher
     loop = WorkerLoop(
@@ -113,6 +113,9 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
         owner_ip=owner_ip,
         on_owner_machine=True,
         log_tail_fn=make_log_tail_fn(0),
+        attempt_store_factory=lambda conn, job: PgAttemptStore(
+            conn, job, worker_id=worker_id
+        ),
     )
     loop.current_agent = agent
     loop.current_model = launcher.effective_agent_model_label(agent, model)
@@ -144,11 +147,6 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
         except Exception:
             pass
     while max_iterations is None or it < max_iterations:
-        admission = emergency_admission.linkedin_tick_admission()
-        if not admission.allowed:
-            logger.error(admission.reason)
-            counts["halted"] += 1
-            break
         it += 1
         try:
             if budget is not None and switcher is not None:
@@ -195,6 +193,11 @@ def run_linkedin(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                         pass
                     current_agent = agent
             with conn_factory() as conn:
+                admission = emergency_admission.linkedin_tick_admission(conn)
+                if not admission.allowed:
+                    logger.error(admission.reason)
+                    counts["halted"] += 1
+                    break
                 if pgqueue.linkedin_should_halt(conn):
                     counts["halted"] += 1
                     try:
@@ -262,19 +265,26 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
-    from applypilot.fleet import emergency_admission
-    emergency_admission.require_allowed(emergency_admission.linkedin_worker_admission())
-
     _setup_apply_env()
     from applypilot.apply import pgqueue
-    from applypilot.fleet import schema as fleet_schema
+    from applypilot.fleet import emergency_admission, schema as fleet_schema
 
     with pgqueue.connect(args.dsn) as schema_conn:
+        emergency_admission.require_allowed(
+            emergency_admission.linkedin_worker_admission(schema_conn)
+        )
         try:
             fleet_schema.require_apply_result_event_schema(schema_conn)
             fleet_schema.require_apply_attempt_schema(schema_conn)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from None
+        with schema_conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_admission_snapshot() AS snapshot")
+            startup = cur.fetchone()["snapshot"] or {}
+        schema_conn.rollback()
+    configured_owner_ip = startup.get("linkedin_owner_ip") or startup.get("public_ip")
+    if not configured_owner_ip:
+        raise SystemExit("LinkedIn owner IP is not configured in fleet control state")
 
     # Open a DEDICATED long-lived connection solely for holding the advisory lock.
     # This connection is kept open for the process life; releasing it releases the lock.
@@ -288,7 +298,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     loop = build_linkedin_loop(
         dsn=args.dsn,
         worker_id=args.worker_id,
-        owner_ip=args.owner_ip,
+        owner_ip=configured_owner_ip,
         model=args.model,
         agent=args.agent,
         machine_owner=args.machine_owner,

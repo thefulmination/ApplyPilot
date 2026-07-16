@@ -10,7 +10,6 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import itertools
-import math
 import os
 import time
 from dataclasses import dataclass
@@ -26,8 +25,6 @@ from applypilot.mail_source import validate_max_messages
 _DEFAULT_ANSWERED_TTL_SECONDS = 600
 _DEFAULT_SCAN_MAX_MESSAGES = 1000
 _MAX_RESPONDER_ITEMS = 1000
-_REQUEST_LOCK_TIMEOUT_SECONDS = 5.0
-_REQUEST_LOCK_RETRY_SECONDS = 0.05
 
 @dataclass(frozen=True)
 class RelayCode:
@@ -78,36 +75,6 @@ def _responder_lock_key() -> int:
     return _advisory_lock_key("applypilot:otp_responder")
 
 
-def _acquire_request_lock(
-    conn,
-    lock_key: int,
-    *,
-    timeout_seconds: float = _REQUEST_LOCK_TIMEOUT_SECONDS,
-) -> None:
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
-        raise ValueError("request lock timeout must be from 0 to 60 seconds")
-    if timeout_seconds < 0 or timeout_seconds > 60:
-        raise ValueError("request lock timeout must be from 0 to 60 seconds")
-    normalized_timeout = float(timeout_seconds)
-    if not math.isfinite(normalized_timeout):
-        raise ValueError("request lock timeout must be from 0 to 60 seconds")
-
-    deadline = time.monotonic() + normalized_timeout
-    while True:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT pg_try_advisory_xact_lock(%s) AS acquired",
-                (lock_key,),
-            )
-            if cur.fetchone()["acquired"]:
-                return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            conn.rollback()
-            raise TimeoutError("timed out acquiring OTP request lock")
-        time.sleep(min(_REQUEST_LOCK_RETRY_SECONDS, remaining))
-
-
 def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
                  ttl_seconds: int = 300) -> int:
     """Return the active request row's id after serializing concurrent duplicates.
@@ -115,33 +82,12 @@ def request_code(conn, *, worker_id: str, job_url: str, application_url: str,
     Requests for the same worker and target serialize under a transaction advisory lock.
     """
     ttl_seconds = _validate_ttl_seconds(ttl_seconds)
-    target = application_url or job_url
-    _acquire_request_lock(conn, _request_lock_key(worker_id, target))
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, code FROM otp_request "
-            "WHERE worker_id=%s AND url=%s AND consumed_at IS NULL "
-            "      AND (expires_at IS NULL OR expires_at > now()) "
-            "ORDER BY requested_at DESC, id DESC LIMIT 1",
-            (worker_id, target),
+            "SELECT public.fleet_worker_otp_request(%s,%s,%s,%s) AS request_id",
+            (worker_id, job_url, application_url, ttl_seconds),
         )
-        active = cur.fetchone()
-        if active:
-            rid = active["id"]
-            if active["code"] is None:
-                cur.execute(
-                    "UPDATE otp_request "
-                    "SET expires_at=GREATEST(expires_at, now() + make_interval(secs => %s)) "
-                    "WHERE id=%s AND code IS NULL",
-                    (ttl_seconds, rid),
-                )
-        else:
-            cur.execute(
-                "INSERT INTO otp_request (worker_id, url, sender_hint, expires_at) "
-                "VALUES (%s, %s, %s, now() + make_interval(secs => %s)) RETURNING id",
-                (worker_id, target, _apply_domain(target), ttl_seconds),
-            )
-            rid = cur.fetchone()["id"]
+        rid = cur.fetchone()["request_id"]
     conn.commit()
     return rid
 
@@ -150,22 +96,14 @@ def _try_consume(conn, request_id: int) -> RelayCode | None:
     """Atomically capture-and-null an unexpired, unconsumed code. Single-use."""
     with conn.cursor() as cur:
         cur.execute(
-            "WITH picked AS ("
-            "  SELECT id, code, code_kind FROM otp_request "
-            "  WHERE id = %s AND consumed_at IS NULL AND code IS NOT NULL "
-            "        AND (expires_at IS NULL OR expires_at > now()) "
-            "  FOR UPDATE"
-            ") "
-            "UPDATE otp_request o SET consumed_at = now(), code = NULL "
-            "FROM picked WHERE o.id = picked.id "
-            "RETURNING picked.code AS code, picked.code_kind AS code_kind",
+            "SELECT public.fleet_worker_otp_consume(%s) AS relay_code",
             (request_id,),
         )
-        row = cur.fetchone()
+        row = cur.fetchone()["relay_code"]
     conn.commit()
     if not row:
         return None
-    return RelayCode(value=row["code"], kind=(row["code_kind"] or "code"))
+    return RelayCode(value=row["value"], kind=(row["kind"] or "code"))
 
 
 def poll_for_code(conn, request_id: int, *, timeout_seconds: int = 300,
@@ -186,9 +124,7 @@ def poll_for_code(conn, request_id: int, *, timeout_seconds: int = 300,
 def _stamp_wait_started(conn, request_id: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE otp_request SET wait_started_at=COALESCE(wait_started_at, now()) "
-            "WHERE id=%s AND consumed_at IS NULL "
-            "      AND (expires_at IS NULL OR expires_at > now())",
+            "SELECT public.fleet_worker_otp_wait(%s)",
             (request_id,),
         )
     conn.commit()
@@ -348,13 +284,15 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, requested_at, sender_hint FROM otp_request "
-            "WHERE code IS NULL AND consumed_at IS NULL "
-            "      AND expires_at > now() "
-            "ORDER BY requested_at, id LIMIT %s",
+            "SELECT public.fleet_controller_otp_pending(%s) AS pending",
             (_MAX_RESPONDER_ITEMS + 1,),
         )
-        pending = cur.fetchall()
+        pending = cur.fetchone()["pending"] or []
+    for request in pending:
+        if isinstance(request.get("requested_at"), str):
+            request["requested_at"] = _dt.datetime.fromisoformat(
+                request["requested_at"].replace("Z", "+00:00")
+            )
     conn.commit()
     if not pending or len(pending) > _MAX_RESPONDER_ITEMS:
         return 0
@@ -406,11 +344,10 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
     candidate_message_ids = list(dict.fromkeys(m.message_id for m, _ts in parsed))
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT matched_message_id FROM otp_request "
-            "WHERE matched_message_id = ANY(%s)",
+            "SELECT public.fleet_controller_otp_used_messages(%s) AS used",
             (candidate_message_ids,),
         )
-        used_messages = {row["matched_message_id"] for row in cur.fetchall()}
+        used_messages = set(cur.fetchone()["used"] or [])
     conn.commit()
 
     assignments = _unique_assignments(
@@ -421,16 +358,12 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE otp_request SET code=%s, code_kind=%s, matched_email_ts=%s, "
-                    "matched_message_id=%s, answered_at=now(), "
-                    "expires_at=GREATEST(expires_at, now() + make_interval(secs => %s)) "
-                    "WHERE id=%s AND code IS NULL AND consumed_at IS NULL "
-                    "AND (expires_at IS NULL OR expires_at > now())",
-                    (chosen.candidate.value, chosen.candidate.kind,
+                    "SELECT public.fleet_controller_otp_answer(%s,%s,%s,%s,%s,%s) AS updated",
+                    (req["id"], chosen.candidate.value, chosen.candidate.kind,
                      _parse_email_dt(chosen.received_at), chosen.message_id,
-                     answered_ttl_seconds, req["id"]),
+                     answered_ttl_seconds),
                 )
-                updated = cur.rowcount
+                updated = int(bool(cur.fetchone()["updated"]))
             conn.commit()
         except psycopg.errors.UniqueViolation:
             conn.rollback()
@@ -445,10 +378,7 @@ def _answer_pending_locked(conn, gmail_service=None, *, window_minutes: int = 15
 def purge_expired(conn) -> int:
     """Null the code on expired/consumed rows so no code lingers; keep the audit row."""
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE otp_request SET code = NULL "
-            "WHERE code IS NOT NULL AND expires_at IS NOT NULL AND expires_at <= now()"
-        )
-        n = cur.rowcount
+        cur.execute("SELECT public.fleet_controller_otp_purge() AS purged")
+        n = cur.fetchone()["purged"]
     conn.commit()
     return n

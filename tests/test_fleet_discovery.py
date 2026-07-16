@@ -1,5 +1,4 @@
 # tests/test_fleet_discovery.py
-import os
 import math
 
 from applypilot.apply import pgqueue
@@ -21,6 +20,39 @@ def test_main_worker_no_dsn_raises_system_exit(monkeypatch):
         dm.main_worker(["--worker-id", "w1"])
 
 
+def test_discovery_entrypoint_requires_server_admission_before_loop(monkeypatch):
+    from applypilot.fleet import discovery_main as dm
+    from applypilot.fleet import emergency_admission
+    import pytest
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(dm.pgqueue, "connect", lambda _dsn: Conn())
+    monkeypatch.setattr(dm.fleet_schema, "require_apply_result_event_schema", lambda _conn: None)
+    monkeypatch.setattr(dm.fleet_schema, "require_apply_attempt_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        dm,
+        "build_discovery_loop",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("discovery loop built before admission")
+        ),
+    )
+    monkeypatch.setattr(
+        dm,
+        "discovery_worker_admission",
+        lambda _conn: emergency_admission.deny("discovery denied by server"),
+        raising=False,
+    )
+
+    with pytest.raises(SystemExit, match="discovery denied by server"):
+        dm.main_worker(["--dsn", "test", "--worker-id", "worker-a"])
+
+
 def test_worker_discovery_stages_postings(fleet_db):
     from applypilot.fleet.worker import WorkerLoop
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
@@ -35,7 +67,8 @@ def test_worker_discovery_stages_postings(fleet_db):
         cur.execute("SELECT count(*) AS n FROM discovered_postings WHERE task_id='t1'")
         assert cur.fetchone()["n"] == 2
         cur.execute("SELECT status, next_due_at > now() AS future FROM search_tasks WHERE task_id='t1'")
-        r = cur.fetchone(); assert r["status"] == "queued" and r["future"] is True  # rescheduled
+        r = cur.fetchone()
+        assert r["status"] == "queued" and r["future"] is True  # rescheduled
 
 
 def test_push_discovered_stages_rows(fleet_db):
@@ -112,7 +145,8 @@ def test_pull_discovered_ingests_and_marks_synced(fleet_db, monkeypatch):
     import applypilot.fleet.sync as sync_mod
     captured = {}
     def fake_store(conn, df, source_label):
-        captured["urls"] = list(df["job_url"]); captured["label"] = source_label
+        captured["urls"] = list(df["job_url"])
+        captured["label"] = source_label
         return (len(df), 0)
     monkeypatch.setattr(sync_mod, "store_jobspy_results", fake_store)
     with pgqueue.connect(fleet_db) as conn:

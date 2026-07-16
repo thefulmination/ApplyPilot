@@ -42,6 +42,20 @@ def create_prepared(
     route_version: str | None,
     evidence: dict | None = None,
 ) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_catalog.has_table_privilege(current_user,'public.apply_attempts','INSERT') AS controller"
+        )
+        controller = bool(cur.fetchone()["controller"])
+    if not controller:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.fleet_worker_attempt_create(%s,%s,%s) AS attempt_id",
+                (route, route_version, Jsonb(evidence or {})),
+            )
+            attempt_id = str(cur.fetchone()["attempt_id"])
+        conn.commit()
+        return attempt_id
     attempt_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
@@ -75,6 +89,28 @@ def transition(
 ) -> dict:
     if state not in _TRANSITIONS.get(expected, frozenset()):
         raise ValueError(f"invalid apply attempt transition: {expected} -> {state}")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_catalog.has_table_privilege(current_user,'public.apply_attempts','UPDATE') AS controller"
+        )
+        controller = bool(cur.fetchone()["controller"])
+    if not controller:
+        if verification_method is not None or verification_ref is not None:
+            raise ValueError("worker transitions cannot supply verification authority")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT public.fleet_worker_attempt_transition(%s,%s,%s,%s) AS attempt",
+                    (attempt_id, expected, state, Jsonb(evidence or {})),
+                )
+                row = cur.fetchone()["attempt"]
+            conn.commit()
+            return dict(row)
+        except errors.SerializationFailure as exc:
+            conn.rollback()
+            raise AttemptTransitionError(
+                f"attempt {attempt_id} is not in expected state {expected}"
+            ) from exc
     try:
         with conn.cursor() as cur:
             cur.execute(

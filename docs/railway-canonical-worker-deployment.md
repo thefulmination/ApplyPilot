@@ -7,11 +7,15 @@ retired `applypilot.apply.container_worker` must never be used.
 
 Set these Railway variables before deploying:
 
-- `DATABASE_URL`: reference the intended Postgres service. Never paste the home
-  fleet DSN into a public variable.
+- `FLEET_PG_DSN`: a sealed DSN for this replica's unique mapped login role. It
+  must not be the Railway-generated admin reference, an admin URL, a `postgres` login, or
+  the shared `fleet_worker` login. Generate one mapped role per node and build
+  the DSN with the Railway private host plus that role's rotated SCRAM secret.
 - `DEEPSEEK_API_KEY`: sealed service variable used by the local LiteLLM proxy.
 - `APPLYPILOT_WORKER_ID`: unique stable worker identity. Do not reuse one value
   across replicas.
+- `APPLYPILOT_WORKER_CONTRACT=apply`: contract stored beside the login role in
+  `fleet_worker_principals`.
 - `APPLYPILOT_RELEASE_VERSION`: exact value pinned in
   `fleet_config.pinned_worker_version`, formatted as
   `0.3.0+git.tree.<7-lowercase-hex>`.
@@ -30,6 +34,229 @@ Optional variables:
 Attach a persistent volume at `/data/applypilot` containing non-empty
 `profile.json` and `resume.pdf`. The entrypoint refuses to start without them.
 
+Every fleet DSN must contain an explicit password. ApplyPilot does not consult
+`.pgpass`, password files, service files, or ambient libpq connection variables.
+`FLEET_PG_DSN` is the sole accepted DSN environment variable.
+
+At startup the entrypoint parses the DSN and rejects missing usernames,
+`postgres`, and `fleet_worker`. It then connects and requires `session_user` and
+`current_user` to be identical to the unique mapped login role, with the exact
+`APPLYPILOT_WORKER_ID` and `APPLYPILOT_WORKER_CONTRACT` mapping. A mismatch exits
+before LiteLLM or the worker starts.
+The service also refuses and unsets generic, admin, controller, and ambient
+libpq database variables before any child process starts. A worker environment
+containing one of those variables is a deployment error, even when
+`FLEET_PG_DSN` is otherwise valid.
+
+## Controller migration and database ACLs
+
+Use the Railway admin reference `APPLYPILOT_ADMIN_PG_DSN=${{Postgres.DATABASE_URL}}`
+only for the one-time bootstrap. The bootstrap session user, normally
+`postgres`, must be named in `infrastructure_superuser_roles`. It remains
+`SUPERUSER LOGIN` as the provider's offline break-glass authority and is an
+explicit member of the effective database CONNECT allowlist. This design does
+not claim to eliminate PostgreSQL's superuser bypass; it isolates the exception.
+Store that credential offline, do not set its DSN in controller or worker
+services, and use it only for bootstrap or execution of the prewritten rollback.
+
+Bootstrap creates the dedicated NOLOGIN database owner, LOGIN/NOSUPERUSER
+controller, NOLOGIN verifier, and NOLOGIN migrator topology. It strips LOGIN,
+SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, and REPLICATION from separately
+named legacy roles in `retired_admin_roles`; the infrastructure break-glass role
+must never appear in that list. After bootstrap, delete
+`APPLYPILOT_ADMIN_PG_DSN` and `APPLYPILOT_CONTROLLER_PG_PASSWORD` from the
+shell. Set `APPLYPILOT_CONTROLLER_PG_DSN` only in the administrative migration
+job. Normal migration and reconciliation run as that non-superuser controller,
+which has explicit `brain_schema_migrator` membership. Never expose any admin or
+controller variable to a worker service.
+
+Example one-time bootstrap:
+
+```powershell
+$env:APPLYPILOT_ADMIN_PG_DSN = '<provider-admin-url>'
+$env:APPLYPILOT_CONTROLLER_PG_PASSWORD = '<new-scram-secret>'
+python scripts/bootstrap-fleet-pg-roles.py `
+  --database-owner-role applypilot_database_owner `
+  --controller-role applypilot_deployment_controller `
+  --verifier-role brain_schema_verifier `
+  --migrator-role brain_schema_migrator `
+  --retired-admin-role legacy_fleet_admin `
+  --infrastructure-superuser-role postgres `
+  --receipt-path .\evidence\bootstrap-receipt.json `
+  --rollback-sql .\evidence\bootstrap-rollback.sql
+Remove-Item Env:APPLYPILOT_ADMIN_PG_DSN, Env:APPLYPILOT_CONTROLLER_PG_PASSWORD
+```
+
+Before role hardening, prepare a reviewed JSON regrant manifest:
+
+```json
+{
+  "database_owner_role": "applypilot_database_owner",
+  "controller_roles": ["applypilot_deployment_controller"],
+  "verifier_roles": ["brain_schema_verifier"],
+  "retired_admin_roles": ["legacy_fleet_admin"],
+  "infrastructure_superuser_roles": ["postgres"],
+  "expected_service_roles": [],
+  "regrants": [
+    {
+      "object_kind": "table",
+      "qualified_name": "public.service_health",
+      "privileges": ["SELECT"],
+      "grantee": "applypilot_deployment_controller"
+    }
+  ]
+}
+```
+
+`expected_service_roles` must exactly acknowledge other active database service
+principals during the maintenance window. Every `regrants` item is parsed as a
+structured object kind, qualified name, privilege allowlist, and approved
+grantee. Raw SQL, comments, control characters, unknown fields, unsupported
+privileges, secrets, and PUBLIC grantees are rejected before mutation.
+
+Run `scripts/setup-fleet-pg-tailscale.ps1` once per enrolled node identity,
+contract, and unique role. Reconciliation executes `REVOKE CONNECT ON DATABASE`
+from PUBLIC, transfers ownership to the dedicated NOLOGIN/NOSUPERUSER owner,
+retires the named legacy/shared admin logins while preserving the isolated
+infrastructure break-glass role, revokes broad
+PUBLIC/object/default ACLs, then grants CONNECT only to the owner, controller,
+verifier, mapped per-node contract roles, and named infrastructure break-glass
+roles. Final validation enumerates every direct and effective grantee, including
+database-owner and superuser behavior, proves that reconnect-capable roles are
+exactly the explicitly allowlisted LOGIN roles, and checks the complete
+function-only worker privilege boundary after SCRAM rotation. The normal
+controller remains NOSUPERUSER and operational after the bootstrap credential
+is removed from the environment.
+
+The command writes a secret-free JSON receipt and rollback SQL before changing
+`pg_hba.conf`. The receipt records the principal/service/default-ACL inventory,
+allowlist, effective grantees, mapping, target-role attributes and memberships,
+direct database/schema/table/sequence/function/type ACLs, relevant default ACLs,
+PUBLIC database `CONNECT`, `CREATE`, and `TEMPORARY`, every structured regrant
+target ACL, the principal mapping's original `created_at`, PostgreSQL 18 inbound
+and outbound membership grantor plus `ADMIN`/`INHERIT`/`SET` options, HBA
+inventory, and backup path. It stores
+only structured fields and the rollback SQL hash, never raw regrant SQL. Keep both artifacts with the
+deployment evidence. The HBA edit inserts an allow followed by IPv4/IPv6 rejects
+before every pre-existing host rule, rejects all include directives and input
+control characters, uses an atomic replacement, validates both parsed rules and
+effective first-match order, reloads, and restores the exact original plus
+pre-write receipt outputs on any post-write failure. Receipt, rollback, HBA,
+candidate, and backup path collisions abort before database or HBA mutation.
+Every durable prepared or database-reconciled receipt has
+`escalation_required=true` and `in_doubt=true`. This remains authoritative if
+the process crashes after the database commit but before final receipt
+replacement. Only a durably replaced `status=deployment_committed` or
+`status=bootstrap_committed` receipt clears both flags. Deployment finalization
+serializes the complete committed receipt to a same-directory temporary file,
+flushes its contents and preserved destination ACL/owner metadata to disk, then
+atomically replaces the in-doubt receipt. It never clears `in_doubt` in place;
+abrupt termination therefore leaves either the intact database-reconciled
+in-doubt receipt or the complete committed receipt, never partial JSON.
+
+Rollback order is: pause all lanes, retrieve the offline break-glass credential,
+verify the rollback file's SHA-256 against the durable receipt, establish and
+validate the named break-glass database session, then restore the recorded HBA
+backup and reload through that already-established session. Run the generated
+rollback SQL in one fail-stop transaction equivalent to
+`psql --single-transaction --set=ON_ERROR_STOP=on`; never pipe or execute its
+statements independently. Use the executable workflow:
+
+```powershell
+$env:APPLYPILOT_ADMIN_PG_DSN = '<offline-break-glass-url>'
+python scripts/rollback-fleet-pg-role.py `
+  --receipt .\deployment-receipts\fleet-role-receipt.json `
+  --rollback-sql .\deployment-receipts\fleet-role-rollback.sql `
+  --restore-hba
+Remove-Item Env:APPLYPILOT_ADMIN_PG_DSN
+```
+
+The executor refuses a SHA-256 mismatch, a non-superuser or unreceipted session,
+an HBA reload before break-glass authentication, or any SQL error. After it
+commits, revoke or disable the new
+mapped login, restore the prior service credentials, and validate connectivity
+for every regranted dependency. The rollback restores the locked pre-bootstrap
+role attributes, ownership, memberships, CONNECT ACL, object ACL, and default
+ACL snapshot. It intentionally contains no role password or DSN. Re-isolate the
+break-glass credential after validation. A provider that cannot preserve this
+authority, create the topology, strip legacy attributes, or execute the
+prewritten rollback is unsupported and the bootstrap fails closed.
+
+Mapped-role rollback is deliberately a quarantine operation, not a password
+restore. For a role that existed before reconciliation, rollback removes the new
+contract, schema, type, function, and structured regrant grants; restores its
+prior direct/default ACLs, exact PostgreSQL 18 membership rows, non-secret
+attributes, and principal mapping including its historical `created_at`; and
+forces the role to `NOLOGIN`. The receipt sets
+`credential_forward_reconcile_required=true` because the prior password or SCRAM
+verifier cannot appear in secret-free evidence. The role must remain quarantined
+until the controller forward-reconciles a newly generated password and all final
+privilege and identity checks pass; only then may LOGIN be restored. Never reuse
+the pre-rollback password. If reconciliation created the role, rollback first
+removes its mapping and applied structured regrants, then runs `DROP OWNED BY`
+and `DROP ROLE`. Execute mapped-role rollback with the isolated infrastructure
+break-glass authority, then remove that DSN from the operator environment.
+
+## External worker release connectivity
+
+The Railway-hosted worker uses the database service's valid
+`*.railway.internal` hostname over Railway's authenticated private mesh. Tarpon,
+GGGTower, and any other worker outside that project must not resolve or route to
+this name directly. A released external worker must use one of these
+authenticated paths:
+
+- an authenticated Tailscale/private gateway into the Railway private network,
+  addressed by its full Tailscale MagicDNS hostname such as
+  `pg-gateway.example-tailnet.ts.net` and restricted by tailnet ACLs;
+- a database provider endpoint whose certificate validates the public hostname,
+  configured with `sslmode=verify-full` and an explicit `sslrootcert` (including
+`sslrootcert=system` when the issuer is in the system trust store).
+
+A raw Tailscale IP, arbitrary RFC1918/link-local address, test-network address,
+Unix socket, or shortened `*.ts.net` name is not an authenticated private
+topology contract. Only exact loopback (`localhost`, `127.0.0.1`, or `::1`) is
+accepted for local testing. All other targets must satisfy the public
+`verify-full` certificate contract unless they match the Railway or full
+MagicDNS suffixes above; Railway and Tailscale provide the encrypted private
+transport for those two suffixes.
+
+For a provider endpoint with publicly valid hostname identity, the contract is:
+
+```text
+postgresql://USER:PASSWORD@db.example.com:5432/fleet?sslmode=verify-full&sslrootcert=system
+```
+
+Keep credentials in the machine's secret store. Do not put a real DSN in task
+arguments, checked-in configuration, or logs. A generic database variable is
+never accepted as an ApplyPilot fleet fallback, including on external workers.
+
+### Railway public proxy limitation
+
+The observed Railway public proxy certificate has `subject CN=localhost`,
+`issuer CN=root-ca`, and only `SAN DNS:localhost`. Connecting through the public
+proxy hostname with `sslmode=verify-full` and `sslrootcert=system` therefore
+fails hostname/certificate verification. The current Railway public proxy is
+migration/admin-only and is not a fleet release path. It does not satisfy the
+external-worker cutover gate, and the runbook must not treat a successful
+`sslmode=require` connection as release evidence.
+
+Migration and administrative tooling that uses the proxy remains separate from
+the fleet worker release contract and requires an explicit operator-approved
+procedure. Do not deploy Tarpon or GGGTower against `DATABASE_PUBLIC_URL` until
+Railway presents a certificate valid for the proxy hostname or one of the
+authenticated private paths above is in place.
+
+## Connection ownership
+
+This API remains connection-per-process: a long-lived worker opens one
+connection and reuses it for its transaction loop. Do not reconnect for every
+lease or result write, and do not add a pool inside `pgqueue.connect()`.
+
+A controller that fans out concurrent work must own a separate, bounded
+connection pool sized to its concurrency and Railway connection budget. Each
+concurrent transaction checks out one connection from that controller-owned
+pool; workers continue to receive and reuse a direct connection.
+
 ## Release sequence
 
 1. Keep global and ATS lane pauses enabled, canary capacity at zero, and spend
@@ -41,11 +268,14 @@ Attach a persistent volume at `/data/applypilot` containing non-empty
    Postgres.
 5. Apply schema migrations from the owner/migration service. The worker has no
    schema-authority role and exits if required result/attempt tables are absent.
-6. Deploy one replica with a unique worker ID.
-7. Require a fresh heartbeat whose `sw_version`, machine owner, role, and worker
+6. Inventory principals and services, review the regrant manifest, create the
+   unique mapped login role, and archive its rollback SQL/receipt.
+7. Set the replica's unique mapped `FLEET_PG_DSN`, worker ID, and contract.
+8. Deploy one replica with a unique worker ID.
+9. Require a fresh heartbeat whose `sw_version`, machine owner, role, and worker
    ID match the release contract.
-8. Verify the worker remains unable to lease while the lane is paused.
-9. Arm a separately approved ATS canary only after the deployment and policy
+10. Verify the worker remains unable to lease while the lane is paused.
+11. Arm a separately approved ATS canary only after the deployment and policy
    gates pass.
 
 Do not scale by cloning a service with the same `APPLYPILOT_WORKER_ID`. Each

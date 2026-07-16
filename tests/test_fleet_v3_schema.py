@@ -1,16 +1,18 @@
 """v3 schema: loads cleanly against real Postgres, idempotent, all tables + columns present."""
 from __future__ import annotations
 
-import threading
-import uuid
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+from psycopg import sql  # noqa: E402
+from psycopg.conninfo import conninfo_to_dict, make_conninfo  # noqa: E402
+from psycopg.rows import dict_row  # noqa: E402
 
 from applypilot.apply import pgqueue  # noqa: E402
+from applypilot.fleet import apply_worker_main, compute_context, emergency_admission, queue  # noqa: E402
 from applypilot.fleet import schema as fleet_schema  # noqa: E402
 
 EXPECTED_TABLES = {
@@ -31,6 +33,169 @@ CANONICAL_QUEUE_COLUMNS = {
 CANONICAL_CONSTRAINT_SUFFIXES = {
     "canonical_provenance_ck", "lane_ck", "policy_lane_fk",
 }
+
+
+@pytest.mark.parametrize("contract", ["apply", "linkedin", "compute", "discovery"])
+def test_mapped_scram_worker_starts_through_narrow_contract(fleet_db, contract):
+    role = f"runtime_{contract}_worker"
+    worker_id = f"runtime-box-{contract}"
+    password = f"runtime-{contract}-scram-secret"
+    now = datetime.now(timezone.utc)
+    with pgqueue.connect(fleet_db) as owner:
+        owner.execute(
+            "CREATE TABLE IF NOT EXISTS public.fleet_desired_state("
+            "machine_owner text primary key,desired_workers integer,agent text,model text,"
+            "generation integer,updated_at timestamptz)"
+        )
+        owner.execute(
+            "INSERT INTO public.fleet_desired_state(machine_owner,desired_workers,agent,model,generation,updated_at) "
+            "VALUES('runtime-box',4,'codex','test-model',1,now()) "
+            "ON CONFLICT(machine_owner) DO UPDATE SET desired_workers=4,agent='codex',model='test-model',"
+            "generation=1,updated_at=now()"
+        )
+        owner.execute(
+            "INSERT INTO public.workers(worker_id,machine_owner,public_ip,validated,capabilities) "
+            "VALUES(%s,'runtime-box','1.1.1.1',true,'{}'::jsonb)", (worker_id,)
+        )
+        owner.execute(
+            "INSERT INTO public.worker_heartbeat(worker_id,machine_owner,home_ip,role,state,sw_version,last_beat) "
+            "VALUES(%s,'runtime-box','1.1.1.1',%s,'idle','runtime-v1',now())", (worker_id, contract)
+        )
+        owner.execute(
+            "INSERT INTO public.fleet_decision_policies(policy_version,lane,status) VALUES"
+            "('runtime-ats-policy','ats','active'),('runtime-linkedin-policy','linkedin','active') "
+            "ON CONFLICT(policy_version) DO UPDATE SET status='active'"
+        )
+        owner.execute(
+            "UPDATE public.fleet_config SET paused=false,ats_paused=false,ats_apply_mode='steady',"
+            "linkedin_apply_mode='steady',ats_policy_version='runtime-ats-policy',"
+            "linkedin_policy_version='runtime-linkedin-policy',linkedin_owner_ip='1.1.1.1',"
+            "pinned_worker_version='runtime-v1',spend_cap_usd=0 WHERE id=1"
+        )
+        owner.execute(
+            "INSERT INTO public.rate_governor(scope_key,daily_cap,min_gap_seconds,count_24h) "
+            "VALUES('account:linkedin',20,0,0),('global',100,0,0) ON CONFLICT(scope_key) DO UPDATE SET "
+            "daily_cap=EXCLUDED.daily_cap,min_gap_seconds=0,count_24h=0,halted_until=NULL,"
+            "breaker_state='ok',last_applied_at=NULL"
+        )
+        if contract == "linkedin":
+            owner.execute(
+                "INSERT INTO public.linkedin_queue(url,application_url,score,status,lane,approved_batch,dedup_key,"
+                "linkedin_resolve_status,linkedin_resolved_at,decision_id,policy_version,decision_action,"
+                "qualification_verdict,qualification_score,qualification_floor,preference_score,outcome_score,"
+                "final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash) "
+                "VALUES('runtime-linkedin-job','https://linkedin.com/jobs/runtime',9,'queued','linkedin','runtime',"
+                "'runtime-linkedin-dedup','easy_apply',now(),'runtime-linkedin-decision','runtime-linkedin-policy',"
+                "'apply','qualified',9,7,9,9,9,.9,%s,%s,'runtime-linkedin-hash')",
+                (now, now + timedelta(days=1)),
+            )
+        elif contract == "apply":
+            owner.execute(
+                "INSERT INTO public.llm_usage(worker_id,task,provider,cost_usd) "
+                "VALUES(%s,'apply_agent','runtime-agent',2)", (worker_id,)
+            )
+        owner.execute(sql.SQL(
+            "CREATE ROLE {} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS PASSWORD {}"
+        ).format(sql.Identifier(role), sql.Literal(password)))
+        owner.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+            sql.Identifier(conninfo_to_dict(fleet_db)["dbname"]), sql.Identifier(role)
+        ))
+        owner.execute(
+            "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) VALUES(%s,%s,%s)",
+            (role, worker_id, contract),
+        )
+        owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role)))
+        owner.execute(sql.SQL(
+            "GRANT EXECUTE ON FUNCTION public.fleet_worker_schema_contract(), "
+            "public.fleet_worker_admission_snapshot(), public.fleet_worker_runtime_state(text) TO {}"
+        ).format(sql.Identifier(role)))
+        if contract in {"apply", "linkedin"}:
+            owner.execute(sql.SQL(
+                "GRANT EXECUTE ON FUNCTION public.fleet_worker_evaluate_agent_budget(jsonb,integer,integer), "
+                "public.fleet_worker_agent_blocks() TO {}"
+            ).format(sql.Identifier(role)))
+        if contract == "apply":
+            owner.execute(sql.SQL(
+                "GRANT USAGE ON TYPE public.apply_queue TO {}; "
+                "GRANT EXECUTE ON FUNCTION public.fleet_worker_lease_ats(text,text,integer,text,integer) TO {}"
+            ).format(sql.Identifier(role), sql.Identifier(role)))
+        elif contract == "linkedin":
+            owner.execute(sql.SQL(
+                "GRANT USAGE ON TYPE public.linkedin_queue TO {}; "
+                "GRANT EXECUTE ON FUNCTION public.fleet_worker_lease_linkedin(text,text,text,integer,text) TO {}"
+            ).format(sql.Identifier(role), sql.Identifier(role)))
+        owner.commit()
+
+    params = conninfo_to_dict(fleet_db)
+    params.update(user=role, password=password)
+    try:
+        with psycopg.connect(make_conninfo(**params), row_factory=dict_row) as worker:
+            fleet_schema.ensure_schema_v3(worker)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                worker.execute("SELECT * FROM public.fleet_config")
+            worker.rollback()
+            snapshot = worker.execute(
+                "SELECT public.fleet_worker_admission_snapshot() AS snapshot"
+            ).fetchone()["snapshot"]
+            assert snapshot["worker_id"] == worker_id
+            assert snapshot["admission_allowed"] is True
+            if contract == "apply":
+                assert emergency_admission.worker_admission(
+                    worker, machine_label="runtime-box", machine_owner="runtime-box",
+                    worker_id=worker_id,
+                ).allowed
+                worker.rollback()
+                apply_worker_main.PgAgentBudget(
+                    soft_caps={"runtime-agent": 1}, window_seconds=3600,
+                    cooldown_seconds=60, eval_interval_seconds=0,
+                ).maybe_evaluate(worker)
+                blocks = worker.execute(
+                    "SELECT public.fleet_worker_agent_blocks() AS blocks"
+                ).fetchone()["blocks"]
+                assert "runtime-agent" in blocks
+            elif contract == "linkedin":
+                assert emergency_admission.linkedin_worker_admission(worker).allowed
+                leased = queue.lease_linkedin(
+                    worker, "forged-worker", public_ip="1.1.1.1", owner_ip="1.1.1.1",
+                    sw_version="forged-version", min_gap_seconds=0,
+                )
+                assert leased and leased["url"] == "runtime-linkedin-job"
+                with pgqueue.connect(fleet_db) as owner:
+                    counts = owner.execute(
+                        "SELECT scope_key,count_24h FROM public.rate_governor "
+                        "WHERE scope_key IN ('global','account:linkedin') ORDER BY scope_key"
+                    ).fetchall()
+                assert {row["scope_key"]: row["count_24h"] for row in counts} == {
+                    "account:linkedin": 1, "global": 1,
+                }
+            elif contract == "compute":
+                context, version = compute_context.load_context(worker, providers=("test",))
+                assert context.providers == ["test"]
+                assert version == ""
+            else:
+                state = worker.execute(
+                    "SELECT public.fleet_worker_runtime_state('forged-worker') AS state"
+                ).fetchone()["state"]
+                assert state["state"] == "idle"
+            if contract in {"apply", "linkedin"}:
+                worker.rollback()
+                lane_column = "ats_apply_mode" if contract == "apply" else "linkedin_apply_mode"
+                with pgqueue.connect(fleet_db) as owner:
+                    owner.execute(sql.SQL("UPDATE public.fleet_config SET {}='stopped' WHERE id=1")
+                                  .format(sql.Identifier(lane_column)))
+                    owner.commit()
+                if contract == "apply":
+                    denied = emergency_admission.worker_tick_admission(worker)
+                else:
+                    denied = emergency_admission.linkedin_tick_admission(worker)
+                assert not denied.allowed
+    finally:
+        with pgqueue.connect(fleet_db) as owner:
+            owner.execute("DELETE FROM public.fleet_worker_principals WHERE role_name=%s", (role,))
+            owner.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
+            owner.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+            owner.commit()
 
 
 def _canonical_row(*, table: str, url: str = "canonical", **overrides):
@@ -55,6 +220,25 @@ def _canonical_row(*, table: str, url: str = "canonical", **overrides):
     }
     row.update(overrides)
     return row
+
+
+def test_worker_principal_mapping_is_unique_per_worker_contract(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        conn.execute(
+            "INSERT INTO public.workers(worker_id,machine_owner,validated,capabilities) "
+            "VALUES('unique-runtime-worker','runtime-box',true,'{}'::jsonb)"
+        )
+        conn.execute(
+            "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
+            "VALUES('runtime-role-a','unique-runtime-worker','apply')"
+        )
+        conn.commit()
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(
+                "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
+                "VALUES('runtime-role-b','unique-runtime-worker','apply')"
+            )
+        conn.rollback()
 
 
 def _insert_canonical(cur, table: str, row: dict) -> None:
@@ -291,7 +475,7 @@ def test_apply_attempts_schema_and_unresolved_index(fleet_db):
     assert "submitted_unverified" in indexdef
 
 
-def test_apply_attempts_schema_revokes_destructive_worker_privileges():
+def test_apply_attempts_schema_never_restores_broad_worker_privileges():
     schema = (
         Path(__file__).resolve().parents[1]
         / "src"
@@ -300,7 +484,7 @@ def test_apply_attempts_schema_revokes_destructive_worker_privileges():
         / "schema_v3.sql"
     ).read_text(encoding="utf-8")
 
-    assert "GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker" in schema
+    assert "GRANT SELECT, INSERT, UPDATE ON apply_attempts TO fleet_worker" not in schema
     assert (
         "REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON apply_attempts FROM fleet_worker"
         in schema
@@ -324,8 +508,8 @@ def test_apply_worker_schema_check_reports_missing_columns():
         def execute(self, *args, **kwargs):
             pass
 
-        def fetchall(self):
-            return [{"column_name": "url"}, {"column_name": "status"}]
+        def fetchone(self):
+            return {"contract": {"contract": "apply", "apply_result_event_ready": False}}
 
     class _Conn:
         def cursor(self):
@@ -334,7 +518,7 @@ def test_apply_worker_schema_check_reports_missing_columns():
         def rollback(self):
             pass
 
-    with pytest.raises(RuntimeError, match="apply_result_events.*route"):
+    with pytest.raises(RuntimeError, match="apply-result worker contract"):
         fleet_schema.require_apply_result_event_schema(_Conn())
 
 
@@ -349,8 +533,8 @@ def test_apply_attempt_schema_check_reports_missing_columns():
         def execute(self, *args, **kwargs):
             pass
 
-        def fetchall(self):
-            return [{"column_name": "attempt_id"}, {"column_name": "url"}]
+        def fetchone(self):
+            return {"contract": {"contract": "apply", "apply_attempt_ready": False}}
 
     class _Conn:
         def cursor(self):
@@ -359,7 +543,7 @@ def test_apply_attempt_schema_check_reports_missing_columns():
         def rollback(self):
             pass
 
-    with pytest.raises(RuntimeError, match="apply_attempts.*state"):
+    with pytest.raises(RuntimeError, match="apply-attempt worker contract"):
         fleet_schema.require_apply_attempt_schema(_Conn())
 
 
@@ -375,6 +559,74 @@ def test_linkedin_queue_freshness_columns(fleet_db):
         "linkedin_next_action",
     ):
         assert c in cols, f"linkedin_queue missing {c}"
+
+
+def test_worker_canary_security_definer_schema_and_upgrade(fleet_db):
+    charge_columns = {
+        "linkedin_canary_charge_attempt",
+        "linkedin_canary_charge_worker",
+        "linkedin_canary_charge_policy_version",
+        "linkedin_canary_charge_capacity",
+        "linkedin_canary_charge_exhausted",
+        "linkedin_canary_refunded_attempt",
+    }
+    with pgqueue.connect(fleet_db) as conn:
+        with conn.cursor() as cur:
+            worker_functions = {
+                "fleet_worker_authorize_lease",
+                "fleet_worker_refund_linkedin_canary",
+                "fleet_worker_lease_ats",
+                "fleet_worker_lease_linkedin",
+                "fleet_worker_requeue",
+                "fleet_worker_terminalize",
+                "fleet_worker_park",
+            }
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='linkedin_queue'"
+            )
+            assert charge_columns <= {row["column_name"] for row in cur.fetchall()}
+            cur.execute(
+                "SELECT p.proname, p.prosecdef, p.proconfig, "
+                "COALESCE(bool_or(acl.grantee=0 AND acl.privilege_type='EXECUTE'),FALSE) AS public_execute "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                "LEFT JOIN LATERAL aclexplode(COALESCE(p.proacl, acldefault('f',p.proowner))) acl ON TRUE "
+                "WHERE n.nspname='public' AND p.proname = ANY(%s) "
+                "GROUP BY p.proname,p.prosecdef,p.proconfig ORDER BY p.proname"
+                , (list(worker_functions),)
+            )
+            rows = cur.fetchall()
+            assert {row["proname"] for row in rows} == worker_functions
+            for row in rows:
+                assert row["prosecdef"] is True
+                assert row["proconfig"] == ["search_path=pg_catalog, public"]
+                assert row["public_execute"] is False
+
+            for column in charge_columns:
+                cur.execute(sql.SQL("ALTER TABLE linkedin_queue DROP COLUMN {}").format(sql.Identifier(column)))
+            cur.execute("ALTER TABLE apply_queue DROP COLUMN worker_lease_id")
+            cur.execute("ALTER TABLE linkedin_queue DROP COLUMN worker_lease_id")
+            cur.execute("DROP TABLE fleet_worker_lease_ledger")
+        conn.commit()
+        fleet_schema.ensure_schema_v3(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='linkedin_queue'"
+            )
+            assert charge_columns <= {row["column_name"] for row in cur.fetchall()}
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name='fleet_worker_lease_ledger'"
+            )
+            assert cur.fetchone() is not None
+            for table in ("apply_queue", "linkedin_queue"):
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema='public' "
+                    "AND table_name=%s AND column_name='worker_lease_id'",
+                    (table,),
+                )
+                assert cur.fetchone() is not None
 
 
 def test_fleet_config_v3_columns(fleet_db):

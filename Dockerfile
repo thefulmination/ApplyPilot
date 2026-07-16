@@ -40,7 +40,7 @@ ENV CLAUDE_PATH=/usr/local/bin/claude \
     IS_SANDBOX=1 \
     PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
-# Required Railway variables: DATABASE_URL, DEEPSEEK_API_KEY, unique
+# Required Railway variables: FLEET_PG_DSN, DEEPSEEK_API_KEY, unique
 # APPLYPILOT_WORKER_ID, and APPLYPILOT_RELEASE_VERSION. The release value must be
 # the exact fleet pin (for example 0.3.0+git.tree.840f17b) because .git is excluded
 # from the image. PII (profile.json + resume.pdf) mounts from a Railway volume at

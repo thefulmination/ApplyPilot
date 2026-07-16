@@ -11,22 +11,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from fleet_agent_env import require_fleet_pg_dsn
+
 
 def main() -> int:
     try:
         from applypilot.apply import pgqueue
         from applypilot.fleet.software_version import current_sw_version
 
-        dsn = (
-            os.environ.get("FLEET_PG_DSN")
-            or os.environ.get("APPLYPILOT_FLEET_DSN")
-            or os.environ.get("DATABASE_URL")
-        )
+        dsn = require_fleet_pg_dsn(os.environ)
         current = current_sw_version(repo=Path(__file__).resolve().parent)
         with pgqueue.connect(dsn) as conn, conn.cursor() as cur:
-            cur.execute("SELECT pinned_worker_version FROM fleet_config WHERE id=1")
-            row = cur.fetchone()
-        pinned = (row or {}).get("pinned_worker_version") or ""
+            cur.execute("SELECT public.fleet_worker_admission_snapshot() AS state")
+            row = cur.fetchone()["state"] or {}
+        pinned = row.get("pinned_worker_version") or ""
         state = "unpinned" if not pinned else ("match" if current == pinned else "drift")
         print(f"OK|{current}|{pinned}|{state}")
         return 0

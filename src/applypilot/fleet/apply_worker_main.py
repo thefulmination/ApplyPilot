@@ -6,6 +6,7 @@ linkedin_should_halt gate so a Doctor ATS pause can never halt it."""
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import platform
@@ -252,6 +253,15 @@ class PgAttemptStore:
 
         return apply_attempts.transition(self.conn, attempt_id, **kwargs)
 
+    def mark_browser_interaction(self) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_mark_browser_interaction() AS marked")
+            marked = cur.fetchone()["marked"]
+        if not marked:
+            self.conn.rollback()
+            raise RuntimeError("browser interaction marker rejected for active worker lease")
+        self.conn.commit()
+
 
 def make_apply_fn(
     model: str,
@@ -280,7 +290,11 @@ def make_apply_fn(
     agent_model = launcher.effective_agent_model_label(agent, model)
 
     def apply_fn(job: dict, *, attempt_store=None) -> dict:
-        emergency_admission.require_allowed(emergency_admission.launcher_admission())
+        emergency_admission.require_allowed(
+            emergency_admission.launcher_admission(
+                attempt_store.conn if attempt_store is not None else None
+            )
+        )
         # `slot` keys this worker's Chrome profile + CDP port + per-run logs, so multiple
         # workers on ONE machine (distinct slots) never collide in a shared browser.
         worker_id = slot
@@ -349,7 +363,9 @@ def make_apply_fn(
             assisted_retry_count = 0
             assisted_hint_kind = None
             prearmed_request_id = (
-                launcher._prearm_inbox_auth_request(job)
+                launcher._prearm_inbox_auth_request(
+                    job, conn=attempt_store.conn if attempt_store is not None else None
+                )
                 if launcher._should_prearm_inbox_auth(job)
                 else None
             )
@@ -378,6 +394,7 @@ def make_apply_fn(
                 inbox_hint = launcher._consume_prearmed_inbox_auth_hint(
                     prearmed_request_id,
                     timeout_seconds=min(total_timeout, postrun_timeout),
+                    conn=attempt_store.conn if attempt_store is not None else None,
                 )
                 if not inbox_hint and launcher._is_auth_required_result(status):
                     elapsed = time.monotonic() - wait_started
@@ -385,6 +402,7 @@ def make_apply_fn(
                     inbox_hint = launcher._consume_prearmed_inbox_auth_hint(
                         prearmed_request_id,
                         timeout_seconds=remaining,
+                        conn=attempt_store.conn if attempt_store is not None else None,
                     )
                 if inbox_hint:
                     assisted_retry_count = 1
@@ -540,8 +558,9 @@ def resolve_agent_timeout(conn, *, env_default=None) -> int:
             default = 300
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT agent_timeout_override FROM fleet_config WHERE id=1")
-            row = cur.fetchone()
+            cur.execute("SELECT public.fleet_worker_admission_snapshot() AS snapshot")
+            snapshot = cur.fetchone()["snapshot"] or {}
+            row = {"agent_timeout_override": snapshot.get("agent_timeout_override")}
         try:
             conn.rollback()  # read-only
         except Exception:
@@ -634,15 +653,25 @@ class PgAgentBudget:
         self._last_eval = None  # None = never evaluated -> first maybe_evaluate runs
 
     def blocks(self, conn) -> dict:
-        from applypilot.fleet import agent_budget
-        return {a: dt.timestamp() for a, dt in agent_budget.get_blocks(conn).items()}
+        from datetime import datetime
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_agent_blocks() AS blocks")
+            rows = cur.fetchone()["blocks"] or {}
+        conn.rollback()
+        return {
+            agent: datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            for agent, value in rows.items()
+        }
 
     def record_wall(self, conn, agent, blocked_until_epoch) -> None:
         from datetime import datetime, timezone
-        from applypilot.fleet import agent_budget
-        agent_budget.record_block(
-            conn, agent, datetime.fromtimestamp(blocked_until_epoch, tz=timezone.utc),
-            "usage_limit_wall")
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.fleet_worker_record_agent_wall(%s,%s)",
+                (agent, datetime.fromtimestamp(blocked_until_epoch, tz=timezone.utc)),
+            )
+        conn.commit()
 
     def maybe_evaluate(self, conn) -> None:
         if not any(c and c > 0 for c in self.soft_caps.values()):
@@ -651,10 +680,13 @@ class PgAgentBudget:
         if self._last_eval is not None and now - self._last_eval < self.eval_interval_seconds:
             return
         self._last_eval = now
-        from applypilot.fleet import agent_budget
-        agent_budget.evaluate_soft_blocks(
-            conn, soft_caps=self.soft_caps, window_seconds=self.window_seconds,
-            cooldown_seconds=self.cooldown_seconds)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.fleet_worker_evaluate_agent_budget(%s::jsonb,%s,%s) AS blocks",
+                (json.dumps(self.soft_caps), int(self.window_seconds), int(self.cooldown_seconds)),
+            )
+            cur.fetchone()
+        conn.commit()
 
 
 def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
@@ -686,11 +718,6 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
         except Exception:
             pass
     while not _STOP_REQUESTED.is_set() and (max_iterations is None or it < max_iterations):
-        admission = emergency_admission.worker_tick_admission()
-        if not admission.allowed:
-            logger.error(admission.reason)
-            counts["halted"] += 1
-            break
         it += 1
         try:
             command_handler = (
@@ -770,6 +797,11 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
                             last_agent_switch_reason=reason,
                         )
             with conn_factory() as conn:
+                admission = emergency_admission.worker_tick_admission(conn)
+                if not admission.allowed:
+                    logger.error(admission.reason)
+                    counts["halted"] += 1
+                    break
                 # Re-resolve the Doctor's agent_timeout_override on EVERY tick (not just at
                 # startup): the Doctor sets the override mid-flight while this worker is already
                 # running, so a startup-only read would never see a live timeout_bump. The
