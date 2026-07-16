@@ -124,6 +124,17 @@ def test_worker_requeues_untouched_browser_preflight_failure(fleet_db, monkeypat
             (url,),
         )
         events = cur.fetchone()["n"]
+        cur.execute(
+            "SELECT state, closed_at FROM fleet_worker_lease_ledger "
+            "WHERE lane='ats' AND url=%s ORDER BY leased_at DESC LIMIT 1",
+            (url,),
+        )
+        ledger = cur.fetchone()
+        cur.execute(
+            "SELECT scope_key, count_24h FROM rate_governor "
+            "WHERE scope_key IN ('global','home_ip:1.2.3.4','host:example.com')",
+        )
+        governor_counts = {item["scope_key"]: item["count_24h"] for item in cur.fetchall()}
     assert row["status"] == "failed"
     assert row["attempts"] == 0
     assert row["lease_owner"] is None
@@ -132,6 +143,13 @@ def test_worker_requeues_untouched_browser_preflight_failure(fleet_db, monkeypat
     assert row["apply_status"] == "infrastructure_pending"
     assert row["infrastructure_failure_count"] == 1
     assert events == 0
+    assert ledger["state"] == "terminal"
+    assert ledger["closed_at"] is not None
+    assert governor_counts == {
+        "global": 0,
+        "home_ip:1.2.3.4": 0,
+        "host:example.com": 0,
+    }
 
 
 def test_apply_fn_restarts_browser_once_before_reporting_failure(monkeypatch, tmp_path):

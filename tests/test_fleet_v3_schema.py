@@ -766,6 +766,7 @@ def test_worker_canary_security_definer_schema_and_upgrade(fleet_db):
                 "fleet_worker_lease_ats",
                 "fleet_worker_lease_linkedin",
                 "fleet_worker_requeue",
+                "fleet_worker_park_infrastructure",
                 "fleet_worker_terminalize",
                 "fleet_worker_park",
             }

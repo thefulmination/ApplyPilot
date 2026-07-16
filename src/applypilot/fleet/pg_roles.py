@@ -100,6 +100,7 @@ _COMMON_FUNCTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 _TRANSITION_FUNCTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("fleet_worker_requeue", ("TEXT", "TEXT", "TEXT", "TEXT")),
+    ("fleet_worker_park_infrastructure", ("TEXT", "TEXT", "TEXT")),
     ("fleet_worker_terminalize", ("TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "JSONB")),
     ("fleet_worker_park", ("TEXT", "TEXT", "TEXT", "TEXT", "INTEGER", "JSONB")),
     ("fleet_worker_mark_browser_interaction", ()),

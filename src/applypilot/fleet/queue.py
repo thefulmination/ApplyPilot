@@ -495,14 +495,14 @@ def requeue_apply(conn, worker_id, url, *, apply_error=None) -> bool:
 
 def park_infrastructure_failure(conn, worker_id, url, *, apply_error) -> dict | None:
     """Park an untouched row after its one local component restart also failed."""
-    landed = _terminalize(
-        conn, "ats", worker_id, url, status="failed",
-        apply_status="infrastructure_pending",
-        apply_error=(apply_error[:200] if apply_error else "browser_preflight"), evidence={},
-        commit=False,
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT public.fleet_worker_park_infrastructure(%s,%s,%s) AS parked",
+            (url, worker_id, apply_error),
+        )
+        parked = cur.fetchone()["parked"]
     conn.commit()
-    return {"status": "failed", "apply_status": "infrastructure_pending"} if landed else None
+    return dict(parked) if parked else None
 
 
 def _result_line(status, apply_status=None, apply_error=None) -> str:

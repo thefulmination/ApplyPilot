@@ -1337,6 +1337,13 @@ BEGIN
       AND q.qualification_score >= q.qualification_floor
       AND q.decision_expires_at > pg_catalog.now() AND q.score=q.final_score
       AND (cfg.approval_threshold IS NULL OR q.final_score >= cfg.approval_threshold)
+      AND COALESCE(q.apply_error,'') NOT ILIKE 'requeued_by_%'
+      AND NOT EXISTS (
+          SELECT 1 FROM public.apply_result_events prior
+          WHERE prior.queue_name='apply_queue' AND prior.url=q.url
+            AND (COALESCE(prior.application_tool_calls,0)>0
+                 OR COALESCE(prior.apply_error,'') ILIKE 'requeued_by_%')
+      )
       AND EXISTS (
           SELECT 1 FROM public.fleet_decision_policies p
           WHERE p.policy_version=q.policy_version AND p.lane='ats'
@@ -1674,6 +1681,68 @@ BEGIN
 END
 $fleet_worker_requeue$;
 
+CREATE OR REPLACE FUNCTION public.fleet_worker_park_infrastructure(
+    p_url TEXT,p_worker TEXT,p_error TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
+AS $fleet_worker_park_infrastructure$
+DECLARE
+    lease public.fleet_worker_lease_ledger%ROWTYPE;
+    cfg public.fleet_config%ROWTYPE;
+    mapped_worker TEXT;
+    refunded INTEGER;
+    failure_count INTEGER;
+BEGIN
+    SELECT p.worker_id INTO mapped_worker FROM public.fleet_worker_principals p
+    WHERE p.role_name=session_user AND p.contract='apply';
+    IF FOUND THEN p_worker:=mapped_worker;
+    ELSIF session_user<>current_user THEN
+      RAISE EXCEPTION 'unmapped or cross-contract worker principal' USING ERRCODE='insufficient_privilege';
+    END IF;
+    SELECT * INTO lease FROM public.fleet_worker_lease_ledger l
+    WHERE l.lane='ats' AND l.url=p_url AND l.worker_id=p_worker AND l.state='leased'
+    ORDER BY l.leased_at DESC LIMIT 1 FOR UPDATE;
+    IF NOT FOUND OR lease.browser_interaction_at IS NOT NULL THEN RETURN NULL; END IF;
+    IF NULLIF(pg_catalog.current_setting('applypilot.worker_lease_id',TRUE),'') IS NULL
+       OR NULLIF(pg_catalog.current_setting('applypilot.worker_lease_id',TRUE),'')::uuid
+          IS DISTINCT FROM lease.lease_id
+    THEN RETURN NULL; END IF;
+    PERFORM 1 FROM public.apply_queue q WHERE q.url=p_url AND q.status='leased'
+      AND q.lease_owner=p_worker AND q.worker_lease_id=lease.lease_id FOR UPDATE;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO STRICT cfg FROM public.fleet_config WHERE id=1 FOR UPDATE;
+    IF lease.canary_charged AND lease.refunded_at IS NULL THEN
+      refunded:=LEAST(COALESCE(cfg.canary_remaining,0)+1,lease.canary_capacity_before);
+      UPDATE public.fleet_config SET canary_remaining=refunded,
+        ats_apply_mode=CASE
+          WHEN lease.canary_exhausted AND ats_apply_mode='stopped' AND NOT paused
+            AND NOT ats_paused AND canary_enabled THEN 'canary'
+          ELSE ats_apply_mode END
+      WHERE id=1;
+      UPDATE public.fleet_worker_lease_ledger SET refunded_at=pg_catalog.now()
+      WHERE lease_id=lease.lease_id AND refunded_at IS NULL;
+    END IF;
+    UPDATE public.apply_queue SET status='failed',apply_status='infrastructure_pending',
+      apply_error=pg_catalog.left(COALESCE(NULLIF(p_error,''),'browser_preflight'),200),
+      attempts=GREATEST(attempts-1,0),
+      infrastructure_failure_count=COALESCE(infrastructure_failure_count,0)+1,
+      infrastructure_last_failure_at=pg_catalog.now(),lease_owner=NULL,lease_expires_at=NULL,
+      worker_lease_id=NULL,updated_at=pg_catalog.now()
+    WHERE url=p_url AND worker_lease_id=lease.lease_id
+    RETURNING infrastructure_failure_count INTO failure_count;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    UPDATE public.rate_governor SET count_24h=GREATEST(count_24h-1,0),
+      updated_at=pg_catalog.now()
+    WHERE scope_key IN ('global','home_ip:'||lease.home_ip,'host:'||lease.target_host);
+    UPDATE public.fleet_worker_lease_ledger SET state='terminal',closed_at=pg_catalog.now()
+    WHERE lease_id=lease.lease_id;
+    PERFORM pg_catalog.set_config('applypilot.worker_lease_id','',FALSE);
+    RETURN pg_catalog.jsonb_build_object(
+      'status','failed','apply_status','infrastructure_pending',
+      'infrastructure_failure_count',failure_count);
+END
+$fleet_worker_park_infrastructure$;
+
 CREATE OR REPLACE FUNCTION public.fleet_worker_terminalize(
     p_lane TEXT,p_url TEXT,p_worker TEXT,p_status TEXT,p_apply_status TEXT,
     p_apply_error TEXT,p_evidence JSONB
@@ -1911,6 +1980,7 @@ $fleet_worker_park$;
 REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_lease_ats(TEXT,TEXT,INTEGER,TEXT,INTEGER) FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_lease_linkedin(TEXT,TEXT,TEXT,INTEGER,TEXT) FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_requeue(TEXT,TEXT,TEXT,TEXT) FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_park_infrastructure(TEXT,TEXT,TEXT) FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_terminalize(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,JSONB) FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_park(TEXT,TEXT,TEXT,TEXT,INTEGER,JSONB) FROM PUBLIC;
 

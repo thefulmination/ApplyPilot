@@ -25,17 +25,18 @@ def _activate_policy(conn, lane="ats"):
     return policy
 
 
-def _seed_approved_apply_rows(conn, n, *, batch="b1", start=0):
+def _seed_approved_apply_rows(conn, n, *, batch="b1", start=0, distinct_hosts=False):
     policy = _activate_policy(conn)
     now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
         for i in range(start, start + n):
+            host = f"acme-{i}.com" if distinct_hosts else "acme.com"
             cur.execute(
                 "INSERT INTO apply_queue (url, application_url, score, status, lane, approved_batch, dedup_key, apply_domain, "
                 "decision_id,policy_version,decision_action,qualification_verdict,qualification_score,qualification_floor,"
                 "preference_score,outcome_score,final_score,decision_confidence,decision_created_at,decision_expires_at,input_hash) "
-                "VALUES (%s,%s,%s,'queued','ats',%s,%s,'acme.com',%s,%s,'apply','qualified',9,7,8,8,%s,.9,%s,%s,%s)",
-                (f"u{i}", f"http://acme.com/{i}", 9.0 - i*0.01, batch, f"dk{i}",
+                "VALUES (%s,%s,%s,'queued','ats',%s,%s,%s,%s,%s,'apply','qualified',9,7,8,8,%s,.9,%s,%s,%s)",
+                (f"u{i}", f"http://{host}/{i}", 9.0 - i*0.01, batch, f"dk{i}", host,
                  f"d{i}", policy, 9.0 - i*0.01, now, now + timedelta(days=1), f"h{i}"))
         conn.commit()
 
@@ -84,7 +85,7 @@ def test_lease_rejects_prior_browser_or_requeue_evidence(fleet_db):
 def test_canary_caps_total_leases_fleetwide(fleet_db):
     from applypilot.fleet import queue
     with pgqueue.connect(fleet_db) as conn:
-        _seed_approved_apply_rows(conn, 5)
+        _seed_approved_apply_rows(conn, 5, distinct_hosts=True)
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE fleet_config SET ats_apply_mode='canary', "
