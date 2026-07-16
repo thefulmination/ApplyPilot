@@ -171,6 +171,8 @@ def worker_admission(
     if not isinstance(desired_workers, int) or desired_workers <= 0 or not isinstance(generation, int):
         return deny("worker denied: desired state is inactive or ambiguous")
     if not isinstance(updated_at, datetime):
+        if _paused_heartbeat_only(snapshot):
+            return allow("worker admitted for paused heartbeat only")
         return deny("worker denied: desired state freshness is unavailable")
     enrolled_owner = str(snapshot.get("machine_owner") or "")
     if enrolled_owner.casefold() != owner.casefold():
@@ -181,6 +183,8 @@ def worker_admission(
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=timezone.utc)
     if current - updated_at.astimezone(timezone.utc) > max_desired_state_age:
+        if _paused_heartbeat_only(snapshot):
+            return allow("worker admitted for paused heartbeat only")
         return deny("worker denied: desired state is stale")
     if not bool(snapshot.get("admission_allowed")) and not _paused_heartbeat_only(snapshot):
         return deny(f"worker denied: {snapshot.get('admission_reason') or 'admission_failed'}")
