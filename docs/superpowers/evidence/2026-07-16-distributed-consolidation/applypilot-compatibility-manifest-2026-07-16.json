@@ -5,7 +5,7 @@
   "python": {
     "repository": "thefulmination/ApplyPilot",
     "branch": "codex/cloud-cutover-runtime-integration",
-    "commitSha": "14c1abe625e700dade8f6e4bc2743737ed1523dd",
+    "commitSha": "b40c9e412152b6c6c0552944bc7c9089140d3494",
     "rollback": {
       "branch": "codex/fleet-dbhot-stage1-rollback",
       "commitSha": "f364bfec643026bf57969efda31bd545bc214142"
