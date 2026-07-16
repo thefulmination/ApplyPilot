@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -431,6 +434,87 @@ def test_v3_schema_backfills_cumulative_cost_from_latest_or_events(fleet_db):
         rows = {row["url"]: float(row["cumulative_cost_usd"]) for row in cur.fetchall()}
 
     assert rows == {"legacy-events": 0.75, "legacy-latest": 1.25}
+
+
+def test_v3_schema_adds_and_backfills_cumulative_cost_for_pre_column_queues(fleet_pg):
+    database_name = f"applypilot_legacy_{uuid.uuid4().hex}"
+    legacy_dsn = psycopg.conninfo.make_conninfo(fleet_pg, dbname=database_name)
+    base_schema = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "applypilot"
+        / "apply"
+        / "fleet_schema.sql"
+    ).read_text(encoding="utf-8")
+    legacy_schema = "\n".join(
+        line for line in base_schema.splitlines()
+        if "cumulative_cost_usd" not in line
+    )
+    assert legacy_schema != base_schema
+    assert "cumulative_cost_usd" not in legacy_schema
+
+    with pgqueue.connect(fleet_pg, autocommit=True) as admin:
+        admin.execute(
+            psycopg.sql.SQL("CREATE DATABASE {}").format(
+                psycopg.sql.Identifier(database_name)
+            )
+        )
+    try:
+        with pgqueue.connect(legacy_dsn) as conn, conn.cursor() as cur:
+            cur.execute(legacy_schema)
+            cur.execute(
+                "CREATE TABLE linkedin_queue "
+                "(LIKE apply_queue INCLUDING DEFAULTS INCLUDING INDEXES)"
+            )
+            cur.execute(
+                "INSERT INTO apply_queue (url, application_url, score, est_cost_usd) "
+                "VALUES ('pre-column-apply', 'pre-column-apply', 1, 1.25)"
+            )
+            cur.execute(
+                "INSERT INTO linkedin_queue (url, application_url, score, est_cost_usd) "
+                "VALUES ('pre-column-linkedin', 'pre-column-linkedin', 1, 2.25)"
+            )
+            conn.commit()
+            cur.execute(
+                "SELECT table_name FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name IN ('apply_queue', 'linkedin_queue') "
+                "AND column_name='cumulative_cost_usd'"
+            )
+            assert cur.fetchall() == []
+            conn.rollback()
+
+            fleet_schema.ensure_schema_v3(conn)
+
+            cur.execute(
+                "SELECT table_name FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name IN ('apply_queue', 'linkedin_queue') "
+                "AND column_name='cumulative_cost_usd'"
+            )
+            assert {row["table_name"] for row in cur.fetchall()} == {
+                "apply_queue",
+                "linkedin_queue",
+            }
+            cur.execute(
+                "SELECT cumulative_cost_usd FROM apply_queue WHERE url='pre-column-apply'"
+            )
+            apply_cost = float(cur.fetchone()["cumulative_cost_usd"])
+            cur.execute(
+                "SELECT cumulative_cost_usd FROM linkedin_queue "
+                "WHERE url='pre-column-linkedin'"
+            )
+            linkedin_cost = float(cur.fetchone()["cumulative_cost_usd"])
+    finally:
+        with pgqueue.connect(fleet_pg, autocommit=True) as admin:
+            admin.execute(
+                psycopg.sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
+                    psycopg.sql.Identifier(database_name)
+                )
+            )
+
+    assert apply_cost == 1.25
+    assert linkedin_cost == 2.25
 
 
 def test_v3_schema_does_not_rewrite_already_backfilled_queue_rows(fleet_db):
