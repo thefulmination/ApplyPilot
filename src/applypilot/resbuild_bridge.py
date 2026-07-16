@@ -23,6 +23,16 @@ safety rails the raw importer lacks:
 
 Promotion only STAGES jobs as apply-eligible in the brain; nothing applies until
 the fleet is run, so staging is safe.
+
+Authority
+---------
+The fleet PostgreSQL queue is the CANONICAL authority on what the fleet has
+already leased/applied; the local SQLite brain is only the promotion target. The
+fleet cross-check is therefore fail-closed: if the authority is configured but
+cannot be consulted, ``promote`` raises rather than falling back to SQLite's view.
+``promote`` takes its authority as an explicit ``fleet_connect`` dependency; the
+ambient FLEET_PG_DSN default exists solely for production callers that inject
+nothing (the CLI).
 """
 from __future__ import annotations
 
@@ -41,6 +51,11 @@ from applypilot.apply import pgqueue
 
 DEFAULT_EXCLUDE_HOSTS = ("linkedin.com",)
 DEFAULT_SOURCE = "res_build"
+
+# Sentinel for promote(fleet_connect=...): "resolve the fleet authority from the
+# ambient environment" (production default). An explicit None means "no fleet
+# authority for this call" and must never reach the ambient DSN.
+AMBIENT_FLEET_AUTHORITY = object()
 
 # Columns import_decisions overwrites; snapshot/restore EXACTLY these so a revert
 # is a faithful undo (mirrors _DECISION_UPDATE in import_decisions.py).
@@ -173,11 +188,26 @@ def _filter(conn, recs, *, exclude_hosts, only_applyable, limit, fleet_applied_u
     return kept, excluded_fleet_applied
 
 
+def _ambient_fleet_connect():
+    """Production fleet-authority resolution: the fleet Postgres connector, but
+    only when a fleet DSN is actually configured. Returns None otherwise."""
+    if not os.environ.get("FLEET_PG_DSN"):
+        return None
+    return pgqueue.connect
+
+
 def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
             exclude_hosts: Iterable[str] = DEFAULT_EXCLUDE_HOSTS,
             only_applyable: bool = True, limit: int | None = None,
-            snapshot_path=None, dry_run: bool = False) -> dict:
+            snapshot_path=None, dry_run: bool = False,
+            fleet_connect=AMBIENT_FLEET_AUTHORITY) -> dict:
     """Promote a scoped subset of the apply-list into the apply gate.
+
+    ``fleet_connect`` is the fleet Postgres AUTHORITY dependency: a zero-arg
+    callable returning a connection. Pass None to run with no fleet authority
+    (the cross-check is then reported as skipped). Left unset, it resolves from
+    the ambient FLEET_PG_DSN -- which is what production callers want and what
+    tests must never rely on.
 
     Returns a counts report. With ``dry_run`` nothing is written (and no snapshot
     is taken). Otherwise a snapshot is written FIRST (if ``snapshot_path`` given),
@@ -187,21 +217,26 @@ def promote(path, *, source: str = DEFAULT_SOURCE, scale: str = "ten",
     conn = get_connection()
     path = Path(path)
     recs = _approved_url_records(path)
-    fleet_cross_check = "skipped_no_dsn"
+
+    if fleet_connect is AMBIENT_FLEET_AUTHORITY:
+        fleet_connect = _ambient_fleet_connect()
+        fleet_cross_check = "skipped_no_dsn"
+    else:
+        fleet_cross_check = "skipped_no_authority"
+
     fleet_applied_urls: set[str] = set()
-    if os.environ.get("FLEET_PG_DSN"):
+    if fleet_connect is not None:
+        # Fail-closed: a configured authority that cannot be consulted aborts the
+        # promotion. Never degrade to SQLite's view of what the fleet has applied.
+        pg_conn = fleet_connect()
         try:
-            pg_conn = pgqueue.connect()
-            try:
-                kept_urls_hint = [u for (u, _r) in recs if not _excluded(u, exclude_hosts)]
-                existing_hint = _existing(conn, kept_urls_hint)
-                if existing_hint:
-                    fleet_applied_urls = _fleet_cross_checked_urls(pg_conn, list(existing_hint))
-            finally:
-                pg_conn.close()
-            fleet_cross_check = "ok"
-        except Exception:
-            raise
+            kept_urls_hint = [u for (u, _r) in recs if not _excluded(u, exclude_hosts)]
+            existing_hint = _existing(conn, kept_urls_hint)
+            if existing_hint:
+                fleet_applied_urls = _fleet_cross_checked_urls(pg_conn, list(existing_hint))
+        finally:
+            pg_conn.close()
+        fleet_cross_check = "ok"
 
     kept, excluded_fleet_applied = _filter(
         conn,
