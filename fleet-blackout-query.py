@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from datetime import datetime
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 # Endpoint, database/role, credentials, TLS/auth, and routing define authority.
@@ -75,8 +76,9 @@ _SENSITIVE_AUTHORITY_FIELDS = frozenset(
 _SENSITIVE_KEY_PATTERN = "|".join(
     re.escape(key) for key in sorted(_SENSITIVE_AUTHORITY_FIELDS, key=len, reverse=True)
 )
+_CONNINFO_VALUE_PATTERN = r'''(?:'(?:\\.|[^'])*'|"(?:\\.|[^"])*"|(?:\\.|[^\s])+)'''
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
-    rf"(?i)\b({_SENSITIVE_KEY_PATTERN})\s*=\s*('(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\"|\S+)"
+    rf"(?i)\b({_SENSITIVE_KEY_PATTERN})\s*=\s*({_CONNINFO_VALUE_PATTERN})"
 )
 _POSTGRES_USERINFO_RE = re.compile(r"(?i)\b(postgres(?:ql)?://)([^@\s/]+)@")
 
@@ -107,14 +109,33 @@ def _safe_field(value: object) -> str:
     return " ".join(str(value).replace("|", "/").split())[:300]
 
 
+def _safe_expiry(value: object) -> str:
+    expires = _safe_field(value)
+    if expires:
+        try:
+            datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RuntimeError("Invalid machine blackout expiry protocol") from exc
+    return expires
+
+
 def _unquote_conninfo_value(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         value = value[1:-1]
-        value = re.sub(r"\\(.)", r"\1", value)
-    return value
+    return re.sub(r"\\(.)", r"\1", value)
 
 
-def _sensitive_values_from_dsn(dsn: str) -> set[str]:
+def _sensitive_values_from_dsn(dsn: str, *, conninfo_to_dict=None) -> set[str]:
+    if conninfo_to_dict is not None:
+        try:
+            parsed = conninfo_to_dict(dsn)
+            return {
+                value
+                for key, value in parsed.items()
+                if key in _SENSITIVE_AUTHORITY_FIELDS and value
+            }
+        except Exception:
+            pass
     values = {
         _unquote_conninfo_value(match.group(2))
         for match in _SENSITIVE_ASSIGNMENT_RE.finditer(dsn)
@@ -134,10 +155,14 @@ def _sensitive_values_from_dsn(dsn: str) -> set[str]:
     return {value for value in values if value}
 
 
-def _sanitize_text(value: object, *dsns: str) -> str:
+def _sanitize_text(value: object, *dsns: str, conninfo_to_dict=None) -> str:
     message = str(value)
     for dsn in dsns:
-        for secret in sorted(_sensitive_values_from_dsn(dsn), key=len, reverse=True):
+        secrets = _sensitive_values_from_dsn(
+            dsn,
+            conninfo_to_dict=conninfo_to_dict,
+        )
+        for secret in sorted(secrets, key=len, reverse=True):
             message = message.replace(secret, "***")
         if dsn:
             message = message.replace(dsn, "***")
@@ -148,22 +173,39 @@ def _sanitize_text(value: object, *dsns: str) -> str:
     return _safe_field(message)
 
 
-def _sanitize_status_line(line: object, *dsns: str) -> str:
+def _sanitize_status_line(line: object, *dsns: str, conninfo_to_dict=None) -> str:
     parts = str(line).split("|", 5)
     if len(parts) != 6 or parts[0] not in {"OK", "BLOCKED"}:
         raise RuntimeError("Invalid machine blackout status protocol")
     if parts[0] == "OK" and parts[3:] != ["", "", ""]:
         raise RuntimeError("Invalid machine blackout OK status protocol")
-    return "|".join([parts[0], *(_sanitize_text(part, *dsns) for part in parts[1:])])
+    status, machine, role, policy, expires, reason = parts
+    safe_machine = _safe_field(machine)
+    safe_role = _safe_field(role)
+    safe_policy = _sanitize_text(
+        policy,
+        *dsns,
+        conninfo_to_dict=conninfo_to_dict,
+    )
+    safe_expires = _safe_expiry(expires)
+    safe_reason = _sanitize_text(
+        reason,
+        *dsns,
+        conninfo_to_dict=conninfo_to_dict,
+    )
+    return f"{status}|{safe_machine}|{safe_role}|{safe_policy}|{safe_expires}|{safe_reason}"
 
 label = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("APPLYPILOT_FLEET_LABEL", "home")
 role = sys.argv[2] if len(sys.argv) > 2 else "fleet"
 fleet_dsn = (os.environ.get("FLEET_PG_DSN") or "").strip()
 applypilot_fleet_dsn = (os.environ.get("APPLYPILOT_FLEET_DSN") or "").strip()
+conninfo_parser = None
 
 try:
     from psycopg import pq
     from psycopg.conninfo import conninfo_to_dict
+
+    conninfo_parser = conninfo_to_dict
 
     from applypilot.apply import pgqueue
     from applypilot.fleet import machine_blackout
@@ -189,6 +231,7 @@ try:
             machine_blackout.status_line(conn, label, role=role),
             fleet_dsn,
             applypilot_fleet_dsn,
+            conninfo_to_dict=conninfo_parser,
         )
     )
 except Exception as exc:
@@ -196,6 +239,7 @@ except Exception as exc:
         f"{type(exc).__name__}: {exc}",
         os.environ.get("FLEET_PG_DSN", ""),
         os.environ.get("APPLYPILOT_FLEET_DSN", ""),
+        conninfo_to_dict=conninfo_parser,
     )
     safe_label = _safe_field(label).lower()
     safe_role = _safe_field(role).lower()

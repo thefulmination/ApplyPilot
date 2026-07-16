@@ -45,6 +45,26 @@ def test_blackout_poll_does_not_migrate_and_marks_connection_read_only(monkeypat
     assert capsys.readouterr().out.strip() == "OK|m4|compute|||"
 
 
+def test_blackout_poll_preserves_ok_role_with_one_character_password(monkeypatch, capsys):
+    conn = _ReadOnlyConnection()
+    dsn = "host=fleet.invalid dbname=applypilot user=worker password=p"
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
+    monkeypatch.setattr(
+        machine_blackout,
+        "status_line",
+        lambda *_args, **_kwargs: "OK|m4|compute|||",
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "OK|m4|compute|||"
+    assert captured.err == ""
+
+
 @pytest.mark.parametrize("variable", ["FLEET_PG_DSN", "APPLYPILOT_FLEET_DSN"])
 def test_blackout_poll_accepts_each_fleet_dsn(variable, monkeypatch, capsys):
     conn = _ReadOnlyConnection()
@@ -378,6 +398,38 @@ def test_blackout_poll_import_failure_still_emits_sanitized_blocked_line(
     assert secret not in captured.err
 
 
+def test_blackout_poll_import_failure_fallback_decodes_escaped_keyword_secret(
+    monkeypatch,
+    capsys,
+):
+    decoded_secret = "alpha beta"
+    escaped_secret = r"alpha\ beta"
+    dsn = f"host=fleet.invalid dbname=applypilot user=worker password={escaped_secret}"
+    real_import = builtins.__import__
+
+    def fail_psycopg_import(name, *args, **kwargs):
+        if name == "psycopg" or name.startswith("psycopg."):
+            raise ImportError(
+                f"psycopg unavailable for {decoded_secret} password={escaped_secret}"
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_psycopg_import)
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert len(captured.out.splitlines()) == 1
+    assert decoded_secret not in captured.out
+    assert decoded_secret not in captured.err
+    assert escaped_secret not in captured.out
+    assert escaped_secret not in captured.err
+
+
 def test_blackout_poll_sanitizes_blocked_policy_name_protocol(monkeypatch, capsys):
     conn = _ReadOnlyConnection()
     dsn_secret = "policy-dsn-secret"
@@ -459,3 +511,63 @@ def test_blackout_poll_sanitizes_blocked_policy_reason_credentials(monkeypatch, 
         server_key_secret,
     ):
         assert secret not in line
+
+
+@pytest.mark.parametrize("surface", ["policy", "diagnostic"])
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "password",
+        "sslpassword",
+        "passfile",
+        "sslkey",
+        "oauth_client_secret",
+        "scram_client_key",
+        "scram_server_key",
+    ],
+)
+def test_blackout_poll_decodes_escaped_keyword_secrets_with_psycopg(
+    sensitive_key,
+    surface,
+    monkeypatch,
+    capsys,
+):
+    decoded_secret = "alpha beta"
+    escaped_secret = r"alpha\ beta"
+    dsn = (
+        "host=fleet.invalid dbname=applypilot user=worker "
+        f"{sensitive_key}={escaped_secret}"
+    )
+    conn = _ReadOnlyConnection()
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+    if surface == "policy":
+        monkeypatch.setattr(pgqueue, "connect", lambda _dsn: conn)
+        monkeypatch.setattr(
+            machine_blackout,
+            "status_line",
+            lambda *_args, **_kwargs: (
+                f"BLOCKED|m4|compute|policy {decoded_secret}||reason {decoded_secret}"
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            pgqueue,
+            "connect",
+            lambda _dsn: (_ for _ in ()).throw(
+                RuntimeError(
+                    f"credential failure {decoded_secret} "
+                    f"{sensitive_key}={escaped_secret}"
+                )
+            ),
+        )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|")
+    assert decoded_secret not in captured.out
+    assert decoded_secret not in captured.err
+    assert escaped_secret not in captured.out
+    assert escaped_secret not in captured.err
