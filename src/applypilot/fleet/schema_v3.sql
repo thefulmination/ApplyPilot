@@ -612,6 +612,24 @@ CREATE TABLE IF NOT EXISTS workers (
     revoked_at    TIMESTAMPTZ
 );
 
+-- fleet_desired_state is the single declarative actuator input for worker
+-- enrollment.  Admission requires this table even while the fleet is paused;
+-- desired_workers stays positive so a paused worker can heartbeat and prove
+-- identity without receiving a lease.
+CREATE TABLE IF NOT EXISTS fleet_desired_state (
+    machine_owner TEXT PRIMARY KEY,
+    desired_workers INTEGER NOT NULL DEFAULT 0 CHECK (desired_workers >= 0),
+    agent TEXT NOT NULL,
+    model TEXT NOT NULL,
+    generation BIGINT NOT NULL DEFAULT 0,
+    updated_by TEXT NOT NULL DEFAULT 'schema-bootstrap',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_desired_state_freshness
+    ON fleet_desired_state (updated_at);
+ALTER TABLE fleet_desired_state
+    ALTER COLUMN updated_by SET DEFAULT 'schema-bootstrap';
+
 -- ---------------------------------------------------------------------------
 -- worker_heartbeat: fleet health substrate (R5, R7). Updated ~every 20s.
 -- ---------------------------------------------------------------------------
