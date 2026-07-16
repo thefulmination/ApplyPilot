@@ -4,7 +4,7 @@ Run date: 2026-07-16
 
 Branch: `codex/cloud-cutover-runtime-integration`
 Plan: `docs/superpowers/plans/2026-07-16-parallel-release-remediation.md`
-Verified candidate head before final CI: `dde99e3ea38cf6a8d06537f0f9763f2b81b7a23b`
+Verified candidate head: `5f75b7cb3e150cf6bf96b4664de80c3c20dac393`
 
 ## Integrated Work
 
@@ -54,20 +54,20 @@ Claude C1 source commit: `fdf16af`. The commit was pushed to `claude/resbuild-po
 
 ## Final CI Evidence
 
-Previous workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29509248944
+Final workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29516416588
 
-- Python 3.11: `2226 passed, 982 skipped in 110.95s`.
-- Python 3.12: `2226 passed, 982 skipped in 95.01s`.
+- Python 3.11: `2230 passed, 982 skipped in 103.45s`.
+- Python 3.12: `2230 passed, 982 skipped in 95.00s`.
 - Python 3.12 wheel and source distribution: passed.
-- Windows-native contracts: `894 passed, 1 skipped in 1069.24s`.
+- Windows-native contracts: `894 passed, 1 skipped in 984.51s`.
 - Container candidate build: passed without registry login or push.
 - Deterministic container smoke check: passed.
 - Overall workflow conclusion: `success`.
 
-The skipped CI tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. A final workflow for the C1-integrated head is required and will be recorded here after dispatch.
+The skipped CI tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. They remain explicit release-environment follow-up gates, not silent passes.
 
 ## Scope Decision
 
-Codex-owned X1, X2, and X3 integration/release-gate work are complete locally, including Claude C1. The overall plan is pending only the final CI run from the C1-integrated head.
+Codex-owned X1, X2, and X3 integration/release-gate work are complete, including Claude C1. The parallel remediation plan is complete through code integration and CI verification. Production deployment, staging validation, and canary approval remain separate operational steps.
 
 No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched. Production application lanes remain paused pending separate staging/canary approval after C1 is integrated and verified.
