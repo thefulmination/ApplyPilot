@@ -22,6 +22,7 @@ this test fails without needing a Docker daemon.
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 import yaml
 
@@ -30,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 DOCKERFILE_PATH = REPO_ROOT / "Dockerfile"
 DOCKERIGNORE_PATH = REPO_ROOT / ".dockerignore"
+PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
 
 CONTAINER_JOB_NAME = "container-build"
 
@@ -124,6 +126,23 @@ def test_triggers_are_bounded() -> None:
 
     pr = triggers.get("pull_request")
     assert pr.get("branches"), "pull_request trigger must be branch-scoped"
+
+
+def test_python_ci_installs_jobspy_and_excludes_windows_only_suite() -> None:
+    job = _load_workflow()["jobs"]["test"]
+    steps = {step["name"]: step for step in job["steps"]}
+    install = steps["Install dependencies"]["run"]
+    assert "pip install --no-deps python-jobspy" in install
+    test_command = steps["Test"]["run"]
+    assert "--ignore=tests/test_fleet_machine_blackout_scripts.py" in test_command
+
+
+def test_python_ci_matrix_matches_declared_support() -> None:
+    job = _load_workflow()["jobs"]["test"]
+    assert job["strategy"]["matrix"]["python-version"] == ["3.11", "3.12"]
+    project = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))["project"]
+    assert project["requires-python"] == ">=3.11,<3.13"
+    assert "Programming Language :: Python :: 3.13" not in project["classifiers"]
 
 
 def test_dockerfile_entrypoint_contract_unchanged() -> None:
