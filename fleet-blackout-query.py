@@ -63,6 +63,11 @@ _AUTHORITY_IDENTITY_FIELDS = frozenset(
         "oauth_scope",
     }
 )
+# libpq treats an empty value as the effective environment/built-in default for
+# these connection identity fields; focused tests cover both default sources.
+_EMPTY_MEANS_DEFAULT_FIELDS = frozenset(
+    {"host", "hostaddr", "port", "user", "password", "passfile", "dbname"}
+)
 _SENSITIVE_AUTHORITY_FIELDS = frozenset(
     {
         "password",
@@ -95,7 +100,7 @@ def _normalized_dsn(dsn: str, *, pq, conninfo_to_dict) -> dict[str, str]:
     normalized = dict(defaults)
     normalized.update(explicit)
     for key, value in explicit.items():
-        if value != "":
+        if value != "" or key not in _EMPTY_MEANS_DEFAULT_FIELDS:
             continue
         if defaults.get(key):
             normalized[key] = defaults[key]

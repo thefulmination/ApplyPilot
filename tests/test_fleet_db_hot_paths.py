@@ -244,6 +244,38 @@ def test_blackout_poll_treats_explicit_empty_conninfo_as_effective_default(
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "sslmode",
+        "target_session_attrs",
+        "channel_binding",
+        "gssencmode",
+        "sslcertmode",
+    ],
+)
+def test_blackout_poll_rejects_explicit_empty_invalid_authority_field(
+    field,
+    monkeypatch,
+    capsys,
+):
+    base_dsn = "host=fleet.example dbname=applypilot user=worker password=secret"
+    monkeypatch.setenv("FLEET_PG_DSN", base_dsn)
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", f"{base_dsn} {field}=''")
+    monkeypatch.setattr(
+        pgqueue,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("conflicting fleet DSNs reached connector"),
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert "Inconsistent fleet Postgres DSN references" in captured.err
+
+
+@pytest.mark.parametrize(
     ("fleet_dsn", "applypilot_fleet_dsn"),
     [
         (
