@@ -497,6 +497,19 @@ def test_v3_schema_adds_and_backfills_cumulative_cost_for_pre_column_queues(flee
                 "linkedin_queue",
             }
             cur.execute(
+                "SELECT table_name, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name IN ('apply_queue', 'linkedin_queue') "
+                "AND column_name='cumulative_cost_usd'"
+            )
+            metadata = {row["table_name"]: row for row in cur.fetchall()}
+            assert {table: row["is_nullable"] for table, row in metadata.items()} == {
+                "apply_queue": "NO",
+                "linkedin_queue": "NO",
+            }
+            assert all(row["column_default"] == "0" for row in metadata.values())
+            cur.execute(
                 "SELECT cumulative_cost_usd FROM apply_queue WHERE url='pre-column-apply'"
             )
             apply_cost = float(cur.fetchone()["cumulative_cost_usd"])
@@ -552,43 +565,52 @@ def test_v3_schema_does_not_rewrite_already_backfilled_queue_rows(fleet_db):
 
 def test_v3_schema_initializes_null_legacy_cumulative_costs(fleet_db):
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
-        try:
-            cur.execute("ALTER TABLE apply_queue ALTER COLUMN cumulative_cost_usd DROP NOT NULL")
-            cur.execute("ALTER TABLE linkedin_queue ALTER COLUMN cumulative_cost_usd DROP NOT NULL")
-            cur.execute(
-                "INSERT INTO apply_queue "
-                "(url, application_url, score, est_cost_usd, cumulative_cost_usd) "
-                "VALUES ('null-legacy-apply', 'null-legacy-apply', 1, 1.25, NULL)"
-            )
-            cur.execute(
-                "INSERT INTO apply_result_events (url, est_cost_usd) "
-                "VALUES ('null-legacy-apply', 0.75), ('null-legacy-apply', 0.80)"
-            )
-            cur.execute(
-                "INSERT INTO linkedin_queue "
-                "(url, application_url, score, est_cost_usd, cumulative_cost_usd) "
-                "VALUES ('null-legacy-linkedin', 'null-legacy-linkedin', 1, 2.25, NULL)"
-            )
-            conn.commit()
+        cur.execute("ALTER TABLE apply_queue ALTER COLUMN cumulative_cost_usd DROP NOT NULL")
+        cur.execute("ALTER TABLE apply_queue ALTER COLUMN cumulative_cost_usd DROP DEFAULT")
+        cur.execute("ALTER TABLE linkedin_queue ALTER COLUMN cumulative_cost_usd DROP NOT NULL")
+        cur.execute("ALTER TABLE linkedin_queue ALTER COLUMN cumulative_cost_usd DROP DEFAULT")
+        cur.execute(
+            "INSERT INTO apply_queue "
+            "(url, application_url, score, est_cost_usd, cumulative_cost_usd) "
+            "VALUES ('null-legacy-apply', 'null-legacy-apply', 1, 1.25, NULL)"
+        )
+        cur.execute(
+            "INSERT INTO apply_result_events (url, est_cost_usd) "
+            "VALUES ('null-legacy-apply', 0.75), ('null-legacy-apply', 0.80)"
+        )
+        cur.execute(
+            "INSERT INTO linkedin_queue "
+            "(url, application_url, score, est_cost_usd, cumulative_cost_usd) "
+            "VALUES ('null-legacy-linkedin', 'null-legacy-linkedin', 1, 2.25, NULL)"
+        )
+        conn.commit()
 
-            fleet_schema.ensure_schema_v3(conn)
+        fleet_schema.ensure_schema_v3(conn)
 
-            cur.execute(
-                "SELECT cumulative_cost_usd FROM apply_queue WHERE url='null-legacy-apply'"
-            )
-            apply_cost = float(cur.fetchone()["cumulative_cost_usd"])
-            cur.execute(
-                "SELECT cumulative_cost_usd FROM linkedin_queue WHERE url='null-legacy-linkedin'"
-            )
-            linkedin_cost = float(cur.fetchone()["cumulative_cost_usd"])
-            conn.rollback()
-        finally:
-            cur.execute("ALTER TABLE apply_queue ALTER COLUMN cumulative_cost_usd SET NOT NULL")
-            cur.execute("ALTER TABLE linkedin_queue ALTER COLUMN cumulative_cost_usd SET NOT NULL")
-            conn.commit()
+        cur.execute(
+            "SELECT cumulative_cost_usd FROM apply_queue WHERE url='null-legacy-apply'"
+        )
+        apply_cost = float(cur.fetchone()["cumulative_cost_usd"])
+        cur.execute(
+            "SELECT cumulative_cost_usd FROM linkedin_queue WHERE url='null-legacy-linkedin'"
+        )
+        linkedin_cost = float(cur.fetchone()["cumulative_cost_usd"])
+        cur.execute(
+            "SELECT table_name, is_nullable, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema='public' "
+            "AND table_name IN ('apply_queue', 'linkedin_queue') "
+            "AND column_name='cumulative_cost_usd'"
+        )
+        metadata = {row["table_name"]: row for row in cur.fetchall()}
 
     assert apply_cost == 1.55
     assert linkedin_cost == 2.25
+    assert {table: row["is_nullable"] for table, row in metadata.items()} == {
+        "apply_queue": "NO",
+        "linkedin_queue": "NO",
+    }
+    assert all(row["column_default"] == "0" for row in metadata.values())
 
 
 def test_apply_result_events_include_cost_router_metadata(fleet_db):

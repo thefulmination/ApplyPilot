@@ -1918,34 +1918,45 @@ REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_park(TEXT,TEXT,TEXT,TEXT,I
 -- attempt value for diagnostics; cumulative_cost_usd is the cap/reporting ledger.
 ALTER TABLE apply_queue
     ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
-UPDATE apply_queue q
-SET cumulative_cost_usd = GREATEST(
-    COALESCE(q.cumulative_cost_usd, 0),
-    COALESCE(q.est_cost_usd, 0),
-    COALESCE((
-        SELECT SUM(e.est_cost_usd)
-        FROM apply_result_events e
-        WHERE e.queue_name = 'apply_queue' AND e.url = q.url
-    ), 0)
+WITH event_costs AS MATERIALIZED (
+    SELECT e.url, SUM(e.est_cost_usd) AS total_cost_usd
+    FROM apply_result_events e
+    WHERE e.queue_name = 'apply_queue'
+    GROUP BY e.url
+), desired AS MATERIALIZED (
+    SELECT q.url, GREATEST(
+        COALESCE(q.cumulative_cost_usd, 0),
+        COALESCE(q.est_cost_usd, 0),
+        COALESCE(e.total_cost_usd, 0)
+    ) AS cumulative_cost_usd
+    FROM apply_queue q
+    LEFT JOIN event_costs e ON e.url = q.url
 )
-WHERE q.cumulative_cost_usd IS DISTINCT FROM GREATEST(
-    COALESCE(q.cumulative_cost_usd, 0),
-    COALESCE(q.est_cost_usd, 0),
-    COALESCE((
-        SELECT SUM(e.est_cost_usd)
-        FROM apply_result_events e
-        WHERE e.queue_name = 'apply_queue' AND e.url = q.url
-    ), 0)
-);
+UPDATE apply_queue q
+SET cumulative_cost_usd = desired.cumulative_cost_usd
+FROM desired
+WHERE q.url = desired.url
+  AND q.cumulative_cost_usd IS DISTINCT FROM desired.cumulative_cost_usd;
+ALTER TABLE apply_queue
+    ALTER COLUMN cumulative_cost_usd SET DEFAULT 0,
+    ALTER COLUMN cumulative_cost_usd SET NOT NULL;
 ALTER TABLE linkedin_queue
     ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
-UPDATE linkedin_queue q
-SET cumulative_cost_usd = GREATEST(
-    COALESCE(q.cumulative_cost_usd, 0), COALESCE(q.est_cost_usd, 0)
+WITH desired AS MATERIALIZED (
+    SELECT q.url, GREATEST(
+        COALESCE(q.cumulative_cost_usd, 0),
+        COALESCE(q.est_cost_usd, 0)
+    ) AS cumulative_cost_usd
+    FROM linkedin_queue q
 )
-WHERE q.cumulative_cost_usd IS DISTINCT FROM GREATEST(
-    COALESCE(q.cumulative_cost_usd, 0), COALESCE(q.est_cost_usd, 0)
-);
+UPDATE linkedin_queue q
+SET cumulative_cost_usd = desired.cumulative_cost_usd
+FROM desired
+WHERE q.url = desired.url
+  AND q.cumulative_cost_usd IS DISTINCT FROM desired.cumulative_cost_usd;
+ALTER TABLE linkedin_queue
+    ALTER COLUMN cumulative_cost_usd SET DEFAULT 0,
+    ALTER COLUMN cumulative_cost_usd SET NOT NULL;
 
 -- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on
 -- the diagnosis row, so a Reverse / audit can report exactly which/how-many rows were affected,

@@ -55,9 +55,19 @@ foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
 }
 if (-not $py) { throw "python not found (.conda-env or .venv) -- run the setup script first." }
 
-$machinePolicy = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label "apply" 2>$null | Select-Object -Last 1)
-if ("$machinePolicy" -match '^BLOCKED\|') {
-  throw "Refusing to start apply worker '$WorkerId': machine blackout active. $machinePolicy"
+function Test-MachineBlackout([string]$Role) {
+  $line = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null | Select-Object -Last 1)
+  $queryExit = $LASTEXITCODE
+  if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
+  $expected = "OK|$($Label.Trim().ToLowerInvariant())|$($Role.Trim().ToLowerInvariant())|||"
+  if ("$line" -ceq $expected) { return $null }
+  if ([string]::IsNullOrWhiteSpace("$line")) { return "ERROR|empty-blackout-status" }
+  return "$line"
+}
+
+$machinePolicyFailure = Test-MachineBlackout "apply"
+if ($machinePolicyFailure) {
+  throw "Refusing to start apply worker '$WorkerId': machine blackout status did not return exact OK. $machinePolicyFailure"
 }
 
 function Resolve-FleetHomeIp([string]$Candidate) {
