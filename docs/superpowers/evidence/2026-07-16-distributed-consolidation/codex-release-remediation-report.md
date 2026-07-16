@@ -50,7 +50,7 @@ Claude C1 source commit: `fdf16af`. The commit was pushed to `claude/resbuild-po
 - Workflow YAML parse: passed.
 - `git diff --check`: passed.
 - Full four-worker diagnostic before C1: `3971 passed, 17 skipped, 13 failed`; all 13 failures were legacy ResBuild SQLite fixtures reaching an ambient Postgres DSN.
-- Complete local serial suite: inconclusive because it exceeded the 30-minute local timeout without a summary. This is not represented as a pass or failure.
+- Complete local serial suite: **PASS** at `ef39c9b`: `python -m pytest -q -p no:randomly` produced `3990 passed, 17 skipped, 0 failed, 0 errors` in `2609.30s (0:43:29)`. The pinned isolated-worktree evidence is documented in [`claude-serial-gate-verification.md`](claude-serial-gate-verification.md). The earlier Codex-local run was inconclusive because its 30-minute local execution budget cannot fit this approximately 43-minute suite; that limitation did not invalidate the completed pinned run.
 
 ## Final CI Evidence
 
