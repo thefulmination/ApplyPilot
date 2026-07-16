@@ -17,6 +17,55 @@ from psycopg import pq
 from psycopg.conninfo import conninfo_to_dict
 
 
+# Endpoint, database/role, credentials, TLS/auth, and routing define authority.
+# Client tuning such as timeouts, application names, and keepalives is excluded.
+_AUTHORITY_IDENTITY_FIELDS = frozenset(
+    {
+        "service",
+        "servicefile",
+        "host",
+        "hostaddr",
+        "port",
+        "dbname",
+        "user",
+        "password",
+        "passfile",
+        "options",
+        "channel_binding",
+        "sslmode",
+        "sslnegotiation",
+        "sslcompression",
+        "sslcert",
+        "sslkey",
+        "sslcertmode",
+        "sslpassword",
+        "sslrootcert",
+        "sslcrl",
+        "sslcrldir",
+        "sslsni",
+        "requirepeer",
+        "require_auth",
+        "min_protocol_version",
+        "max_protocol_version",
+        "ssl_min_protocol_version",
+        "ssl_max_protocol_version",
+        "gssencmode",
+        "krbsrvname",
+        "gsslib",
+        "gssdelegation",
+        "replication",
+        "target_session_attrs",
+        "load_balance_hosts",
+        "scram_client_key",
+        "scram_server_key",
+        "oauth_issuer",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "oauth_scope",
+    }
+)
+
+
 def _normalized_dsn(dsn: str) -> dict[str, str]:
     normalized = {
         option.keyword.decode(): option.val.decode()
@@ -26,7 +75,7 @@ def _normalized_dsn(dsn: str) -> dict[str, str]:
     normalized.update(conninfo_to_dict(dsn))
     if "dbname" not in normalized and "user" in normalized:
         normalized["dbname"] = normalized["user"]
-    return normalized
+    return {key: value for key, value in normalized.items() if key in _AUTHORITY_IDENTITY_FIELDS}
 
 
 def _safe_field(value: object) -> str:

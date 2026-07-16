@@ -118,6 +118,11 @@ def test_blackout_poll_rejects_database_url_without_fleet_dsn(monkeypatch, capsy
         "postgresql://worker:other-secret@fleet-one.invalid:5432/other_database",
         "postgresql://other-user:other-secret@fleet-one.invalid:5432/applypilot",
         "postgresql://worker:different-secret@fleet-one.invalid:5432/applypilot",
+        "postgresql://worker:other-secret@fleet-one.invalid:5432/applypilot?sslmode=require",
+        (
+            "postgresql://worker:other-secret@fleet-one.invalid:5432/applypilot"
+            "?target_session_attrs=read-write"
+        ),
     ],
 )
 def test_blackout_poll_rejects_conflicting_fleet_dsns(
@@ -278,6 +283,23 @@ def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypa
         (
             "postgresql://worker:secret@fleet.example",
             "postgresql://worker:secret@fleet.example/worker",
+        ),
+        (
+            "host=fleet.example dbname=applypilot user=worker password=secret",
+            (
+                "host=fleet.example dbname=applypilot user=worker password=secret "
+                "connect_timeout=0"
+            ),
+        ),
+        (
+            (
+                "host=fleet.example dbname=applypilot user=worker password=secret "
+                "connect_timeout=2"
+            ),
+            (
+                "host=fleet.example dbname=applypilot user=worker password=secret "
+                "connect_timeout=30"
+            ),
         ),
     ],
 )
