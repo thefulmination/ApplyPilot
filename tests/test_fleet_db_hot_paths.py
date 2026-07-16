@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+from psycopg.conninfo import make_conninfo  # noqa: E402
 
 from applypilot.apply import pgqueue  # noqa: E402
 from applypilot.fleet import machine_blackout, machine_blackout_main  # noqa: E402
@@ -301,6 +302,32 @@ def test_control_status_does_not_migrate_and_marks_connection_read_only(monkeypa
                 "connect_timeout=30"
             ),
         ),
+        (
+            "port=5432 dbname=applypilot user=worker password=secret",
+            "host='' port=5432 dbname=applypilot user=worker password=secret",
+        ),
+        (
+            "host=fleet.example port=5432 dbname=applypilot user=worker password=secret",
+            (
+                "host=fleet.example hostaddr='' port=5432 dbname=applypilot "
+                "user=worker password=secret"
+            ),
+        ),
+        (
+            "host=fleet.example dbname=applypilot user=worker password=secret",
+            "host=fleet.example port='' dbname=applypilot user=worker password=secret",
+        ),
+        (
+            "host=fleet.example user=worker password=secret",
+            "host=fleet.example user=worker password=secret dbname=''",
+        ),
+        (
+            "host=fleet.example dbname=applypilot user=worker password=secret",
+            (
+                "host=fleet.example dbname=applypilot user=worker password=secret "
+                "sslcertmode=allow"
+            ),
+        ),
     ],
 )
 def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
@@ -310,7 +337,15 @@ def test_blackout_poll_accepts_semantically_equivalent_fleet_dsns(
     capsys,
 ):
     conn = _ReadOnlyConnection()
-    for variable in ("PGPORT", "PGSSLMODE", "PGTARGETSESSIONATTRS"):
+    for variable in (
+        "PGDATABASE",
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGSSLCERTMODE",
+        "PGSSLMODE",
+        "PGTARGETSESSIONATTRS",
+    ):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("FLEET_PG_DSN", fleet_dsn)
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", applypilot_fleet_dsn)
@@ -435,3 +470,50 @@ def test_desired_state_poll_returns_stop_when_query_fails(monkeypatch, capsys):
     assert captured.out.strip() == "STOP|||"
     assert "control state unavailable" in captured.err
     assert "desired-state query failed" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "sensitive_key",
+    [
+        "password",
+        "sslpassword",
+        "passfile",
+        "sslkey",
+        "oauth_client_secret",
+        "scram_client_key",
+        "scram_server_key",
+    ],
+)
+def test_blackout_poll_redacts_every_sensitive_authority_value(
+    sensitive_key,
+    monkeypatch,
+    capsys,
+):
+    parsed_secret = f"parsed-{sensitive_key}-secret"
+    diagnostic_secret = f"diagnostic-{sensitive_key}-secret"
+    dsn = make_conninfo(
+        host="fleet.invalid",
+        dbname="applypilot",
+        user="worker",
+        **{sensitive_key: parsed_secret},
+    )
+    monkeypatch.setenv("FLEET_PG_DSN", dsn)
+    monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
+
+    def fail_connect(_dsn):
+        raise RuntimeError(
+            f"credential failure {parsed_secret} {sensitive_key}={diagnostic_secret}"
+        )
+
+    monkeypatch.setattr(pgqueue, "connect", fail_connect)
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert "***" in captured.out
+    assert "***" in captured.err
+    for secret in (parsed_secret, diagnostic_secret):
+        assert secret not in captured.out
+        assert secret not in captured.err
