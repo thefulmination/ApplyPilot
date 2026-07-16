@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -220,6 +221,32 @@ def _blob_id(data: bytes) -> str:
     return hashlib.sha1(header + data).hexdigest()
 
 
+def _git_predecessor_blob(root: Path, runtime_commit: str, path: str) -> str | None:
+    try:
+        merge_base = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", runtime_commit, "HEAD"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if merge_base.returncode != 0:
+            return None
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", runtime_commit, "--", path],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split()
+    if len(fields) < 3 or fields[1] != "blob" or not _HEX40.fullmatch(fields[2]):
+        return None
+    return fields[2]
+
+
 def verify_predecessor(manifest: Manifest, repository_root: str | Path) -> None:
     root = Path(repository_root).resolve()
     for item in manifest.predecessor.files:
@@ -233,6 +260,9 @@ def verify_predecessor(manifest: Manifest, repository_root: str | Path) -> None:
                 raise ManifestError(f"predecessor blob has a non-CRLF carriage return: {item.path}")
             actual = _blob_id(data.replace(b"\r\n", b"\n"))
         if actual != item.git_blob:
+            git_blob = _git_predecessor_blob(root, manifest.predecessor.runtime_commit, item.path)
+            if git_blob == item.git_blob:
+                continue
             raise ManifestError(f"predecessor blob mismatch for {item.path}: expected {item.git_blob}, got {actual}")
 
 

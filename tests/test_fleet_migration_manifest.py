@@ -98,10 +98,28 @@ def test_repository_manifest_pins_the_exact_legacy_predecessor():
         "src/applypilot/apply/fleet_schema.sql": "6eb4a84dcc05568233ee32551b28c75f13b0a17f",
         "src/applypilot/fleet/schema.py": "5637001b6457f9fc8f0c22f4220fe2e1249ff9c0",
     }
+    assert _git_blob_id((REPO_ROOT / "src/applypilot/fleet/schema_v3.sql").read_bytes()) != (
+        "0741a6e675d2ea42a3bb0d785fd4c0c444e96b3d"
+    )
     assert tuple(item.id for item in manifest.migrations) == (
         "20260715_001_application_authority",
     )
     migrator.verify_predecessor(manifest, REPO_ROOT)
+
+
+def test_repository_manifest_rejects_wrong_predecessor_commit(tmp_path):
+    payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    payload["predecessor"]["runtime_commit"] = "0" * 40
+    path = tmp_path / "manifest-v1.json"
+    path.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    manifest = migrator.load_manifest(path)
+    with pytest.raises(migrator.ManifestError, match="predecessor blob mismatch"):
+        migrator.verify_predecessor(manifest, REPO_ROOT)
 
 
 def test_manifest_rejects_duplicate_keys_unknown_fields_and_unsafe_paths(tmp_path):

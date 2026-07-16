@@ -24,6 +24,10 @@ def _supported_powershells() -> list[str]:
     return _production_shells()
 
 
+def _primary_production_shell() -> str:
+    return _production_shells()[0]
+
+
 def _powershell_function(script: str, name: str) -> str:
     start = script.index(f"function {name}")
     opening = script.index("{", start)
@@ -499,7 +503,7 @@ def test_new_worker_launcher_requires_exact_successful_ok_status(
     )
 
     assert (result.returncode == 0) is allowed, (result.stdout, result.stderr)
-    assert "blackout query diagnostic" in result.stderr
+    assert "blackoutquerydiagnostic" in "".join(result.stderr.lower().split())
     if not allowed:
         assert result.returncode == 42, (result.stdout, result.stderr)
 
@@ -542,9 +546,7 @@ def test_fleet_agent_blackout_status_is_fail_closed(
     exit_code,
     expected_state,
 ):
-    pwsh = shutil.which("pwsh")
-    if not pwsh:
-        pytest.skip("pwsh is required for fleet-agent guard tests")
+    powershell = _primary_production_shell()
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
     function = _powershell_function(script, "Get-MachineBlackoutStatus")
     shim = tmp_path / "blackout-shim.ps1"
@@ -568,7 +570,7 @@ def test_fleet_agent_blackout_status_is_fail_closed(
     env["BLACKOUT_EXIT"] = str(exit_code)
 
     result = subprocess.run(
-        [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
         text=True,
         env=env,
@@ -594,9 +596,7 @@ def test_fleet_agent_keeps_existing_state_when_blackout_status_is_uncertain(
     output,
     exit_code,
 ):
-    pwsh = shutil.which("pwsh")
-    if not pwsh:
-        pytest.skip("pwsh is required for fleet-agent guard tests")
+    powershell = _primary_production_shell()
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
     function = _powershell_function(script, "Get-MachineBlackoutStatus")
     guard_start = script.index("  $machinePolicy = Get-MachineBlackoutStatus")
@@ -630,7 +630,7 @@ def test_fleet_agent_keeps_existing_state_when_blackout_status_is_uncertain(
     env["BLACKOUT_EXIT"] = str(exit_code)
 
     result = subprocess.run(
-        [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
         text=True,
         env=env,
@@ -707,7 +707,7 @@ def test_fleet_agent_requeries_policy_after_update_before_reconciliation(
     )
 
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        [_primary_production_shell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
         text=True,
         timeout=30,

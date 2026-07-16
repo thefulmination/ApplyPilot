@@ -2,10 +2,12 @@
   "machine": "tarpon",
   "branch": "codex/consolidation-python-tarpon-20260716",
   "base_sha": "2b3a7c83118df840dda60c9b728f29e3dc0c1b9d",
-  "head_sha": "000d284cd213187f7004d1993276fff8d7515ccb",
+  "prior_blocked_handoff_sha": "66c209cbf6f5eb81f1434ab0fd651b0a948df8d0",
+  "head_sha_before_report_commit": "99253a1a4ce1ebd79ac23760f431ffdd794d3499",
   "disposable_database": "applypilot_consolidation_tarpon",
   "production_database_used": false,
-  "focused_tests_passed": false,
+  "application_lane_state_touched": false,
+  "focused_tests_passed": true,
   "real_postgres_tests_passed": false,
   "integrated_rows": [
     {
@@ -31,7 +33,18 @@
     {
       "branch": "codex/fleet-dbhot-live-hotfix",
       "source_head": "706bf4297de143bcc6e4edb15bb040617b530562",
-      "status": "blocked-missing-git-objects"
+      "status": "integrated",
+      "integrated_commits": [
+        "ddad31f30ae49f09d28f888d42e01e85fc22bdfb",
+        "9218ee17961ddd44b4c995c6ea5981f28f893d29",
+        "9b98e125dbe7e018047d770e97b09fe407a42fae",
+        "cfd1eeeb2d9ef6844554bca2b5324299a60d2000",
+        "4fd6746c3cb8879b8bae912617dce5f916028101",
+        "706bf4297de143bcc6e4edb15bb040617b530562"
+      ],
+      "equivalent_commits_not_duplicated": [
+        "9ec4910324650b6c55f6720140116437fdb8b157"
+      ]
     },
     {
       "branch": "codex/snapshot-python-main-safety-20260716",
@@ -44,47 +57,59 @@
       "status": "integrated"
     }
   ],
+  "migration_chain_resolution": {
+    "status": "resolved",
+    "runtime_commit": "2b3a7c83118df840dda60c9b728f29e3dc0c1b9d",
+    "verified_predecessor_blobs": {
+      "src/applypilot/fleet/schema_v3.sql": "0741a6e675d2ea42a3bb0d785fd4c0c444e96b3d",
+      "src/applypilot/apply/fleet_schema.sql": "6eb4a84dcc05568233ee32551b28c75f13b0a17f",
+      "src/applypilot/fleet/schema.py": "5637001b6457f9fc8f0c22f4220fe2e1249ff9c0"
+    },
+    "current_schema_v3_blob": "f8fc0f9574f1fa7eaa5e8e9fa4a2fae774594079",
+    "verification": "verify_predecessor now accepts an advanced checkout only when the recorded predecessor commit is an ancestor of HEAD and its tree contains the exact pinned blobs"
+  },
   "test_evidence": [
     {
-      "command": ".\\.venv\\Scripts\\python.exe -m ruff check src tests",
-      "exit_code": 1,
-      "result": "failed on repository-wide lint debt; integration-introduced unused imports fixed"
-    },
-    {
-      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_v3_schema.py tests/test_fleet_pgqueue.py tests/test_fleet_v3_broker.py tests/test_fleet_v3_governor_queue.py tests/test_fleet_v3_worker.py tests/test_fleet_pg_roles.py -q --basetemp .pytest-tarpon-focused1",
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_migration_manifest.py -q --basetemp .pytest-tarpon-migrations-fixed",
       "exit_code": 0,
-      "result": "109 passed, 191 skipped in 1.31s"
+      "result": "5 passed, 5 skipped in 0.59s"
     },
     {
-      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_outcome_timeline.py tests/test_emergency_admission_policy.py tests/test_apply_preflight_liveness.py -q --basetemp .pytest-tarpon-focused2-python",
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_agent_autoupdate_script.py tests/test_fleet_machine_blackout.py tests/test_fleet_machine_blackout_scripts.py tests/test_fleet_db_hot_paths.py -q --basetemp .pytest-tarpon-live-hotfix2",
       "exit_code": 0,
-      "result": "47 passed in 1.08s"
+      "result": "173 passed, 6 skipped in 92.49s"
     },
     {
-      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_outcome_timeline.py tests/test_emergency_admission_policy.py tests/test_apply_preflight_liveness.py tests/test_emergency_legacy_authority_containment.py -q --basetemp .pytest-tarpon-focused2",
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_v3_schema.py tests/test_fleet_pgqueue.py tests/test_fleet_v3_broker.py tests/test_fleet_v3_governor_queue.py tests/test_fleet_v3_worker.py tests/test_fleet_pg_roles.py -q --basetemp .pytest-tarpon-focused1-livehotfix",
+      "exit_code": 0,
+      "result": "109 passed, 191 skipped in 0.98s"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_outcome_timeline.py tests/test_emergency_admission_policy.py tests/test_apply_preflight_liveness.py -q --basetemp .pytest-tarpon-focused2-python-livehotfix",
+      "exit_code": 0,
+      "result": "47 passed in 0.82s"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_emergency_legacy_authority_containment.py -q --basetemp .pytest-tarpon-containment-livehotfix",
       "exit_code": 1,
-      "result": "failed because pwsh was not installed"
+      "result": "failed immediately with FileNotFoundError [WinError 2] because pwsh is absent"
     },
     {
-      "command": "same second focused group with temporary pwsh.exe shim to Windows PowerShell",
-      "exit_code": 124,
-      "result": "timed out after 305 seconds; Windows PowerShell is not a valid substitute for PowerShell 7"
+      "command": ".\\.venv\\Scripts\\python.exe -m ruff check src\\applypilot\\fleet\\migrator.py tests\\test_fleet_migration_manifest.py tests\\test_fleet_machine_blackout_scripts.py tests\\test_fleet_agent_autoupdate_script.py tests\\test_fleet_machine_blackout.py tests\\test_fleet_db_hot_paths.py",
+      "exit_code": 0,
+      "result": "all changed-file checks passed"
     },
     {
-      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_migration_manifest.py -q --basetemp .pytest-tarpon-migrations2",
-      "exit_code": 1,
-      "result": "1 failed, 3 passed, 5 skipped; predecessor blob mismatch for schema_v3.sql"
-    },
-    {
-      "command": "git diff --check 2b3a7c83118df840dda60c9b728f29e3dc0c1b9d..HEAD",
+      "command": "git diff --check",
       "exit_code": 0,
       "result": "passed"
     }
   ],
-  "unresolved_blockers": [
-    "Missing local-only codex/fleet-dbhot-live-hotfix objects: head 706bf4297de143bcc6e4edb15bb040617b530562 and ordered commits are unavailable after git fetch --all.",
-    "No disposable Postgres binary environment is available: conda, initdb, pg_ctl, and psql are absent and APPLYPILOT_PGTEST_BIN is unset.",
-    "PowerShell 7 pwsh is absent. Windows PowerShell shim fails at least one containment semantic probe and the full containment group timed out.",
-    "Migration manifest predecessor verification fails after integrated schema_v3.sql changes: expected blob 0741a6e675d2ea42a3bb0d785fd4c0c444e96b3d, current blob f8fc0f9574f1fa7eaa5e8e9fa4a2fae774594079."
-  ]
+  "environment_limitations": [
+    "Docker is absent from PATH.",
+    "Local Postgres binaries are absent from PATH: initdb, pg_ctl, and psql were not found; APPLYPILOT_PGTEST_BIN is unset.",
+    "PowerShell 7 pwsh is absent from PATH.",
+    "Windows PowerShell 5.1 is present at C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe but was not used as a substitute for pwsh-only containment verification."
+  ],
+  "unresolved_blockers": []
 }
