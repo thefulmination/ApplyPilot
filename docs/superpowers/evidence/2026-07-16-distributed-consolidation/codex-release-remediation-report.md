@@ -4,54 +4,68 @@ Run date: 2026-07-16
 
 Branch: `codex/cloud-cutover-runtime-integration`
 Plan: `docs/superpowers/plans/2026-07-16-parallel-release-remediation.md`
-Candidate head before this evidence commit: `01638c7`
+Verified candidate head: `5f90feb3ac5374fe57f513744c6c1823ace174b9`
 
 ## Integrated Work
 
-- `26f0d3b` sanitizes the fleet-version test subprocess while preserving the fail-closed database environment contract.
-- `ae48526` updates the OTP relay test double for the canonical Postgres pending-request procedure.
-- `29b2b36` updates apply/auth test doubles for lease interaction markers and canonical connection propagation.
-- `93c4dce` restores canonical ATS prior-evidence lease blockers and adds a lease-ledger-guarded infrastructure-failure transition with attempt, governor, and canary refunds.
-- `27cc59e` makes controller challenge tests seed explicit controller-owned parked state instead of forging worker lease authority.
+- `26f0d3b` sanitizes the fleet-version test subprocess without weakening the fail-closed database environment contract.
+- `ae48526` updates the OTP relay double for the canonical Postgres pending-request procedure.
+- `29b2b36` updates apply/auth doubles for lease interaction markers and canonical connection propagation.
+- `93c4dce` restores ATS prior-evidence lease blockers and adds a ledger-guarded infrastructure-failure transition with attempt, governor, and canary refunds.
+- `27cc59e` makes challenge tests seed controller-owned parked state instead of forging worker lease authority.
 - `d1638fb` integrates Claude C2's non-publishing container build and smoke gate.
 - `01638c7` integrates Claude C3's read-only apply-runtime triage report.
+- `e0b05d9` aligns the supported Python matrix with the pinned NumPy runtime and installs JobSpy without allowing it to replace pinned dependencies.
+- `86b9e41` makes the fleet environment contract test portable under the pytest console entrypoint.
+- `bfc4d62` separates Windows-native and portable CI contracts, restores Railway entrypoint executable mode, ensures MCP and fleet helper paths are self-contained, and gives migration verification full predecessor history.
+- `b721b52` makes browser tests platform-deterministic and hardens brain snapshot recovery across POSIX hard-link ctime changes.
+- `5f90feb` preserves receipt ACLs after durable atomic replacement and removes ambient libpq variables from the mapped-control fixture.
 
-Claude C1 (`claude/resbuild-postgres-authority`) has not returned a repair commit and remains outside the completed Codex scope.
+Claude C1 (`claude/resbuild-postgres-authority`) has not returned a repair commit. Its ResBuild dependency-injection task remains outside the completed Codex scope.
 
 ## Root Causes Repaired
 
-1. Correct lease-marker and `conn=` production contracts were being bypassed by stale apply/auth test doubles.
-2. The canonical `fleet_worker_lease_ats` migration dropped the prior browser-interaction and remediator-requeue exclusion predicates, allowing unsafe re-leasing.
-3. Untouched browser-preflight failures were routed through generic terminalization, consuming an attempt, omitting infrastructure counters/refunds, and emitting false application evidence.
-4. Challenge controller tests manually created leases that could not satisfy the canonical worker lease ledger and active-lease session binding.
-5. A canary-capacity test used one host for every row and was blocked by the independent host pacing governor after its first lease.
-6. The version-script subprocess inherited a forbidden legacy DSN variable from the developer machine.
+1. Stale apply/auth doubles bypassed required lease markers and `conn=` propagation.
+2. The canonical ATS lease function had lost prior browser-interaction and remediator-requeue exclusions.
+3. Untouched browser-preflight failures consumed attempts and emitted false application evidence instead of refunding infrastructure reservations.
+4. Challenge tests created leases that violated the canonical lease ledger and session binding.
+5. CI mixed Windows handle, PowerShell 5.1, `cmd.exe`, and `msvcrt` contracts into Ubuntu jobs.
+6. Apply workers wrote MCP configuration before ensuring the application directory existed.
+7. Root fleet helpers depended on the caller placing the repository root on `sys.path`.
+8. Shallow CI checkout prevented cryptographic verification of the pinned migration predecessor.
+9. Brain recovery treated a legitimate POSIX hard-link ctime change as replacement; recovery now binds device, inode, size, and mtime before and after hashing, then verifies SHA-256 and SQLite integrity.
+10. Durable receipt replacement did not explicitly reapply the captured destination ACL after `File.Replace`.
 
-## Verification
+## Local Verification
 
 - Apply/auth focused gate: `133 passed in 19.39s`.
 - Fleet, schema, role, and version focused gate: `129 passed in 143.84s`.
-- Container static contract: `7 passed in 0.40s`.
+- Portability and workflow gate: `113 passed`.
+- Brain, apply-channel, and mapped-role gate: `92 passed`.
+- Final Windows failure regression gate: `3 passed`.
 - `python -m ruff check src`: passed.
-- Touched-file Ruff gate: passed.
+- Touched-file Ruff checks: passed.
 - Workflow YAML parse: passed.
-- `git diff --check`: passed before commits.
-- Full four-worker diagnostic: `3971 passed, 17 skipped, 13 failed in 1088.65s`.
-- All 13 diagnostic failures are in `tests/test_resbuild_bridge.py` and belong to unfinished Claude C1. Each reaches `pgqueue.connect()` from a legacy SQLite fixture without an explicitly injected Postgres authority dependency.
-- Complete serial suite: inconclusive. The command exceeded the 30-minute local timeout and returned no test summary. This is not a passing or failing result.
+- `git diff --check`: passed.
+- Full four-worker diagnostic before C1: `3971 passed, 17 skipped, 13 failed`; all 13 failures were legacy ResBuild SQLite fixtures reaching an ambient Postgres DSN.
+- Complete local serial suite: inconclusive because it exceeded the 30-minute local timeout without a summary. This is not represented as a pass or failure.
 
-## Container And CI
+## Final CI Evidence
 
-- Local Docker build: not run because Docker is not installed on this machine.
-- The integrated GitHub Actions `container-build` job builds without registry login or push and runs deterministic image smoke checks.
-- Workflow run URL: pending branch push and non-publishing dispatch.
+Workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29509248944
 
-## Release Decision
+- Python 3.11: `2226 passed, 982 skipped in 110.95s`.
+- Python 3.12: `2226 passed, 982 skipped in 95.01s`.
+- Python 3.12 wheel and source distribution: passed.
+- Windows-native contracts: `894 passed, 1 skipped in 1069.24s`.
+- Container candidate build: passed without registry login or push.
+- Deterministic container smoke check: passed.
+- Overall workflow conclusion: `success`.
 
-The Codex-owned X1 and X2 repairs are complete and focused-green. The overall release remains **not ready** until:
+The skipped CI tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. The green workflow does not substitute for Claude C1's explicit ResBuild authority dependency-injection work.
 
-1. Claude C1 repairs and verifies `tests/test_resbuild_bridge.py` without weakening Postgres authority.
-2. A complete serial or deterministic sharded Python suite finishes successfully.
-3. The non-publishing container image build and smoke job succeeds in GitHub Actions.
+## Scope Decision
 
-No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched.
+Codex-owned X1, X2, and the available X3 integration/release-gate work are complete and green on the verified candidate. The overall parallel plan is not fully complete because Claude C1 has not produced the required ResBuild repair commit.
+
+No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched. Production application lanes remain paused pending separate staging/canary approval after C1 is integrated and verified.
