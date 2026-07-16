@@ -119,7 +119,7 @@ if [ "$APPLYPILOT_WORKER_CONTRACT" != "apply" ]; then
   exit 64
 fi
 
-python - <<'PY'
+python3 - <<'PY'
 import os
 
 import psycopg

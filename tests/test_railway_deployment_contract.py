@@ -20,8 +20,10 @@ def test_railway_entrypoint_runs_canonical_v3_worker_fail_closed() -> None:
         'exec applypilot-fleet-apply "${worker_args[@]}"',
         '--worker-id "$APPLYPILOT_WORKER_ID"',
         '--machine-owner "$FLEET_MACHINE_OWNER"',
-    ):
-        assert required in script
+        ):
+            assert required in script
+    assert "python - <<'PY'" not in script
+    assert "python3 - <<'PY'" in script
 
     assert "applypilot.apply.container_worker" not in script
     assert "${APPLYPILOT_WORKER_ID:-0}" not in script
