@@ -198,7 +198,13 @@ def _paused_heartbeat_only(snapshot: dict[str, Any]) -> bool:
     reason = snapshot.get("admission_reason")
     return (
         not snapshot.get("admission_allowed")
-        and reason in {"global_paused", "ats_paused", "heartbeat_stale", "version_mismatch"}
+        and reason in {
+            "global_paused",
+            "ats_paused",
+            "desired_state_stale",
+            "heartbeat_stale",
+            "version_mismatch",
+        }
         and bool(snapshot.get("validated"))
         and snapshot.get("revoked_at") is None
         and isinstance(snapshot.get("desired_workers"), int)
