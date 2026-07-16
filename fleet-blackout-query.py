@@ -12,14 +12,20 @@ import sys
 
 label = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("APPLYPILOT_FLEET_LABEL", "home")
 role = sys.argv[2] if len(sys.argv) > 2 else "fleet"
-dsn = os.environ.get("FLEET_PG_DSN") or os.environ.get("APPLYPILOT_FLEET_DSN") or os.environ.get("DATABASE_URL")
 
 try:
     from applypilot.apply import pgqueue
-    from applypilot.fleet import machine_blackout, schema
+    from applypilot.fleet import machine_blackout
 
+    fleet_dsn = (os.environ.get("FLEET_PG_DSN") or "").strip()
+    applypilot_fleet_dsn = (os.environ.get("APPLYPILOT_FLEET_DSN") or "").strip()
+    if fleet_dsn and applypilot_fleet_dsn and fleet_dsn != applypilot_fleet_dsn:
+        raise RuntimeError("Inconsistent fleet Postgres DSN references")
+    dsn = fleet_dsn or applypilot_fleet_dsn
+    if not dsn:
+        raise RuntimeError("No fleet Postgres DSN: set FLEET_PG_DSN or APPLYPILOT_FLEET_DSN")
     conn = pgqueue.connect(dsn)
-    schema.ensure_schema_v3(conn)
+    conn.read_only = True
     print(machine_blackout.status_line(conn, label, role=role))
 except Exception as exc:
     print(f"fleet-blackout-query: {type(exc).__name__}: {exc}", file=sys.stderr)
