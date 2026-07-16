@@ -465,6 +465,8 @@ def test_answer_pending_defaults_to_mail_source(monkeypatch):
                 self._row = {"acquired": True}
             elif "pg_advisory_unlock" in query:
                 self._row = {"released": True}
+            elif "fleet_controller_otp_pending" in query:
+                self._row = {"pending": self._rows}
 
         def fetchone(self):
             return self._row
