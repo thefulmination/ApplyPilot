@@ -259,6 +259,56 @@ def _run_wrapper_rewrite_harness(
     return result, json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def _run_evidence_crash_harness(
+    tmp_path: Path,
+    wrapper: Path,
+    boundary: str,
+) -> subprocess.CompletedProcess[str]:
+    overrides = {
+        "post_create": "\n".join(
+            [
+                "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
+                "  Stop-Process -Id $PID -Force",
+                "}",
+            ]
+        ),
+        "pre_hardlink": "\n".join(
+            [
+                "function Publish-NewKnownEvidenceByHandle($Lease) {",
+                "  Stop-Process -Id $PID -Force",
+                "}",
+            ]
+        ),
+        "post_hardlink": "\n".join(
+            [
+                "$script:OriginalEvidencePublisher = ${function:Publish-NewKnownEvidenceByHandle}",
+                "function Publish-NewKnownEvidenceByHandle($Lease) {",
+                "  & $script:OriginalEvidencePublisher $Lease",
+                "  Stop-Process -Id $PID -Force",
+                "}",
+            ]
+        ),
+    }
+    harness = tmp_path / f"crash-evidence-{boundary}.ps1"
+    harness.write_text(
+        "\n".join(
+            [
+                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrapper.parent)}'",
+                overrides[boundary],
+                "Remove-EmbeddedWrapperDsns",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _run_orchestration(
     mode: str,
     fixture: dict[str, Path],
@@ -663,20 +713,16 @@ def test_evidence_delete_and_replace_are_blocked_until_wrapper_and_reverify_fini
     replacement = base64.b64encode(b"unverified replacement bytes").decode("ascii")
     overrides = "\n".join(
         [
-            "$script:EvidenceVerificationCount = 0",
-            "function Assert-KnownEvidenceStreamDigest($Stream, [string]$ExpectedDigest) {",
-            "  $bytes = Read-KnownWrapperStreamBytes $Stream",
-            "  if ((Get-KnownWrapperByteDigest $bytes) -cne $ExpectedDigest) { throw 'digest mismatch' }",
-            "  $script:EvidenceVerificationCount++",
-            "  if ($script:EvidenceVerificationCount -eq 1) {",
-            f"    try {{ [IO.File]::Delete('{_ps_quote(evidence_path)}'); Add-Content "
+            "$script:OriginalEvidencePublisher = ${function:Publish-NewKnownEvidenceByHandle}",
+            "function Publish-NewKnownEvidenceByHandle($Lease) {",
+            "  & $script:OriginalEvidencePublisher $Lease",
+            f"  try {{ [IO.File]::Delete('{_ps_quote(evidence_path)}'); Add-Content "
             f"-LiteralPath '{_ps_quote(marker)}' -Value 'delete_succeeded' }} "
             f"catch {{ Add-Content -LiteralPath '{_ps_quote(marker)}' -Value 'delete_blocked' }}",
-            f"    try {{ [IO.File]::WriteAllBytes('{_ps_quote(evidence_path)}', "
+            f"  try {{ [IO.File]::WriteAllBytes('{_ps_quote(evidence_path)}', "
             f"[Convert]::FromBase64String('{replacement}')); Add-Content "
             f"-LiteralPath '{_ps_quote(marker)}' -Value 'replace_succeeded' }} "
             f"catch {{ Add-Content -LiteralPath '{_ps_quote(marker)}' -Value 'replace_blocked' }}",
-            "  }",
             "}",
         ]
     )
@@ -983,41 +1029,19 @@ def test_failed_evidence_publication_deletes_partial_and_allows_clean_retry(tmp_
     assert evidence[0].read_bytes() == preimage
 
 
-def test_process_termination_during_partial_evidence_write_leaves_no_final_artifact(
-    tmp_path,
-):
+@pytest.mark.parametrize("boundary", ["post_create", "pre_hardlink"])
+def test_process_termination_before_evidence_hardlink_is_cleanly_retryable(tmp_path, boundary):
     wrappers = tmp_path / "wrappers"
     wrappers.mkdir()
     wrapper = wrappers / "apply-cycle-task.ps1"
     preimage = b"Write-Output 'crash-idempotent evidence'\n"
     wrapper.write_bytes(preimage)
-    crash_harness = tmp_path / "crash-evidence-write.ps1"
-    crash_harness.write_text(
-        "\n".join(
-            [
-                f". '{_ps_quote(SCRIPT)}' -DefinitionImport -WrapperRoot '{_ps_quote(wrappers)}'",
-                "function Write-KnownEvidenceBytes($Stream, [byte[]]$Content) {",
-                "  $Stream.Write($Content, 0, 8)",
-                "  $Stream.Flush($true)",
-                "  Stop-Process -Id $PID -Force",
-                "}",
-                "Remove-EmbeddedWrapperDsns",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    crashed = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(crash_harness)],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    crashed = _run_evidence_crash_harness(tmp_path, wrapper, boundary)
 
     assert crashed.returncode != 0
     assert wrapper.read_bytes() == preimage
     assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == []
+    assert list(wrappers.glob(".applypilot-emergency-containment-stage-*")) == []
 
     retry_result, retry_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
 
@@ -1027,6 +1051,36 @@ def test_process_termination_during_partial_evidence_write_leaves_no_final_artif
     evidence = list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*"))
     assert len(evidence) == 1
     assert evidence[0].read_bytes() == preimage
+
+
+def test_process_termination_after_evidence_hardlink_preserves_exact_final_and_retries(
+    tmp_path,
+):
+    wrappers = tmp_path / "wrappers"
+    wrappers.mkdir()
+    wrapper = wrappers / "apply-cycle-task.ps1"
+    preimage = b"Write-Output 'post-hardlink crash evidence'\n"
+    wrapper.write_bytes(preimage)
+    digest = hashlib.sha256(preimage).hexdigest()
+    final_evidence = wrappers / f"{wrapper.name}.emergency-containment-evidence-{digest}"
+
+    crashed = _run_evidence_crash_harness(tmp_path, wrapper, "post_hardlink")
+
+    assert crashed.returncode != 0
+    assert wrapper.read_bytes() == preimage
+    assert final_evidence.read_bytes() == preimage
+    assert list(wrappers.glob(".applypilot-emergency-containment-stage-*")) == []
+
+    retry_result, retry_payload = _run_wrapper_rewrite_harness(tmp_path, wrapper)
+
+    assert retry_result.returncode == 0, retry_result.stderr
+    assert retry_payload["failures"] == []
+    assert retry_payload["unresolved"] == []
+    assert final_evidence.read_bytes() == preimage
+    assert list(wrappers.glob(f"{wrapper.name}.emergency-containment-evidence-*")) == [
+        final_evidence
+    ]
+    assert b"emergency containment" in wrapper.read_bytes().lower()
 
 
 def test_wrapper_stream_write_failure_preserves_preimage_and_reports_failure(tmp_path):
@@ -3312,6 +3366,22 @@ def test_script_has_no_destructive_evidence_deletion_and_matches_installed_workd
     assert "applypilot-workday-onboard" in text
     assert "Get-ChildItem -LiteralPath $root -File -ErrorAction Stop" in text
     assert "-Recurse" not in text
+
+
+def test_evidence_publication_uses_delete_on_close_staging_and_no_replace_hardlink():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "FileAttributeTemporary = 0x00000100" in text
+    assert "FileFlagDeleteOnClose = 0x04000000" in text
+    assert "GenericRead | GenericWrite | Delete" in text
+    assert "CreateNew" in text
+    assert "CreateHardLinkW(finalPath, stagePath, IntPtr.Zero)" in text
+    assert "FileAttributeTemporary | FileFlagDeleteOnClose" in text
+    assert "[guid]::NewGuid().ToString('N')" in text
+    assert ".applypilot-emergency-containment-stage-" in text
+    assert "SetFileInformationByHandle" not in text
+    assert "MoveFile" not in text
+    assert "ReplaceFile" not in text
+    assert "File.Move" not in text
 
 
 def test_control_database_failure_returns_stop_not_keep(monkeypatch, capsys):
