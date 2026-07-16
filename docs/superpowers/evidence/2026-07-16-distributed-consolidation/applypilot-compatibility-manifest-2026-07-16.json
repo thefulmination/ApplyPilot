@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "applypilot_compatibility_manifest_v1",
+  "releaseId": "applypilot-cloud-staging-2026-07-16",
+  "generatedAt": "2026-07-16T21:00:00Z",
+  "python": {
+    "repository": "thefulmination/ApplyPilot",
+    "branch": "codex/cloud-cutover-runtime-integration",
+    "commitSha": "f0566cc59576a53f8fb486e5d40ecfd9dcd47ec9",
+    "rollback": {
+      "branch": "codex/fleet-dbhot-stage1-rollback",
+      "commitSha": "f364bfec643026bf57969efda31bd545bc214142"
+    },
+    "brainSchema": {
+      "sqlPath": "src/applypilot/brain/schema_v1.sql",
+      "sha256": "1976FDC4DBEAC4CF853CE6E445EFB071651696AE47EE67B61E58AAB98FF4E2A5"
+    },
+    "fleetSchema": {
+      "path": "src/applypilot/fleet/schema.py",
+      "sha256": "496689D22D2980CFF423E8A5F545FF1B4C4CE1A2F61C89D0A125247F3CCDFA02"
+    }
+  },
+  "typescript": {
+    "repository": "thefulmination/res_build",
+    "branch": "codex/cloud-cutover-brain-integration",
+    "commitSha": "c06e0862749aea50f4a89009c75c85872ca83078",
+    "policyVersion": "fit_philosophy_policy_v1",
+    "promptVersion": "fit_philosophy_prompt_v1_fit_philosophy_policy_v1_instruction_v2",
+    "embeddingModel": "text-embedding-3-large"
+  },
+  "artifacts": {
+    "knowledgeGraph": [
+      {"path":"data/applypilot_kg/knowledge_graph.json","bytes":3766105,"sha256":"9201805479FEE6510D0F9F1973C0B7A453AF76752828988F4DE690AB68DDFD9E"},
+      {"path":"data/applypilot_kg/compact/compact_knowledge_graph.json","bytes":485869,"sha256":"91345970988CC8B99EA6D7E8340E976F414C14FD092BA6973C81946D566BD10E"},
+      {"path":"data/applypilot_kg/compact/compact_kg_prompt_pack.md","bytes":27180,"sha256":"6A0F2A68C70CA264568ACCD75617CF7DABA83DA6F376D4FAA0F8E32F2D4404D3"},
+      {"path":"data/applypilot_kg/compact/compact_canonical_facts.json","bytes":60793,"sha256":"B77E4AD9F73DDD8C80E14FE6F1C3D57FC961B06E72142DE5E2DCE3FC66922D5F"},
+      {"path":"data/applypilot_kg/compact/compact_gap_signals.json","bytes":29059,"sha256":"992D84F28F3BEFC2ABA12874087C2FAE7D897BA41B52D68CA668D94933C64DCC"}
+    ],
+    "fitMap": [
+      {"path":"data/applypilot_kg/fitmap_observations.jsonl","bytes":1879663,"sha256":"CEF07DDC5955685FB517140DA9913D83E72EEDA1DA3BBB1D2149EAFF1046B592"},
+      {"path":"data/review/applypilot-preference-profile.json","bytes":43921,"sha256":"705141F353431281E1C6AEF13E00EEF23ED0AA1501E63DAC4D38B46987A5CB40"}
+    ],
+    "pairwise": [
+      {"path":"data/review/applypilot-pairwise-annotation.jsonl","bytes":47330,"sha256":"A6109AB2A3B12BC3DD509E87A5AB534B246664D2A7C70044826C43B637CD064A"},
+      {"path":"data/review/applypilot-pairwise-queue.json","bytes":835599,"sha256":"5E35406407E194EDA5313E68C4D88916507D2416D8383180F9FFA09A8CDB52FF"}
+    ]
+  },
+  "deployment": {
+    "railwayProject": "applypilot-staging",
+    "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+    "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+    "postgresServiceId": "aa551e4f-51fa-49df-b02c-a45e3ea22fd1",
+    "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
+    "postgresVolumeId": "02dee98b-ef6e-4314-ba1e-579b4ef75812",
+    "workerVolumeId": "4eaef62a-8070-4954-82ad-cb574e889b5c"
+  },
+  "guardrails": {
+    "lanesPaused": true,
+    "atsCanaryEnabled": false,
+    "linkedinCanaryEnabled": false,
+    "productionTouched": false
+  },
+  "knownGap": "Mined-evidence decisions are currently a CLI-only overlay and are not included in the compact scorer prompt pack; staging promotion must not claim full graph grounding until that overlay is imported or explicitly excluded."
+}

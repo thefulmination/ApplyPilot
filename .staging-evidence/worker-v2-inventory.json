@@ -1,0 +1,84 @@
+{
+  "connect_allowlist": [
+    "staging_owner_v2",
+    "staging_controller_v2",
+    "staging_verifier_v2",
+    "postgres",
+    "staging_worker_ats_0"
+  ],
+  "database_name": "railway",
+  "database_owner_before": "staging_owner_v2",
+  "database_owner_after": "staging_owner_v2",
+  "retired_admin_roles": [
+    "staging_legacy_admin"
+  ],
+  "infrastructure_superuser_roles": [
+    "postgres"
+  ],
+  "active_service_roles": [],
+  "explicit_connect_roles": [
+    "postgres",
+    "staging_controller_v2",
+    "staging_verifier_v2"
+  ],
+  "default_acls": [],
+  "regrants": [],
+  "target_role": "staging_worker_ats_0",
+  "target_role_existed": false,
+  "target_role_snapshot": {
+    "existed": false,
+    "attributes": null,
+    "memberships": [],
+    "granted_memberships": [],
+    "principal_mapping": null,
+    "direct_acls": [],
+    "default_acls": [],
+    "default_acl_scopes": [
+      {
+        "owner": "staging_controller_v2",
+        "schema": "public",
+        "object_type": "f"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": "public",
+        "object_type": "r"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": "public",
+        "object_type": "S"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": "public",
+        "object_type": "T"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": null,
+        "object_type": "f"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": null,
+        "object_type": "r"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": null,
+        "object_type": "S"
+      },
+      {
+        "owner": "staging_controller_v2",
+        "schema": null,
+        "object_type": "T"
+      }
+    ]
+  },
+  "structured_regrant_acl_snapshots": [],
+  "credential_forward_reconcile_required": false,
+  "worker_id": "staging-ats-0",
+  "contract": "apply",
+  "prepared_at": "2026-07-16T20:47:20.076507+00:00"
+}
