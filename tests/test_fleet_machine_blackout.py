@@ -72,6 +72,35 @@ def test_status_line_is_powershell_friendly(fleet_db):
     assert line.endswith("|blocked for workday")
 
 
+def test_status_line_sanitizes_protocol_fields(monkeypatch):
+    expires_at = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        machine_blackout,
+        "is_machine_allowed",
+        lambda *_args, **_kwargs: machine_blackout.MachinePolicyVerdict(
+            allowed=False,
+            machine="m4",
+            role="all",
+            policy_name="policy|name\r\nnext",
+            expires_at=expires_at,
+            reason="reason|first\r\nsecond",
+        ),
+    )
+
+    line = machine_blackout.status_line(object(), "m4", role="all")
+    fields = line.split("|")
+
+    assert len(fields) == 6
+    assert fields == [
+        "BLOCKED",
+        "m4",
+        "all",
+        "policy name  next",
+        expires_at.isoformat(),
+        "reason first  second",
+    ]
+
+
 def test_control_cli_defaults_allow_home_and_mac_without_duplicates(fleet_db, monkeypatch, capsys):
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", fleet_db)
     controlled_now = datetime(2035, 7, 6, 16, 0, tzinfo=timezone.utc)

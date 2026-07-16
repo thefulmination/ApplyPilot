@@ -259,6 +259,7 @@ $agentWrapperContent = @"
 `$env:FLEET_PG_DSN = '$effectiveDsn'
 Set-Location '$repo'
 & '$fleetAgentPs1' -Label $Machine$($agentAutoUpdate)
+exit `$LASTEXITCODE
 "@
 $agentWrapper = Write-Wrapper "fleet-agent-task" $agentWrapperContent
 $agentTrigger = New-ScheduledTaskTrigger -AtLogOn
