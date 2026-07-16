@@ -874,6 +874,9 @@ def test_launcher_does_not_release_agent_fallback_when_page_close_fails_after_su
     monkeypatch.setattr(playwright.sync_api, "sync_playwright", lambda: PlaywrightContext())
 
     class AttemptStore:
+        def mark_browser_interaction(self):
+            return None
+
         def create_prepared(self, **_kwargs):
             return "attempt-1"
 

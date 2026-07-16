@@ -406,6 +406,8 @@ def test_greenhouse_shadow_result_records_adapter_route_stats(monkeypatch, tmp_p
     monkeypatch.setitem(sys.modules, "playwright", playwright_module)
     monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api_module)
 
+    attempt_store = types.SimpleNamespace(mark_browser_interaction=lambda: None)
+
     result = launcher._maybe_greenhouse_apply(
         {
             "application_url": "https://boards.greenhouse.io/acme/jobs/123",
@@ -416,6 +418,7 @@ def test_greenhouse_shadow_result_records_adapter_route_stats(monkeypatch, tmp_p
         resume_text="resume",
         resume_path=tmp_path / "resume.txt",
         worker_id=worker_id,
+        attempt_store=attempt_store,
     )
 
     assert result is None
@@ -447,6 +450,9 @@ def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeyp
         def transition(self, attempt_id, **kwargs):
             self.calls.append(("transition", attempt_id, kwargs))
             return {"state": kwargs["state"]}
+
+        def mark_browser_interaction(self):
+            self.calls.append(("mark_browser_interaction",))
 
     store = FakeStore()
 
@@ -523,16 +529,16 @@ def test_greenhouse_owned_submit_uses_attempt_store_and_records_verifier(monkeyp
 
     assert result[0] == "applied"
     assert [call[0] for call in store.calls] == [
-        "create_prepared", "transition", "transition"
+        "mark_browser_interaction", "create_prepared", "transition", "transition"
     ]
-    assert store.calls[1][2]["state"] == "submit_started"
-    assert store.calls[2][2]["state"] == "verified"
+    assert store.calls[2][2]["state"] == "submit_started"
+    assert store.calls[3][2]["state"] == "verified"
     stats = launcher._adapter_route_stats.pop(worker_id)
     assert stats["attempt_id"] == "attempt-1"
     assert stats["verification_method"] == "confirmation_dom"
     assert stats["submit_checkpoint_state"] == "verified"
     assert stats["submission_diagnostics"]["response_status"] == 200
-    assert store.calls[2][2]["evidence"]["submission_diagnostics"][
+    assert store.calls[3][2]["evidence"]["submission_diagnostics"][
         "response_request_id"
     ] == "request-123"
 
@@ -560,6 +566,9 @@ def test_greenhouse_runtime_required_fields_park_before_submit_without_agent(
         def transition(self, attempt_id, **kwargs):
             self.calls.append(("transition", attempt_id, kwargs))
             return {"state": kwargs["state"]}
+
+        def mark_browser_interaction(self):
+            self.calls.append(("mark_browser_interaction",))
 
     store = Store()
 
@@ -668,7 +677,7 @@ def test_greenhouse_submit_mode_parks_incomplete_plan_without_agent_fallback(
         resume_text="resume",
         resume_path=tmp_path / "resume.txt",
         worker_id=worker_id,
-        attempt_store=types.SimpleNamespace(),
+        attempt_store=types.SimpleNamespace(mark_browser_interaction=lambda: None),
     )
 
     assert result[0] == "profile_required"

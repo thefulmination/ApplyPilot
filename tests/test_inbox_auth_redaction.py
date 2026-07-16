@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import re
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
@@ -536,7 +537,11 @@ def test_run_job_redacts_magic_link_from_every_persistent_sink_and_parses_result
     monkeypatch.setattr(launcher, "_last_run_stats", {})
 
     status, _ = launcher._run_job_impl(
-        _job(), port=9001, worker_id=7, inbox_auth_hint=hint
+        _job(),
+        port=9001,
+        worker_id=7,
+        inbox_auth_hint=hint,
+        attempt_store=SimpleNamespace(mark_browser_interaction=lambda: None),
     )
 
     assert status == "applied"

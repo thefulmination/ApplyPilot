@@ -194,7 +194,8 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
     monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
 
-    def fake_prearm(job):
+    def fake_prearm(job, *, conn=None):
+        assert conn is None
         prearm_worker_ids.append(__import__("os").environ.get("FLEET_WORKER_ID"))
         return 42
 
@@ -202,7 +203,7 @@ def test_make_apply_fn_retries_auth_gated_browser_failure_with_prearmed_otp(monk
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id, *, timeout_seconds: (
+        lambda request_id, *, timeout_seconds, conn=None: (
             "code=246810\nsource=fleet_relay" if request_id == 42 else None
         ),
     )
@@ -263,11 +264,13 @@ def test_make_apply_fn_records_magic_link_kind_without_secret(monkeypatch):
     monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: True)
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
-    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 81)
+    monkeypatch.setattr(
+        launcher, "_prearm_inbox_auth_request", lambda job, *, conn=None: 81
+    )
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id, *, timeout_seconds: f"magic_link={secret_link}",
+        lambda request_id, *, timeout_seconds, conn=None: f"magic_link={secret_link}",
     )
     monkeypatch.setattr(
         launcher,
@@ -306,14 +309,16 @@ def test_auth_required_reuses_prearmed_request_for_full_bounded_wait(monkeypatch
     monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
     monkeypatch.setattr(awm.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
-    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher, "_prearm_inbox_auth_request", lambda job, *, conn=None: 73
+    )
     monkeypatch.setattr(
         launcher,
         "_poll_inbox_auth_hint",
         lambda job: (_ for _ in ()).throw(AssertionError("must reuse prearmed request")),
     )
 
-    def fake_consume(request_id, *, timeout_seconds):
+    def fake_consume(request_id, *, timeout_seconds, conn=None):
         consume_calls.append((request_id, timeout_seconds))
         return None if len(consume_calls) == 1 else hint
 
@@ -345,11 +350,13 @@ def test_auth_required_assisted_retry_runs_at_most_once(monkeypatch):
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
     monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
-    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher, "_prearm_inbox_auth_request", lambda job, *, conn=None: 73
+    )
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id, *, timeout_seconds: hint,
+        lambda request_id, *, timeout_seconds, conn=None: hint,
     )
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
@@ -379,11 +386,13 @@ def test_prearmed_auth_without_hint_reports_no_assisted_retry(monkeypatch):
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
     monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
-    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher, "_prearm_inbox_auth_request", lambda job, *, conn=None: 73
+    )
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id, *, timeout_seconds: None,
+        lambda request_id, *, timeout_seconds, conn=None: None,
     )
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
@@ -413,11 +422,13 @@ def test_assisted_retry_terminal_includes_bounded_terminal_failure(monkeypatch):
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: None)
     monkeypatch.setattr(awm, "_cdp_page_urls", lambda port: [])
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
-    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher, "_prearm_inbox_auth_request", lambda job, *, conn=None: 73
+    )
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id, *, timeout_seconds: "code=246810\nsource=fleet_relay",
+        lambda request_id, *, timeout_seconds, conn=None: "code=246810\nsource=fleet_relay",
     )
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
@@ -543,11 +554,13 @@ def test_controlled_apply_successful_cleanup_is_true_and_retry_stays_bounded(mon
     monkeypatch.setattr(chrome, "launch_chrome", lambda worker_id, **kwargs: proc)
     monkeypatch.setattr(chrome, "cleanup_worker", lambda worker_id, process: True)
     monkeypatch.setattr(launcher, "_should_prearm_inbox_auth", lambda job: True)
-    monkeypatch.setattr(launcher, "_prearm_inbox_auth_request", lambda job: 73)
+    monkeypatch.setattr(
+        launcher, "_prearm_inbox_auth_request", lambda job, *, conn=None: 73
+    )
     monkeypatch.setattr(
         launcher,
         "_consume_prearmed_inbox_auth_hint",
-        lambda request_id, *, timeout_seconds: hint,
+        lambda request_id, *, timeout_seconds, conn=None: hint,
     )
 
     def fake_run_job(job, port, worker_id, model, agent, inbox_auth_hint=None):
