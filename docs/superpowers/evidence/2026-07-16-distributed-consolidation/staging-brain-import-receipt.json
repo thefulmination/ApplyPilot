@@ -1,0 +1,45 @@
+{
+  "receiptVersion": "applypilot_staging_brain_import_v1",
+  "recordedAt": "2026-07-16T22:32:00Z",
+  "railway": {
+    "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+    "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+    "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
+    "workerVolumeId": "4eaef62a-8070-4954-82ad-cb574e889b5c",
+    "deploymentId": "a729ca1a-694d-4e88-b76f-e9ad8ec83bcf",
+    "imageDigest": "sha256:1f0f3e437a170086187a231d753b1cb839deb134c3c13508a3f64d0f7f111806"
+  },
+  "brainSchema": {
+    "version": 1,
+    "migrationName": "brain schema v1",
+    "migrationChecksum": "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5",
+    "verification": "verify_brain_schema_v1 passed",
+    "migrationRole": "brain_schema_migrator",
+    "verifierRole": "brain_schema_verifier"
+  },
+  "artifactBackend": {
+    "backend": "railway_persistent_worker_volume",
+    "root": "/data/applypilot/brain-assets",
+    "artifactLedgerRows": 9,
+    "durableLocationRows": 9
+  },
+  "artifacts": [
+    {"name":"knowledge_graph","path":"/data/applypilot/brain-assets/knowledge_graph.json","bytes":3766105,"sha256":"9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e"},
+    {"name":"compact_knowledge_graph","path":"/data/applypilot/brain-assets/compact_knowledge_graph.json","bytes":485869,"sha256":"91345970988cc8b99ea6d7e8340e976f414c14fd092ba6973c81946d566bd10e"},
+    {"name":"compact_prompt_pack","path":"/data/applypilot/brain-assets/compact_kg_prompt_pack.md","bytes":27180,"sha256":"6a0f2a68c70ca264568accd75617cf7daba83da6f376d4faa0f8e32f2d4404d3"},
+    {"name":"compact_canonical_facts","path":"/data/applypilot/brain-assets/compact_canonical_facts.json","bytes":60793,"sha256":"b77e4ad9f73ddd8c80e14fe6f1c3d57fc961b06e72142de5e2dce3fc66922d5f"},
+    {"name":"compact_gap_signals","path":"/data/applypilot/brain-assets/compact_gap_signals.json","bytes":29059,"sha256":"992d84f28f3befc2aba12874087c2fae7d897ba41b52d68ca668d94933c64dcc"},
+    {"name":"fitmap_observations","path":"/data/applypilot/brain-assets/fitmap_observations.jsonl","bytes":1879663,"sha256":"cef07ddc5955685fb517140da9913d83e72eeda1da3bbb1d2149eaff1046b592"},
+    {"name":"preference_profile","path":"/data/applypilot/brain-assets/preference-profile.json","bytes":43921,"sha256":"705141f353431281e1c6aef13e00eef23edaa1501e63dac4d38b46987a5cb40"},
+    {"name":"pairwise_annotation","path":"/data/applypilot/brain-assets/pairwise-annotation.jsonl","bytes":47330,"sha256":"a6109ab2a3b12bc3dd509e87a5ab534b246664d2a7c70044826c43b637cd064a"},
+    {"name":"pairwise_queue","path":"/data/applypilot/brain-assets/pairwise-queue.json","bytes":835599,"sha256":"5e35406407e194eda5313e68c4d88916507d2416d8383180f9ffa09a8cdb52ff"}
+  ],
+  "validation": {
+    "volume_listing_sizes_match": true,
+    "artifact_ledger_hashes_match_local_manifest": true,
+    "production_touched": false,
+    "lanes_paused": true,
+    "active_leases": 0
+  },
+  "known_limitation": "This receipt proves artifact durability and ledger registration, not row-level SQLite-to-Postgres decision parity. The resumable source-table importer and parity gates remain required before authority promotion."
+}

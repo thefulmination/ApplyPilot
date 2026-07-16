@@ -5,7 +5,8 @@
   "python": {
     "repository": "thefulmination/ApplyPilot",
     "branch": "codex/cloud-cutover-runtime-integration",
-    "commitSha": "c005a9b4af51d1dfa87a1f2a264a1a806ec822fb",
+    "commitSha": "0992e2c21f3b74d391f8e201505b83d16d2b1a54",
+    "releaseVersion": "0.3.0+git.tree.57f9f2f",
     "rollback": {
       "branch": "codex/fleet-dbhot-stage1-rollback",
       "commitSha": "f364bfec643026bf57969efda31bd545bc214142"
@@ -20,7 +21,7 @@
     },
     "fleetSchemaSql": {
       "path": "src/applypilot/fleet/schema_v3.sql",
-      "sha256": "AD7EB941CC071D9C26753830F45CA2BCD82C09DA7359B118DA7A7D56A1143E73"
+      "sha256": "7D9520B50707D32523FB6407071180F2137B4FA253628AF76AA2C494236CAD45"
     }
   },
   "typescript": {
