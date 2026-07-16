@@ -52,13 +52,16 @@ foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
 if (-not $py) { $py = "python" }
 
 function Test-MachineBlackout([string]$Role) {
-  $line = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null | Select-Object -Last 1)
+  $lines = @(& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null)
   $queryExit = $LASTEXITCODE
   if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
+  if ($lines.Count -eq 0) { return "ERROR|empty-blackout-status" }
+  if ($lines.Count -ne 1) { return "ERROR|multiline-blackout-status" }
+  $line = "$($lines[0])"
+  if ($line -match "[`r`n]") { return "ERROR|multiline-blackout-status" }
   $expected = "OK|$($Label.Trim().ToLowerInvariant())|$($Role.Trim().ToLowerInvariant())|||"
-  if ("$line" -ceq $expected) { return $null }
-  if ([string]::IsNullOrWhiteSpace("$line")) { return "ERROR|empty-blackout-status" }
-  return "$line"
+  if ($line -ceq $expected) { return $null }
+  return $line
 }
 
 # Run exactly one worker (helper used by both the single-worker path and each spawned child).

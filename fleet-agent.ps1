@@ -123,6 +123,37 @@ function Get-LocalWorkers {
 }
 function Slot-Of($proc) { if ($proc.CommandLine -match ('--worker-id\s+"?' + [regex]::Escape($Label) + '-(\d+)')) { [int]$matches[1] } else { -1 } }
 
+function Get-MachineBlackoutStatus([string]$Role) {
+  $lines = @(& $py "fleet-blackout-query.py" $Label $Role 2>$null)
+  $queryExit = $LASTEXITCODE
+  if ($queryExit -ne 0) {
+    return [pscustomobject]@{ State = "KEEP"; Line = "ERROR|blackout-query-exit=$queryExit" }
+  }
+  if ($lines.Count -eq 0) {
+    return [pscustomobject]@{ State = "KEEP"; Line = "ERROR|empty-blackout-status" }
+  }
+  if ($lines.Count -ne 1) {
+    return [pscustomobject]@{ State = "KEEP"; Line = "ERROR|multiline-blackout-status" }
+  }
+
+  $line = "$($lines[0])"
+  if ($line -match "[`r`n]") {
+    return [pscustomobject]@{ State = "KEEP"; Line = "ERROR|multiline-blackout-status" }
+  }
+  $expectedLabel = $Label.Trim().ToLowerInvariant()
+  $expectedRole = $Role.Trim().ToLowerInvariant()
+  if ($line -ceq "OK|$expectedLabel|$expectedRole|||") {
+    return [pscustomobject]@{ State = "OK"; Line = $line }
+  }
+
+  $parts = $line -split '\|', 6
+  if ($parts.Count -eq 6 -and $parts[0] -ceq "BLOCKED" -and
+      $parts[1] -ceq $expectedLabel -and $parts[2] -ceq $expectedRole) {
+    return [pscustomobject]@{ State = "BLOCKED"; Line = $line }
+  }
+  return [pscustomobject]@{ State = "KEEP"; Line = $line }
+}
+
 # ---- auto-update (spec: 2026-07-03-fleet-pull-updater-design.md) ----
 $updateLog = Join-Path $repo ".fleet-logs\fleet-agent-update.log"
 function Log-Update([string]$msg, [string]$color = "Gray") {
@@ -249,6 +280,13 @@ function Invoke-AutoUpdate {
 $lastGen = $null
 Write-Host "[fleet-agent:$Label] online -- reconciling LOCAL workers to fleet_desired_state every ${PollSec}s (Ctrl-C to stop)" -ForegroundColor Cyan
 while ($true) {
+  $machinePolicy = Get-MachineBlackoutStatus "all"
+  if ($machinePolicy.State -eq "KEEP") {
+    Write-Host "[fleet-agent:$Label] blackout status unavailable or invalid; preserving existing workers for this tick. $($machinePolicy.Line)" -ForegroundColor Yellow
+    Start-Sleep -Seconds $PollSec
+    continue
+  }
+
   # auto-update runs BEFORE reconcile so a post-update respawn happens in this same tick
   if ($AutoUpdate) { Invoke-AutoUpdate | Out-Null }
 
@@ -257,9 +295,8 @@ while ($true) {
   if ($f.Count -lt 4 -or $f[0] -eq 'KEEP') { Start-Sleep -Seconds $PollSec; continue }  # DB blip -> leave as-is
   $want = [int]$f[0]; $agent = $f[1]; $model = $f[2]; $gen = [int]$f[3]
   $desiredWant = $want
-  $machinePolicy = (& $py "fleet-blackout-query.py" $Label "all" 2>$null | Select-Object -Last 1)
-  if ("$machinePolicy" -match '^BLOCKED\|') {
-    $parts = "$machinePolicy" -split '\|', 6
+  if ($machinePolicy.State -eq "BLOCKED") {
+    $parts = $machinePolicy.Line -split '\|', 6
     $policyName = if ($parts.Count -ge 4) { $parts[3] } else { "machine blackout" }
     $expiresAt = if ($parts.Count -ge 5) { $parts[4] } else { "" }
     if ($want -gt 0) {
