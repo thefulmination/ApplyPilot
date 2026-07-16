@@ -1,14 +1,17 @@
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 
 from applypilot.apply import pgqueue
 from applypilot.fleet.software_version import current_sw_version
-from fleet_agent_env import FORBIDDEN_DATABASE_ENV_VARS
 
 
 REPO = Path(__file__).resolve().parents[1]
+FORBIDDEN_DATABASE_ENV_VARS = runpy.run_path(str(REPO / "fleet_agent_env.py"))[
+    "FORBIDDEN_DATABASE_ENV_VARS"
+]
 
 
 def _run_version_script(fleet_db: str) -> str:
