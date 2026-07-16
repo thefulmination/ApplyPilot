@@ -35,6 +35,7 @@ _AUTHORITY_IDENTITY_FIELDS = frozenset(
         "sslcompression",
         "sslcert",
         "sslkey",
+        "sslkeylogfile",
         "sslcertmode",
         "sslpassword",
         "sslrootcert",
@@ -68,6 +69,7 @@ _SENSITIVE_AUTHORITY_FIELDS = frozenset(
         "sslpassword",
         "passfile",
         "sslkey",
+        "sslkeylogfile",
         "oauth_client_secret",
         "scram_client_key",
         "scram_server_key",
@@ -89,16 +91,16 @@ def _normalized_dsn(dsn: str, *, pq, conninfo_to_dict) -> dict[str, str]:
         for option in pq.Conninfo.get_defaults()
         if option.val is not None
     }
+    explicit = conninfo_to_dict(dsn)
     normalized = dict(defaults)
-    normalized.update(conninfo_to_dict(dsn))
-    for key in ("host", "hostaddr"):
-        if normalized.get(key) == "":
-            normalized.pop(key)
-    if normalized.get("port") == "":
-        if "port" in defaults:
-            normalized["port"] = defaults["port"]
+    normalized.update(explicit)
+    for key, value in explicit.items():
+        if value != "":
+            continue
+        if defaults.get(key):
+            normalized[key] = defaults[key]
         else:
-            normalized.pop("port")
+            normalized.pop(key, None)
     if not normalized.get("dbname") and normalized.get("user"):
         normalized["dbname"] = normalized["user"]
     normalized.setdefault("sslcertmode", "allow")

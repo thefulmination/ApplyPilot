@@ -176,6 +176,74 @@ def test_blackout_poll_does_not_equate_omitted_host_with_localhost(monkeypatch, 
 
 
 @pytest.mark.parametrize(
+    ("environment", "fleet_dsn", "applypilot_fleet_dsn"),
+    [
+        (
+            {},
+            "host=fleet.example password=secret",
+            "host=fleet.example user='' password=secret",
+        ),
+        (
+            {"PGHOST": "env.example", "PGPORT": "6543", "PGUSER": "env-worker"},
+            "dbname=applypilot password=secret",
+            "host='' port='' dbname=applypilot user='' password=secret",
+        ),
+        (
+            {"PGPASSWORD": "env-secret", "PGPASSFILE": "env-passfile"},
+            "host=fleet.example dbname=applypilot user=worker",
+            (
+                "host=fleet.example dbname=applypilot user=worker "
+                "password='' passfile=''"
+            ),
+        ),
+        (
+            {},
+            "host=fleet.example dbname=applypilot user=worker",
+            (
+                "host=fleet.example dbname=applypilot user=worker "
+                "password='' passfile=''"
+            ),
+        ),
+    ],
+)
+def test_blackout_poll_treats_explicit_empty_conninfo_as_effective_default(
+    environment,
+    fleet_dsn,
+    applypilot_fleet_dsn,
+    monkeypatch,
+    capsys,
+):
+    conn = _ReadOnlyConnection()
+    for variable in (
+        "PGDATABASE",
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGPASSFILE",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+    monkeypatch.setenv("FLEET_PG_DSN", fleet_dsn)
+    monkeypatch.setenv("APPLYPILOT_FLEET_DSN", applypilot_fleet_dsn)
+    monkeypatch.setattr(pgqueue, "connect", lambda dsn: conn if dsn == fleet_dsn else None)
+    monkeypatch.setattr(
+        machine_blackout,
+        "status_line",
+        lambda status_conn, label, *, role: f"OK|{label}|{role}|||",
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "OK|m4|compute|||"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
     ("fleet_dsn", "applypilot_fleet_dsn"),
     [
         (
@@ -333,6 +401,7 @@ def test_blackout_poll_returns_sanitized_blocked_when_database_access_fails(
         "oauth_client_secret",
         "scram_client_key",
         "scram_server_key",
+        "sslkeylogfile",
     ],
 )
 def test_blackout_poll_redacts_every_sensitive_authority_value(
@@ -368,6 +437,35 @@ def test_blackout_poll_redacts_every_sensitive_authority_value(
     for secret in (parsed_secret, diagnostic_secret):
         assert secret not in captured.out
         assert secret not in captured.err
+
+
+def test_blackout_poll_rejects_and_redacts_conflicting_sslkeylogfile(
+    monkeypatch,
+    capsys,
+):
+    first_path = r"C:\sensitive\fleet-one.keys"
+    second_path = r"C:\sensitive\fleet-two.keys"
+    base = "host=fleet.example dbname=applypilot user=worker password=secret"
+    monkeypatch.setenv("FLEET_PG_DSN", make_conninfo(base, sslkeylogfile=first_path))
+    monkeypatch.setenv(
+        "APPLYPILOT_FLEET_DSN",
+        make_conninfo(base, sslkeylogfile=second_path),
+    )
+    monkeypatch.setattr(
+        pgqueue,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("conflicting fleet DSNs reached connector"),
+    )
+    monkeypatch.setattr(sys, "argv", ["fleet-blackout-query.py", "m4", "compute"])
+
+    runpy.run_path(str(ROOT / "fleet-blackout-query.py"), run_name="__main__")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip().startswith("BLOCKED|m4|compute|blackout-query-error||")
+    assert "Inconsistent fleet Postgres DSN references" in captured.err
+    for path in (first_path, second_path):
+        assert path not in captured.out
+        assert path not in captured.err
 
 
 def test_blackout_poll_import_failure_still_emits_sanitized_blocked_line(
