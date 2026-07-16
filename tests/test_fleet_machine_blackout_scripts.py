@@ -120,6 +120,7 @@ def test_launcher_guard_matrix_includes_every_available_supported_shell():
     [
         ("OK|m4|all|||", 0, "OK"),
         ("BLOCKED|m4|all|policy||reason", 0, "BLOCKED"),
+        ("", 0, "KEEP"),
         ("KEEP|m4|all|||error", 0, "KEEP"),
         ("malformed", 0, "KEEP"),
         ("KEEP|m4|all|||error\nOK|m4|all|||", 0, "KEEP"),
@@ -172,8 +173,10 @@ def test_fleet_agent_blackout_status_is_fail_closed(
 @pytest.mark.parametrize(
     ("output", "exit_code"),
     [
+        ("", 0),
         ("KEEP|m4|all|||error", 0),
         ("malformed", 0),
+        ("KEEP|m4|all|||error\nOK|m4|all|||", 0),
         ("OK|m4|all|||", 7),
     ],
 )
