@@ -560,7 +560,14 @@ def _create_restricted_directory(path: Path) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
-        path.mkdir(mode=0o700)
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            # Another initializer may win this exact creation race. Continue
+            # through the link/type checks; callers will resolve ownership via
+            # the root coordination lock rather than leaking a raw OS error.
+            if not path.is_dir():
+                raise ArtifactIntegrityError(f"storage path is not a directory: {path}") from None
         return
 
     security_descriptor = _windows_security_descriptor(directory=True)
