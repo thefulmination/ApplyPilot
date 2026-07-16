@@ -591,25 +591,19 @@ def test_answer_history_lookup_is_bounded_to_candidate_message_ids(monkeypatch):
                 self.rows = [{"acquired": True}]
             elif "pg_advisory_unlock" in query:
                 self.rows = []
-            elif "SELECT id, requested_at, sender_hint" in query:
+            elif "fleet_controller_otp_pending" in query:
                 queries.append((query, params))
-                assert "array_agg" not in query
-                assert "CROSS JOIN" not in query
-                self.rows = [{
-                    "id": 1,
-                    "requested_at": now,
-                    "sender_hint": "greenhouse.io",
-                }]
-            elif "matched_message_id = ANY(%s)" in query:
+                self.rows = [{"pending": [{
+                    "id": 1, "requested_at": now.isoformat(), "sender_hint": "greenhouse.io",
+                }]}]
+            elif "fleet_controller_otp_used_messages" in query:
                 queries.append((query, params))
                 candidate_ids = params[0]
                 assert set(candidate_ids) == {"candidate-1", "candidate-2"}
                 assert len(candidate_ids) == 2
-                self.rows = [
-                    {"matched_message_id": message_id}
-                    for message_id in candidate_ids
-                    if message_id in historical_ids
-                ]
+                self.rows = [{"used": [
+                    message_id for message_id in candidate_ids if message_id in historical_ids
+                ]}]
             else:
                 raise AssertionError(f"unexpected query: {query}")
 
@@ -649,19 +643,19 @@ def test_answer_with_no_candidates_skips_history_query(monkeypatch):
             return False
 
         def execute(self, query, params=None):
-            if "pg_try_advisory_lock" in query:
-                self._row = {"acquired": True}
-            elif "pg_advisory_unlock" in query:
-                self._row = None
-            else:
-                queries.append((query, params))
-
-        def fetchall(self):
-            return [{
-                "id": 1,
-                "requested_at": now,
-                "sender_hint": "greenhouse.io",
-            }]
+                if "pg_try_advisory_lock" in query:
+                    self._row = {"acquired": True}
+                elif "pg_advisory_unlock" in query:
+                    self._row = None
+                elif "fleet_controller_otp_pending" in query:
+                    queries.append((query, params))
+                    self._row = {"pending": [{
+                        "id": 1,
+                        "requested_at": now.isoformat(),
+                        "sender_hint": "greenhouse.io",
+                    }]}
+                else:
+                    queries.append((query, params))
 
         def fetchone(self):
             return getattr(self, "_row", None)

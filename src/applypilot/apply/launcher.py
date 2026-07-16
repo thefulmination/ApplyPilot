@@ -1775,6 +1775,72 @@ _SAFE_PREPAGE_TOOL_NAMES = {
     "tool_search",
 }
 
+_BROWSER_READ_TOOLS = frozenset(
+    {
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_wait_for",
+    }
+)
+
+
+def _normalize_browser_tool_name(name: str | None) -> str:
+    """Return one canonical browser tool name across agent protocols."""
+    normalized = (name or "").strip().lower()
+    for prefix in (
+        "mcp__playwright__",
+        "mcp__codex__",
+        "mcp__codex_apps__",
+        "playwright__",
+        "playwright.",
+        "mcp.playwright.",
+    ):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    if normalized and not normalized.startswith("browser_"):
+        aliases = {
+            "click",
+            "close",
+            "console_messages",
+            "drag",
+            "evaluate",
+            "fill_form",
+            "handle_dialog",
+            "hover",
+            "navigate",
+            "navigate_back",
+            "network_requests",
+            "press_key",
+            "resize",
+            "select_option",
+            "snapshot",
+            "tabs",
+            "take_screenshot",
+            "type",
+            "upload_file",
+            "wait_for",
+        }
+        if normalized in aliases:
+            normalized = f"browser_{normalized}"
+    return normalized
+
+
+def _browser_tool_policy(name: str | None) -> str:
+    """Classify browser calls; unknown browser tools are interaction boundaries."""
+    normalized = _normalize_browser_tool_name(name)
+    if normalized in _BROWSER_READ_TOOLS:
+        return "read"
+    if normalized.startswith("browser_"):
+        return "interaction"
+    return "other"
+
+
+def _event_tool_name(item: dict) -> str:
+    return str(item.get("name") or item.get("tool_name") or item.get("tool") or "")
+
 
 def _tool_call_touches_application(name: str | None) -> bool:
     """False only for agent/meta tools that cannot inspect or modify the application.
@@ -1849,7 +1915,7 @@ class _ExecutionEvidence:
         ("login", ("sign in", "create account", "login")),
     )
 
-    def __init__(self, started_at: float) -> None:
+    def __init__(self, started_at: float, *, interaction_marker=None) -> None:
         self.started_at = started_at
         self.last_at = started_at
         self.last_action = "starting"
@@ -1859,6 +1925,17 @@ class _ExecutionEvidence:
         self.timeline: list[dict] = []
         self.phase_durations_ms: dict[str, int] = {}
         self.current_phase = "startup"
+        self._interaction_marker = interaction_marker
+        self._interaction_marked = False
+
+    def prepare_tool(self, tool: str) -> None:
+        """Persist the lease checkpoint before an interaction tool is dispatched."""
+        if _browser_tool_policy(tool) != "interaction" or self._interaction_marked:
+            return
+        if self._interaction_marker is None:
+            raise RuntimeError("browser interaction boundary is not bound to the active lease")
+        self._interaction_marker()
+        self._interaction_marked = True
 
     def _phase_for(self, text: str) -> str:
         low = text.lower()
@@ -1871,6 +1948,7 @@ class _ExecutionEvidence:
         return "navigation"
 
     def note_action(self, tool: str, description: str, raw_text: str = "") -> None:
+        self.prepare_tool(tool)
         now = time.monotonic()
         elapsed_ms = max(0, int((now - self.last_at) * 1000))
         self.phase_durations_ms[self.current_phase] = (
@@ -2036,6 +2114,9 @@ def _maybe_greenhouse_apply(job: dict, port: int, *, dry_run: bool,
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
             page = ctx.new_page()
             try:
+                if attempt_store is None or not hasattr(attempt_store, "mark_browser_interaction"):
+                    raise RuntimeError("Greenhouse browser path lacks a lease interaction marker")
+                attempt_store.mark_browser_interaction()
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 res = apply_greenhouse(url, profile=profile, resume_text=resume_text,
                                        resume_path=pdf, page=page, dry_run=not own,
@@ -2218,9 +2299,8 @@ def _maybe_ashby_apply(job: dict, port: int, *, dry_run: bool,
                 fields = discover_fields(page)
                 answer_fn = None
                 if not own:
-                    answer_fn = lambda *args, **kwargs: types.SimpleNamespace(
-                        verified=False, text="",
-                    )
+                    def answer_fn(*args, **kwargs):
+                        return types.SimpleNamespace(verified=False, text="")
                 plan = build_ashby_plan(
                     fields, profile=profile, resume_text=resume_text,
                     job={"site": job.get("site", ""), "title": job.get("title", "")},
@@ -2426,6 +2506,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    _require_direct_launcher_admission()
     status, duration_ms = _run_job_impl(
         job, port, worker_id=worker_id, model=model, dry_run=dry_run,
         agent=agent, inbox_auth_hint=inbox_auth_hint, attempt_store=attempt_store,
@@ -2438,6 +2519,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         except Exception:
             logger.debug("supervised record_tenant_outcome failed", exc_info=True)
     return status, duration_ms
+
+
+def _require_direct_launcher_admission() -> None:
+    from applypilot.fleet import emergency_admission
+
+    admission = emergency_admission.launcher_admission()
+    if admission.allowed:
+        return
+    print(
+        f"{emergency_admission.denial_marker(admission)} {admission.reason}",
+        file=sys.stderr,
+    )
+    raise SystemExit(emergency_admission.DENIAL_EXIT_CODE)
 
 
 def _run_job_impl(job: dict, port: int, worker_id: int = 0,
@@ -2612,6 +2706,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+    mcp_config_path.parent.mkdir(parents=True, exist_ok=True)
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
     agent = _normalize_agent(agent)
@@ -2657,10 +2752,14 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     application_tool_calls = [0]
     tool_calls_total = [0]
     last_tool_seen = [""]
+    stream_failure: list[Exception] = []
     terminal_result_seen = threading.Event()
     proc = None
     guard = None
-    execution_evidence = _ExecutionEvidence(time.monotonic())
+    execution_evidence = _ExecutionEvidence(
+        time.monotonic(),
+        interaction_marker=getattr(attempt_store, "mark_browser_interaction", None),
+    )
 
     def _record_run_stats(*, transcript: str, job_log_path: str | None,
                           application_tool_calls: int, final_result_source: str,
@@ -2743,11 +2842,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     _note_terminal_result(block["text"])
                                     lf.write(redact_persistent(block["text"]) + "\n")
                                 elif bt == "tool_use":
-                                    name = (
-                                        block.get("name", "")
-                                        .replace("mcp__playwright__", "")
-                                        .replace("mcp__gmail__", "gmail:")
-                                    )
+                                    raw_name = block.get("name", "")
+                                    execution_evidence.prepare_tool(raw_name)
+                                    name = _normalize_browser_tool_name(raw_name)
+                                    if name == raw_name:
+                                        name = name.replace("mcp__gmail__", "gmail:")
                                     tool_calls_total[0] += 1
                                     last_tool_seen[0] = name
                                     if _tool_call_touches_application(name):
@@ -2795,6 +2894,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             final_result_text.clear()
                             final_result_text.append(rt)
                             _note_terminal_result(rt, trusted=True)
+                        elif msg_type == "item.started":
+                            item = msg.get("item", {})
+                            if item.get("type") in {"mcp_tool_call", "tool_call"}:
+                                execution_evidence.prepare_tool(_event_tool_name(item))
                         elif msg_type == "item.completed":
                             item = msg.get("item", {})
                             item_type = item.get("type")
@@ -2807,7 +2910,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     final_result_text.append(text)
                                     lf.write(redact_persistent(text) + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
-                                name = item.get("name") or item.get("tool_name") or item_type
+                                raw_name = _event_tool_name(item) or item_type
+                                name = _normalize_browser_tool_name(raw_name)
                                 tool_calls_total[0] += 1
                                 last_tool_seen[0] = str(name)
                                 if _tool_call_touches_application(str(name)):
@@ -2852,6 +2956,16 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                         text_parts.append(line)
                         _note_terminal_result(line)
                         lf.write(redact_persistent(line) + "\n")
+                    except Exception as exc:
+                        stream_failure.append(exc)
+                        if proc is not None and proc.poll() is None:
+                            _terminate_agent_child(
+                                worker_id,
+                                proc,
+                                guard,
+                                "browser-interaction-marker",
+                            )
+                        break
 
         # Start reading BEFORE writing the prompt so a large prompt can't deadlock
         # against a full stdout pipe.
@@ -2900,6 +3014,9 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                 final_result_source="transcript",
             )
             return "failed:timeout", int((time.time() - start) * 1000)
+
+        if stream_failure:
+            raise stream_failure[0]
 
         try:
             proc.wait(timeout=30)
@@ -3193,15 +3310,18 @@ def _should_prearm_inbox_auth(job: dict) -> bool:
         return False
 
 
-def _prearm_inbox_auth_request(job: dict) -> int | None:
+def _prearm_inbox_auth_request(job: dict, *, conn=None) -> int | None:
     """Create a pending relay request without waiting for the code."""
-    try:
-        from applypilot.apply import pgqueue
-        from applypilot.fleet import otp_relay
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import otp_relay
 
+    owned = conn is None
+    if owned:
         dsn = os.environ.get("FLEET_PG_DSN")
         if not dsn:
-            return None
+            raise RuntimeError("fleet OTP relay requires FLEET_PG_DSN")
+        conn = pgqueue.connect(dsn)
+    try:
         worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
         timeout = max(1, int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT") or 300))
         agent_timeout = max(
@@ -3209,19 +3329,14 @@ def _prearm_inbox_auth_request(job: dict) -> int | None:
             int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or AGENT_TIMEOUT_SECONDS),
             AGENT_TIMEOUT_SECONDS,
         )
-        ttl_seconds = agent_timeout + timeout
         apply_target = job.get("application_url") or job["url"]
-        with pgqueue.connect(dsn) as conn:
-            return otp_relay.request_code(
-                conn,
-                worker_id=worker_id,
-                job_url=job["url"],
-                application_url=apply_target,
-                ttl_seconds=ttl_seconds,
-            )
-    except Exception:
-        logger.debug("Relay inbox auth pre-arm failed", exc_info=True)
-        return None
+        return otp_relay.request_code(
+            conn, worker_id=worker_id, job_url=job["url"],
+            application_url=apply_target, ttl_seconds=agent_timeout + timeout,
+        )
+    finally:
+        if owned:
+            conn.close()
 
 
 def _format_relay_code_hint(code) -> str:
@@ -3235,17 +3350,21 @@ def _consume_prearmed_inbox_auth_hint(
     *,
     timeout_seconds: int | None = None,
     poll_seconds: float | None = None,
+    conn=None,
 ) -> str | None:
     """Wait briefly for a pre-filed relay request and return the prompt hint."""
     if request_id is None:
         return None
-    try:
-        from applypilot.apply import pgqueue
-        from applypilot.fleet import otp_relay
+    from applypilot.apply import pgqueue
+    from applypilot.fleet import otp_relay
 
+    owned = conn is None
+    if owned:
         dsn = os.environ.get("FLEET_PG_DSN")
         if not dsn:
-            return None
+            raise RuntimeError("fleet OTP relay requires FLEET_PG_DSN")
+        conn = pgqueue.connect(dsn)
+    try:
         if timeout_seconds is None:
             timeout_seconds = int(
                 os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT")
@@ -3253,37 +3372,27 @@ def _consume_prearmed_inbox_auth_hint(
             )
         if poll_seconds is None:
             poll_seconds = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
-        with pgqueue.connect(dsn) as conn:
-            code = otp_relay.poll_for_code(
-                conn,
-                request_id,
-                timeout_seconds=timeout_seconds,
-                poll_seconds=poll_seconds,
-            )
+        code = otp_relay.poll_for_code(
+            conn, request_id, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds,
+        )
         if code is None:
             return None
         return _format_relay_code_hint(code)
-    except Exception:
-        logger.debug("Relay inbox auth consume failed", exc_info=True)
-        return None
+    finally:
+        if owned:
+            conn.close()
 
 
 def _relay_inbox_auth_hint(job: dict) -> str | None:
     """Remote-worker path: get the verification code from the fleet OTP relay."""
-    try:
-        request_id = _prearm_inbox_auth_request(job)
-        if request_id is None:
-            return None
-        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
-        poll = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
-        return _consume_prearmed_inbox_auth_hint(
-            request_id,
-            timeout_seconds=timeout,
-            poll_seconds=poll,
-        )
-    except Exception:
-        logger.debug("Relay inbox auth failed", exc_info=True)
+    request_id = _prearm_inbox_auth_request(job)
+    if request_id is None:
         return None
+    timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
+    poll = float(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
+    return _consume_prearmed_inbox_auth_hint(
+        request_id, timeout_seconds=timeout, poll_seconds=poll,
+    )
 
 
 def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
@@ -3691,6 +3800,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     Returns:
         Tuple of (applied_count, failed_count).
     """
+    _require_direct_launcher_admission()
     applied = 0
     failed = 0
     continuous = limit == 0
@@ -4059,6 +4169,9 @@ def main(limit: int = 1, target_url: str | None = None,
             the real terminal status and a challenge-class result halts that
             tenant for the day.
     """
+    from applypilot.fleet.emergency_admission import launcher_admission, require_allowed
+
+    require_allowed(launcher_admission())
     global POLL_INTERVAL
     POLL_INTERVAL = int(os.environ.get("APPLYPILOT_POLL_INTERVAL") or poll_interval)
     _stop_event.clear()

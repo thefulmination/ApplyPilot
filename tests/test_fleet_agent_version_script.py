@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 
@@ -8,10 +9,15 @@ from applypilot.fleet.software_version import current_sw_version
 
 
 REPO = Path(__file__).resolve().parents[1]
+FORBIDDEN_DATABASE_ENV_VARS = runpy.run_path(str(REPO / "fleet_agent_env.py"))[
+    "FORBIDDEN_DATABASE_ENV_VARS"
+]
 
 
 def _run_version_script(fleet_db: str) -> str:
     env = os.environ.copy()
+    for name in FORBIDDEN_DATABASE_ENV_VARS:
+        env.pop(name, None)
     env["FLEET_PG_DSN"] = fleet_db
     result = subprocess.run(
         [sys.executable, str(REPO / "fleet-agent-version.py")],

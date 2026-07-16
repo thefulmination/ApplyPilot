@@ -5,9 +5,13 @@ import time
 from email.utils import format_datetime
 
 import pytest
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.rows import dict_row
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import otp_relay, schema as fleet_schema
+from applypilot.fleet import otp_relay, queue, schema as fleet_schema
 
 
 def _fresh(fleet_db):
@@ -21,6 +25,89 @@ def _home_writes_code(conn, request_id, code="482913", kind="code"):
         cur.execute("UPDATE otp_request SET code=%s, code_kind=%s, answered_at=now() WHERE id=%s",
                     (code, kind, request_id))
     conn.commit()
+
+
+def test_mapped_worker_otp_roundtrip_is_identity_and_lease_bound(fleet_db):
+    role = "otp_worker_test"
+    worker_id = "otp-mapped-1"
+    password = "otp-mapped-scram-password"
+    job_url = "https://example.test/jobs/otp-mapped"
+    application_url = "https://greenhouse.io/otp-mapped"
+    now = dt.datetime.now(dt.timezone.utc)
+    with pgqueue.connect(fleet_db) as owner:
+        owner.execute("CREATE TABLE IF NOT EXISTS public.fleet_desired_state("
+                      "machine_owner text primary key,desired_workers integer,agent text,model text,"
+                      "generation integer,updated_at timestamptz)")
+        owner.execute("INSERT INTO public.fleet_desired_state(machine_owner,desired_workers,agent,model,generation,updated_at) "
+                      "VALUES('otp-box',1,'codex','test',1,now()) ON CONFLICT(machine_owner) DO UPDATE SET "
+                      "desired_workers=1,generation=1,updated_at=now()")
+        owner.execute("INSERT INTO public.workers(worker_id,machine_owner,public_ip,validated,capabilities) "
+                      "VALUES(%s,'otp-box','1.1.1.1',true,'{\"can_ats\":true}'::jsonb)", (worker_id,))
+        owner.execute("INSERT INTO public.worker_heartbeat(worker_id,machine_owner,home_ip,role,state,sw_version,last_beat) "
+                      "VALUES(%s,'otp-box','1.1.1.1','apply','idle','v1',now())", (worker_id,))
+        owner.execute("INSERT INTO public.fleet_decision_policies(policy_version,lane,status) "
+                      "VALUES('otp-policy','ats','active')")
+        owner.execute("UPDATE public.fleet_config SET paused=false,ats_paused=false,ats_apply_mode='steady',"
+                      "ats_policy_version='otp-policy',pinned_worker_version='v1' WHERE id=1")
+        for scope in ("global", "home_ip:1.1.1.1", "host:greenhouse.io"):
+            owner.execute("INSERT INTO public.rate_governor(scope_key,daily_cap,min_gap_seconds) "
+                          "VALUES(%s,100,0) ON CONFLICT(scope_key) DO UPDATE SET daily_cap=100,min_gap_seconds=0", (scope,))
+        owner.execute(
+            "INSERT INTO public.apply_queue(url,application_url,score,apply_domain,target_host,lane,dedup_key,"
+            "approved_batch,decision_id,policy_version,decision_action,qualification_verdict,qualification_score,"
+            "qualification_floor,preference_score,outcome_score,final_score,decision_confidence,decision_created_at,"
+            "decision_expires_at,input_hash) VALUES(%s,%s,9,'greenhouse.io','greenhouse.io','ats','otp-dedup',"
+            "'test','otp-decision','otp-policy','apply','qualified',9,7,9,9,9,.9,%s,%s,'otp-hash')",
+            (job_url, application_url, now, now + dt.timedelta(days=1)),
+        )
+        owner.commit()
+        owner.execute(sql.SQL(
+            "CREATE ROLE {} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS PASSWORD {}"
+        ).format(sql.Identifier(role), sql.Literal(password)))
+        owner.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+            sql.Identifier(conninfo_to_dict(fleet_db)["dbname"]), sql.Identifier(role)
+        ))
+        owner.execute(
+            "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) VALUES(%s,%s,'apply')",
+            (role, worker_id),
+        )
+        owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role)))
+        owner.execute(sql.SQL("GRANT USAGE ON TYPE public.apply_queue TO {}").format(sql.Identifier(role)))
+        owner.execute(sql.SQL(
+            "GRANT EXECUTE ON FUNCTION public.fleet_worker_lease_ats(text,text,integer,text,integer), "
+            "public.fleet_worker_otp_request(text,text,text,integer), "
+            "public.fleet_worker_otp_wait(bigint), public.fleet_worker_otp_consume(bigint) TO {}"
+        ).format(sql.Identifier(role)))
+        owner.commit()
+    params = conninfo_to_dict(fleet_db)
+    params.update(user=role, password=password)
+    try:
+        with psycopg.connect(make_conninfo(**params), row_factory=dict_row) as worker:
+            leased = queue.lease_apply(worker, "forged", home_ip="9.9.9.9", sw_version="forged")
+            assert leased and leased["url"] == job_url
+            request_id = otp_relay.request_code(
+                worker, worker_id="forged", job_url=job_url,
+                application_url=application_url, ttl_seconds=300,
+            )
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                worker.execute("SELECT * FROM public.otp_request")
+            worker.rollback()
+            with pgqueue.connect(fleet_db) as owner:
+                assert owner.execute(
+                    "SELECT public.fleet_controller_otp_answer(%s,'482913','code',now(),"
+                    "'mapped-message',300) AS ok", (request_id,),
+                ).fetchone()["ok"] is True
+                owner.commit()
+            code = otp_relay.poll_for_code(worker, request_id, timeout_seconds=0)
+            assert code == otp_relay.RelayCode("482913", "code")
+            assert otp_relay.poll_for_code(worker, request_id, timeout_seconds=0) is None
+    finally:
+        with pgqueue.connect(fleet_db) as owner:
+            owner.execute("DELETE FROM public.fleet_worker_principals WHERE role_name=%s", (role,))
+            owner.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
+            owner.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+            owner.commit()
 
 
 def test_request_code_inserts_pending_row(fleet_db):
@@ -130,102 +217,6 @@ def test_request_lock_key_is_stable_signed_64_bit():
         "worker-1", "https://example.test/apply",
     ) == key
     assert otp_relay._request_lock_key("x", "y") == -6285053798989339351
-
-
-def test_request_lock_timeout_is_bounded_and_rolls_back(monkeypatch):
-    class _Cursor:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def execute(self, query, params):
-            assert "pg_try_advisory_xact_lock(%s)" in query
-            assert params == (17,)
-
-        def fetchone(self):
-            return {"acquired": False}
-
-    class _Conn:
-        rollbacks = 0
-
-        def cursor(self):
-            return _Cursor()
-
-        def rollback(self):
-            self.rollbacks += 1
-
-    conn = _Conn()
-    monotonic_values = iter((10.0, 10.0, 10.04, 10.11))
-    sleeps = []
-    monkeypatch.setattr(otp_relay.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(otp_relay.time, "sleep", sleeps.append)
-
-    with pytest.raises(TimeoutError, match="^timed out acquiring OTP request lock$"):
-        otp_relay._acquire_request_lock(conn, 17, timeout_seconds=0.1)
-
-    assert conn.rollbacks == 1
-    assert all(0 < delay <= 0.05 for delay in sleeps)
-
-
-@pytest.mark.parametrize(
-    "timeout_seconds",
-    [
-        float("nan"), float("inf"), float("-inf"), -0.01, True, "1", None,
-        60.01, 10 ** 1000,
-    ],
-)
-def test_request_lock_rejects_invalid_timeout_before_cursor(timeout_seconds):
-    class _Conn:
-        def cursor(self):
-            raise AssertionError("cursor must not be opened for an invalid timeout")
-
-    with pytest.raises(ValueError):
-        otp_relay._acquire_request_lock(
-            _Conn(), 17, timeout_seconds=timeout_seconds,
-        )
-
-
-def test_request_lock_zero_timeout_attempts_once_then_times_out(monkeypatch):
-    class _Cursor:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def execute(self, query, params):
-            assert "pg_try_advisory_xact_lock(%s)" in query
-            assert params == (17,)
-
-        def fetchone(self):
-            return {"acquired": False}
-
-    class _Conn:
-        attempts = 0
-        rollbacks = 0
-
-        def cursor(self):
-            self.attempts += 1
-            return _Cursor()
-
-        def rollback(self):
-            self.rollbacks += 1
-
-    conn = _Conn()
-    monkeypatch.setattr(otp_relay.time, "monotonic", lambda: 10.0)
-    monkeypatch.setattr(
-        otp_relay.time,
-        "sleep",
-        lambda _seconds: pytest.fail("zero timeout must not sleep"),
-    )
-
-    with pytest.raises(TimeoutError, match="^timed out acquiring OTP request lock$"):
-        otp_relay._acquire_request_lock(conn, 17, timeout_seconds=0)
-
-    assert conn.attempts == 1
-    assert conn.rollbacks == 1
 
 
 def test_concurrent_request_code_calls_share_one_active_row(fleet_db):

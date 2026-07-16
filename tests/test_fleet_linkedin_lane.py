@@ -215,7 +215,7 @@ def test_linkedin_external_auth_required_closes_job_without_account_halt(fleet_d
         assert governor is not None and governor["halted_until"] is None
 
 
-def test_linkedin_driver_uses_lane_specific_halt(monkeypatch):
+def test_linkedin_driver_uses_lane_specific_halt(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
 
     class _Conn:
@@ -266,7 +266,7 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
     assert captured["fleet_worker_id"] == "w"
 
 
-def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
+def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
 
     class _Conn:
@@ -289,7 +289,7 @@ def test_linkedin_driver_backs_off_after_usage_limit(monkeypatch):
     assert sleeps == [7]
 
 
-def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
+def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
     from applypilot.fleet.agent_switch import AgentSwitcher
 
@@ -337,7 +337,7 @@ def test_linkedin_driver_switches_to_fallback_after_usage_limit(monkeypatch):
     assert counts["applied"] == 1
 
 
-def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch):
+def test_linkedin_driver_pauses_when_all_agents_walled(monkeypatch, acquisition_admitted):
     from applypilot.fleet import linkedin_worker_main as lm
     from applypilot.fleet.agent_switch import AgentSwitcher
 
@@ -427,19 +427,19 @@ def test_linkedin_setup_env_prefers_repo_local_profile(monkeypatch, tmp_path):
     assert os.environ["APPLYPILOT_DB_PATH"].endswith("fleet_apply_throwaway.db")
 
 
-def test_park_linkedin_sets_halt_one_tx_even_without_account_row(fleet_db):
+def test_park_linkedin_rejects_fabricated_lease_without_account_row(fleet_db):
     from applypilot.fleet import queue
 
     with pgqueue.connect(fleet_db) as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO linkedin_queue (url, application_url, score, status, lane, lease_owner) "
                     "VALUES ('lp','https://linkedin.com/jobs/x','9','leased','ats','w1')")
         conn.commit()
-        assert queue.park_linkedin_challenge(conn, "w1", "lp", halt_seconds=21600) is True
+        assert queue.park_linkedin_challenge(conn, "w1", "lp", halt_seconds=21600) is False
         cur.execute("SELECT halted_until FROM rate_governor WHERE scope_key='account:linkedin'")
-        assert cur.fetchone()["halted_until"] is not None       # account row was INSERTed + halted
+        assert cur.fetchone() is None
         cur.execute("SELECT status, apply_status FROM linkedin_queue WHERE url='lp'")
         r = cur.fetchone()
-        assert r["status"] == "leased" and r["apply_status"] == "challenge_pending"  # frozen, not closed
+        assert r["status"] == "leased" and r["apply_status"] is None
 
 
 def test_reclaim_linkedin_crash_unconfirmed_only(fleet_db):

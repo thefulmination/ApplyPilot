@@ -72,14 +72,29 @@ $pyGuard = @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe") | Where-Ob
 if (-not $pyGuard) { $pyGuard = "python" }
 
 function Test-MachineBlackout([string]$Role) {
-  $line = (& $pyGuard (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null | Select-Object -Last 1)
-  if ("$line" -match '^BLOCKED\|') { return $line }
-  return $null
+  $stderrPath = [IO.Path]::GetTempFileName()
+  try {
+    $lines = @(& $pyGuard (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2> $stderrPath)
+    $queryExit = $LASTEXITCODE
+    Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue | ForEach-Object {
+      if (-not [string]::IsNullOrWhiteSpace("$_")) { [Console]::Error.WriteLine("$_") }
+    }
+  } finally {
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+  if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
+  if ($lines.Count -eq 0) { return "ERROR|empty-blackout-status" }
+  if ($lines.Count -ne 1) { return "ERROR|multiline-blackout-status" }
+  $line = "$($lines[0])"
+  if ($line -match "[`r`n]") { return "ERROR|multiline-blackout-status" }
+  $expected = "OK|$($Label.Trim().ToLowerInvariant())|$($Role.Trim().ToLowerInvariant())|||"
+  if ($line -ceq $expected) { return $null }
+  return $line
 }
 
 function Start-OneWorker([string]$wid) {
   $blocked = Test-MachineBlackout "compute"
-  if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout active. $blocked" }
+  if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout status did not return exact OK. $blocked" }
   Write-Host "[fleet-compute] worker $wid  providers=$Providers  (IP-free score/audit, cost-cap gated)"
   & $exe --worker-id "$wid" --home-ip "0.0.0.0" --machine-owner $Label
 }
@@ -106,7 +121,7 @@ if ($Workers -le 1) { Start-OneWorker "$Label-score-0"; return }
 
 # --- multi-worker: clean slate, then one window per worker on a DISTINCT id ---
 $blocked = Test-MachineBlackout "compute"
-if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout active. $blocked" }
+if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout status did not return exact OK. $blocked" }
 $self = $MyInvocation.MyCommand.Path
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
   $_.Name -eq 'applypilot-fleet-compute.exe' -or

@@ -6,7 +6,14 @@ from pathlib import Path
 
 
 def _setup(monkeypatch, tmp_path: Path):
-    """Wire both import_decisions and resbuild_bridge to one disposable SQLite brain."""
+    """Wire both import_decisions and resbuild_bridge to one disposable SQLite brain.
+
+    The SQLite brain here is a DISPOSABLE COMPATIBILITY FIXTURE for the bridge's
+    filtering/floor/snapshot logic only. It is never a stand-in for the fleet
+    Postgres authority: every test below injects its fleet authority explicitly
+    via ``promote(..., fleet_connect=...)`` so no test can resolve the ambient
+    FLEET_PG_DSN and reach the real fleet database.
+    """
     from applypilot import database, import_decisions, resbuild_bridge
 
     conn = database.init_db(tmp_path / "applypilot.db")
@@ -14,6 +21,15 @@ def _setup(monkeypatch, tmp_path: Path):
         monkeypatch.setattr(mod, "init_db", lambda *a, **k: conn)
         monkeypatch.setattr(mod, "get_connection", lambda: conn)
     return conn, resbuild_bridge
+
+
+def _no_fleet(monkeypatch):
+    """Poison the real fleet connector: any test that reaches it FAILS loudly
+    instead of silently dialing production Postgres."""
+    def _boom():
+        raise AssertionError("pgqueue.connect() must never be reached from a unit test")
+
+    monkeypatch.setattr("applypilot.resbuild_bridge.pgqueue.connect", _boom)
 
 
 def _insert_job(conn, url, *, title="Engineer", site="Co", fit_score=5,
@@ -42,13 +58,15 @@ def _src(conn, url):
 
 def test_excludes_linkedin_by_default(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://www.linkedin.com/jobs/view/1")
     _insert_job(conn, "https://job-boards.greenhouse.io/x/jobs/2")
     path = _write(tmp_path, [
         {"url": "https://www.linkedin.com/jobs/view/1", "verdict": "approve", "decision_score": 9},
         {"url": "https://job-boards.greenhouse.io/x/jobs/2", "verdict": "approve", "decision_score": 9},
     ])
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 1
     assert _src(conn, "https://www.linkedin.com/jobs/view/1") is None       # catastrophe lane untouched
     gh = conn.execute("SELECT decision_source, audit_score, external_decision_score FROM jobs WHERE url=?",
@@ -61,16 +79,19 @@ def test_excludes_linkedin_by_default(monkeypatch, tmp_path):
 def test_excludes_linkedin_trailing_dot_fqdn(monkeypatch, tmp_path):
     # The fully-qualified 'linkedin.com.' form must NOT slip past the exclusion.
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     url = "https://www.linkedin.com./jobs/view/9"
     _insert_job(conn, url)
     path = _write(tmp_path, [{"url": url, "verdict": "approve", "decision_score": 9}])
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 0
     assert _src(conn, url) is None
 
 
 def test_only_applyable_skips_applied_and_duplicate(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/clean")
     _insert_job(conn, "https://x.io/applied", applied_at="2026-06-01T00:00:00+00:00")
     _insert_job(conn, "https://x.io/dup", duplicate_of_url="https://x.io/clean")
@@ -79,7 +100,8 @@ def test_only_applyable_skips_applied_and_duplicate(monkeypatch, tmp_path):
         {"url": "https://x.io/applied", "verdict": "approve", "decision_score": 9},
         {"url": "https://x.io/dup", "verdict": "approve", "decision_score": 9},
     ])
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 1
     assert _src(conn, "https://x.io/clean") == "res_build"
     assert _src(conn, "https://x.io/applied") is None
@@ -88,6 +110,7 @@ def test_only_applyable_skips_applied_and_duplicate(monkeypatch, tmp_path):
 
 def test_limit_takes_top_by_score(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     for u in ("https://x.io/a", "https://x.io/b", "https://x.io/c"):
         _insert_job(conn, u, fit_score=3)
     path = _write(tmp_path, [
@@ -95,7 +118,8 @@ def test_limit_takes_top_by_score(monkeypatch, tmp_path):
         {"url": "https://x.io/b", "verdict": "approve", "decision_score": 7},
         {"url": "https://x.io/c", "verdict": "approve", "decision_score": 5},
     ])
-    r = mod.promote(path, source="res_build", limit=2, snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", limit=2, snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 2
     promoted = {row["url"] for row in conn.execute(
         "SELECT url FROM jobs WHERE decision_source='res_build'")}
@@ -104,10 +128,12 @@ def test_limit_takes_top_by_score(monkeypatch, tmp_path):
 
 def test_dry_run_writes_nothing(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/j", fit_score=5)
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
     snap = tmp_path / "snap.json"
-    r = mod.promote(path, source="res_build", dry_run=True, snapshot_path=snap)
+    r = mod.promote(path, source="res_build", dry_run=True, snapshot_path=snap,
+                    fleet_connect=None)
     assert r["dry_run"] is True and r["would_promote"] == 1
     row = conn.execute("SELECT audit_score, decision_source FROM jobs WHERE url=?",
                       ("https://x.io/j",)).fetchone()
@@ -117,22 +143,24 @@ def test_dry_run_writes_nothing(monkeypatch, tmp_path):
 
 def test_dry_run_counts_only_jobs_it_unlocks(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/low", fit_score=5)    # eff 5 < 7 -> unlocked by bridge
     _insert_job(conn, "https://x.io/high", fit_score=8)   # eff 8 >= 7 -> already qualifies
     path = _write(tmp_path, [
         {"url": "https://x.io/low", "verdict": "approve", "decision_score": 9},
         {"url": "https://x.io/high", "verdict": "approve", "decision_score": 9},
     ])
-    r = mod.promote(path, source="res_build", dry_run=True)
+    r = mod.promote(path, source="res_build", dry_run=True, fleet_connect=None)
     assert r["would_promote"] == 2 and r["would_raise"] == 1
 
 
 def test_promote_then_revert_restores_prior(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/j", fit_score=5, audit_score=4.0, audit_label="audit")
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
     snap = tmp_path / "snap.json"
-    mod.promote(path, source="res_build", snapshot_path=snap)
+    mod.promote(path, source="res_build", snapshot_path=snap, fleet_connect=None)
     row = conn.execute("SELECT audit_score, decision_source FROM jobs WHERE url=?",
                       ("https://x.io/j",)).fetchone()
     assert row["audit_score"] == 4.0 and row["decision_source"] == "res_build"
@@ -144,10 +172,11 @@ def test_promote_then_revert_restores_prior(monkeypatch, tmp_path):
 
 def test_revert_restores_null_prior(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/j", fit_score=5)   # no prior audit at all
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
     snap = tmp_path / "snap.json"
-    mod.promote(path, source="res_build", snapshot_path=snap)
+    mod.promote(path, source="res_build", snapshot_path=snap, fleet_connect=None)
     promoted = conn.execute(
         "SELECT audit_score, external_decision_score FROM jobs WHERE url=?", ("https://x.io/j",)
     ).fetchone()
@@ -161,9 +190,11 @@ def test_revert_restores_null_prior(monkeypatch, tmp_path):
 
 def test_scale_ten_preserves_decimal(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/j", fit_score=5)
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9.9}])
-    mod.promote(path, source="res_build", scale="ten", snapshot_path=tmp_path / "snap.json")
+    mod.promote(path, source="res_build", scale="ten", snapshot_path=tmp_path / "snap.json",
+                fleet_connect=None)
     row = conn.execute(
         "SELECT audit_score, external_decision_score FROM jobs WHERE url=?", ("https://x.io/j",)
     ).fetchone()
@@ -176,10 +207,12 @@ def test_approval_never_demotes_prior_effective(monkeypatch, tmp_path):
     # even when the res_build score is lower (approval is the decision; the score
     # is only a rank). The raw res score lands in external_decision_score.
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
     _insert_job(conn, "https://x.io/j", fit_score=5, audit_score=8.2, audit_label="audit")
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 4.5}])
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 1
     row = conn.execute(
         "SELECT audit_score, external_decision_score, decision_source FROM jobs WHERE url=?",
@@ -192,10 +225,12 @@ def test_approval_never_demotes_prior_effective(monkeypatch, tmp_path):
 def test_approval_below_threshold_remains_non_authoritative(monkeypatch, tmp_path):
     # Legacy review evidence is retained, but cannot raise the apply gate.
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
     _insert_job(conn, "https://x.io/j", fit_score=3)
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 4.5}])
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 1
     row = conn.execute(
         "SELECT audit_score, external_decision_score FROM jobs WHERE url=?",
@@ -206,10 +241,12 @@ def test_approval_below_threshold_remains_non_authoritative(monkeypatch, tmp_pat
 
 def test_unit_scale_preserves_benchmark_without_authority(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     monkeypatch.setattr("applypilot.config.get_min_score", lambda: 6)
     _insert_job(conn, "https://x.io/j", fit_score=3)
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 0.45}])
-    mod.promote(path, source="res_build", scale="unit", snapshot_path=tmp_path / "snap.json")
+    mod.promote(path, source="res_build", scale="unit", snapshot_path=tmp_path / "snap.json",
+                fleet_connect=None)
     row = conn.execute(
         "SELECT audit_score, external_decision_score FROM jobs WHERE url=?",
         ("https://x.io/j",)).fetchone()
@@ -219,10 +256,11 @@ def test_unit_scale_preserves_benchmark_without_authority(monkeypatch, tmp_path)
 
 def test_revert_skips_rows_no_longer_ours(monkeypatch, tmp_path):
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/j", fit_score=5)
     path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
     snap = tmp_path / "snap.json"
-    mod.promote(path, source="res_build", snapshot_path=snap)
+    mod.promote(path, source="res_build", snapshot_path=snap, fleet_connect=None)
     conn.execute("UPDATE jobs SET decision_source='other', audit_score=6 WHERE url=?", ("https://x.io/j",))
     conn.commit()
     assert mod.revert(snap) == 0   # not ours anymore -> leave it alone
@@ -260,17 +298,20 @@ class _FakePgCursor:
 class _FakePgConn:
     def __init__(self, apply_queue_urls=(), linkedin_queue_urls=()):
         self._cursor = _FakePgCursor(apply_queue_urls, linkedin_queue_urls)
+        self.closed = False
 
     def cursor(self):
         return self._cursor
 
     def close(self):
-        return None
+        self.closed = True
 
 
 def test_promote_excludes_fleet_applied_rows_and_counts(monkeypatch, tmp_path):
+    # PostgreSQL behaviour: the fleet authority is injected as a fake Postgres
+    # connection -- never resolved from the ambient DSN.
     conn, mod = _setup(monkeypatch, tmp_path)
-    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    _no_fleet(monkeypatch)
     _insert_job(conn, "https://x.io/normal", fit_score=5)
     _insert_job(conn, "https://x.io/fleet", fit_score=5)
     path = _write(
@@ -281,18 +322,51 @@ def test_promote_excludes_fleet_applied_rows_and_counts(monkeypatch, tmp_path):
         ],
     )
 
-    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://unit-test")
-    monkeypatch.setattr(
-        "applypilot.resbuild_bridge.pgqueue.connect",
-        lambda: _FakePgConn(apply_queue_urls=["https://x.io/fleet"]),
-    )
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    fake = _FakePgConn(apply_queue_urls=["https://x.io/fleet"])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=lambda: fake)
 
     assert r["fleet_cross_check"] == "ok"
     assert r["excluded_fleet_applied"] == 1
     assert r["promoted"] == 1
     assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", ("https://x.io/normal",)).fetchone()["decision_source"] == "res_build"
     assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", ("https://x.io/fleet",)).fetchone()["decision_source"] is None
+    assert fake.closed is True   # the injected authority connection is released
+
+
+def test_promote_cross_checks_linkedin_queue_too(monkeypatch, tmp_path):
+    # A row already leased/applied on the LinkedIn lane is fleet-applied too:
+    # Postgres remains the single authority on what the fleet has touched.
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
+    _insert_job(conn, "https://x.io/li-lane", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/li-lane", "verdict": "approve", "decision_score": 9}])
+
+    fake = _FakePgConn(linkedin_queue_urls=["https://x.io/li-lane"])
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=lambda: fake)
+
+    assert r["fleet_cross_check"] == "ok"
+    assert r["excluded_fleet_applied"] == 1
+    assert r["promoted"] == 0
+    assert _src(conn, "https://x.io/li-lane") is None
+
+
+def test_fleet_authority_failure_is_fail_closed(monkeypatch, tmp_path):
+    # Postgres is the authority. If it cannot be consulted the promotion ABORTS --
+    # it must never silently fall back to the local SQLite view of the world.
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
+    _insert_job(conn, "https://x.io/j", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/j", "verdict": "approve", "decision_score": 9}])
+
+    def _unreachable():
+        raise RuntimeError("fleet postgres unreachable")
+
+    with pytest.raises(RuntimeError, match="fleet postgres unreachable"):
+        mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=_unreachable)
+    assert _src(conn, "https://x.io/j") is None   # nothing was promoted
 
 
 @pytest.mark.parametrize("field,value", [("apply_status", "applied"), ("apply_status", "in_progress"),
@@ -301,27 +375,66 @@ def test_promote_excludes_fleet_applied_rows_and_counts(monkeypatch, tmp_path):
                                         ("apply_error", "crash_unconfirmed")])
 def test_promote_excludes_submit_markers(monkeypatch, tmp_path, field, value):
     conn, mod = _setup(monkeypatch, tmp_path)
-    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
+    _no_fleet(monkeypatch)
     url = f"https://x.io/{field}-{value}"
     _insert_job(conn, url, fit_score=5, **{field: value})
     path = _write(tmp_path, [{"url": url, "verdict": "approve", "decision_score": 9}])
 
-    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
     assert r["promoted"] == 0
-    assert r["fleet_cross_check"] == "skipped_no_dsn"
+    assert r["fleet_cross_check"] == "skipped_no_authority"
     assert r["excluded_fleet_applied"] == 0
     assert conn.execute("SELECT decision_source FROM jobs WHERE url=?", (url,)).fetchone()["decision_source"] is None
 
 
-def test_promote_without_dsn_skips_fleet_cross_check(monkeypatch, tmp_path):
+def test_explicit_no_authority_ignores_ambient_dsn(monkeypatch, tmp_path):
+    # REGRESSION GUARD: an explicitly injected 'no fleet authority' must win over a
+    # FLEET_PG_DSN that happens to be set in the environment. Without this, a local
+    # SQLite fixture test silently dials the real fleet Postgres.
     conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
+    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://should-never-be-used")
+    _insert_job(conn, "https://x.io/normal", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/normal", "verdict": "approve", "decision_score": 9}])
+
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json",
+                    fleet_connect=None)
+    assert r["fleet_cross_check"] == "skipped_no_authority"
+    assert r["excluded_fleet_applied"] == 0
+    assert r["promoted"] == 1
+
+
+def test_ambient_default_resolves_fleet_authority_when_dsn_present(monkeypatch, tmp_path):
+    # PRODUCTION CONTRACT: callers that inject nothing (e.g. the CLI) still resolve
+    # the fleet Postgres authority from FLEET_PG_DSN via pgqueue.connect().
+    conn, mod = _setup(monkeypatch, tmp_path)
+    monkeypatch.setenv("FLEET_PG_DSN", "postgresql://unit-test")
+    _insert_job(conn, "https://x.io/fleet", fit_score=5)
+    path = _write(tmp_path, [{"url": "https://x.io/fleet", "verdict": "approve", "decision_score": 9}])
+
+    calls = []
+    fake = _FakePgConn(apply_queue_urls=["https://x.io/fleet"])
+
+    def _connect():
+        calls.append(True)
+        return fake
+
+    monkeypatch.setattr("applypilot.resbuild_bridge.pgqueue.connect", _connect)
+    r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
+
+    assert calls == [True]
+    assert r["fleet_cross_check"] == "ok"
+    assert r["excluded_fleet_applied"] == 1
+    assert r["promoted"] == 0
+
+
+def test_ambient_default_without_dsn_skips_fleet_cross_check(monkeypatch, tmp_path):
+    conn, mod = _setup(monkeypatch, tmp_path)
+    _no_fleet(monkeypatch)
     monkeypatch.delenv("FLEET_PG_DSN", raising=False)
     _insert_job(conn, "https://x.io/normal", fit_score=5)
     path = _write(tmp_path, [{"url": "https://x.io/normal", "verdict": "approve", "decision_score": 9}])
-    monkeypatch.setattr(
-        "applypilot.resbuild_bridge.pgqueue.connect",
-        lambda: (_ for _ in ()).throw(RuntimeError("should not be called")),
-    )
 
     r = mod.promote(path, source="res_build", snapshot_path=tmp_path / "snap.json")
     assert r["fleet_cross_check"] == "skipped_no_dsn"

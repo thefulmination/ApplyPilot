@@ -4,7 +4,7 @@ version = "0.3.0"
 description = "AI-powered end-to-end job application pipeline"
 readme = "README.md"
 license = "AGPL-3.0-only"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 authors = [{name = "Pickle-Pixel"}]
 keywords = ["job-search", "automation", "ai", "resume", "apply", "job-application"]
 classifiers = [
@@ -13,7 +13,6 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Topic :: Office/Business",
 ]
 
@@ -37,6 +36,7 @@ dependencies = [
     "pandas>=2.1,<3.0",
     "pydantic>=2.13,<2.14",
     "regex>=2024.4.28,<2025.0.0",
+    "rfc8785==0.1.4",
     # Postgres driver for the cloud apply-fleet: the home box uses it for the
     # SQLite<->PG PUSH/PULL sync; the worker container uses it to lease/report.
     "psycopg[binary]>=3.2",
@@ -44,7 +44,7 @@ dependencies = [
     ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+dev = ["pytest>=7.0", "ruff>=0.1", "google-auth-oauthlib", "google-api-python-client"]
 
 [project.scripts]
 applypilot-workday-rollout = "applypilot.fleet.workday_rollout_main:main"
@@ -73,6 +73,7 @@ applypilot-fleet-reconcile-email = "applypilot.fleet.email_reconcile_main:main"
 applypilot-fleet-otp-home = "applypilot.fleet.otp_responder_main:main"
 applypilot-fleet-deadman = "applypilot.fleet.deadman:main"
 applypilot-fleet-control = "applypilot.fleet.machine_blackout_main:main"
+applypilot-fleet-migrate-schema = "applypilot.fleet.schema_main:main"
 applypilot-greenhouse-shadow = "applypilot.apply.greenhouse_shadow_main:main"
 
 [project.urls]

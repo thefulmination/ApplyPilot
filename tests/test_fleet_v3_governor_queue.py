@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from psycopg.errors import DeadlockDetected
+from psycopg.errors import CheckViolation, DeadlockDetected
 
 from applypilot.apply import pgqueue
 from applypilot.fleet import config as fcfg
@@ -347,6 +347,82 @@ def test_linkedin_canary_exhaustion_does_not_block_ats(fleet_db):
         assert queue.lease_apply(conn, "ats-worker", home_ip="1.1.1.1") is not None
 
 
+def test_authorize_lease_gate_failure_rolls_back_queue_transition(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _seed_apply(conn, "gate-race", host="greenhouse.io", score=9)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET paused=TRUE, ats_apply_mode='canary', "
+                "canary_enabled=TRUE, canary_remaining=1 WHERE id=1"
+            )
+        conn.commit()
+
+        with pytest.raises(CheckViolation, match="ATS lease gates changed"):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE apply_queue SET status='leased',lease_owner='worker-race',attempts=attempts+1 "
+                    "WHERE url='gate-race' RETURNING attempts"
+                )
+                attempt = cur.fetchone()["attempts"]
+                cur.execute(
+                    "SELECT public.fleet_worker_authorize_lease('ats',%s,%s,%s)",
+                    ("gate-race", "worker-race", attempt),
+                )
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT status,lease_owner,attempts FROM apply_queue WHERE url='gate-race'")
+            assert tuple(cur.fetchone().values()) == ("queued", None, 0)
+
+
+def test_linkedin_canary_refund_is_attempt_bound_idempotent_and_policy_safe(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        governor.ensure_scope(conn, governor.LINKEDIN_ACCOUNT, daily_cap=20, min_gap_seconds=0)
+        _seed_linkedin(conn, "li-refund")
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_apply_mode='canary', "
+                "linkedin_canary_enabled=TRUE, linkedin_canary_remaining=1 WHERE id=1"
+            )
+        conn.commit()
+
+        leased = queue.lease_linkedin(
+            conn, "refund-worker", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        )
+        assert leased is not None
+        assert queue.requeue_linkedin(conn, "other-worker", "li-refund") is False
+        assert queue.requeue_linkedin(conn, "refund-worker", "li-refund", apply_error="usage") is True
+        assert queue.requeue_linkedin(conn, "refund-worker", "li-refund", apply_error="usage") is False
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT linkedin_canary_remaining,linkedin_apply_mode FROM fleet_config WHERE id=1"
+            )
+            assert tuple(cur.fetchone().values()) == (1, "canary")
+
+        leased = queue.lease_linkedin(
+            conn, "refund-worker", public_ip="1.1.1.1", owner_ip="1.1.1.1", min_gap_seconds=0
+        )
+        assert leased is not None
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fleet_decision_policies SET status='retired' "
+                "WHERE lane='linkedin' AND status='active'"
+            )
+            cur.execute(
+                "INSERT INTO fleet_decision_policies(policy_version,lane,status) "
+                "VALUES ('replacement-linkedin','linkedin','active')"
+            )
+            cur.execute(
+                "UPDATE fleet_config SET linkedin_policy_version='replacement-linkedin' WHERE id=1"
+            )
+        conn.commit()
+        assert queue.requeue_linkedin(conn, "refund-worker", "li-refund", apply_error="usage") is True
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT linkedin_canary_remaining,linkedin_apply_mode FROM fleet_config WHERE id=1"
+            )
+            assert tuple(cur.fetchone().values()) == (1, "stopped")
+
+
 def test_lease_apply_skips_company_blocklist_match(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "openai-direct", host="greenhouse.io", score=10,
@@ -391,6 +467,11 @@ def test_lease_dedup_guard_blocks_reapply(fleet_db):
         assert a is not None
         queue.write_apply_result(conn, "w1", a["url"], status="applied",
                                  target_host=a["target_host"], home_ip="1.1.1.1")
+        conn.execute(
+            "SELECT public.fleet_controller_verify_submission('ats',%s,%s,'queue_test')",
+            (a["url"], "independent-test-receipt"),
+        )
+        conn.commit()
         # the OTHER board's posting (same company+role) must not be leasable now
         b = queue.lease_apply(conn, "w2", home_ip="2.2.2.2")
         assert b is None, "cross-board dedup should block the duplicate posting"
@@ -536,6 +617,14 @@ def test_write_result_records_outcome_and_applied_set(fleet_db):
         ok = queue.write_apply_result(conn, "w1", a["url"], status="applied",
                                       target_host="greenhouse.io", home_ip="1.2.3.4", est_cost_usd=0.5)
         assert ok
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM applied_set")
+            assert cur.fetchone()["n"] == 0
+        conn.execute(
+            "SELECT public.fleet_controller_verify_submission('ats',%s,%s,'queue_test')",
+            (a["url"], "independent-test-receipt"),
+        )
+        conn.commit()
         with conn.cursor() as cur:
             cur.execute("SELECT success_24h, count_24h FROM rate_governor WHERE scope_key='global'")
             g = cur.fetchone()
@@ -1018,7 +1107,7 @@ def test_linkedin_lease_serializes_under_concurrency(fleet_db):
     assert len(leased) == 1, f"account:linkedin must serialize to ONE concurrent session, got {leased}"
 
 
-def test_ats_canary_exhaustion_does_not_globally_pause_linkedin(fleet_db):
+def test_legacy_ats_canary_exhaustion_does_not_globally_pause_linkedin(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "ats-canary", host="greenhouse.io", score=9)
         _seed_linkedin(conn, "li-after-ats-canary", score=8)
@@ -1043,7 +1132,7 @@ def test_ats_canary_exhaustion_does_not_globally_pause_linkedin(fleet_db):
         assert leased["url"] == "li-after-ats-canary"
 
 
-def test_linkedin_canary_exhaustion_does_not_block_ats(fleet_db):
+def test_legacy_linkedin_canary_exhaustion_does_not_block_ats(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _seed_apply(conn, "ats-after-li-canary", host="greenhouse.io", score=9)
         _seed_linkedin(conn, "li-canary", score=8)
@@ -1098,6 +1187,14 @@ def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
             result_metadata={"apply_channel": "easy_apply"},
         ) is True
         with conn.cursor() as cur:
+            cur.execute("SELECT status FROM linkedin_queue WHERE url='li-x'")
+            assert cur.fetchone()["status"] == "crash_unconfirmed"
+        conn.execute(
+            "SELECT public.fleet_controller_verify_submission('linkedin',%s,%s,'queue_test')",
+            ("li-x", "independent-linkedin-receipt"),
+        )
+        conn.commit()
+        with conn.cursor() as cur:
             cur.execute(
                 "SELECT status, agent_model, apply_duration_ms FROM linkedin_queue WHERE url='li-x'"
             )
@@ -1109,7 +1206,7 @@ def test_write_linkedin_result_closes_linkedin_queue(fleet_db):
             }
             cur.execute(
                 "SELECT queue_name, agent, agent_model, application_tool_calls, result_metadata "
-                "FROM apply_result_events WHERE url='li-x'"
+                "FROM apply_result_events WHERE url='li-x' AND source='worker' ORDER BY id DESC LIMIT 1"
             )
             event = cur.fetchone()
             assert event["queue_name"] == "linkedin_queue"
@@ -1163,6 +1260,11 @@ def test_apply_host_cap_blocks_then_allows(fleet_db):
         a = queue.lease_apply(conn, "w1", home_ip="1.1.1.1")
         assert a is not None
         queue.write_apply_result(conn, "w1", a["url"], status="applied", target_host="cap.io", home_ip="1.1.1.1")
+        conn.execute(
+            "SELECT public.fleet_controller_verify_submission('ats',%s,%s,'queue_test')",
+            (a["url"], "independent-cap-receipt"),
+        )
+        conn.commit()
         # cap=1 reached. Wind last_applied back so the GAP isn't the blocker -> isolate the CAP.
         with conn.cursor() as cur:
             cur.execute("UPDATE rate_governor SET last_applied_at = now() - interval '300 seconds' WHERE scope_key='host:cap.io'")

@@ -340,3 +340,19 @@ def test_workday_cxs_block_does_not_trust_script_only_apply_marker(monkeypatch):
     assert liveness.probe_url(
         "https://visa.wd5.myworkdayjobs.com/Visa/job/US---CA/Senior-Analyst_REF1"
     ) == (liveness.UNCERTAIN, "workday_blocked_403")
+
+
+def test_workday_cxs_block_does_not_trust_generic_careers_apply_page(monkeypatch):
+    def fetch(url, accept=None):
+        if "/wday/cxs/" in url:
+            return 403, url, ""
+        return 200, url, (
+            "<html><body><h1>Company careers</h1>"
+            "<p>Explore our teams and apply for open roles.</p></body></html>" + "x" * 200
+        )
+
+    monkeypatch.setattr(liveness, "_fetch", fetch)
+
+    assert liveness.probe_url(
+        "https://visa.wd5.myworkdayjobs.com/Visa/job/US---CA/Senior-Analyst_REF1"
+    ) == (liveness.UNCERTAIN, "workday_blocked_403")

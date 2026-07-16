@@ -116,7 +116,7 @@ def build_ashby_plan(fields, *, profile, resume_text, corpus=None, answer_fn=Non
             if "sponsor" in low or "visa" in low:
                 sponsor = work_auth.get("require_sponsorship")
                 if sponsor is not None:
-                    value = not (str(sponsor).strip().lower() in {"no", "false", "0", "n"})
+                    value = str(sponsor).strip().lower() not in {"no", "false", "0", "n"}
             elif "authorized" in low or "eligible to work" in low:
                 authorized = work_auth.get("legally_authorized_to_work")
                 if authorized is not None:

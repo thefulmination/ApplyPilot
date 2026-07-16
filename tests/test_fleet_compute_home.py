@@ -66,7 +66,7 @@ def test_push_backlog_can_add_audit_task_after_score_task_exists(fleet_db, tmp_p
     assert {r["payload"]["full_description"] for r in rows} == {"the full JD"}
 
 
-def test_main_push_threads_unscored_only_and_limit(monkeypatch, capsys):
+def test_main_push_threads_unscored_only_and_limit(monkeypatch, capsys, fleet_db):
     called: dict[str, object] = {}
 
     def fake_push_backlog(**kwargs):
@@ -132,7 +132,7 @@ def test_reopen_results_exposes_compute_reopen_command(fleet_db):
         assert chm.reopen_results(pg_conn=pg) == 0
 
 
-def test_main_reopen_prints_reopened_count(monkeypatch, capsys):
+def test_main_reopen_prints_reopened_count(monkeypatch, capsys, fleet_db):
     monkeypatch.setattr(chm, "reopen_results", lambda: 3)
 
     assert chm.main(["reopen"]) == 0
@@ -298,7 +298,7 @@ def test_score_delta_audit_compares_snapshot_to_current_results(fleet_db):
     assert {row["url"] for row in report["top_changes"][:2]} == {"u-up", "u-down"}
 
 
-def test_main_delta_audit_prints_json(monkeypatch, capsys):
+def test_main_delta_audit_prints_json(monkeypatch, capsys, fleet_db):
     monkeypatch.setattr(chm, "score_delta_audit", lambda **kwargs: {"snapshot_rows": 2, "task": kwargs["task"]})
 
     assert chm.main(["delta-audit", "--snapshot", "snap", "--task", "score", "--json"]) == 0
@@ -346,7 +346,7 @@ def test_prioritize_snapshot_moves_only_queued_snapshot_rows_ahead(fleet_db):
     assert next(r for r in rows if r["url"] == "u-snapshot-done")["status"] == "done"
 
 
-def test_main_prioritize_snapshot_prints_count(monkeypatch, capsys):
+def test_main_prioritize_snapshot_prints_count(monkeypatch, capsys, fleet_db):
     monkeypatch.setattr(chm, "prioritize_snapshot", lambda **kwargs: 9)
 
     assert chm.main(["prioritize-snapshot", "--snapshot", "snap", "--task", "score"]) == 0

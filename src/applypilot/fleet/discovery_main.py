@@ -15,6 +15,7 @@ import os
 from applypilot.apply import pgqueue
 from applypilot.fleet.discovery_adapter import make_search_fn
 from applypilot.fleet import schema as fleet_schema
+from applypilot.fleet.emergency_admission import discovery_worker_admission, require_allowed
 from applypilot.fleet.worker import WorkerLoop
 
 
@@ -90,6 +91,7 @@ def main_worker(argv=None) -> int:
     with pgqueue.connect(args.dsn) as conn:
         fleet_schema.require_apply_result_event_schema(conn)
         fleet_schema.require_apply_attempt_schema(conn)
+        require_allowed(discovery_worker_admission(conn))
     loop = build_discovery_loop(
         dsn=args.dsn,
         worker_id=args.worker_id,

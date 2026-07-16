@@ -20,9 +20,10 @@ from pathlib import Path
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+conninfo_to_dict = psycopg.conninfo.conninfo_to_dict
 
-from applypilot.apply import pgqueue
-from applypilot.apply import fleet_sync
+from applypilot.apply import fleet_sync  # noqa: E402
+from applypilot.apply import pgqueue  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +33,7 @@ def _retire_score_only_queue_tests(request):
         "test_ensure_schema_is_idempotent",
         "test_legacy_score_only_queue_apis_are_disabled",
     }
-    if request.node.name not in allowed:
+    if request.node.name not in allowed and not request.node.name.startswith("test_connection_"):
         pytest.skip("legacy score-only queue retired; canonical v3 queue owns these invariants")
 
 
@@ -113,7 +114,7 @@ def pg_dsn():
         shutil.rmtree(datadir, ignore_errors=True)
         pytest.skip(f"could not start test Postgres (exit {e.returncode}):\n{log}")
 
-    dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+    dsn = f"postgresql://postgres:test-password@127.0.0.1:{port}/postgres"
     try:
         yield dsn
     finally:
@@ -174,11 +175,339 @@ def _insert_leased(conn, url, *, owner, attempts, apply_error, expires_delta_sec
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_get_dsn_prefers_applypilot_specific_env(monkeypatch):
+_CONNECTION_DEFAULTS = {
+    "application_name": "ApplyPilot",
+    "connect_timeout": "10",
+    "keepalives": "1",
+    "keepalives_idle": "30",
+    "keepalives_interval": "10",
+    "keepalives_count": "5",
+}
+_DOCUMENTED_LIBPQ_CONNECTION_ENV_VARS = (
+    "PGAPPNAME",
+    "PGCHANNELBINDING",
+    "PGCLIENTENCODING",
+    "PGCONNECT_TIMEOUT",
+    "PGDATABASE",
+    "PGDATESTYLE",
+    "PGGEQO",
+    "PGGSSDELEGATION",
+    "PGGSSENCMODE",
+    "PGGSSLIB",
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGKRBSRVNAME",
+    "PGLOADBALANCEHOSTS",
+    "PGLOCALEDIR",
+    "PGMAXPROTOCOLVERSION",
+    "PGMINPROTOCOLVERSION",
+    "PGOPTIONS",
+    "PGPASSFILE",
+    "PGPASSWORD",
+    "PGPORT",
+    "PGREQUIREAUTH",
+    "PGREQUIREPEER",
+    "PGREQUIRESSL",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSYSCONFDIR",
+    "PGSSLCERT",
+    "PGSSLCERTMODE",
+    "PGSSLCOMPRESSION",
+    "PGSSLCRL",
+    "PGSSLCRLDIR",
+    "PGSSLKEY",
+    "PGSSLMAXPROTOCOLVERSION",
+    "PGSSLMINPROTOCOLVERSION",
+    "PGSSLMODE",
+    "PGSSLNEGOTIATION",
+    "PGSSLROOTCERT",
+    "PGSSLSNI",
+    "PGTARGETSESSIONATTRS",
+    "PGTZ",
+    "PGUSER",
+)
+
+
+def _clear_ambient_libpq(monkeypatch):
+    for name in _DOCUMENTED_LIBPQ_CONNECTION_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def _capture_connection(monkeypatch):
+    _clear_ambient_libpq(monkeypatch)
+    captured = {}
+    sentinel = object()
+
+    def fake_connect(conninfo, **kwargs):
+        captured["params"] = conninfo_to_dict(conninfo)
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(pgqueue.psycopg, "connect", fake_connect)
+    return captured, sentinel
+
+
+@pytest.mark.parametrize(
+    "dsn, expected_host",
+    [
+        ("postgresql://worker:p%40ss@localhost/fleet", "localhost"),
+        ("postgresql://worker:p%40ss@[::1]:5432/fleet", "::1"),
+        ("host=127.0.0.1 dbname=fleet user=worker password='p@ss'", "127.0.0.1"),
+        (
+            "host=postgres.railway.internal dbname=fleet password='p@ss'",
+            "postgres.railway.internal",
+        ),
+        (
+            "host=pg-gateway.tailnet.ts.net dbname=fleet password='p@ss'",
+            "pg-gateway.tailnet.ts.net",
+        ),
+    ],
+)
+def test_connection_private_endpoints_receive_bounded_defaults(monkeypatch, dsn, expected_host):
+    captured, sentinel = _capture_connection(monkeypatch)
+
+    assert pgqueue.connect(dsn, autocommit=True) is sentinel
+
+    assert captured["params"]["host"] == expected_host
+    if "password" in captured["params"]:
+        assert captured["params"]["password"] == "p@ss"
+    for key, value in _CONNECTION_DEFAULTS.items():
+        assert captured["params"][key] == value
+    assert captured["kwargs"]["autocommit"] is True
+
+
+@pytest.mark.parametrize(
+    "dsn, expected_mode",
+    [
+        (
+            "postgresql://worker:p%40ss@db.example.com:5432/fleet?sslmode=verify-full&sslrootcert=system",
+            "verify-full",
+        ),
+        (
+            "host=db.example.com port=5432 dbname=fleet password=p "
+            "sslmode=verify-full sslrootcert=/run/secrets/provider-ca.pem",
+            "verify-full",
+        ),
+    ],
+)
+def test_connection_public_endpoints_require_explicit_tls(monkeypatch, dsn, expected_mode):
+    captured, sentinel = _capture_connection(monkeypatch)
+
+    assert pgqueue.connect(dsn) is sentinel
+
+    assert captured["params"]["sslmode"] == expected_mode
+    assert captured["params"]["sslrootcert"]
+    for key, value in _CONNECTION_DEFAULTS.items():
+        assert captured["params"][key] == value
+
+
+@pytest.mark.parametrize("sslmode", [None, "disable", "allow", "prefer", "require", "verify-ca"])
+def test_connection_public_endpoint_rejects_non_verifying_tls(monkeypatch, sslmode):
+    _clear_ambient_libpq(monkeypatch)
+    secret = "never-print-this-password"
+    suffix = "" if sslmode is None else f"?sslmode={sslmode}"
+    dsn = f"postgresql://worker:{secret}@roundhouse.proxy.rlwy.net:12345/fleet{suffix}"
+    monkeypatch.setattr(
+        pgqueue.psycopg,
+        "connect",
+        lambda *args, **kwargs: pytest.fail("invalid connection contract reached psycopg.connect"),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        pgqueue.connect(dsn)
+
+    assert "sslmode=verify-full" in str(exc_info.value)
+    assert secret not in str(exc_info.value)
+
+
+def test_connection_public_verify_full_requires_explicit_root_certificate(monkeypatch):
+    _clear_ambient_libpq(monkeypatch)
+    secret = "never-print-this-password"
+    dsn = f"postgresql://worker:{secret}@db.example.com/fleet?sslmode=verify-full"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        pgqueue.connect(dsn)
+
+    assert "sslrootcert" in str(exc_info.value)
+    assert secret not in str(exc_info.value)
+
+
+def test_connection_mixed_private_and_public_hosts_require_public_release_tls(monkeypatch):
+    _clear_ambient_libpq(monkeypatch)
+    monkeypatch.setattr(
+        pgqueue.psycopg,
+        "connect",
+        lambda *args, **kwargs: pytest.fail("ambiguous connection reached psycopg.connect"),
+    )
+
+    with pytest.raises(RuntimeError, match="sslmode=verify-full"):
+        pgqueue.connect("host=localhost,roundhouse.proxy.rlwy.net dbname=fleet password=p")
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "dbname=fleet",
+        "postgresql:///fleet",
+        "service=fleet",
+        "host=localhost service=fleet dbname=fleet",
+        "host=localhost passfile=/run/secrets/pgpass dbname=fleet",
+    ],
+)
+def test_connection_rejects_hostless_and_indirect_targets(monkeypatch, dsn):
+    _clear_ambient_libpq(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit|indirection"):
+        pgqueue.connect(dsn)
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://worker@localhost/fleet",
+        "host=localhost dbname=fleet user=worker",
+        "postgresql://worker@db.example.com/fleet?sslmode=verify-full&sslrootcert=system",
+        "host=db.example.com dbname=fleet sslmode=verify-full sslrootcert=system",
+    ],
+)
+def test_connection_rejects_passwordless_dsn_without_exposing_target(monkeypatch, dsn):
+    _clear_ambient_libpq(monkeypatch)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        pgqueue.connect(dsn)
+
+    assert "explicit password" in str(exc_info.value)
+    assert "localhost" not in str(exc_info.value)
+    assert "db.example.com" not in str(exc_info.value)
+
+
+def test_connection_environment_rejection_constant_is_exhaustive():
+    assert pgqueue.LIBPQ_CONNECTION_ENV_VARS == frozenset(_DOCUMENTED_LIBPQ_CONNECTION_ENV_VARS)
+    assert "PG_CONFIG" not in pgqueue.LIBPQ_CONNECTION_ENV_VARS
+
+
+@pytest.mark.parametrize("variable", _DOCUMENTED_LIBPQ_CONNECTION_ENV_VARS)
+def test_connection_rejects_every_documented_libpq_connection_variable(monkeypatch, variable):
+    _clear_ambient_libpq(monkeypatch)
+    monkeypatch.setenv(variable, "never-print-this-secret")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        pgqueue.connect("host=localhost dbname=fleet")
+
+    assert variable in str(exc_info.value)
+    assert "never-print-this-secret" not in str(exc_info.value)
+
+
+def test_connection_rejects_ambient_libpq_variable_even_when_empty(monkeypatch):
+    _clear_ambient_libpq(monkeypatch)
+    monkeypatch.setenv("PGHOST", "")
+
+    with pytest.raises(RuntimeError, match="PGHOST"):
+        pgqueue.connect("host=localhost dbname=fleet")
+
+
+@pytest.mark.parametrize("variable", ["PG_CONFIG", "PG_FLEET_LABEL", "PGAPP_WORKER_ID"])
+def test_connection_does_not_reject_unrelated_pg_prefixed_variables(monkeypatch, variable):
+    monkeypatch.setenv(variable, "unrelated-application-value")
+    monkeypatch.setenv("PG_CONFIG", "C:/PostgreSQL/bin/pg_config.exe")
+    captured, sentinel = _capture_connection(monkeypatch)
+
+    assert pgqueue.connect("host=localhost dbname=fleet password=p") is sentinel
+    assert captured["params"]["host"] == "localhost"
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "hostaddr=127.0.0.1 dbname=fleet",
+        "hostaddr=127.0.0.1,127.0.0.2 dbname=fleet",
+        "host=localhost hostaddr=127.0.0.1 dbname=fleet",
+        "host=localhost,db.example.com hostaddr=127.0.0.1 dbname=fleet",
+        "host=localhost hostaddr=8.8.8.8 dbname=fleet",
+        "host=db.example.com hostaddr=127.0.0.1 dbname=fleet",
+        "host=localhost, hostaddr=127.0.0.1,127.0.0.2 dbname=fleet",
+    ],
+)
+def test_connection_rejects_all_hostaddr_targets(monkeypatch, dsn):
+    _clear_ambient_libpq(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="hostaddr"):
+        pgqueue.connect(dsn)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "10.0.0.8",
+        "100.100.100.100",
+        "127.0.0.2",
+        "169.254.1.1",
+        "192.0.2.1",
+    ],
+)
+def test_connection_does_not_exempt_unapproved_ip_topologies(monkeypatch, host):
+    _clear_ambient_libpq(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="sslmode=verify-full"):
+        pgqueue.connect(f"host={host} dbname=fleet password=p")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "/var/run/postgresql",
+        "foo..railway.internal",
+        "-bad.railway.internal",
+        "*.tailnet.ts.net",
+        "gateway.ts.net",
+    ],
+)
+def test_connection_rejects_invalid_private_topology_syntax(monkeypatch, host):
+    _clear_ambient_libpq(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="topology|syntax"):
+        pgqueue.connect(f"host={host} dbname=fleet password=p")
+
+
+def test_connection_preserves_explicit_caller_settings(monkeypatch):
+    captured, sentinel = _capture_connection(monkeypatch)
+    dsn = (
+        "host=localhost dbname=fleet password=p connect_timeout=3 keepalives=1 "
+        "keepalives_idle=15 keepalives_interval=4 keepalives_count=2 "
+        "application_name=ApplyPilotController"
+    )
+
+    assert pgqueue.connect(dsn) is sentinel
+
+    assert captured["params"]["connect_timeout"] == "3"
+    assert captured["params"]["keepalives_idle"] == "15"
+    assert captured["params"]["keepalives_interval"] == "4"
+    assert captured["params"]["keepalives_count"] == "2"
+    assert captured["params"]["application_name"] == "ApplyPilotController"
+
+
+def test_connection_invalid_conninfo_error_is_secret_safe(monkeypatch):
+    _clear_ambient_libpq(monkeypatch)
+    secret = "never-print-this-password"
+    malformed = f"host=localhost password={secret} broken='unterminated"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        pgqueue.connect(malformed)
+
+    assert "Invalid fleet Postgres DSN" in str(exc_info.value)
+    assert secret not in str(exc_info.value)
+
+
+def test_connection_get_dsn_rejects_retired_applypilot_alias(monkeypatch):
+    monkeypatch.delenv("FLEET_PG_DSN", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://live.example/postgres")
     monkeypatch.setenv("APPLYPILOT_FLEET_DSN", "postgresql://test.example/postgres")
 
-    assert pgqueue.get_dsn() == "postgresql://test.example/postgres"
+    with pytest.raises(RuntimeError, match="FLEET_PG_DSN") as exc_info:
+        pgqueue.get_dsn()
+
+    assert "APPLYPILOT_FLEET_DSN" not in str(exc_info.value)
 
 
 def test_ensure_schema_is_idempotent(db):

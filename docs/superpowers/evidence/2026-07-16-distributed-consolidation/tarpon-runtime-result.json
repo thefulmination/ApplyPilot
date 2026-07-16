@@ -1,0 +1,115 @@
+{
+  "machine": "tarpon",
+  "branch": "codex/consolidation-python-tarpon-20260716",
+  "base_sha": "2b3a7c83118df840dda60c9b728f29e3dc0c1b9d",
+  "prior_blocked_handoff_sha": "66c209cbf6f5eb81f1434ab0fd651b0a948df8d0",
+  "head_sha_before_report_commit": "99253a1a4ce1ebd79ac23760f431ffdd794d3499",
+  "disposable_database": "applypilot_consolidation_tarpon",
+  "production_database_used": false,
+  "application_lane_state_touched": false,
+  "focused_tests_passed": true,
+  "real_postgres_tests_passed": false,
+  "integrated_rows": [
+    {
+      "branch": "codex/runtime-postgres-p0-p1",
+      "source_head": "bf3e1d2a2eab668c331a546f04089c7c8a2d46a9",
+      "status": "integrated"
+    },
+    {
+      "branch": "codex/postgres-canonical-brain-phase1",
+      "source_head": "6a0e3dce0377e6ff7f54cbdbc4d01bcb2bd820a3",
+      "status": "integrated"
+    },
+    {
+      "branch": "codex/audit-remediation-runtime",
+      "source_head": "93f0c475297332eb3ea428cae8fa1af3dfb57fed",
+      "status": "integrated"
+    },
+    {
+      "branch": "codex/fleet-dbhot-stage1",
+      "source_head": "2dfbaa310618e7e3d9e18526fa932b0c39f70ca6",
+      "status": "integrated"
+    },
+    {
+      "branch": "codex/fleet-dbhot-live-hotfix",
+      "source_head": "706bf4297de143bcc6e4edb15bb040617b530562",
+      "status": "integrated",
+      "integrated_commits": [
+        "ddad31f30ae49f09d28f888d42e01e85fc22bdfb",
+        "9218ee17961ddd44b4c995c6ea5981f28f893d29",
+        "9b98e125dbe7e018047d770e97b09fe407a42fae",
+        "cfd1eeeb2d9ef6844554bca2b5324299a60d2000",
+        "4fd6746c3cb8879b8bae912617dce5f916028101",
+        "706bf4297de143bcc6e4edb15bb040617b530562"
+      ],
+      "equivalent_commits_not_duplicated": [
+        "9ec4910324650b6c55f6720140116437fdb8b157"
+      ]
+    },
+    {
+      "branch": "codex/snapshot-python-main-safety-20260716",
+      "source_head": "4cde021ddd6f5cdbd4d8f8d9bdaff8d863113c89",
+      "status": "integrated"
+    },
+    {
+      "branch": "codex/p0-crash-idempotent-evidence-20260713-a25132",
+      "source_head": "57205199faf6e9fcf1142327424c1e412ac78f0e",
+      "status": "integrated"
+    }
+  ],
+  "migration_chain_resolution": {
+    "status": "resolved",
+    "runtime_commit": "2b3a7c83118df840dda60c9b728f29e3dc0c1b9d",
+    "verified_predecessor_blobs": {
+      "src/applypilot/fleet/schema_v3.sql": "0741a6e675d2ea42a3bb0d785fd4c0c444e96b3d",
+      "src/applypilot/apply/fleet_schema.sql": "6eb4a84dcc05568233ee32551b28c75f13b0a17f",
+      "src/applypilot/fleet/schema.py": "5637001b6457f9fc8f0c22f4220fe2e1249ff9c0"
+    },
+    "current_schema_v3_blob": "f8fc0f9574f1fa7eaa5e8e9fa4a2fae774594079",
+    "verification": "verify_predecessor now accepts an advanced checkout only when the recorded predecessor commit is an ancestor of HEAD and its tree contains the exact pinned blobs"
+  },
+  "test_evidence": [
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_migration_manifest.py -q --basetemp .pytest-tarpon-migrations-fixed",
+      "exit_code": 0,
+      "result": "5 passed, 5 skipped in 0.59s"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_agent_autoupdate_script.py tests/test_fleet_machine_blackout.py tests/test_fleet_machine_blackout_scripts.py tests/test_fleet_db_hot_paths.py -q --basetemp .pytest-tarpon-live-hotfix2",
+      "exit_code": 0,
+      "result": "173 passed, 6 skipped in 92.49s"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_fleet_v3_schema.py tests/test_fleet_pgqueue.py tests/test_fleet_v3_broker.py tests/test_fleet_v3_governor_queue.py tests/test_fleet_v3_worker.py tests/test_fleet_pg_roles.py -q --basetemp .pytest-tarpon-focused1-livehotfix",
+      "exit_code": 0,
+      "result": "109 passed, 191 skipped in 0.98s"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_outcome_timeline.py tests/test_emergency_admission_policy.py tests/test_apply_preflight_liveness.py -q --basetemp .pytest-tarpon-focused2-python-livehotfix",
+      "exit_code": 0,
+      "result": "47 passed in 0.82s"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m pytest tests/test_emergency_legacy_authority_containment.py -q --basetemp .pytest-tarpon-containment-livehotfix",
+      "exit_code": 1,
+      "result": "failed immediately with FileNotFoundError [WinError 2] because pwsh is absent"
+    },
+    {
+      "command": ".\\.venv\\Scripts\\python.exe -m ruff check src\\applypilot\\fleet\\migrator.py tests\\test_fleet_migration_manifest.py tests\\test_fleet_machine_blackout_scripts.py tests\\test_fleet_agent_autoupdate_script.py tests\\test_fleet_machine_blackout.py tests\\test_fleet_db_hot_paths.py",
+      "exit_code": 0,
+      "result": "all changed-file checks passed"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "result": "passed"
+    }
+  ],
+  "environment_limitations": [
+    "Docker is absent from PATH.",
+    "Local Postgres binaries are absent from PATH: initdb, pg_ctl, and psql were not found; APPLYPILOT_PGTEST_BIN is unset.",
+    "PowerShell 7 pwsh is absent from PATH.",
+    "Windows PowerShell 5.1 is present at C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe but was not used as a substitute for pwsh-only containment verification."
+  ],
+  "unresolved_blockers": []
+}

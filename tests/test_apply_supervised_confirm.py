@@ -87,7 +87,7 @@ def _job(url="https://boards.greenhouse.io/acme/jobs/123"):
     }
 
 
-def test_run_job_supervised_calls_record_once_on_applied(monkeypatch) -> None:
+def test_run_job_supervised_calls_record_once_on_applied(monkeypatch, acquisition_admitted) -> None:
     calls = []
 
     def fake_record(conn, apply_url, status):
@@ -106,7 +106,7 @@ def test_run_job_supervised_calls_record_once_on_applied(monkeypatch) -> None:
     assert calls[0][1] == "applied"
 
 
-def test_run_job_supervised_calls_record_once_on_failure(monkeypatch) -> None:
+def test_run_job_supervised_calls_record_once_on_failure(monkeypatch, acquisition_admitted) -> None:
     calls = []
 
     def fake_record(conn, apply_url, status):
@@ -124,7 +124,7 @@ def test_run_job_supervised_calls_record_once_on_failure(monkeypatch) -> None:
     assert calls[0][1] == "failed:no_confirmation"
 
 
-def test_run_job_non_supervised_never_calls_record(monkeypatch) -> None:
+def test_run_job_non_supervised_never_calls_record(monkeypatch, acquisition_admitted) -> None:
     calls = []
 
     def fake_record(conn, apply_url, status):

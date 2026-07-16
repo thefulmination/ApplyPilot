@@ -84,6 +84,53 @@ CANONICAL_QUEUE_FIELDS = frozenset({
 })
 
 
+def _sync_worker_lease_authority(conn, *, linkedin_owner_ip=None, home_ip=None) -> bool:
+    """Refresh controller-owned lease inputs when called by a privileged connection."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT has_table_privilege(current_user,'public.fleet_worker_blocklist','INSERT,DELETE') "
+            "AS controller"
+        )
+        if not cur.fetchone()["controller"]:
+            return False
+        blocked_names, blocked_patterns = config.load_blocked_companies()
+        cur.execute("DELETE FROM public.fleet_worker_blocklist")
+        cur.executemany(
+            "INSERT INTO public.fleet_worker_blocklist(kind,value) VALUES (%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            [*(('company', value) for value in blocked_names),
+             *(('pattern', value) for value in blocked_patterns)],
+        )
+        if linkedin_owner_ip is not None:
+            cur.execute(
+                "UPDATE public.fleet_config SET linkedin_owner_ip=%s WHERE id=1",
+                (linkedin_owner_ip,),
+            )
+        if home_ip is not None:
+            cur.execute(
+                "INSERT INTO public.rate_governor(scope_key) VALUES ('global'),(%s) "
+                "ON CONFLICT(scope_key) DO NOTHING",
+                (governor.home_ip_scope(home_ip),),
+            )
+            cur.execute(
+                "INSERT INTO public.rate_governor(scope_key) "
+                "SELECT DISTINCT 'host:'||COALESCE(target_host,apply_domain) "
+                "FROM public.apply_queue WHERE status='queued' "
+                "AND COALESCE(target_host,apply_domain) IS NOT NULL "
+                "ON CONFLICT(scope_key) DO NOTHING"
+            )
+    return True
+
+
+def _has_controller_table_authority(conn, table: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_catalog.has_table_privilege(current_user,%s,'UPDATE') AS allowed",
+            (f"public.{table}",),
+        )
+        return bool(cur.fetchone()["allowed"])
+
+
 def _validate_canonical_queue_row(row: Mapping[str, object]) -> None:
     missing = sorted(CANONICAL_QUEUE_FIELDS - row.keys())
     nulls = sorted(key for key in CANONICAL_QUEUE_FIELDS if key in row and row[key] is None)
@@ -117,10 +164,9 @@ def _validate_canonical_queue_row(row: Mapping[str, object]) -> None:
 #   - cfg … FOR UPDATE row-locks the single fleet_config row, serializing ALL
 #     apply leases on it — exactly as _LEASE_LINKEDIN locks 'account:linkedin'.
 #     No two transactions can pass the canary guard simultaneously.
-#   - The reserve UPDATE is a data-modifying CTE. Postgres runs ALL WITH
-#     data-modifying CTEs to completion even when unreferenced in the outer
-#     statement. It only fires when EXISTS(next_job), so a no-op lease (empty
-#     queue / all guards fail) never decrements canary_remaining.
+#   - After the queue row is leased, fleet_worker_authorize_lease rechecks the
+#     locked config/policy gates and performs any canary decrement. A failed
+#     authorization aborts this transaction, rolling the queue lease back.
 #   - ats_apply_mode is lane-local. Exhausting an ATS canary stops only the ATS
 #     lane; it never writes the shared paused flag that also gates LinkedIn.
 # ---------------------------------------------------------------------------
@@ -231,29 +277,11 @@ WITH cfg AS (SELECT ats_apply_mode, canary_enabled, canary_remaining, paused, at
        ORDER BY q.score DESC, q.url
        LIMIT 1
        FOR UPDATE OF q SKIP LOCKED
-     ),
-     reserve AS (
-       UPDATE fleet_config
-          SET canary_remaining = CASE
-                                    WHEN ats_apply_mode = 'canary' AND canary_enabled
-                                    THEN COALESCE(canary_remaining, 0) - 1
-                                    ELSE canary_remaining
-                                 END,
-              ats_apply_mode = CASE
-                                 WHEN ats_apply_mode = 'canary'
-                                      AND canary_enabled
-                                      AND COALESCE(canary_remaining, 0) - 1 <= 0
-                                 THEN 'stopped'
-                                 ELSE ats_apply_mode
-                               END
-        WHERE id = 1 AND EXISTS (SELECT 1 FROM next_job)
-       RETURNING 1
      )
 UPDATE apply_queue q
 SET status='leased', lease_owner=%(worker)s, lease_expires_at = now() + make_interval(secs => %(ttl)s),
     last_attempted_at = now(), attempts = q.attempts + 1, updated_at = now(), worker_home_ip = %(home_ip)s
 FROM next_job
-LEFT JOIN reserve ON TRUE
 WHERE q.url = next_job.url
 RETURNING q.url, q.company, q.title, q.application_url,
           COALESCE(q.target_host, q.apply_domain) AS target_host, q.score, q.dedup_key, q.attempts,
@@ -263,40 +291,14 @@ RETURNING q.url, q.company, q.title, q.application_url,
 
 def lease_apply(conn, worker_id, *, home_ip, ttl_seconds=1200, sw_version=None,
                 liveness_fresh_seconds=LIVENESS_FRESH_SECONDS):
-    if version_mismatch(conn, worker_id, sw_version):
-        return None
-    blocked_names, blocked_pats = config.load_blocked_companies()
+    if _has_controller_table_authority(conn, "fleet_config"):
+        _sync_worker_lease_authority(conn, home_ip=home_ip)
     with conn.cursor() as cur:
-        cur.execute(_LEASE_APPLY, {
-            "worker": worker_id, "home_ip": home_ip,
-            "home_scope": governor.home_ip_scope(home_ip), "ttl": ttl_seconds,
-            "liveness_fresh": liveness_fresh_seconds,
-            "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
-        })
+        cur.execute(
+            "SELECT * FROM public.fleet_worker_lease_ats(%s,%s,%s,%s,%s)",
+            (worker_id, home_ip, ttl_seconds, sw_version, liveness_fresh_seconds),
+        )
         row = cur.fetchone()
-        if row is not None:
-            # A worker can die after the lease is committed but before the terminal
-            # result writer runs. Keep a durable lifecycle marker so diagnostics can
-            # distinguish "leased, no terminal result" from an older row with no
-            # evidence at all. This is deliberately not a zero-tool result: a lease
-            # marker never proves that the application form was untouched.
-            cur.execute(
-                "INSERT INTO apply_result_events ("
-                "queue_name, url, worker_id, status, apply_status, target_host, "
-                "result_metadata, result_line, source"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    "apply_queue",
-                    row["url"],
-                    worker_id,
-                    "leased",
-                    "leased",
-                    row.get("target_host") or row.get("apply_domain"),
-                    Jsonb({"execution_evidence": "lease_started"}),
-                    "RESULT:lease_started",
-                    "worker_lease",
-                ),
-            )
     conn.commit()
     return dict(row) if row else None
 
@@ -396,6 +398,12 @@ def claim_liveness_check(conn, worker_id, *, ttl_seconds=120,
                          structural_retry_seconds=LIVENESS_STRUCTURAL_RETRY_SECONDS,
                          host_cooldown_seconds=LIVENESS_HOST_COOLDOWN_SECONDS):
     """Claim one stale required-liveness row without leasing an application."""
+    if not _has_controller_table_authority(conn, "apply_queue"):
+        with conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_claim_liveness() AS job")
+            row = cur.fetchone()["job"]
+        conn.commit()
+        return dict(row) if row else None
     with conn.cursor() as cur:
         cur.execute(_CLAIM_LIVENESS_SQL, {
             "worker": worker_id,
@@ -413,6 +421,15 @@ def claim_liveness_check(conn, worker_id, *, ttl_seconds=120,
 
 def write_liveness_result(conn, worker_id, url, *, status, reason) -> bool:
     """Commit an owner-guarded preflight verdict; confirmed dead rows terminate."""
+    if not _has_controller_table_authority(conn, "apply_queue"):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.fleet_worker_write_liveness(%s,%s,%s) AS ok",
+                (url, status, reason),
+            )
+            landed = cur.fetchone()["ok"]
+        conn.commit()
+        return landed
     normalized = status if status in {"live", "dead", "uncertain"} else "uncertain"
     with conn.cursor() as cur:
         cur.execute(
@@ -467,8 +484,11 @@ def requeue_apply(conn, worker_id, url, *, apply_error=None) -> bool:
     double-submit. Lease-owner guarded, so a reclaimed/foreign row is never clobbered.
     Returns True only if this worker held the lease."""
     with conn.cursor() as cur:
-        cur.execute(_REQUEUE_APPLY_SQL, {"apply_error": apply_error, "worker": worker_id, "url": url})
-        landed = cur.fetchone() is not None
+        cur.execute(
+            "SELECT public.fleet_worker_requeue('ats',%s,%s,%s) AS landed",
+            (url, worker_id, apply_error),
+        )
+        landed = cur.fetchone()["landed"]
     conn.commit()
     return landed
 
@@ -477,18 +497,12 @@ def park_infrastructure_failure(conn, worker_id, url, *, apply_error) -> dict | 
     """Park an untouched row after its one local component restart also failed."""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE apply_queue SET status='failed'::apply_queue_status, "
-            "apply_status='infrastructure_pending', apply_error=%s, "
-            "attempts=GREATEST(attempts-1,0), infrastructure_failure_count="
-            "COALESCE(infrastructure_failure_count,0)+1, infrastructure_last_failure_at=now(), "
-            "lease_owner=NULL, lease_expires_at=NULL, updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s "
-            "RETURNING status, apply_status, infrastructure_failure_count",
-            (apply_error[:200] if apply_error else "browser_preflight", url, worker_id),
+            "SELECT public.fleet_worker_park_infrastructure(%s,%s,%s) AS parked",
+            (url, worker_id, apply_error),
         )
-        row = cur.fetchone()
+        parked = cur.fetchone()["parked"]
     conn.commit()
-    return dict(row) if row else None
+    return dict(parked) if parked else None
 
 
 def _result_line(status, apply_status=None, apply_error=None) -> str:
@@ -496,6 +510,20 @@ def _result_line(status, apply_status=None, apply_error=None) -> str:
         return "RESULT:APPLIED"
     token = apply_error or apply_status or status or "unknown"
     return f"RESULT:{token}"
+
+
+def _terminalize(
+    conn, lane, worker_id, url, *, status, apply_status, apply_error, evidence, commit=True
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT public.fleet_worker_terminalize(%s,%s,%s,%s,%s,%s,%s) AS landed",
+            (lane, url, worker_id, status, apply_status, apply_error, Jsonb(evidence)),
+        )
+        landed = cur.fetchone()["landed"]
+    if commit:
+        conn.commit()
+    return landed
 
 
 def resolve_superseded_challenges(cur, url, *, terminal_status, queue_name) -> int:
@@ -528,173 +556,44 @@ def write_apply_result(conn, worker_id, url, *, status, target_host, home_ip,
                         application_tool_calls=None, last_tool=None, host_policy=None,
                         job_log_path=None, transcript_digest=None,
                         final_result_source=None, result_metadata=None):
-    """Close the apply (lease-owner guarded), record the governor outcome on
-    global+host+home_ip (bump cap on a confirmed apply), and UPSERT applied_set
-    so the posting can never be applied to again. One transaction.
+    """Record a lease-bound worker assertion and park claimed submissions.
+
+    This never creates canonical applied state or ``applied_set``. Independent
+    controller verification performs that promotion in a separate boundary.
 
     ``outcome`` in {'success','captcha','block'}; derived from ``status`` if None.
     A generic page/form failure derives to None and records NO challenge outcome,
     so it cannot pollute the captcha_24h leading indicator that drives the breaker.
     Returns False if the lease was lost (already reclaimed/closed)."""
-    if outcome is None:
-        # Only true terminal classes map to a governor outcome; unknown -> None.
-        outcome = {"applied": "success", "blocked": "block", "captcha": "captcha"}.get(status)
-    scopes = [governor.GLOBAL, governor.host_scope(target_host), governor.home_ip_scope(home_ip)]
-    # A3: last_attempt_at stamped on EVERY recorded outcome (so a never-succeeded host is still
-    # spaced by the lease's COALESCE(last_applied_at, last_attempt_at) gap); last_applied_at +
-    # count_24h remain confirmed-apply only.
-    extra = (", count_24h = count_24h + 1, last_applied_at = now(), last_attempt_at = now()"
-             if status == "applied" else ", last_attempt_at = now()")
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE apply_queue SET status=%s, apply_status=%s, apply_error=%s, "
-            "est_cost_usd=COALESCE(%s,0), "
-            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+COALESCE(%s,0), "
-            "agent_model=%s, apply_duration_ms=%s, "
-            "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s RETURNING host_policy",
-            (
-                status, apply_status, apply_error, est_cost_usd, est_cost_usd,
-                agent_model, apply_duration_ms,
-                status, worker_id, url, worker_id,
-            ),
-        )
-        if cur.rowcount == 0:
-            conn.rollback()
-            return False
-        queue_host_policy = cur.fetchone()["host_policy"]
-        resolve_superseded_challenges(
-            cur, url, terminal_status=status, queue_name="apply_queue"
-        )
-        if outcome is not None:
-            col = governor._OUTCOME_COL[outcome]
-            for sk in scopes:
-                cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
-                cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at = now() WHERE scope_key = %s", (sk,))
-        # A confirmed apply OR a possibly-submitted crash both enter applied_set, so the
-        # cross-board dedup guard at lease time covers a posting that may already carry
-        # the user's name -- never re-apply (and never re-push, see fleet.sync).
-        if status in ("applied", "crash_unconfirmed"):
-            cur.execute(
-                "INSERT INTO applied_set (dedup_key, company, applied_url) "
-                "SELECT dedup_key, company, application_url FROM apply_queue WHERE url=%s AND dedup_key IS NOT NULL "
-                "ON CONFLICT (dedup_key) DO NOTHING",
-                (url,),
-            )
-        cur.execute(
-            "INSERT INTO apply_result_events ("
-            "queue_name, url, worker_id, machine_owner, status, apply_status, apply_error, target_host, home_ip, "
-            "agent, agent_model, est_cost_usd, apply_duration_ms, route, failure_class, tool_calls_total, "
-            "application_tool_calls, last_tool, host_policy, job_log_path, transcript_digest, "
-            "final_result_source, result_metadata, result_line, source"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                "apply_queue",
-                url,
-                worker_id,
-                machine_owner,
-                status,
-                apply_status,
-                apply_error,
-                target_host,
-                home_ip,
-                agent,
-                agent_model,
-                est_cost_usd,
-                apply_duration_ms,
-                route,
-                failure_class,
-                tool_calls_total,
-                application_tool_calls,
-                last_tool,
-                host_policy if host_policy is not None else queue_host_policy,
-                job_log_path,
-                transcript_digest,
-                final_result_source,
-                Jsonb(result_metadata or {}),
-                _result_line(status, apply_status=apply_status, apply_error=apply_error),
-                "worker",
-            ),
-        )
-        # Phase 2.1: the apply lane spends real agent money but never recorded it to
-        # llm_usage, so every cost cap (_cost_cap_exceeded, fleet_config spend caps)
-        # read $0 while real cost was incurred. Mirrors write_compute_result's insert;
-        # 'apply_agent' matches the existing SQLite-brain stage convention (see
-        # apply.supervisor._apply_cost_total). Only a real, positive cost is worth a row.
-        if est_cost_usd is not None and float(est_cost_usd) > 0:
-            # provider = the apply agent that spent it (claude/codex/deepseek) so
-            # agent_budget.rolling_spend can sum per-agent spend for the predictive monitor.
-            cur.execute(
-                "INSERT INTO llm_usage (worker_id, machine_owner, task, model, provider, cost_usd) "
-                "VALUES (%s,%s,%s,%s,%s,%s)",
-                (worker_id, machine_owner, "apply_agent", agent_model, agent, est_cost_usd),
-            )
-    conn.commit()
-    return True
-
-
-def record_apply_challenge_event(
-    conn,
-    worker_id,
-    url,
-    *,
-    kind,
-    target_host,
-    home_ip,
-    est_cost_usd=0,
-    agent=None,
-    agent_model=None,
-    apply_duration_ms=None,
-    route=None,
-    failure_class=None,
-    tool_calls_total=None,
-    application_tool_calls=None,
-    last_tool=None,
-    result_metadata=None,
-    job_log_path=None,
-    transcript_digest=None,
-    final_result_source=None,
-    commit=True,
-):
-    """Persist nonterminal challenge spend without closing the held lease."""
-    cost = float(est_cost_usd or 0)
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE apply_queue SET est_cost_usd=COALESCE(est_cost_usd,0)+%s, "
-            "cumulative_cost_usd=COALESCE(cumulative_cost_usd,0)+%s, "
-            "agent_model=COALESCE(%s,agent_model), worker_id=%s, updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s AND status='leased'",
-            (cost, cost, agent_model, worker_id, url, worker_id),
-        )
-        if cur.rowcount == 0:
-            if commit:
-                conn.rollback()
-            return False
-        cur.execute(
-            "INSERT INTO apply_result_events ("
-            "queue_name,url,worker_id,status,apply_status,apply_error,target_host,home_ip,"
-            "agent,agent_model,est_cost_usd,apply_duration_ms,result_line,source,route,"
-            "failure_class,tool_calls_total,application_tool_calls,last_tool,result_metadata,"
-            "job_log_path,transcript_digest,final_result_source"
-            ") VALUES ("
-            "%s,%s,%s,'challenge_pending','challenge_pending',%s,%s,%s,%s,%s,%s,%s,"
-            "'RESULT:challenge_pending','worker',%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                "apply_queue", url, worker_id, f"challenge:{kind}", target_host, home_ip,
-                agent, agent_model, cost, apply_duration_ms, route, failure_class,
-                tool_calls_total, application_tool_calls, last_tool,
-                Jsonb(result_metadata or {}) if result_metadata is not None else None,
-                job_log_path, transcript_digest, final_result_source,
-            ),
-        )
-        if cost > 0:
-            cur.execute(
-                "INSERT INTO llm_usage (worker_id,task,provider,cost_usd) VALUES (%s,%s,%s,%s)",
-                (worker_id, "apply_agent", agent, cost),
-            )
-    if commit:
-        conn.commit()
-    return True
+    return _terminalize(
+        conn,
+        "ats",
+        worker_id,
+        url,
+        status=status,
+        apply_status=apply_status,
+        apply_error=apply_error,
+        evidence={
+            "asserted_target_host": target_host,
+            "asserted_home_ip": home_ip,
+            "est_cost_usd": est_cost_usd,
+            "agent": agent,
+            "agent_model": agent_model,
+            "apply_duration_ms": apply_duration_ms,
+            "machine_owner": machine_owner,
+            "route": route,
+            "failure_class": failure_class,
+            "tool_calls_total": tool_calls_total,
+            "application_tool_calls": application_tool_calls,
+            "last_tool": last_tool,
+            "host_policy": host_policy,
+            "job_log_path": job_log_path,
+            "transcript_digest": transcript_digest,
+            "final_result_source": final_result_source,
+            "result_metadata": result_metadata or {},
+            "asserted_outcome": outcome,
+        },
+    )
 
 
 def suppress_applied_set_duplicates(conn, *, commit=True) -> int:
@@ -866,7 +765,8 @@ def approve_jobs(conn, urls, batch, *, commit=True) -> int:
     return n
 
 
-def park_challenge(conn, worker_id, url, *, commit=True) -> bool:
+def park_challenge(conn, worker_id, url, *, kind="challenge", route=None, evidence=None,
+                   commit=True) -> bool:
     """Freeze a leased apply row OUT of the reclaim pool while a human resolves an
     auth wall (R3 fail-safe). Keep status='leased' (so ``lease_apply`` -- which only
     picks status='queued' -- never re-picks it), but push ``lease_expires_at`` far
@@ -877,12 +777,10 @@ def park_challenge(conn, worker_id, url, *, commit=True) -> bool:
     False if the lease is no longer held."""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE apply_queue SET lease_expires_at = now() + interval '3650 days', "
-            "apply_status='challenge_pending', apply_error=COALESCE(apply_error,'challenge_pending'), updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s AND status='leased'",
-            (url, worker_id),
+            "SELECT public.fleet_worker_park('ats',%s,%s,%s,0,%s) AS ok",
+            (url, worker_id, kind, Jsonb({**(evidence or {}), "challenge_route": route})),
         )
-        ok = cur.rowcount > 0
+        ok = cur.fetchone()["ok"]
     if commit:
         conn.commit()
     return ok
@@ -956,6 +854,12 @@ RETURNING c.url, c.task, c.payload, c.attempts;
 
 
 def lease_compute(conn, worker_id, *, ttl_seconds=1200, sw_version=None):
+    if not _has_controller_table_authority(conn, "compute_queue"):
+        with conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_lease_compute() AS job")
+            row = cur.fetchone()["job"]
+        conn.commit()
+        return dict(row) if row else None
     if version_mismatch(conn, worker_id, sw_version):
         return None
     if _cost_cap_exceeded(conn):
@@ -973,6 +877,22 @@ def write_compute_result(conn, worker_id, url, *, result, status="done", cost_us
     effective_task = task
     if effective_task is None and isinstance(result, dict):
         effective_task = result.get("task")
+    if not _has_controller_table_authority(conn, "compute_queue"):
+        usage = {
+            "cost_usd": cost_usd,
+            "model": model,
+            "provider": provider,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+        }
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.fleet_worker_complete_compute(%s,%s,%s,%s,%s) AS ok",
+                (url, effective_task, status, Jsonb(result), Jsonb(usage)),
+            )
+            landed = cur.fetchone()["ok"]
+        conn.commit()
+        return landed
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE compute_queue SET status=%s, result=%s, est_cost_usd=COALESCE(%s,0), updated_at=now() "
@@ -1056,6 +976,12 @@ def _run_search_transaction_with_retry(conn, operation):
 
 
 def lease_search(conn, worker_id, *, ttl_seconds=900, sw_version=None):
+    if not _has_controller_table_authority(conn, "search_tasks"):
+        with conn.cursor() as cur:
+            cur.execute("SELECT public.fleet_worker_lease_search() AS task")
+            row = cur.fetchone()["task"]
+        conn.commit()
+        return dict(row) if row else None
     if version_mismatch(conn, worker_id, sw_version):
         return None
     def operation():
@@ -1068,9 +994,30 @@ def lease_search(conn, worker_id, *, ttl_seconds=900, sw_version=None):
     return _run_search_transaction_with_retry(conn, operation)
 
 
-def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, error=None, cadence_seconds=None):
+def complete_search(conn, worker_id, task_id, *, result_count=0, board=None, error=None,
+                    cadence_seconds=None, postings=None):
     """Mark the search done, record a scrape outcome on the board scope, and
     RE-SCHEDULE the task (status back to 'queued', next_due_at = now + cadence)."""
+    if not _has_controller_table_authority(conn, "search_tasks"):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.fleet_worker_complete_search(%s,%s,%s) AS ok",
+                (task_id, Jsonb(postings or []), error),
+            )
+            landed = cur.fetchone()["ok"]
+        conn.commit()
+        return landed
+
+    if postings:
+        push_discovered(
+            conn,
+            task_id=task_id,
+            source_label=board,
+            worker_id=worker_id,
+            postings=postings,
+            commit=False,
+        )
+
     def operation():
         with conn.cursor() as cur:
             cur.execute(
@@ -1125,7 +1072,8 @@ LINKEDIN_FRESH_MAX_AGE_DAYS = 3
 
 _LEASE_LINKEDIN = """
 WITH cfg AS (SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canary_remaining,
-                    linkedin_policy_version, approval_threshold FROM fleet_config WHERE id=1 FOR UPDATE),
+                    linkedin_policy_version, approval_threshold, paused
+             FROM fleet_config WHERE id=1 FOR UPDATE),
      acct AS (
        SELECT count_24h, daily_cap, last_applied_at, min_gap_seconds, breaker_state, breaker_until, halted_until
        FROM rate_governor WHERE scope_key = 'account:linkedin' FOR UPDATE
@@ -1145,6 +1093,7 @@ WITH cfg AS (SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canar
                    AND COALESCE(cfg.linkedin_canary_remaining, 0) > 0
               )
          )
+         AND NOT COALESCE(cfg.paused, FALSE)
          AND q.decision_id IS NOT NULL
          AND q.policy_version = cfg.linkedin_policy_version
          AND q.decision_action = 'apply'
@@ -1174,28 +1123,13 @@ WITH cfg AS (SELECT linkedin_apply_mode, linkedin_canary_enabled, linkedin_canar
      reserve AS (
        UPDATE rate_governor SET count_24h = count_24h + 1, last_applied_at = now(), updated_at = now()
        WHERE scope_key = 'account:linkedin' AND EXISTS (SELECT 1 FROM next) RETURNING 1
-     ),
-     canary AS (
-       UPDATE fleet_config
-       SET linkedin_canary_remaining = COALESCE(linkedin_canary_remaining, 0) - 1,
-           linkedin_apply_mode = CASE
-                                   WHEN COALESCE(linkedin_canary_remaining, 0) - 1 <= 0
-                                   THEN 'stopped'
-                                   ELSE linkedin_apply_mode
-                                 END
-       WHERE id = 1
-         AND linkedin_apply_mode = 'canary'
-         AND linkedin_canary_enabled
-         AND EXISTS (SELECT 1 FROM next)
-       RETURNING 1
      )
 UPDATE linkedin_queue q SET status='leased', lease_owner=%(worker)s,
   lease_expires_at = now() + make_interval(secs => %(ttl)s), last_attempted_at=now(), attempts=q.attempts+1, updated_at=now()
 FROM next
 LEFT JOIN reserve ON TRUE
-LEFT JOIN canary ON TRUE
 WHERE q.url = next.url
-RETURNING q.url, q.company, q.title, q.application_url, q.score;
+RETURNING q.url, q.company, q.title, q.application_url, q.score, q.attempts;
 """
 
 
@@ -1208,23 +1142,26 @@ def lease_linkedin(conn, worker_id, *, public_ip, owner_ip, ttl_seconds=1200,
     worker. They must match or the lease is refused outright."""
     if public_ip is None or owner_ip is None or public_ip != owner_ip:
         return None  # LinkedIn never from a different IP than the owner's
-    if version_mismatch(conn, worker_id, sw_version):
-        return None
-    blocked_names, blocked_pats = config.load_blocked_companies()
+    controller = _has_controller_table_authority(conn, "fleet_config")
+    if controller:
+        _sync_worker_lease_authority(conn, linkedin_owner_ip=owner_ip)
     with conn.cursor() as cur:
         # Ensure the account governor row EXISTS so the FOR UPDATE mutex has a row to
         # lock (otherwise concurrent leases wouldn't serialize). Preserves an existing cap.
+        if controller:
+            cur.execute(
+                "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
+                "VALUES ('account:linkedin', %s, %s, %s) ON CONFLICT (scope_key) DO NOTHING",
+                (daily_cap, min_gap_seconds, min_gap_seconds),
+            )
+            cur.execute(
+                "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
+                "VALUES ('global', 100000, 0, 0) ON CONFLICT (scope_key) DO NOTHING"
+            )
         cur.execute(
-            "INSERT INTO rate_governor (scope_key, daily_cap, min_gap_seconds, base_min_gap_seconds) "
-            "VALUES ('account:linkedin', %s, %s, %s) ON CONFLICT (scope_key) DO NOTHING",
-            (daily_cap, min_gap_seconds, min_gap_seconds),
+            "SELECT * FROM public.fleet_worker_lease_linkedin(%s,%s,%s,%s,%s)",
+            (worker_id, public_ip, owner_ip, ttl_seconds, sw_version),
         )
-        cur.execute(_LEASE_LINKEDIN, {
-            "worker": worker_id, "ttl": ttl_seconds,
-            "blocked_names": list(blocked_names), "blocked_pats": blocked_pats,
-            "fresh_statuses": list(LINKEDIN_FRESH_STATUSES),
-            "fresh_days": LINKEDIN_FRESH_MAX_AGE_DAYS,
-        })
         row = cur.fetchone()
     conn.commit()
     return dict(row) if row else None
@@ -1241,15 +1178,8 @@ SET status           = 'queued',
     updated_at       = now()
 WHERE url = %(url)s
   AND lease_owner = %(worker)s
+  AND attempts = %(attempt)s
 RETURNING url;
-"""
-
-_REFUND_LINKEDIN_CANARY_SQL = """
-UPDATE fleet_config
-SET linkedin_canary_remaining = COALESCE(linkedin_canary_remaining, 0) + 1,
-    linkedin_apply_mode = 'canary'
-WHERE id = 1
-  AND linkedin_canary_enabled;
 """
 
 _REFUND_LINKEDIN_ACCOUNT_SQL = """
@@ -1278,13 +1208,16 @@ def requeue_linkedin(conn, worker_id, url, *, apply_error=None) -> bool:
     no-op path also refunds that reservation so a quota wall does not block real applies.
     """
     with conn.cursor() as cur:
-        cur.execute(_REQUEUE_LINKEDIN_SQL, {"apply_error": apply_error, "worker": worker_id, "url": url})
-        landed = cur.fetchone() is not None
-        if landed:
-            cur.execute(_REFUND_LINKEDIN_CANARY_SQL)
-            cur.execute(_REFUND_LINKEDIN_ACCOUNT_SQL, {"url": url})
+        cur.execute(
+            "SELECT public.fleet_worker_requeue('linkedin',%s,%s,%s) AS landed",
+            (url, worker_id, apply_error),
+        )
+        landed = cur.fetchone()["landed"]
+        if not landed:
+            conn.rollback()
+            return False
     conn.commit()
-    return landed
+    return True
 
 
 def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, apply_error=None,
@@ -1294,67 +1227,38 @@ def write_linkedin_result(conn, worker_id, url, *, status, apply_status=None, ap
                           application_tool_calls=None, job_log_path=None,
                           transcript_digest=None, final_result_source=None,
                           result_metadata=None):
-    """Close a LinkedIn lease (lease-owner guarded) in linkedin_queue -- NOT apply_queue --
-    record the outcome on the account:linkedin governor, and UPSERT applied_set on a
-    confirmed/possibly-submitted terminal. The cap (count_24h) + min-gap were already
-    RESERVED at lease time, so this does NOT bump count_24h again. Returns False if the
-    lease was lost."""
-    if outcome is None:
-        outcome = {"applied": "success", "blocked": "block", "captcha": "captcha"}.get(status)
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE linkedin_queue SET status=%s, apply_status=%s, apply_error=%s, est_cost_usd=COALESCE(%s,0), "
-            "agent_model=%s, apply_duration_ms=%s, "
-            "apply_channel=COALESCE(%s, apply_channel), apply_external_host=COALESCE(%s, apply_external_host), "
-            "applied_at = CASE WHEN %s = 'applied' THEN now() ELSE applied_at END, worker_id=%s, updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s",
-            (status, apply_status, apply_error, est_cost_usd, agent_model, apply_duration_ms,
-             apply_channel, apply_external_host,
-             status, worker_id, url, worker_id),
-        )
-        if cur.rowcount == 0:
-            conn.rollback()
-            return False
-        resolve_superseded_challenges(
-            cur, url, terminal_status=status, queue_name="linkedin_queue"
-        )
-        if outcome is not None:
-            sk = governor.LINKEDIN_ACCOUNT
-            col = governor._OUTCOME_COL[outcome]
-            extra = ", last_applied_at = now()" if status == "applied" else ""  # refresh gap on a confirmed apply
-            cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING", (sk,))
-            cur.execute(f"UPDATE rate_governor SET {col} = {col} + 1{extra}, updated_at=now() WHERE scope_key=%s", (sk,))
-        if status in ("applied", "crash_unconfirmed"):
-            cur.execute(
-                "INSERT INTO applied_set (dedup_key, company, applied_url) "
-                "SELECT dedup_key, company, application_url FROM linkedin_queue WHERE url=%s AND dedup_key IS NOT NULL "
-                "ON CONFLICT (dedup_key) DO NOTHING",
-                (url,),
-            )
-        cur.execute(
-            "INSERT INTO apply_result_events ("
-            "queue_name, url, worker_id, machine_owner, status, apply_status, apply_error, target_host, home_ip, "
-            "agent, agent_model, est_cost_usd, apply_duration_ms, application_tool_calls, "
-            "job_log_path, transcript_digest, final_result_source, result_metadata, result_line, source"
-            ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,0),%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                "linkedin_queue", url, worker_id, machine_owner, status, apply_status, apply_error,
-                target_host, home_ip, agent, agent_model, est_cost_usd, apply_duration_ms,
-                application_tool_calls, job_log_path, transcript_digest, final_result_source,
-                Jsonb(result_metadata or {}),
-                _result_line(status, apply_status=apply_status, apply_error=apply_error),
-                "worker",
-            ),
-        )
-        if est_cost_usd is not None and float(est_cost_usd) > 0:
-            cur.execute(
-                "INSERT INTO llm_usage (worker_id, machine_owner, task, model, provider, cost_usd) "
-                "VALUES (%s,%s,%s,%s,%s,%s)",
-                (worker_id, machine_owner, "apply_agent", agent_model, agent, est_cost_usd),
-            )
-    conn.commit()
-    return True
+    """Record a lease-bound LinkedIn assertion and park claimed submissions.
 
+    This never creates canonical applied state or ``applied_set``. The account
+    reservation was made at lease time and is not incremented again here.
+    Returns False if the lease was lost.
+    """
+    return _terminalize(
+        conn,
+        "linkedin",
+        worker_id,
+        url,
+        status=status,
+        apply_status=apply_status,
+        apply_error=apply_error,
+        evidence={
+            "est_cost_usd": est_cost_usd,
+            "asserted_outcome": outcome,
+            "apply_channel": apply_channel,
+            "apply_external_host": apply_external_host,
+            "asserted_target_host": target_host,
+            "asserted_home_ip": home_ip,
+            "agent": agent,
+            "agent_model": agent_model,
+            "apply_duration_ms": apply_duration_ms,
+            "machine_owner": machine_owner,
+            "application_tool_calls": application_tool_calls,
+            "job_log_path": job_log_path,
+            "transcript_digest": transcript_digest,
+            "final_result_source": final_result_source,
+            "result_metadata": result_metadata or {},
+        },
+    )
 
 # ---------------------------------------------------------------------------
 # DISCOVERY staging -- lean workers push raw JobSpy postings here; home box ingests.
@@ -1386,23 +1290,18 @@ def push_discovered(conn, *, task_id, source_label, worker_id, postings, commit=
     return n
 
 
-def park_linkedin_challenge(conn, worker_id, url, *, halt_seconds, commit=True) -> bool:
+def park_linkedin_challenge(conn, worker_id, url, *, halt_seconds, kind="challenge",
+                            route=None, evidence=None, commit=True) -> bool:
     """Freeze the held linkedin_queue lease out of reclaim AND set the account halt, in ONE tx."""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE linkedin_queue SET apply_status='challenge_pending', "
-            "lease_expires_at = now() + interval '3650 days', updated_at=now() "
-            "WHERE url=%s AND lease_owner=%s", (url, worker_id))
-        if cur.rowcount == 0:
-            conn.rollback()
-            return False
-        cur.execute("INSERT INTO rate_governor (scope_key) VALUES (%s) ON CONFLICT (scope_key) DO NOTHING",
-                    (governor.LINKEDIN_ACCOUNT,))
-        cur.execute("UPDATE rate_governor SET halted_until = now() + make_interval(secs => %s), updated_at=now() "
-                    "WHERE scope_key=%s", (halt_seconds, governor.LINKEDIN_ACCOUNT))
+            "SELECT public.fleet_worker_park('linkedin',%s,%s,%s,%s,%s) AS ok",
+            (url, worker_id, kind, halt_seconds, Jsonb({**(evidence or {}), "challenge_route": route})),
+        )
+        ok = cur.fetchone()["ok"]
     if commit:
         conn.commit()
-    return True
+    return ok
 
 
 def reclaim_linkedin(conn, *, grace_seconds=30, commit=True) -> int:

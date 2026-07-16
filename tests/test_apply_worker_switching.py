@@ -7,8 +7,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
 from applypilot.fleet import apply_worker_main as awm
 from applypilot.fleet.agent_switch import AgentSwitcher
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 class _StubCtx:
@@ -375,20 +379,30 @@ def test_run_apply_propagates_local_wall_to_budget(monkeypatch):
 
 
 def test_pg_agent_budget_throttles_evaluate(monkeypatch):
-    calls = {"n": 0}
-    monkeypatch.setattr("applypilot.fleet.agent_budget.evaluate_soft_blocks",
-                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), [])[1])
+    calls = []
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, statement, params): calls.append((statement, params))
+        def fetchone(self): return {"blocks": {}}
+
+    class Connection:
+        def cursor(self): return Cursor()
+        def commit(self): return None
+
     clock = {"t": 0.0}
     b = awm.PgAgentBudget(soft_caps={"claude": 5.0}, eval_interval_seconds=100,
                           time_fn=lambda: clock["t"])
-    b.maybe_evaluate(object())
-    assert calls["n"] == 1        # first call runs
+    b.maybe_evaluate(Connection())
+    assert len(calls) == 1        # first call runs
+    assert "fleet_worker_evaluate_agent_budget" in calls[0][0]
     clock["t"] = 50
-    b.maybe_evaluate(object())
-    assert calls["n"] == 1        # throttled
+    b.maybe_evaluate(Connection())
+    assert len(calls) == 1        # throttled
     clock["t"] = 101
-    b.maybe_evaluate(object())
-    assert calls["n"] == 2        # due again
+    b.maybe_evaluate(Connection())
+    assert len(calls) == 2        # due again
 
 
 def test_pg_agent_budget_no_caps_skips_evaluate(monkeypatch):

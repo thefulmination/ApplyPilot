@@ -29,14 +29,15 @@ def test_match_is_case_and_whitespace_insensitive():
     enforce_host_identity("  Home ", env={"APPLYPILOT_FLEET_LABEL": "home"})
 
 
-def test_unlabeled_box_is_permissive_for_backcompat():
-    # Box identity unknown -> cannot guard -> allow, so boxes that haven't set
-    # APPLYPILOT_FLEET_LABEL yet (m2/m4) keep working until they're labeled.
-    enforce_host_identity("m2", env={})
-    enforce_host_identity("m2", env={"APPLYPILOT_FLEET_LABEL": "   "})
+def test_unlabeled_or_unenrolled_worker_is_rejected():
+    with pytest.raises(SystemExit, match="APPLYPILOT_FLEET_LABEL"):
+        enforce_host_identity("m2", env={})
+    with pytest.raises(SystemExit, match="APPLYPILOT_FLEET_LABEL"):
+        enforce_host_identity("m2", env={"APPLYPILOT_FLEET_LABEL": "   "})
 
 
-def test_blank_machine_owner_is_allowed():
-    # No owner to compare against -> nothing to refuse.
-    enforce_host_identity(None, env={"APPLYPILOT_FLEET_LABEL": "home"})
-    enforce_host_identity("", env={"APPLYPILOT_FLEET_LABEL": "home"})
+def test_blank_machine_owner_is_rejected_as_unenrolled():
+    with pytest.raises(SystemExit, match="machine-owner"):
+        enforce_host_identity(None, env={"APPLYPILOT_FLEET_LABEL": "home"})
+    with pytest.raises(SystemExit, match="machine-owner"):
+        enforce_host_identity("", env={"APPLYPILOT_FLEET_LABEL": "home"})

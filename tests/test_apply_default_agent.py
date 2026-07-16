@@ -8,9 +8,13 @@ control spillover.
 
 import inspect
 
+import pytest
+
 from applypilot import cli
 from applypilot.fleet import apply_worker_main as awm
 from applypilot.fleet.apply_worker_main import build_parser
+
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
 
 
 class _SchemaConnection:

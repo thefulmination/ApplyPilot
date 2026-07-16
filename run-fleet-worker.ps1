@@ -55,9 +55,30 @@ foreach ($d in @(".\.conda-env\python.exe", ".\.venv\Scripts\python.exe")) {
 }
 if (-not $py) { throw "python not found (.conda-env or .venv) -- run the setup script first." }
 
-$machinePolicy = (& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label "apply" 2>$null | Select-Object -Last 1)
-if ("$machinePolicy" -match '^BLOCKED\|') {
-  throw "Refusing to start apply worker '$WorkerId': machine blackout active. $machinePolicy"
+function Test-MachineBlackout([string]$Role) {
+  $stderrPath = [IO.Path]::GetTempFileName()
+  try {
+    $lines = @(& $py (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2> $stderrPath)
+    $queryExit = $LASTEXITCODE
+    Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue | ForEach-Object {
+      if (-not [string]::IsNullOrWhiteSpace("$_")) { [Console]::Error.WriteLine("$_") }
+    }
+  } finally {
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+  if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
+  if ($lines.Count -eq 0) { return "ERROR|empty-blackout-status" }
+  if ($lines.Count -ne 1) { return "ERROR|multiline-blackout-status" }
+  $line = "$($lines[0])"
+  if ($line -match "[`r`n]") { return "ERROR|multiline-blackout-status" }
+  $expected = "OK|$($Label.Trim().ToLowerInvariant())|$($Role.Trim().ToLowerInvariant())|||"
+  if ($line -ceq $expected) { return $null }
+  return $line
+}
+
+$machinePolicyFailure = Test-MachineBlackout "apply"
+if ($machinePolicyFailure) {
+  throw "Refusing to start apply worker '$WorkerId': machine blackout status did not return exact OK. $machinePolicyFailure"
 }
 
 function Resolve-FleetHomeIp([string]$Candidate) {

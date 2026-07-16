@@ -139,6 +139,10 @@ def _tenant_executor(profile: dict, *, headless: bool, base_port: int = 9460):
     sequence = {"value": 0}
 
     def execute(job: dict, *, submit: bool):
+        from applypilot.fleet import emergency_admission
+        emergency_admission.require_allowed(
+            emergency_admission.workday_rollout_admission("launch")
+        )
         index = sequence["value"]
         sequence["value"] += 1
         worker_id, port = 150 + index, base_port + index
@@ -168,6 +172,10 @@ def main() -> None:
     parser.add_argument("--observer-present", action="store_true")
     parser.add_argument("--approval-token")
     args = parser.parse_args()
+    from applypilot.fleet import emergency_admission
+    emergency_admission.require_allowed(
+        emergency_admission.workday_rollout_admission(args.stage)
+    )
     conn = config.get_connection() if hasattr(config, "get_connection") else None
     if conn is None:
         from applypilot.database import get_connection
@@ -195,7 +203,8 @@ def main() -> None:
         if args.stage == "shadow"
         else _tenant_executor(config.load_profile(), headless=args.stage == "prepare")
     )
-    record_fn = lambda record: persist_record(conn, record)
+    def record_fn(record):
+        return persist_record(conn, record)
     if args.stage == "shadow":
         records = run_workday_shadow(jobs, executor, record_fn=record_fn)
     elif args.stage == "prepare":

@@ -66,6 +66,19 @@ def _bootstrap() -> None:
     init_db()
 
 
+def _require_local_apply_admission(*, target_url: str | None = None) -> None:
+    from applypilot.fleet import emergency_admission
+
+    admission = emergency_admission.local_apply_admission(target_url=target_url)
+    if admission.allowed:
+        return
+    typer.echo(
+        f"{emergency_admission.denial_marker(admission)} {admission.reason}",
+        err=True,
+    )
+    raise typer.Exit(code=emergency_admission.DENIAL_EXIT_CODE)
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"[bold]applypilot[/bold] {__version__}")
@@ -1399,6 +1412,9 @@ def apply(
     tenant: Optional[str] = typer.Option(None, "--tenant", help="With --auth-gated: scope this run to a single tenant host (e.g. acme.myworkdayjobs.com)."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
+    utility_mode = bool(mark_applied or mark_failed or reset_failed or gen)
+    if not utility_mode:
+        _require_local_apply_admission(target_url=url)
     _bootstrap()
 
     from applypilot import config
@@ -2194,6 +2210,7 @@ def supervise_apply_command(
     crash within ~30s (and a stall after --stall-minutes), cleans up orphaned Chrome / MCP
     servers, and relaunches with the remaining budget. Logs to <LOG_DIR>/supervisor.log.
     """
+    _require_local_apply_admission()
     _bootstrap()
     from applypilot.apply.supervisor import supervise
     supervise(

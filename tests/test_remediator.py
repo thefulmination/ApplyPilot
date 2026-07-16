@@ -100,6 +100,22 @@ def test_candidate_sql_excludes_may_have_submitted():
     assert "fleet_diagnoses" not in sql
 
 
+def test_pre_touch_backfill_requires_latest_durable_zero_tool_event():
+    rows = [{"url": "https://job/1", "worker_id": "m2-3", "dedup_key": "dk1",
+             "status": "failed", "attempts": 1, "apply_error": "failed:no_browser_tool",
+             "reason": "pre_touch_backfill"}]
+    conn = _FakeConn({"FROM apply_queue": rows})
+
+    candidates = remediator.select_pre_touch_backfill_candidates(conn, max_per_job=2)
+
+    assert [candidate.url for candidate in candidates] == ["https://job/1"]
+    sql = conn._cur.executed[0][0]
+    assert "apply_result_events" in sql
+    assert "application_tool_calls = 0" in sql
+    assert "no_browser_tool" in sql
+    assert "ORDER BY e.created_at DESC, e.id DESC" in sql
+
+
 def test_has_confirming_email_graceful_on_corrupt_brain(tmp_path):
     """A corrupt (non-SQLite) brain file must degrade to False, not raise."""
     p = tmp_path / "corrupt.db"

@@ -246,7 +246,7 @@ def test_agents_api_includes_switch_verdicts_and_spend(monkeypatch, fleet_db) ->
     assert summary["model_missing_workers"] == 0
 
 
-def test_agents_api_is_read_only_and_html_wires_call(live_server) -> None:
+def test_agents_api_is_read_only_and_html_wires_call(live_server, fleet_db) -> None:
     with urllib.request.urlopen(f"{live_server}/") as resp:
         html = resp.read().decode("utf-8")
     assert 'id="agents"' in html

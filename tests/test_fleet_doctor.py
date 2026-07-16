@@ -656,7 +656,7 @@ def _seed_linkedin_job(conn, url="li0", dk="lidk0"):
     conn.commit()
 
 
-def test_H1_doctor_pause_cannot_halt_linkedin_lane(fleet_db):
+def test_H1_doctor_pause_cannot_halt_linkedin_lane(fleet_db, acquisition_admitted):
     """H1 CATASTROPHE: arm a LinkedIn worker context, fire a Doctor lane-PAUSE, and assert the
     LinkedIn lane is UNAFFECTED -- it still leases AND linkedin_should_halt() == False. This is the
     single most important proof: the Doctor's pause writes ats_paused, never fleet_config.paused
@@ -710,7 +710,7 @@ def test_H4_multi_actor_effective_gap_is_monotone_until_both_ttls_expire(fleet_d
     """H4 MULTI-ACTOR MONOTONE: co-run the watchdog breaker + a Doctor pace on ONE throttled host;
     assert the EFFECTIVE gap (GREATEST(min_gap_seconds, doctor_min_gap_floor)) is monotone
     non-decreasing -- the breaker recovery can never wipe the still-active Doctor pace."""
-    from applypilot.fleet import governor, watchdog
+    from applypilot.fleet import governor
     with pgqueue.connect(fleet_db) as conn:
         sk = "host:slow.com"
         with conn.cursor() as cur:
@@ -1218,5 +1218,8 @@ def test_A1_sweep_and_breaker_no_deadlock(fleet_db):
 
     t1 = threading.Thread(target=run, args=(lambda c: governor.evaluate_breakers(c, min_samples=1),))
     t2 = threading.Thread(target=run, args=(lambda c: doctor.sweep_expired(c),))
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert not any("40P01" in e or "deadlock" in e.lower() for e in errors), errors

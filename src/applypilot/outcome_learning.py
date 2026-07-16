@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from applypilot.config import APPLICATION_EXPORT_DIR
-from applypilot.lane_insights import derive_segments
 from applypilot.outcome_operator import build_operator_payload
 from applypilot.outcome_dashboard import build_insights
 

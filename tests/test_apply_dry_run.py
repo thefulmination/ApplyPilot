@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("acquisition_admitted")
+
 
 def _patch_worker_io(monkeypatch, launcher, run_job_result, jobs):
     """Stub out the dashboard, Chrome, and DB-touching bits of worker_loop so the

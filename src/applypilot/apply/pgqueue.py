@@ -8,7 +8,7 @@ re-pushes and nothing important is gone.
 
 Every function takes an OPEN psycopg connection so callers control transaction scope and the
 whole layer is trivially testable against a throwaway local Postgres. The production DSN comes
-from APPLYPILOT_FLEET_DSN when set, otherwise DATABASE_URL (Railway injects it for the worker).
+only from FLEET_PG_DSN; generic database variables may identify an unrelated database.
 
 Concurrency contract (the part that must never break):
   * lease_one  -> FOR UPDATE SKIP LOCKED: N workers each grab a DISTINCT row, never blocking.
@@ -16,13 +16,17 @@ Concurrency contract (the part that must never break):
     pinned crash_unconfirmed and NEVER re-leased (no double-submit under Jonathan's name).
   * write_result is lease_owner-guarded: only the holder may close a row.
 """
+
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -33,18 +37,161 @@ _SCHEMA_SQL = (Path(__file__).with_name("fleet_schema.sql")).read_text(encoding=
 # Connection
 # ---------------------------------------------------------------------------
 
-def get_dsn(dsn: str | None = None) -> str:
-    dsn = dsn or os.environ.get("APPLYPILOT_FLEET_DSN") or os.environ.get("DATABASE_URL")
-    if not dsn:
+_CONNECTION_DEFAULTS = {
+    "application_name": "ApplyPilot",
+    "connect_timeout": "10",
+    "keepalives": "1",
+    "keepalives_idle": "30",
+    "keepalives_interval": "10",
+    "keepalives_count": "5",
+}
+_INDIRECT_CONNINFO_OPTIONS = {"passfile", "service"}
+LIBPQ_CONNECTION_ENV_VARS = frozenset(
+    {
+        "PGAPPNAME",
+        "PGCHANNELBINDING",
+        "PGCLIENTENCODING",
+        "PGCONNECT_TIMEOUT",
+        "PGDATABASE",
+        "PGDATESTYLE",
+        "PGGEQO",
+        "PGGSSDELEGATION",
+        "PGGSSENCMODE",
+        "PGGSSLIB",
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGKRBSRVNAME",
+        "PGLOADBALANCEHOSTS",
+        "PGLOCALEDIR",
+        "PGMAXPROTOCOLVERSION",
+        "PGMINPROTOCOLVERSION",
+        "PGOPTIONS",
+        "PGPASSFILE",
+        "PGPASSWORD",
+        "PGPORT",
+        "PGREQUIREAUTH",
+        "PGREQUIREPEER",
+        "PGREQUIRESSL",
+        "PGSERVICE",
+        "PGSERVICEFILE",
+        "PGSYSCONFDIR",
+        "PGSSLCERT",
+        "PGSSLCERTMODE",
+        "PGSSLCOMPRESSION",
+        "PGSSLCRL",
+        "PGSSLCRLDIR",
+        "PGSSLKEY",
+        "PGSSLMAXPROTOCOLVERSION",
+        "PGSSLMINPROTOCOLVERSION",
+        "PGSSLMODE",
+        "PGSSLNEGOTIATION",
+        "PGSSLROOTCERT",
+        "PGSSLSNI",
+        "PGTARGETSESSIONATTRS",
+        "PGTZ",
+        "PGUSER",
+    }
+)
+_LOCAL_PG_HOSTS = {"127.0.0.1", "::1", "localhost"}
+_DNS_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+
+
+def _is_authenticated_private_host(host: str) -> bool:
+    normalized = host.strip().rstrip(".").lower()
+    if normalized in _LOCAL_PG_HOSTS:
+        return True
+
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        if normalized.startswith(("/", "@")) or _DNS_HOST_RE.fullmatch(normalized) is None:
+            raise RuntimeError("Fleet Postgres host has invalid topology syntax; connection details were not logged.")
+    else:
+        return False
+
+    labels = normalized.split(".")
+    if normalized.endswith(".railway.internal"):
+        return len(labels) >= 3
+    if normalized.endswith(".ts.net"):
+        if len(labels) < 4:
+            raise RuntimeError(
+                "Fleet Postgres Tailscale topology requires a full MagicDNS hostname; "
+                "connection details were not logged."
+            )
+        return True
+    return False
+
+
+def _explicit_targets(params: dict[str, str]) -> list[str]:
+    if "hostaddr" in params:
+        raise RuntimeError("Fleet Postgres DSN must not contain hostaddr; connection details were not logged.")
+
+    host = params.get("host")
+    if not host:
+        raise RuntimeError("Fleet Postgres DSN must contain an explicit host; connection details were not logged.")
+
+    hosts = host.split(",")
+    if any(not item.strip() for item in hosts):
+        raise RuntimeError("Fleet Postgres host entries must be non-empty; connection details were not logged.")
+    return hosts
+
+
+def _prepare_conninfo(dsn: str) -> str:
+    ambient = sorted(name for name in LIBPQ_CONNECTION_ENV_VARS if name in os.environ)
+    if ambient:
+        names = ", ".join(ambient)
         raise RuntimeError(
-            "No Postgres DSN: set DATABASE_URL (Railway) or APPLYPILOT_FLEET_DSN."
+            f"Ambient libpq variables are not allowed for fleet Postgres: {names}; connection details were not logged."
         )
+
+    try:
+        params = conninfo_to_dict(dsn)
+    except (psycopg.Error, ValueError) as exc:
+        raise RuntimeError("Invalid fleet Postgres DSN; connection details were not logged.") from exc
+
+    indirect = sorted(_INDIRECT_CONNINFO_OPTIONS.intersection(params))
+    if indirect:
+        names = ", ".join(indirect)
+        raise RuntimeError(
+            f"Fleet Postgres DSN indirection is not allowed: {names}; connection details were not logged."
+        )
+
+    targets = _explicit_targets(params)
+    if params.get("password") in (None, ""):
+        raise RuntimeError("Fleet Postgres DSN must contain an explicit password; connection details were not logged.")
+
+    uses_public_tcp = any(not _is_authenticated_private_host(target) for target in targets)
+    if uses_public_tcp:
+        if params.get("sslmode", "").lower() != "verify-full":
+            raise RuntimeError(
+                "Public fleet Postgres connections must specify sslmode=verify-full; "
+                "connection details were not logged."
+            )
+        if not params.get("sslrootcert", "").strip():
+            raise RuntimeError(
+                "Public fleet Postgres connections must specify sslrootcert explicitly; "
+                "connection details were not logged."
+            )
+
+    defaults = {key: value for key, value in _CONNECTION_DEFAULTS.items() if key not in params}
+    try:
+        return make_conninfo(dsn, **defaults)
+    except (psycopg.Error, ValueError) as exc:
+        raise RuntimeError("Invalid fleet Postgres DSN; connection details were not logged.") from exc
+
+
+def get_dsn(dsn: str | None = None) -> str:
+    if dsn:
+        return dsn
+    dsn = os.environ.get("FLEET_PG_DSN")
+    if not dsn:
+        raise RuntimeError("No fleet Postgres DSN: set FLEET_PG_DSN explicitly.")
     return dsn
 
 
 def connect(dsn: str | None = None, *, autocommit: bool = False) -> psycopg.Connection:
-    """Open a dict-row psycopg connection to the fleet Postgres."""
-    return psycopg.connect(get_dsn(dsn), autocommit=autocommit, row_factory=dict_row)
+    """Open a hardened dict-row psycopg connection to the fleet Postgres."""
+    return psycopg.connect(_prepare_conninfo(get_dsn(dsn)), autocommit=autocommit, row_factory=dict_row)
 
 
 def ensure_schema(conn: psycopg.Connection) -> None:
@@ -184,17 +331,6 @@ def reclaim_stale_leases(conn: psycopg.Connection, *, grace_seconds: int = 30) -
 # Spend cap / kill switch
 # ---------------------------------------------------------------------------
 
-_HALT_SQL = """
-SELECT
-    fc.paused
-    OR (fc.spend_cap_usd > 0
-        AND COALESCE((SELECT SUM(cumulative_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
-        AS should_halt
-FROM fleet_config fc
-WHERE fc.id = 1;
-"""
-
-
 def should_halt(conn: psycopg.Connection) -> bool:
     """True if the fleet must stop leasing: globally paused OR cumulative spend >= cap.
     A soft pre-lease gate (spec S6) -- up to ~N in-flight jobs may overshoot, which is fine
@@ -205,17 +341,10 @@ def should_halt(conn: psycopg.Connection) -> bool:
     (which OR-s in ats_paused); the LinkedIn lane uses linkedin_should_halt() to avoid
     reading apply_queue from the catastrophe lane's pre-flight tick."""
     with conn.cursor() as cur:
-        cur.execute(_HALT_SQL)
-        row = cur.fetchone()
+        cur.execute("SELECT public.fleet_worker_admission_snapshot() AS state")
+        row = cur.fetchone()["state"] or {}
     conn.rollback()  # read-only
-    return bool(row["should_halt"]) if row else False
-
-
-_LINKEDIN_HALT_SQL = """
-SELECT COALESCE(fc.paused, FALSE) AS should_halt
-FROM fleet_config fc
-WHERE fc.id = 1;
-"""
+    return bool(row.get("global_should_halt"))
 
 
 def linkedin_should_halt(conn: psycopg.Connection) -> bool:
@@ -227,22 +356,10 @@ def linkedin_should_halt(conn: psycopg.Connection) -> bool:
     that couples LinkedIn to ATS spend state and can deadlock with schema maintenance.
     """
     with conn.cursor() as cur:
-        cur.execute(_LINKEDIN_HALT_SQL)
-        row = cur.fetchone()
+        cur.execute("SELECT public.fleet_worker_admission_snapshot() AS state")
+        row = cur.fetchone()["state"] or {}
     conn.rollback()  # read-only
-    return bool(row["should_halt"]) if row else False
-
-
-_ATS_HALT_SQL = """
-SELECT
-    fc.paused
-    OR COALESCE(fc.ats_paused, FALSE)
-    OR (fc.spend_cap_usd > 0
-        AND COALESCE((SELECT SUM(cumulative_cost_usd) FROM apply_queue), 0) >= fc.spend_cap_usd)
-        AS should_halt
-FROM fleet_config fc
-WHERE fc.id = 1;
-"""
+    return bool(row.get("linkedin_should_halt"))
 
 
 def ats_should_halt(conn: psycopg.Connection) -> bool:
@@ -250,10 +367,10 @@ def ats_should_halt(conn: psycopg.Connection) -> bool:
     Fleet Doctor's ATS-only ats_paused (H1). The LinkedIn worker must NEVER call this -- it
     uses linkedin_should_halt() so a Doctor ATS pause can never stop the LinkedIn lane."""
     with conn.cursor() as cur:
-        cur.execute(_ATS_HALT_SQL)
-        row = cur.fetchone()
+        cur.execute("SELECT public.fleet_worker_admission_snapshot() AS state")
+        row = cur.fetchone()["state"] or {}
     conn.rollback()  # read-only
-    return bool(row["should_halt"]) if row else False
+    return bool(row.get("ats_should_halt"))
 
 
 def set_ats_paused(conn: psycopg.Connection, paused: bool, *, source: str | None = None) -> None:

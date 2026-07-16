@@ -29,6 +29,7 @@ import pandas as pd
 
 from applypilot import config, database
 from applypilot.apply import pgqueue
+from applypilot.apply.greenhouse_adapter import parse_greenhouse_url
 from applypilot.apply import tenant_sessions as _tenant_sessions
 from applypilot.database import THIN_DESCRIPTION_CHARS
 from applypilot.fleet import dedup as _dedup

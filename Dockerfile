@@ -40,9 +40,21 @@ ENV CLAUDE_PATH=/usr/local/bin/claude \
     IS_SANDBOX=1 \
     PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
-# Required Railway variables: DATABASE_URL, DEEPSEEK_API_KEY, unique
+# Required Railway variables: FLEET_PG_DSN, DEEPSEEK_API_KEY, unique
 # APPLYPILOT_WORKER_ID, and APPLYPILOT_RELEASE_VERSION. The release value must be
 # the exact fleet pin (for example 0.3.0+git.tree.840f17b) because .git is excluded
 # from the image. PII (profile.json + resume.pdf) mounts from a Railway volume at
 # /data/applypilot. The entrypoint refuses to start if any contract item is absent.
+#
+# Contract notes (recorded 2026-07-16, C2 container-build-gate):
+# - Non-root: this image never drops back from `USER root` (line 6) — it runs
+#   as root end-to-end. That's an existing gap, not something this change
+#   fixes; altering the user model touches Chromium sandbox/runtime behavior
+#   outside this CI-gate lane's scope.
+# - Smoke/health: there is no HEALTHCHECK here because the real entrypoint
+#   requires live secrets (FLEET_PG_DSN, DEEPSEEK_API_KEY) and mounted PII
+#   (profile.json, resume.pdf) before it will even start the LiteLLM proxy.
+#   CI's deterministic smoke check (.github/workflows/ci.yml, job
+#   `container-build`) therefore overrides the entrypoint to check imports
+#   and file presence instead of invoking CMD.
 CMD ["/app/entrypoint.sh"]
