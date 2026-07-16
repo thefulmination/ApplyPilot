@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
