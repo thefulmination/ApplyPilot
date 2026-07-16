@@ -122,6 +122,24 @@ def test_repository_manifest_rejects_wrong_predecessor_commit(tmp_path):
         migrator.verify_predecessor(manifest, REPO_ROOT)
 
 
+def test_pinned_predecessor_is_verified_without_git_metadata(tmp_path):
+    manifest = migrator.load_manifest(MANIFEST_PATH)
+    for item in manifest.predecessor.files:
+        source = REPO_ROOT / item.path
+        target = tmp_path / item.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+
+    migrator.verify_predecessor(manifest, tmp_path)
+
+    payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    payload["predecessor"]["runtime_commit"] = "0" * 40
+    unknown_path = tmp_path / "unknown-manifest.json"
+    unknown_path.write_text(json.dumps(payload) + "\n", encoding="utf-8", newline="\n")
+    with pytest.raises(migrator.ManifestError, match="predecessor blob mismatch"):
+        migrator.verify_predecessor(migrator.load_manifest(unknown_path), tmp_path)
+
+
 def test_manifest_rejects_duplicate_keys_unknown_fields_and_unsafe_paths(tmp_path):
     duplicate = tmp_path / "duplicate.json"
     duplicate.write_text('{"schema_version":1,"schema_version":1}\n', encoding="utf-8", newline="\n")

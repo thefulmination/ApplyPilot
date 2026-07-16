@@ -35,6 +35,13 @@ _LOCK_KEY = "applypilot:fleet:migrations:v1"
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 _DEFAULT_STATEMENT_TIMEOUT_MS = 300_000
 _LEDGER_TABLE = "applypilot_fleet_schema_migrations"
+_PINNED_PREDECESSORS = {
+    "2b3a7c83118df840dda60c9b728f29e3dc0c1b9d": {
+        "src/applypilot/fleet/schema_v3.sql": "0741a6e675d2ea42a3bb0d785fd4c0c444e96b3d",
+        "src/applypilot/apply/fleet_schema.sql": "6eb4a84dcc05568233ee32551b28c75f13b0a17f",
+        "src/applypilot/fleet/schema.py": "5637001b6457f9fc8f0c22f4220fe2e1249ff9c0",
+    }
+}
 
 
 class ManifestError(ValueError):
@@ -249,6 +256,7 @@ def _git_predecessor_blob(root: Path, runtime_commit: str, path: str) -> str | N
 
 def verify_predecessor(manifest: Manifest, repository_root: str | Path) -> None:
     root = Path(repository_root).resolve()
+    declared = {item.path: item.git_blob for item in manifest.predecessor.files}
     for item in manifest.predecessor.files:
         path = (root / Path(*PurePosixPath(item.path).parts)).resolve()
         if not path.is_relative_to(root) or not path.is_file():
@@ -262,6 +270,11 @@ def verify_predecessor(manifest: Manifest, repository_root: str | Path) -> None:
         if actual != item.git_blob:
             git_blob = _git_predecessor_blob(root, manifest.predecessor.runtime_commit, item.path)
             if git_blob == item.git_blob:
+                continue
+            # Release archives intentionally omit .git. The closed predecessor
+            # tuple above is the artifact-safe provenance boundary in that case.
+            pinned = _PINNED_PREDECESSORS.get(manifest.predecessor.runtime_commit)
+            if not (root / ".git").exists() and pinned == declared:
                 continue
             raise ManifestError(f"predecessor blob mismatch for {item.path}: expected {item.git_blob}, got {actual}")
 

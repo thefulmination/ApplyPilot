@@ -11,7 +11,7 @@
       "transaction_mode": "transactional",
       "minimum_schema_contract": "fleet-v3",
       "maximum_schema_contract": "fleet-v3",
-      "forward_recovery_command": "applypilot-fleet-migrate --through 20260715_001_application_authority"
+      "forward_recovery_command": "applypilot-fleet-migrate-schema"
     }
   ],
   "predecessor": {

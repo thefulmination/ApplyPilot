@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import schema as fleet_schema
+from applypilot.fleet import migrator
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+_MANIFEST_PATH = _REPOSITORY_ROOT / "src" / "applypilot" / "fleet" / "migrations" / "manifest-v1.json"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,13 +24,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         dsn = pgqueue.get_dsn(args.dsn)
+        manifest = migrator.load_manifest(_MANIFEST_PATH)
         with pgqueue.connect(dsn) as conn:
-            fleet_schema.ensure_schema_v3(conn)
+            result = migrator.apply_manifest(conn, manifest, _REPOSITORY_ROOT)
     except Exception as exc:
         print(f"fleet schema migration failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    print("fleet schema v3 migration complete")
+    print(
+        "fleet schema migration complete: "
+        f"applied={len(result.applied)} already_applied={len(result.already_applied)}"
+    )
     return 0
 
 

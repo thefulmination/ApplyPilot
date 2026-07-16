@@ -5,7 +5,7 @@ from pathlib import Path
 import tomllib
 
 from applypilot.apply import pgqueue
-from applypilot.fleet import schema as fleet_schema
+from applypilot.fleet import migrator
 from applypilot.fleet import schema_main
 
 
@@ -34,23 +34,27 @@ def test_migrate_schema_requires_explicit_fleet_dsn(monkeypatch, capsys):
 def test_migrate_schema_uses_locked_schema_migrator(monkeypatch, capsys):
     conn = object()
     calls = []
+    manifest = object()
     monkeypatch.setattr(pgqueue, "connect", lambda dsn: nullcontext(conn))
-    monkeypatch.setattr(fleet_schema, "ensure_schema_v3", lambda value: calls.append(value))
+    monkeypatch.setattr(migrator, "load_manifest", lambda path: manifest)
+    monkeypatch.setattr(
+        migrator,
+        "apply_manifest",
+        lambda value, loaded, root: calls.append((value, loaded, root))
+        or migrator.ApplyResult(applied=("migration",), already_applied=()),
+    )
 
     rc = schema_main.main(["--dsn", "postgresql://controller/test"])
 
     assert rc == 0
-    assert calls == [conn]
-    assert "migration complete" in capsys.readouterr().out
+    assert calls == [(conn, manifest, ROOT)]
+    assert "applied=1 already_applied=0" in capsys.readouterr().out
 
 
 def test_migrate_schema_returns_nonzero_on_migration_failure(monkeypatch, capsys):
     monkeypatch.setattr(pgqueue, "connect", lambda _dsn: nullcontext(object()))
-    monkeypatch.setattr(
-        fleet_schema,
-        "ensure_schema_v3",
-        lambda _conn: (_ for _ in ()).throw(RuntimeError("migration rejected")),
-    )
+    monkeypatch.setattr(migrator, "load_manifest", lambda _path: object())
+    monkeypatch.setattr(migrator, "apply_manifest", lambda *_args: (_ for _ in ()).throw(RuntimeError("migration rejected")))
 
     rc = schema_main.main(["--dsn", "postgresql://controller/test"])
 
