@@ -4,7 +4,7 @@ Run date: 2026-07-16
 
 Branch: `codex/cloud-cutover-runtime-integration`
 Plan: `docs/superpowers/plans/2026-07-16-parallel-release-remediation.md`
-Verified candidate head: `5f90feb3ac5374fe57f513744c6c1823ace174b9`
+Verified candidate head before final CI: `dde99e3ea38cf6a8d06537f0f9763f2b81b7a23b`
 
 ## Integrated Work
 
@@ -20,8 +20,9 @@ Verified candidate head: `5f90feb3ac5374fe57f513744c6c1823ace174b9`
 - `bfc4d62` separates Windows-native and portable CI contracts, restores Railway entrypoint executable mode, ensures MCP and fleet helper paths are self-contained, and gives migration verification full predecessor history.
 - `b721b52` makes browser tests platform-deterministic and hardens brain snapshot recovery across POSIX hard-link ctime changes.
 - `5f90feb` preserves receipt ACLs after durable atomic replacement and removes ambient libpq variables from the mapped-control fixture.
+- `dde99e3` integrates Claude C1's Postgres-authority dependency injection for ResBuild and isolates SQLite compatibility fixtures from the ambient fleet DSN.
 
-Claude C1 (`claude/resbuild-postgres-authority`) has not returned a repair commit. Its ResBuild dependency-injection task remains outside the completed Codex scope.
+Claude C1 source commit: `fdf16af`. The commit was pushed to `claude/resbuild-postgres-authority` and integrated into this branch as `dde99e3`.
 
 ## Root Causes Repaired
 
@@ -43,6 +44,7 @@ Claude C1 (`claude/resbuild-postgres-authority`) has not returned a repair commi
 - Portability and workflow gate: `113 passed`.
 - Brain, apply-channel, and mapped-role gate: `92 passed`.
 - Final Windows failure regression gate: `3 passed`.
+- ResBuild authority gate after C1 integration: `24 passed in 2.43s`.
 - `python -m ruff check src`: passed.
 - Touched-file Ruff checks: passed.
 - Workflow YAML parse: passed.
@@ -52,7 +54,7 @@ Claude C1 (`claude/resbuild-postgres-authority`) has not returned a repair commi
 
 ## Final CI Evidence
 
-Workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29509248944
+Previous workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29509248944
 
 - Python 3.11: `2226 passed, 982 skipped in 110.95s`.
 - Python 3.12: `2226 passed, 982 skipped in 95.01s`.
@@ -62,10 +64,10 @@ Workflow: https://github.com/thefulmination/ApplyPilot/actions/runs/29509248944
 - Deterministic container smoke check: passed.
 - Overall workflow conclusion: `success`.
 
-The skipped CI tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. The green workflow does not substitute for Claude C1's explicit ResBuild authority dependency-injection work.
+The skipped CI tests require external services, credentials, or integration infrastructure not present on GitHub-hosted runners. A final workflow for the C1-integrated head is required and will be recorded here after dispatch.
 
 ## Scope Decision
 
-Codex-owned X1, X2, and the available X3 integration/release-gate work are complete and green on the verified candidate. The overall parallel plan is not fully complete because Claude C1 has not produced the required ResBuild repair commit.
+Codex-owned X1, X2, and X3 integration/release-gate work are complete locally, including Claude C1. The overall plan is pending only the final CI run from the C1-integrated head.
 
 No production PostgreSQL, secrets, deployment, worker command, application lane, or container registry was touched. Production application lanes remain paused pending separate staging/canary approval after C1 is integrated and verified.
