@@ -41,6 +41,8 @@ def _ps_quote(value) -> str:
         ("OK|m4|{role}|||", 0, True),
         ("KEEP|m4|{role}|||error", 0, False),
         ("BLOCKED|m4|{role}|policy||reason", 0, False),
+        ("KEEP|m4|{role}|||error\nOK|m4|{role}|||", 0, False),
+        ("OK|m4|{role}|||\nBLOCKED|m4|{role}|policy||reason", 0, False),
         ("", 0, False),
         ("malformed", 0, False),
         ("OK|wrong-label|{role}|||", 0, False),
@@ -64,7 +66,7 @@ def test_new_worker_launcher_requires_exact_successful_ok_status(
     shim = tmp_path / "blackout-shim.ps1"
     shim.write_text(
         "param([Parameter(ValueFromRemainingArguments=$true)]$Ignored)\n"
-        "if ($env:BLACKOUT_OUTPUT) { Write-Output $env:BLACKOUT_OUTPUT }\n"
+        "if ($env:BLACKOUT_OUTPUT) { $env:BLACKOUT_OUTPUT -split '\\r?\\n' | Write-Output }\n"
         "exit [int]$env:BLACKOUT_EXIT\n",
         encoding="utf-8",
     )
