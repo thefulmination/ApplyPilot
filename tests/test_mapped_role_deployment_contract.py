@@ -52,6 +52,7 @@ def test_database_hardening_script_requires_identity_manifest_and_receipts() -> 
         "$stream.Flush($true)",
         "Get-Acl -LiteralPath $fullPath",
         "Set-Acl -LiteralPath $temporary",
+        "Set-Acl -LiteralPath $fullPath -AclObject $destinationAcl",
     ):
         assert required in script
 

@@ -181,6 +181,7 @@ function Write-ApplyPilotDurableAtomicJson {
         finally { $metadataStream.Dispose() }
         if ($BeforeReplace) { & $BeforeReplace }
         [IO.File]::Replace($temporary, $fullPath, $replacementBackup, $true)
+        Set-Acl -LiteralPath $fullPath -AclObject $destinationAcl
         $committedStream = [IO.FileStream]::new(
             $fullPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read
         )

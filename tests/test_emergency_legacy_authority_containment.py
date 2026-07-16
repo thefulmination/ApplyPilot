@@ -4172,6 +4172,7 @@ def test_control_database_failure_returns_stop_not_keep(monkeypatch, capsys):
 
 def test_healthy_mapped_control_database_returns_desired_worker_contract(monkeypatch, capsys):
     from applypilot.apply import pgqueue
+    from fleet_agent_env import LIBPQ_SESSION_ENV_VARS
 
     class Cursor:
         def __enter__(self): return self
@@ -4189,6 +4190,8 @@ def test_healthy_mapped_control_database_returns_desired_worker_contract(monkeyp
 
     monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
     monkeypatch.setattr(sys, "argv", ["fleet-agent-query.py", "m2"])
+    for variable in LIBPQ_SESSION_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("FLEET_PG_DSN", "fleet-test-dsn")
     monkeypatch.delenv("APPLYPILOT_FLEET_DSN", raising=False)
     runpy.run_path(str(ROOT / "fleet-agent-query.py"), run_name="__main__")
