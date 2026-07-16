@@ -73,13 +73,17 @@ if (-not $pyGuard) { $pyGuard = "python" }
 
 function Test-MachineBlackout([string]$Role) {
   $line = (& $pyGuard (Join-Path $ProjectRoot "fleet-blackout-query.py") $Label $Role 2>$null | Select-Object -Last 1)
-  if ("$line" -match '^BLOCKED\|') { return $line }
-  return $null
+  $queryExit = $LASTEXITCODE
+  if ($queryExit -ne 0) { return "ERROR|blackout-query-exit=$queryExit" }
+  $expected = "OK|$($Label.Trim().ToLowerInvariant())|$($Role.Trim().ToLowerInvariant())|||"
+  if ("$line" -ceq $expected) { return $null }
+  if ([string]::IsNullOrWhiteSpace("$line")) { return "ERROR|empty-blackout-status" }
+  return "$line"
 }
 
 function Start-OneWorker([string]$wid) {
   $blocked = Test-MachineBlackout "compute"
-  if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout active. $blocked" }
+  if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout status did not return exact OK. $blocked" }
   Write-Host "[fleet-compute] worker $wid  providers=$Providers  (IP-free score/audit, cost-cap gated)"
   & $exe --worker-id "$wid" --home-ip "0.0.0.0" --machine-owner $Label
 }
@@ -106,7 +110,7 @@ if ($Workers -le 1) { Start-OneWorker "$Label-score-0"; return }
 
 # --- multi-worker: clean slate, then one window per worker on a DISTINCT id ---
 $blocked = Test-MachineBlackout "compute"
-if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout active. $blocked" }
+if ($blocked) { throw "Refusing to start compute workers for '$Label': machine blackout status did not return exact OK. $blocked" }
 $self = $MyInvocation.MyCommand.Path
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
   $_.Name -eq 'applypilot-fleet-compute.exe' -or
