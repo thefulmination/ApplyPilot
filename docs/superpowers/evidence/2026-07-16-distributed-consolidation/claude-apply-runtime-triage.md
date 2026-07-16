@@ -444,27 +444,51 @@ blemish. Verified chain:
    src/applypilot/fleet/schema_v3.sql:62:          ON apply_queue (infrastructure_last_failure_at DESC)
    ```
    Two reads in one SELECT, one `ADD COLUMN`, one index. The column is declared `TIMESTAMPTZ`
-   with **no `DEFAULT`** (`schema_v3.sql:35`), so every parked row's value is `NULL`.
+   with **no `DEFAULT`** (`schema_v3.sql:35`), so every row parked **since `d486d4a`** has a
+   `NULL` value. Rows parked *before* `d486d4a` are not affected: the old implementation wrote
+   `infrastructure_last_failure_at=now()` itself (visible in the deleted lines quoted above), so
+   those rows carry a real timestamp and remain recoverable by the sweep. The stranding is
+   scoped to everything parked after the `_terminalize` swap.
 2. **The only consumer is the recovery sweep**, `retry_infrastructure_pending()` at
    `apply_home_main.py:1138`, whose SELECT filters on
    `AND q.infrastructure_last_failure_at <= now() - make_interval(hours => %s)`
    (`apply_home_main.py:1160`).
-3. **`NULL <= anything` is `NULL`, not `TRUE`**, so that predicate is never satisfied. The sweep
-   matches zero rows, `urls` is empty, and `requeued` stays 0 — permanently, for every parked row,
-   regardless of cooldown or `--execute`.
+3. **`NULL <= anything` is `NULL`, not `TRUE`**, so that predicate is never satisfied for a
+   `NULL` timestamp. The sweep can never match a row parked since `d486d4a` — permanently,
+   regardless of cooldown or `--execute`. (It still matches older, pre-`d486d4a` parked rows,
+   which carry a real timestamp; those recover normally, which is part of why the regression can
+   go unnoticed — the sweep keeps returning plausible non-zero counts while every newly parked
+   row is stranded.)
 
 So the branch at `worker.py:759-773` parks untouched jobs into
 `status='failed' / apply_status='infrastructure_pending'`, and the one mechanism built to bring
-them back out can no longer see them. Jobs parked by a transient local Chrome fault are dead in
-the queue forever, with no operator surface reporting it — the sweep reports "0 candidates" and
-looks healthy. Note that the sibling count predicate at `apply_home_main.py:1159` uses
-`COALESCE(q.infrastructure_failure_count,0)`, which tolerates the missing counter write; the
-timestamp predicate has no such `COALESCE`, which is why the timestamp is the fatal one.
+them back out can no longer see them. Jobs parked by a transient local Chrome fault since
+`d486d4a` are dead in the queue forever, and nothing reports it: the sweep simply omits them
+from its candidate set and returns a normal-looking count, so the failure presents as silence
+rather than as an error. The asymmetry between the two lost writes is decided by the **schema
+declarations**, not by the query text. `schema_v3.sql:34` declares
+`infrastructure_failure_count INTEGER NOT NULL DEFAULT 0`, so the missing counter increment
+leaves a real `0`, and the sibling predicate at `apply_home_main.py:1159`
+(`COALESCE(q.infrastructure_failure_count,0) <= %s`) evaluates `0 <= %s` and passes. That
+`COALESCE` is effectively a no-op against a `NOT NULL DEFAULT 0` column — the predicate would
+pass without it. `schema_v3.sql:35` gives `infrastructure_last_failure_at` **no `DEFAULT`**, so
+the missing timestamp write leaves `NULL`, and `NULL <= …` is never `TRUE`. The timestamp is
+fatal because its column defaults to `NULL`; the counter is survivable because its column
+defaults to `0`.
 
-The lost `infrastructure_failure_count` is the milder, subtler harm: there is a partial index
-built specifically on it (`schema_v3.sql:61-63`, `idx_apply_queue_infrastructure_pending`), so an
-operator surface exists that is now reading a column nothing increments — it will silently report
-zero infrastructure failures forever.
+The lost `infrastructure_failure_count` is the milder, subtler harm, and its blast radius is
+narrow. `grep -rn "infrastructure_failure_count" src/` returns exactly three hits:
+```
+src/applypilot/fleet/schema_v3.sql:34:         ... infrastructure_failure_count INTEGER NOT NULL DEFAULT 0;
+src/applypilot/fleet/apply_home_main.py:1159:  AND COALESCE(q.infrastructure_failure_count,0) <= %s
+src/applypilot/fleet/worker.py:772:            "failure_count": (parked or {}).get("infrastructure_failure_count"),
+```
+One declaration and two consumers — and both consumers are already accounted for above.
+`apply_home_main.py:1159` tolerates the loss (it reads a `NOT NULL DEFAULT 0` column and passes
+on `0`), and `worker.py:772` is the event-payload breakage documented immediately below. **No
+operator surface reads this counter**, so the loss produces no wrong dashboard number; it
+degrades the park path's retry-budget accounting into a constant `0`, which will matter once the
+`<= %s` bound at `apply_home_main.py:1159` is meant to actually stop runaway re-parks.
 
 **A second, silent consumer breakage on the same path.** The dropped counter also broke the
 worker's own event payload, independently of the database. `park_infrastructure_failure` now
