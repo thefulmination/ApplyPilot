@@ -28,11 +28,14 @@ def parse_operator_time(raw: str) -> datetime:
     return value
 
 
-def _connect():
+def _connect(*, read_only: bool = False):
     conn = pgqueue.connect()
-    from applypilot.fleet import schema
+    if read_only:
+        conn.read_only = True
+    else:
+        from applypilot.fleet import schema
 
-    schema.ensure_schema_v3(conn)
+        schema.ensure_schema_v3(conn)
     return conn
 
 
@@ -60,7 +63,7 @@ def main(
     p_clear.add_argument("--name")
 
     args = parser.parse_args(argv)
-    with _connect() as conn:
+    with _connect(read_only=args.cmd == "status") as conn:
         if args.cmd == "blackout":
             policy_id = machine_blackout.create_blackout(
                 conn,

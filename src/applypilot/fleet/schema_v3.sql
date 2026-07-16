@@ -963,12 +963,24 @@ SET cumulative_cost_usd = GREATEST(
         FROM apply_result_events e
         WHERE e.queue_name = 'apply_queue' AND e.url = q.url
     ), 0)
+)
+WHERE q.cumulative_cost_usd IS DISTINCT FROM GREATEST(
+    COALESCE(q.cumulative_cost_usd, 0),
+    COALESCE(q.est_cost_usd, 0),
+    COALESCE((
+        SELECT SUM(e.est_cost_usd)
+        FROM apply_result_events e
+        WHERE e.queue_name = 'apply_queue' AND e.url = q.url
+    ), 0)
 );
 ALTER TABLE linkedin_queue
     ADD COLUMN IF NOT EXISTS cumulative_cost_usd NUMERIC(12,4) NOT NULL DEFAULT 0;
-UPDATE linkedin_queue
+UPDATE linkedin_queue q
 SET cumulative_cost_usd = GREATEST(
-    COALESCE(cumulative_cost_usd, 0), COALESCE(est_cost_usd, 0)
+    COALESCE(q.cumulative_cost_usd, 0), COALESCE(q.est_cost_usd, 0)
+)
+WHERE q.cumulative_cost_usd IS DISTINCT FROM GREATEST(
+    COALESCE(q.cumulative_cost_usd, 0), COALESCE(q.est_cost_usd, 0)
 );
 
 -- H19/H13 (red-team): self-contained host_skip audit + recurrence linkage + breadth evidence on

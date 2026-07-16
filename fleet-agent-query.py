@@ -21,6 +21,7 @@ try:
     if fleet_dsn and applypilot_dsn and fleet_dsn != applypilot_dsn:
         raise RuntimeError("inconsistent fleet DSN references")
     conn = pgqueue.connect(dsn)
+    conn.read_only = True
     with conn.cursor() as cur:
         cur.execute(
             "SELECT desired_workers, agent, COALESCE(model,'') AS model, generation "
