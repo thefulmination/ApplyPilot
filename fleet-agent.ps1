@@ -191,26 +191,110 @@ function Log-Update([string]$msg, [string]$color = "Gray") {
 }
 function Get-ShortSha([string]$sha) { if ($sha -and $sha.Length -ge 9) { $sha.Substring(0, 9) } else { "$sha" } }
 
+function Get-PinnedWorkerVersion {
+  $versionLines = @(& $py "fleet-agent-version.py" 2>$null)
+  $versionExit = $LASTEXITCODE
+  if ($versionExit -ne 0) {
+    return [pscustomobject]@{ Valid = $false; Reason = "query exit=$versionExit"; CurrentVersion = $null; PinnedVersion = $null }
+  }
+  if ($versionLines.Count -ne 1) {
+    return [pscustomobject]@{ Valid = $false; Reason = "expected one line, got $($versionLines.Count)"; CurrentVersion = $null; PinnedVersion = $null }
+  }
+  $versionLine = "$($versionLines[0])"
+  $vf = $versionLine -split '\|', 4
+  if ($vf.Count -lt 4 -or $vf[0] -cne "OK") {
+    return [pscustomobject]@{ Valid = $false; Reason = "malformed status '$versionLine'"; CurrentVersion = $null; PinnedVersion = $null }
+  }
+  if ([string]::IsNullOrWhiteSpace($vf[2])) {
+    return [pscustomobject]@{ Valid = $false; Reason = "pinned_worker_version is missing or blank"; CurrentVersion = $vf[1]; PinnedVersion = $null }
+  }
+  return [pscustomobject]@{ Valid = $true; Reason = $null; CurrentVersion = $vf[1]; PinnedVersion = $vf[2] }
+}
+
+function Confirm-PinnedWorkerVersion([string]$CapturedPinnedVersion) {
+  $freshVersion = Get-PinnedWorkerVersion
+  if (-not $freshVersion.Valid) {
+    Log-Update "UPDATE BLOCKED: pinned_worker_version revalidation failed immediately before merge ($($freshVersion.Reason))" "Red"
+    return $false
+  }
+  if ($freshVersion.PinnedVersion -cne $CapturedPinnedVersion) {
+    Log-Update "UPDATE BLOCKED: pinned_worker_version changed immediately before merge (captured '$CapturedPinnedVersion', now '$($freshVersion.PinnedVersion)')" "Red"
+    return $false
+  }
+  return $true
+}
+
+function Test-InstalledAgentWrapper {
+  $wrapperPath = Join-Path $repo ".fleet-logs\_task-wrappers\fleet-agent-task.ps1"
+  $reRegister = "re-run register-fleet-tasks.ps1 elevated on this node"
+  if (-not (Test-Path -LiteralPath $wrapperPath -PathType Leaf)) {
+    Log-Update "UPDATE DEFERRED: installed FleetAgent wrapper is missing; operator re-registration required ($reRegister)" "Red"
+    return $false
+  }
+
+  try {
+    $tokens = $null
+    $parseErrors = $null
+    $wrapperAst = [System.Management.Automation.Language.Parser]::ParseFile(
+      $wrapperPath, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0 -or $null -eq $wrapperAst.EndBlock) { throw "wrapper does not parse cleanly" }
+    $expectedAgent = [IO.Path]::GetFullPath((Join-Path $repo "fleet-agent.ps1"))
+    $agentCommands = @($wrapperAst.FindAll({
+      param($node)
+      if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+      $commandName = $node.GetCommandName()
+      if (-not $commandName) { return $false }
+      try { return [IO.Path]::GetFullPath($commandName) -ieq $expectedAgent } catch { return $false }
+    }, $true))
+    if ($agentCommands.Count -ne 1) { throw "expected one direct fleet-agent.ps1 invocation, got $($agentCommands.Count)" }
+
+    $statements = @($wrapperAst.EndBlock.Statements)
+    $commandOffset = $agentCommands[0].Extent.StartOffset
+    $commandStatementIndex = -1
+    for ($i = 0; $i -lt $statements.Count; $i++) {
+      if ($statements[$i].Extent.StartOffset -le $commandOffset -and
+          $statements[$i].Extent.EndOffset -ge $agentCommands[0].Extent.EndOffset) {
+        $commandStatementIndex = $i
+        break
+      }
+    }
+    if ($commandStatementIndex -ne ($statements.Count - 2)) { throw "fleet-agent invocation is not immediately before the final statement" }
+    if ($statements[-1].Extent.Text.Trim() -cnotmatch '(?i)^exit\s+\$LASTEXITCODE$') {
+      throw "final statement is not explicit exit `$LASTEXITCODE"
+    }
+    return $true
+  } catch {
+    Log-Update "UPDATE DEFERRED: installed FleetAgent wrapper is old or ambiguous; operator re-registration required ($reRegister): $_" "Red"
+    return $false
+  }
+}
+
 function Get-UpdateRestartTarget {
   if (-not (Test-Path -LiteralPath $updateRestartMarker -PathType Leaf)) { return $null }
   try {
     $lines = @(Get-Content -LiteralPath $updateRestartMarker -ErrorAction Stop)
     if ($lines.Count -ne 1) { throw "expected one line, got $($lines.Count)" }
-    $target = "$($lines[0])".Trim()
+    $markerFields = "$($lines[0])".Trim() -split '\|', 2
+    $target = $markerFields[0]
     if ($target -cnotmatch '^[0-9a-fA-F]{40}$') { throw "target SHA is invalid" }
-    return $target
+    $preMergeHead = $null
+    if ($markerFields.Count -eq 2) {
+      if ($markerFields[1] -cnotmatch '^[0-9a-fA-F]{40}$') { throw "pre-merge SHA is invalid" }
+      $preMergeHead = $markerFields[1]
+    }
+    return [pscustomobject]@{ Target = $target; PreMergeHead = $preMergeHead }
   } catch {
     Log-Update "restart marker invalid; retaining it and preserving workers: $_" "Red"
     return $null
   }
 }
 
-function Write-UpdateRestartMarker([string]$Target) {
+function Write-UpdateRestartMarker([string]$Target, [string]$PreMergeHead) {
   $dir = Split-Path -Parent $updateRestartMarker
   $tempMarker = "$updateRestartMarker.tmp.$PID"
   try {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Set-Content -LiteralPath $tempMarker -Value $Target -Encoding Ascii -NoNewline -ErrorAction Stop
+    Set-Content -LiteralPath $tempMarker -Value "$Target|$PreMergeHead" -Encoding Ascii -NoNewline -ErrorAction Stop
     Move-Item -LiteralPath $tempMarker -Destination $updateRestartMarker -Force -ErrorAction Stop
     return $true
   } catch {
@@ -231,10 +315,23 @@ function Clear-UpdateRestartMarker {
   }
 }
 
+function Clear-UnappliedUpdateRestartMarker(
+  [string]$PreMergeHead, [string]$ObservedHead, [int]$ObservedExit, [string]$Context) {
+  if ($ObservedExit -eq 0 -and
+      $ObservedHead -cmatch '^[0-9a-fA-F]{40}$' -and
+      $ObservedHead -ceq $PreMergeHead) {
+    Log-Update "${Context}: merge confirmed not applied; clearing restart marker at $(Get-ShortSha $PreMergeHead)" "Yellow"
+    return (Clear-UpdateRestartMarker)
+  }
+  Log-Update "${Context}: HEAD is unavailable, malformed, or not the captured pre-merge commit; retaining restart marker" "Red"
+  return $false
+}
+
 function Complete-PendingUpdateRestart([pscustomobject]$MachinePolicy) {
   if (-not (Test-Path -LiteralPath $updateRestartMarker -PathType Leaf)) { return "NONE" }
-  $target = Get-UpdateRestartTarget
-  if (-not $target) { return "WAIT" }
+  $restartState = Get-UpdateRestartTarget
+  if (-not $restartState) { return "WAIT" }
+  $target = $restartState.Target
 
   $currentHead = "$(& git rev-parse HEAD 2>$null)".Trim()
   $headExit = $LASTEXITCODE
@@ -243,9 +340,13 @@ function Complete-PendingUpdateRestart([pscustomobject]$MachinePolicy) {
     return "WAIT"
   }
   if ($currentHead -cne $target) {
-    Log-Update "discarding pre-merge restart marker for $(Get-ShortSha $target); HEAD remains $(Get-ShortSha $currentHead)" "Yellow"
-    if (-not (Clear-UpdateRestartMarker)) { return "WAIT" }
-    return "NONE"
+    if ($restartState.PreMergeHead -and $currentHead -ceq $restartState.PreMergeHead) {
+      Log-Update "discarding unapplied restart marker for $(Get-ShortSha $target); HEAD remains captured pre-merge $(Get-ShortSha $currentHead)" "Yellow"
+      if (-not (Clear-UpdateRestartMarker)) { return "WAIT" }
+      return "NONE"
+    }
+    Log-Update "restart marker deferred: HEAD $(Get-ShortSha $currentHead) is neither target $(Get-ShortSha $target) nor a known captured pre-merge commit" "Red"
+    return "WAIT"
   }
   if ($null -eq $MachinePolicy -or @("OK", "BLOCKED") -cnotcontains $MachinePolicy.State) {
     Log-Update "post-merge restart deferred: machine blackout policy is not a valid OK/BLOCKED verdict" "Yellow"
@@ -312,18 +413,13 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
   # Pin-aware guard: branch heads are transport; fleet_config.pinned_worker_version is
   # the release contract. This prevents a clean worker from pulling an unpinned branch
   # tip just because someone pushed ahead of the fleet pin.
-  $versionLine = (& $py "fleet-agent-version.py" 2>$null | Select-Object -Last 1)
-  $vf = "$versionLine" -split '\|', 4
-  if ($vf.Count -lt 4 -or $vf[0] -ne "OK") {
-    Log-Update "skip: could not read pinned_worker_version via fleet-agent-version.py (got '$versionLine')" "Yellow"
+  $versionStatus = Get-PinnedWorkerVersion
+  if (-not $versionStatus.Valid) {
+    Log-Update "UPDATE BLOCKED: could not capture pinned_worker_version ($($versionStatus.Reason))" "Red"
     $script:updatePending = $false; return $false
   }
-  $currentVersion = $vf[1]
-  $pinnedVersion = $vf[2]
-  if ([string]::IsNullOrWhiteSpace($pinnedVersion)) {
-    Log-Update "UPDATE BLOCKED: pinned_worker_version is missing or blank" "Red"
-    $script:updatePending = $false; return $false
-  }
+  $currentVersion = $versionStatus.CurrentVersion
+  $pinnedVersion = $versionStatus.PinnedVersion
   $packageVersion = $currentVersion
   if ($packageVersion -match '^(.+)\+git\.') { $packageVersion = $matches[1] } else { $packageVersion = "0.3.0" }
   $targetTree = (& git rev-parse "$target^{tree}" 2>$null)
@@ -388,7 +484,13 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
       $script:updatePending = $false; return $false
     }
 
+    if (-not (Test-InstalledAgentWrapper)) {
+      $script:updatePending = $false; return $false
+    }
     Log-Update "KEEP recovery update: $(Get-ShortSha $local) -> $(Get-ShortSha $target) ($($targetChanges.Count) allowlisted files); workers remain running" "Cyan"
+    if (-not (Confirm-PinnedWorkerVersion $pinnedVersion)) {
+      $script:updatePending = $false; return $false
+    }
     & git merge --ff-only --quiet $target 2>$null
     if ($LASTEXITCODE -ne 0) {
       Log-Update "KEEP RECOVERY FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local)" "Red"
@@ -427,14 +529,26 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
     return $false
   }
 
-  if (-not (Write-UpdateRestartMarker $target)) {
+  if (-not (Test-InstalledAgentWrapper)) {
+    $script:updatePending = $false; return $false
+  }
+
+  if (-not (Write-UpdateRestartMarker $target $local)) {
     $script:updatePending = $false; return $false
   }
 
   Log-Update "between-jobs window open -- merging captured target while current workers remain running" "Cyan"
+  if (-not (Confirm-PinnedWorkerVersion $pinnedVersion)) {
+    $headBeforeMerge = "$(& git rev-parse HEAD 2>$null)".Trim()
+    $headBeforeMergeExit = $LASTEXITCODE
+    Clear-UnappliedUpdateRestartMarker $local $headBeforeMerge $headBeforeMergeExit "UPDATE ABORTED" | Out-Null
+    $script:updatePending = $false; return $false
+  }
   & git merge --ff-only --quiet $target 2>$null
   if ($LASTEXITCODE -ne 0) {
-    Clear-UpdateRestartMarker | Out-Null
+    $failedMergeHead = "$(& git rev-parse HEAD 2>$null)".Trim()
+    $failedMergeHeadExit = $LASTEXITCODE
+    Clear-UnappliedUpdateRestartMarker $local $failedMergeHead $failedMergeHeadExit "UPDATE FAILED" | Out-Null
     Log-Update "UPDATE FAILED: ff-only merge refused -- leaving tree at $(Get-ShortSha $local); workers remain running" "Red"
     $script:updatePending = $false; return $false
   }
@@ -442,7 +556,7 @@ function Invoke-AutoUpdate([pscustomobject]$ExpectedMachinePolicy, [switch]$Reco
   $mergedHeadExit = $LASTEXITCODE
   $mergedHead = "$mergedHead".Trim()
   if ($mergedHeadExit -ne 0 -or $mergedHead -cne $target) {
-    Clear-UpdateRestartMarker | Out-Null
+    Clear-UnappliedUpdateRestartMarker $local $mergedHead $mergedHeadExit "UPDATE FAILED" | Out-Null
     Log-Update "UPDATE FAILED: HEAD verification did not match captured target $(Get-ShortSha $target); workers remain running" "Red"
     $script:updatePending = $false; return $false
   }

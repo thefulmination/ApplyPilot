@@ -38,6 +38,15 @@ def _ps_quote(value) -> str:
     return str(value).replace("'", "''")
 
 
+def _install_corrected_agent_wrapper(repo: Path) -> None:
+    wrapper_dir = repo / ".fleet-logs" / "_task-wrappers"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    (wrapper_dir / "fleet-agent-task.ps1").write_text(
+        f"& '{_ps_quote(repo / 'fleet-agent.ps1')}' -Label m4 -AutoUpdate\nexit $LASTEXITCODE\n",
+        encoding="utf-8",
+    )
+
+
 def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -58,10 +67,19 @@ def _recovery_update_fixture(tmp_path: Path, changed_path: str) -> tuple[Path, s
     _git(seed, "config", "user.email", "fleet-test@example.com")
     _git(seed, "config", "user.name", "Fleet Test")
     (seed / "fleet-agent-version.py").write_text(
-        "import os\nprint(os.environ['VERSION_LINE'])\n",
+        "import os\n"
+        "from pathlib import Path\n"
+        "counter = Path(os.environ['VERSION_COUNT_FILE'])\n"
+        "count = int(counter.read_text()) if counter.exists() else 0\n"
+        "counter.write_text(str(count + 1))\n"
+        "if count and int(os.environ.get('SECOND_VERSION_EXIT', '0')):\n"
+        "    raise SystemExit(int(os.environ['SECOND_VERSION_EXIT']))\n"
+        "key = 'VERSION_LINE' if count == 0 else 'SECOND_VERSION_LINE'\n"
+        "print(os.environ[key])\n",
         encoding="utf-8",
     )
     (seed / "fleet-blackout-query.py").write_text("old\n", encoding="utf-8")
+    (seed / ".gitignore").write_text(".fleet-logs/\n", encoding="utf-8")
     _git(seed, "add", ".")
     _git(seed, "commit", "-m", "initial")
     _git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
@@ -85,13 +103,25 @@ def _recovery_update_fixture(tmp_path: Path, changed_path: str) -> tuple[Path, s
 
 def _run_recovery_update(
     tmp_path: Path,
+    shell: str,
     changed_path: str,
     *,
     pinned_version: str | None = None,
+    repinned_version: str | None = None,
+    second_version_exit: int = 0,
 ) -> tuple[subprocess.CompletedProcess, Path]:
     worker, target_version = _recovery_update_fixture(tmp_path, changed_path)
+    _install_corrected_agent_wrapper(worker)
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
-    update_function = _powershell_function(script, "Invoke-AutoUpdate")
+    functions = "\n".join(
+        _powershell_function(script, name)
+        for name in (
+            "Get-PinnedWorkerVersion",
+            "Confirm-PinnedWorkerVersion",
+            "Test-InstalledAgentWrapper",
+            "Invoke-AutoUpdate",
+        )
+    )
     recovery_start = script.index("$recoveryFiles = @")
     recovery_end = script.index("\n$script:lastUpdateCheck", recovery_start)
     recovery_declaration = script[recovery_start:recovery_end]
@@ -102,6 +132,7 @@ def _run_recovery_update(
         f"$repo = '{_ps_quote(worker)}'\n"
         "$Label = 'm4'\n"
         f"$py = '{_ps_quote(sys.executable)}'\n"
+        f"$updateRestartMarker = '{_ps_quote(tmp_path / 'recovery-restart-marker.sha')}'\n"
         "$UpdateEverySec = 0\n"
         "$script:lastUpdateCheck = [datetime]::MinValue\n"
         "$script:updatePending = $false\n"
@@ -111,7 +142,7 @@ def _run_recovery_update(
         "function Log-Update { param([string]$msg, [string]$color = 'Gray') }\n"
         "function Get-ShortSha([string]$sha) { $sha }\n"
         f"function Get-LocalWorkers {{ Add-Content '{_ps_quote(mutation_marker)}' 'workers'; @() }}\n"
-        f"{update_function}\n"
+        f"{functions}\n"
         "Invoke-AutoUpdate -RecoveryOnly | Out-Null\n"
         "exit 0\n",
         encoding="utf-8",
@@ -119,8 +150,12 @@ def _run_recovery_update(
     env = os.environ.copy()
     effective_pin = target_version if pinned_version is None else pinned_version
     env["VERSION_LINE"] = f"OK|0.3.0+git.tree.0000000|{effective_pin}|"
+    effective_repin = effective_pin if repinned_version is None else repinned_version
+    env["SECOND_VERSION_LINE"] = f"OK|0.3.0+git.tree.0000000|{effective_repin}|"
+    env["SECOND_VERSION_EXIT"] = str(second_version_exit)
+    env["VERSION_COUNT_FILE"] = str(tmp_path / "version-count.txt")
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
         text=True,
         env=env,
@@ -132,14 +167,30 @@ def _run_recovery_update(
 
 def _run_update_harness(
     tmp_path: Path,
+    shell: str,
     *,
     pinned_version: str = "0.3.0+git.tree.ccccccc",
+    repinned_version: str | None = None,
+    second_version_exit: int = 0,
     fresh_policy_state: str = "OK",
     fresh_policy_line: str = "OK|m4|all|||",
     fail_git_command: str = "",
 ) -> tuple[subprocess.CompletedProcess, Path]:
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
-    update_function = _powershell_function(script, "Invoke-AutoUpdate")
+    functions = "\n".join(
+        _powershell_function(script, name)
+        for name in (
+            "Get-PinnedWorkerVersion",
+            "Confirm-PinnedWorkerVersion",
+            "Test-InstalledAgentWrapper",
+            "Get-UpdateRestartTarget",
+            "Write-UpdateRestartMarker",
+            "Clear-UpdateRestartMarker",
+            "Clear-UnappliedUpdateRestartMarker",
+            "Complete-PendingUpdateRestart",
+            "Invoke-AutoUpdate",
+        )
+    )
     declarations_start = script.index("$recoveryFiles = @")
     declarations_end = script.index("\n$script:lastUpdateCheck", declarations_start)
     declarations = script[declarations_start:declarations_end]
@@ -147,13 +198,24 @@ def _run_update_harness(
     py_shim = tmp_path / "python-shim.ps1"
     py_shim.write_text(
         "param([string]$ScriptName)\n"
-        "if ($ScriptName -eq 'fleet-agent-version.py') { Write-Output $env:VERSION_LINE; exit 0 }\n"
+        "if ($ScriptName -eq 'fleet-agent-version.py') {\n"
+        "  $count = if (Test-Path -LiteralPath $env:VERSION_COUNT_FILE) { "
+        "[int](Get-Content -LiteralPath $env:VERSION_COUNT_FILE) } else { 0 }\n"
+        "  Set-Content -LiteralPath $env:VERSION_COUNT_FILE -Value ($count + 1)\n"
+        "  if ($count -gt 0 -and [int]$env:SECOND_VERSION_EXIT -ne 0) { "
+        "exit ([int]$env:SECOND_VERSION_EXIT) }\n"
+        "  if ($count -eq 0) { Write-Output $env:VERSION_LINE } "
+        "else { Write-Output $env:SECOND_VERSION_LINE }\n"
+        "  exit 0\n"
+        "}\n"
         "if ($ScriptName -eq 'fleet-agent-update-gate.py') { Write-Output 'IDLE'; exit 0 }\n"
         "exit 1\n",
         encoding="utf-8",
     )
     harness = tmp_path / "update-harness.ps1"
+    _install_corrected_agent_wrapper(tmp_path)
     harness.write_text(
+        f"$repo = '{_ps_quote(tmp_path)}'\n"
         "$Label = 'm4'\n"
         f"$py = '{_ps_quote(py_shim)}'\n"
         f"$updateRestartMarker = '{_ps_quote(tmp_path / 'missing-restart-marker.sha')}'\n"
@@ -183,7 +245,10 @@ def _run_update_harness(
         f"  [pscustomobject]@{{ State = '{fresh_policy_state}'; Line = '{fresh_policy_line}' }}\n"
         "}\n"
         f"function Get-LocalWorkers {{ Add-Content '{_ps_quote(mutation_marker)}' 'workers'; @() }}\n"
-        f"{update_function}\n"
+        "function Slot-Of($proc) { 0 }\n"
+        "function Start-Sleep { param([int]$Seconds) }\n"
+        "function Stop-Process { param($Id, [switch]$Force, $ErrorAction) }\n"
+        f"{functions}\n"
         "$expected = [pscustomobject]@{ State = 'OK'; Line = 'OK|m4|all|||' }\n"
         "$result = Invoke-AutoUpdate -ExpectedMachinePolicy $expected\n"
         "Write-Output \"result=$result\"\n",
@@ -191,9 +256,13 @@ def _run_update_harness(
     )
     env = os.environ.copy()
     env["VERSION_LINE"] = f"OK|0.3.0+git.tree.aaaaaaa|{pinned_version}|"
+    effective_repin = pinned_version if repinned_version is None else repinned_version
+    env["SECOND_VERSION_LINE"] = f"OK|0.3.0+git.tree.aaaaaaa|{effective_repin}|"
+    env["SECOND_VERSION_EXIT"] = str(second_version_exit)
+    env["VERSION_COUNT_FILE"] = str(tmp_path / "version-count.txt")
     env["FAIL_GIT_COMMAND"] = fail_git_command
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         capture_output=True,
         text=True,
         env=env,
@@ -210,15 +279,20 @@ def _run_restart_sequence_harness(
     complete_later: bool = False,
     restart_surviving_marker: bool = False,
     fail_merge: bool = False,
+    post_merge_head: str = "target",
     gate: str = "IDLE",
 ) -> subprocess.CompletedProcess:
     script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
     functions = "\n".join(
         _powershell_function(script, name)
         for name in (
+            "Get-PinnedWorkerVersion",
+            "Confirm-PinnedWorkerVersion",
+            "Test-InstalledAgentWrapper",
             "Get-UpdateRestartTarget",
             "Write-UpdateRestartMarker",
             "Clear-UpdateRestartMarker",
+            "Clear-UnappliedUpdateRestartMarker",
             "Complete-PendingUpdateRestart",
             "Invoke-AutoUpdate",
         )
@@ -272,7 +346,9 @@ def _run_restart_sequence_harness(
         )
     )
     harness = tmp_path / "restart-sequence-harness.ps1"
+    _install_corrected_agent_wrapper(tmp_path)
     harness.write_text(
+        f"$repo = '{_ps_quote(tmp_path)}'\n"
         "$Label = 'm4'\n"
         f"$py = '{_ps_quote(py_shim)}'\n"
         f"$updateRestartMarker = '{_ps_quote(marker)}'\n"
@@ -285,6 +361,7 @@ def _run_restart_sequence_harness(
         f"$script:head = '{initial_head}'\n"
         "$script:policyCalls = 0\n"
         "$script:stops = 0\n"
+        "$script:mergeAttempted = $false\n"
         f"{declarations}\n"
         "function Log-Update { param([string]$msg, [string]$color = 'Gray') }\n"
         "function Get-ShortSha([string]$sha) { $sha }\n"
@@ -308,9 +385,24 @@ def _run_restart_sequence_harness(
         "    'config branch.main.remote' { 'origin' }\n"
         f"    'rev-parse origin/main' {{ '{target}' }}\n"
         f"    'rev-parse {target}^{{tree}}' {{ '{'c' * 40}' }}\n"
-        "    'rev-parse HEAD' { $script:head }\n"
+        "    'rev-parse HEAD' {\n"
+        + (
+            "      if ($script:mergeAttempted) { $global:LASTEXITCODE = 17; return }\n"
+            if post_merge_head == "failure"
+            else (
+                "      if ($script:mergeAttempted) { 'malformed'; return }\n"
+                if post_merge_head == "malformed"
+                else (
+                    f"      if ($script:mergeAttempted) {{ '{'d' * 40}'; return }}\n"
+                    if post_merge_head == "mismatch"
+                    else ""
+                )
+            )
+        )
+        + "      $script:head\n"
+        "    }\n"
         f"    'diff --name-only {local} {target}' {{ 'fleet-blackout-query.py' }}\n"
-        f"    'merge --ff-only --quiet {target}' {{ "
+        f"    'merge --ff-only --quiet {target}' {{ $script:mergeAttempted = $true; "
         + ("$global:LASTEXITCODE = 17" if fail_merge else f"$script:head = '{target}'")
         + " }\n"
         "  }\n"
@@ -628,23 +720,27 @@ def test_fleet_agent_keep_only_attempts_allowlisted_recovery_before_skipping_tic
         ]
 
 
-def test_fleet_agent_applies_allowlisted_recovery_without_worker_mutation(tmp_path):
-    result, worker = _run_recovery_update(tmp_path, "fleet-blackout-query.py")
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_fleet_agent_applies_allowlisted_recovery_without_worker_mutation(tmp_path, shell):
+    result, worker = _run_recovery_update(tmp_path, shell, "fleet-blackout-query.py")
 
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "recovery\n"
 
 
-def test_fleet_agent_recovery_can_deliver_task_registration_fix(tmp_path):
-    result, worker = _run_recovery_update(tmp_path, "register-fleet-tasks.ps1")
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_fleet_agent_recovery_can_deliver_task_registration_fix(tmp_path, shell):
+    result, worker = _run_recovery_update(tmp_path, shell, "register-fleet-tasks.ps1")
 
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert (worker / "register-fleet-tasks.ps1").read_text(encoding="utf-8") == "recovery\n"
 
 
-def test_fleet_agent_recovery_rejects_unpinned_target(tmp_path):
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_fleet_agent_recovery_rejects_unpinned_target(tmp_path, shell):
     result, worker = _run_recovery_update(
         tmp_path,
+        shell,
         "fleet-blackout-query.py",
         pinned_version="   ",
     )
@@ -653,8 +749,9 @@ def test_fleet_agent_recovery_rejects_unpinned_target(tmp_path):
     assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "old\n"
 
 
-def test_normal_update_rejects_unpinned_target(tmp_path):
-    result, marker = _run_update_harness(tmp_path, pinned_version="   ")
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_normal_update_rejects_unpinned_target(tmp_path, shell):
+    result, marker = _run_update_harness(tmp_path, shell, pinned_version="   ")
 
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert not marker.exists()
@@ -732,6 +829,58 @@ def test_merge_failure_clears_marker_without_stopping_workers(tmp_path, shell):
     assert "after-update result=False marker=False stops=0" in result.stdout
 
 
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+@pytest.mark.parametrize("post_merge_head", ["failure", "malformed", "mismatch"])
+def test_post_merge_head_ambiguity_retains_marker_and_workers(tmp_path, shell, post_merge_head):
+    result = _run_restart_sequence_harness(
+        tmp_path,
+        shell,
+        post_merge_head=post_merge_head,
+        complete_later=True,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "after-update result=False marker=True stops=0" in result.stdout
+    assert "later action=WAIT marker=True stops=0" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+@pytest.mark.parametrize(
+    ("repinned_version", "second_version_exit"),
+    [
+        ("0.3.0+git.tree.ddddddd", 0),
+        ("   ", 0),
+        ("0.3.0+git.tree.ccccccc", 17),
+    ],
+    ids=["changed", "blank", "query-failure"],
+)
+def test_normal_update_aborts_on_concurrent_repin(tmp_path, shell, repinned_version, second_version_exit):
+    result, mutation_marker = _run_update_harness(
+        tmp_path,
+        shell,
+        repinned_version=repinned_version,
+        second_version_exit=second_version_exit,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not mutation_marker.exists()
+    assert "result=False" in result.stdout
+    assert not (tmp_path / "missing-restart-marker.sha").exists()
+
+
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_recovery_update_aborts_on_concurrent_repin(tmp_path, shell):
+    result, worker = _run_recovery_update(
+        tmp_path,
+        shell,
+        "fleet-blackout-query.py",
+        repinned_version="0.3.0+git.tree.ddddddd",
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (worker / "fleet-blackout-query.py").read_text(encoding="utf-8") == "old\n"
+
+
 @pytest.mark.parametrize(
     ("fresh_state", "fresh_line"),
     [
@@ -739,9 +888,11 @@ def test_merge_failure_clears_marker_without_stopping_workers(tmp_path, shell):
         ("BLOCKED", "BLOCKED|m4|all|policy|2099-01-01T00:00:00+00:00|reason"),
     ],
 )
-def test_normal_update_revalidates_policy_before_worker_mutation(tmp_path, fresh_state, fresh_line):
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_normal_update_revalidates_policy_before_worker_mutation(tmp_path, shell, fresh_state, fresh_line):
     result, marker = _run_update_harness(
         tmp_path,
+        shell,
         fresh_policy_state=fresh_state,
         fresh_policy_line=fresh_line,
     )
@@ -760,16 +911,18 @@ def test_normal_update_revalidates_policy_before_worker_mutation(tmp_path, fresh
         "diff --name-only aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ],
 )
-def test_normal_update_fails_closed_on_git_command_failure(tmp_path, failed_command):
-    result, marker = _run_update_harness(tmp_path, fail_git_command=failed_command)
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_normal_update_fails_closed_on_git_command_failure(tmp_path, shell, failed_command):
+    result, marker = _run_update_harness(tmp_path, shell, fail_git_command=failed_command)
 
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert not marker.exists()
     assert "result=False" in result.stdout
 
 
-def test_fleet_agent_rejects_broader_recovery_update(tmp_path):
-    result, worker = _run_recovery_update(tmp_path, "src/applypilot/unrelated.py")
+@pytest.mark.parametrize("shell", _production_shells(), ids=lambda value: Path(value).name)
+def test_fleet_agent_rejects_broader_recovery_update(tmp_path, shell):
+    result, worker = _run_recovery_update(tmp_path, shell, "src/applypilot/unrelated.py")
 
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert not (worker / "src/applypilot/unrelated.py").exists()

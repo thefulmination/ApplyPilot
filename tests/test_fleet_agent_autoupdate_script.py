@@ -2,8 +2,24 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def _powershell_function(script: str, name: str) -> str:
+    start = script.index(f"function {name}")
+    opening = script.index("{", start)
+    depth = 0
+    for index in range(opening, len(script)):
+        if script[index] == "{":
+            depth += 1
+        elif script[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return script[start : index + 1]
+    raise AssertionError(f"unterminated PowerShell function {name}")
 
 
 def _production_powershells() -> list[str]:
@@ -31,7 +47,7 @@ def test_fleet_agent_autoupdate_checks_pin_before_fast_forward() -> None:
     ):
         assert text in script
 
-    assert '[string]::IsNullOrWhiteSpace($pinnedVersion)' in script
+    assert "[string]::IsNullOrWhiteSpace($vf[2])" in script
     assert '$RecoveryOnly -and [string]::IsNullOrWhiteSpace($pinnedVersion)' not in script
     assert 'git rev-parse "$remote/$branch"' in script
     assert 'git rev-parse "$target^{tree}"' in script
@@ -108,6 +124,54 @@ def test_restart_marker_controls_post_merge_worker_restart() -> None:
     completion = script.index("Complete-PendingUpdateRestart", post_policy)
     stop = script.index("Stop-Process", completion)
     assert merge < post_policy < completion < stop
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "accepted"),
+    [
+        (
+            "& 'C:\\ApplyPilot\\fleet-agent.ps1' -Label m4 -AutoUpdate\n",
+            False,
+        ),
+        (
+            "& 'C:\\ApplyPilot\\fleet-agent.ps1' -Label m4 -AutoUpdate\n"
+            "Write-Host 'intervening command'\n"
+            "exit $LASTEXITCODE\n",
+            False,
+        ),
+        (
+            "& 'C:\\ApplyPilot\\fleet-agent.ps1' -Label m4 -AutoUpdate\nexit $LASTEXITCODE\n",
+            True,
+        ),
+    ],
+    ids=["old-wrapper", "ambiguous-wrapper", "corrected-wrapper"],
+)
+def test_installed_fleet_agent_wrapper_guard(tmp_path, wrapper: str, accepted: bool) -> None:
+    script = (REPO / "fleet-agent.ps1").read_text(encoding="utf-8")
+    guard = _powershell_function(script, "Test-InstalledAgentWrapper")
+    wrapper_dir = tmp_path / ".fleet-logs" / "_task-wrappers"
+    wrapper_dir.mkdir(parents=True)
+    installed_wrapper = wrapper.replace("C:\\ApplyPilot", str(tmp_path))
+    (wrapper_dir / "fleet-agent-task.ps1").write_text(installed_wrapper, encoding="utf-8")
+    harness = tmp_path / "wrapper-guard-harness.ps1"
+    quoted_tmp = str(tmp_path).replace("'", "''")
+    harness.write_text(
+        f"$repo = '{quoted_tmp}'\n"
+        "function Log-Update { param([string]$msg, [string]$color = 'Gray') }\n"
+        f"{guard}\n"
+        "Write-Output (Test-InstalledAgentWrapper)\n",
+        encoding="utf-8",
+    )
+
+    for shell in _production_powershells():
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, (shell, result.stdout, result.stderr)
+        assert result.stdout.strip() == str(accepted), (shell, result.stdout, result.stderr)
 
 
 def test_recovery_allowlist_is_narrow_but_can_deliver_task_registration_fix() -> None:
