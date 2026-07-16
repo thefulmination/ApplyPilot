@@ -12,13 +12,12 @@ import sys
 
 label = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("APPLYPILOT_FLEET_LABEL", "home")
 role = sys.argv[2] if len(sys.argv) > 2 else "fleet"
-dsn = os.environ.get("FLEET_PG_DSN") or os.environ.get("APPLYPILOT_FLEET_DSN") or os.environ.get("DATABASE_URL")
 
 try:
     from applypilot.apply import pgqueue
     from applypilot.fleet import machine_blackout
 
-    conn = pgqueue.connect(dsn)
+    conn = pgqueue.connect()
     conn.read_only = True
     print(machine_blackout.status_line(conn, label, role=role))
 except Exception as exc:
