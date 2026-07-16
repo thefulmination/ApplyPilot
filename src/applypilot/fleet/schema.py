@@ -72,6 +72,7 @@ _REQUIRED_TABLES = {
     "agent_availability",
     "answer_bank",
     "applied_set",
+    "apply_attempts",
     "apply_queue",
     "apply_result_events",
     "auth_challenge",
@@ -83,6 +84,7 @@ _REQUIRED_TABLES = {
     "email_reconcile_actions",
     "fleet_assets",
     "fleet_config",
+    "fleet_decision_policies",
     "fleet_console_audit",
     "fleet_diagnoses",
     "fleet_knobs",
@@ -101,6 +103,7 @@ _REQUIRED_TABLES = {
 }
 
 _REQUIRED_COLUMNS = {
+    "apply_attempts": set(_APPLY_ATTEMPT_REQUIRED_COLUMNS),
     "apply_queue": {
         "approved_batch",
         "dedup_key",
@@ -129,6 +132,14 @@ _REQUIRED_COLUMNS = {
         "linkedin_apply_mode",
         "linkedin_canary_enabled",
         "linkedin_canary_remaining",
+    },
+    "fleet_decision_policies": {
+        "policy_version",
+        "lane",
+        "status",
+        "created_at",
+        "activated_at",
+        "retired_at",
     },
     "linkedin_queue": {
         "approved_batch",

@@ -381,15 +381,18 @@ def _workday(url: str, *, meta: dict[str, str | None] | None = None) -> tuple[st
                     return DEAD, f"workday_page_{page_status}_after_cxs_{st}"
                 if page_status == 200:
                     normalized = _visible_text(page_body).casefold()
-                    has_job_evidence = any(marker in normalized for marker in (
-                        "jobtitleheading", "apply", "job description", "job posting",
+                    has_title_marker = bool(re.search(
+                        r"data-automation-id\s*=\s*['\"]jobtitleheading['\"]",
+                        page_body,
+                        re.I,
                     ))
+                    has_apply_control = bool(re.search(r"\bapply\b", normalized))
                     page_state, _page_reason = _classify_body(
                         page_status, page_url, page_body, meta=meta, requested_url=url
                     )
                     if page_state == DEAD:
                         return DEAD, f"workday_page_closed_after_cxs_{st}"
-                    if page_state == LIVE and has_job_evidence:
+                    if page_state == LIVE and has_title_marker and has_apply_control:
                         return LIVE, f"workday_page_200_after_cxs_{st}"
                 return UNCERTAIN, f"workday_blocked_{st}"
             return UNCERTAIN, f"workday_cxs_{st}"

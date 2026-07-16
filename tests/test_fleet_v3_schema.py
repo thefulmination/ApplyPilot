@@ -1,9 +1,6 @@
 """v3 schema: loads cleanly against real Postgres, idempotent, all tables + columns present."""
 from __future__ import annotations
 
-import threading
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -19,7 +16,17 @@ EXPECTED_TABLES = {
     "applied_set", "answer_bank", "auth_challenge", "otp_request", "inbox_events",
     "workers", "worker_heartbeat", "poison_jobs", "remote_commands", "autotriage_actions",
     "fleet_decision_policies",
+    "apply_attempts",
 }
+
+
+def test_read_only_compatibility_contract_covers_runtime_tables():
+    assert {"apply_attempts", "fleet_decision_policies"} <= fleet_schema._REQUIRED_TABLES
+    assert fleet_schema._APPLY_ATTEMPT_REQUIRED_COLUMNS <= fleet_schema._REQUIRED_COLUMNS["apply_attempts"]
+    assert {"policy_version", "lane", "status"} <= fleet_schema._REQUIRED_COLUMNS[
+        "fleet_decision_policies"
+    ]
+
 
 CANONICAL_QUEUE_COLUMNS = {
     "decision_id", "policy_version", "decision_action", "qualification_verdict",
