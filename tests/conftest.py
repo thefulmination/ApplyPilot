@@ -184,6 +184,11 @@ def fleet_db(fleet_pg, monkeypatch):
     """Clean v3 schema for each test; yields the DSN."""
     monkeypatch.setenv("FLEET_PG_DSN", fleet_pg)
     with pgqueue.connect(fleet_pg) as conn:
+        # This compatibility table is created by a few focused console/worker
+        # tests with deliberately different column sets. It is not part of the
+        # canonical v3 schema, so remove it before each clean-schema test rather
+        # than allowing one test's shape to leak into the next.
+        conn.execute("DROP TABLE IF EXISTS fleet_desired_state CASCADE;")
         fleet_schema.ensure_schema_v3(conn)
         with conn.cursor() as cur:
             cur.execute("TRUNCATE apply_queue CASCADE;")
