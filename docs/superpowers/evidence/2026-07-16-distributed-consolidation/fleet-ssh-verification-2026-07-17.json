@@ -1,0 +1,35 @@
+{
+  "receiptVersion": "applypilot_fleet_ssh_verification_v1",
+  "verifiedAt": "2026-07-17T00:25:43-04:00",
+  "transport": "tailscale_ssh_over_openssh",
+  "masterTailscaleIp": "100.90.104.99",
+  "publicKey": {
+    "algorithm": "ED25519",
+    "bits": 256,
+    "fingerprint": "SHA256:aSgnCUHB80q+KnWTiMJl2rbHaMDDz6ovmklJJKqNz/M",
+    "privateKeyRecorded": false
+  },
+  "hosts": [
+    {
+      "sshAlias": "gggtower",
+      "hostname": "GGGTower",
+      "tailscaleIp": "100.69.68.103",
+      "remoteIdentity": "gggtower\\backoffice",
+      "batchAuthentication": "passed",
+      "tailscalePingMs": 17,
+      "sshdStatus": "Running",
+      "sshdStartType": "Automatic",
+      "port": 22,
+      "firewallScope": "master Tailscale IP only"
+    },
+    {
+      "sshAlias": "tarpon",
+      "hostname": "Tarpon",
+      "tailscaleIp": "100.77.65.8",
+      "remoteIdentity": "tarpon\\rstal",
+      "batchAuthentication": "passed",
+      "tailscalePingMs": 22,
+      "port": 22
+    }
+  ]
+}
