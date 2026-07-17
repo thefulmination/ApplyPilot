@@ -1,0 +1,112 @@
+{
+  "schemaVersion": "applypilot_staging_clean_authority_promotion_v1",
+  "recordedAt": "2026-07-17T14:32:14.288Z",
+  "promotionAuthorized": false,
+  "scope": "Railway staging database and controller only; no external fleet node or canary was opened",
+  "sourceDatabase": {
+    "name": "applypilot_brain_clean_20260717_v2",
+    "importStatus": "completed",
+    "importBatches": 14,
+    "quarantines": 0,
+    "paritySets": 16,
+    "sourceSqliteSha256": "02344457781051085c43ade3e55cadd2e0497f849183560272449a505f6afd2c"
+  },
+  "rejectedDatabase": {
+    "name": "railway",
+    "reason": "rejected predecessor import remained installed: 582 quarantines, 3608 label events, and zero policy artifact bindings",
+    "retainedAsRollbackEvidence": true
+  },
+  "prePromotionBackup": {
+    "path": "C:\\Users\\JStal\\AppData\\Local\\ApplyPilot\\railway-backups\\applypilot-brain-clean-v2-pre-promotion-20260717-140701.dump",
+    "bytes": 1118554951,
+    "sha256": "c987685fc3b91c9cead876a2a935f658f08d299e36ab58a266a9abd1d28eefbe",
+    "pgRestoreListEntries": 925,
+    "format": "PostgreSQL custom archive"
+  },
+  "schema": {
+    "fleetMigrations": [
+      {
+        "id": "20260715_001_application_authority",
+        "sha256": "65d10d1a16e9829a7995f48776697e3200daf7a5074147a9a3ed8c0293f56bea"
+      },
+      {
+        "id": "20260717_002_lane_specific_canary_pins",
+        "sha256": "1ee176c419508cd5a9c7004460798d14fd6749addbf293892fd2d859a1b6dd1d"
+      }
+    ],
+    "brainMigrations": [
+      {
+        "version": 1,
+        "sha256": "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5"
+      },
+      {
+        "version": 2,
+        "sha256": "0d4f29cf873e7e6c5051851be3a1ecf9701fdd8d0570af6f9503e83bb783577a"
+      },
+      {
+        "version": 3,
+        "sha256": "a8fe5bb48a8c481ad11c63712a16a86c2dc58836de50ad323589b274bb19f5d6"
+      }
+    ],
+    "deepBrainVerification": "passed",
+    "liveAclStatementsReplayed": 229,
+    "identityFunctionOwner": "applypilot_fleet_migrator"
+  },
+  "release": {
+    "pythonCodeCommit": "ac3cdf030e30c0aef63ab81e7781928937dc0c40",
+    "pythonCodeTree": "0bc0c1c1bee12a454db1edab1728b99378728e2c",
+    "pythonEvidenceHead": "7d338516224b28c32d2e066f0110fd551b626fa7",
+    "typescriptCommit": "ff06cd09c44c1498f5efa45d87c5e44e1d788844",
+    "typescriptTree": "2519c8a05410ba124fb63c7bb2dc7bfad35c10ca",
+    "workerVersion": "0.3.0+git.tree.0bc0c1c"
+  },
+  "railway": {
+    "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+    "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+    "postgresServiceId": "aa551e4f-51fa-49df-b02c-a45e3ea22fd1",
+    "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
+    "databaseSwitchDeploymentId": "39a2f21c-b15a-479a-b358-f699bdb255ac",
+    "releaseIdentityDeploymentId": "07a339db-afe1-4277-a2a8-51f2e2d13a4c",
+    "deploymentStatus": "SUCCESS",
+    "imageDigest": "sha256:d3de970b79c7ea280cbf5e170c5d4d30e43f22e262d284c5b2033ea3bff6bfb0"
+  },
+  "principalProof": {
+    "workerRole": "staging_worker_ats_0",
+    "workerId": "staging-ats-0",
+    "contract": "apply",
+    "workerBrainReadAllowed": false,
+    "statusPrincipal": "brain_status_operator",
+    "controllerPrincipal": "brain_policy_operator",
+    "unifiedAuthorityDatabase": "applypilot_brain_clean_20260717_v2"
+  },
+  "liveState": {
+    "globalPaused": true,
+    "atsPaused": true,
+    "atsMode": "stopped",
+    "linkedinMode": "stopped",
+    "atsCanaryEnabled": false,
+    "linkedinCanaryEnabled": false,
+    "atsOutstandingLeases": 0,
+    "linkedinOutstandingLeases": 0,
+    "workerHeartbeatState": "paused",
+    "workerHeartbeatVersion": "0.3.0+git.tree.0bc0c1c",
+    "brainPolicyArtifactBindings": 80,
+    "brainMigrationQuarantines": 0,
+    "policyLifecycle": {
+      "draft": 14,
+      "validated": 0,
+      "canary": 0,
+      "active": 0
+    }
+  },
+  "remainingGates": [
+    "Implement and prove TypeScript Postgres-authoritative scoring; the current mode remains an explicit fail-closed placeholder.",
+    "Bootstrap and hash-verify the five unproven release artifacts plus approved profile.json and resume.pdf without fabricating them.",
+    "Provision a durable immutable artifact backend for policy source payloads.",
+    "Create distinct LinkedIn and external-node mapped principals and lane pins.",
+    "Deploy a two-backend Tailscale Service gateway before external fleet database cutover.",
+    "Roll exact release code to Tarpon and GGGTower while paused, with task-specific credentials.",
+    "Validate new ATS and LinkedIn policies independently and run separate bounded canaries.",
+    "Do not authorize production promotion from this receipt."
+  ]
+}
