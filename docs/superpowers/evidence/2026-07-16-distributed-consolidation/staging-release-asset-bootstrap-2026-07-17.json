@@ -1,0 +1,157 @@
+{
+  "schemaVersion": "applypilot_staging_release_asset_bootstrap_v1",
+  "recordedAt": "2026-07-17T14:54:11.1478346Z",
+  "release": {
+    "releaseId": "applypilot-cloud-staging-2026-07-17-rc4",
+    "tag": "applypilot-cloud-staging-20260717-rc4",
+    "manifestPath": "docs/superpowers/evidence/2026-07-16-distributed-consolidation/applypilot-compatibility-manifest-2026-07-17-rc4.json",
+    "manifestSha256": "39d2c3be5c261bb93b853e9e921fd58047295e71315834211557a04395123aba"
+  },
+  "objectStore": {
+    "provider": "railway-s3-compatible-bucket",
+    "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+    "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+    "bucketDisplayName": "applypilot-brain-artifacts-staging",
+    "bucketName": "applypilot-brain-artifacts-staging-3n7mme",
+    "bucketId": "da8cb4a4-ad31-4e8f-bc72-a2ea7fc24e42",
+    "region": "sjc",
+    "credentialRegion": "auto",
+    "versioningStatus": "disabled",
+    "objectLockStatus": "not_configured",
+    "durabilityClassification": "staging_verified_not_cutover_durable",
+    "productionLimitation": "The Railway bucket has no demonstrated object versioning or Object Lock. A separately administered immutable or retention-locked copy is required before production promotion."
+  },
+  "verification": {
+    "method": "For each RC4 artifact, upload to a SHA-256-addressed key, HEAD the object, download it, then recompute byte length and SHA-256 locally.",
+    "verifiedAt": "2026-07-17T14:54:11.1478346Z",
+    "expectedObjectCount": 13,
+    "verifiedObjectCount": 13,
+    "allHeadLengthsMatched": true,
+    "allReadBackHashesMatched": true
+  },
+  "executionTarget": {
+    "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
+    "workerServiceInstanceId": "d0520023-b874-43d6-9ae0-a6f4c77fc49b",
+    "workerVolumeId": "4eaef62a-8070-4954-82ad-cb574e889b5c",
+    "volumeMountPath": "/data/applypilot",
+    "successfulDeploymentId": "07a339db-afe1-4277-a2a8-51f2e2d13a4c",
+    "imageDigest": "sha256:d3de970b79c7ea280cbf5e170c5d4d30e43f22e262d284c5b2033ea3bff6bfb0"
+  },
+  "objects": [
+    {
+      "role": "artifact_manifest",
+      "objectKey": "release-inputs/sha256/ce707879a9079aaae96da8507c1db974a2f094a35d866f2ab262ffe87a096c79/applypilot-artifact-manifest.json",
+      "bytes": 2316,
+      "sha256": "ce707879a9079aaae96da8507c1db974a2f094a35d866f2ab262ffe87a096c79",
+      "etag": "a21452aa86654b6251ca1dc77e8a38be"
+    },
+    {
+      "role": "knowledge_graph",
+      "objectKey": "release-inputs/sha256/9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e/knowledge_graph.json",
+      "bytes": 3766105,
+      "sha256": "9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e",
+      "etag": "fdbcd2b88d84df0bead268bcbb461e77"
+    },
+    {
+      "role": "compact_knowledge_graph",
+      "objectKey": "release-inputs/sha256/91345970988cc8b99ea6d7e8340e976f414c14fd092ba6973c81946d566bd10e/compact_knowledge_graph.json",
+      "bytes": 485869,
+      "sha256": "91345970988cc8b99ea6d7e8340e976f414c14fd092ba6973c81946d566bd10e",
+      "etag": "59c8e1da6366b2a487df2d5ec5a43312"
+    },
+    {
+      "role": "compact_kg_prompt_pack",
+      "objectKey": "release-inputs/sha256/6a0f2a68c70ca264568accd75617cf7daba83da6f376d4faa0f8e32f2d4404d3/compact_kg_prompt_pack.md",
+      "bytes": 27180,
+      "sha256": "6a0f2a68c70ca264568accd75617cf7daba83da6f376d4faa0f8e32f2d4404d3",
+      "etag": "38fdbed58447bc3cceb401ddbd14488b"
+    },
+    {
+      "role": "compact_canonical_facts",
+      "objectKey": "release-inputs/sha256/b77e4ad9f73ddd8c80e14fe6f1c3d57fc961b06e72142de5e2dce3fc66922d5f/compact_canonical_facts.json",
+      "bytes": 60793,
+      "sha256": "b77e4ad9f73ddd8c80e14fe6f1c3d57fc961b06e72142de5e2dce3fc66922d5f",
+      "etag": "1f999e9956aca1e220cfe33f51fd0f81"
+    },
+    {
+      "role": "compact_gap_signals",
+      "objectKey": "release-inputs/sha256/992d84f28f3befc2aba12874087c2fae7d897ba41b52d68ca668d94933c64dcc/compact_gap_signals.json",
+      "bytes": 29059,
+      "sha256": "992d84f28f3befc2aba12874087c2fae7d897ba41b52d68ca668d94933c64dcc",
+      "etag": "7700edcaa62746a50aa2a4350143c194"
+    },
+    {
+      "role": "fitmap_observations",
+      "objectKey": "release-inputs/sha256/cef07ddc5955685fb517140da9913d83e72eeda1da3bbb1d2149eaff1046b592/fitmap_observations.jsonl",
+      "bytes": 1879663,
+      "sha256": "cef07ddc5955685fb517140da9913d83e72eeda1da3bbb1d2149eaff1046b592",
+      "etag": "2cc533f77dbaed0689428c1330f857c2"
+    },
+    {
+      "role": "preference_profile",
+      "objectKey": "release-inputs/sha256/705141f353431281e1c6aef13e00eef23ed0aa1501e63dac4d38b46987a5cb40/applypilot-preference-profile.json",
+      "bytes": 43921,
+      "sha256": "705141f353431281e1c6aef13e00eef23ed0aa1501e63dac4d38b46987a5cb40",
+      "etag": "6b6072db10da0c434dec96b893dbe75c"
+    },
+    {
+      "role": "pairwise_annotations",
+      "objectKey": "release-inputs/sha256/a6109ab2a3b12bc3dd509e87a5ab534b246664d2a7c70044826c43b637cd064a/applypilot-pairwise-annotation.jsonl",
+      "bytes": 47330,
+      "sha256": "a6109ab2a3b12bc3dd509e87a5ab534b246664d2a7c70044826c43b637cd064a",
+      "etag": "7cdb66a4ee246c77435aef3e93bdc3b8"
+    },
+    {
+      "role": "pairwise_queue",
+      "objectKey": "release-inputs/sha256/5e35406407e194eda5313e68c4d88916507d2416d8383180f9ffa09a8cdb52ff/applypilot-pairwise-queue.json",
+      "bytes": 835599,
+      "sha256": "5e35406407e194eda5313e68c4d88916507d2416d8383180f9ffa09a8cdb52ff",
+      "etag": "6b8c65fa8fb6cae73cf372a1636ef4aa"
+    },
+    {
+      "role": "canonical_all_label_events",
+      "objectKey": "release-inputs/sha256/0320572bc039ee01e8527c0d8125fda32d0bddef8f7cf2a2008e6d102f1cc1ac/applypilot-canonical-all-label-events.jsonl",
+      "bytes": 2849926,
+      "sha256": "0320572bc039ee01e8527c0d8125fda32d0bddef8f7cf2a2008e6d102f1cc1ac",
+      "etag": "6a06ae51b7f3c25c2b02b8e2befcd3e7"
+    },
+    {
+      "role": "label_learning_corpus",
+      "objectKey": "release-inputs/sha256/3a76555bd8cb4cb39d1cf5495cc50ee41769a0fe731eea33c28f5e98fe7d312f/label-corpus-latest.jsonl",
+      "bytes": 8210720,
+      "sha256": "3a76555bd8cb4cb39d1cf5495cc50ee41769a0fe731eea33c28f5e98fe7d312f",
+      "etag": "24d1425d88c65c2fa905f069a8e9c675"
+    },
+    {
+      "role": "label_learning_summary",
+      "objectKey": "release-inputs/sha256/31caeaf253e3a847c835f5f65340955012bb8055ed7211007eb3f43536e7dff4/label-corpus-summary-latest.json",
+      "bytes": 506,
+      "sha256": "31caeaf253e3a847c835f5f65340955012bb8055ed7211007eb3f43536e7dff4",
+      "etag": "6daa95d50e7931b89f70d8a0bcd4b2f3"
+    }
+  ],
+  "executionAssets": [
+    {
+      "role": "approved_profile",
+      "localSource": "C:\\Users\\JStal\\OneDrive\\Documents\\New project\\ApplyPilot\\.applypilot\\profile.json",
+      "mountedPath": "/data/applypilot/profile.json",
+      "localBytes": 2603,
+      "mountedBytes": 2603,
+      "localSha256": "53417cbfacd540ebb940164cecd46b8af5115e9725fbdc5b899143f9207cd58c",
+      "mountedSha256": "53417cbfacd540ebb940164cecd46b8af5115e9725fbdc5b899143f9207cd58c",
+      "validation": "local and mounted hashes and byte lengths match; local JSON parsed successfully"
+    },
+    {
+      "role": "approved_resume",
+      "localSource": "C:\\Users\\JStal\\OneDrive\\Documents\\New project\\ApplyPilot\\.applypilot\\resume.pdf",
+      "mountedPath": "/data/applypilot/resume.pdf",
+      "localBytes": 364594,
+      "mountedBytes": 364594,
+      "localSha256": "e5c75e2c3adeb4b64f2fbf850609649bbf79bdee1f35ebedd1826cfdf3e10c18",
+      "mountedSha256": "e5c75e2c3adeb4b64f2fbf850609649bbf79bdee1f35ebedd1826cfdf3e10c18",
+      "validation": "local and mounted hashes and byte lengths match; PDF begins with %PDF- and ends with %%EOF"
+    }
+  ],
+  "promotionAuthorized": false,
+  "remainingGate": "Copy every release artifact, this receipt, and its SHA-256 sidecar to a separately administered versioned and retention-locked production archive; read all objects back, verify their byte lengths and hashes, and complete a restore drill before production promotion."
+}
