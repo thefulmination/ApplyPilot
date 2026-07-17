@@ -1,0 +1,54 @@
+{
+  "artifactLedgerCount": 87,
+  "database": "applypilot_brain_clean_20260717_v2",
+  "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+  "finalizedAt": "2026-07-17T09:50:44.299835+00:00",
+  "fleetQueues": {
+    "apply": 0,
+    "linkedin": 0
+  },
+  "import": {
+    "batchSize": 5000,
+    "completedBatches": 14,
+    "durationSeconds": 2874.219,
+    "migrationRunId": 1,
+    "quarantines": 0,
+    "runKey": "sealed-0234445778105108-clean-v2",
+    "status": "completed"
+  },
+  "independentParity": {
+    "aliases": {"count": 101679, "sha256": "d075ba9ea63a9d8b3fed8118257914b25387fde63fd1b86b134282a61f03eba6"},
+    "application_events": {"count": 1088, "sha256": "fa11e0e68f5b3905a3f2c996d9c206b20ed94cc75a131eaf10ebb01ce63d21ff"},
+    "applications": {"count": 1077, "sha256": "dd871f06b45f9ed47f3368d31b126e9cffd17d1c9216e63381a2e5e8b369774a"},
+    "decision_policy_versions": {"count": 14, "sha256": "fcd1f5b32f9c6ee93030c94f4e6e5ac5f3917ee657ef34f7e992083b0811f20b"},
+    "email_event_reviews": {"count": 93, "sha256": "28c647cec10344259dbf0a10278cc088dabb6a34198bdae23b3b090f0ff3f875"},
+    "email_events": {"count": 2109, "sha256": "accfcbb28d84e54b640ec77e5b3d5a95d6b47c9e06ea0f2f732185122534f234"},
+    "job_decisions": {"count": 701658, "sha256": "97f6f093ac8bfa1d7265998e7461a70bf8bc14a4c5ad7292bf6330a3c8514c80"},
+    "jobs": {"count": 101679, "sha256": "93e1a4185261f3b95851da53cf07a9635a78aa3ce7525abced75efed67a20336"},
+    "observations": {"count": 101679, "sha256": "3d215c56d191c2a1aaf2cc4b3cab4fe8b88c315f85d190b86d5af96603ac6225"},
+    "research_kg_artifacts": {"count": 1, "sha256": "53678e8dedb2418b7755cdcf1baa5a773bfe6fce98d82a960d66025c85caf0f4"},
+    "research_kg_runs": {"count": 0, "sha256": "0424a3cb3b6b2e3193349fed4bd1d259bc7a64db6bf11bae638f20704cc641e2"},
+    "research_label_confidence": {"count": 2023, "sha256": "98d3e5b622e42b813f9c035e0d270ad0c3fdabcefa12a44fb8beccadee723d26"},
+    "research_labels": {"count": 2167, "sha256": "ed60cf21e7379873ad36d589d91d36e69e954395e6eb8a0342252613c123c2b8"},
+    "research_pairwise_labels": {"count": 133, "sha256": "8b228b69248fd5eccabed6a2bfcdb806505e1c783a3e3cc597d125eade96dcbf"},
+    "research_scores": {"count": 0, "sha256": "0424a3cb3b6b2e3193349fed4bd1d259bc7a64db6bf11bae638f20704cc641e2"},
+    "reviewed_outcomes": {"count": 42, "sha256": "a46511a9e2a8d5f076aa657ebe48b447e44a246602f329b3e30c1ed5e2d87bde"}
+  },
+  "parityDurationSeconds": 4769.016,
+  "postgresServiceId": "aa551e4f-51fa-49df-b02c-a45e3ea22fd1",
+  "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+  "rejectedPredecessor": {
+    "database": "applypilot_brain_clean_20260717",
+    "reason": "24 research_label_confidence rows lost decimal precision through binary-float-to-NUMERIC coercion",
+    "status": "failed"
+  },
+  "source": {
+    "byteLength": 7813488640,
+    "sha256": "02344457781051085c43ade3e55cadd2e0497f849183560272449a505f6afd2c"
+  },
+  "verification": {
+    "disposablePostgresTests": 45,
+    "focusedBrainTests": 108,
+    "ruff": "passed"
+  }
+}

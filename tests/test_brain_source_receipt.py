@@ -44,10 +44,11 @@ def test_receipt_contains_required_counts_and_fingerprint(tmp_path):
     }
 
 
-def test_receipt_rejects_non_empty_wal(tmp_path):
+@pytest.mark.parametrize(("suffix", "content"), [("-wal", b""), ("-wal", b"wal"), ("-shm", b"shm")])
+def test_receipt_rejects_any_sidecar_state(tmp_path, suffix, content):
     path = tmp_path / "applypilot.db"
     _make_source(path)
-    path.with_name(path.name + "-wal").write_bytes(b"not a valid wal")
+    path.with_name(path.name + suffix).write_bytes(content)
 
-    with pytest.raises(SourceReceiptError, match="WAL is non-empty"):
+    with pytest.raises(SourceReceiptError, match="has sidecar state"):
         capture_sqlite_source_receipt(path)

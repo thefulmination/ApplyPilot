@@ -89,8 +89,9 @@ def capture_sqlite_source_receipt(path: str | os.PathLike[str]) -> SQLiteSourceR
     shm = Path(f"{source}-shm")
     wal_size = wal.stat().st_size if wal.exists() else 0
     shm_size = shm.stat().st_size if shm.exists() else 0
-    if wal_size:
-        raise SourceReceiptError(f"SQLite WAL is non-empty; seal a snapshot first: {wal}")
+    if wal.exists() or shm.exists():
+        present = ", ".join(str(path) for path in (wal, shm) if path.exists())
+        raise SourceReceiptError(f"sealed SQLite source has sidecar state; seal a clean snapshot first: {present}")
 
     before = _stat_identity(source)
     encoded = source.as_posix().replace("'", "%27")

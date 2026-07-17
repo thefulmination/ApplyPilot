@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from threading import Barrier
 
 import psycopg
@@ -11,6 +12,15 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 
 from applypilot.brain import schema
+from applypilot.brain.policy_artifacts import compile_policy_artifacts
+from applypilot.brain.sqlite_to_postgres import (
+    _acquire_import_lock,
+    _activate_controller,
+    _insert_decisions,
+    _insert_policies,
+    _release_import_context,
+    BrainImportError,
+)
 from applypilot.fleet import schema as fleet_schema
 
 
@@ -338,6 +348,212 @@ def test_exact_configured_migration_role_is_allowed(brain_pg, monkeypatch):
     with psycopg.connect(_dsn_for(brain_pg, "brain_schema_reader"), row_factory=dict_row) as conn:
         schema.ensure_schema_v1(conn)
         assert conn.info.transaction_status == TransactionStatus.IDLE
+
+
+def test_importer_activates_controller_and_serializes_source_ownership(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        schema.ensure_schema_v1(owner)
+    source_hash = "1" * 64
+    with (
+        psycopg.connect(brain_pg, row_factory=dict_row) as holder,
+        psycopg.connect(brain_pg, row_factory=dict_row) as contender,
+    ):
+        _activate_controller(holder)
+        _acquire_import_lock(holder, source_hash)
+        assert holder.execute("SELECT current_user AS role").fetchone()["role"] == "brain_schema_migrator"
+
+        _activate_controller(contender)
+        with pytest.raises(BrainImportError, match="already owns source"):
+            _acquire_import_lock(contender, source_hash)
+
+        _release_import_context(contender, source_hash, lock_acquired=False)
+        _release_import_context(holder, source_hash, lock_acquired=True)
+        assert holder.execute("SELECT current_user AS role").fetchone()["role"] == "postgres"
+
+
+def test_importer_refuses_to_commit_caller_transaction(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        schema.ensure_schema_v1(conn)
+        conn.execute("CREATE TEMP TABLE importer_caller_work (value integer)")
+        conn.execute("INSERT INTO importer_caller_work VALUES (1)")
+
+        with pytest.raises(BrainImportError, match="idle dedicated"):
+            _activate_controller(conn)
+
+        assert conn.info.transaction_status == TransactionStatus.INTRANS
+        assert conn.execute("SELECT value FROM importer_caller_work").fetchone()["value"] == 1
+        conn.rollback()
+
+
+def test_policy_import_uses_compiled_artifacts_and_compact_graph_binding(brain_pg):
+    source = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    source.execute(
+        """CREATE TABLE decision_policy_versions (
+            policy_version TEXT PRIMARY KEY, lane TEXT, status TEXT,
+            qualification_model TEXT, preference_model TEXT, outcome_model TEXT,
+            kg_version TEXT, label_snapshot TEXT, pairwise_snapshot TEXT, outcome_snapshot TEXT,
+            config_json TEXT, metrics_json TEXT, created_at TEXT, validated_at TEXT,
+            activated_at TEXT, retired_at TEXT)"""
+    )
+    source.execute(
+        "INSERT INTO decision_policy_versions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "policy-import-test",
+            "ats",
+            "draft",
+            "qualification-v1",
+            None,
+            None,
+            HASHES[0],
+            None,
+            None,
+            None,
+            '{"models":{"qualificationEvidence":{"weights":[1]}}}',
+            None,
+            "2026-07-16T00:00:00Z",
+            None,
+            None,
+            None,
+        ),
+    )
+    compiled = compile_policy_artifacts(dict(source.execute("SELECT * FROM decision_policy_versions").fetchone()))
+
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        schema.ensure_schema_v1(conn)
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO brain_artifacts "
+                "(request_id,artifact_hash,media_type,byte_length,schema_version,location) "
+                "VALUES ('graph-import-test',%s,'application/json',1,1,'memory://graph')",
+                (HASHES[0],),
+            )
+            for artifact in compiled.artifacts:
+                conn.execute(
+                    "INSERT INTO brain_artifacts "
+                    "(request_id,artifact_hash,media_type,byte_length,schema_version,location) "
+                    "VALUES (%s,%s,%s,%s,1,%s)",
+                    (
+                        f"policy-import-test:{artifact.sha256}",
+                        artifact.sha256,
+                        artifact.media_type,
+                        artifact.byte_length,
+                        f"memory://{artifact.sha256}",
+                    ),
+                )
+        _activate_controller(conn)
+        try:
+            assert _insert_policies(conn, source) == 1
+        finally:
+            _release_import_context(conn, "0" * 64, lock_acquired=False)
+
+        policy = conn.execute(
+            "SELECT lane,lifecycle,policy_metadata FROM brain_decision_policies "
+            "WHERE policy_version='policy-import-test'"
+        ).fetchone()
+        assert policy["lane"] == "ats"
+        assert policy["lifecycle"] == "draft"
+        assert policy["policy_metadata"] == compiled.metadata_object()
+        bindings = conn.execute(
+            "SELECT artifact_role,artifact_hash FROM brain_policy_artifacts "
+            "WHERE policy_version='policy-import-test' ORDER BY artifact_role"
+        ).fetchall()
+        assert bindings == [
+            {"artifact_role": "config", "artifact_hash": compiled.artifact("config").sha256},
+            {"artifact_role": "knowledge_graph", "artifact_hash": HASHES[0]},
+            {
+                "artifact_role": "qualification_model",
+                "artifact_hash": compiled.artifact("qualification_model").sha256,
+            },
+        ]
+
+
+def test_decision_delta_accepts_new_ids_that_sort_before_existing_ids(brain_pg):
+    source = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    source.execute(
+        """CREATE TABLE job_decisions (
+            decision_id TEXT PRIMARY KEY, job_url TEXT, policy_version TEXT, lane TEXT,
+            qualification_score REAL, preference_score REAL, outcome_score REAL, final_score REAL,
+            qualification_verdict TEXT, action TEXT, confidence REAL, uncertainty_json TEXT,
+            blockers_json TEXT, requirements_json TEXT, evidence_node_ids_json TEXT,
+            title_signals_json TEXT, explanation TEXT, input_hash TEXT, created_at TEXT,
+            expires_at TEXT)"""
+    )
+    source.executemany(
+        "INSERT INTO job_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (
+                decision_id,
+                job_url,
+                "policy-delta-test",
+                "ats",
+                0.8,
+                0.7,
+                0.6,
+                0.75,
+                "qualified",
+                "review",
+                0.9,
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "test",
+                input_hash,
+                "2026-07-16T00:00:00Z",
+                None,
+            )
+            for decision_id, job_url, input_hash in (
+                ("a-new", "https://jobs/new", "a" * 64),
+                ("m-existing", "https://jobs/existing", "b" * 64),
+            )
+        ],
+    )
+
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        schema.ensure_schema_v1(conn)
+        _activate_controller(conn)
+        conn.execute(
+            "INSERT INTO brain_decision_policies (policy_version,lane,lifecycle) "
+            "VALUES ('policy-delta-test','ats','draft')"
+        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO brain_jobs (job_id,source_namespace,source_job_id,canonical_url) "
+                "VALUES (%s,'applypilot-sqlite',%s,%s)",
+                [
+                    ("job-new", "https://jobs/new", "https://jobs/new"),
+                    ("job-existing", "https://jobs/existing", "https://jobs/existing"),
+                ],
+            )
+        conn.commit()
+        schema.ensure_policy_partition(conn, "policy-delta-test")
+        _activate_controller(conn)
+        conn.execute(
+            """INSERT INTO brain_job_decisions
+               (decision_id,source_namespace,source_decision_id,job_id,policy_version,lane,
+                qualification_score,preference_score,outcome_score,final_score,
+                qualification_verdict,action,confidence,uncertainty,blockers,requirements,
+                evidence_nodes,title_signals,explanation,input_hash,created_at)
+               VALUES ('m-existing','applypilot-sqlite','m-existing','job-existing',
+                       'policy-delta-test','ats',0.8,0.7,0.6,0.75,'qualified','review',0.9,
+                       '[]','[]','[]','[]','[]','test',%s,'2026-07-16T00:00:00Z')""",
+            ("b" * 64,),
+        )
+        conn.commit()
+
+        assert _insert_decisions(
+            conn,
+            source,
+            {"https://jobs/new": "job-new", "https://jobs/existing": "job-existing"},
+            1,
+        ) == 2
+        assert conn.execute(
+            "SELECT source_decision_id FROM brain_job_decisions "
+            "WHERE source_namespace='applypilot-sqlite' ORDER BY source_decision_id"
+        ).fetchall() == [{"source_decision_id": "a-new"}, {"source_decision_id": "m-existing"}]
 
 
 def test_deep_verification_rejects_malformed_same_column_schema(brain_pg):
