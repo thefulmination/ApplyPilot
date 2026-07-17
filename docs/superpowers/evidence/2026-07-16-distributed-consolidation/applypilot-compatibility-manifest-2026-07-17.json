@@ -1,16 +1,16 @@
 {
   "schemaVersion": "applypilot_compatibility_manifest_v2",
-  "releaseId": "applypilot-cloud-staging-2026-07-17-rc1",
-  "generatedAt": "2026-07-17T10:03:54.7569813Z",
+  "releaseId": "applypilot-cloud-staging-2026-07-17-rc2",
+  "generatedAt": "2026-07-17T12:55:11.2160596Z",
   "releaseState": "staging_candidate",
   "promotionAuthorized": false,
   "repositories": {
     "python": {
       "repository": "thefulmination/ApplyPilot",
       "branch": "codex/cloud-cutover-runtime-integration",
-      "testedCommitSha": "1640867d06a21493ac71ef841f2daa13288cfc0a",
-      "testedTreeSha": "56e408a7730cbe9732848eead98ae48e583ad1ff",
-      "releaseVersion": "0.3.0+git.tree.56e408a",
+      "testedCommitSha": "623f469a75acb52417a6a6e9e39ea21dedb0b902",
+      "testedTreeSha": "d44a5b0587cebd595cff9cc8f4306c8e7ee0c3ad",
+      "releaseVersion": "0.3.0+git.tree.d44a5b0",
       "rollback": {
         "branch": "codex/fleet-dbhot-stage1-rollback",
         "commitSha": "f364bfec643026bf57969efda31bd545bc214142",
@@ -20,9 +20,9 @@
     "typescript": {
       "repository": "thefulmination/res_build",
       "branch": "codex/cloud-cutover-brain-integration",
-      "releaseEvidenceHeadSha": "2c9ea4bbf6cb78c08de15fcc29c31962ec055305",
-      "testedCommitSha": "80a9ef51a3bbd5d248af887509101ae4b1f5895f",
-      "testedTreeSha": "ca0db156c34c1a66c603c8f6df5ffaa16e735c0f",
+      "releaseEvidenceHeadSha": "ff06cd09c44c1498f5efa45d87c5e44e1d788844",
+      "testedCommitSha": "ff06cd09c44c1498f5efa45d87c5e44e1d788844",
+      "testedTreeSha": "2519c8a05410ba124fb63c7bb2dc7bfad35c10ca",
       "rollback": {
         "branch": "codex/repo-sync-consolidation",
         "commitSha": "b1694ce52b879d7058cd48534ea6f3592c9a3641",
@@ -35,6 +35,11 @@
       "path": "src/applypilot/brain/schema_v1.sql",
       "bytes": 77803,
       "sha256": "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5"
+    },
+    "brainSqlV2": {
+      "path": "src/applypilot/brain/schema_v2.sql",
+      "bytes": 27172,
+      "sha256": "0d4f29cf873e7e6c5051851be3a1ecf9701fdd8d0570af6f9503e83bb783577a"
     },
     "fleetPython": {
       "path": "src/applypilot/fleet/schema.py",
@@ -136,7 +141,11 @@
     "postgresServiceId": "aa551e4f-51fa-49df-b02c-a45e3ea22fd1",
     "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
     "postgresVolumeId": "02dee98b-ef6e-4314-ba1e-579b4ef75812",
-    "workerVolumeId": "4eaef62a-8070-4954-82ad-cb574e889b5c"
+    "workerVolumeId": "4eaef62a-8070-4954-82ad-cb574e889b5c",
+    "liveBrainSchemaVersions": [1, 2],
+    "liveBrainSchemaV2Verified": true,
+    "brainStatusPrincipal": "brain_status_operator",
+    "brainControllerPrincipal": "brain_policy_operator"
   },
   "verification": {
     "typescript": {
@@ -154,7 +163,7 @@
   "guardrails": {
     "lanesPaused": true,
     "zeroFleetLeasesProvenForRelease": false,
-    "principalValidationProven": false,
+    "principalValidationProven": true,
     "workerVersionIdentityProven": false,
     "atsCanaryEnabled": false,
     "linkedinCanaryEnabled": false,
@@ -164,7 +173,8 @@
     "Bootstrap every ignored artifact from its pinned source bytes into staging storage and verify byte length plus SHA-256.",
     "Correct or supersede the historical staging asset receipt whose preference-profile digest is malformed.",
     "Validate and activate separate ATS and LinkedIn policy versions only after replay and canary evidence.",
-    "Prove staging principal validation, heartbeat, exact release identity, paused state, and zero leases.",
+    "Upgrade and bind GGGTower and Tarpon to separate cloud worker principals while all apply lanes remain paused.",
+    "Prove exact RC2 heartbeat identity and zero leases after the node fleet is rebound to Railway Postgres.",
     "Build and bind the deployable image digest.",
     "Run separate ATS and LinkedIn canaries before database or fleet promotion.",
     "Create and verify the combined release tag after this manifest and its SHA-256 sidecar are committed."
