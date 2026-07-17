@@ -17,6 +17,27 @@ from psycopg import sql
 
 DEFAULT_ROLE = "fleet_worker"
 _ROLE_LOCK_KEY = "applypilot:fleet-worker-role:v2"
+_CANDIDATE_ROLE_LOCK_KEY = "applypilot:brain-candidate-roles:v1"
+BRAIN_CANDIDATE_READER_ROLE = "brain_candidate_reader"
+BRAIN_CANDIDATE_WRITER_ROLE = "brain_candidate_writer"
+_CANDIDATE_READ_RELATIONS = (
+    "brain_authority_scope_state",
+    "brain_v4_candidate_decisions",
+    "brain_v4_decision_envelopes",
+    "brain_immutable_artifact_references",
+)
+_CANDIDATE_ALL_RELATIONS = (
+    "brain_authority_scope_state",
+    "brain_authority_transition_events",
+    "brain_graph_approval_receipts",
+    "brain_v4_candidate_decisions",
+    "brain_v4_decision_envelopes",
+    "brain_graph_approval_consumptions",
+    "brain_immutable_artifact_references",
+)
+_CANDIDATE_PUBLISH_SIGNATURE = (
+    "public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)"
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +73,13 @@ class RoleReconciliationReceipt:
     inventory: Mapping[str, Any]
     rollback_sql: str
     credential_forward_reconcile_required: bool
+    reconciled_at: str
+
+
+@dataclass(frozen=True)
+class CandidateRoleReconciliationReceipt:
+    reader_role: str
+    writer_role: str
     reconciled_at: str
 
 
@@ -1898,6 +1926,173 @@ def validate_runtime_principal(conn, *, worker_id: str, contract: str) -> Runtim
     if identity.contract != contract:
         raise RuntimeError(f"worker contract mismatch: mapped={identity.contract!r}, configured={contract!r}")
     return identity
+
+
+def ensure_brain_candidate_roles(
+    conn,
+    *,
+    reader_role: str = BRAIN_CANDIDATE_READER_ROLE,
+    writer_role: str = BRAIN_CANDIDATE_WRITER_ROLE,
+) -> CandidateRoleReconciliationReceipt:
+    """Reconcile NOLOGIN V4 candidate capabilities without granting fleet authority."""
+    if reader_role == writer_role:
+        raise ValueError("candidate reader and writer roles must be distinct")
+    for role_name in (reader_role, writer_role):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", role_name):
+            raise ValueError("candidate role names must be plain PostgreSQL identifiers")
+    if conn.info.transaction_status.name != "IDLE":
+        raise RuntimeError("candidate role reconciliation requires an idle connection")
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL search_path=pg_catalog")
+                cur.execute("SELECT rolsuper OR rolcreaterole AS allowed FROM pg_roles WHERE rolname=current_user")
+                row = cur.fetchone()
+                if row is None or not _row_value(row, "allowed"):
+                    raise RuntimeError("candidate role reconciliation requires CREATEROLE or provider-admin authority")
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_CANDIDATE_ROLE_LOCK_KEY,))
+                for role_name in (reader_role, writer_role):
+                    identifier = sql.Identifier(role_name)
+                    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,))
+                    if cur.fetchone() is None:
+                        cur.execute(sql.SQL("CREATE ROLE {}").format(identifier))
+                    cur.execute(
+                        sql.SQL(
+                            "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                            "NOREPLICATION NOBYPASSRLS"
+                        ).format(identifier)
+                    )
+                    cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(identifier))
+                    cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier))
+
+                cur.execute(
+                    "SELECT parent.rolname AS parent_role,member.rolname AS member_role "
+                    "FROM pg_auth_members membership JOIN pg_roles parent ON parent.oid=membership.roleid "
+                    "JOIN pg_roles member ON member.oid=membership.member WHERE member.rolname=ANY(%s)",
+                    ([reader_role, writer_role],),
+                )
+                for membership in cur.fetchall():
+                    cur.execute(sql.SQL("REVOKE {} FROM {}").format(
+                        sql.Identifier(membership["parent_role"]), sql.Identifier(membership["member_role"])
+                    ))
+                cur.execute(
+                    "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\' "
+                    "AND nspname <> 'information_schema'"
+                )
+                namespaces = [row["nspname"] for row in cur.fetchall()]
+                cur.execute(
+                    "SELECT n.nspname,t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
+                    "WHERE n.nspname=ANY(%s) AND t.typtype IN ('c','d','e','r','m') "
+                    "ORDER BY n.nspname,t.typname",
+                    (namespaces,),
+                )
+                grantable_types = [(row["nspname"], row["typname"]) for row in cur.fetchall()]
+                cur.execute(
+                    "SELECT object_kind,object_name FROM ("
+                    "SELECT 'relation' AS object_kind,format('%%I.%%I',n.nspname,c.relname) AS object_name "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE c.relowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+                    "UNION ALL SELECT 'function',format('%%I.%%I',n.nspname,p.proname) "
+                    "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                    "WHERE p.proowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+                    "UNION ALL SELECT 'schema',n.nspname FROM pg_namespace n "
+                    "WHERE n.nspowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+                    "UNION ALL SELECT 'type',format('%%I.%%I',n.nspname,t.typname) "
+                    "FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
+                    "WHERE t.typowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+                    "UNION ALL SELECT 'database',d.datname FROM pg_database d "
+                    "WHERE d.datdba IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))"
+                    ") owned ORDER BY object_kind,object_name",
+                    ([reader_role, writer_role],) * 5,
+                )
+                owned_objects = [f"{row['object_kind']}:{row['object_name']}" for row in cur.fetchall()]
+                if owned_objects:
+                    raise RuntimeError(
+                        "candidate roles must not own database objects: " + ", ".join(owned_objects)
+                    )
+                cur.execute("SELECT current_database() AS database_name")
+                database = sql.Identifier(cur.fetchone()["database_name"])
+                for role_name in (reader_role, writer_role):
+                    identifier = sql.Identifier(role_name)
+                    cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(database, identifier))
+                    for namespace in namespaces:
+                        schema_name = sql.Identifier(namespace)
+                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} FROM {}").format(
+                            schema_name, identifier
+                        ))
+                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(
+                            schema_name, identifier
+                        ))
+                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM {}").format(
+                            schema_name, identifier
+                        ))
+                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA {} FROM {}").format(schema_name, identifier))
+                    for namespace, type_name in grantable_types:
+                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TYPE {}.{} FROM {}").format(
+                            sql.Identifier(namespace), sql.Identifier(type_name), identifier
+                        ))
+                cur.execute(
+                    "SELECT owner.rolname AS owner_role,n.nspname AS schema_name,da.defaclobjtype "
+                    "FROM pg_default_acl da JOIN pg_roles owner ON owner.oid=da.defaclrole "
+                    "LEFT JOIN pg_namespace n ON n.oid=da.defaclnamespace CROSS JOIN LATERAL aclexplode(da.defaclacl) acl "
+                    "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))",
+                    ([reader_role, writer_role],),
+                )
+                default_acl_kinds = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES", "n": "SCHEMAS"}
+                for default_acl in cur.fetchall():
+                    for role_name in (reader_role, writer_role):
+                        cur.execute(
+                            sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} {} REVOKE ALL ON {} FROM {}").format(
+                                sql.Identifier(default_acl["owner_role"]),
+                                sql.SQL("") if default_acl["schema_name"] is None else sql.SQL("IN SCHEMA {} ").format(sql.Identifier(default_acl["schema_name"])),
+                                sql.SQL(default_acl_kinds[default_acl["defaclobjtype"]]),
+                                sql.Identifier(role_name),
+                            )
+                        )
+                for role_name in (reader_role, writer_role):
+                    cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role_name)))
+
+                for relation in _CANDIDATE_ALL_RELATIONS:
+                    cur.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",))
+                    if cur.fetchone()["relation"] is None:
+                        continue
+                    table = sql.SQL("public.{}").format(sql.Identifier(relation))
+                    cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}, {}").format(
+                        table, sql.Identifier(reader_role), sql.Identifier(writer_role)
+                    ))
+                    if relation in _CANDIDATE_READ_RELATIONS:
+                        cur.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, sql.Identifier(reader_role)))
+                cur.execute("SELECT to_regprocedure(%s) AS procedure", (_CANDIDATE_PUBLISH_SIGNATURE,))
+                if cur.fetchone()["procedure"] is not None:
+                    procedure = sql.SQL(_CANDIDATE_PUBLISH_SIGNATURE)
+                    cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {}, {}").format(
+                        procedure, sql.Identifier(reader_role), sql.Identifier(writer_role)
+                    ))
+                    cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(procedure, sql.Identifier(writer_role)))
+                cur.execute(
+                    "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+                    "FROM pg_roles WHERE rolname=ANY(%s)", ([reader_role, writer_role],)
+                )
+                roles = {role["rolname"]: role for role in cur.fetchall()}
+                for role_name in (reader_role, writer_role):
+                    role = roles.get(role_name)
+                    if role is None or any(
+                        role[key]
+                        for key in ("rolcanlogin", "rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+                    ):
+                        raise RuntimeError(f"candidate role attributes invalid for {role_name}")
+                cur.execute("SELECT rolcreaterole FROM pg_roles WHERE rolname='brain_schema_migrator'")
+                migrator = cur.fetchone()
+                if migrator is not None and migrator["rolcreaterole"]:
+                    raise RuntimeError("brain_schema_migrator must not retain CREATEROLE")
+        return CandidateRoleReconciliationReceipt(
+            reader_role=reader_role,
+            writer_role=writer_role,
+            reconciled_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _bootstrap_object_rollback_sql(cur, ownership: tuple[dict[str, Any], ...]) -> str:

@@ -14,7 +14,12 @@ import tempfile
 import psycopg
 from psycopg.rows import dict_row
 
-from applypilot.fleet.pg_roles import BootstrapTopology, bootstrap_database_roles
+from applypilot.brain.schema import ensure_brain_schema_v4, verify_brain_schema_v4
+from applypilot.fleet.pg_roles import (
+    BootstrapTopology,
+    bootstrap_database_roles,
+    ensure_brain_candidate_roles,
+)
 
 
 def _safe_path(value: str) -> Path:
@@ -70,6 +75,15 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _install_v4_authority(conn):
+    """Install and verify V4 only after its capability roles exist."""
+    ensure_brain_candidate_roles(conn)
+    ensure_brain_schema_v4(conn)
+    candidate_roles = ensure_brain_candidate_roles(conn)
+    verify_brain_schema_v4(conn)
+    return candidate_roles
+
+
 def main() -> int:
     args = _parser().parse_args()
     if args.receipt_path == args.rollback_sql:
@@ -117,6 +131,7 @@ def main() -> int:
             topology=topology,
             evidence_writer=write_evidence,
         )
+        candidate_roles = _install_v4_authority(conn)
     result = asdict(receipt)
     rollback_sql = result.pop("rollback_sql")
     result.update(
@@ -125,6 +140,7 @@ def main() -> int:
         in_doubt=False,
         rollback_sql_path=str(args.rollback_sql),
         rollback_sql_sha256=hashlib.sha256(rollback_sql.encode("utf-8")).hexdigest(),
+        candidate_roles=asdict(candidate_roles),
     )
     _replace_durable(
         args.receipt_path,

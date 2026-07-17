@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import importlib.util
+from pathlib import Path
 import sqlite3
 from threading import Barrier
 
@@ -23,6 +25,15 @@ from applypilot.brain.sqlite_to_postgres import (
     BrainImportError,
 )
 from applypilot.fleet import schema as fleet_schema
+
+
+def _bootstrap_script_module():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap-fleet-pg-roles.py"
+    specification = importlib.util.spec_from_file_location("bootstrap_fleet_pg_roles", script)
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
 
 
 AUTHORITY_TABLES = {
@@ -159,7 +170,7 @@ def brain_pg(fleet_db):
         conn.execute(
             "DO $$ BEGIN CREATE ROLE brain_schema_verifier LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
         )
-        for role in ("brain_status_reader", "brain_policy_controller"):
+        for role in ("brain_status_reader", "brain_policy_controller", "brain_candidate_reader", "brain_candidate_writer"):
             conn.execute(
                 pg_sql.SQL(
                     "DO $$ BEGIN CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB "
@@ -2495,6 +2506,31 @@ def test_exact_owner_rejects_membership_proxy_owner(brain_pg):
         conn.commit()
         with pytest.raises(RuntimeError, match="ownership mismatch.*brain_jobs.*brain_proxy_owner"):
             schema.verify_schema_v1(conn)
+
+
+def test_bootstrap_v4_authority_creates_candidates_before_schema_and_reconciles_after(brain_pg):
+    bootstrap = _bootstrap_script_module()
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        schema.ensure_brain_schema_v1(conn)
+        conn.execute("REVOKE ALL PRIVILEGES ON SCHEMA public FROM brain_candidate_reader, brain_candidate_writer")
+        conn.execute("DROP ROLE brain_candidate_reader")
+        conn.execute("DROP ROLE brain_candidate_writer")
+        conn.commit()
+
+        candidate_roles = bootstrap._install_v4_authority(conn)
+
+        assert candidate_roles.reader_role == "brain_candidate_reader"
+        assert candidate_roles.writer_role == "brain_candidate_writer"
+        assert conn.execute(
+            "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
+        ).fetchone()["versions"] == [1, 2, 3, 4]
+        assert conn.execute(
+            "SELECT has_function_privilege('brain_candidate_writer',"
+            "'public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)'"
+            "::regprocedure,'EXECUTE') AS allowed"
+        ).fetchone()["allowed"] is True
+        conn.commit()
+        schema.verify_brain_schema_v4(conn)
 
 
 def test_verifier_has_public_usage_and_only_enumerated_brain_reads(brain_pg):

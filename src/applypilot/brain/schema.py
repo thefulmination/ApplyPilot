@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -15,14 +16,165 @@ from psycopg.pq import TransactionStatus
 _SCHEMA_SQL = Path(__file__).with_name("schema_v1.sql")
 _SCHEMA_V2_SQL = Path(__file__).with_name("schema_v2.sql")
 _SCHEMA_V3_SQL = Path(__file__).with_name("schema_v3.sql")
+_SCHEMA_V4_SQL = Path(__file__).with_name("schema_v4.sql")
 _SCHEMA_LOCK_KEY = "applypilot:brain:schema:v1"
 _MIGRATION_NAME = "brain schema v1"
 _MIGRATION_V2_NAME = "brain schema v2 lifecycle principals"
 _MIGRATION_V3_NAME = "brain schema v3 lane canary pins"
+_MIGRATION_V4_NAME = "brain schema v4 scoped candidate authority"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
 _STATUS_ROLE = "brain_status_reader"
 _POLICY_CONTROLLER_ROLE = "brain_policy_controller"
+_CANDIDATE_READER_ROLE = "brain_candidate_reader"
+_CANDIDATE_WRITER_ROLE = "brain_candidate_writer"
+_V4_PUBLISH_SIGNATURE = (
+    "public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)"
+)
+_V4_PUBLISH_ARGUMENTS = (
+    "requested_owner_id text, requested_campaign_id text, requested_recommendation_lane text, "
+    "requested_execution_channel text, requested_execution_scope text, requested_authority_epoch bigint, "
+    "requested_database_incarnation_id uuid, requested_candidate_decision_id text, "
+    "requested_semantic_content_hash text, requested_candidate_artifact_hash text, "
+    "requested_envelope_id text, requested_envelope_artifact_hash text, "
+    "requested_graph_approval_receipt_id bigint"
+)
+_V4_PUBLISH_ARGUMENT_NAMES = tuple(argument.split()[0] for argument in _V4_PUBLISH_ARGUMENTS.split(", "))
+_V4_RELATIONS = {
+    "brain_authority_scope_state",
+    "brain_authority_transition_events",
+    "brain_graph_approval_receipts",
+    "brain_v4_candidate_decisions",
+    "brain_v4_decision_envelopes",
+    "brain_graph_approval_consumptions",
+    "brain_immutable_artifact_references",
+}
+_V4_READ_RELATIONS = {
+    "brain_authority_scope_state",
+    "brain_v4_candidate_decisions",
+    "brain_v4_decision_envelopes",
+    "brain_immutable_artifact_references",
+}
+_V4_COLUMN_CONTRACTS = {
+    "brain_authority_scope_state": (
+        ("authority_scope_id", "bigint", True, "a", ""),
+        ("owner_id", "text", True, "", ""),
+        ("campaign_id", "text", True, "", ""),
+        ("recommendation_lane", "text", True, "", ""),
+        ("execution_channel", "text", True, "", ""),
+        ("execution_scope", "text", True, "", ""),
+        ("state", "text", True, "", "'active'::text"),
+        ("authority_epoch", "bigint", True, "", ""),
+        ("database_incarnation_id", "uuid", True, "", ""),
+        ("migration_run_id", "bigint", True, "", ""),
+        ("source_namespace", "text", True, "", ""),
+        ("parity_run_id", "bigint", True, "", ""),
+        ("definition_version", "integer", True, "", ""),
+        ("report_artifact_hash", "text", True, "", ""),
+        ("created_at", "timestamp with time zone", True, "", "now()"),
+    ),
+    "brain_authority_transition_events": (
+        ("authority_transition_event_id", "bigint", True, "a", ""),
+        ("authority_scope_id", "bigint", True, "", ""),
+        ("event_type", "text", True, "", ""),
+        ("authority_epoch", "bigint", True, "", ""),
+        ("database_incarnation_id", "uuid", True, "", ""),
+        ("actor_id", "text", True, "", ""),
+        ("occurred_at", "timestamp with time zone", True, "", "now()"),
+        ("created_at", "timestamp with time zone", True, "", "now()"),
+    ),
+    "brain_graph_approval_receipts": (
+        ("graph_approval_receipt_id", "bigint", True, "a", ""),
+        ("authority_scope_id", "bigint", True, "", ""),
+        ("authority_epoch", "bigint", True, "", ""),
+        ("database_incarnation_id", "uuid", True, "", ""),
+        ("graph_snapshot_id", "text", True, "", ""),
+        ("approval_state", "text", True, "", ""),
+        ("approval_artifact_hash", "text", True, "", ""),
+        ("predecessor_deny_receipt_hash", "text", False, "", ""),
+        ("created_at", "timestamp with time zone", True, "", "now()"),
+    ),
+    "brain_v4_candidate_decisions": (
+        ("candidate_decision_id", "text", True, "", ""),
+        ("authority_scope_id", "bigint", True, "", ""),
+        ("semantic_content_hash", "text", True, "", ""),
+        ("candidate_artifact_hash", "text", True, "", ""),
+        ("graph_approval_receipt_id", "bigint", True, "", ""),
+        ("published_at", "timestamp with time zone", True, "", "now()"),
+    ),
+    "brain_v4_decision_envelopes": (
+        ("envelope_id", "text", True, "", ""),
+        ("candidate_decision_id", "text", True, "", ""),
+        ("envelope_artifact_hash", "text", True, "", ""),
+        ("created_at", "timestamp with time zone", True, "", "now()"),
+    ),
+    "brain_graph_approval_consumptions": (
+        ("graph_approval_consumption_id", "bigint", True, "a", ""),
+        ("graph_approval_receipt_id", "bigint", True, "", ""),
+        ("candidate_decision_id", "text", True, "", ""),
+        ("authority_scope_id", "bigint", True, "", ""),
+        ("consumed_at", "timestamp with time zone", True, "", "now()"),
+    ),
+    "brain_immutable_artifact_references": (
+        ("artifact_reference_id", "bigint", True, "a", ""),
+        ("artifact_hash", "text", True, "", ""),
+        ("reference_type", "text", True, "", ""),
+        ("subject_id", "text", True, "", ""),
+        ("created_at", "timestamp with time zone", True, "", "now()"),
+    ),
+}
+_V4_KEY_CONTRACTS = {
+    ("brain_authority_scope_state", "p", ("authority_scope_id",)),
+    ("brain_authority_scope_state", "u", (
+        "owner_id", "campaign_id", "recommendation_lane", "execution_channel", "execution_scope",
+    )),
+    ("brain_authority_transition_events", "p", ("authority_transition_event_id",)),
+    ("brain_authority_transition_events", "u", (
+        "authority_scope_id", "event_type", "authority_epoch", "database_incarnation_id",
+    )),
+    ("brain_graph_approval_receipts", "p", ("graph_approval_receipt_id",)),
+    ("brain_graph_approval_receipts", "u", (
+        "authority_scope_id", "authority_epoch", "database_incarnation_id", "graph_snapshot_id",
+    )),
+    ("brain_v4_candidate_decisions", "p", ("candidate_decision_id",)),
+    ("brain_v4_candidate_decisions", "u", ("authority_scope_id", "semantic_content_hash")),
+    ("brain_v4_decision_envelopes", "p", ("envelope_id",)),
+    ("brain_v4_decision_envelopes", "u", ("candidate_decision_id",)),
+    ("brain_graph_approval_consumptions", "p", ("graph_approval_consumption_id",)),
+    ("brain_graph_approval_consumptions", "u", ("graph_approval_receipt_id",)),
+    ("brain_graph_approval_consumptions", "u", ("candidate_decision_id",)),
+    ("brain_immutable_artifact_references", "p", ("artifact_reference_id",)),
+    ("brain_immutable_artifact_references", "u", ("artifact_hash", "reference_type", "subject_id")),
+}
+_V4_FOREIGN_KEY_CONTRACTS = {
+    ("brain_authority_scope_state", (
+        "migration_run_id", "source_namespace", "parity_run_id", "definition_version", "report_artifact_hash",
+    ), "brain_parity_runs", (
+        "migration_run_id", "source_namespace", "parity_run_id", "definition_version", "report_artifact_hash",
+    )),
+    ("brain_authority_transition_events", ("authority_scope_id",), "brain_authority_scope_state", ("authority_scope_id",)),
+    ("brain_graph_approval_receipts", ("authority_scope_id",), "brain_authority_scope_state", ("authority_scope_id",)),
+    ("brain_graph_approval_receipts", ("approval_artifact_hash",), "brain_artifacts", ("artifact_hash",)),
+    ("brain_graph_approval_receipts", ("predecessor_deny_receipt_hash",), "brain_artifacts", ("artifact_hash",)),
+    ("brain_v4_candidate_decisions", ("authority_scope_id",), "brain_authority_scope_state", ("authority_scope_id",)),
+    ("brain_v4_candidate_decisions", ("candidate_artifact_hash",), "brain_artifacts", ("artifact_hash",)),
+    ("brain_v4_candidate_decisions", ("graph_approval_receipt_id",), "brain_graph_approval_receipts", ("graph_approval_receipt_id",)),
+    ("brain_v4_decision_envelopes", ("candidate_decision_id",), "brain_v4_candidate_decisions", ("candidate_decision_id",)),
+    ("brain_v4_decision_envelopes", ("envelope_artifact_hash",), "brain_artifacts", ("artifact_hash",)),
+    ("brain_graph_approval_consumptions", ("graph_approval_receipt_id",), "brain_graph_approval_receipts", ("graph_approval_receipt_id",)),
+    ("brain_graph_approval_consumptions", ("candidate_decision_id",), "brain_v4_candidate_decisions", ("candidate_decision_id",)),
+    ("brain_graph_approval_consumptions", ("authority_scope_id",), "brain_authority_scope_state", ("authority_scope_id",)),
+    ("brain_immutable_artifact_references", ("artifact_hash",), "brain_artifacts", ("artifact_hash",)),
+}
+_V4_SCOPE_CHECK_FRAGMENTS = (
+    ("btrim(owner_id)", "<>''"),
+    ("btrim(campaign_id)", "<>''"),
+    ("recommendation_lane", "core_fit", "strategic_stretch", "qualified_fallback", "review", "reject_hold"),
+    ("execution_channel", "ats", "linkedin"),
+    ("btrim(execution_scope)", "lower(btrim(execution_scope))", "global"),
+    ("state", "active"),
+    ("authority_epoch>0",),
+)
 _STATUS_READ_RELATIONS = {
     "brain_decision_policies",
     "brain_policy_artifacts",
@@ -327,6 +479,217 @@ def _schema_v3_checksum() -> str:
     return hashlib.sha256(_schema_v3_bytes()).hexdigest()
 
 
+def _schema_v4_bytes() -> bytes:
+    return _SCHEMA_V4_SQL.read_bytes()
+
+
+def _schema_v4_checksum() -> str:
+    return hashlib.sha256(_schema_v4_bytes()).hexdigest()
+
+
+def _compact_sql(value: str) -> str:
+    return re.sub(r"\s+", "", value).lower().replace("::text", "")
+
+
+def _function_body_fingerprint(definition: str) -> str | None:
+    body = re.search(r"\bAS\s+(\$[A-Za-z0-9_]*\$)(.*?)\1", definition, re.IGNORECASE | re.DOTALL)
+    if body is None:
+        return None
+    normalized = re.sub(r"\s+", " ", body.group(2).strip())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _expected_v4_publish_body_fingerprint() -> str:
+    fingerprint = _function_body_fingerprint(_schema_v4_bytes().decode("utf-8"))
+    if fingerprint is None:
+        raise RuntimeError("schema v4 publish function body could not be fingerprinted")
+    return fingerprint
+
+
+def _verify_v4_catalog_contract(cur, problems: list[str]) -> None:
+    cur.execute(
+        "SELECT c.relname,a.attname,format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull,"
+        "a.attidentity,COALESCE(pg_get_expr(default_value.adbin,default_value.adrelid),'') AS default_expression "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
+        "LEFT JOIN pg_attrdef default_value ON default_value.adrelid=a.attrelid AND default_value.adnum=a.attnum "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s) ORDER BY c.relname,a.attnum",
+        (list(_V4_COLUMN_CONTRACTS),),
+    )
+    actual_columns: dict[str, tuple[tuple[str, str, bool, str, str], ...]] = {}
+    for row in cur.fetchall():
+        actual_columns.setdefault(row["relname"], tuple())
+        actual_columns[row["relname"]] += ((
+            row["attname"], row["data_type"], bool(row["attnotnull"]), row["attidentity"], row["default_expression"],
+        ),)
+    for relation, expected in _V4_COLUMN_CONTRACTS.items():
+        if actual_columns.get(relation) != expected:
+            problems.append(
+                f"v4 column contract mismatch for {relation}: "
+                f"expected={expected!r}, actual={actual_columns.get(relation)!r}"
+            )
+
+    cur.execute(
+        "SELECT relation.relname,con.contype,ARRAY(SELECT attribute.attname "
+        "FROM unnest(con.conkey) WITH ORDINALITY key_column(attnum,position) "
+        "JOIN pg_attribute attribute ON attribute.attrelid=con.conrelid AND attribute.attnum=key_column.attnum "
+        "ORDER BY key_column.position) AS columns "
+        "FROM pg_constraint con JOIN pg_class relation ON relation.oid=con.conrelid "
+        "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname='public' AND relation.relname=ANY(%s) AND con.contype IN ('p','u')",
+        (list(_V4_RELATIONS),),
+    )
+    actual_keys = {
+        (row["relname"], row["contype"], tuple(row["columns"]))
+        for row in cur.fetchall()
+    }
+    if actual_keys != _V4_KEY_CONTRACTS:
+        problems.append(
+            "v4 primary/unique constraint contract mismatch: "
+            f"expected={sorted(_V4_KEY_CONTRACTS)!r}, actual={sorted(actual_keys)!r}"
+        )
+
+    cur.execute(
+        "SELECT relation.relname AS relation_name,target_namespace.nspname AS target_schema,target.relname AS target_name,"
+        "ARRAY(SELECT attribute.attname FROM unnest(con.conkey) WITH ORDINALITY key_column(attnum,position) "
+        "JOIN pg_attribute attribute ON attribute.attrelid=con.conrelid AND attribute.attnum=key_column.attnum "
+        "ORDER BY key_column.position) AS local_columns,"
+        "ARRAY(SELECT attribute.attname FROM unnest(con.confkey) WITH ORDINALITY key_column(attnum,position) "
+        "JOIN pg_attribute attribute ON attribute.attrelid=con.confrelid AND attribute.attnum=key_column.attnum "
+        "ORDER BY key_column.position) AS target_columns "
+        "FROM pg_constraint con JOIN pg_class relation ON relation.oid=con.conrelid "
+        "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "JOIN pg_class target ON target.oid=con.confrelid "
+        "JOIN pg_namespace target_namespace ON target_namespace.oid=target.relnamespace "
+        "WHERE namespace.nspname='public' AND relation.relname=ANY(%s) AND con.contype='f'",
+        (list(_V4_RELATIONS),),
+    )
+    actual_foreign_keys = {
+        (
+            row["relation_name"],
+            tuple(row["local_columns"]),
+            f"{row['target_schema']}.{row['target_name']}",
+            tuple(row["target_columns"]),
+        )
+        for row in cur.fetchall()
+    }
+    expected_foreign_keys = {
+        (relation, local_columns, f"public.{target_name}", target_columns)
+        for relation, local_columns, target_name, target_columns in _V4_FOREIGN_KEY_CONTRACTS
+    }
+    if actual_foreign_keys != expected_foreign_keys:
+        problems.append(
+            "v4 foreign-key lineage contract mismatch: "
+            f"expected={sorted(expected_foreign_keys)!r}, actual={sorted(actual_foreign_keys)!r}"
+        )
+
+    cur.execute(
+        "SELECT pg_get_constraintdef(con.oid,true) AS definition FROM pg_constraint con "
+        "WHERE con.conrelid='public.brain_authority_scope_state'::regclass AND con.contype='c'"
+    )
+    scope_checks = tuple(_compact_sql(row["definition"]) for row in cur.fetchall())
+    for fragments in _V4_SCOPE_CHECK_FRAGMENTS:
+        normalized = tuple(_compact_sql(fragment) for fragment in fragments)
+        if not any(all(fragment in definition for fragment in normalized) for definition in scope_checks):
+            problems.append(
+                "v4 authority scope constraint mismatch: required=" + ",".join(fragments)
+            )
+
+    cur.execute(
+        "SELECT relation.relname,t.tgname,t.tgenabled,t.tgtype,function.proname FROM pg_trigger t "
+        "JOIN pg_class relation ON relation.oid=t.tgrelid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "JOIN pg_proc function ON function.oid=t.tgfoid "
+        "WHERE NOT t.tgisinternal AND namespace.nspname='public' AND relation.relname=ANY(%s)",
+        (list(_V4_RELATIONS),),
+    )
+    actual_triggers = {
+        (row["relname"], row["tgname"], row["tgenabled"], row["tgtype"], row["proname"])
+        for row in cur.fetchall()
+    }
+    expected_triggers = {
+        (relation, f"{relation}_immutable", "O", 27, "brain_reject_mutation")
+        for relation in _V4_RELATIONS
+    }
+    if actual_triggers != expected_triggers:
+        problems.append(
+            "v4 immutable trigger contract mismatch: "
+            f"expected={sorted(expected_triggers)!r}, actual={sorted(actual_triggers)!r}"
+        )
+
+
+def _verify_v4_publish_function(cur, problems: list[str]) -> None:
+    cur.execute(
+        "SELECT p.oid,owner.rolname AS owner_name,p.prokind,p.prosecdef,p.proconfig,p.proargnames,"
+        "pg_get_function_identity_arguments(p.oid) AS arguments,pg_get_function_result(p.oid) AS result,"
+        "language.lanname,pg_get_functiondef(p.oid) AS definition "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner "
+        "JOIN pg_language language ON language.oid=p.prolang "
+        "WHERE n.nspname='public' AND p.oid=to_regprocedure(%s)",
+        (_V4_PUBLISH_SIGNATURE,),
+    )
+    function = cur.fetchone()
+    if function is None:
+        problems.append("v4 candidate publish procedure missing or identity signature mismatch")
+        return
+    if function["owner_name"] != _MIGRATION_ROLE:
+        problems.append("v4 candidate publish procedure ownership mismatch")
+    if function["prokind"] != "f" or function["arguments"] != _V4_PUBLISH_ARGUMENTS or function["result"] != "text":
+        problems.append("v4 candidate publish procedure identity signature mismatch")
+    if tuple(function["proargnames"] or ()) != _V4_PUBLISH_ARGUMENT_NAMES:
+        problems.append("v4 candidate publish procedure argument-name signature mismatch")
+    if function["lanname"] != "plpgsql" or not function["prosecdef"]:
+        problems.append("v4 candidate publish procedure language/security-definer mismatch")
+    if tuple(function["proconfig"] or ()) != ("search_path=pg_catalog, public",):
+        problems.append("v4 candidate publish procedure search_path mismatch")
+    if _function_body_fingerprint(function["definition"]) != _expected_v4_publish_body_fingerprint():
+        problems.append("v4 candidate publish procedure body fingerprint mismatch")
+
+
+def _verify_v4_effective_candidate_authority(cur, problems: list[str]) -> None:
+    for role_name, expected_tables, expected_function in (
+        (_CANDIDATE_READER_ROLE, {("public", relation, "SELECT") for relation in _V4_READ_RELATIONS}, None),
+        (_CANDIDATE_WRITER_ROLE, set(), _V4_PUBLISH_SIGNATURE),
+    ):
+        cur.execute(
+            "SELECT n.nspname,c.relname,privilege.privilege_type FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) "
+            "AS privilege(privilege_type) WHERE n.nspname<>'information_schema' AND n.nspname!~'^pg_' "
+            "AND c.relkind IN ('r','p','v','m','f') "
+            "AND has_table_privilege(%s,c.oid,privilege.privilege_type)",
+            (role_name,),
+        )
+        actual_tables = {(row["nspname"], row["relname"], row["privilege_type"]) for row in cur.fetchall()}
+        if actual_tables != expected_tables:
+            exposures = sorted(actual_tables - expected_tables)
+            missing = sorted(expected_tables - actual_tables)
+            problems.append(
+                f"candidate {role_name} effective table authority exposure: "
+                f"extra={exposures!r}, missing={missing!r}"
+            )
+        cur.execute(
+            "SELECT n.nspname,p.proname,pg_get_function_identity_arguments(p.oid) AS arguments "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+            "WHERE n.nspname<>'information_schema' AND n.nspname!~'^pg_' "
+            "AND has_function_privilege(%s,p.oid,'EXECUTE')",
+            (role_name,),
+        )
+        actual_functions = {
+            (row["nspname"], row["proname"], row["arguments"])
+            for row in cur.fetchall()
+        }
+        expected_functions = set()
+        if expected_function is not None:
+            expected_functions.add(("public", "brain_publish_v4_candidate", _V4_PUBLISH_ARGUMENTS))
+        if actual_functions != expected_functions:
+            exposures = sorted(actual_functions - expected_functions)
+            missing = sorted(expected_functions - actual_functions)
+            problems.append(
+                f"candidate {role_name} effective function authority exposure: "
+                f"extra={exposures!r}, missing={missing!r}"
+            )
+
+
 def _require_idle(conn) -> None:
     if conn.info.transaction_status != TransactionStatus.IDLE:
         raise RuntimeError("brain schema helpers require an idle connection and never commit or roll back caller work")
@@ -436,11 +799,17 @@ def _version_rows(cur):
     if not rows:
         raise RuntimeError("brain schema version ledger exists but is empty")
     versions = [row["version"] for row in rows]
-    if versions not in ([1], [1, 2], [1, 2, 3]):
+    if versions not in ([1], [1, 2], [1, 2, 3], [1, 2, 3, 4]):
         raise RuntimeError(
             "unsupported or non-contiguous brain schema version ledger: "
             + ", ".join(str(version) for version in versions)
         )
+    if len(rows) == 4 and (
+        rows[3]["migration_name"] != _MIGRATION_V4_NAME
+        or rows[3]["migration_checksum"] != _schema_v4_checksum()
+        or rows[3]["applied_by"] != _MIGRATION_ROLE
+    ):
+        raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 4 contract")
     return rows
 
 
@@ -556,6 +925,7 @@ def _catalog_contract_hash(cur) -> str:
         "regexp_replace(p.prosrc,'\\s+',' ','g') AS normalized_body "
         "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_language l ON l.oid=p.prolang "
         "WHERE n.nspname='public' AND left(p.proname,6)='brain_' "
+        "AND p.proname <> 'brain_publish_v4_candidate' "
         "ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)"
     )
     functions = cur.fetchall()
@@ -837,7 +1207,7 @@ def _verify_contract(cur) -> None:
             or any(child_indexes[name] != parent_indexes[name] for name in parent_indexes)
         ):
             problems.append(f"partition {child} index contract mismatch")
-    allowed_public_relations = set(_RELATIONS) | set(children)
+    allowed_public_relations = set(_RELATIONS) | _V4_RELATIONS | set(children)
     cur.execute(
         "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
         "WHERE n.nspname='public' AND left(c.relname,6)='brain_' AND c.relkind IN ('r','p')"
@@ -1131,6 +1501,17 @@ def _verify_contract(cur) -> None:
             and row["grantee"] == _STATUS_ROLE
             and row["privilege_type"] == "SELECT"
         )
+        allowed = allowed or (
+            row["nspname"] == "public"
+            and row["relname"] in {
+                "brain_authority_scope_state",
+                "brain_v4_candidate_decisions",
+                "brain_v4_decision_envelopes",
+                "brain_immutable_artifact_references",
+            }
+            and row["grantee"] == _CANDIDATE_READER_ROLE
+            and row["privilege_type"] == "SELECT"
+        )
         if not allowed:
             invalid_grants.append(f"{row['nspname']}.{row['relname']}->{row['grantee']}:{row['privilege_type']}")
     if invalid_grants:
@@ -1161,10 +1542,10 @@ def _verify_contract(cur) -> None:
     function_grants = [
         f"{row['proname']}()->{row['grantee']}"
         for row in cur.fetchall()
-        if not (
-            row["proname"] in _CONTROLLER_FUNCTIONS
-            and row["grantee"] == _POLICY_CONTROLLER_ROLE
-        )
+            if not (
+                row["proname"] in _CONTROLLER_FUNCTIONS
+                and row["grantee"] == _POLICY_CONTROLLER_ROLE
+            ) and not (row["proname"] == "brain_publish_v4_candidate" and row["grantee"] == _CANDIDATE_WRITER_ROLE)
     ]
     if function_grants:
         problems.append("non-owner function ACLs: " + ", ".join(sorted(set(function_grants))))
@@ -1229,6 +1610,187 @@ def _verify_contract(cur) -> None:
         raise RuntimeError("brain schema v1 verification failed: " + "; ".join(problems))
 
 
+def _verify_v4_contract(cur) -> None:
+    """Verify the additive V4 authority objects without perturbing V1-V3 hashes."""
+    versions = _version_rows(cur)
+    problems: list[str] = []
+    if len(versions) != 4:
+        problems.append("missing schema version 4 scoped candidate authority contract")
+    else:
+        version = versions[3]
+        if version["migration_name"] != _MIGRATION_V4_NAME:
+            problems.append("migration v4 name mismatch")
+        if version["migration_checksum"] != _schema_v4_checksum():
+            problems.append("migration v4 checksum mismatch")
+        if version["applied_by"] != _MIGRATION_ROLE:
+            problems.append("migration v4 ledger owner mismatch")
+
+    cur.execute(
+        "SELECT c.relname, owner.rolname AS owner_name FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles owner ON owner.oid=c.relowner "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s)",
+        (list(_V4_RELATIONS),),
+    )
+    objects = {row["relname"]: row["owner_name"] for row in cur.fetchall()}
+    for relation in _V4_RELATIONS:
+        if objects.get(relation) != _MIGRATION_ROLE:
+            problems.append(f"v4 ownership mismatch for {relation}: {objects.get(relation)!r}")
+    _verify_v4_catalog_contract(cur, problems)
+    _verify_v4_publish_function(cur, problems)
+
+    for role_name in (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE, _MIGRATION_ROLE):
+        cur.execute(
+            "SELECT rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit "
+            "FROM pg_roles WHERE rolname=%s", (role_name,)
+        )
+        role = cur.fetchone()
+        if role is None:
+            problems.append(f"missing v4 role {role_name}")
+        elif any(
+            role[name]
+            for name in (
+                "rolcanlogin",
+                "rolsuper",
+                "rolcreatedb",
+                "rolcreaterole",
+                "rolreplication",
+                "rolbypassrls",
+            )
+        ) or (role_name != _MIGRATION_ROLE and role["rolinherit"]):
+            problems.append(f"v4 role attributes invalid for {role_name}")
+
+    cur.execute(
+        "SELECT member.rolname AS member_role,parent.rolname AS parent_role FROM pg_auth_members membership "
+        "JOIN pg_roles member ON member.oid=membership.member JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "WHERE member.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    memberships = [f"{row['member_role']}->{row['parent_role']}" for row in cur.fetchall()]
+    if memberships:
+        problems.append("candidate role memberships retained: " + ", ".join(sorted(memberships)))
+    cur.execute(
+        "SELECT n.nspname,c.relname,COALESCE(role.rolname,'PUBLIC') AS grantee,acl.privilege_type FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+        "JOIN pg_roles role ON role.oid=acl.grantee WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_' "
+        "AND c.relkind IN ('r','p','v','m','f') "
+        "AND role.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    expected_table_acls = {
+        ("public", relation, _CANDIDATE_READER_ROLE, "SELECT")
+        for relation in (
+            "brain_authority_scope_state",
+            "brain_v4_candidate_decisions",
+            "brain_v4_decision_envelopes",
+            "brain_immutable_artifact_references",
+        )
+    }
+    actual_table_acls = {
+        (row["nspname"], row["relname"], row["grantee"], row["privilege_type"])
+        for row in cur.fetchall()
+    }
+    if actual_table_acls != expected_table_acls:
+        problems.append("candidate table ACL contract mismatch")
+    cur.execute(
+        "SELECT n.nspname,c.relname,role.rolname AS grantee,acl.privilege_type FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+        "JOIN pg_roles role ON role.oid=acl.grantee WHERE c.relkind='S' "
+        "AND role.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    if cur.fetchall():
+        problems.append("candidate sequence ACLs retained")
+    cur.execute(
+        "SELECT n.nspname,t.typname,role.rolname AS grantee,acl.privilege_type FROM pg_type t "
+        "JOIN pg_namespace n ON n.oid=t.typnamespace CROSS JOIN LATERAL aclexplode(t.typacl) acl "
+        "JOIN pg_roles role ON role.oid=acl.grantee WHERE t.typtype IN ('c','d','e','r','m') "
+        "AND role.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    if cur.fetchall():
+        problems.append("candidate type ACLs retained")
+    cur.execute(
+        "SELECT n.nspname,p.proname,role.rolname AS grantee,acl.privilege_type FROM pg_proc p "
+        "JOIN pg_namespace n ON n.oid=p.pronamespace CROSS JOIN LATERAL aclexplode(p.proacl) acl "
+        "JOIN pg_roles role ON role.oid=acl.grantee WHERE role.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    actual_function_acls = {(row["nspname"], row["proname"], row["grantee"], row["privilege_type"]) for row in cur.fetchall()}
+    if actual_function_acls != {("public", "brain_publish_v4_candidate", _CANDIDATE_WRITER_ROLE, "EXECUTE")}:
+        problems.append("candidate function ACL contract mismatch")
+    cur.execute(
+        "SELECT n.nspname,role.rolname AS grantee,acl.privilege_type FROM pg_namespace n "
+        "CROSS JOIN LATERAL aclexplode(n.nspacl) acl JOIN pg_roles role ON role.oid=acl.grantee "
+        "WHERE role.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    schema_acls = {(row["nspname"], row["grantee"], row["privilege_type"]) for row in cur.fetchall()}
+    allowed_schema_acls = {
+        ("public", _CANDIDATE_READER_ROLE, "USAGE"),
+        ("public", _CANDIDATE_WRITER_ROLE, "USAGE"),
+    }
+    if not schema_acls <= allowed_schema_acls:
+        problems.append(f"candidate schema ACL contract mismatch: {sorted(schema_acls)!r}")
+    for role_name in (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE):
+        cur.execute(
+            "SELECT has_schema_privilege(%s,'public','USAGE') AS usage,has_schema_privilege(%s,'public','CREATE') AS create",
+            (role_name, role_name),
+        )
+        if cur.fetchone() != {"usage": True, "create": False}:
+            problems.append(f"candidate schema capability mismatch for {role_name}")
+    cur.execute(
+        "SELECT role.rolname FROM pg_database d CROSS JOIN LATERAL aclexplode(d.datacl) acl "
+        "JOIN pg_roles role ON role.oid=acl.grantee WHERE d.datname=current_database() "
+        "AND role.rolname IN (%s,%s)",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    if cur.fetchall():
+        problems.append("candidate database ACLs retained")
+    cur.execute(
+        "SELECT 1 FROM pg_default_acl da CROSS JOIN LATERAL aclexplode(da.defaclacl) acl "
+        "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN (%s,%s))",
+        (_CANDIDATE_READER_ROLE, _CANDIDATE_WRITER_ROLE),
+    )
+    if cur.fetchone() is not None:
+        problems.append("candidate default ACLs retained")
+
+    cur.execute(
+        "SELECT c.relname, COALESCE(grantee.rolname,'PUBLIC') AS grantee, acl.privilege_type "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) acl "
+        "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s) AND acl.grantee=0",
+        (list(_V4_RELATIONS),),
+    )
+    public_grants = [f"{row['relname']}:{row['privilege_type']}" for row in cur.fetchall()]
+    if public_grants:
+        problems.append("v4 PUBLIC table grants: " + ", ".join(sorted(public_grants)))
+    cur.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) acl "
+        "WHERE p.oid=to_regprocedure(%s) "
+        "AND acl.grantee=0) AS allowed",
+        (_V4_PUBLISH_SIGNATURE,),
+    )
+    if cur.fetchone()["allowed"]:
+        problems.append("v4 PUBLIC candidate publish grant")
+    for relation in _V4_RELATIONS:
+        cur.execute(
+            "SELECT has_table_privilege(%s,%s,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS allowed",
+            (_CANDIDATE_WRITER_ROLE, f"public.{relation}"),
+        )
+        if cur.fetchone()["allowed"]:
+            problems.append(f"candidate writer direct mutation grant on {relation}")
+    cur.execute(
+        "SELECT has_function_privilege(%s,to_regprocedure(%s),'EXECUTE') AS allowed",
+        (_CANDIDATE_WRITER_ROLE, _V4_PUBLISH_SIGNATURE),
+    )
+    if not cur.fetchone()["allowed"]:
+        problems.append("candidate writer lacks bounded publish capability")
+    _verify_v4_effective_candidate_authority(cur, problems)
+    if problems:
+        raise RuntimeError("brain schema v4 verification failed: " + "; ".join(problems))
+
+
 def verify_brain_schema_v1(conn) -> None:
     """Deeply verify schema v1 without changing caller transaction state."""
     _require_idle(conn)
@@ -1247,7 +1809,7 @@ def ensure_brain_schema_v1(
     with conn.transaction():
         with conn.cursor() as cur:
             versions = _version_rows(cur)
-            if len(versions) == 3:
+            if len(versions) >= 3:
                 _verify_contract(cur)
                 return
 
@@ -1257,7 +1819,7 @@ def ensure_brain_schema_v1(
 
             # Another installer may have completed while this connection waited.
             versions = _version_rows(cur)
-            if len(versions) == 3:
+            if len(versions) >= 3:
                 _verify_contract(cur)
                 return
 
@@ -1288,6 +1850,50 @@ def ensure_brain_schema_v1(
                 (_MIGRATION_V3_NAME, _schema_v3_checksum(), migration_identity),
             )
             _verify_contract(cur)
+
+
+def verify_brain_schema_v4(conn) -> None:
+    """Verify the V1-V4 immutable migration ledger and V4 authority boundary."""
+    _require_idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            _verify_contract(cur)
+            _verify_v4_contract(cur)
+
+
+def ensure_brain_schema_v4(
+    conn,
+    *,
+    lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
+) -> None:
+    """Install the additive scoped-authority migration after the immutable V1-V3 ledger."""
+    ensure_brain_schema_v1(conn, lock_timeout_seconds=lock_timeout_seconds)
+    _require_idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            versions = _version_rows(cur)
+            if len(versions) == 4:
+                _verify_contract(cur)
+                _verify_v4_contract(cur)
+                return
+            migration_identity = _activate_migration_identity(cur)
+            _assert_existing_ownership(cur, migration_identity)
+            _acquire_xact_lock(cur, lock_timeout_seconds)
+            versions = _version_rows(cur)
+            if len(versions) == 4:
+                _verify_contract(cur)
+                _verify_v4_contract(cur)
+                return
+            if len(versions) != 3:
+                raise RuntimeError("brain schema v4 requires contiguous V1-V3 ledger")
+            cur.execute(_schema_v4_bytes().decode("utf-8"))
+            cur.execute(
+                "INSERT INTO public.brain_schema_versions "
+                "(version, migration_name, migration_checksum, applied_by) VALUES (4, %s, %s, %s)",
+                (_MIGRATION_V4_NAME, _schema_v4_checksum(), migration_identity),
+            )
+            _verify_contract(cur)
+            _verify_v4_contract(cur)
 
 
 def ensure_policy_partition(conn, policy_version: str) -> str:
@@ -1417,3 +2023,5 @@ def ensure_policy_partition(conn, policy_version: str) -> str:
 
 ensure_schema_v1 = ensure_brain_schema_v1
 verify_schema_v1 = verify_brain_schema_v1
+ensure_schema_v4 = ensure_brain_schema_v4
+verify_schema_v4 = verify_brain_schema_v4

@@ -1218,3 +1218,31 @@ def test_authenticated_discovery_requires_existing_governor_and_derives_worker(f
             ]
             == WORKER
         )
+
+
+def test_candidate_capability_roles_are_nologin_and_cannot_create_or_escalate(fleet_db):
+    with psycopg.connect(fleet_db, row_factory=dict_row) as provider:
+        provider.execute(
+            "DO $$ BEGIN CREATE ROLE brain_schema_migrator NOLOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; "
+            "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        )
+        provider.commit()
+        receipt = pg_roles.ensure_brain_candidate_roles(provider)
+        assert receipt.reader_role == "brain_candidate_reader"
+        assert receipt.writer_role == "brain_candidate_writer"
+        rows = provider.execute(
+            "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+            "FROM pg_roles WHERE rolname IN ('brain_candidate_reader','brain_candidate_writer','brain_schema_migrator') "
+            "ORDER BY rolname"
+        ).fetchall()
+        assert all(
+            not any(
+                row[key]
+                for key in ("rolcanlogin", "rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+            )
+            for row in rows
+        )
+        assert provider.execute(
+            "SELECT has_schema_privilege('brain_candidate_writer','public','CREATE') AS allowed"
+        ).fetchone()["allowed"] is False
