@@ -188,6 +188,37 @@ def _harden(fleet_db: str, *, password: str = PASSWORD, contract: str = "apply")
         )
 
 
+def test_identity_function_does_not_depend_on_controller_migrator_membership(fleet_db):
+    _harden(fleet_db)
+    with pgqueue.connect(fleet_db) as controller:
+        metadata = controller.execute(
+            "SELECT function_owner.rolname AS function_owner,"
+            "table_owner.rolname AS table_owner "
+            "FROM pg_proc function "
+            "JOIN pg_roles function_owner ON function_owner.oid=function.proowner "
+            "JOIN pg_class relation ON relation.oid='public.fleet_worker_principals'::regclass "
+            "JOIN pg_roles table_owner ON table_owner.oid=relation.relowner "
+            "WHERE function.oid='public.fleet_worker_identity()'::regprocedure"
+        ).fetchone()
+        assert metadata == {"function_owner": MIGRATOR_ROLE, "table_owner": MIGRATOR_ROLE}
+    with psycopg.connect(fleet_db, row_factory=dict_row) as break_glass:
+        break_glass.execute(
+            sql.SQL("REVOKE {} FROM {}").format(
+                sql.Identifier(MIGRATOR_ROLE), sql.Identifier(CONTROLLER_ROLE)
+            )
+        )
+        break_glass.commit()
+
+    with psycopg.connect(_dsn(fleet_db), row_factory=dict_row) as worker:
+        assert worker.execute(
+            "SELECT public.fleet_worker_identity() AS identity"
+        ).fetchone()["identity"] == {
+            "role_name": ROLE,
+            "worker_id": WORKER,
+            "contract": "apply",
+        }
+
+
 def _seed_apply(conn, *, remaining: int = 2, policy: str = "policy-a", suffix: str = "role-boundary") -> str:
     now = datetime.now(timezone.utc)
     url = f"https://example.test/job/{suffix}"

@@ -1341,6 +1341,17 @@ def _install_identity_function(cur) -> None:
         "FROM public.fleet_worker_principals p WHERE p.role_name=session_user $$"
     )
     cur.execute("REVOKE ALL PRIVILEGES ON FUNCTION public.fleet_worker_identity() FROM PUBLIC")
+    cur.execute(
+        "SELECT owner.rolname FROM pg_class relation "
+        "JOIN pg_roles owner ON owner.oid=relation.relowner "
+        "WHERE relation.oid='public.fleet_worker_principals'::regclass"
+    )
+    principal_owner = _row_value(cur.fetchone(), "rolname")
+    cur.execute(
+        sql.SQL("ALTER FUNCTION public.fleet_worker_identity() OWNER TO {}").format(
+            sql.Identifier(principal_owner)
+        )
+    )
 
 
 def _harden_database_connect(
