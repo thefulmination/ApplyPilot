@@ -1,0 +1,253 @@
+{
+  "schemaVersion": "applypilot_immutable_release_archive_v1",
+  "recordedAt": "2026-07-17T15:25:11.3516252Z",
+  "releaseId": "applypilot-cloud-staging-2026-07-17-rc4",
+  "compatibilityManifestSha256": "39d2c3be5c261bb93b853e9e921fd58047295e71315834211557a04395123aba",
+  "provider": {
+    "name": "aws-s3",
+    "accountId": "376892783155",
+    "operatorArn": "arn:aws:iam::376892783155:user/2026",
+    "bucket": "applypilot-brain-archive-376892783155-us-west-2",
+    "bucketArn": "arn:aws:s3:::applypilot-brain-archive-376892783155-us-west-2",
+    "region": "us-west-2",
+    "versioning": "Enabled",
+    "mfaDelete": "Disabled",
+    "objectLock": {
+      "enabled": true,
+      "defaultMode": "COMPLIANCE",
+      "defaultRetentionDays": 30
+    },
+    "encryption": {
+      "mode": "provider_managed",
+      "algorithm": "AES256",
+      "keyId": "AES256",
+      "sseCustomerKeysBlocked": true
+    },
+    "publicAccessBlock": {
+      "blockPublicAcls": true,
+      "ignorePublicAcls": true,
+      "blockPublicPolicy": true,
+      "restrictPublicBuckets": true
+    }
+  },
+  "verification": {
+    "uploadedObjectCount": 22,
+    "headVerifiedObjectCount": 22,
+    "readBackVerifiedObjectCount": 22,
+    "restoreDrillObjectCount": 22,
+    "allVerified": true,
+    "restoreRoot": "C:\\Users\\JStal\\AppData\\Local\\ApplyPilot\\archive-restore-drills\\rc4-20260717T152231Z",
+    "restoreInventorySha256": "dec4c7125d6ba03bfa842f6ced2a577efe0de9de593dc73f0f6e793dee254bab",
+    "restoreMethod": "Download every object by exact immutable S3 version ID into a new empty directory, recompute byte length and SHA-256, and hash the sorted role/SHA-256/length/version inventory."
+  },
+  "artifactLocationDefaults": {
+    "backend": "aws_s3",
+    "bucketOrContainer": "applypilot-brain-archive-376892783155-us-west-2",
+    "storageImmutable": true,
+    "encryptionMode": "provider_managed",
+    "encryptionKeyId": "AES256",
+    "durability": "verified"
+  },
+  "objects": [
+    {
+      "role": "artifact_manifest",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/ce707879a9079aaae96da8507c1db974a2f094a35d866f2ab262ffe87a096c79/applypilot-artifact-manifest.json",
+      "bytes": 2316,
+      "sha256": "ce707879a9079aaae96da8507c1db974a2f094a35d866f2ab262ffe87a096c79",
+      "providerVersionId": "nOgP7AgZxojXsxPBGn0wSxzLJSvxlkFW",
+      "providerChecksum": "znB4eakHmqrpbahQfB25dKLwlKNdhm8qsmL/6HoJbHk=",
+      "retainUntil": "2026-08-16T15:18:58.107Z"
+    },
+    {
+      "role": "knowledge_graph",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e/knowledge_graph.json",
+      "bytes": 3766105,
+      "sha256": "9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e",
+      "providerVersionId": "kpmg0sDuO9fuFmMeZfz6V3VcWvkuZl0K",
+      "providerChecksum": "kgGAVHn+5lEND58Zc8C3pFOvdnUoKJiPTeaQq2jd/Z4=",
+      "retainUntil": "2026-08-16T15:19:07.189Z"
+    },
+    {
+      "role": "compact_knowledge_graph",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/91345970988cc8b99ea6d7e8340e976f414c14fd092ba6973c81946d566bd10e/compact_knowledge_graph.json",
+      "bytes": 485869,
+      "sha256": "91345970988cc8b99ea6d7e8340e976f414c14fd092ba6973c81946d566bd10e",
+      "providerVersionId": "3zLNNpfsEClrhRm8ASm0.Lq.vXk_NXcf",
+      "providerChecksum": "kTRZcJiMyLmeptfoNA6Xb0FMFP0JK6aXPIGUbVZr0Q4=",
+      "retainUntil": "2026-08-16T15:19:15.761Z"
+    },
+    {
+      "role": "compact_kg_prompt_pack",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/6a0f2a68c70ca264568accd75617cf7daba83da6f376d4faa0f8e32f2d4404d3/compact_kg_prompt_pack.md",
+      "bytes": 27180,
+      "sha256": "6a0f2a68c70ca264568accd75617cf7daba83da6f376d4faa0f8e32f2d4404d3",
+      "providerVersionId": "1R1JklwBmLxZ9GCZliHxLkVAGPM7egsw",
+      "providerChecksum": "ag8qaMcMomRWiszXVhfPfauoPabzdtT6oPjjLy1EBNM=",
+      "retainUntil": "2026-08-16T15:19:24.217Z"
+    },
+    {
+      "role": "compact_canonical_facts",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/b77e4ad9f73ddd8c80e14fe6f1c3d57fc961b06e72142de5e2dce3fc66922d5f/compact_canonical_facts.json",
+      "bytes": 60793,
+      "sha256": "b77e4ad9f73ddd8c80e14fe6f1c3d57fc961b06e72142de5e2dce3fc66922d5f",
+      "providerVersionId": "q23_UIvQrcb7jgFbkmClCFx3SDJQTXVD",
+      "providerChecksum": "t35K2fc93YyA4U/m8cPVf8lhsG5yFC3l4tzj/GaSLV8=",
+      "retainUntil": "2026-08-16T15:19:31.062Z"
+    },
+    {
+      "role": "compact_gap_signals",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/992d84f28f3befc2aba12874087c2fae7d897ba41b52d68ca668d94933c64dcc/compact_gap_signals.json",
+      "bytes": 29059,
+      "sha256": "992d84f28f3befc2aba12874087c2fae7d897ba41b52d68ca668d94933c64dcc",
+      "providerVersionId": "fWBXIXhMosZQG74zkbJ6Ajxdh1fw5QA1",
+      "providerChecksum": "mS2E8o8778KroSh0CHwvrn2Je6QbUtaMpmjZSTPGTcw=",
+      "retainUntil": "2026-08-16T15:19:38.557Z"
+    },
+    {
+      "role": "fitmap_observations",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/cef07ddc5955685fb517140da9913d83e72eeda1da3bbb1d2149eaff1046b592/fitmap_observations.jsonl",
+      "bytes": 1879663,
+      "sha256": "cef07ddc5955685fb517140da9913d83e72eeda1da3bbb1d2149eaff1046b592",
+      "providerVersionId": "0Rzdn11Fn6_FpA7SuWuGpEiP2QOjCRsc",
+      "providerChecksum": "zvB93FlVaF+1FxQNqZE9g+cu7aHaO7sdIUnq/xBGtZI=",
+      "retainUntil": "2026-08-16T15:19:45.304Z"
+    },
+    {
+      "role": "preference_profile",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/705141f353431281e1c6aef13e00eef23ed0aa1501e63dac4d38b46987a5cb40/applypilot-preference-profile.json",
+      "bytes": 43921,
+      "sha256": "705141f353431281e1c6aef13e00eef23ed0aa1501e63dac4d38b46987a5cb40",
+      "providerVersionId": "YQcPYL.JZIr9jA3VTqaj_OjDPvF1XdTN",
+      "providerChecksum": "cFFB81NDEoHhxq7xPgDu8j7QqhUB5j2sTTi0aYely0A=",
+      "retainUntil": "2026-08-16T15:19:53.827Z"
+    },
+    {
+      "role": "pairwise_annotations",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/a6109ab2a3b12bc3dd509e87a5ab534b246664d2a7c70044826c43b637cd064a/applypilot-pairwise-annotation.jsonl",
+      "bytes": 47330,
+      "sha256": "a6109ab2a3b12bc3dd509e87a5ab534b246664d2a7c70044826c43b637cd064a",
+      "providerVersionId": "DqePTabNp_PI8ojYEyYU.W3LdJ6hYXqT",
+      "providerChecksum": "phCasqOxK8PdUJ6HpatTSyRmZNKnxwBEgmxDtjfNBko=",
+      "retainUntil": "2026-08-16T15:20:00.663Z"
+    },
+    {
+      "role": "pairwise_queue",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/5e35406407e194eda5313e68c4d88916507d2416d8383180f9ffa09a8cdb52ff/applypilot-pairwise-queue.json",
+      "bytes": 835599,
+      "sha256": "5e35406407e194eda5313e68c4d88916507d2416d8383180f9ffa09a8cdb52ff",
+      "providerVersionId": "uRiRBOxLCw2MNdshRnHNplgUtXpxFIgr",
+      "providerChecksum": "XjVAZAfhlO2lMT5oxNiJFlB9JBbYODGA+f+gmozbUv8=",
+      "retainUntil": "2026-08-16T15:20:08.480Z"
+    },
+    {
+      "role": "canonical_all_label_events",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/0320572bc039ee01e8527c0d8125fda32d0bddef8f7cf2a2008e6d102f1cc1ac/applypilot-canonical-all-label-events.jsonl",
+      "bytes": 2849926,
+      "sha256": "0320572bc039ee01e8527c0d8125fda32d0bddef8f7cf2a2008e6d102f1cc1ac",
+      "providerVersionId": "bKzYPXvtlyq6xt2Km_K_Dvc3ILohvSbf",
+      "providerChecksum": "AyBXK8A57gHoUnwNgSX9oy0L3e+PfPKiAI5tEC8cwaw=",
+      "retainUntil": "2026-08-16T15:20:16.592Z"
+    },
+    {
+      "role": "label_learning_corpus",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/3a76555bd8cb4cb39d1cf5495cc50ee41769a0fe731eea33c28f5e98fe7d312f/label-corpus-latest.jsonl",
+      "bytes": 8210720,
+      "sha256": "3a76555bd8cb4cb39d1cf5495cc50ee41769a0fe731eea33c28f5e98fe7d312f",
+      "providerVersionId": "5hT7zHq2QLapgmrOOH9j4nyH.AAgyLbw",
+      "providerChecksum": "OnZVW9jLTLOdHPVJXMUO5BdpoP5zHuozwo9emP59MS8=",
+      "retainUntil": "2026-08-16T15:20:25.237Z"
+    },
+    {
+      "role": "label_learning_summary",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/31caeaf253e3a847c835f5f65340955012bb8055ed7211007eb3f43536e7dff4/label-corpus-summary-latest.json",
+      "bytes": 506,
+      "sha256": "31caeaf253e3a847c835f5f65340955012bb8055ed7211007eb3f43536e7dff4",
+      "providerVersionId": "sbaO_8d6rKc1FwsZO3b7vR_AfMCtGla_",
+      "providerChecksum": "Mcrq8lPjqEfINfX2U0CVUBK7gFXtchEAfrP0NTbn3/Q=",
+      "retainUntil": "2026-08-16T15:20:35.325Z"
+    },
+    {
+      "role": "compatibility_manifest",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/39d2c3be5c261bb93b853e9e921fd58047295e71315834211557a04395123aba/applypilot-compatibility-manifest-2026-07-17-rc4.json",
+      "bytes": 12576,
+      "sha256": "39d2c3be5c261bb93b853e9e921fd58047295e71315834211557a04395123aba",
+      "providerVersionId": "JX16fnyKVRnH5SM0ZiKV6ien2NUSpcyr",
+      "providerChecksum": "OdLDvlwmG7k7hT6ekh/VgEcpXnExWDQhFVegQ5USOro=",
+      "retainUntil": "2026-08-16T15:20:41.840Z"
+    },
+    {
+      "role": "compatibility_manifest_sidecar",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/edb333e841faf3d087e8d8c38b323412d3ff84ebb798b79692923cd0cd8a576a/applypilot-compatibility-manifest-2026-07-17-rc4.sha256",
+      "bytes": 120,
+      "sha256": "edb333e841faf3d087e8d8c38b323412d3ff84ebb798b79692923cd0cd8a576a",
+      "providerVersionId": "RzRlrodyuETP6xK_SGQgR3mEi7oB5EbL",
+      "providerChecksum": "7bMz6EH689CH6NjDizI0EtP/hOu3mLeWkpI80M2KV2o=",
+      "retainUntil": "2026-08-16T15:20:48.570Z"
+    },
+    {
+      "role": "authority_promotion_receipt",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/42a1e08ab77402b0dbb780ef073a2e97e2c9207c59b23a3c9d35759451243f25/staging-clean-authority-promotion-2026-07-17.json",
+      "bytes": 4635,
+      "sha256": "42a1e08ab77402b0dbb780ef073a2e97e2c9207c59b23a3c9d35759451243f25",
+      "providerVersionId": "6wNZSA3rIBCgar.8omPrcywiceZ2.7t0",
+      "providerChecksum": "QqHgird0ArDbt4DvBzoul+LJIHxZsjo8nTV1lFEkPyU=",
+      "retainUntil": "2026-08-16T15:20:55.387Z"
+    },
+    {
+      "role": "authority_promotion_sidecar",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/3254eeba3c6408c1304be733a41821496fafccb4a1fd0e3cd8c1ca6b95a8e3a0/staging-clean-authority-promotion-2026-07-17.sha256",
+      "bytes": 116,
+      "sha256": "3254eeba3c6408c1304be733a41821496fafccb4a1fd0e3cd8c1ca6b95a8e3a0",
+      "providerVersionId": "yPeNoiMdoxi6M0ToJQPvCp9kJ5p3nhfK",
+      "providerChecksum": "MlTuujxkCMEwS+czpBghSW+vzLSh/Q482MHKa5Wo46A=",
+      "retainUntil": "2026-08-16T15:21:02.348Z"
+    },
+    {
+      "role": "clean_import_parity_receipt",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/11fdd50f4a351b5a6d83eb3b918393bc9ec7f11c937b7072482dfb4d460dbdd4/staging-brain-clean-import-parity-2026-07-17.json",
+      "bytes": 3020,
+      "sha256": "11fdd50f4a351b5a6d83eb3b918393bc9ec7f11c937b7072482dfb4d460dbdd4",
+      "providerVersionId": "qY6Iil.8zJsqJUK657HkQ6zLd0fMTbit",
+      "providerChecksum": "Ef3VD0o1G1ptg+s7kYOTvJ7H8RyTe3BySC37TUYNvdQ=",
+      "retainUntil": "2026-08-16T15:21:09.324Z"
+    },
+    {
+      "role": "asset_bootstrap_receipt",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/b7c1f86fa2b07aa733b1cd35ffcff11fae0dc4ed8dddfc0f82bb7aebb9b8d8ae/staging-release-asset-bootstrap-2026-07-17.json",
+      "bytes": 8027,
+      "sha256": "b7c1f86fa2b07aa733b1cd35ffcff11fae0dc4ed8dddfc0f82bb7aebb9b8d8ae",
+      "providerVersionId": "V2ByyU79T2.u52Wvqai5COyaBYoiWGOX",
+      "providerChecksum": "t8H4b6Kweqczsc01/8/xH64NxO2N3fwPgrt667m42K4=",
+      "retainUntil": "2026-08-16T15:21:15.882Z"
+    },
+    {
+      "role": "asset_bootstrap_sidecar",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/40de7cf68e21a602076e497295c18cae809793ee0b0dcf98918bd24b016fa6fc/staging-release-asset-bootstrap-2026-07-17.sha256",
+      "bytes": 114,
+      "sha256": "40de7cf68e21a602076e497295c18cae809793ee0b0dcf98918bd24b016fa6fc",
+      "providerVersionId": "llmHCw6rQiS_2irAWmuhalqs4evP6e4t",
+      "providerChecksum": "QN589o4hpgIHbklylcGMroCXk+4LDc+YkYvSSwFvpvw=",
+      "retainUntil": "2026-08-16T15:21:22.533Z"
+    },
+    {
+      "role": "approved_profile",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/53417cbfacd540ebb940164cecd46b8af5115e9725fbdc5b899143f9207cd58c/profile.json",
+      "bytes": 2603,
+      "sha256": "53417cbfacd540ebb940164cecd46b8af5115e9725fbdc5b899143f9207cd58c",
+      "providerVersionId": ".yjSxKkb6FzpfIz6ciKbaXRKSdOF3OKP",
+      "providerChecksum": "U0F8v6zVQOu5QBZM7NRrivURXpcl+9xbiZFD+SB81Yw=",
+      "retainUntil": "2026-08-16T15:21:29.363Z"
+    },
+    {
+      "role": "approved_resume",
+      "objectKey": "releases/applypilot-cloud-staging-2026-07-17-rc4/sha256/e5c75e2c3adeb4b64f2fbf850609649bbf79bdee1f35ebedd1826cfdf3e10c18/resume.pdf",
+      "bytes": 364594,
+      "sha256": "e5c75e2c3adeb4b64f2fbf850609649bbf79bdee1f35ebedd1826cfdf3e10c18",
+      "providerVersionId": "3UAcAcmZeo9FmW58Xk.RJK2t_oBHmuQE",
+      "providerChecksum": "5cdeLDretLZPL7+FBglkm795ve4fNevt0YJs/fPhDBg=",
+      "retainUntil": "2026-08-16T15:21:36.891Z"
+    }
+  ],
+  "promotionAuthorized": false,
+  "remainingGate": "Register the authoritative artifact hashes and exact AWS versioned locations in Postgres through the artifact coordinator, then verify brain_artifact_is_authoritative for every policy and gate artifact."
+}
