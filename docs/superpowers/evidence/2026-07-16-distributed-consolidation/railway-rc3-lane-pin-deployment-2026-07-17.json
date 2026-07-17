@@ -1,0 +1,91 @@
+{
+  "schemaVersion": "applypilot_railway_lane_pin_deployment_receipt_v1",
+  "recordedAt": "2026-07-17T13:49:00Z",
+  "releaseId": "applypilot-cloud-staging-2026-07-17-rc3",
+  "promotionAuthorized": false,
+  "repository": {
+    "name": "thefulmination/ApplyPilot",
+    "branch": "codex/cloud-cutover-runtime-integration",
+    "releaseCodeCommit": "5b8a7c0a6ed1aae9bd30a93a8c0cd66a127d34c5",
+    "releaseCodeTree": "bb7824ae0d8042ada6f748147fdccd9c7edab039",
+    "releaseManifestCommit": "c66915a",
+    "identityOwnershipFixCommit": "ac3cdf0",
+    "releaseVersion": "0.3.0+git.tree.bb7824a"
+  },
+  "railway": {
+    "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+    "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+    "postgresServiceId": "aa551e4f-51fa-49df-b02c-a45e3ea22fd1",
+    "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
+    "successfulDeploymentId": "37e8373f-551a-4720-9ed6-d64a23dd4d2c",
+    "imageDigest": "sha256:16262d2ea7eaee0c5accbbf169dd4f6430fa70b1f770c6191f281d6cf956e1e5"
+  },
+  "migration": {
+    "fleetRoleRenamedFrom": "staging_migrator_v2",
+    "fleetRole": "applypilot_fleet_migrator",
+    "fleetRoleAttributes": "NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+    "fleetLedger": [
+      {
+        "id": "20260715_001_application_authority",
+        "sha256": "65d10d1a16e9829a7995f48776697e3200daf7a5074147a9a3ed8c0293f56bea"
+      },
+      {
+        "id": "20260717_002_lane_specific_canary_pins",
+        "sha256": "1ee176c419508cd5a9c7004460798d14fd6749addbf293892fd2d859a1b6dd1d"
+      }
+    ],
+    "brainLedger": [
+      {
+        "version": 1,
+        "sha256": "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5"
+      },
+      {
+        "version": 2,
+        "sha256": "0d4f29cf873e7e6c5051851be3a1ecf9701fdd8d0570af6f9503e83bb783577a"
+      },
+      {
+        "version": 3,
+        "sha256": "a8fe5bb48a8c481ad11c63712a16a86c2dc58836de50ad323589b274bb19f5d6"
+      }
+    ]
+  },
+  "liveState": {
+    "globalPaused": true,
+    "atsPaused": true,
+    "atsMode": "stopped",
+    "linkedinMode": "stopped",
+    "atsCanaryEnabled": false,
+    "linkedinCanaryEnabled": false,
+    "atsOutstandingLeases": 0,
+    "linkedinOutstandingLeases": 0,
+    "pinnedWorkerVersion": "0.3.0+git.tree.bb7824a",
+    "atsCanaryWorkerId": "staging-ats-0",
+    "atsCanaryVersion": "0.3.0+git.tree.bb7824a",
+    "linkedinCanaryWorkerId": null,
+    "linkedinCanaryVersion": null,
+    "workerHeartbeatState": "paused",
+    "workerHeartbeatVersion": "0.3.0+git.tree.bb7824a"
+  },
+  "incident": {
+    "failedDeploymentId": "73fccdf1-ffc5-45c6-805e-dffce3e7cc2a",
+    "symptom": "fleet_worker_identity failed because its SECURITY DEFINER owner lacked public schema and fleet_worker_principals access",
+    "rootCause": "the identity function was owned by staging_controller_v2 and depended on inherited fleet-migrator membership",
+    "repair": "ownership moved to applypilot_fleet_migrator and bootstrap code now binds identity-function ownership to the principal-table owner",
+    "regressionTestsPassed": 29
+  },
+  "access": {
+    "gggTowerSshAlias": "gggtower",
+    "gggTowerSshVerified": true,
+    "gggTowerSshUser": "gggtower\\backoffice",
+    "sshdRunning": true,
+    "sshdAutomatic": true,
+    "tailscaleRunning": true,
+    "tailscaleAutomatic": true
+  },
+  "remainingGates": [
+    "Provision and verify a distinct cloud LinkedIn worker principal before setting the LinkedIn lane pin.",
+    "Roll the pinned runtime to GGGTower and Tarpon while both application lanes remain paused.",
+    "Run separate ATS and LinkedIn canaries only after policy and artifact gates pass.",
+    "Do not authorize promotion from this receipt."
+  ]
+}
