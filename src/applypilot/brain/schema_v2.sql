@@ -449,8 +449,6 @@ TO brain_policy_controller;
 
 REVOKE ALL PRIVILEGES ON SCHEMA public FROM brain_status_reader,brain_policy_controller;
 GRANT USAGE ON SCHEMA public TO brain_status_reader,brain_policy_controller;
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public
-FROM brain_status_reader,brain_policy_controller;
 GRANT SELECT ON TABLE public.brain_decision_policies,public.brain_policy_artifacts,
     public.brain_policy_approvals,public.brain_parity_runs,public.brain_parity_run_events
 TO brain_status_reader;
