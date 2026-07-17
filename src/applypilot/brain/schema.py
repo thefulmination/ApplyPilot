@@ -13,11 +13,68 @@ from psycopg import sql
 from psycopg.pq import TransactionStatus
 
 _SCHEMA_SQL = Path(__file__).with_name("schema_v1.sql")
+_SCHEMA_V2_SQL = Path(__file__).with_name("schema_v2.sql")
 _SCHEMA_LOCK_KEY = "applypilot:brain:schema:v1"
 _MIGRATION_NAME = "brain schema v1"
+_MIGRATION_V2_NAME = "brain schema v2 lifecycle principals"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
-_EXPECTED_CATALOG_HASH = "8c3377fc210922a5583995f0e6981ed1f023432c51218a960e055030ae7e243a"
+_STATUS_ROLE = "brain_status_reader"
+_POLICY_CONTROLLER_ROLE = "brain_policy_controller"
+_STATUS_READ_RELATIONS = {
+    "brain_decision_policies",
+    "brain_policy_artifacts",
+    "brain_policy_approvals",
+    "brain_parity_runs",
+    "brain_parity_run_events",
+}
+_STATUS_READ_COLUMNS = {
+    "fleet_config": {
+        "id", "paused", "ats_paused", "ats_pause_source", "ats_apply_mode",
+        "linkedin_apply_mode", "canary_enabled", "linkedin_canary_enabled",
+        "canary_remaining", "linkedin_canary_remaining", "ats_policy_version",
+        "linkedin_policy_version", "pinned_worker_version", "canary_worker_id",
+        "canary_version", "approval_threshold", "spend_cap_usd", "linkedin_owner_ip",
+    },
+    "fleet_decision_policies": {
+        "policy_version", "lane", "status", "activated_at", "retired_at",
+    },
+    "apply_queue": {
+        "status", "lease_owner", "lease_expires_at", "decision_id", "policy_version",
+        "decision_action", "qualification_verdict", "qualification_score",
+        "qualification_floor", "preference_score", "outcome_score", "final_score",
+        "decision_confidence", "decision_created_at", "decision_expires_at", "input_hash",
+    },
+    "linkedin_queue": {
+        "status", "lease_owner", "lease_expires_at", "decision_id", "policy_version",
+        "decision_action", "qualification_verdict", "qualification_score",
+        "qualification_floor", "preference_score", "outcome_score", "final_score",
+        "decision_confidence", "decision_created_at", "decision_expires_at", "input_hash",
+    },
+}
+_CONTROLLER_FUNCTIONS = {
+    "brain_controller_transition_policy",
+    "brain_controller_arm_canary",
+    "brain_controller_stop_canary",
+}
+_LIFECYCLE_LOCK_RELATIONS = {
+    "apply_queue",
+    "fleet_config",
+    "fleet_decision_policies",
+    "fleet_desired_state",
+    "fleet_worker_principals",
+    "linkedin_queue",
+    "rate_governor",
+    "worker_heartbeat",
+    "workers",
+}
+_LIFECYCLE_OWNER_READ_RELATIONS = _LIFECYCLE_LOCK_RELATIONS | {
+    "applied_set",
+    "apply_attempts",
+    "apply_result_events",
+    "fleet_worker_blocklist",
+}
+_EXPECTED_CATALOG_HASH = "e966e54ccb0ed6f14059e0e0a1c185001f42490e2b48dc27a887662afe23259f"
 
 _FUNCTIONS = {
     "brain_reject_mutation": "",
@@ -38,6 +95,15 @@ _FUNCTIONS = {
     "brain_check_parity_result": "",
     "brain_check_archive_manifest": "",
     "brain_transition_policy": "requested_policy_version text, requested_lifecycle text",
+    "brain_controller_transition_policy": (
+        "requested_policy_version text, requested_lifecycle text, expected_lane text"
+    ),
+    "brain_controller_arm_canary": (
+        "requested_policy_version text, requested_lane text, requested_capacity integer, "
+        "expected_ats_pause_source text, expect_null_ats_pause_source boolean, "
+        "heartbeat_max_age_seconds integer"
+    ),
+    "brain_controller_stop_canary": "requested_lane text",
 }
 
 
@@ -71,6 +137,7 @@ _RELATIONS = {
     "brain_policy_release_gate_events": "r",
     "brain_policy_transition_receipts": "r",
     "brain_policy_activation_receipts": "r",
+    "brain_canary_lifecycle_events": "r",
     "brain_decision_identities": "r",
     "brain_job_decisions": "p",
     "brain_migration_sources": "r",
@@ -102,6 +169,7 @@ _KEY_COLUMNS = {
     ("brain_applications", "lane"): ("text", False),
     ("brain_application_events", "application_id"): ("text", True),
     ("brain_policy_artifacts", "artifact_role"): ("text", True),
+    ("brain_canary_lifecycle_events", "prior_ats_pause_source"): ("text", False),
     ("brain_job_decisions", "decision_id"): ("text", True),
     ("brain_job_decisions", "policy_version"): ("text", True),
     ("brain_job_decisions", "confidence"): ("numeric", False),
@@ -111,6 +179,8 @@ _KEY_COLUMNS = {
 }
 
 _CONSTRAINTS = {
+    "brain_canary_lifecycle_events_lane_check": ("lane", "ats", "linkedin"),
+    "brain_canary_lifecycle_events_type_check": ("event_type", "armed", "stopped"),
     "brain_job_aliases_idempotent": ("UNIQUE NULLS NOT DISTINCT", "source_namespace", "source_database_fingerprint"),
     "brain_label_events_endpoint": (
         "CHECK",
@@ -212,6 +282,7 @@ _IMMUTABLE_TABLES = {
     "brain_policy_release_gate_events",
     "brain_policy_transition_receipts",
     "brain_policy_activation_receipts",
+    "brain_canary_lifecycle_events",
     "brain_decision_identities",
     "brain_job_decisions",
     "brain_migration_sources",
@@ -234,6 +305,14 @@ def _schema_bytes() -> bytes:
 
 def _schema_checksum() -> str:
     return hashlib.sha256(_schema_bytes()).hexdigest()
+
+
+def _schema_v2_bytes() -> bytes:
+    return _SCHEMA_V2_SQL.read_bytes()
+
+
+def _schema_v2_checksum() -> str:
+    return hashlib.sha256(_schema_v2_bytes()).hexdigest()
 
 
 def _require_idle(conn) -> None:
@@ -307,6 +386,9 @@ def _apply_acl_contract(cur, migration_identity: str) -> None:
     cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA public, brain_archive FROM {}").format(verifier))
     cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public, brain_archive TO {}").format(verifier))
     for relation in _RELATIONS:
+        cur.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",))
+        if cur.fetchone()["relation"] is None:
+            continue
         cur.execute(
             sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
                 sql.Identifier("public"), sql.Identifier(relation), verifier
@@ -330,10 +412,10 @@ def _apply_acl_contract(cur, migration_identity: str) -> None:
                 )
 
 
-def _version_row(cur):
+def _version_rows(cur):
     cur.execute("SELECT to_regclass('public.brain_schema_versions') AS relation")
     if cur.fetchone()["relation"] is None:
-        return None
+        return []
     cur.execute(
         "SELECT version, migration_name, migration_checksum, applied_at, applied_by "
         "FROM public.brain_schema_versions ORDER BY version"
@@ -342,12 +424,17 @@ def _version_row(cur):
     if not rows:
         raise RuntimeError("brain schema version ledger exists but is empty")
     versions = [row["version"] for row in rows]
-    if versions != [1]:
+    if versions not in ([1], [1, 2]):
         raise RuntimeError(
             "unsupported or non-contiguous brain schema version ledger: "
             + ", ".join(str(version) for version in versions)
         )
-    return rows[0]
+    return rows
+
+
+def _version_row(cur):
+    rows = _version_rows(cur)
+    return rows[0] if rows else None
 
 
 def _assert_existing_ownership(cur, migration_identity: str) -> None:
@@ -473,7 +560,8 @@ def _catalog_contract_hash(cur) -> str:
 
 def _verify_contract(cur) -> None:
     checksum = _schema_checksum()
-    version = _version_row(cur)
+    versions = _version_rows(cur)
+    version = versions[0] if versions else None
     problems: list[str] = []
     if version is None:
         problems.append("missing schema version 1")
@@ -486,6 +574,19 @@ def _verify_contract(cur) -> None:
             problems.append("migration checksum mismatch")
         if version["applied_by"] != _MIGRATION_ROLE:
             problems.append(f"migration ledger owner mismatch: expected {_MIGRATION_ROLE}, got {version['applied_by']}")
+    version_v2 = versions[1] if len(versions) > 1 else None
+    if version_v2 is None:
+        problems.append("missing schema version 2 lifecycle principal contract")
+    else:
+        if version_v2["migration_name"] != _MIGRATION_V2_NAME:
+            problems.append("migration v2 name mismatch")
+        if version_v2["migration_checksum"] != _schema_v2_checksum():
+            problems.append("migration v2 checksum mismatch")
+        if version_v2["applied_by"] != _MIGRATION_ROLE:
+            problems.append(
+                f"migration v2 ledger owner mismatch: expected {_MIGRATION_ROLE}, "
+                f"got {version_v2['applied_by']}"
+            )
 
     cur.execute(
         "SELECT c.relname, c.relkind FROM pg_class c "
@@ -617,7 +718,7 @@ def _verify_contract(cur) -> None:
     functions = {row["proname"]: row for row in cur.fetchall()}
     for name, arguments in _FUNCTIONS.items():
         function = functions.get(name)
-        expected_security_definer = name == "brain_transition_policy"
+        expected_security_definer = name == "brain_transition_policy" or name in _CONTROLLER_FUNCTIONS
         if (
             function is None
             or function["arguments"] != arguments
@@ -764,6 +865,203 @@ def _verify_contract(cur) -> None:
     if _EXPECTED_CATALOG_HASH and catalog_hash != _EXPECTED_CATALOG_HASH:
         problems.append(f"catalog contract hash mismatch: expected {_EXPECTED_CATALOG_HASH}, got {catalog_hash}")
 
+    cur.execute(
+        "SELECT rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,"
+        "rolbypassrls,rolinherit FROM pg_roles WHERE rolname=ANY(%s) ORDER BY rolname",
+        ([_POLICY_CONTROLLER_ROLE, _STATUS_ROLE],),
+    )
+    capability_roles = cur.fetchall()
+    if len(capability_roles) != 2:
+        problems.append("missing fixed lifecycle capability roles")
+    for role in capability_roles:
+        unsafe = any(
+            role[key]
+            for key in (
+                "rolcanlogin",
+                "rolsuper",
+                "rolcreatedb",
+                "rolcreaterole",
+                "rolreplication",
+                "rolbypassrls",
+                "rolinherit",
+            )
+        )
+        if unsafe:
+            problems.append(f"unsafe lifecycle capability role attributes: {role['rolname']}")
+    cur.execute(
+        "SELECT member_role.rolname AS member_role,parent_role.rolname AS parent_role "
+        "FROM pg_auth_members membership "
+        "JOIN pg_roles member_role ON member_role.oid=membership.member "
+        "JOIN pg_roles parent_role ON parent_role.oid=membership.roleid "
+        "WHERE member_role.rolname=ANY(%s) OR parent_role.rolname=ANY(%s)",
+        (
+            [_POLICY_CONTROLLER_ROLE, _STATUS_ROLE],
+            [_MIGRATION_ROLE, _POLICY_CONTROLLER_ROLE, _STATUS_ROLE],
+        ),
+    )
+    unsafe_memberships = [
+        f"{row['member_role']}->{row['parent_role']}"
+        for row in cur.fetchall()
+        if row["member_role"] in {_POLICY_CONTROLLER_ROLE, _STATUS_ROLE}
+    ]
+    if unsafe_memberships:
+        problems.append("unsafe lifecycle role membership: " + ", ".join(unsafe_memberships))
+    cur.execute(
+        "WITH RECURSIVE memberships(login_oid,roleid) AS ("
+        "SELECT oid,oid FROM pg_roles WHERE rolcanlogin UNION "
+        "SELECT prior.login_oid,membership.roleid FROM memberships prior "
+        "JOIN pg_auth_members membership ON membership.member=prior.roleid) "
+        "SELECT DISTINCT login.rolname AS login_name,capability.rolname AS capability "
+        "FROM memberships JOIN pg_roles login ON login.oid=memberships.login_oid "
+        "JOIN pg_roles capability ON capability.oid=memberships.roleid "
+        "WHERE capability.rolname=ANY(%s)",
+        ([_POLICY_CONTROLLER_ROLE, _STATUS_ROLE],),
+    )
+    for lifecycle_login in cur.fetchall():
+        login_name = lifecycle_login["login_name"]
+        capability_name = lifecycle_login["capability"]
+        cur.execute(
+            "WITH RECURSIVE memberships(roleid) AS ("
+            "SELECT oid FROM pg_roles WHERE rolname=%s UNION "
+            "SELECT member.roleid FROM pg_auth_members member "
+            "JOIN memberships prior ON prior.roleid=member.member) "
+            "SELECT EXISTS(SELECT 1 FROM memberships JOIN pg_roles role ON role.oid=memberships.roleid "
+            "WHERE role.rolname<>%s AND role.rolname<>%s) AS extra_membership,"
+            "EXISTS(SELECT 1 FROM pg_roles role WHERE role.rolname=%s AND "
+            "(role.rolsuper OR role.rolcreatedb OR role.rolcreaterole OR role.rolreplication "
+            "OR role.rolbypassrls)) AS unsafe_identity,"
+            "has_schema_privilege(%s,'public','CREATE') AS public_create,"
+            "EXISTS(SELECT 1 FROM pg_class relation JOIN pg_namespace namespace "
+            "ON namespace.oid=relation.relnamespace WHERE namespace.nspname='public' "
+            "AND relation.relkind IN ('r','p','v','m','f') AND (has_table_privilege(%s,relation.oid,"
+            "'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') OR "
+            "has_any_column_privilege(%s,relation.oid,'INSERT,UPDATE,REFERENCES'))) AS mutation_authority,"
+            "EXISTS(SELECT 1 FROM pg_proc function JOIN pg_namespace namespace "
+            "ON namespace.oid=function.pronamespace CROSS JOIN LATERAL aclexplode(function.proacl) acl "
+            "WHERE namespace.nspname='public' AND acl.grantee="
+            "(SELECT oid FROM pg_roles WHERE rolname=%s)) AS direct_function_grant",
+            (
+                login_name,
+                login_name,
+                capability_name,
+                login_name,
+                login_name,
+                login_name,
+                login_name,
+                login_name,
+            ),
+        )
+        login_contract = cur.fetchone()
+        if login_contract is None or any(login_contract.values()):
+            problems.append(
+                f"lifecycle login {login_name} exceeds {capability_name} capability"
+            )
+    cur.execute(
+        "SELECT p.proname,has_function_privilege(%s,p.oid,'EXECUTE') AS controller_execute,"
+        "has_function_privilege(%s,p.oid,'EXECUTE') AS status_execute "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "WHERE n.nspname='public' AND p.proname=ANY(%s) ORDER BY p.proname",
+        (
+            _POLICY_CONTROLLER_ROLE,
+            _STATUS_ROLE,
+            sorted(_CONTROLLER_FUNCTIONS | {"brain_transition_policy"}),
+        ),
+    )
+    lifecycle_function_acl = cur.fetchall()
+    if len(lifecycle_function_acl) != 4 or any(
+        row["status_execute"]
+        or row["controller_execute"] != (row["proname"] in _CONTROLLER_FUNCTIONS)
+        for row in lifecycle_function_acl
+    ):
+        problems.append("lifecycle function ACL contract mismatch")
+    missing_owner_privileges: list[str] = []
+    for privilege, relations in (
+        ("SELECT", _LIFECYCLE_OWNER_READ_RELATIONS),
+        ("UPDATE", _LIFECYCLE_LOCK_RELATIONS),
+        ("INSERT", {"fleet_decision_policies"}),
+    ):
+        cur.execute(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname='public' AND c.relname=ANY(%s) "
+            "AND NOT has_table_privilege(%s,c.oid,%s) ORDER BY c.relname",
+            (sorted(relations), _MIGRATION_ROLE, privilege),
+        )
+        missing_owner_privileges.extend(
+            f"{row['relname']}:{privilege}" for row in cur.fetchall()
+        )
+    if missing_owner_privileges:
+        problems.append(
+            "lifecycle function owner lacks required privileges: "
+            + ", ".join(missing_owner_privileges)
+        )
+    for role_name in (_STATUS_ROLE, _POLICY_CONTROLLER_ROLE):
+        cur.execute(
+            "SELECT has_schema_privilege(%s,'public','USAGE') AS usage,"
+            "has_schema_privilege(%s,'public','CREATE') AS create",
+            (role_name, role_name),
+        )
+        if cur.fetchone() != {"usage": True, "create": False}:
+            problems.append(f"lifecycle role {role_name} schema ACL mismatch")
+    cur.execute(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='public' AND c.relkind IN ('r','p') AND "
+        "has_table_privilege(%s,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')",
+        (_STATUS_ROLE,),
+    )
+    status_mutations = [row["relname"] for row in cur.fetchall()]
+    if status_mutations:
+        problems.append("status role has mutation privileges: " + ", ".join(status_mutations))
+    cur.execute(
+        "SELECT c.relname,NULL::text AS column_name,acl.privilege_type FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+        "WHERE n.nspname='public' AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s) "
+        "UNION ALL "
+        "SELECT c.relname,a.attname,acl.privilege_type FROM pg_attribute a "
+        "JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(a.attacl) acl WHERE n.nspname='public' "
+        "AND a.attnum>0 AND NOT a.attisdropped "
+        "AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s)",
+        (_STATUS_ROLE, _STATUS_ROLE),
+    )
+    actual_status_acls = {
+        (row["relname"], row["column_name"], row["privilege_type"])
+        for row in cur.fetchall()
+    }
+    expected_status_acls = {
+        (relation, None, "SELECT") for relation in _STATUS_READ_RELATIONS
+    } | {
+        (relation, column, "SELECT")
+        for relation, columns in _STATUS_READ_COLUMNS.items()
+        for column in columns
+    }
+    if actual_status_acls != expected_status_acls:
+        problems.append(
+            "status role direct ACL contract mismatch: "
+            f"missing={sorted(expected_status_acls - actual_status_acls)!r} "
+            f"extra={sorted(actual_status_acls - expected_status_acls)!r}"
+        )
+    cur.execute(
+        "SELECT c.relname,acl.privilege_type FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+        "WHERE n.nspname='public' AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s) "
+        "UNION ALL "
+        "SELECT c.relname||'.'||a.attname,acl.privilege_type FROM pg_attribute a "
+        "JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(a.attacl) acl "
+        "WHERE n.nspname='public' AND a.attnum>0 AND NOT a.attisdropped "
+        "AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s)",
+        (_POLICY_CONTROLLER_ROLE, _POLICY_CONTROLLER_ROLE),
+    )
+    controller_table_acls = [
+        f"{row['relname']}:{row['privilege_type']}" for row in cur.fetchall()
+    ]
+    if controller_table_acls:
+        problems.append(
+            "policy controller has forbidden direct table privileges: "
+            + ", ".join(sorted(controller_table_acls))
+        )
+
     verifier_identity = _verifier_identity()
     cur.execute(
         "SELECT has_schema_privilege(%s,'public','USAGE') AS public_usage,"
@@ -801,7 +1099,14 @@ def _verify_contract(cur) -> None:
     )
     invalid_grants = []
     for row in cur.fetchall():
-        if row["grantee"] != verifier_identity or row["privilege_type"] != "SELECT":
+        allowed = row["grantee"] == verifier_identity and row["privilege_type"] == "SELECT"
+        allowed = allowed or (
+            row["nspname"] == "public"
+            and row["relname"] in _STATUS_READ_RELATIONS
+            and row["grantee"] == _STATUS_ROLE
+            and row["privilege_type"] == "SELECT"
+        )
+        if not allowed:
             invalid_grants.append(f"{row['nspname']}.{row['relname']}->{row['grantee']}:{row['privilege_type']}")
     if invalid_grants:
         problems.append("invalid non-owner object ACLs: " + ", ".join(sorted(set(invalid_grants))))
@@ -828,7 +1133,14 @@ def _verify_contract(cur) -> None:
         "WHERE n.nspname = 'public' AND left(p.proname, 6) = 'brain_' "
         "AND acl.grantee <> p.proowner"
     )
-    function_grants = [f"{row['proname']}()->{row['grantee']}" for row in cur.fetchall()]
+    function_grants = [
+        f"{row['proname']}()->{row['grantee']}"
+        for row in cur.fetchall()
+        if not (
+            row["proname"] in _CONTROLLER_FUNCTIONS
+            and row["grantee"] == _POLICY_CONTROLLER_ROLE
+        )
+    ]
     if function_grants:
         problems.append("non-owner function ACLs: " + ", ".join(sorted(set(function_grants))))
     cur.execute(
@@ -909,8 +1221,8 @@ def ensure_brain_schema_v1(
     _require_idle(conn)
     with conn.transaction():
         with conn.cursor() as cur:
-            version = _version_row(cur)
-            if version is not None:
+            versions = _version_rows(cur)
+            if len(versions) == 2:
                 _verify_contract(cur)
                 return
 
@@ -919,18 +1231,27 @@ def ensure_brain_schema_v1(
             _acquire_xact_lock(cur, lock_timeout_seconds)
 
             # Another installer may have completed while this connection waited.
-            version = _version_row(cur)
-            if version is not None:
+            versions = _version_rows(cur)
+            if len(versions) == 2:
                 _verify_contract(cur)
                 return
 
-            cur.execute(_schema_bytes().decode("utf-8"))
+            if not versions:
+                cur.execute(_schema_bytes().decode("utf-8"))
+                _apply_acl_contract(cur, migration_identity)
+                cur.execute(
+                    "INSERT INTO public.brain_schema_versions "
+                    "(version, migration_name, migration_checksum, applied_by) "
+                    "VALUES (1, %s, %s, %s)",
+                    (_MIGRATION_NAME, _schema_checksum(), migration_identity),
+                )
+            cur.execute(_schema_v2_bytes().decode("utf-8"))
             _apply_acl_contract(cur, migration_identity)
             cur.execute(
                 "INSERT INTO public.brain_schema_versions "
                 "(version, migration_name, migration_checksum, applied_by) "
-                "VALUES (1, %s, %s, %s)",
-                (_MIGRATION_NAME, _schema_checksum(), migration_identity),
+                "VALUES (2, %s, %s, %s)",
+                (_MIGRATION_V2_NAME, _schema_v2_checksum(), migration_identity),
             )
             _verify_contract(cur)
 

@@ -1,11 +1,12 @@
 import json
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from typer.testing import CliRunner
 
 from applypilot import canonical_decisions, database
 from applypilot.apply import pgqueue
-from applypilot.cli import app
+from applypilot.cli import _postgres_policy_transition, app
 
 
 runner = CliRunner()
@@ -57,101 +58,218 @@ def _brain(tmp_path, monkeypatch):
     return database.init_db(path)
 
 
-def test_canonical_status_and_validate(tmp_path, monkeypatch):
-    conn = _brain(tmp_path, monkeypatch)
-    _draft(conn)
-    status = runner.invoke(app, ["canonical", "status"])
-    assert status.exit_code == 0
-    assert "missing_projection" in status.stdout
-    validated = runner.invoke(app, ["canonical", "validate", "policy-ats-v2"])
-    assert validated.exit_code == 0
-    assert conn.execute(
-        "SELECT status FROM decision_policy_versions WHERE policy_version='policy-ats-v2'"
-    ).fetchone()[0] == "validated"
+def test_canonical_status_reads_only_unified_postgres(monkeypatch):
+    class ReadOnlyConnection:
+        def rollback(self):
+            pass
+
+    sentinel = ReadOnlyConnection()
+
+    @contextmanager
+    def connect(dsn):
+        assert dsn == "postgresql://brain"
+        yield sentinel
+
+    monkeypatch.setattr(pgqueue, "connect", connect)
+    monkeypatch.setattr(
+        "applypilot.brain.lifecycle.authority_status",
+        lambda conn: {
+            "authority": "postgres_staging_candidate",
+            "cutover_proven": False,
+            "lanes": {"ats": {}, "linkedin": {}},
+        },
+    )
+    monkeypatch.setattr(
+        "applypilot.cli._sqlite_cache_connection",
+        lambda: (_ for _ in ()).throw(AssertionError("SQLite must not be opened")),
+    )
+
+    status = runner.invoke(
+        app, ["canonical", "status", "--dsn", "postgresql://brain"]
+    )
+
+    assert status.exit_code == 0, status.stdout
+    assert '"authority": "postgres_staging_candidate"' in status.stdout
 
 
-def test_canonical_promote_requires_lane_and_replay_metrics(fleet_db, tmp_path, monkeypatch):
-    conn = _brain(tmp_path, monkeypatch)
-    _draft(conn, metrics=False)
+def test_canonical_validate_and_promote_require_explicit_postgres_steps(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "applypilot.cli._postgres_policy_transition",
+        lambda dsn, policy, lifecycle, lane=None: calls.append(
+            (dsn, policy, lifecycle, lane)
+        ) or {"lane": lane or "ats"},
+    )
+    validated = runner.invoke(
+        app,
+        ["canonical", "validate", "policy-ats-v2", "--dsn", "postgresql://brain"],
+    )
+    assert validated.exit_code == 0, validated.stdout
+
     missing_lane = runner.invoke(
-        app, ["canonical", "promote", "policy-ats-v2", "--dsn", fleet_db]
+        app,
+        [
+            "canonical", "promote", "policy-ats-v2", "--to", "canary",
+            "--dsn", "postgresql://brain",
+        ],
     )
     assert missing_lane.exit_code != 0
-    failed = runner.invoke(
+    missing_target = runner.invoke(
         app,
-        ["canonical", "promote", "policy-ats-v2", "--lane", "ats", "--dsn", fleet_db],
+        [
+            "canonical", "promote", "policy-ats-v2", "--lane", "ats",
+            "--dsn", "postgresql://brain",
+        ],
     )
-    assert failed.exit_code != 0
-
-
-def test_canonical_promote_pg_failure_leaves_validated_policy(tmp_path, monkeypatch):
-    conn = _brain(tmp_path, monkeypatch)
-    _draft(conn)
-
-    failed = runner.invoke(
-        app,
-        ["canonical", "promote", "policy-ats-v2", "--lane", "ats", "--dsn", "invalid"],
-    )
-
-    assert failed.exit_code == 2
-    assert conn.execute(
-        "SELECT status FROM decision_policy_versions WHERE policy_version='policy-ats-v2'"
-    ).fetchone()[0] == "validated"
-
-
-def test_canonical_retire_pg_failure_leaves_sqlite_active(tmp_path, monkeypatch):
-    conn = _brain(tmp_path, monkeypatch)
-    _draft(conn)
-    canonical_decisions.validate_policy(conn, "policy-ats-v2")
-    canonical_decisions.activate_policy(conn, "policy-ats-v2", lane="ats")
-
-    failed = runner.invoke(
-        app, ["canonical", "retire", "policy-ats-v2", "--dsn", "invalid"]
-    )
-
-    assert failed.exit_code == 2
-    assert conn.execute(
-        "SELECT status FROM decision_policy_versions WHERE policy_version='policy-ats-v2'"
-    ).fetchone()[0] == "active"
-
-
-def test_canonical_promote_and_retire_are_lane_scoped(fleet_db, tmp_path, monkeypatch):
-    conn = _brain(tmp_path, monkeypatch)
-    _draft(conn)
+    assert missing_target.exit_code != 0
     promoted = runner.invoke(
         app,
-        ["canonical", "promote", "policy-ats-v2", "--lane", "ats", "--dsn", fleet_db],
+        [
+            "canonical", "promote", "policy-ats-v2", "--lane", "ats",
+            "--to", "canary", "--dsn", "postgresql://brain",
+        ],
     )
     assert promoted.exit_code == 0, promoted.stdout
-    assert conn.execute(
-        "SELECT status FROM decision_policy_versions WHERE policy_version='policy-ats-v2'"
-    ).fetchone()[0] == "active"
-    now = datetime.now(timezone.utc)
-    with pgqueue.connect(fleet_db) as pg, pg.cursor() as cur:
-        cur.execute("SELECT ats_policy_version,ats_paused FROM fleet_config WHERE id=1")
-        assert cur.fetchone()["ats_policy_version"] == "policy-ats-v2"
-        cur.execute(
-            "INSERT INTO apply_queue (url,application_url,score,status,lane,approved_batch,"
-            "decision_id,policy_version,decision_action,qualification_verdict,qualification_score,"
-            "qualification_floor,preference_score,outcome_score,final_score,decision_confidence,"
-            "decision_created_at,decision_expires_at,input_hash) "
-            "VALUES ('queued','https://example.com',9,'queued','ats','b1','d1','policy-ats-v2',"
-            "'apply','qualified',9,7,8,8,9,.9,%s,%s,'hash')",
-            (now, now + timedelta(days=1)),
-        )
-        pg.commit()
-
     retired = runner.invoke(
-        app, ["canonical", "retire", "policy-ats-v2", "--dsn", fleet_db]
+        app,
+        ["canonical", "retire", "policy-ats-v2", "--dsn", "postgresql://brain"],
     )
     assert retired.exit_code == 0, retired.stdout
-    with pgqueue.connect(fleet_db) as pg, pg.cursor() as cur:
-        cur.execute("SELECT ats_policy_version,ats_paused FROM fleet_config WHERE id=1")
-        cfg = cur.fetchone()
-        assert cfg["ats_policy_version"] is None and cfg["ats_paused"] is True
-        cur.execute("SELECT status,apply_error FROM apply_queue WHERE url='queued'")
-        row = cur.fetchone()
-        assert row["status"] == "failed" and row["apply_error"] == "canonical_policy_retired"
+    assert calls == [
+        ("postgresql://brain", "policy-ats-v2", "validated", None),
+        ("postgresql://brain", "policy-ats-v2", "canary", "ats"),
+        ("postgresql://brain", "policy-ats-v2", "retired", None),
+    ]
+
+
+def test_postgres_policy_transition_never_opens_sqlite(monkeypatch):
+    sentinel = object()
+
+    @contextmanager
+    def connect(dsn):
+        assert dsn == "postgresql://brain"
+        yield sentinel
+
+    monkeypatch.setattr(pgqueue, "connect", connect)
+    monkeypatch.setattr(
+        "applypilot.brain.lifecycle.transition_policy",
+        lambda conn, policy, lifecycle, expected_lane=None: {
+            "policy_version": policy,
+            "lane": expected_lane,
+            "lifecycle": lifecycle,
+        },
+    )
+    monkeypatch.setattr(
+        "applypilot.cli._sqlite_cache_connection",
+        lambda: (_ for _ in ()).throw(AssertionError("SQLite must not be opened")),
+    )
+
+    result = _postgres_policy_transition(
+        "postgresql://brain", "ats-v7", "canary", lane="ats"
+    )
+
+    assert result == {
+        "policy_version": "ats-v7",
+        "lane": "ats",
+        "lifecycle": "canary",
+    }
+
+
+def test_canonical_canary_commands_are_lane_scoped_and_bounded(monkeypatch):
+    sentinel = object()
+    calls = []
+
+    @contextmanager
+    def connect(dsn):
+        assert dsn == "postgresql://brain"
+        yield sentinel
+
+    monkeypatch.setattr(pgqueue, "connect", connect)
+    monkeypatch.setattr(
+        "applypilot.brain.lifecycle.arm_canary",
+        lambda conn, policy, lane, capacity, expected_ats_pause_source=None: calls.append(
+            ("arm", policy, lane, capacity, expected_ats_pause_source)
+        ) or {
+            "worker_id": "ats-0",
+            "pinned_worker_version": "release-v1",
+            "expected_worker_version": "release-canary-v2",
+            "candidate_url": "https://example.test/job",
+        },
+    )
+    monkeypatch.setattr(
+        "applypilot.brain.lifecycle.stop_canary",
+        lambda conn, lane: calls.append(("stop", lane)),
+    )
+
+    armed = runner.invoke(
+        app,
+        [
+            "canonical", "canary-arm", "ats-v7", "--lane", "ats",
+            "--capacity", "20", "--dsn", "postgresql://brain",
+            "--expected-ats-pause-source", "operator_hold",
+        ],
+    )
+    stopped = runner.invoke(
+        app,
+        ["canonical", "canary-stop", "--lane", "ats", "--dsn", "postgresql://brain"],
+    )
+    invalid = runner.invoke(
+        app,
+        [
+            "canonical", "canary-arm", "ats-v7", "--lane", "ats",
+            "--capacity", "0", "--dsn", "postgresql://brain",
+        ],
+    )
+
+    assert armed.exit_code == 0, armed.stdout
+    assert "version=release-canary-v2" in armed.stdout
+    assert stopped.exit_code == 0, stopped.stdout
+    assert invalid.exit_code != 0
+    assert calls == [
+        ("arm", "ats-v7", "ats", 20, "operator_hold"),
+        ("stop", "ats"),
+    ]
+
+
+def test_canonical_canary_arm_can_authorize_sql_null_pause_source(monkeypatch):
+    seen = []
+
+    @contextmanager
+    def connect(_dsn):
+        yield object()
+
+    monkeypatch.setattr(pgqueue, "connect", connect)
+    monkeypatch.setattr(
+        "applypilot.brain.lifecycle.arm_canary",
+        lambda _conn, _policy, _lane, _capacity, expected_ats_pause_source: seen.append(
+            expected_ats_pause_source
+        )
+        or {
+            "worker_id": "ats-0",
+            "pinned_worker_version": "release-v1",
+            "expected_worker_version": "release-v1",
+            "candidate_url": "https://example.test/job",
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "canonical",
+            "canary-arm",
+            "ats-v7",
+            "--lane",
+            "ats",
+            "--capacity",
+            "1",
+            "--expect-null-ats-pause-source",
+            "--dsn",
+            "postgresql://brain",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert seen == [None]
 
 
 def test_canonical_backfill_and_outcome_review(tmp_path, monkeypatch):
@@ -166,12 +284,20 @@ def test_canonical_backfill_and_outcome_review(tmp_path, monkeypatch):
     conn.commit()
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    assert runner.invoke(app, ["canonical", "backfill", str(artifacts)]).exit_code == 0
+    assert runner.invoke(
+        app, ["canonical", "cache-backfill", str(artifacts)]
+    ).exit_code == 0
     reviewed = runner.invoke(
         app,
-        ["canonical", "outcome-review", "mail", "--resolution", "trusted"],
+        ["canonical", "cache-outcome-review", "mail", "--resolution", "trusted"],
     )
     assert reviewed.exit_code == 0, reviewed.stdout
     assert conn.execute(
         "SELECT resolution FROM email_event_reviews WHERE message_id='mail'"
     ).fetchone()[0] == "trusted"
+
+
+def test_legacy_authoritative_names_no_longer_expose_sqlite_writers():
+    for command in ("backfill", "outcome-review", "outcome-review-queue"):
+        result = runner.invoke(app, ["canonical", command])
+        assert result.exit_code == 2

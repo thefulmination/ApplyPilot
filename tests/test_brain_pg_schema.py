@@ -12,6 +12,7 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 
 from applypilot.brain import schema
+from applypilot.brain.lifecycle import arm_canary, authority_status, stop_canary
 from applypilot.brain.policy_artifacts import compile_policy_artifacts
 from applypilot.brain.sqlite_to_postgres import (
     _acquire_import_lock,
@@ -44,6 +45,7 @@ AUTHORITY_TABLES = {
     "brain_policy_release_gate_events",
     "brain_policy_transition_receipts",
     "brain_policy_activation_receipts",
+    "brain_canary_lifecycle_events",
     "brain_decision_identities",
     "brain_job_decisions",
     "brain_job_decisions_default",
@@ -74,6 +76,11 @@ TEST_ROLES = (
     "brain_broad_role",
     "brain_proxy_owner",
     "fleet_worker",
+    "brain_status_test_login",
+    "brain_controller_test_login",
+    "ats_worker_role",
+    "linkedin_worker_role",
+    "brain_rogue_writer",
 )
 HASHES = tuple(character * 64 for character in "abcdef0123456789")
 
@@ -132,29 +139,58 @@ def _cleanup(dsn: str) -> None:
 
 
 @pytest.fixture
-def brain_pg(fleet_pg):
-    with psycopg.connect(fleet_pg, row_factory=dict_row) as conn:
+def brain_pg(fleet_db):
+    with psycopg.connect(fleet_db, row_factory=dict_row) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS public.fleet_desired_state("
+            "machine_owner text primary key,desired_workers integer NOT NULL,agent text,model text,"
+            "generation integer,updated_at timestamptz NOT NULL DEFAULT now())"
+        )
         conn.execute(
             "DO $$ BEGIN CREATE ROLE brain_schema_migrator NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
         )
         conn.execute(
             "DO $$ BEGIN CREATE ROLE brain_schema_verifier LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
         )
-        _set_role_password(conn, fleet_pg, "brain_schema_verifier")
+        for role in ("brain_status_reader", "brain_policy_controller"):
+            conn.execute(
+                pg_sql.SQL(
+                    "DO $$ BEGIN CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB "
+                    "NOCREATEROLE NOREPLICATION NOBYPASSRLS; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                ).format(pg_sql.Identifier(role))
+            )
+        _set_role_password(conn, fleet_db, "brain_schema_verifier")
         conn.execute("GRANT brain_schema_migrator TO postgres")
         conn.execute("GRANT USAGE, CREATE ON SCHEMA public TO brain_schema_migrator")
         conn.execute("GRANT CREATE ON DATABASE postgres TO brain_schema_migrator")
-        for relation in ("fleet_config", "fleet_decision_policies", "apply_queue", "linkedin_queue"):
+        conn.execute(
+            "GRANT SELECT ON ALL TABLES IN SCHEMA public TO brain_schema_migrator WITH GRANT OPTION"
+        )
+        for relation in (
+            "fleet_config",
+            "fleet_decision_policies",
+            "apply_queue",
+            "linkedin_queue",
+            "workers",
+            "worker_heartbeat",
+            "fleet_worker_principals",
+            "fleet_desired_state",
+            "rate_governor",
+        ):
             if conn.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",)).fetchone()["relation"]:
                 conn.execute(
-                    pg_sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO brain_schema_migrator").format(
+                    pg_sql.SQL(
+                        "GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} "
+                        "TO brain_schema_migrator WITH GRANT OPTION"
+                    ).format(
                         pg_sql.Identifier("public"), pg_sql.Identifier(relation)
                     )
                 )
         conn.commit()
-    _cleanup(fleet_pg)
-    yield fleet_pg
-    _cleanup(fleet_pg)
+    _cleanup(fleet_db)
+    yield fleet_db
+    _cleanup(fleet_db)
 
 
 def _dsn_for(dsn: str, role: str) -> str:
@@ -164,7 +200,433 @@ def _dsn_for(dsn: str, role: str) -> str:
 def _set_role_password(conn, dsn: str, role: str) -> None:
     password = conninfo_to_dict(dsn).get("password")
     if password:
-        conn.execute(pg_sql.SQL("ALTER ROLE {} PASSWORD {}").format(pg_sql.Identifier(role), pg_sql.Literal(password)))
+        conn.execute(
+            pg_sql.SQL("ALTER ROLE {} PASSWORD {}").format(
+                pg_sql.Identifier(role),
+                pg_sql.Literal(password),
+            )
+        )
+
+
+def _create_lifecycle_login(conn, dsn: str, login: str, capability: str) -> None:
+    conn.execute(
+        pg_sql.SQL(
+            "CREATE ROLE {} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS"
+        ).format(pg_sql.Identifier(login))
+    )
+    _set_role_password(conn, dsn, login)
+    conn.execute(
+        pg_sql.SQL("GRANT {} TO {}").format(
+            pg_sql.Identifier(capability),
+            pg_sql.Identifier(login),
+        )
+    )
+
+
+def test_v2_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        schema.ensure_schema_v1(owner)
+        _create_lifecycle_login(
+            owner,
+            brain_pg,
+            "brain_status_test_login",
+            "brain_status_reader",
+        )
+        _create_lifecycle_login(
+            owner,
+            brain_pg,
+            "brain_controller_test_login",
+            "brain_policy_controller",
+        )
+        owner.commit()
+
+    with psycopg.connect(
+        _dsn_for(brain_pg, "brain_status_test_login"),
+        row_factory=dict_row,
+    ) as status_conn:
+        result = authority_status(status_conn)
+        assert result["authority"] == "postgres_staging_candidate"
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            status_conn.execute("UPDATE public.fleet_config SET paused=TRUE WHERE id=1")
+        status_conn.rollback()
+
+    with psycopg.connect(
+        _dsn_for(brain_pg, "brain_controller_test_login"),
+        row_factory=dict_row,
+    ) as controller:
+        with pytest.raises(psycopg.errors.NoDataFound, match="unknown policy_version"):
+            controller.execute(
+                "SELECT public.brain_controller_transition_policy("
+                "'missing-policy','validated',NULL)"
+            )
+        controller.rollback()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            controller.execute(
+                "SELECT public.brain_transition_policy('missing-policy','validated')"
+            )
+        controller.rollback()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            controller.execute(
+                "UPDATE public.fleet_config SET paused=TRUE WHERE id=1"
+            )
+        controller.rollback()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            controller.execute(
+                "INSERT INTO public.brain_decision_policies(policy_version,lane,lifecycle) "
+                "VALUES('forbidden','ats','draft')"
+            )
+        controller.rollback()
+
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        owner.execute("CREATE ROLE brain_rogue_writer NOLOGIN")
+        owner.execute("GRANT UPDATE ON public.fleet_config TO brain_rogue_writer")
+        owner.execute("GRANT brain_rogue_writer TO brain_controller_test_login")
+        owner.commit()
+        with pytest.raises(RuntimeError, match="lifecycle login brain_controller_test_login exceeds"):
+            schema.ensure_schema_v1(owner)
+    with psycopg.connect(
+        _dsn_for(brain_pg, "brain_controller_test_login"),
+        row_factory=dict_row,
+    ) as controller:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege, match="outside its lifecycle capability"):
+            controller.execute(
+                "SELECT public.brain_controller_transition_policy("
+                "'missing-policy','validated',NULL)"
+            )
+        controller.rollback()
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        owner.execute("REVOKE brain_rogue_writer FROM brain_controller_test_login")
+        owner.execute(
+            "GRANT UPDATE (paused) ON public.fleet_config TO brain_controller_test_login"
+        )
+        owner.commit()
+        with pytest.raises(RuntimeError, match="lifecycle login brain_controller_test_login exceeds"):
+            schema.ensure_schema_v1(owner)
+    with psycopg.connect(
+        _dsn_for(brain_pg, "brain_controller_test_login"),
+        row_factory=dict_row,
+    ) as controller:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege, match="outside its lifecycle capability"):
+            controller.execute(
+                "SELECT public.brain_controller_transition_policy("
+                "'missing-policy','validated',NULL)"
+            )
+
+
+def test_v2_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        schema.ensure_schema_v1(owner)
+        _create_lifecycle_login(
+            owner,
+            brain_pg,
+            "brain_controller_test_login",
+            "brain_policy_controller",
+        )
+        owner.commit()
+        _activate_controller(owner)
+        owner.execute(
+            "INSERT INTO public.brain_decision_policies(policy_version,lane,lifecycle) "
+            "VALUES('ats-canary-real','ats','draft')"
+        )
+        owner.execute("SET LOCAL ROLE NONE")
+        owner.execute(
+            "ALTER TABLE public.brain_decision_policies "
+            "DISABLE TRIGGER brain_decision_policies_lifecycle"
+        )
+        owner.execute(
+            "UPDATE public.brain_decision_policies SET lifecycle='canary',"
+            "validated_at=now(),canary_at=now() "
+            "WHERE policy_version='ats-canary-real'"
+        )
+        owner.execute(
+            "ALTER TABLE public.brain_decision_policies "
+            "ENABLE TRIGGER brain_decision_policies_lifecycle"
+        )
+        owner.commit()
+        owner.execute("RESET ROLE")
+        owner.execute(
+            "INSERT INTO public.fleet_decision_policies(policy_version,lane,status) "
+            "VALUES('ats-canary-real','ats','canary')"
+        )
+        owner.execute(
+            "INSERT INTO public.fleet_desired_state("
+            "machine_owner,desired_workers,agent,model,generation,updated_at) "
+            "VALUES('GGGTower',1,'codex','test-model',1,now())"
+        )
+        owner.execute(
+            "INSERT INTO public.workers(worker_id,machine_owner,public_ip,validated,capabilities) "
+            "VALUES('ats-canary-worker','GGGTower','203.0.113.10',TRUE,'{\"can_ats\":true}')"
+        )
+        owner.execute(
+            "INSERT INTO public.worker_heartbeat(worker_id,machine_owner,home_ip,role,state,sw_version,last_beat) "
+            "VALUES('ats-canary-worker','GGGTower','203.0.113.10','apply','idle','release-v2',now())"
+        )
+        owner.execute("CREATE ROLE ats_worker_role LOGIN INHERIT")
+        _set_role_password(owner, brain_pg, "ats_worker_role")
+        owner.execute("GRANT USAGE ON SCHEMA public TO ats_worker_role")
+        owner.execute("GRANT USAGE ON TYPE public.apply_queue TO ats_worker_role")
+        owner.execute(
+            "GRANT EXECUTE ON FUNCTION "
+            "public.fleet_worker_lease_ats(TEXT,TEXT,INTEGER,TEXT,INTEGER) TO ats_worker_role"
+        )
+        owner.execute(
+            "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
+            "VALUES('ats_worker_role','ats-canary-worker','apply')"
+        )
+        owner.execute(
+            "INSERT INTO public.rate_governor(scope_key,daily_cap,count_24h,min_gap_seconds) VALUES "
+            "('global',100,0,0),('home_ip:203.0.113.10',10,0,0),('host:example.test',10,0,0)"
+        )
+        owner.execute(
+            "INSERT INTO public.apply_queue("
+            "url,application_url,company,score,status,lane,approved_batch,dedup_key,apply_domain,"
+            "target_host,decision_id,policy_version,decision_action,qualification_verdict,"
+            "qualification_score,qualification_floor,preference_score,outcome_score,final_score,"
+            "decision_confidence,decision_created_at,decision_expires_at,input_hash) VALUES("
+            "'https://example.test/job','https://example.test/apply','Example',9,'queued','ats',"
+            "'reviewed','ats-real-dedup','example.test','example.test','decision-real',"
+            "'ats-canary-real','apply','qualified',9,7,9,9,9,.9,now(),now()+interval '1 day','hash-real')"
+        )
+        owner.execute(
+            "UPDATE public.fleet_config SET paused=TRUE,ats_paused=TRUE,"
+            "ats_pause_source='operator_test',ats_apply_mode='stopped',"
+            "linkedin_apply_mode='stopped',canary_enabled=FALSE,"
+            "linkedin_canary_enabled=FALSE,ats_policy_version=NULL,"
+            "linkedin_policy_version=NULL,pinned_worker_version='release-v1',"
+            "canary_worker_id='ats-canary-worker',canary_version='release-v2',spend_cap_usd=0 "
+            "WHERE id=1"
+        )
+        owner.commit()
+
+    with psycopg.connect(
+        _dsn_for(brain_pg, "brain_controller_test_login"),
+        row_factory=dict_row,
+    ) as controller:
+        with pytest.raises(psycopg.errors.CheckViolation, match="invalid canary lane"):
+            controller.execute(
+                "SELECT public.brain_controller_arm_canary(%s,%s,%s,%s,%s,%s)",
+                ("ats-canary-real", "ats", 1, "operator_test", False, 121),
+            )
+        controller.rollback()
+        armed = arm_canary(
+            controller,
+            "ats-canary-real",
+            "ats",
+            1,
+            expected_ats_pause_source="operator_test",
+        )
+        assert armed["worker_id"] == "ats-canary-worker"
+        assert armed["expected_worker_version"] == "release-v2"
+        assert armed["candidate_url"] == "https://example.test/job"
+        with psycopg.connect(
+            _dsn_for(brain_pg, "ats_worker_role"),
+            row_factory=dict_row,
+        ) as worker:
+            leased = worker.execute(
+                "SELECT url FROM public.fleet_worker_lease_ats(NULL,NULL,1200,NULL,900)"
+            ).fetchone()
+            assert leased["url"] == "https://example.test/job"
+            worker.commit()
+        stopped = stop_canary(controller, "ats")
+        assert stopped["fleet_config"]["paused"] is True
+        assert stopped["fleet_config"]["ats_apply_mode"] == "stopped"
+        assert stopped["fleet_config"]["ats_pause_source"] == "operator_test"
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        events = owner.execute(
+            "SELECT event_type,prior_ats_pause_source FROM public.brain_canary_lifecycle_events "
+            "WHERE policy_version='ats-canary-real' ORDER BY event_id"
+        ).fetchall()
+        assert events == [
+            {"event_type": "armed", "prior_ats_pause_source": "operator_test"},
+            {"event_type": "stopped", "prior_ats_pause_source": "operator_test"},
+        ]
+
+
+def test_v2_controller_arms_and_stops_real_postgres_linkedin_canary(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
+        schema.ensure_schema_v1(owner)
+        _create_lifecycle_login(
+            owner,
+            brain_pg,
+            "brain_controller_test_login",
+            "brain_policy_controller",
+        )
+        owner.commit()
+        _activate_controller(owner)
+        owner.execute(
+            "INSERT INTO public.brain_decision_policies(policy_version,lane,lifecycle) "
+            "VALUES('linkedin-canary-real','linkedin','draft')"
+        )
+        owner.execute("SET LOCAL ROLE NONE")
+        owner.execute(
+            "ALTER TABLE public.brain_decision_policies "
+            "DISABLE TRIGGER brain_decision_policies_lifecycle"
+        )
+        owner.execute(
+            "UPDATE public.brain_decision_policies SET lifecycle='canary',"
+            "validated_at=now(),canary_at=now() "
+            "WHERE policy_version='linkedin-canary-real'"
+        )
+        owner.execute(
+            "ALTER TABLE public.brain_decision_policies "
+            "ENABLE TRIGGER brain_decision_policies_lifecycle"
+        )
+        owner.commit()
+        owner.execute("RESET ROLE")
+        owner.execute(
+            "INSERT INTO public.fleet_decision_policies(policy_version,lane,status) "
+            "VALUES('linkedin-canary-real','linkedin','canary')"
+        )
+        owner.execute(
+            "INSERT INTO public.fleet_desired_state("
+            "machine_owner,desired_workers,agent,model,generation,updated_at) "
+            "VALUES('Tarpon',1,'codex','test-model',1,now())"
+        )
+        owner.execute(
+            "INSERT INTO public.workers(worker_id,machine_owner,public_ip,validated,capabilities) "
+            "VALUES('linkedin-canary-worker','Tarpon','203.0.113.20',TRUE,"
+            "'{\"can_linkedin\":true}')"
+        )
+        owner.execute(
+            "INSERT INTO public.worker_heartbeat(worker_id,machine_owner,home_ip,role,state,sw_version,last_beat) "
+            "VALUES('linkedin-canary-worker','Tarpon','203.0.113.20','linkedin','idle','release-v2',now())"
+        )
+        owner.execute("CREATE ROLE linkedin_worker_role LOGIN INHERIT")
+        _set_role_password(owner, brain_pg, "linkedin_worker_role")
+        owner.execute("GRANT USAGE ON SCHEMA public TO linkedin_worker_role")
+        owner.execute("GRANT USAGE ON TYPE public.linkedin_queue TO linkedin_worker_role")
+        owner.execute(
+            "GRANT EXECUTE ON FUNCTION "
+            "public.fleet_worker_lease_linkedin(TEXT,TEXT,TEXT,INTEGER,TEXT) "
+            "TO linkedin_worker_role"
+        )
+        owner.execute(
+            "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
+            "VALUES('linkedin_worker_role','linkedin-canary-worker','linkedin')"
+        )
+        owner.execute(
+            "INSERT INTO public.rate_governor(scope_key,daily_cap,count_24h,min_gap_seconds) VALUES "
+            "('global',100,0,0),('account:linkedin',10,0,0)"
+        )
+        owner.execute(
+            "INSERT INTO public.linkedin_queue("
+            "url,application_url,company,score,status,lane,approved_batch,dedup_key,"
+            "linkedin_resolve_status,linkedin_resolved_at,decision_id,policy_version,"
+            "decision_action,qualification_verdict,qualification_score,qualification_floor,"
+            "preference_score,outcome_score,final_score,decision_confidence,"
+            "decision_created_at,decision_expires_at,input_hash) VALUES("
+            "'https://linkedin.test/job','https://linkedin.test/apply','Example',9,'queued',"
+            "'linkedin','reviewed','linkedin-real-dedup','easy_apply',now(),"
+            "'decision-linkedin-real','linkedin-canary-real','apply','qualified',9,7,9,9,9,.9,"
+            "now(),now()+interval '1 day','hash-linkedin-real')"
+        )
+        owner.execute(
+            "UPDATE public.fleet_config SET paused=TRUE,ats_paused=TRUE,"
+            "ats_pause_source='incident_hold',ats_apply_mode='stopped',"
+            "linkedin_apply_mode='stopped',canary_enabled=FALSE,"
+            "linkedin_canary_enabled=FALSE,ats_policy_version=NULL,"
+            "linkedin_policy_version=NULL,pinned_worker_version='release-v1',"
+            "canary_worker_id='linkedin-canary-worker',canary_version='release-v2',"
+            "linkedin_owner_ip='203.0.113.20',spend_cap_usd=0 WHERE id=1"
+        )
+        owner.commit()
+
+    with psycopg.connect(
+        _dsn_for(brain_pg, "brain_controller_test_login"),
+        row_factory=dict_row,
+    ) as controller:
+        armed = arm_canary(controller, "linkedin-canary-real", "linkedin", 1)
+        assert armed["worker_id"] == "linkedin-canary-worker"
+        assert armed["candidate_url"] == "https://linkedin.test/job"
+        assert armed["fleet_config"]["ats_pause_source"] == "incident_hold"
+        with psycopg.connect(
+            _dsn_for(brain_pg, "linkedin_worker_role"),
+            row_factory=dict_row,
+        ) as worker:
+            leased = worker.execute(
+                "SELECT url FROM public.fleet_worker_lease_linkedin(NULL,NULL,NULL,1200,NULL)"
+            ).fetchone()
+            assert leased["url"] == "https://linkedin.test/job"
+            worker.rollback()
+        stopped = stop_canary(controller, "linkedin")
+        assert stopped["fleet_config"]["paused"] is True
+        assert stopped["fleet_config"]["ats_pause_source"] == "incident_hold"
+
+
+def test_existing_v1_database_upgrades_atomically_to_v2(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                migration_identity = schema._activate_migration_identity(cur)
+                cur.execute(schema._schema_bytes().decode("utf-8"))
+                schema._apply_acl_contract(cur, migration_identity)
+                cur.execute(
+                    "INSERT INTO public.brain_schema_versions("
+                    "version,migration_name,migration_checksum,applied_by) VALUES(1,%s,%s,%s)",
+                    (
+                        schema._MIGRATION_NAME,
+                        schema._schema_checksum(),
+                        migration_identity,
+                    ),
+                )
+        before = conn.execute(
+            "SELECT version FROM public.brain_schema_versions ORDER BY version"
+        ).fetchall()
+        conn.rollback()
+        assert [row["version"] for row in before] == [1]
+
+        schema.ensure_schema_v1(conn)
+        first = conn.execute(
+            "SELECT version,migration_checksum,applied_at "
+            "FROM public.brain_schema_versions ORDER BY version"
+        ).fetchall()
+        conn.rollback()
+        assert [row["version"] for row in first] == [1, 2]
+
+        schema.ensure_schema_v1(conn)
+        second = conn.execute(
+            "SELECT version,migration_checksum,applied_at "
+            "FROM public.brain_schema_versions ORDER BY version"
+        ).fetchall()
+        conn.rollback()
+        assert second == first
+
+
+def test_failed_v1_to_v2_upgrade_rolls_back_and_retries(brain_pg, monkeypatch):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                migration_identity = schema._activate_migration_identity(cur)
+                cur.execute(schema._schema_bytes().decode("utf-8"))
+                schema._apply_acl_contract(cur, migration_identity)
+                cur.execute(
+                    "INSERT INTO public.brain_schema_versions("
+                    "version,migration_name,migration_checksum,applied_by) VALUES(1,%s,%s,%s)",
+                    (
+                        schema._MIGRATION_NAME,
+                        schema._schema_checksum(),
+                        migration_identity,
+                    ),
+                )
+        with monkeypatch.context() as patch:
+            patch.setattr(schema, "_schema_v2_bytes", lambda: b"CREATE TABLE broken (")
+            with pytest.raises(psycopg.errors.SyntaxError):
+                schema.ensure_schema_v1(conn)
+        versions = conn.execute(
+            "SELECT version FROM public.brain_schema_versions ORDER BY version"
+        ).fetchall()
+        assert [row["version"] for row in versions] == [1]
+        assert conn.execute(
+            "SELECT to_regclass('public.brain_canary_lifecycle_events') AS relation"
+        ).fetchone()["relation"] is None
+        conn.rollback()
+
+        schema.ensure_schema_v1(conn)
+        versions = conn.execute(
+            "SELECT version FROM public.brain_schema_versions ORDER BY version"
+        ).fetchall()
+        assert [row["version"] for row in versions] == [1, 2]
 
 
 def _fleet_snapshot(conn):
@@ -264,6 +726,8 @@ def test_fresh_install_true_noop_and_fleet_unchanged(brain_pg):
             "INSERT INTO brain_jobs (job_id, source_namespace, source_job_id) VALUES ('preserved', 'test', 'preserved')"
         )
         conn.commit()
+        fleet_after_lifecycle_acl = _fleet_snapshot(conn)
+        conn.rollback()
         before = conn.execute(
             "SELECT applied_at, migration_checksum FROM brain_schema_versions WHERE version = 1"
         ).fetchone()
@@ -284,7 +748,9 @@ def test_fresh_install_true_noop_and_fleet_unchanged(brain_pg):
         assert before == after
         assert acl_before == acl_after
         assert conn.execute("SELECT count(*) AS n FROM brain_jobs").fetchone()["n"] == 1
-        assert _fleet_snapshot(conn) == fleet_before
+        fleet_after_noop = _fleet_snapshot(conn)
+        assert fleet_after_lifecycle_acl == fleet_after_noop
+        assert fleet_after_lifecycle_acl[:2] == fleet_before[:2]
 
 
 def test_failed_install_rolls_back_completely_and_retries(brain_pg):
@@ -1013,8 +1479,12 @@ def test_public_fleet_worker_and_broad_default_grants_are_removed(brain_pg):
         assert rows
         assert all(not row["fleet"] and not row["broad"] for row in rows)
         assert conn.execute(
-            "SELECT bool_and(COALESCE(r.rolname,'PUBLIC')='brain_schema_verifier' "
-            "AND acl.privilege_type='SELECT') AS valid FROM pg_class c "
+            "SELECT bool_and(acl.privilege_type='SELECT' AND ("
+            "COALESCE(r.rolname,'PUBLIC')='brain_schema_verifier' OR ("
+            "COALESCE(r.rolname,'PUBLIC') IN ('brain_status_reader','brain_policy_controller') "
+            "AND c.relname IN ('brain_decision_policies','brain_policy_artifacts',"
+            "'brain_policy_approvals','brain_parity_runs','brain_parity_run_events')))) AS valid "
+            "FROM pg_class c "
             "JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) acl "
             "LEFT JOIN pg_roles r ON r.oid=acl.grantee WHERE n.nspname='public' "
             "AND left(c.relname,6)='brain_' AND acl.grantee<>c.relowner"
@@ -1420,7 +1890,7 @@ def test_schema_version_ledger_rejects_future_and_interrupted_versions(brain_pg)
         conn.execute(
             "INSERT INTO brain_schema_versions "
             "(version,migration_name,migration_checksum,applied_at,applied_by) "
-            "VALUES (2,'future','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',now(),current_user)"
+            "VALUES (3,'future','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',now(),current_user)"
         )
         conn.commit()
         with pytest.raises(RuntimeError, match="unsupported or non-contiguous"):
