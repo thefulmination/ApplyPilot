@@ -15,10 +15,15 @@ the other.
 - Promotion does not clear an operator pause or arm a canary.
 - Promote ATS and LinkedIn separately. A passing ATS replay says nothing about
   LinkedIn readiness, and vice versa.
-- Policy state, queue capacity, and admission proofs are lane-specific. Canary
-  execution is temporarily serialized because fleet configuration still has one
-  shared worker/version slot. Do not arm both lanes concurrently until the
-  lane-specific worker-pin migration is installed and verified.
+- Policy state, queue capacity, execution worker/version pins, and admission
+  proofs are lane-specific. The lifecycle controller still serializes opening a
+  lane canary so a release begins with zero leases and the other lane stopped;
+  this is a blast-radius rule, not a shared canary. Stopping one lane clears only
+  its execution pin and preserves the other lane's pin.
+- `canary_worker_id` and `canary_version` are the generic staged software pin for
+  compute/discovery workers. ATS uses `ats_canary_worker_id/version`; LinkedIn
+  uses `linkedin_canary_worker_id/version`. Never substitute one class of pin for
+  another.
 
 ## 1. Confirm fail-closed state
 

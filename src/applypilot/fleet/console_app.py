@@ -49,6 +49,7 @@ from applypilot.apply import pgqueue
 from applypilot.fleet import apply_home_main as H
 from applypilot.fleet import codex_bridge as cb
 from applypilot.fleet import compute_home_main as compute_home
+from applypilot.fleet import config as fleet_config
 from applypilot.fleet import console_machines
 from applypilot.fleet import queue as _queue
 from applypilot.fleet.failure_taxonomy import canonical_failure_group
@@ -1102,34 +1103,34 @@ def _workers(conn) -> list[dict]:
 def _versions(conn) -> dict:
     """Read-only software-version rollup for drift visibility.
 
-    A worker is drifted when a pinned version exists and its heartbeat version differs
-    from the expected pin. If a canary worker/version is configured, that worker is
-    compared against the canary version while the rest compare against the pin.
+    Application workers use their lane-specific canary pin. Non-application workers
+    use the generic staged rollout canary, preserving the legacy behavior.
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT pinned_worker_version, canary_version, canary_worker_id "
+            "SELECT pinned_worker_version, canary_version, canary_worker_id, "
+            "ats_canary_version, ats_canary_worker_id, "
+            "linkedin_canary_version, linkedin_canary_worker_id "
             "FROM fleet_config WHERE id=1"
         )
         cfg = cur.fetchone() or {}
         cur.execute(
             "SELECT worker_id, machine_owner, role, sw_version "
             "FROM worker_heartbeat "
-            "WHERE role IN ('apply', 'compute', 'discovery') "
+            "WHERE role IN ('apply', 'linkedin', 'compute', 'discovery') "
             "ORDER BY worker_id"
         )
         rows = cur.fetchall()
     conn.rollback()  # read-only
 
-    pinned = cfg.get("pinned_worker_version")
-    canary_version = cfg.get("canary_version")
-    canary_worker_id = cfg.get("canary_worker_id")
     counts: dict[str, int] = {}
     drifted: list[dict] = []
     for row in rows:
         version = row.get("sw_version") or "(unreported)"
         counts[version] = counts.get(version, 0) + 1
-        expected = canary_version if row.get("worker_id") == canary_worker_id and canary_version else pinned
+        expected = fleet_config.version_for_worker_config(
+            cfg, row.get("worker_id"), lane=row.get("role")
+        )
         if expected and version != expected:
             drifted.append({
                 "worker_id": row.get("worker_id"),
@@ -1137,9 +1138,13 @@ def _versions(conn) -> dict:
                 "sw_version": row.get("sw_version"),
             })
     return {
-        "pinned_worker_version": pinned,
-        "canary_version": canary_version,
-        "canary_worker_id": canary_worker_id,
+        "pinned_worker_version": cfg.get("pinned_worker_version"),
+        "canary_version": cfg.get("canary_version"),
+        "canary_worker_id": cfg.get("canary_worker_id"),
+        "ats_canary_version": cfg.get("ats_canary_version"),
+        "ats_canary_worker_id": cfg.get("ats_canary_worker_id"),
+        "linkedin_canary_version": cfg.get("linkedin_canary_version"),
+        "linkedin_canary_worker_id": cfg.get("linkedin_canary_worker_id"),
         "worker_versions": counts,
         "drifted_workers": drifted,
     }
@@ -4614,8 +4619,12 @@ _INDEX_HTML = r"""<!doctype html>
     <div class="cards" style="margin-bottom:12px">
       <div class="card"><div class="label">Pinned</div>
         <div class="val" id="versionPinned">&mdash;</div><div class="hint">expected worker version</div></div>
-      <div class="card"><div class="label">Canary</div>
-        <div class="val" id="versionCanary">&mdash;</div><div class="hint" id="versionCanaryHint">optional staged worker</div></div>
+      <div class="card"><div class="label">Generic canary</div>
+        <div class="val" id="versionCanary">&mdash;</div><div class="hint" id="versionCanaryHint">optional non-application worker</div></div>
+      <div class="card"><div class="label">ATS canary</div>
+        <div class="val" id="versionAtsCanary">&mdash;</div><div class="hint" id="versionAtsCanaryHint">off</div></div>
+      <div class="card"><div class="label">LinkedIn canary</div>
+        <div class="val" id="versionLinkedinCanary">&mdash;</div><div class="hint" id="versionLinkedinCanaryHint">off</div></div>
       <div class="card"><div class="label">Drifted</div>
         <div class="val" id="versionDrift">&mdash;</div><div class="hint">workers off expected version</div></div>
     </div>
@@ -5768,7 +5777,13 @@ function render(s){
   document.getElementById("versionPinned").textContent = versions.pinned_worker_version || "not pinned";
   document.getElementById("versionCanary").textContent = versions.canary_version || "off";
   document.getElementById("versionCanaryHint").textContent =
-    versions.canary_worker_id ? ("worker " + versions.canary_worker_id) : "optional staged worker";
+    versions.canary_worker_id ? ("worker " + versions.canary_worker_id) : "optional non-application worker";
+  document.getElementById("versionAtsCanary").textContent = versions.ats_canary_version || "off";
+  document.getElementById("versionAtsCanaryHint").textContent =
+    versions.ats_canary_worker_id ? ("worker " + versions.ats_canary_worker_id) : "off";
+  document.getElementById("versionLinkedinCanary").textContent = versions.linkedin_canary_version || "off";
+  document.getElementById("versionLinkedinCanaryHint").textContent =
+    versions.linkedin_canary_worker_id ? ("worker " + versions.linkedin_canary_worker_id) : "off";
   document.getElementById("versionDrift").textContent = (versions.drifted_workers || []).length;
   const vt = document.getElementById("versionRows");
   const versionRows = Object.entries(versions.worker_versions || {});

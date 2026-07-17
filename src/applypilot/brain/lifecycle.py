@@ -166,7 +166,8 @@ def _fleet_config(conn, *, for_update: bool = False) -> dict[str, Any]:
         "SELECT paused,ats_paused,ats_pause_source,ats_apply_mode,linkedin_apply_mode,"
         "canary_enabled,linkedin_canary_enabled,canary_remaining,linkedin_canary_remaining,"
         "ats_policy_version,linkedin_policy_version,pinned_worker_version,"
-        "canary_worker_id,canary_version,approval_threshold,spend_cap_usd "
+        "canary_worker_id,canary_version,ats_canary_worker_id,ats_canary_version,"
+        "linkedin_canary_worker_id,linkedin_canary_version,approval_threshold,spend_cap_usd "
         ",linkedin_owner_ip "
         f"FROM public.fleet_config WHERE id=1{suffix}"
     ).fetchone()

@@ -6,9 +6,12 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg import sql
 from psycopg.rows import dict_row
 
 from applypilot.fleet import migrator
+from applypilot.fleet import pg_roles
+from applypilot.fleet import schema as fleet_schema
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,21 +74,37 @@ def _migration(root: Path, migration_id: str, predecessor_id: str | None, predec
 
 @pytest.fixture
 def migration_pg(fleet_pg):
-    with psycopg.connect(fleet_pg, autocommit=True) as conn:
+    with psycopg.connect(fleet_pg, autocommit=True, row_factory=dict_row) as conn:
+        fleet_schema.ensure_schema_v3(conn)
+        original_owner = conn.execute("SELECT current_user AS role_name").fetchone()["role_name"]
         conn.execute("DROP TABLE IF EXISTS applypilot_fleet_schema_migrations CASCADE")
         conn.execute("DROP FUNCTION IF EXISTS applypilot_reject_migration_ledger_mutation() CASCADE")
-        if conn.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='applypilot_fleet_migrator')").fetchone()[0]:
+        if conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='applypilot_fleet_migrator') AS present"
+        ).fetchone()["present"]:
             conn.execute("DROP OWNED BY applypilot_fleet_migrator CASCADE")
             conn.execute("DROP ROLE applypilot_fleet_migrator")
         conn.execute("CREATE ROLE applypilot_fleet_migrator NOLOGIN")
         conn.execute("GRANT USAGE, CREATE ON SCHEMA public TO applypilot_fleet_migrator")
+        with conn.cursor() as cur:
+            pg_roles._transfer_application_ownership(
+                cur,
+                new_owner_role="applypilot_fleet_migrator",
+            )
     try:
         yield fleet_pg
     finally:
-        with psycopg.connect(fleet_pg, autocommit=True) as conn:
+        with psycopg.connect(fleet_pg, autocommit=True, row_factory=dict_row) as conn:
             conn.execute("DROP TABLE IF EXISTS applypilot_fleet_schema_migrations CASCADE")
             conn.execute("DROP FUNCTION IF EXISTS applypilot_reject_migration_ledger_mutation() CASCADE")
-            if conn.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='applypilot_fleet_migrator')").fetchone()[0]:
+            if conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='applypilot_fleet_migrator') AS present"
+            ).fetchone()["present"]:
+                conn.execute(
+                    sql.SQL("REASSIGN OWNED BY applypilot_fleet_migrator TO {}").format(
+                        sql.Identifier(original_owner)
+                    )
+                )
                 conn.execute("DROP OWNED BY applypilot_fleet_migrator CASCADE")
                 conn.execute("DROP ROLE applypilot_fleet_migrator")
 
@@ -103,6 +122,7 @@ def test_repository_manifest_pins_the_exact_legacy_predecessor():
     )
     assert tuple(item.id for item in manifest.migrations) == (
         "20260715_001_application_authority",
+        "20260717_002_lane_specific_canary_pins",
     )
     migrator.verify_predecessor(manifest, REPO_ROOT)
 

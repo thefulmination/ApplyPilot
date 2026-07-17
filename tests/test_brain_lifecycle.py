@@ -60,6 +60,10 @@ class _TransitionConnection:
             "pinned_worker_version": "test-version",
             "canary_worker_id": f"{lane}-0",
             "canary_version": None,
+            "ats_canary_worker_id": "ats-0",
+            "ats_canary_version": "ats-test-version",
+            "linkedin_canary_worker_id": "linkedin-0",
+            "linkedin_canary_version": "linkedin-test-version",
             "spend_cap_usd": 1,
         }
 
@@ -123,8 +127,10 @@ class _TransitionConnection:
                 expected = None if params[4] else params[3]
                 if self.config["ats_pause_source"] != expected:
                     raise BrainLifecycleError("pause source changed")
-            if not self.config["canary_worker_id"]:
-                raise BrainLifecycleError("pinned canary worker identity")
+            worker_key = f"{params[1]}_canary_worker_id"
+            version_key = f"{params[1]}_canary_version"
+            if not self.config[worker_key] or not self.config[version_key]:
+                raise BrainLifecycleError("exact lane canary worker/version")
             if params[1] == "ats":
                 self.config.update(
                     paused=False,
@@ -150,11 +156,10 @@ class _TransitionConnection:
                         "policy_version": params[0],
                         "lane": params[1],
                         "capacity": params[2],
-                        "worker_id": self.config["canary_worker_id"],
+                        "worker_id": self.config[worker_key],
                         "prior_active_policy": self.active_policy,
                         "pinned_worker_version": self.config["pinned_worker_version"],
-                        "expected_worker_version": self.config["canary_version"]
-                        or self.config["pinned_worker_version"],
+                        "expected_worker_version": self.config[version_key],
                         "candidate_url": candidate_url,
                         "fleet_config": dict(self.config),
                     }
@@ -182,6 +187,8 @@ class _TransitionConnection:
                 linkedin_canary_enabled=False,
                 linkedin_canary_remaining=None,
             )
+            self.config[f"{lane}_canary_worker_id"] = None
+            self.config[f"{lane}_canary_version"] = None
             if lane == "ats":
                 self.config.update(
                     ats_paused=True,
@@ -450,9 +457,9 @@ def test_canary_arm_requires_exact_ats_pause_source_and_rolls_back():
 def test_canary_arm_requires_an_explicit_canary_worker_identity():
     conn = _TransitionConnection(lifecycle="canary", lane="ats")
     conn.fleet_policy_status = "canary"
-    conn.config["canary_worker_id"] = None
+    conn.config["ats_canary_worker_id"] = None
 
-    with pytest.raises(BrainLifecycleError, match="pinned canary worker identity"):
+    with pytest.raises(BrainLifecycleError, match="exact lane canary worker/version"):
         arm_canary(
             conn,
             "ats-v7",
@@ -533,6 +540,10 @@ def test_linkedin_canary_stop_preserves_ats_pause_provenance():
 
     assert conn.config["ats_paused"] is True
     assert conn.config["ats_pause_source"] == "incident_hold"
+    assert conn.config["linkedin_canary_worker_id"] is None
+    assert conn.config["linkedin_canary_version"] is None
+    assert conn.config["ats_canary_worker_id"] == "ats-0"
+    assert conn.config["ats_canary_version"] == "ats-test-version"
 
 def test_unified_relation_contract_covers_both_lane_queues():
     assert set(_REQUIRED_RELATIONS) >= {
@@ -551,6 +562,13 @@ def test_authority_status_reads_integrated_disposable_postgres(fleet_db):
             "machine_owner text primary key,desired_workers integer NOT NULL,agent text,model text,"
             "generation integer,updated_at timestamptz NOT NULL DEFAULT now())"
         )
+        for column in (
+            "ats_canary_worker_id",
+            "ats_canary_version",
+            "linkedin_canary_worker_id",
+            "linkedin_canary_version",
+        ):
+            conn.execute(f"ALTER TABLE public.fleet_config ADD COLUMN IF NOT EXISTS {column} text")
         conn.execute(
             "DO $$ BEGIN CREATE ROLE brain_schema_migrator NOLOGIN; "
             "EXCEPTION WHEN duplicate_object THEN NULL; END $$"

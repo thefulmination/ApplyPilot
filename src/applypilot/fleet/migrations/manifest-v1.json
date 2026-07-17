@@ -12,6 +12,17 @@
       "minimum_schema_contract": "fleet-v3",
       "maximum_schema_contract": "fleet-v3",
       "forward_recovery_command": "applypilot-fleet-migrate-schema"
+    },
+    {
+      "id": "20260717_002_lane_specific_canary_pins",
+      "sha256": "1ee176c419508cd5a9c7004460798d14fd6749addbf293892fd2d859a1b6dd1d",
+      "path": "src/applypilot/fleet/migrations/20260717_002_lane_specific_canary_pins.sql",
+      "predecessor_id": "20260715_001_application_authority",
+      "predecessor_sha256": "65d10d1a16e9829a7995f48776697e3200daf7a5074147a9a3ed8c0293f56bea",
+      "transaction_mode": "transactional",
+      "minimum_schema_contract": "fleet-v3",
+      "maximum_schema_contract": "fleet-v3",
+      "forward_recovery_command": "applypilot-fleet-migrate-schema"
     }
   ],
   "predecessor": {

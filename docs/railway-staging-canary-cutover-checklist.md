@@ -37,6 +37,8 @@ the production project, production DSN, or live worker identities.
 ## 3. Database and role gates
 
 - [ ] Apply migrations from the owner/migration service, not from a worker.
+- [ ] Apply fleet migration `20260717_002_lane_specific_canary_pins` before brain
+  schema v3. Verify both immutable migration ledgers before starting a worker.
 - [ ] Capture the migration receipt, rollback SQL, and SHA-256 evidence.
 - [ ] Verify the mapped role, worker ID, contract, and schema permissions using
   `scripts/bootstrap-fleet-pg-roles.py` and the runtime principal verifier.
@@ -64,6 +66,8 @@ the other.
 ### ATS
 
 - [ ] Approve only a reviewed staging batch.
+- [ ] Set the exact `ats_canary_worker_id` and `ats_canary_version`; do not use the
+  generic software canary pin for an ATS execution canary.
 - [ ] Arm the ATS canary with a small explicit `K`.
 - [ ] Verify leases are bounded by `K`, then verify automatic pause.
 - [ ] Inspect application evidence, duplicate protection, challenge rate, spend,
@@ -73,7 +77,9 @@ the other.
 ### LinkedIn
 
 - [ ] Verify LinkedIn authentication, challenge state, and browser readiness.
-- [ ] Arm only `linkedin_canary_remaining`; do not modify ATS canary fields.
+- [ ] Set the exact `linkedin_canary_worker_id` and
+  `linkedin_canary_version`; do not modify ATS execution pins.
+- [ ] Arm only `linkedin_canary_remaining`; do not modify ATS capacity fields.
 - [ ] Verify the LinkedIn lane auto-stops at its independent `K`.
 - [ ] Inspect challenge, duplicate, evidence, and worker-version results.
 - [ ] Keep LinkedIn paused until separately approved.

@@ -146,6 +146,13 @@ def brain_pg(fleet_db):
             "machine_owner text primary key,desired_workers integer NOT NULL,agent text,model text,"
             "generation integer,updated_at timestamptz NOT NULL DEFAULT now())"
         )
+        for column in (
+            "ats_canary_worker_id",
+            "ats_canary_version",
+            "linkedin_canary_worker_id",
+            "linkedin_canary_version",
+        ):
+            conn.execute(f"ALTER TABLE public.fleet_config ADD COLUMN IF NOT EXISTS {column} text")
         conn.execute(
             "DO $$ BEGIN CREATE ROLE brain_schema_migrator NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
         )
@@ -224,7 +231,7 @@ def _create_lifecycle_login(conn, dsn: str, login: str, capability: str) -> None
     )
 
 
-def test_v2_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
+def test_v3_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
     with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
         schema.ensure_schema_v1(owner)
         _create_lifecycle_login(
@@ -247,6 +254,15 @@ def test_v2_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
     ) as status_conn:
         result = authority_status(status_conn)
         assert result["authority"] == "postgres_staging_candidate"
+        assert status_conn.execute(
+            "SELECT ats_canary_worker_id,ats_canary_version,linkedin_canary_worker_id,"
+            "linkedin_canary_version FROM public.fleet_config WHERE id=1"
+        ).fetchone() == {
+            "ats_canary_worker_id": None,
+            "ats_canary_version": None,
+            "linkedin_canary_worker_id": None,
+            "linkedin_canary_version": None,
+        }
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             status_conn.execute("UPDATE public.fleet_config SET paused=TRUE WHERE id=1")
         status_conn.rollback()
@@ -314,7 +330,7 @@ def test_v2_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
             )
 
 
-def test_v2_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
+def test_v3_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
     with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
         schema.ensure_schema_v1(owner)
         _create_lifecycle_login(
@@ -394,7 +410,10 @@ def test_v2_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
             "linkedin_apply_mode='stopped',canary_enabled=FALSE,"
             "linkedin_canary_enabled=FALSE,ats_policy_version=NULL,"
             "linkedin_policy_version=NULL,pinned_worker_version='release-v1',"
-            "canary_worker_id='ats-canary-worker',canary_version='release-v2',spend_cap_usd=0 "
+            "canary_worker_id='ats-canary-worker',canary_version='release-v2',"
+            "ats_canary_worker_id='ats-canary-worker',ats_canary_version='release-v2',"
+            "linkedin_canary_worker_id='preserved-linkedin-worker',"
+            "linkedin_canary_version='preserved-linkedin-version',spend_cap_usd=0 "
             "WHERE id=1"
         )
         owner.commit()
@@ -432,6 +451,10 @@ def test_v2_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
         assert stopped["fleet_config"]["paused"] is True
         assert stopped["fleet_config"]["ats_apply_mode"] == "stopped"
         assert stopped["fleet_config"]["ats_pause_source"] == "operator_test"
+        assert stopped["fleet_config"]["ats_canary_worker_id"] is None
+        assert stopped["fleet_config"]["ats_canary_version"] is None
+        assert stopped["fleet_config"]["linkedin_canary_worker_id"] == "preserved-linkedin-worker"
+        assert stopped["fleet_config"]["linkedin_canary_version"] == "preserved-linkedin-version"
     with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
         events = owner.execute(
             "SELECT event_type,prior_ats_pause_source FROM public.brain_canary_lifecycle_events "
@@ -443,7 +466,7 @@ def test_v2_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
         ]
 
 
-def test_v2_controller_arms_and_stops_real_postgres_linkedin_canary(brain_pg):
+def test_v3_controller_arms_and_stops_real_postgres_linkedin_canary(brain_pg):
     with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
         schema.ensure_schema_v1(owner)
         _create_lifecycle_login(
@@ -528,6 +551,10 @@ def test_v2_controller_arms_and_stops_real_postgres_linkedin_canary(brain_pg):
             "linkedin_canary_enabled=FALSE,ats_policy_version=NULL,"
             "linkedin_policy_version=NULL,pinned_worker_version='release-v1',"
             "canary_worker_id='linkedin-canary-worker',canary_version='release-v2',"
+            "ats_canary_worker_id='preserved-ats-worker',"
+            "ats_canary_version='preserved-ats-version',"
+            "linkedin_canary_worker_id='linkedin-canary-worker',"
+            "linkedin_canary_version='release-v2',"
             "linkedin_owner_ip='203.0.113.20',spend_cap_usd=0 WHERE id=1"
         )
         owner.commit()
@@ -552,9 +579,85 @@ def test_v2_controller_arms_and_stops_real_postgres_linkedin_canary(brain_pg):
         stopped = stop_canary(controller, "linkedin")
         assert stopped["fleet_config"]["paused"] is True
         assert stopped["fleet_config"]["ats_pause_source"] == "incident_hold"
+        assert stopped["fleet_config"]["linkedin_canary_worker_id"] is None
+        assert stopped["fleet_config"]["linkedin_canary_version"] is None
+        assert stopped["fleet_config"]["ats_canary_worker_id"] == "preserved-ats-worker"
+        assert stopped["fleet_config"]["ats_canary_version"] == "preserved-ats-version"
 
 
-def test_existing_v1_database_upgrades_atomically_to_v2(brain_pg):
+def _install_brain_schema_through_v2(conn) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            migration_identity = schema._activate_migration_identity(cur)
+            cur.execute(schema._schema_bytes().decode("utf-8"))
+            schema._apply_acl_contract(cur, migration_identity)
+            cur.execute(
+                "INSERT INTO public.brain_schema_versions("
+                "version,migration_name,migration_checksum,applied_by) VALUES(1,%s,%s,%s)",
+                (schema._MIGRATION_NAME, schema._schema_checksum(), migration_identity),
+            )
+            cur.execute(schema._schema_v2_bytes().decode("utf-8"))
+            schema._apply_acl_contract(cur, migration_identity)
+            cur.execute(
+                "INSERT INTO public.brain_schema_versions("
+                "version,migration_name,migration_checksum,applied_by) VALUES(2,%s,%s,%s)",
+                (schema._MIGRATION_V2_NAME, schema._schema_v2_checksum(), migration_identity),
+            )
+
+
+def test_schema_v2_bytes_remain_immutable():
+    assert schema._schema_v2_checksum() == "0d4f29cf873e7e6c5051851be3a1ecf9701fdd8d0570af6f9503e83bb783577a"
+
+
+def test_existing_v2_database_upgrades_atomically_to_v3(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        _install_brain_schema_through_v2(conn)
+        before_v2 = conn.execute(
+            "SELECT migration_name,migration_checksum,applied_at,applied_by "
+            "FROM public.brain_schema_versions WHERE version=2"
+        ).fetchone()
+        conn.rollback()
+
+        schema.ensure_schema_v1(conn)
+
+        versions = conn.execute(
+            "SELECT version,migration_name,migration_checksum FROM public.brain_schema_versions "
+            "ORDER BY version"
+        ).fetchall()
+        assert [row["version"] for row in versions] == [1, 2, 3]
+        assert versions[2]["migration_name"] == schema._MIGRATION_V3_NAME
+        assert versions[2]["migration_checksum"] == schema._schema_v3_checksum()
+        assert conn.execute(
+            "SELECT migration_name,migration_checksum,applied_at,applied_by "
+            "FROM public.brain_schema_versions WHERE version=2"
+        ).fetchone() == before_v2
+
+
+def test_failed_v2_to_v3_upgrade_rolls_back_and_retries(brain_pg, monkeypatch):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        _install_brain_schema_through_v2(conn)
+        with monkeypatch.context() as patch:
+            patch.setattr(schema, "_schema_v3_bytes", lambda: b"CREATE TABLE broken (")
+            with pytest.raises(psycopg.errors.SyntaxError):
+                schema.ensure_schema_v1(conn)
+        assert [
+            row["version"]
+            for row in conn.execute(
+                "SELECT version FROM public.brain_schema_versions ORDER BY version"
+            ).fetchall()
+        ] == [1, 2]
+        conn.rollback()
+
+        schema.ensure_schema_v1(conn)
+        assert [
+            row["version"]
+            for row in conn.execute(
+                "SELECT version FROM public.brain_schema_versions ORDER BY version"
+            ).fetchall()
+        ] == [1, 2, 3]
+
+
+def test_existing_v1_database_upgrades_atomically_to_v3(brain_pg):
     with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -582,7 +685,7 @@ def test_existing_v1_database_upgrades_atomically_to_v2(brain_pg):
             "FROM public.brain_schema_versions ORDER BY version"
         ).fetchall()
         conn.rollback()
-        assert [row["version"] for row in first] == [1, 2]
+        assert [row["version"] for row in first] == [1, 2, 3]
 
         schema.ensure_schema_v1(conn)
         second = conn.execute(
@@ -626,7 +729,7 @@ def test_failed_v1_to_v2_upgrade_rolls_back_and_retries(brain_pg, monkeypatch):
         versions = conn.execute(
             "SELECT version FROM public.brain_schema_versions ORDER BY version"
         ).fetchall()
-        assert [row["version"] for row in versions] == [1, 2]
+        assert [row["version"] for row in versions] == [1, 2, 3]
 
 
 def _fleet_snapshot(conn):
@@ -1890,7 +1993,7 @@ def test_schema_version_ledger_rejects_future_and_interrupted_versions(brain_pg)
         conn.execute(
             "INSERT INTO brain_schema_versions "
             "(version,migration_name,migration_checksum,applied_at,applied_by) "
-            "VALUES (3,'future','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',now(),current_user)"
+            "VALUES (4,'future','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',now(),current_user)"
         )
         conn.commit()
         with pytest.raises(RuntimeError, match="unsupported or non-contiguous"):

@@ -266,8 +266,10 @@ pool; workers continue to receive and reuse a direct connection.
    `python -c "from applypilot.fleet.software_version import current_sw_version; print(current_sw_version())"`.
 4. Set `APPLYPILOT_RELEASE_VERSION` to that exact value and pin the same value in
    Postgres.
-5. Apply schema migrations from the owner/migration service. The worker has no
-   schema-authority role and exits if required result/attempt tables are absent.
+5. Apply fleet migrations from the owner/migration service, including
+   `20260717_002_lane_specific_canary_pins`, and verify the fleet ledger. Then
+   install and verify canonical brain schema v3. The worker has no
+   schema-authority role and exits if required fleet objects are absent.
 6. Inventory principals and services, review the regrant manifest, create the
    unique mapped login role, and archive its rollback SQL/receipt.
 7. Set the replica's unique mapped `FLEET_PG_DSN`, worker ID, and contract.
@@ -275,8 +277,9 @@ pool; workers continue to receive and reuse a direct connection.
 9. Require a fresh heartbeat whose `sw_version`, machine owner, role, and worker
    ID match the release contract.
 10. Verify the worker remains unable to lease while the lane is paused.
-11. Arm a separately approved ATS canary only after the deployment and policy
-   gates pass.
+11. Configure the exact lane worker/version pin and arm a separately approved
+    ATS or LinkedIn canary only after that lane's deployment and policy gates
+    pass.
 
 Do not scale by cloning a service with the same `APPLYPILOT_WORKER_ID`. Each
 replica needs an independently stable identity or a launcher that derives and

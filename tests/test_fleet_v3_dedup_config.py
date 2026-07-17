@@ -6,6 +6,18 @@ from applypilot.fleet import config as fcfg
 from applypilot.fleet import dedup
 
 
+def _ensure_lane_pin_columns(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE fleet_config "
+            "ADD COLUMN IF NOT EXISTS ats_canary_worker_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS ats_canary_version TEXT, "
+            "ADD COLUMN IF NOT EXISTS linkedin_canary_worker_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS linkedin_canary_version TEXT"
+        )
+    conn.commit()
+
+
 # ---- dedup (pure, no Postgres) -------------------------------------------------
 
 def test_dedup_collapses_across_boards():
@@ -73,3 +85,48 @@ def test_version_for_worker_canary(fleet_db):
         fcfg.set_pinned_version(conn, "1.2.0", canary_version="1.3.0-rc1", canary_worker_id="w-canary")
         assert fcfg.version_for_worker(conn, "w-canary") == "1.3.0-rc1"
         assert fcfg.version_for_worker(conn, "w-other") == "1.2.0"
+
+
+def test_version_for_worker_resolves_application_canaries_by_lane(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _ensure_lane_pin_columns(conn)
+        fcfg.set_pinned_version(
+            conn,
+            "1.2.0",
+            canary_version="1.3.0-generic",
+            canary_worker_id="shared-canary",
+            ats_canary_version="1.3.0-ats",
+            ats_canary_worker_id="shared-canary",
+            linkedin_canary_version="1.3.0-linkedin",
+            linkedin_canary_worker_id="shared-canary",
+        )
+
+        assert fcfg.version_for_worker(conn, "shared-canary", lane="ats") == "1.3.0-ats"
+        assert fcfg.version_for_worker(conn, "shared-canary", lane="apply") == "1.3.0-ats"
+        assert fcfg.version_for_worker(conn, "shared-canary", lane="linkedin") == "1.3.0-linkedin"
+        assert fcfg.version_for_worker(conn, "shared-canary", lane="compute") == "1.3.0-generic"
+        assert fcfg.version_for_worker(conn, "shared-canary") == "1.3.0-generic"
+        assert fcfg.version_for_worker(conn, "other-ats", lane="ats") == "1.2.0"
+
+
+def test_legacy_pin_update_preserves_application_canaries(fleet_db):
+    with pgqueue.connect(fleet_db) as conn:
+        _ensure_lane_pin_columns(conn)
+        fcfg.set_pinned_version(
+            conn,
+            "1.2.0",
+            ats_canary_version="1.3.0-ats",
+            ats_canary_worker_id="ats-canary",
+            linkedin_canary_version="1.3.0-linkedin",
+            linkedin_canary_worker_id="linkedin-canary",
+        )
+        fcfg.set_pinned_version(
+            conn,
+            "1.2.1",
+            canary_version="1.3.1-generic",
+            canary_worker_id="generic-canary",
+        )
+
+        assert fcfg.version_for_worker(conn, "ats-canary", lane="ats") == "1.3.0-ats"
+        assert fcfg.version_for_worker(conn, "linkedin-canary", lane="linkedin") == "1.3.0-linkedin"
+        assert fcfg.version_for_worker(conn, "generic-canary", lane="compute") == "1.3.1-generic"

@@ -1,4 +1,4 @@
-"""Install and deeply verify the additive Postgres canonical-brain schema v1."""
+"""Install and deeply verify the additive Postgres canonical-brain schema."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from psycopg.pq import TransactionStatus
 
 _SCHEMA_SQL = Path(__file__).with_name("schema_v1.sql")
 _SCHEMA_V2_SQL = Path(__file__).with_name("schema_v2.sql")
+_SCHEMA_V3_SQL = Path(__file__).with_name("schema_v3.sql")
 _SCHEMA_LOCK_KEY = "applypilot:brain:schema:v1"
 _MIGRATION_NAME = "brain schema v1"
 _MIGRATION_V2_NAME = "brain schema v2 lifecycle principals"
+_MIGRATION_V3_NAME = "brain schema v3 lane canary pins"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
 _STATUS_ROLE = "brain_status_reader"
@@ -34,7 +36,9 @@ _STATUS_READ_COLUMNS = {
         "linkedin_apply_mode", "canary_enabled", "linkedin_canary_enabled",
         "canary_remaining", "linkedin_canary_remaining", "ats_policy_version",
         "linkedin_policy_version", "pinned_worker_version", "canary_worker_id",
-        "canary_version", "approval_threshold", "spend_cap_usd", "linkedin_owner_ip",
+        "canary_version", "ats_canary_worker_id", "ats_canary_version",
+        "linkedin_canary_worker_id", "linkedin_canary_version", "approval_threshold",
+        "spend_cap_usd", "linkedin_owner_ip",
     },
     "fleet_decision_policies": {
         "policy_version", "lane", "status", "activated_at", "retired_at",
@@ -74,7 +78,7 @@ _LIFECYCLE_OWNER_READ_RELATIONS = _LIFECYCLE_LOCK_RELATIONS | {
     "apply_result_events",
     "fleet_worker_blocklist",
 }
-_EXPECTED_CATALOG_HASH = "e966e54ccb0ed6f14059e0e0a1c185001f42490e2b48dc27a887662afe23259f"
+_EXPECTED_CATALOG_HASH = "d3a53e2c29a5ddad1118168eeeaaf3ce681a17c05083cb39a9c1810c624fa4d5"
 
 _FUNCTIONS = {
     "brain_reject_mutation": "",
@@ -315,6 +319,14 @@ def _schema_v2_checksum() -> str:
     return hashlib.sha256(_schema_v2_bytes()).hexdigest()
 
 
+def _schema_v3_bytes() -> bytes:
+    return _SCHEMA_V3_SQL.read_bytes()
+
+
+def _schema_v3_checksum() -> str:
+    return hashlib.sha256(_schema_v3_bytes()).hexdigest()
+
+
 def _require_idle(conn) -> None:
     if conn.info.transaction_status != TransactionStatus.IDLE:
         raise RuntimeError("brain schema helpers require an idle connection and never commit or roll back caller work")
@@ -424,7 +436,7 @@ def _version_rows(cur):
     if not rows:
         raise RuntimeError("brain schema version ledger exists but is empty")
     versions = [row["version"] for row in rows]
-    if versions not in ([1], [1, 2]):
+    if versions not in ([1], [1, 2], [1, 2, 3]):
         raise RuntimeError(
             "unsupported or non-contiguous brain schema version ledger: "
             + ", ".join(str(version) for version in versions)
@@ -586,6 +598,19 @@ def _verify_contract(cur) -> None:
             problems.append(
                 f"migration v2 ledger owner mismatch: expected {_MIGRATION_ROLE}, "
                 f"got {version_v2['applied_by']}"
+            )
+    version_v3 = versions[2] if len(versions) > 2 else None
+    if version_v3 is None:
+        problems.append("missing schema version 3 lane canary pin contract")
+    else:
+        if version_v3["migration_name"] != _MIGRATION_V3_NAME:
+            problems.append("migration v3 name mismatch")
+        if version_v3["migration_checksum"] != _schema_v3_checksum():
+            problems.append("migration v3 checksum mismatch")
+        if version_v3["applied_by"] != _MIGRATION_ROLE:
+            problems.append(
+                f"migration v3 ledger owner mismatch: expected {_MIGRATION_ROLE}, "
+                f"got {version_v3['applied_by']}"
             )
 
     cur.execute(
@@ -1217,12 +1242,12 @@ def ensure_brain_schema_v1(
     *,
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
 ) -> None:
-    """Install schema v1 once with a dedicated migration identity, or verify it."""
+    """Install every immutable brain schema migration, or verify the latest contract."""
     _require_idle(conn)
     with conn.transaction():
         with conn.cursor() as cur:
             versions = _version_rows(cur)
-            if len(versions) == 2:
+            if len(versions) == 3:
                 _verify_contract(cur)
                 return
 
@@ -1232,7 +1257,7 @@ def ensure_brain_schema_v1(
 
             # Another installer may have completed while this connection waited.
             versions = _version_rows(cur)
-            if len(versions) == 2:
+            if len(versions) == 3:
                 _verify_contract(cur)
                 return
 
@@ -1245,13 +1270,22 @@ def ensure_brain_schema_v1(
                     "VALUES (1, %s, %s, %s)",
                     (_MIGRATION_NAME, _schema_checksum(), migration_identity),
                 )
-            cur.execute(_schema_v2_bytes().decode("utf-8"))
+            if len(versions) < 2:
+                cur.execute(_schema_v2_bytes().decode("utf-8"))
+                _apply_acl_contract(cur, migration_identity)
+                cur.execute(
+                    "INSERT INTO public.brain_schema_versions "
+                    "(version, migration_name, migration_checksum, applied_by) "
+                    "VALUES (2, %s, %s, %s)",
+                    (_MIGRATION_V2_NAME, _schema_v2_checksum(), migration_identity),
+                )
+            cur.execute(_schema_v3_bytes().decode("utf-8"))
             _apply_acl_contract(cur, migration_identity)
             cur.execute(
                 "INSERT INTO public.brain_schema_versions "
                 "(version, migration_name, migration_checksum, applied_by) "
-                "VALUES (2, %s, %s, %s)",
-                (_MIGRATION_V2_NAME, _schema_v2_checksum(), migration_identity),
+                "VALUES (3, %s, %s, %s)",
+                (_MIGRATION_V3_NAME, _schema_v3_checksum(), migration_identity),
             )
             _verify_contract(cur)
 
