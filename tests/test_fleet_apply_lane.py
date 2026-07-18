@@ -191,7 +191,11 @@ def test_apply_worker_main_validates_schema_before_building_loop(monkeypatch):
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr(am, "enforce_host_identity", lambda machine_owner: calls.append("identity"))
+    monkeypatch.setattr(
+        am,
+        "enforce_host_identity",
+        lambda machine_owner, **_kwargs: calls.append("identity"),
+    )
     monkeypatch.setattr(pgqueue, "connect", lambda dsn: _Ctx())
     monkeypatch.setattr(
         fleet_schema,

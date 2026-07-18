@@ -260,7 +260,12 @@ def test_linkedin_loop_defaults_to_codex_agent(monkeypatch):
 
     monkeypatch.setattr(awm, "make_apply_fn", _fake_make_apply_fn)
 
-    lm.build_linkedin_loop(dsn="postgresql://example.invalid/db", worker_id="w", owner_ip="1.1.1.1")
+    lm.build_linkedin_loop(
+        dsn="postgresql://example.invalid/db",
+        worker_id="w",
+        public_ip="1.1.1.1",
+        owner_ip="1.1.1.1",
+    )
 
     assert captured["agent"] == "codex"
     assert captured["fleet_worker_id"] == "w"
@@ -482,7 +487,14 @@ def test_linkedin_interlock_refuses_when_held(fleet_db):
 
 def test_build_linkedin_loop_role(fleet_db):
     from applypilot.fleet import linkedin_worker_main as lm
-    loop = lm.build_linkedin_loop(dsn=fleet_db, worker_id="w1", owner_ip="1.1.1.1", model="sonnet", agent="claude")
+    loop = lm.build_linkedin_loop(
+        dsn=fleet_db,
+        worker_id="w1",
+        public_ip="1.1.1.1",
+        owner_ip="1.1.1.1",
+        model="sonnet",
+        agent="claude",
+    )
     assert loop.role == "linkedin" and loop.apply_fn is not None and loop.owner_ip == "1.1.1.1"
 
 

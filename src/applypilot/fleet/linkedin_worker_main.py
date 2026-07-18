@@ -18,6 +18,8 @@ from pathlib import Path
 import sys
 import time
 
+from applypilot.fleet.browser_host_guard import require_linkedin_owner_host
+
 logger = logging.getLogger("applypilot.fleet.linkedin_worker_main")
 
 _PAUSE_CEILING = 300.0
@@ -86,11 +88,20 @@ def acquire_linkedin_interlock(conn) -> bool:
     return bool(ok)
 
 
-def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="codex", machine_owner=None):
+def build_linkedin_loop(
+    *,
+    dsn,
+    worker_id,
+    public_ip,
+    owner_ip,
+    model="sonnet",
+    agent="codex",
+    machine_owner=None,
+):
     """Construct a WorkerLoop for the linkedin role.
 
-    public_ip and owner_ip are both set to *owner_ip*: the LinkedIn driver always
-    runs on the owner's home box, so the residential egress IP IS the owner IP.
+    public_ip is the enrolled node's observed identity and owner_ip is the configured
+    owner identity. The entrypoint requires them to match before constructing the loop.
     apply_fn is built via the same make_apply_fn path used by apply_worker_main --
     run_job is URL-agnostic; the LinkedIn-seeded Chrome profile is what
     setup_worker_profile already prefers for li_at sessions. We do NOT force a
@@ -105,11 +116,11 @@ def build_linkedin_loop(*, dsn, worker_id, owner_ip, model="sonnet", agent="code
     loop = WorkerLoop(
         lambda: pgqueue.connect(dsn),
         worker_id,
-        home_ip=owner_ip,
+        home_ip=public_ip,
         role="linkedin",
         apply_fn=make_apply_fn(model, agent, fleet_worker_id=worker_id),
         machine_owner=machine_owner,
-        public_ip=owner_ip,
+        public_ip=public_ip,
         owner_ip=owner_ip,
         on_owner_machine=True,
         log_tail_fn=make_log_tail_fn(0),
@@ -250,6 +261,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     p = argparse.ArgumentParser(prog="applypilot-fleet-linkedin")
     p.add_argument("--dsn", default=os.environ.get("FLEET_PG_DSN"))
     p.add_argument("--worker-id", required=True)
+    p.add_argument("--public-ip", default=os.environ.get("FLEET_HOME_IP", "0.0.0.0"))
     p.add_argument("--owner-ip", default=os.environ.get("FLEET_OWNER_IP", "0.0.0.0"))
     p.add_argument("--model", default="sonnet")
     # Match the apply-lane default: Codex uses the ChatGPT quota pool and avoids
@@ -262,6 +274,11 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
                         "until the primary agent's window resets.")
     p.add_argument("--machine-owner", default=os.environ.get("FLEET_MACHINE_OWNER"))
     args = p.parse_args(argv)
+    require_linkedin_owner_host(
+        machine_owner=args.machine_owner,
+        public_ip=args.public_ip,
+        owner_ip=args.owner_ip,
+    )
     if not args.dsn:
         raise SystemExit("set --dsn or FLEET_PG_DSN")
 
@@ -282,9 +299,14 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
             cur.execute("SELECT public.fleet_worker_admission_snapshot() AS snapshot")
             startup = cur.fetchone()["snapshot"] or {}
         schema_conn.rollback()
-    configured_owner_ip = startup.get("linkedin_owner_ip") or startup.get("public_ip")
+    configured_owner_ip = startup.get("linkedin_owner_ip")
     if not configured_owner_ip:
         raise SystemExit("LinkedIn owner IP is not configured in fleet control state")
+    require_linkedin_owner_host(
+        machine_owner=args.machine_owner,
+        public_ip=args.public_ip,
+        owner_ip=configured_owner_ip,
+    )
 
     # Open a DEDICATED long-lived connection solely for holding the advisory lock.
     # This connection is kept open for the process life; releasing it releases the lock.
@@ -298,6 +320,7 @@ def main(argv=None) -> int:  # pragma: no cover - long-running
     loop = build_linkedin_loop(
         dsn=args.dsn,
         worker_id=args.worker_id,
+        public_ip=args.public_ip,
         owner_ip=configured_owner_ip,
         model=args.model,
         agent=args.agent,

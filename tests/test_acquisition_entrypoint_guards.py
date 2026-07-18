@@ -38,7 +38,11 @@ def test_linkedin_worker_startup_denies_after_server_admission_before_schema(mon
                 "--worker-id",
                 "owner-1",
                 "--machine-owner",
-                "owner",
+                "home",
+                "--public-ip",
+                "1.1.1.1",
+                "--owner-ip",
+                "1.1.1.1",
             ]
         )
 
