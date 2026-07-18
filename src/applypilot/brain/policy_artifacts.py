@@ -33,6 +33,11 @@ _SOURCE_REFERENCE_FIELDS = (
     ("pairwise_snapshot", "pairwiseSnapshot"),
     ("outcome_snapshot", "outcomeSnapshot"),
 )
+_SNAPSHOT_REFERENCE_FIELDS = (
+    ("label_snapshot", "labelSnapshot"),
+    ("pairwise_snapshot", "pairwiseSnapshot"),
+    ("outcome_snapshot", "outcomeSnapshot"),
+)
 
 
 class PolicyArtifactError(ValueError):
@@ -48,6 +53,7 @@ class ArtifactDescriptor:
     byte_length: int
     media_type: str
     content: bytes
+    policy_source_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +180,33 @@ def _artifact(role: str, value: object) -> ArtifactDescriptor:
     )
 
 
+def _snapshot_reference_artifact(
+    *,
+    policy_version: str,
+    lane: str,
+    role: str,
+    source_sha256: str,
+) -> ArtifactDescriptor:
+    value = {
+        "kind": "applypilot.policy.snapshot-reference",
+        "lane": lane,
+        "policyVersion": policy_version,
+        "role": role,
+        "schemaVersion": 1,
+        "sourceField": role,
+        "sourceSha256": source_sha256,
+    }
+    content = _canonical_bytes(value, f"{role} artifact")
+    return ArtifactDescriptor(
+        role=role,
+        sha256=hashlib.sha256(content).hexdigest(),
+        byte_length=len(content),
+        media_type=ARTIFACT_MEDIA_TYPE,
+        content=content,
+        policy_source_id=content.decode("utf-8"),
+    )
+
+
 def compile_policy_artifacts(row: Mapping[str, object]) -> CompiledPolicyArtifacts:
     """Compile only artifacts and metadata directly supported by a SQLite policy row.
 
@@ -257,6 +290,18 @@ def compile_policy_artifacts(row: Mapping[str, object]) -> CompiledPolicyArtifac
         for source_field, target_field in _SOURCE_REFERENCE_FIELDS
     }
     source_references["replayInputHash"] = replay_input_hash
+    for source_field, metadata_key in _SNAPSHOT_REFERENCE_FIELDS:
+        source_sha256 = source_references[metadata_key]
+        if source_sha256 is None:
+            continue
+        artifacts.append(
+            _snapshot_reference_artifact(
+                policy_version=policy_version,
+                lane=lane,
+                role=source_field,
+                source_sha256=source_sha256,
+            )
+        )
     metadata = {
         "contractVersion": 1,
         "modelNames": model_names,

@@ -726,13 +726,16 @@ _BINDABLE_COMPILED_POLICY_ROLES = frozenset({
     "outcome_model",
     "config",
     "metrics",
+    "label_snapshot",
+    "pairwise_snapshot",
+    "outcome_snapshot",
 })
 
 
 def _require_artifact(pg, artifact: ArtifactDescriptor) -> None:
     with pg.cursor() as cur:
         cur.execute(
-            "SELECT artifact_hash,byte_length,media_type FROM brain_artifacts WHERE artifact_hash=%s",
+            "SELECT artifact_hash,byte_length,media_type,provenance FROM brain_artifacts WHERE artifact_hash=%s",
             (artifact.sha256,),
         )
         target = cur.fetchone()
@@ -742,6 +745,13 @@ def _require_artifact(pg, artifact: ArtifactDescriptor) -> None:
         or target["media_type"] != artifact.media_type
     ):
         raise BrainImportError(f"policy artifact is missing or inconsistent: {artifact.sha256}")
+    if artifact.policy_source_id is not None:
+        provenance = target.get("provenance")
+        if (
+            not isinstance(provenance, Mapping)
+            or provenance.get("policy_source_id") != artifact.policy_source_id
+        ):
+            raise BrainImportError(f"policy artifact provenance is missing or inconsistent: {artifact.sha256}")
 
 
 def _require_referenced_artifact(pg, artifact_hash: str, role: str) -> None:

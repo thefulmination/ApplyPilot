@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 import applypilot.brain.sqlite_to_postgres as importer_module
+from applypilot.brain.policy_artifacts import ARTIFACT_MEDIA_TYPE, ArtifactDescriptor
 from applypilot.brain.sqlite_to_postgres import _acquire_import_lock
 from applypilot.brain.sqlite_to_postgres import _activate_controller
 from applypilot.brain.sqlite_to_postgres import _commit_phase
@@ -21,6 +22,7 @@ from applypilot.brain.sqlite_to_postgres import _mark_run_failed
 from applypilot.brain.sqlite_to_postgres import _migration_run_resume_event
 from applypilot.brain.sqlite_to_postgres import _parity_metadata
 from applypilot.brain.sqlite_to_postgres import _record_completed_batches
+from applypilot.brain.sqlite_to_postgres import _require_artifact
 from applypilot.brain.sqlite_to_postgres import _source_bounds
 from applypilot.brain.sqlite_to_postgres import _verify_kg_artifacts
 from applypilot.brain.sqlite_to_postgres import finalize_sqlite_to_postgres_import
@@ -67,7 +69,7 @@ class _RecordingCursor:
             self._row = {"acquired": self.connection.lock_acquired}
         elif "pg_advisory_unlock" in normalized:
             self._row = {"released": True}
-        elif "SELECT artifact_hash,byte_length,media_type FROM brain_artifacts" in normalized:
+        elif "SELECT artifact_hash,byte_length,media_type" in normalized and "FROM brain_artifacts" in normalized:
             artifact_hash = params[0]
             self._row = self.connection.artifacts.get(artifact_hash)
         elif "INSERT INTO brain_policy_artifacts" in normalized:
@@ -613,3 +615,77 @@ def test_observation_delta_uses_idempotent_source_key_inserts() -> None:
         "ON CONFLICT (source_namespace,source_observation_id) DO NOTHING" in query
         for query, _ in inserts
     )
+
+
+
+def test_snapshot_roles_are_bindable_compiled_policy_roles() -> None:
+    assert {"label_snapshot", "pairwise_snapshot", "outcome_snapshot"} <= (
+        importer_module._BINDABLE_COMPILED_POLICY_ROLES
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        None,
+        {
+            "artifact_hash": hashlib.sha256(b"snapshot-reference").hexdigest(),
+            "byte_length": len(b"snapshot-reference") + 1,
+            "media_type": ARTIFACT_MEDIA_TYPE,
+            "provenance": {"policy_source_id": "snapshot-reference"},
+        },
+        {
+            "artifact_hash": hashlib.sha256(b"snapshot-reference").hexdigest(),
+            "byte_length": len(b"snapshot-reference"),
+            "media_type": "application/octet-stream",
+            "provenance": {"policy_source_id": "snapshot-reference"},
+        },
+        {
+            "artifact_hash": hashlib.sha256(b"snapshot-reference").hexdigest(),
+            "byte_length": len(b"snapshot-reference"),
+            "media_type": ARTIFACT_MEDIA_TYPE,
+            "provenance": {"policy_source_id": "wrong"},
+        },
+    ],
+)
+def test_snapshot_artifact_fails_closed_on_missing_or_conflicting_ledger(
+    target: dict[str, Any] | None,
+) -> None:
+    content = b"snapshot-reference"
+    digest = hashlib.sha256(content).hexdigest()
+    artifact = ArtifactDescriptor(
+        role="outcome_snapshot",
+        sha256=digest,
+        byte_length=len(content),
+        media_type=ARTIFACT_MEDIA_TYPE,
+        content=content,
+        policy_source_id=content.decode("utf-8"),
+    )
+    pg = _RecordingPostgres()
+    if target is not None:
+        pg.artifacts[digest] = target
+
+    with pytest.raises(Exception, match="missing or inconsistent"):
+        _require_artifact(pg, artifact)
+
+
+def test_snapshot_artifact_accepts_exact_registered_policy_source_id() -> None:
+    content = b"snapshot-reference"
+    digest = hashlib.sha256(content).hexdigest()
+    artifact = ArtifactDescriptor(
+        role="label_snapshot",
+        sha256=digest,
+        byte_length=len(content),
+        media_type=ARTIFACT_MEDIA_TYPE,
+        content=content,
+        policy_source_id=content.decode("utf-8"),
+    )
+    pg = _RecordingPostgres()
+    pg.artifacts[digest] = {
+        "artifact_hash": digest,
+        "byte_length": len(content),
+        "media_type": ARTIFACT_MEDIA_TYPE,
+        "provenance": {"policy_source_id": artifact.policy_source_id},
+    }
+
+    _require_artifact(pg, artifact)

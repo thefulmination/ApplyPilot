@@ -28,6 +28,9 @@ _BINDABLE_POLICY_ROLES = frozenset(
         "outcome_model",
         "config",
         "metrics",
+        "label_snapshot",
+        "pairwise_snapshot",
+        "outcome_snapshot",
     }
 )
 _MAX_POLICY_FILTER_BYTES = 1024 * 1024

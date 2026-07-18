@@ -22,6 +22,9 @@ CREATED = "2026-07-16T00:00:00Z"
 KG_CONTENT = b'{"nodes":[]}'
 KG_HASH = hashlib.sha256(KG_CONTENT).hexdigest()
 SOURCE_FINGERPRINT = "f" * 64
+LABEL_SNAPSHOT = "a" * 64
+PAIRWISE_SNAPSHOT = "b" * 64
+OUTCOME_SNAPSHOT = "c" * 64
 
 
 def _utc(minute: int) -> datetime:
@@ -244,9 +247,9 @@ def _source() -> sqlite3.Connection:
             None,
             None,
             KG_HASH,
-            None,
-            None,
-            None,
+            LABEL_SNAPSHOT,
+            PAIRWISE_SNAPSHOT,
+            OUTCOME_SNAPSHOT,
             '{"floor":0.6}',
             None,
             CREATED,
@@ -316,7 +319,17 @@ def _responses(source: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
     artifact_bindings = [
         [artifact.role, artifact.sha256]
         for artifact in compiled.artifacts
-        if artifact.role in {"qualification_model", "preference_model", "outcome_model", "config", "metrics"}
+        if artifact.role
+        in {
+            "qualification_model",
+            "preference_model",
+            "outcome_model",
+            "config",
+            "metrics",
+            "label_snapshot",
+            "pairwise_snapshot",
+            "outcome_snapshot",
+        }
     ]
     artifact_bindings.append(["knowledge_graph", KG_HASH])
     artifact_bindings.sort(key=lambda binding: binding[0])
@@ -668,3 +681,17 @@ def test_unsupported_research_tables_are_strictly_zero_only(nonzero_side: str) -
 
     assert not results["research_scores"].passed
     assert results["research_scores"].mismatch_count > 0
+
+
+
+def test_policy_parity_bindings_use_wrapper_hashes_not_source_fingerprints() -> None:
+    source = _source()
+    policy_row = dict(source.execute("SELECT * FROM decision_policy_versions").fetchone())
+    compiled = compile_policy_artifacts(policy_row)
+    bindings = dict(_responses(source)["decision_policy_versions"][0]["artifact_bindings"])
+
+    for role in ("label_snapshot", "pairwise_snapshot", "outcome_snapshot"):
+        artifact = compiled.artifact(role)
+        assert artifact is not None
+        assert bindings[role] == artifact.sha256
+        assert bindings[role] != policy_row[role]
