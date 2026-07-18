@@ -114,4 +114,3 @@ Expected: all commands exit zero.
 Review `git diff --stat`, `git diff`, and `git status --short`; then commit
 only the approved spec, plan, compiler, importer, parity, and focused tests with
 message `feat(brain): materialize policy snapshot references`. Do not push.
-

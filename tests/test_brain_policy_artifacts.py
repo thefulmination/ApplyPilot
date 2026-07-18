@@ -355,6 +355,34 @@ def test_one_non_null_snapshot_field_emits_exactly_one_wrapper(
     assert json.loads(snapshots[0].content)["sourceSha256"] == source_hash
 
 
+@pytest.mark.parametrize(
+    "missing_role",
+    ["label_snapshot", "pairwise_snapshot", "outcome_snapshot"],
+)
+def test_one_null_snapshot_field_emits_exactly_the_other_two_wrappers(
+    missing_role: str,
+) -> None:
+    values = {
+        "label_snapshot": LABEL_SNAPSHOT,
+        "pairwise_snapshot": PAIRWISE_SNAPSHOT,
+        "outcome_snapshot": OUTCOME_SNAPSHOT,
+    }
+    values[missing_role] = None
+
+    compiled = compile_policy_artifacts(policy_row(**values))
+    snapshot_roles = [
+        artifact.role for artifact in compiled.artifacts if artifact.role.endswith("_snapshot")
+    ]
+
+    assert snapshot_roles == [role for role in values if role != missing_role]
+    metadata_key = {
+        "label_snapshot": "labelSnapshot",
+        "pairwise_snapshot": "pairwiseSnapshot",
+        "outcome_snapshot": "outcomeSnapshot",
+    }[missing_role]
+    assert compiled.metadata_object()["sourceReferences"][metadata_key] is None
+
+
 def test_fourteen_policy_rows_match_exact_six_candidate_snapshot_identities() -> None:
     rows = [
         policy_row(
