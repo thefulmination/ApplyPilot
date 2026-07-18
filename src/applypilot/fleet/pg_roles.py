@@ -24,6 +24,12 @@ from psycopg import sql
 DEFAULT_ROLE = "fleet_worker"
 _ROLE_LOCK_KEY = "applypilot:fleet-worker-role:v2"
 _CANDIDATE_ROLE_LOCK_KEY = "applypilot:brain-candidate-roles:v1"
+
+
+class CrossDatabaseInventoryDriftError(RuntimeError):
+    """Post-fence cluster drift was forced back to a closed state."""
+
+
 BRAIN_CANDIDATE_READER_ROLE = "brain_candidate_reader"
 BRAIN_CANDIDATE_WRITER_ROLE = "brain_candidate_writer"
 _CANDIDATE_READ_RELATIONS = (
@@ -200,14 +206,29 @@ def _write_exclusive_fsync(
     if os.path.lexists(path):
         raise FileExistsError(f"durable evidence path already exists: {path}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
+    parent_descriptor: int | None = None
+    if os.open in os.supports_dir_fd:
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        parent_metadata = os.fstat(parent_descriptor)
+        if (parent_metadata.st_dev, parent_metadata.st_ino) != expected_parent_identity[1:]:
+            os.close(parent_descriptor)
+            raise RuntimeError("durable evidence parent changed while being opened")
+        descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_descriptor)
+    else:
+        descriptor = os.open(path, flags, 0o600)
     metadata = os.fstat(descriptor)
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        _fsync_parent_directory(path.parent)
+        if parent_descriptor is not None:
+            os.fsync(parent_descriptor)
+        else:
+            _fsync_parent_directory(path.parent)
     except BaseException:
         os.close(descriptor)
         _remove_created_evidence(
@@ -218,6 +239,9 @@ def _write_exclusive_fsync(
         raise
     else:
         os.close(descriptor)
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
     return metadata.st_dev, metadata.st_ino
 
 
@@ -232,8 +256,22 @@ def _remove_created_evidence(
     metadata = os.lstat(path)
     if stat.S_ISLNK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != expected_identity:
         raise RuntimeError("cannot safely clean partial evidence after leaf substitution")
-    path.unlink()
-    _fsync_parent_directory(path.parent)
+    if os.unlink in os.supports_dir_fd:
+        descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            parent_metadata = os.fstat(descriptor)
+            if (parent_metadata.st_dev, parent_metadata.st_ino) != expected_parent_identity[1:]:
+                raise RuntimeError("cannot safely clean partial evidence after parent substitution")
+            os.unlink(path.name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    else:
+        path.unlink()
+        _fsync_parent_directory(path.parent)
 
 
 def _validate_evidence_paths(evidence_paths: DurableEvidencePaths) -> None:
@@ -1495,7 +1533,13 @@ def _public_acl_rollback_sql(
         if role_name not in prior_direct_connect:
             cur.execute("SELECT format('%%I',%s::text) AS role_name", (role_name,))
             quoted_role = _row_value(cur.fetchone(), "role_name")
-            statements.append(f"REVOKE CONNECT ON DATABASE {quoted_database} FROM {quoted_role};")
+            statements.append(
+                _conditional_role_statement(
+                    cur,
+                    role_name=role_name,
+                    statement=f"REVOKE CONNECT ON DATABASE {quoted_database} FROM {quoted_role}",
+                )
+            )
     for role_name in sorted(set(retired_admin_roles) & prior_direct_connect):
         cur.execute("SELECT format('%%I',%s::text) AS role_name", (role_name,))
         statements.append(f"GRANT CONNECT ON DATABASE {quoted_database} TO {_row_value(cur.fetchone(), 'role_name')};")
@@ -2514,6 +2558,61 @@ def _bootstrap_object_rollback_sql(cur, ownership: tuple[dict[str, Any], ...]) -
     return "\n".join(statements) + ("\n" if statements else "")
 
 
+def _conditional_role_statement(cur, *, role_name: str, statement: str) -> str:
+    """Execute a rollback statement only when its referenced role exists."""
+    return (
+        sql.SQL(
+            "DO $applypilot_rollback$ BEGIN "
+            "IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname={}) THEN "
+            "EXECUTE {}; END IF; END $applypilot_rollback$;"
+        )
+        .format(sql.Literal(role_name), sql.Literal(statement))
+        .as_string(cur.connection)
+    )
+
+
+def _conditional_role_pair_statement(
+    cur,
+    *,
+    first_role: str,
+    second_role: str,
+    statement: str,
+) -> str:
+    return (
+        sql.SQL(
+            "DO $applypilot_rollback$ BEGIN "
+            "IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname={}) "
+            "AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname={}) THEN "
+            "EXECUTE {}; END IF; END $applypilot_rollback$;"
+        )
+        .format(sql.Literal(first_role), sql.Literal(second_role), sql.Literal(statement))
+        .as_string(cur.connection)
+    )
+
+
+def _conditional_function_revoke(
+    cur,
+    *,
+    signature: str,
+    role_name: str,
+) -> str:
+    statement = (
+        sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {}")
+        .format(sql.SQL(signature), sql.Identifier(role_name))
+        .as_string(cur.connection)
+    )
+    return (
+        sql.SQL(
+            "DO $applypilot_rollback$ BEGIN "
+            "IF pg_catalog.to_regprocedure({}) IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname={}) THEN "
+            "EXECUTE {}; END IF; END $applypilot_rollback$;"
+        )
+        .format(sql.Literal(signature), sql.Literal(role_name), sql.Literal(statement))
+        .as_string(cur.connection)
+    )
+
+
 def _forward_v5_deactivation_sql(
     cur,
     *,
@@ -2522,16 +2621,32 @@ def _forward_v5_deactivation_sql(
     database_owner_before: str,
     ownership: tuple[dict[str, Any], ...],
     other_databases: tuple[dict[str, Any], ...],
+    retired_memberships: tuple[dict[str, Any], ...],
 ) -> str:
     """Deactivate the combined release while preserving additive authority data."""
     database = sql.Identifier(database_name).as_string(cur.connection)
-    statements = [
-        sql.SQL("REVOKE {} FROM {};")
+    controller_revoke = (
+        sql.SQL("REVOKE {} FROM {}")
         .format(sql.Identifier("brain_policy_controller"), sql.Identifier(topology.controller_role))
-        .as_string(cur.connection),
-        sql.SQL("ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;")
+        .as_string(cur.connection)
+    )
+    controller_disable = (
+        sql.SQL("ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS")
         .format(sql.Identifier(topology.controller_role))
-        .as_string(cur.connection),
+        .as_string(cur.connection)
+    )
+    statements = [
+        _conditional_role_pair_statement(
+            cur,
+            first_role="brain_policy_controller",
+            second_role=topology.controller_role,
+            statement=controller_revoke,
+        ),
+        _conditional_role_statement(
+            cur,
+            role_name=topology.controller_role,
+            statement=controller_disable,
+        ),
         f"REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {database} FROM PUBLIC;",
     ]
     for role_name in (
@@ -2540,16 +2655,21 @@ def _forward_v5_deactivation_sql(
         BRAIN_CANDIDATE_READER_ROLE,
         BRAIN_CANDIDATE_WRITER_ROLE,
     ):
-        statements.append(
-            sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM {};")
+        revoke = (
+            sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM {}")
             .format(sql.Identifier(database_name), sql.Identifier(role_name))
             .as_string(cur.connection)
         )
+        statements.append(
+            _conditional_role_statement(cur, role_name=role_name, statement=revoke)
+        )
     for signature in (_CANDIDATE_V5_PUBLISH_SIGNATURE, _CANDIDATE_V4_PUBLISH_SIGNATURE):
         statements.append(
-            sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {};")
-            .format(sql.SQL(signature), sql.Identifier(BRAIN_CANDIDATE_WRITER_ROLE))
-            .as_string(cur.connection)
+            _conditional_function_revoke(
+                cur,
+                signature=signature,
+                role_name=BRAIN_CANDIDATE_WRITER_ROLE,
+            )
         )
     statements.append(
         sql.SQL("ALTER DATABASE {} OWNER TO {};")
@@ -2564,6 +2684,7 @@ def _forward_v5_deactivation_sql(
         ).rstrip()
     )
     statements.append(_bootstrap_object_rollback_sql(cur, ownership).rstrip())
+    statements.append(_retired_membership_rollback_sql(cur, memberships=retired_memberships).rstrip())
     return "\n".join(statement for statement in statements if statement) + "\n"
 
 
@@ -2673,6 +2794,248 @@ def _other_database_connect_rollback_sql(
     return "\n".join(statements) + ("\n" if statements else "")
 
 
+def _retired_membership_inventory(
+    cur,
+    *,
+    retired_admin_roles: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    cur.execute(
+        "SELECT attname FROM pg_catalog.pg_attribute "
+        "WHERE attrelid='pg_catalog.pg_auth_members'::regclass "
+        "AND attname=ANY(%s) AND NOT attisdropped",
+        (["inherit_option", "set_option"],),
+    )
+    option_columns = {_row_value(row, "attname") for row in cur.fetchall()}
+    inherit_projection = (
+        "membership.inherit_option" if "inherit_option" in option_columns else "NULL::boolean AS inherit_option"
+    )
+    set_projection = "membership.set_option" if "set_option" in option_columns else "NULL::boolean AS set_option"
+    cur.execute(
+        "SELECT parent.rolname AS parent_role,member.rolname AS member_role,"
+        "grantor.rolname AS grantor_role,membership.admin_option,"
+        f"{inherit_projection},{set_projection} "
+        "FROM pg_catalog.pg_auth_members membership "
+        "JOIN pg_catalog.pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_catalog.pg_roles member ON member.oid=membership.member "
+        "JOIN pg_catalog.pg_roles grantor ON grantor.oid=membership.grantor "
+        "WHERE parent.rolname=ANY(%s) OR member.rolname=ANY(%s) "
+        "ORDER BY parent.rolname,member.rolname,grantor.rolname",
+        (list(retired_admin_roles), list(retired_admin_roles)),
+    )
+    return tuple(
+        {
+            "parent_role": _row_value(row, "parent_role"),
+            "member_role": _row_value(row, "member_role", 1),
+            "grantor_role": _row_value(row, "grantor_role", 2),
+            "admin_option": bool(_row_value(row, "admin_option", 3)),
+            "inherit_option": _row_value(row, "inherit_option", 4),
+            "set_option": _row_value(row, "set_option", 5),
+        }
+        for row in cur.fetchall()
+    )
+
+
+def _retired_membership_rollback_sql(
+    cur,
+    *,
+    memberships: tuple[dict[str, Any], ...],
+) -> str:
+    statements: list[str] = []
+    for edge in memberships:
+        if edge["inherit_option"] is None and edge["set_option"] is None:
+            base = sql.SQL("GRANT {} TO {}{} GRANTED BY {}").format(
+                sql.Identifier(edge["parent_role"]),
+                sql.Identifier(edge["member_role"]),
+                sql.SQL(" WITH ADMIN OPTION" if edge["admin_option"] else ""),
+                sql.Identifier(edge["grantor_role"]),
+            )
+        else:
+            base = sql.SQL("GRANT {} TO {} WITH ADMIN {} GRANTED BY {}").format(
+                sql.Identifier(edge["parent_role"]),
+                sql.Identifier(edge["member_role"]),
+                sql.SQL("TRUE" if edge["admin_option"] else "FALSE"),
+                sql.Identifier(edge["grantor_role"]),
+            )
+        statements.append(base.as_string(cur.connection) + ";")
+        if edge["inherit_option"] is not None:
+            statements.append(
+                sql.SQL("GRANT {} TO {} WITH INHERIT {} GRANTED BY {};")
+                .format(
+                    sql.Identifier(edge["parent_role"]),
+                    sql.Identifier(edge["member_role"]),
+                    sql.SQL("TRUE" if edge["inherit_option"] else "FALSE"),
+                    sql.Identifier(edge["grantor_role"]),
+                )
+                .as_string(cur.connection)
+            )
+        if edge["set_option"] is not None:
+            statements.append(
+                sql.SQL("GRANT {} TO {} WITH SET {} GRANTED BY {};")
+                .format(
+                    sql.Identifier(edge["parent_role"]),
+                    sql.Identifier(edge["member_role"]),
+                    sql.SQL("TRUE" if edge["set_option"] else "FALSE"),
+                    sql.Identifier(edge["grantor_role"]),
+                )
+                .as_string(cur.connection)
+            )
+    return "\n".join(statements) + ("\n" if statements else "")
+
+
+def _close_retired_admin_memberships(
+    cur,
+    *,
+    retired_admin_roles: tuple[str, ...],
+) -> None:
+    cur.execute(
+        "SELECT parent.rolname AS parent_role,member.rolname AS member_role,grantor.rolname AS grantor_role "
+        "FROM pg_catalog.pg_auth_members membership "
+        "JOIN pg_catalog.pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_catalog.pg_roles member ON member.oid=membership.member "
+        "JOIN pg_catalog.pg_roles grantor ON grantor.oid=membership.grantor "
+        "WHERE grantor.rolname=ANY(%s) ORDER BY parent.rolname,member.rolname,grantor.rolname",
+        (list(retired_admin_roles),),
+    )
+    dependent_grants = [
+        f"{_row_value(row, 'parent_role')}->{_row_value(row, 'member_role', 1)} "
+        f"granted-by {_row_value(row, 'grantor_role', 2)}"
+        for row in cur.fetchall()
+    ]
+    if dependent_grants:
+        raise RuntimeError(
+            "retired provider-admin membership dependencies prevent exact non-cascading closure: "
+            + ", ".join(dependent_grants)
+        )
+    for edge in _retired_membership_inventory(cur, retired_admin_roles=retired_admin_roles):
+        cur.execute(
+            sql.SQL("REVOKE {} FROM {} GRANTED BY {} RESTRICT").format(
+                sql.Identifier(edge["parent_role"]),
+                sql.Identifier(edge["member_role"]),
+                sql.Identifier(edge["grantor_role"]),
+            )
+        )
+
+
+def _validate_retired_admin_memberships_closed(
+    cur,
+    *,
+    retired_admin_roles: tuple[str, ...],
+) -> None:
+    remaining = _retired_membership_inventory(cur, retired_admin_roles=retired_admin_roles)
+    if remaining:
+        rendered = [f"{edge['parent_role']}->{edge['member_role']}" for edge in remaining]
+        raise RuntimeError("retired provider-admin role memberships remain: " + ", ".join(rendered))
+
+
+def _lock_cluster_security_catalogs(cur) -> None:
+    # SHARE blocks external database ACL/topology and role-membership writes while
+    # allowing this transaction to upgrade its own lock for the handoff.
+    cur.execute(
+        "LOCK TABLE pg_catalog.pg_database,pg_catalog.pg_authid,pg_catalog.pg_auth_members IN SHARE MODE"
+    )
+
+
+def _validate_other_database_inventory_unchanged(
+    cur,
+    *,
+    baseline: tuple[dict[str, Any], ...],
+    baseline_database_names: tuple[str, ...],
+    infrastructure_superuser_roles: tuple[str, ...],
+) -> None:
+    current = _other_database_inventory(
+        cur,
+        infrastructure_superuser_roles=infrastructure_superuser_roles,
+    )
+    normalized_current = tuple(
+        {
+            **database,
+            "connection_limit_before": next(
+                (
+                    original["connection_limit_before"]
+                    for original in baseline
+                    if original["database_name"] == database["database_name"]
+                    and database["connection_limit_before"] == 0
+                ),
+                database["connection_limit_before"],
+            ),
+            "active_sessions": (),
+        }
+        for database in current
+    )
+    normalized_baseline = tuple({**database, "active_sessions": ()} for database in baseline)
+    baseline_by_name = {database["database_name"]: database for database in baseline}
+    current_by_name = {database["database_name"]: database for database in current}
+    cur.execute(
+        "SELECT datname,datallowconn FROM pg_catalog.pg_database "
+        "WHERE NOT datistemplate AND datname<>current_database() ORDER BY datname"
+    )
+    catalog = {_row_value(row, "datname"): bool(_row_value(row, "datallowconn", 1)) for row in cur.fetchall()}
+    if normalized_current == normalized_baseline and set(catalog) == set(baseline_database_names):
+        return
+
+    new_database_names = sorted(set(catalog) - set(baseline_database_names))
+    for database_name in new_database_names:
+        cur.execute(
+            sql.SQL("ALTER DATABASE {} CONNECTION LIMIT 0 ALLOW_CONNECTIONS false").format(
+                sql.Identifier(database_name)
+            )
+        )
+    for database_name, original in baseline_by_name.items():
+        if database_name not in catalog:
+            continue
+        if not catalog[database_name]:
+            cur.execute(
+                sql.SQL("ALTER DATABASE {} ALLOW_CONNECTIONS true CONNECTION LIMIT 0").format(
+                    sql.Identifier(database_name)
+                )
+            )
+        current_database = current_by_name.get(database_name)
+        if current_database is None or (
+            current_database["owner_role"] != original["owner_role"]
+            or current_database["acl_grants_before"] != original["acl_grants_before"]
+        ):
+            cur.execute(
+                sql.SQL("ALTER DATABASE {} OWNER TO {}").format(
+                    sql.Identifier(database_name),
+                    sql.Identifier(original["owner_role"]),
+                )
+            )
+            cur.execute(
+                "SELECT DISTINCT CASE WHEN acl.grantee=0 THEN 'PUBLIC' ELSE grantee.rolname END AS grantee "
+                "FROM pg_catalog.pg_database database "
+                "CROSS JOIN LATERAL pg_catalog.aclexplode("
+                "COALESCE(database.datacl,pg_catalog.acldefault('d',database.datdba))) acl "
+                "LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid=acl.grantee "
+                "WHERE database.datname=%s AND acl.privilege_type=ANY(%s) ORDER BY grantee",
+                (database_name, ["CONNECT", "CREATE", "TEMPORARY"]),
+            )
+            for row in cur.fetchall():
+                grantee_name = _row_value(row, "grantee")
+                grantee = sql.SQL("PUBLIC") if grantee_name == "PUBLIC" else sql.Identifier(grantee_name)
+                cur.execute(
+                    sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM {}").format(
+                        sql.Identifier(database_name), grantee
+                    )
+                )
+            for grant in original["acl_grants_before"]:
+                grantee = sql.SQL("PUBLIC") if grant["grantee"] == "PUBLIC" else sql.Identifier(grant["grantee"])
+                statement = sql.SQL("GRANT {} ON DATABASE {} TO {}").format(
+                    sql.SQL(grant["privilege"]), sql.Identifier(database_name), grantee
+                )
+                if grant["grantable"]:
+                    statement += sql.SQL(" WITH GRANT OPTION")
+                cur.execute(statement)
+    _terminate_and_validate_other_database_sessions(
+        cur,
+        databases=tuple({"database_name": database_name} for database_name in sorted(catalog)),
+        infrastructure_superuser_roles=infrastructure_superuser_roles,
+    )
+    raise CrossDatabaseInventoryDriftError(
+        "cross-database topology or ACL inventory changed after the admission fence committed; "
+        "the reconciled admission fence remains closed"
+    )
+
+
 def _isolate_other_databases(
     cur,
     *,
@@ -2733,13 +3096,19 @@ def _terminate_and_validate_other_database_sessions(
     failed = [
         f"{row['datname']}:{row['usename']}:{row['pid']}" for row in cur.fetchall() if not row["terminated"]
     ]
-    cur.execute(
-        "SELECT datname,usename,count(*) AS session_count FROM pg_stat_activity "
-        "WHERE datname=ANY(%s) AND pid<>pg_backend_pid() AND usename IS NOT NULL "
-        "AND usename<>ALL(%s) GROUP BY datname,usename ORDER BY datname,usename",
-        (database_names, allowed),
-    )
-    survivors = [f"{row['datname']}:{row['usename']}:{row['session_count']}" for row in cur.fetchall()]
+    survivors: list[str] = []
+    for attempt in range(41):
+        cur.execute("SELECT pg_stat_clear_snapshot()")
+        cur.execute(
+            "SELECT datname,usename,count(*) AS session_count FROM pg_stat_activity "
+            "WHERE datname=ANY(%s) AND pid<>pg_backend_pid() AND usename IS NOT NULL "
+            "AND usename<>ALL(%s) GROUP BY datname,usename ORDER BY datname,usename",
+            (database_names, allowed),
+        )
+        survivors = [f"{row['datname']}:{row['usename']}:{row['session_count']}" for row in cur.fetchall()]
+        if not survivors or attempt == 40:
+            break
+        cur.execute("SELECT pg_sleep(0.05)")
     if failed or survivors:
         raise RuntimeError(
             "cross-database admission fence could not clear non-breakglass sessions: "
@@ -2765,15 +3134,6 @@ def _validate_other_database_isolation(
     databases: tuple[dict[str, Any], ...],
     topology: BootstrapTopology,
 ) -> None:
-    protected_roles = (
-        topology.controller_role,
-        topology.verifier_role,
-        topology.migrator_role,
-        "brain_status_reader",
-        "brain_policy_controller",
-        BRAIN_CANDIDATE_READER_ROLE,
-        BRAIN_CANDIDATE_WRITER_ROLE,
-    )
     violations: list[str] = []
     for database in databases:
         cur.execute(
@@ -2785,19 +3145,23 @@ def _validate_other_database_isolation(
         violations.extend(
             f"{database['database_name']}:PUBLIC:{row['privilege_type']}" for row in cur.fetchall()
         )
-        for role_name in protected_roles:
-            cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,))
-            if cur.fetchone() is None:
-                continue
-            cur.execute(
-                "SELECT has_database_privilege(%s,%s,'CONNECT') AS allowed",
-                (role_name, database["database_name"]),
-            )
-            if _row_value(cur.fetchone(), "allowed"):
+        cur.execute(
+            "SELECT role.rolname,role.rolsuper,"
+            "pg_catalog.has_database_privilege(role.oid,database.oid,'CONNECT') AS allowed "
+            "FROM pg_catalog.pg_roles role CROSS JOIN pg_catalog.pg_database database "
+            "WHERE role.rolcanlogin AND database.datname=%s ORDER BY role.rolname",
+            (database["database_name"],),
+        )
+        allowed_roles = {database["owner_role"], *topology.infrastructure_superuser_roles}
+        for row in cur.fetchall():
+            role_name = _row_value(row, "rolname")
+            if _row_value(row, "allowed", 2) and role_name not in allowed_roles:
                 violations.append(f"{database['database_name']}:{role_name}")
+            if _row_value(row, "rolsuper", 1) and role_name not in topology.infrastructure_superuser_roles:
+                violations.append(f"{database['database_name']}:{role_name}:unapproved-superuser")
     if violations:
         raise RuntimeError(
-            "controller or brain capability retains CONNECT to another database: " + ", ".join(violations)
+            "login role retains effective CONNECT to another database: " + ", ".join(violations)
         )
 
 
@@ -2913,10 +3277,19 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
         raise RuntimeError("unknown explicit CONNECT dependencies block bootstrap: " + ", ".join(unknown_connect))
 
     ownership = _transfer_application_ownership(cur, new_owner_role=topology.migrator_role, apply=False)
+    retired_memberships = _retired_membership_inventory(
+        cur,
+        retired_admin_roles=topology.retired_admin_roles,
+    )
     other_databases = _other_database_inventory(
         cur,
         infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
     )
+    cur.execute(
+        "SELECT datname FROM pg_catalog.pg_database "
+        "WHERE NOT datistemplate AND datname<>current_database() ORDER BY datname"
+    )
+    cluster_database_names = tuple(_row_value(row, "datname") for row in cur.fetchall())
     return {
         "session_user": session_user,
         "database_name": _row_value(database, "database_name", 2),
@@ -2925,7 +3298,9 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
         "active_services": active_services,
         "direct_connect_before": direct_connect,
         "application_ownership": ownership,
+        "retired_admin_memberships_before": retired_memberships,
         "other_connectable_databases": other_databases,
+        "cluster_database_names_before": cluster_database_names,
     }
 
 
@@ -3055,6 +3430,7 @@ def bootstrap_database_roles(
         raise RuntimeError("bootstrap requires an idle provider-admin connection")
     verifier = _client_scram_verifier(conn, role_name=topology.controller_role, password=controller_password)
     fence_active = False
+    preserve_fence_on_failure = False
     lock_acquired = False
     try:
         with conn.cursor() as cur:
@@ -3064,6 +3440,7 @@ def bootstrap_database_roles(
             )
             lock_acquired = True
             cur.execute("SET LOCAL search_path=pg_catalog")
+            _lock_cluster_security_catalogs(cur)
             inventory = _bootstrap_inventory(cur, topology=topology)
             connect_allowlist = (
                 topology.database_owner_role,
@@ -3080,6 +3457,7 @@ def bootstrap_database_roles(
                     database_owner_before=inventory["database_owner_before"],
                     ownership=inventory["application_ownership"],
                     other_databases=inventory["other_connectable_databases"],
+                    retired_memberships=inventory["retired_admin_memberships_before"],
                 )
             else:
                 rollback_sql = _public_acl_rollback_sql(
@@ -3095,6 +3473,10 @@ def bootstrap_database_roles(
                     infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
                 )
                 rollback_sql += _bootstrap_object_rollback_sql(cur, inventory["application_ownership"])
+                rollback_sql += _retired_membership_rollback_sql(
+                    cur,
+                    memberships=inventory["retired_admin_memberships_before"],
+                )
                 for role_name in (
                     topology.controller_role,
                     topology.verifier_role,
@@ -3102,8 +3484,8 @@ def bootstrap_database_roles(
                     topology.database_owner_role,
                 ):
                     rollback_sql += (
-                        sql.SQL("DROP OWNED BY {};\nDROP ROLE {};\n")
-                        .format(sql.Identifier(role_name), sql.Identifier(role_name))
+                        sql.SQL("DROP ROLE IF EXISTS {};\n")
+                        .format(sql.Identifier(role_name))
                         .as_string(conn)
                     )
 
@@ -3139,6 +3521,18 @@ def bootstrap_database_roles(
 
         with conn.cursor() as cur:
             cur.execute("SET LOCAL search_path=pg_catalog")
+            _lock_cluster_security_catalogs(cur)
+            try:
+                _validate_other_database_inventory_unchanged(
+                    cur,
+                    baseline=inventory["other_connectable_databases"],
+                    baseline_database_names=inventory["cluster_database_names_before"],
+                    infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+                )
+            except CrossDatabaseInventoryDriftError:
+                conn.commit()
+                preserve_fence_on_failure = True
+                raise
             _terminate_and_validate_other_database_sessions(
                 cur,
                 databases=inventory["other_connectable_databases"],
@@ -3189,6 +3583,10 @@ def bootstrap_database_roles(
                         "ALTER ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
                     ).format(sql.Identifier(role_name))
                 )
+            _close_retired_admin_memberships(
+                cur,
+                retired_admin_roles=topology.retired_admin_roles,
+            )
             if install_brain_authority:
                 _install_brain_authority_in_transaction(cur, topology=topology)
             _validate_other_database_isolation(
@@ -3197,6 +3595,10 @@ def bootstrap_database_roles(
                 topology=topology,
             )
             effective = _validate_bootstrap_boundary(cur, topology=topology)
+            _validate_retired_admin_memberships_closed(
+                cur,
+                retired_admin_roles=topology.retired_admin_roles,
+            )
             _validate_other_database_fence(cur, databases=inventory["other_connectable_databases"])
             _terminate_and_validate_other_database_sessions(
                 cur,
@@ -3225,7 +3627,7 @@ def bootstrap_database_roles(
         )
     except BaseException:
         conn.rollback()
-        if fence_active:
+        if fence_active and not preserve_fence_on_failure:
             try:
                 with conn.transaction():
                     with conn.cursor() as cur:

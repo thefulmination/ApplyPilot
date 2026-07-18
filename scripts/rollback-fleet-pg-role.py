@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
 import tempfile
 
@@ -26,6 +27,16 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _hba_restore_supported() -> bool:
+    """HBA replacement requires descriptor-relative filesystem operations."""
+    return (
+        os.name != "nt"
+        and os.open in os.supports_dir_fd
+        and os.replace in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+
+
 def _read_bound_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result]:
     if not path.is_absolute() or path.resolve(strict=True) != path:
         raise SystemExit(f"{label} path must be absolute, canonical, and contain no symlinks")
@@ -33,6 +44,8 @@ def _read_bound_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_
     before = os.lstat(path)
     if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
         raise SystemExit(f"{label} parent must be a real directory")
+    if os.name != "nt" and stat.S_IMODE(parent.st_mode) & 0o022:
+        raise SystemExit(f"{label} parent directory must not be group/world writable")
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
         raise SystemExit(f"{label} must be a regular non-symlink file")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -111,12 +124,33 @@ def _replace_atomic(
     target_before = os.lstat(path)
     if not stat.S_ISDIR(parent_before.st_mode) or stat.S_ISLNK(parent_before.st_mode):
         raise RuntimeError("HBA parent must be a real directory")
+    if os.name != "nt" and stat.S_IMODE(parent_before.st_mode) & 0o022:
+        raise RuntimeError("HBA parent directory must not be group/world writable")
     if not stat.S_ISREG(target_before.st_mode) or stat.S_ISLNK(target_before.st_mode):
         raise RuntimeError("HBA target must be a regular non-symlink file")
     if (target_before.st_dev, target_before.st_ino) != expected_identity:
         raise RuntimeError("HBA target changed after validation")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".applypilot-hba-rollback-", dir=path.parent)
-    temporary = Path(temporary_name)
+    parent_descriptor: int | None = None
+    temporary: Path
+    if os.open in os.supports_dir_fd and os.replace in os.supports_dir_fd:
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (parent_before.st_dev, parent_before.st_ino):
+            os.close(parent_descriptor)
+            raise RuntimeError("HBA parent changed while being opened")
+        temporary = Path(f".applypilot-hba-rollback-{secrets.token_hex(16)}")
+        descriptor = os.open(
+            temporary.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    else:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".applypilot-hba-rollback-", dir=path.parent)
+        temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(payload)
@@ -131,15 +165,31 @@ def _replace_atomic(
             raise RuntimeError("HBA parent changed before replacement")
         if (target_after.st_dev, target_after.st_ino) != expected_identity:
             raise RuntimeError("HBA target changed before replacement")
-        os.replace(temporary, path)
-        _fsync_parent(path)
+        if parent_descriptor is not None:
+            os.replace(
+                temporary.name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            os.fsync(parent_descriptor)
+        else:
+            os.replace(temporary, path)
+            _fsync_parent(path)
         replaced = os.lstat(path)
         if stat.S_IMODE(replaced.st_mode) != replacement_mode:
             raise RuntimeError("HBA replacement mode verification failed")
         if (replaced.st_uid, replaced.st_gid) != replacement_owner:
             raise RuntimeError("HBA replacement ownership verification failed")
     finally:
-        temporary.unlink(missing_ok=True)
+        if parent_descriptor is not None:
+            try:
+                os.unlink(temporary.name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            os.close(parent_descriptor)
+        else:
+            temporary.unlink(missing_ok=True)
 
 
 def _validated_hba_restore(
@@ -186,8 +236,10 @@ def _validated_hba_restore(
     )
 
 
-def _restore_hba_and_reload(conn, receipt: dict) -> None:
-    hba_path, current, backup, identity, live_mode, backup_mode, owner = _validated_hba_restore(conn, receipt)
+def _restore_hba_and_reload(conn, receipt: dict, *, validated=None) -> None:
+    if validated is None:
+        validated = _validated_hba_restore(conn, receipt)
+    hba_path, current, backup, identity, live_mode, backup_mode, owner = validated
     _replace_atomic(
         hba_path,
         backup,
@@ -208,13 +260,28 @@ def _restore_hba_and_reload(conn, receipt: dict) -> None:
             replacement_mode=live_mode,
             replacement_owner=owner,
         )
-        with conn.transaction():
-            conn.execute("SELECT pg_reload_conf()")
-        raise RuntimeError("HBA reload failed; original HBA bytes were restored") from None
+        restore_reloaded = False
+        try:
+            with conn.transaction():
+                restore_reloaded = bool(
+                    conn.execute("SELECT pg_reload_conf() AS reloaded").fetchone()["reloaded"]
+                )
+        except BaseException:
+            restore_reloaded = False
+        if not restore_reloaded:
+            raise RuntimeError(
+                "HBA reload failed; original HBA bytes were restored on disk but active rules are uncertain"
+            ) from None
+        raise RuntimeError("HBA reload failed; original HBA bytes and active rules were restored") from None
 
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.restore_hba and not _hba_restore_supported():
+        raise SystemExit(
+            "secure HBA restoration is unsupported on this platform; "
+            "run database rollback without --restore-hba and restore HBA through a protected host procedure"
+        )
     authentication_key_hex = os.environ.pop("APPLYPILOT_ROLLBACK_HMAC_KEY_HEX", "")
     expected_key_id = os.environ.pop("APPLYPILOT_ROLLBACK_HMAC_KEY_ID", "")
     try:
@@ -246,13 +313,20 @@ def main() -> int:
             or identity["session_user"] not in _break_glass_roles(receipt)
         ):
             raise SystemExit("rollback session must be an explicitly receipted break-glass superuser")
+        hba_preflight = _validated_hba_restore(conn, receipt) if args.restore_hba else None
+        if hba_preflight is not None:
+            # SHOW hba_file starts an implicit psycopg transaction. Complete
+            # that read-only preflight before opening the atomic DB rollback.
+            conn.commit()
+            if conn.info.transaction_status.name != "IDLE":
+                raise RuntimeError("HBA preflight transaction did not return to idle state")
         # psycopg's transaction context is the executable equivalent of
         # psql --single-transaction --set=ON_ERROR_STOP=on.
         with conn.transaction():
             conn.execute(rollback_sql)
         if args.restore_hba:
             try:
-                _restore_hba_and_reload(conn, receipt)
+                _restore_hba_and_reload(conn, receipt, validated=hba_preflight)
             except BaseException as error:
                 raise RuntimeError(f"database rollback committed; HBA recovery failed: {error}") from error
     print("authenticated database rollback committed")

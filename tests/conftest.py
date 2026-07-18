@@ -236,6 +236,9 @@ def fleet_pg():
     ext = ".exe" if os.name == "nt" else ""
     initdb, pg_ctl = binp / f"initdb{ext}", binp / f"pg_ctl{ext}"
     datadir = Path(tempfile.mkdtemp(prefix="ap_fleetpg_"))
+    # Let initdb create the data directory so its service account receives the
+    # platform-native ACL instead of inheriting Python's private temp ACL.
+    datadir.rmdir()
     logfile = datadir / "server.log"
     pwfile = datadir.parent / f"{datadir.name}.pwfile"
     port = _free_port()
@@ -281,7 +284,8 @@ def fleet_pg():
         pwfile.unlink(missing_ok=True)
         log = logfile.read_text(encoding="utf-8", errors="replace") if logfile.exists() else ""
         shutil.rmtree(datadir, ignore_errors=True)
-        pytest.skip(f"could not start test Postgres (exit {e.returncode}):\n{log}")
+        details = "\n".join(part for part in (e.stdout, e.stderr, log) if part)
+        pytest.skip(f"could not start test Postgres (exit {e.returncode}):\n{details}")
 
     dsn = f"postgresql://postgres:{_TEST_PG_PASSWORD}@127.0.0.1:{port}/postgres"
     _FLEET_PG_LOGFILE = logfile

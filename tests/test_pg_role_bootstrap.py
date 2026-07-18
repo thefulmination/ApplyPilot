@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
@@ -362,6 +363,8 @@ def test_rollback_commits_database_before_hba_restore(tmp_path: Path, monkeypatc
             return False
 
     class FakeConnection:
+        info = type("Info", (), {"transaction_status": type("Status", (), {"name": "IDLE"})()})()
+
         def __enter__(self):
             return self
 
@@ -388,7 +391,17 @@ def test_rollback_commits_database_before_hba_restore(tmp_path: Path, monkeypatc
         ),
     )
     monkeypatch.setattr(module.psycopg, "connect", lambda *_args, **_kwargs: FakeConnection())
-    monkeypatch.setattr(module, "_restore_hba_and_reload", lambda *_args: events.append("hba_restore"))
+    monkeypatch.setattr(
+        module,
+        "_validated_hba_restore",
+        lambda *_args: events.append("hba_preflight") or ("validated",),
+    )
+    monkeypatch.setattr(
+        module,
+        "_restore_hba_and_reload",
+        lambda *_args, **_kwargs: events.append("hba_restore"),
+    )
+    monkeypatch.setattr(module, "_hba_restore_supported", lambda: True)
     monkeypatch.setenv("APPLYPILOT_ROLLBACK_HMAC_KEY_HEX", _EVIDENCE_KEY.hex())
     monkeypatch.setenv("APPLYPILOT_ROLLBACK_HMAC_KEY_ID", _EVIDENCE_KEY_ID)
     monkeypatch.setenv("APPLYPILOT_ADMIN_PG_DSN", "postgresql://trusted-break-glass")
@@ -406,8 +419,101 @@ def test_rollback_commits_database_before_hba_restore(tmp_path: Path, monkeypatc
     )
 
     assert module.main() == 0
+    assert events.index("hba_preflight") < events.index("database_transaction_enter")
     assert events.index("database_rollback_sql") < events.index("database_transaction_commit")
     assert events.index("database_transaction_commit") < events.index("hba_restore")
+
+
+def test_real_rollback_commit_is_visible_before_hba_replacement(
+    fleet_db: str, tmp_path: Path, monkeypatch
+) -> None:
+    module = _rollback_script_module()
+    marker = "applypilot_real_rollback_commit_probe"
+    with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cleanup:
+        cleanup.execute(sql.SQL("DROP TABLE IF EXISTS public.{} CASCADE").format(sql.Identifier(marker)))
+
+    monkeypatch.setattr(
+        module,
+        "_verified_inputs",
+        lambda *_args, **_kwargs: (
+            {"topology": {"infrastructure_superuser_roles": ["postgres"]}},
+            sql.SQL("CREATE TABLE public.{} (observed boolean NOT NULL)")
+            .format(sql.Identifier(marker))
+            .as_string(None),
+        ),
+    )
+
+    def preflight(conn, _receipt):
+        conn.execute("SHOW hba_file").fetchone()
+        assert conn.info.transaction_status.name == "INTRANS"
+        return ("validated",)
+
+    replacement_observed = False
+
+    def observe_committed_rollback(_conn, _receipt, *, validated):
+        nonlocal replacement_observed
+        assert validated == ("validated",)
+        with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as observer:
+            replacement_observed = observer.execute(
+                "SELECT to_regclass(%s) IS NOT NULL AS committed",
+                (f"public.{marker}",),
+            ).fetchone()["committed"]
+
+    monkeypatch.setattr(module, "_validated_hba_restore", preflight)
+    monkeypatch.setattr(module, "_restore_hba_and_reload", observe_committed_rollback)
+    monkeypatch.setattr(module, "_hba_restore_supported", lambda: True)
+    monkeypatch.setenv("APPLYPILOT_ROLLBACK_HMAC_KEY_HEX", _EVIDENCE_KEY.hex())
+    monkeypatch.setenv("APPLYPILOT_ROLLBACK_HMAC_KEY_ID", _EVIDENCE_KEY_ID)
+    monkeypatch.setenv("APPLYPILOT_ADMIN_PG_DSN", fleet_db)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rollback-fleet-pg-role.py",
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+            "--rollback-sql",
+            str(tmp_path / "rollback.sql"),
+            "--restore-hba",
+        ],
+    )
+    try:
+        assert module.main() == 0
+        assert replacement_observed is True
+    finally:
+        with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cleanup:
+            cleanup.execute(sql.SQL("DROP TABLE IF EXISTS public.{} CASCADE").format(sql.Identifier(marker)))
+
+
+def test_rollback_rejects_hba_restore_on_windows_before_database_access(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _rollback_script_module()
+    database_accessed = False
+
+    def unexpected_inputs(*_args, **_kwargs):
+        nonlocal database_accessed
+        database_accessed = True
+        raise AssertionError("database inputs must not be opened")
+
+    monkeypatch.setattr(module, "_verified_inputs", unexpected_inputs)
+    monkeypatch.setattr(module.os, "name", "nt")
+    assert module._hba_restore_supported() is False
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rollback-fleet-pg-role.py",
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+            "--rollback-sql",
+            str(tmp_path / "rollback.sql"),
+            "--restore-hba",
+        ],
+    )
+    with pytest.raises(SystemExit, match="secure HBA restoration is unsupported"):
+        module.main()
+    assert database_accessed is False
 
 
 def test_partial_evidence_failure_removes_created_rollback(tmp_path: Path, monkeypatch) -> None:
@@ -440,6 +546,61 @@ def test_partial_evidence_failure_removes_created_rollback(tmp_path: Path, monke
         )
     assert not paths.rollback_sql_path.exists()
     assert not paths.preparation_receipt_path.exists()
+
+
+def test_evidence_write_fails_closed_after_parent_identity_substitution(tmp_path: Path, monkeypatch) -> None:
+    target = (tmp_path / "receipt.json").resolve()
+    expected = pg_roles._evidence_parent_identity(target.parent)
+    monkeypatch.setattr(
+        pg_roles,
+        "_evidence_parent_identity",
+        lambda _parent: (expected[0], expected[1], expected[2] + 1),
+    )
+    with pytest.raises(RuntimeError, match="parent directory changed"):
+        pg_roles._write_exclusive_fsync(
+            target,
+            b"evidence",
+            expected_parent_identity=expected,
+        )
+    assert not target.exists()
+
+
+def test_hba_second_reload_failure_reports_active_rule_uncertainty(monkeypatch) -> None:
+    module = _rollback_script_module()
+    replacements: list[bytes] = []
+
+    class FakeResult:
+        def fetchone(self):
+            return {"reloaded": False}
+
+    class FakeTransaction:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeConnection:
+        def execute(self, _statement):
+            return FakeResult()
+
+        def transaction(self):
+            return FakeTransaction()
+
+    monkeypatch.setattr(
+        module,
+        "_replace_atomic",
+        lambda _path, payload, **_kwargs: replacements.append(payload),
+    )
+    monkeypatch.setattr(
+        module.os,
+        "lstat",
+        lambda _path: type("Stat", (), {"st_dev": 1, "st_ino": 2})(),
+    )
+    validated = (Path("C:/pg_hba.conf"), b"current", b"backup", (1, 1), 0o600, 0o600, (0, 0))
+    with pytest.raises(RuntimeError, match="active rules are uncertain"):
+        module._restore_hba_and_reload(FakeConnection(), {}, validated=validated)
+    assert replacements == [b"backup", b"current"]
 
 
 def test_bootstrap_refuses_autocommit_before_database_mutation(fleet_db: str) -> None:
@@ -552,6 +713,171 @@ def _drop_atomic_bootstrap_roles(conn) -> None:
         "owner_create_grant": True,
     }
     conn.commit()
+
+
+def _seed_v5_rollback_preservation_rows(conn) -> dict[str, object]:
+    def artifact(label: str) -> str:
+        digest = hashlib.sha256(label.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO public.brain_artifacts("
+            "request_id,artifact_hash,media_type,byte_length,schema_version,location) "
+            "VALUES(%s,%s,'application/json',1,1,'rollback-preservation') ON CONFLICT DO NOTHING",
+            (f"rollback-preservation-{label}", digest),
+        )
+        return digest
+
+    owner = "rollback-preservation-owner"
+    ontology = "rollback-preservation-ontology-v1"
+    generation = "rollback-preservation-generation-v1"
+    span = "rollback-preservation-span-v1"
+    event = "rollback-preservation-event-v1"
+    snapshot = "rollback-preservation-snapshot-v1"
+    manifest = artifact("ontology-manifest")
+    term_digest = hashlib.sha256(b"rollback-preservation-term").hexdigest()
+    term_id = f"skill:{term_digest}"
+    conn.execute(
+        "SELECT public.brain_create_factual_ontology(%s,%s,%s)",
+        (owner, ontology, manifest),
+    )
+    conn.execute(
+        "SELECT public.brain_add_factual_ontology_term("
+        "%s,%s,%s,'has_skill','skill',%s,%s,'Rollback preservation skill',%s)",
+        (owner, ontology, manifest, term_digest, term_id, artifact("ontology-term")),
+    )
+    ontology_root = conn.execute(
+        "SELECT public.brain_compute_factual_ontology_root(%s,%s) AS root",
+        (owner, ontology),
+    ).fetchone()["root"]
+    conn.execute(
+        "SELECT public.brain_close_factual_ontology(%s,%s,1,%s,%s)",
+        (owner, ontology, ontology_root, artifact("ontology-close")),
+    )
+    generation_manifest = artifact("generation-manifest")
+    conn.execute(
+        "SELECT public.brain_create_factual_generation(%s,%s,%s,%s,%s)",
+        (owner, generation, generation_manifest, ontology, ontology_root),
+    )
+    source = artifact("source")
+    conn.execute(
+        "SELECT public.brain_add_factual_generation_member(%s,%s,%s,%s,'resume',0)",
+        (owner, generation, span, source),
+    )
+    membership_root = conn.execute(
+        "SELECT public.brain_compute_factual_membership_root(%s,%s) AS root",
+        (owner, generation),
+    ).fetchone()["root"]
+    conn.execute(
+        "SELECT public.brain_close_factual_generation(%s,%s,1,%s,%s)",
+        (owner, generation, membership_root, artifact("generation-close")),
+    )
+    approval = "rollback-preservation-approval-v1"
+    conn.execute(
+        "SELECT public.brain_admit_factual_event("
+        "%s,%s,%s,%s,%s,%s,%s,'resume',%s,'has_skill',%s,%s,%s,1,'assert',NULL,%s)",
+        (
+            owner,
+            generation,
+            span,
+            approval,
+            artifact("approval-receipt"),
+            hashlib.sha256(b"rollback-preservation-claim").hexdigest(),
+            source,
+            ontology,
+            term_id,
+            event,
+            artifact("event"),
+            datetime.now(UTC) - timedelta(seconds=1),
+        ),
+    )
+    conn.execute(
+        "SELECT public.brain_record_factual_assertion_coverage(%s,%s,%s,%s)",
+        (owner, generation, span, event),
+    )
+    semantic_root = conn.execute(
+        "SELECT public.brain_compute_factual_semantic_root(%s,%s) AS root",
+        (owner, generation),
+    ).fetchone()["root"]
+    conn.execute(
+        "SELECT public.brain_publish_factual_snapshot("
+        "%s,%s,%s,%s,%s,%s,1,clock_timestamp(),NULL,%s)",
+        (
+            owner,
+            snapshot,
+            generation,
+            semantic_root,
+            artifact("coverage"),
+            membership_root,
+            artifact("snapshot"),
+        ),
+    )
+    immutable_artifact = artifact("immutable-reference")
+    conn.execute(
+        "INSERT INTO public.brain_immutable_artifact_references(artifact_hash,reference_type,subject_id) "
+        "VALUES(%s,'candidate_payload','rollback-preservation-candidate-v1')",
+        (immutable_artifact,),
+    )
+    conn.commit()
+    return {
+        "generation": conn.execute(
+            "SELECT owner_id,generation_id,membership_manifest_hash,ontology_version,ontology_root_hash "
+            "FROM public.brain_factual_generations WHERE owner_id=%s AND generation_id=%s",
+            (owner, generation),
+        ).fetchone(),
+        "fact": conn.execute(
+            "SELECT owner_id,generation_id,source_span_id,event_id,mutation_action "
+            "FROM public.brain_graph_fact_events WHERE owner_id=%s AND event_id=%s",
+            (owner, event),
+        ).fetchone(),
+        "coverage": conn.execute(
+            "SELECT owner_id,generation_id,source_span_id,disposition,event_id "
+            "FROM public.brain_factual_generation_coverage WHERE owner_id=%s AND generation_id=%s",
+            (owner, generation),
+        ).fetchone(),
+        "snapshot": conn.execute(
+            "SELECT owner_id,graph_snapshot_id,generation_id,semantic_root_hash,membership_root_hash,event_high_water "
+            "FROM public.brain_factual_graph_snapshots WHERE owner_id=%s AND graph_snapshot_id=%s",
+            (owner, snapshot),
+        ).fetchone(),
+        "immutable": conn.execute(
+            "SELECT artifact_hash,reference_type,subject_id FROM public.brain_immutable_artifact_references "
+            "WHERE artifact_hash=%s",
+            (immutable_artifact,),
+        ).fetchone(),
+    }
+
+
+def _read_v5_rollback_preservation_rows(conn, expected: dict[str, object]) -> dict[str, object]:
+    generation = expected["generation"]
+    fact = expected["fact"]
+    snapshot = expected["snapshot"]
+    immutable = expected["immutable"]
+    return {
+        "generation": conn.execute(
+            "SELECT owner_id,generation_id,membership_manifest_hash,ontology_version,ontology_root_hash "
+            "FROM public.brain_factual_generations WHERE owner_id=%s AND generation_id=%s",
+            (generation["owner_id"], generation["generation_id"]),
+        ).fetchone(),
+        "fact": conn.execute(
+            "SELECT owner_id,generation_id,source_span_id,event_id,mutation_action "
+            "FROM public.brain_graph_fact_events WHERE owner_id=%s AND event_id=%s",
+            (fact["owner_id"], fact["event_id"]),
+        ).fetchone(),
+        "coverage": conn.execute(
+            "SELECT owner_id,generation_id,source_span_id,disposition,event_id "
+            "FROM public.brain_factual_generation_coverage WHERE owner_id=%s AND generation_id=%s",
+            (generation["owner_id"], generation["generation_id"]),
+        ).fetchone(),
+        "snapshot": conn.execute(
+            "SELECT owner_id,graph_snapshot_id,generation_id,semantic_root_hash,membership_root_hash,event_high_water "
+            "FROM public.brain_factual_graph_snapshots WHERE owner_id=%s AND graph_snapshot_id=%s",
+            (snapshot["owner_id"], snapshot["graph_snapshot_id"]),
+        ).fetchone(),
+        "immutable": conn.execute(
+            "SELECT artifact_hash,reference_type,subject_id FROM public.brain_immutable_artifact_references "
+            "WHERE artifact_hash=%s",
+            (immutable["artifact_hash"],),
+        ).fetchone(),
+    }
 
 
 def test_fixed_atomic_authority_install_failure_rolls_back_everything(fleet_db: str, monkeypatch) -> None:
@@ -668,9 +994,14 @@ def test_atomic_bootstrap_removes_provider_admin_membership_after_v5_install(fle
                 ).fetchone()["count"]
                 == 0
             )
+            preserved_v5_rows = _seed_v5_rollback_preservation_rows(root)
             assert "DROP OWNED" not in receipt.rollback_sql.upper()
             root.execute(receipt.rollback_sql)
             root.commit()
+            assert _read_v5_rollback_preservation_rows(root, preserved_v5_rows) == preserved_v5_rows
+            root.execute(receipt.rollback_sql)
+            root.commit()
+            assert _read_v5_rollback_preservation_rows(root, preserved_v5_rows) == preserved_v5_rows
             assert root.execute(
                 "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
             ).fetchone()["versions"] == [1, 2, 3, 4, 5]
@@ -691,6 +1022,215 @@ def test_atomic_bootstrap_removes_provider_admin_membership_after_v5_install(fle
             ).fetchone()["allowed"] is False
         finally:
             _drop_atomic_bootstrap_roles(root)
+
+
+def test_prepared_forward_rollback_is_idempotent_after_fence_only_commit(fleet_db: str) -> None:
+    topology = _atomic_topology()
+    with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
+        require_disposable_postgres(cluster_admin)
+        cluster_admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(CROSS_DATABASE)))
+    try:
+        with pgqueue.connect(fleet_db) as root:
+            root.execute(
+                sql.SQL("CREATE ROLE {} LOGIN SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS").format(
+                    sql.Identifier(ATOMIC_RETIRED_ADMIN)
+                )
+            )
+            _create_atomic_lifecycle_roles(root)
+            root.commit()
+            inventory = pg_roles._bootstrap_inventory(root.cursor(), topology=topology)
+            rollback_sql = pg_roles._forward_v5_deactivation_sql(
+                root.cursor(),
+                topology=topology,
+                database_name=inventory["database_name"],
+                database_owner_before=inventory["database_owner_before"],
+                ownership=inventory["application_ownership"],
+                other_databases=inventory["other_connectable_databases"],
+                retired_memberships=inventory["retired_admin_memberships_before"],
+            )
+            pg_roles._set_other_database_admission_fence(
+                root.cursor(),
+                databases=inventory["other_connectable_databases"],
+            )
+            root.commit()
+            assert root.execute(
+                "SELECT datconnlimit FROM pg_database WHERE datname=%s",
+                (CROSS_DATABASE,),
+            ).fetchone()["datconnlimit"] == 0
+
+            root.execute(rollback_sql)
+            root.commit()
+            root.execute(rollback_sql)
+            root.commit()
+            assert root.execute(
+                "SELECT datconnlimit FROM pg_database WHERE datname=%s",
+                (CROSS_DATABASE,),
+            ).fetchone()["datconnlimit"] == -1
+            assert root.execute(
+                "SELECT count(*) AS count FROM pg_roles WHERE rolname=ANY(%s)",
+                ([ATOMIC_OWNER, ATOMIC_CONTROLLER, "brain_schema_verifier", "brain_schema_migrator"],),
+            ).fetchone()["count"] == 0
+    finally:
+        with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
+            cluster_admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(CROSS_DATABASE)))
+            for role_name in (*ATOMIC_LIFECYCLE_ROLES, ATOMIC_RETIRED_ADMIN):
+                if cluster_admin.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    cluster_admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+
+
+def test_post_fence_inventory_rejects_new_database_and_acl_drift(fleet_db: str) -> None:
+    topology = _atomic_topology()
+    drift_database = "applypilot_post_fence_drift_test"
+    drift_role = "applypilot_post_fence_grantee_test"
+    with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
+        require_disposable_postgres(cluster_admin)
+        cluster_admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(CROSS_DATABASE)))
+        cluster_admin.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(drift_role)))
+    try:
+        with pgqueue.connect(fleet_db) as root:
+            root.execute(
+                sql.SQL("CREATE ROLE {} LOGIN SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS").format(
+                    sql.Identifier(ATOMIC_RETIRED_ADMIN)
+                )
+            )
+            root.commit()
+            inventory = pg_roles._bootstrap_inventory(root.cursor(), topology=topology)
+            pg_roles._set_other_database_admission_fence(
+                root.cursor(), databases=inventory["other_connectable_databases"]
+            )
+            root.commit()
+            with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as concurrent:
+                concurrent.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(drift_database)))
+                concurrent.execute(
+                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                        sql.Identifier(CROSS_DATABASE), sql.Identifier(drift_role)
+                    )
+                )
+            pg_roles._lock_cluster_security_catalogs(root.cursor())
+            with pytest.raises(pg_roles.CrossDatabaseInventoryDriftError, match="fence remains closed"):
+                pg_roles._validate_other_database_inventory_unchanged(
+                    root.cursor(),
+                    baseline=inventory["other_connectable_databases"],
+                    baseline_database_names=inventory["cluster_database_names_before"],
+                    infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+                )
+            root.commit()
+            fenced = root.execute(
+                "SELECT datname,datallowconn,datconnlimit FROM pg_database WHERE datname=ANY(%s) ORDER BY datname",
+                ([CROSS_DATABASE, drift_database],),
+            ).fetchall()
+            assert fenced == [
+                {"datname": drift_database, "datallowconn": False, "datconnlimit": 0},
+                {"datname": CROSS_DATABASE, "datallowconn": True, "datconnlimit": 0},
+            ]
+            assert root.execute(
+                "SELECT count(*) AS count FROM pg_database database "
+                "CROSS JOIN LATERAL aclexplode(database.datacl) acl "
+                "WHERE database.datname=%s AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s) "
+                "AND acl.privilege_type='CONNECT'",
+                (CROSS_DATABASE, drift_role),
+            ).fetchone()["count"] == 0
+            pg_roles._restore_other_database_admission_fence(
+                root.cursor(), databases=inventory["other_connectable_databases"]
+            )
+            root.commit()
+    finally:
+        with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
+            for database_name in (drift_database, CROSS_DATABASE):
+                cluster_admin.execute(
+                    sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database_name))
+                )
+            for role_name in (ATOMIC_RETIRED_ADMIN, drift_role):
+                if cluster_admin.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    cluster_admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+
+
+def test_post_fence_new_database_session_is_terminated_before_closed_fence_commit(fleet_db: str) -> None:
+    drift_database = "applypilot_post_fence_live_drift_test"
+    drift_role = "applypilot_post_fence_live_role_test"
+    password = "applypilot-post-fence-live-password"
+    topology = _atomic_topology()
+    active_connection = None
+    baseline_connection = None
+    with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
+        require_disposable_postgres(cluster_admin)
+        cluster_admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(CROSS_DATABASE)))
+        cluster_admin.execute(
+            sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                sql.Identifier(drift_role), sql.Literal(password)
+            )
+        )
+    try:
+        with pgqueue.connect(fleet_db) as root:
+            root.execute(
+                sql.SQL("CREATE ROLE {} LOGIN SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS").format(
+                    sql.Identifier(ATOMIC_RETIRED_ADMIN)
+                )
+            )
+            root.commit()
+            inventory = pg_roles._bootstrap_inventory(root.cursor(), topology=topology)
+            baseline_parameters = conninfo_to_dict(fleet_db)
+            baseline_parameters.update(dbname=CROSS_DATABASE, user=drift_role, password=password)
+            baseline_connection = psycopg.connect(make_conninfo(**baseline_parameters), row_factory=dict_row)
+            assert baseline_connection.execute("SELECT 1 AS alive").fetchone()["alive"] == 1
+            pg_roles._set_other_database_admission_fence(
+                root.cursor(), databases=inventory["other_connectable_databases"]
+            )
+            root.commit()
+            with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as concurrent:
+                concurrent.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(drift_database)))
+                concurrent.execute(
+                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                        sql.Identifier(drift_database), sql.Identifier(drift_role)
+                    )
+                )
+            active_parameters = conninfo_to_dict(fleet_db)
+            active_parameters.update(dbname=drift_database, user=drift_role, password=password)
+            active_connection = psycopg.connect(make_conninfo(**active_parameters), row_factory=dict_row)
+            assert active_connection.execute("SELECT 1 AS alive").fetchone()["alive"] == 1
+            with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as concurrent:
+                concurrent.execute(
+                    sql.SQL("ALTER DATABASE {} ALLOW_CONNECTIONS false").format(
+                        sql.Identifier(drift_database)
+                    )
+                )
+
+            pg_roles._lock_cluster_security_catalogs(root.cursor())
+            with pytest.raises(pg_roles.CrossDatabaseInventoryDriftError, match="fence remains closed"):
+                pg_roles._validate_other_database_inventory_unchanged(
+                    root.cursor(),
+                    baseline=inventory["other_connectable_databases"],
+                    baseline_database_names=inventory["cluster_database_names_before"],
+                    infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+                )
+            root.commit()
+            closed = root.execute(
+                "SELECT datallowconn,datconnlimit FROM pg_database WHERE datname=%s",
+                (drift_database,),
+            ).fetchone()
+            assert closed == {"datallowconn": False, "datconnlimit": 0}
+            with pytest.raises(psycopg.OperationalError):
+                active_connection.execute("SELECT 1")
+            with pytest.raises(psycopg.OperationalError):
+                baseline_connection.execute("SELECT 1")
+            assert root.execute(
+                "SELECT count(*) AS count FROM pg_stat_activity WHERE datname=ANY(%s) AND usename=%s",
+                ([drift_database, CROSS_DATABASE], drift_role),
+            ).fetchone()["count"] == 0
+    finally:
+        if active_connection is not None:
+            active_connection.close()
+        if baseline_connection is not None:
+            baseline_connection.close()
+        with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
+            for database_name in (drift_database, CROSS_DATABASE):
+                cluster_admin.execute(
+                    sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(database_name))
+                )
+            for role_name in (ATOMIC_RETIRED_ADMIN, drift_role):
+                if cluster_admin.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    cluster_admin.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role_name)))
+                    cluster_admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
 
 
 def test_bootstrap_isolates_other_database_and_rollback_restores_public_connect(
@@ -818,7 +1358,7 @@ def test_bootstrap_isolates_other_database_and_rollback_restores_public_connect(
             require_disposable_postgres(cluster_admin)
 
 
-def test_bootstrap_rejects_active_nonbreakglass_session_on_other_database(fleet_db: str) -> None:
+def test_bootstrap_terminates_active_nonbreakglass_session_on_other_database(fleet_db: str) -> None:
     password = "active-other-database-password"
     topology = _atomic_topology()
     evidence_paths = _test_evidence_paths()
@@ -847,13 +1387,18 @@ def test_bootstrap_rejects_active_nonbreakglass_session_on_other_database(fleet_
                 )
             )
             root.commit()
-            with pytest.raises(RuntimeError, match="could not clear non-breakglass sessions"):
-                pg_roles.bootstrap_database_roles(
-                    root,
-                    CONTROLLER_PASSWORD,
-                    topology=topology,
-                    evidence_paths=evidence_paths,
-                )
+            receipt = pg_roles.bootstrap_database_roles(
+                root,
+                CONTROLLER_PASSWORD,
+                topology=topology,
+                evidence_paths=evidence_paths,
+            )
+            with pytest.raises(psycopg.OperationalError):
+                active_connection.execute("SELECT 1")
+            assert root.execute(
+                "SELECT count(*) AS count FROM pg_stat_activity WHERE datname=%s AND usename=%s",
+                (ACTIVE_DATABASE, ACTIVE_DATABASE_ROLE),
+            ).fetchone()["count"] == 0
             assert evidence_paths.preparation_receipt_path.exists()
             assert evidence_paths.rollback_sql_path.exists()
             prepared = json.loads(evidence_paths.preparation_receipt_path.read_text(encoding="utf-8"))
@@ -867,6 +1412,8 @@ def test_bootstrap_rejects_active_nonbreakglass_session_on_other_database(fleet_
             assert prepared["rollback_sql_sha256"] == hashlib.sha256(
                 evidence_paths.rollback_sql_path.read_bytes()
             ).hexdigest()
+            root.execute(receipt.rollback_sql)
+            root.commit()
     finally:
         active_connection.close()
         with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cluster_admin:
@@ -879,6 +1426,267 @@ def test_bootstrap_rejects_active_nonbreakglass_session_on_other_database(fleet_
                     cluster_admin.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role_name)))
                     cluster_admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
             require_disposable_postgres(cluster_admin)
+
+
+def test_other_database_validation_catches_inherited_connect_for_arbitrary_login(fleet_db: str) -> None:
+    parent_role = "applypilot_inherited_connect_parent_test"
+    login_role = "applypilot_inherited_connect_login_test"
+    topology = _atomic_topology()
+    with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as root:
+        require_disposable_postgres(root)
+        root.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(CROSS_DATABASE)))
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(parent_role)))
+        root.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(login_role)))
+        root.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(parent_role), sql.Identifier(login_role)))
+        root.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(CROSS_DATABASE), sql.Identifier(parent_role)
+            )
+        )
+        baseline = pg_roles._other_database_inventory(
+            root.cursor(), infrastructure_superuser_roles=("postgres",)
+        )
+        with pytest.raises(RuntimeError, match="effective CONNECT"):
+            pg_roles._validate_other_database_isolation(
+                root.cursor(), databases=baseline, topology=topology
+            )
+        root.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(CROSS_DATABASE)))
+        root.execute(sql.SQL("REVOKE {} FROM {}").format(sql.Identifier(parent_role), sql.Identifier(login_role)))
+        root.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(login_role)))
+        root.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(parent_role)))
+
+
+def test_bootstrap_closes_and_rollback_restores_retired_admin_membership_edges(fleet_db: str) -> None:
+    parent_role = "applypilot_retired_parent_test"
+    member_role = "applypilot_retired_member_test"
+    topology = _atomic_topology()
+    with pgqueue.connect(fleet_db) as root:
+        require_disposable_postgres(root)
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(parent_role)))
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(member_role)))
+        root.execute(
+            sql.SQL("CREATE ROLE {} LOGIN SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS").format(
+                sql.Identifier(ATOMIC_RETIRED_ADMIN)
+            )
+        )
+        root.execute(
+            sql.SQL("GRANT {} TO {}").format(
+                sql.Identifier(ATOMIC_RETIRED_ADMIN), sql.Identifier(member_role)
+            )
+        )
+        root.execute(
+            sql.SQL("GRANT {} TO {}").format(
+                sql.Identifier(parent_role), sql.Identifier(ATOMIC_RETIRED_ADMIN)
+            )
+        )
+        root.commit()
+        before = pg_roles._retired_membership_inventory(
+            root.cursor(), retired_admin_roles=(ATOMIC_RETIRED_ADMIN,)
+        )
+        root.commit()
+        try:
+            receipt = pg_roles.bootstrap_database_roles(
+                root,
+                CONTROLLER_PASSWORD,
+                topology=topology,
+                evidence_paths=_test_evidence_paths(),
+            )
+            assert pg_roles._retired_membership_inventory(
+                root.cursor(), retired_admin_roles=(ATOMIC_RETIRED_ADMIN,)
+            ) == ()
+            root.execute(receipt.rollback_sql)
+            root.commit()
+            assert pg_roles._retired_membership_inventory(
+                root.cursor(), retired_admin_roles=(ATOMIC_RETIRED_ADMIN,)
+            ) == before
+        finally:
+            root.rollback()
+            require_disposable_postgres(root)
+            for parent, member in (
+                (ATOMIC_RETIRED_ADMIN, member_role),
+                (parent_role, ATOMIC_RETIRED_ADMIN),
+            ):
+                root.execute(
+                    sql.SQL("REVOKE {} FROM {}").format(sql.Identifier(parent), sql.Identifier(member))
+                )
+            for role_name in (
+                ATOMIC_CONTROLLER,
+                "brain_schema_verifier",
+                "brain_schema_migrator",
+                ATOMIC_OWNER,
+                ATOMIC_RETIRED_ADMIN,
+                member_role,
+                parent_role,
+            ):
+                if root.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    root.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+            root.commit()
+
+
+def test_retired_membership_rollback_preserves_grantor_and_supported_options(fleet_db: str) -> None:
+    parent_role = "applypilot_retired_option_parent_test"
+    grantor_role = "applypilot_retired_option_grantor_test"
+    topology = _atomic_topology()
+    with pgqueue.connect(fleet_db) as root:
+        require_disposable_postgres(root)
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(parent_role)))
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(grantor_role)))
+        root.execute(
+            sql.SQL("GRANT {} TO {} WITH ADMIN OPTION").format(
+                sql.Identifier(parent_role), sql.Identifier(grantor_role)
+            )
+        )
+        root.execute(
+            sql.SQL("CREATE ROLE {} LOGIN SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS").format(
+                sql.Identifier(ATOMIC_RETIRED_ADMIN)
+            )
+        )
+        root.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(grantor_role)))
+        root.execute(
+            sql.SQL("GRANT {} TO {} WITH ADMIN TRUE").format(
+                sql.Identifier(parent_role), sql.Identifier(ATOMIC_RETIRED_ADMIN)
+            )
+        )
+        supports_membership_options = root.execute(
+            "SELECT count(*)=2 AS supported FROM pg_attribute "
+            "WHERE attrelid='pg_catalog.pg_auth_members'::regclass "
+            "AND attname=ANY(%s) AND NOT attisdropped",
+            (["inherit_option", "set_option"],),
+        ).fetchone()["supported"]
+        if supports_membership_options:
+            root.execute(
+                sql.SQL("GRANT {} TO {} WITH INHERIT FALSE").format(
+                    sql.Identifier(parent_role), sql.Identifier(ATOMIC_RETIRED_ADMIN)
+                )
+            )
+            root.execute(
+                sql.SQL("GRANT {} TO {} WITH SET FALSE").format(
+                    sql.Identifier(parent_role), sql.Identifier(ATOMIC_RETIRED_ADMIN)
+                )
+            )
+        root.execute("RESET ROLE")
+        root.commit()
+        before = pg_roles._retired_membership_inventory(
+            root.cursor(), retired_admin_roles=(ATOMIC_RETIRED_ADMIN,)
+        )
+        root.commit()
+        try:
+            receipt = pg_roles.bootstrap_database_roles(
+                root,
+                CONTROLLER_PASSWORD,
+                topology=topology,
+                evidence_paths=_test_evidence_paths(),
+            )
+            assert pg_roles._retired_membership_inventory(
+                root.cursor(), retired_admin_roles=(ATOMIC_RETIRED_ADMIN,)
+            ) == ()
+            root.execute(receipt.rollback_sql)
+            root.commit()
+            assert pg_roles._retired_membership_inventory(
+                root.cursor(), retired_admin_roles=(ATOMIC_RETIRED_ADMIN,)
+            ) == before
+            edge = next(item for item in before if item["member_role"] == ATOMIC_RETIRED_ADMIN)
+            assert edge["grantor_role"] == grantor_role
+            assert edge["admin_option"] is True
+            if supports_membership_options:
+                assert edge["inherit_option"] is False
+                assert edge["set_option"] is False
+        finally:
+            root.rollback()
+            require_disposable_postgres(root)
+            database_name = conninfo_to_dict(fleet_db)["dbname"]
+            root.execute(sql.SQL("ALTER DATABASE {} OWNER TO postgres").format(sql.Identifier(database_name)))
+            pg_roles._transfer_application_ownership(root.cursor(), new_owner_role="postgres")
+            for role_name in (
+                ATOMIC_CONTROLLER,
+                "brain_schema_verifier",
+                "brain_schema_migrator",
+                ATOMIC_OWNER,
+                ATOMIC_RETIRED_ADMIN,
+                grantor_role,
+                parent_role,
+            ):
+                if root.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    root.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role_name)))
+                    root.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+            root.commit()
+
+
+def test_retired_membership_closure_fails_without_cascading_dependent_grants(fleet_db: str) -> None:
+    parent_role = "applypilot_retired_dependency_parent_test"
+    downstream_role = "applypilot_retired_dependency_downstream_test"
+    topology = _atomic_topology()
+    with pgqueue.connect(fleet_db) as root:
+        require_disposable_postgres(root)
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(parent_role)))
+        root.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(downstream_role)))
+        root.execute(
+            sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION NOBYPASSRLS").format(
+                sql.Identifier(ATOMIC_RETIRED_ADMIN)
+            )
+        )
+        root.execute(
+            sql.SQL("GRANT {} TO {} WITH ADMIN OPTION").format(
+                sql.Identifier(parent_role), sql.Identifier(ATOMIC_RETIRED_ADMIN)
+            )
+        )
+        root.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(ATOMIC_RETIRED_ADMIN)))
+        root.execute(
+            sql.SQL("GRANT {} TO {}").format(
+                sql.Identifier(parent_role), sql.Identifier(downstream_role)
+            )
+        )
+        root.execute("RESET ROLE")
+        root.commit()
+        try:
+            with pytest.raises(RuntimeError, match="dependencies prevent exact non-cascading closure"):
+                pg_roles.bootstrap_database_roles(
+                    root,
+                    CONTROLLER_PASSWORD,
+                    topology=topology,
+                    evidence_paths=_test_evidence_paths(),
+                )
+            edges = root.execute(
+                "SELECT parent.rolname AS parent_role,member.rolname AS member_role,grantor.rolname AS grantor_role "
+                "FROM pg_auth_members membership "
+                "JOIN pg_roles parent ON parent.oid=membership.roleid "
+                "JOIN pg_roles member ON member.oid=membership.member "
+                "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+                "WHERE parent.rolname=%s ORDER BY member.rolname",
+                (parent_role,),
+            ).fetchall()
+            assert edges == [
+                {
+                    "parent_role": parent_role,
+                    "member_role": downstream_role,
+                    "grantor_role": ATOMIC_RETIRED_ADMIN,
+                },
+                {
+                    "parent_role": parent_role,
+                    "member_role": ATOMIC_RETIRED_ADMIN,
+                    "grantor_role": "postgres",
+                },
+            ]
+        finally:
+            root.rollback()
+            require_disposable_postgres(root)
+            root.execute(
+                sql.SQL("REVOKE {} FROM {} GRANTED BY {}").format(
+                    sql.Identifier(parent_role),
+                    sql.Identifier(downstream_role),
+                    sql.Identifier(ATOMIC_RETIRED_ADMIN),
+                )
+            )
+            root.execute(
+                sql.SQL("REVOKE {} FROM {} GRANTED BY postgres").format(
+                    sql.Identifier(parent_role),
+                    sql.Identifier(ATOMIC_RETIRED_ADMIN),
+                )
+            )
+            for role_name in (ATOMIC_RETIRED_ADMIN, downstream_role, parent_role):
+                if root.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    root.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+            root.commit()
 
 
 def test_live_bootstrap_hands_off_to_non_superuser_controller_and_reconciles(fleet_db: str, tmp_path: Path) -> None:
@@ -979,6 +1787,8 @@ def test_live_bootstrap_hands_off_to_non_superuser_controller_and_reconciles(fle
             assert worker_receipt.contract == "compute"
 
             root.execute(worker_receipt.rollback_sql)
+            root.commit()
+            root.execute(receipt.rollback_sql)
             root.commit()
             root.execute(receipt.rollback_sql)
             root.commit()

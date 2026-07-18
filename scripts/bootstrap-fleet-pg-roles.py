@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
 import tempfile
 
@@ -45,11 +46,31 @@ def _replace_durable(path: Path, payload: bytes) -> None:
     parent_before = os.lstat(path.parent)
     if not stat.S_ISDIR(parent_before.st_mode) or stat.S_ISLNK(parent_before.st_mode):
         raise RuntimeError("receipt parent must be a real directory")
+    if os.name != "nt" and stat.S_IMODE(parent_before.st_mode) & 0o022:
+        raise RuntimeError("receipt parent directory must not be group/world writable")
     target_before = os.lstat(path)
     if not stat.S_ISREG(target_before.st_mode) or stat.S_ISLNK(target_before.st_mode):
         raise RuntimeError("prepared receipt must be a regular non-symlink file")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".applypilot-bootstrap-", dir=path.parent)
-    temporary = Path(temporary_name)
+    parent_descriptor: int | None = None
+    if os.open in os.supports_dir_fd and os.replace in os.supports_dir_fd:
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(parent_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (parent_before.st_dev, parent_before.st_ino):
+            os.close(parent_descriptor)
+            raise RuntimeError("receipt parent changed while being opened")
+        temporary = Path(f".applypilot-bootstrap-{secrets.token_hex(16)}")
+        descriptor = os.open(
+            temporary.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    else:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".applypilot-bootstrap-", dir=path.parent)
+        temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(payload)
@@ -61,10 +82,26 @@ def _replace_durable(path: Path, payload: bytes) -> None:
             raise RuntimeError("receipt parent changed before durable replacement")
         if (target_after.st_dev, target_after.st_ino) != (target_before.st_dev, target_before.st_ino):
             raise RuntimeError("prepared receipt changed before durable replacement")
-        os.replace(temporary, path)
-        _fsync_parent(path)
+        if parent_descriptor is not None:
+            os.replace(
+                temporary.name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            os.fsync(parent_descriptor)
+        else:
+            os.replace(temporary, path)
+            _fsync_parent(path)
     finally:
-        temporary.unlink(missing_ok=True)
+        if parent_descriptor is not None:
+            try:
+                os.unlink(temporary.name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            os.close(parent_descriptor)
+        else:
+            temporary.unlink(missing_ok=True)
 
 
 def _parser() -> argparse.ArgumentParser:
