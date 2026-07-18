@@ -25,8 +25,8 @@ _MIGRATION_V3_NAME = "brain schema v3 lane canary pins"
 _MIGRATION_V4_NAME = "brain schema v4 scoped candidate authority"
 _MIGRATION_V5_NAME = "brain schema v5 durable factual graph authority"
 _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e2576f1267d7"
-_EXPECTED_V5_CHECKSUM = "39fd21da6b829e22d5c2e890a978d0c92de96c92691e205024314f5ca154fb09"
-_EXPECTED_V5_CATALOG_HASH = "7e2b39943c5e00eb27e75264356df199807d28840253a5ac498ed2d46f1f16b5"
+_EXPECTED_V5_CHECKSUM = "52d1726bb13df54591fcd6343884ec8f6f7d18ab7fbf74b4dc33ba509cb0e559"
+_EXPECTED_V5_CATALOG_HASH = "87ed08bc34cc36e12d41fc44bdf4da1771bb67a609eabff2a3c39e0286e2b6a1"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
 _STATUS_ROLE = "brain_status_reader"
@@ -121,6 +121,8 @@ _V4_RELATIONS = {
     "brain_graph_approval_consumptions",
     "brain_immutable_artifact_references",
 }
+_V5_CATALOG_RELATIONS |= _V4_RELATIONS
+_V5_CATALOG_FUNCTIONS = _V5_FUNCTIONS | {"brain_publish_v4_candidate"}
 _V4_READ_RELATIONS = {
     "brain_authority_scope_state",
     "brain_v4_candidate_decisions",
@@ -302,7 +304,7 @@ _LIFECYCLE_OWNER_READ_RELATIONS = _LIFECYCLE_LOCK_RELATIONS | {
     "apply_result_events",
     "fleet_worker_blocklist",
 }
-_EXPECTED_CATALOG_HASH = "d3a53e2c29a5ddad1118168eeeaaf3ce681a17c05083cb39a9c1810c624fa4d5"
+_EXPECTED_CATALOG_HASH = "ec8893845974635b73e65e391561c2ca4418dec11004378ad5e543890cc66d99"
 
 _FUNCTIONS = {
     "brain_reject_mutation": "",
@@ -589,6 +591,14 @@ def _function_body_fingerprint(definition: str) -> str | None:
 
 def _raw_function_body_fingerprint(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _stable_catalog_records(records) -> list[dict[str, object]]:
+    normalized = [dict(record) for record in records]
+    return sorted(
+        normalized,
+        key=lambda record: json.dumps(record, sort_keys=True, separators=(",", ":"), default=str),
+    )
 
 
 def _expected_v4_publish_body_fingerprint() -> str:
@@ -1078,11 +1088,11 @@ def _catalog_contract_hash(cur, *, include_v5: bool = False) -> str:
     )
     functions = cur.fetchall()
     payload = {
-        "columns": columns,
-        "constraints": constraints,
-        "indexes": indexes,
-        "triggers": triggers,
-        "functions": functions,
+        "columns": _stable_catalog_records(columns),
+        "constraints": _stable_catalog_records(constraints),
+        "indexes": _stable_catalog_records(indexes),
+        "triggers": _stable_catalog_records(triggers),
+        "functions": _stable_catalog_records(functions),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     cur.execute("SELECT set_config('search_path', %s, true)", (prior_search_path,))
@@ -1090,7 +1100,7 @@ def _catalog_contract_hash(cur, *, include_v5: bool = False) -> str:
 
 
 def _v5_catalog_contract_hash(cur) -> str:
-    """Fingerprint every catalog surface introduced or changed by V5."""
+    """Fingerprint inherited V4 authority plus every surface introduced or changed by V5."""
     cur.execute("SELECT current_setting('search_path') AS current_search_path")
     prior_search_path = cur.fetchone()["current_search_path"]
     cur.execute("SET LOCAL search_path=pg_catalog, public")
@@ -1181,7 +1191,7 @@ def _v5_catalog_contract_hash(cur) -> str:
             "JOIN pg_roles owner ON owner.oid=p.proowner "
             "WHERE n.nspname='public' AND p.proname=ANY(%s) "
             "ORDER BY p.proname,pg_get_function_identity_arguments(p.oid)",
-            (sorted(_V5_FUNCTIONS),),
+            (sorted(_V5_CATALOG_FUNCTIONS),),
         )
         functions = cur.fetchall()
         cur.execute(
@@ -1207,20 +1217,20 @@ def _v5_catalog_contract_hash(cur) -> str:
             "JOIN pg_roles grantor ON grantor.oid=acl.grantor "
             "WHERE n.nspname='public' AND p.proname=ANY(%s) AND acl.grantee<>p.proowner "
             "ORDER BY p.proname,arguments,grantee,acl.privilege_type",
-            (sorted(_V5_FUNCTIONS),),
+            (sorted(_V5_CATALOG_FUNCTIONS),),
         )
         function_acls = cur.fetchall()
         payload = {
-            "columns": columns,
-            "constraints": constraints,
-            "function_acls": function_acls,
-            "functions": functions,
-            "indexes": indexes,
-            "relation_acls": relation_acls,
-            "relations": relations,
-            "sequences": sequences,
-            "triggers": triggers,
-            "views": views,
+            "columns": _stable_catalog_records(columns),
+            "constraints": _stable_catalog_records(constraints),
+            "function_acls": _stable_catalog_records(function_acls),
+            "functions": _stable_catalog_records(functions),
+            "indexes": _stable_catalog_records(indexes),
+            "relation_acls": _stable_catalog_records(relation_acls),
+            "relations": _stable_catalog_records(relations),
+            "sequences": _stable_catalog_records(sequences),
+            "triggers": _stable_catalog_records(triggers),
+            "views": _stable_catalog_records(views),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
         return hashlib.sha256(encoded).hexdigest()

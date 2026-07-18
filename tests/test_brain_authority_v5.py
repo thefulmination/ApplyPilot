@@ -187,6 +187,42 @@ def _bound_v5_authority(
     return authority, approved_id
 
 
+def _publish_v5_candidate(conn, authority, approved_id: int, *, suffix: str) -> None:
+    conn.execute(
+        "SELECT public.brain_publish_v5_candidate("
+        "'owner-a','campaign-a','core_fit','ats','host:example.test',7,%s,"
+        "%s,%s,%s,%s,%s,%s)",
+        (
+            authority["incarnation"],
+            f"decision-{suffix}",
+            _hash(f"semantic-{suffix}"),
+            HASHES[0],
+            f"envelope-{suffix}",
+            HASHES[1],
+            approved_id,
+        ),
+    )
+
+
+class _ReverseFetchallCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @property
+    def connection(self):
+        return self._cursor.connection
+
+    def execute(self, *args, **kwargs):
+        self._cursor.execute(*args, **kwargs)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return list(reversed(self._cursor.fetchall()))
+
+
 def test_v5_upgrade_preserves_prior_checksums_and_supersedes_publish_acl(authority_v5_pg):
     with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
         rows = conn.execute(
@@ -511,6 +547,41 @@ def test_v5_exact_catalog_verifier_rejects_catalog_mutation(authority_v5_pg, mut
             schema.verify_brain_schema_v5(conn)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "ALTER TABLE public.brain_authority_transition_events ADD COLUMN forbidden_v5_mutation TEXT",
+        "ALTER TABLE public.brain_v4_decision_envelopes "
+        "DROP CONSTRAINT brain_v4_decision_envelopes_candidate_decision_id_key",
+        "DROP TRIGGER brain_immutable_artifact_references_immutable "
+        "ON public.brain_immutable_artifact_references",
+        "ALTER FUNCTION public.brain_publish_v4_candidate("
+        "TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,UUID,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT) STABLE",
+        "GRANT INSERT ON public.brain_immutable_artifact_references TO brain_candidate_reader",
+    ),
+)
+def test_v5_verifier_rejects_mutated_v4_only_authority_contract(authority_v5_pg, mutation):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
+        conn.execute(mutation)
+        conn.commit()
+        with pytest.raises(
+            RuntimeError,
+            match="v5 exact catalog contract mismatch|invalid non-owner object ACLs",
+        ):
+            schema.verify_brain_schema_v5(conn)
+
+
+def test_v5_catalog_hash_is_independent_of_database_result_order(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
+        with conn.cursor() as cursor:
+            expected = schema._v5_catalog_contract_hash(cursor)
+        with conn.cursor() as cursor:
+            reversed_result_order = schema._v5_catalog_contract_hash(_ReverseFetchallCursor(cursor))
+
+        assert expected == schema._EXPECTED_V5_CATALOG_HASH
+        assert reversed_result_order == expected
+
+
 def test_v5_concurrent_factual_admission_has_exactly_one_winner(authority_v5_pg):
     with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
         seeded = _generation(conn)
@@ -797,6 +868,76 @@ def test_v5_coverage_xor_review_and_contradiction_state(authority_v5_pg):
             )
 
 
+def test_v5_supersession_rejects_event_bound_to_immutable_assertion_coverage(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
+        seeded = _generation(conn)
+        _admit(conn, seeded, approval="approval-covered", event="event-covered", sequence=1)
+        conn.execute(
+            "SELECT public.brain_record_factual_assertion_coverage("
+            "'owner-a','generation-a','span-a','event-covered')"
+        )
+
+        with pytest.raises(psycopg.Error, match="immutable assertion coverage"):
+            _admit(
+                conn,
+                seeded,
+                approval="approval-superseding",
+                event="event-superseding",
+                sequence=2,
+                action="supersede",
+                supersedes="event-covered",
+            )
+
+
+def test_v5_admission_rejects_span_with_immutable_exclusion_coverage(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
+        seeded = _generation(conn)
+        conn.execute(
+            "SELECT public.brain_review_factual_exclusion("
+            "'owner-a','generation-a','span-a','excluded',%s,'reviewer',clock_timestamp())",
+            (_artifact(conn, "immutable-exclusion-review"),),
+        )
+
+        with pytest.raises(psycopg.Error, match="immutable exclusion coverage"):
+            _admit(conn, seeded, approval="approval-excluded", event="event-excluded", sequence=1)
+
+
+def test_v5_reviewed_outcome_never_mutates_factual_graph(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
+        seeded = _generation(conn)
+        _admit(conn, seeded, approval="approval-outcome", event="event-outcome", sequence=1)
+        root_before = _semantic_root(conn)
+        high_water_before = conn.execute(
+            "SELECT max(system_receipt_sequence) AS high_water FROM public.brain_graph_fact_events "
+            "WHERE owner_id='owner-a' AND generation_id='generation-a'"
+        ).fetchone()["high_water"]
+
+        conn.execute(
+            "INSERT INTO public.brain_jobs(job_id,source_namespace,source_job_id) "
+            "VALUES('outcome-job','test','outcome-job')"
+        )
+        email_event_id = conn.execute(
+            "INSERT INTO public.brain_email_events("
+            "source_namespace,source_event_id,job_id,event_type,occurred_at) "
+            "VALUES('test','outcome-email','outcome-job','reply',clock_timestamp()) "
+            "RETURNING email_event_id"
+        ).fetchone()["email_event_id"]
+        conn.execute(
+            "INSERT INTO public.brain_reviewed_outcomes("
+            "source_namespace,source_event_id,job_id,email_event_id,review_status,normalized_stage,"
+            "reviewer,created_at,reviewed_at,updated_at) "
+            "VALUES('test','outcome-review','outcome-job',%s,'confirmed','interview','reviewer',"
+            "clock_timestamp(),clock_timestamp(),clock_timestamp())",
+            (email_event_id,),
+        )
+
+        assert _semantic_root(conn) == root_before
+        assert conn.execute(
+            "SELECT max(system_receipt_sequence) AS high_water FROM public.brain_graph_fact_events "
+            "WHERE owner_id='owner-a' AND generation_id='generation-a'"
+        ).fetchone()["high_water"] == high_water_before
+
+
 def test_v5_binding_and_publish_reject_missing_binding_and_revocation(authority_v5_pg):
     with psycopg.connect(authority_v5_pg, row_factory=dict_row) as owner:
         authority, approved_id = _bound_v5_authority(owner, bind=False)
@@ -1065,6 +1206,111 @@ def test_v5_generation_and_scope_operations_share_lock_domains(authority_v5_pg):
                 )
             writer.rollback()
             locker.rollback()
+            locker.execute(
+                "SELECT 1 FROM public.brain_factual_generations "
+                "WHERE owner_id='owner-a' AND generation_id='generation-a' FOR UPDATE"
+            )
+            writer.execute("SET lock_timeout='100ms'")
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                _publish_v5_candidate(
+                    writer,
+                    authority,
+                    approved_id,
+                    suffix="generation-lock-domain",
+                )
+            writer.rollback()
+            locker.rollback()
+
+
+def test_v5_candidate_publication_rejects_snapshot_stale_by_later_fact_event(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as owner:
+        authority, approved_id = _bound_v5_authority(owner)
+        event = owner.execute(
+            "SELECT event.*,member.source_artifact_hash,member.source_class "
+            "FROM public.brain_graph_fact_events event "
+            "JOIN public.brain_factual_generation_members member "
+            "ON member.owner_id=event.owner_id AND member.generation_id=event.generation_id "
+            "AND member.source_span_id=event.source_span_id "
+            "WHERE event.owner_id='owner-a' AND event.event_id='event-a'"
+        ).fetchone()
+        owner.execute(
+            "INSERT INTO public.brain_factual_approval_receipts("
+            "owner_id,human_approval_id,generation_id,approval_receipt_hash,claim_projection_hash,"
+            "ontology_version,predicate,term_id,source_artifact_hash,source_span_id,source_class,"
+            "mutation_action,issued_at) VALUES("
+            "'owner-a','legacy-late-approval','generation-a',%s,%s,%s,%s,%s,%s,%s,%s,'supersede',"
+            "clock_timestamp())",
+            (
+                _artifact(owner, "legacy-late-approval-receipt"),
+                _hash("legacy-late-claim"),
+                event["ontology_version"],
+                event["predicate"],
+                event["term_id"],
+                event["source_artifact_hash"],
+                event["source_span_id"],
+                event["source_class"],
+            ),
+        )
+        owner.execute(
+            "INSERT INTO public.brain_graph_fact_events("
+            "owner_id,event_id,generation_id,source_span_id,human_approval_id,approval_receipt_hash,"
+            "claim_projection_hash,ontology_version,predicate,term_id,event_artifact_hash,"
+            "system_receipt_sequence,mutation_action,supersedes_event_id) VALUES("
+            "'owner-a','legacy-late-event','generation-a',%s,'legacy-late-approval',%s,%s,%s,%s,%s,%s,"
+            "2,'supersede','event-a')",
+            (
+                event["source_span_id"],
+                _artifact(owner, "legacy-late-approval-receipt"),
+                _hash("legacy-late-claim"),
+                event["ontology_version"],
+                event["predicate"],
+                event["term_id"],
+                _artifact(owner, "legacy-late-event-artifact"),
+            ),
+        )
+        owner.commit()
+
+    with psycopg.connect(_dsn_for(authority_v5_pg, WRITER), row_factory=dict_row) as writer:
+        with pytest.raises(psycopg.Error, match="high-water"):
+            _publish_v5_candidate(writer, authority, approved_id, suffix="stale-high-water")
+
+
+def test_v5_candidate_publication_rejects_snapshot_stale_by_later_semantic_root(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as owner:
+        authority, approved_id = _bound_v5_authority(owner)
+        owner.execute(
+            "SELECT public.brain_create_factual_contradiction("
+            "'owner-a','later-noncritical','generation-a',%s)",
+            (_artifact(owner, "later-noncritical-identity"),),
+        )
+        owner.execute(
+            "SELECT public.brain_append_factual_contradiction_event("
+            "'owner-a','later-noncritical',1,'opened','active','noncritical',NULL,NULL)"
+        )
+        owner.commit()
+
+    with psycopg.connect(_dsn_for(authority_v5_pg, WRITER), row_factory=dict_row) as writer:
+        with pytest.raises(psycopg.Error, match="semantic root"):
+            _publish_v5_candidate(writer, authority, approved_id, suffix="stale-semantic-root")
+
+
+def test_v5_candidate_publication_rechecks_later_active_critical_contradiction(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as owner:
+        authority, approved_id = _bound_v5_authority(owner)
+        owner.execute(
+            "SELECT public.brain_create_factual_contradiction("
+            "'owner-a','later-critical','generation-a',%s)",
+            (_artifact(owner, "later-critical-identity"),),
+        )
+        owner.execute(
+            "SELECT public.brain_append_factual_contradiction_event("
+            "'owner-a','later-critical',1,'opened','active','critical',NULL,NULL)"
+        )
+        owner.commit()
+
+    with psycopg.connect(_dsn_for(authority_v5_pg, WRITER), row_factory=dict_row) as writer:
+        with pytest.raises(psycopg.Error, match="active critical contradiction"):
+            _publish_v5_candidate(writer, authority, approved_id, suffix="later-critical")
 
 
 def test_v5_exclusion_rejects_active_fact_future_review_and_snapshot_conflict(authority_v5_pg):

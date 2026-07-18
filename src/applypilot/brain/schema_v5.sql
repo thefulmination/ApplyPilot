@@ -760,6 +760,16 @@ BEGIN
     IF generation.ontology_version<>requested_ontology_version THEN
         RAISE EXCEPTION 'generation ontology version mismatch' USING ERRCODE='55000';
     END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.brain_factual_generation_coverage coverage
+        WHERE coverage.owner_id=requested_owner_id
+          AND coverage.generation_id=requested_generation_id
+          AND coverage.source_span_id=requested_source_span_id
+          AND coverage.disposition='exclusion'
+    ) THEN
+        RAISE EXCEPTION 'factual event admission conflicts with immutable exclusion coverage'
+            USING ERRCODE='55000';
+    END IF;
     IF requested_issued_at>clock_timestamp() THEN
         RAISE EXCEPTION 'approval receipt cannot be issued after admission' USING ERRCODE='55000';
     END IF;
@@ -794,6 +804,17 @@ BEGIN
           AND source_span_id=requested_source_span_id AND event_id=requested_supersedes_event_id;
         IF NOT FOUND OR active_event_id IS DISTINCT FROM requested_supersedes_event_id THEN
             RAISE EXCEPTION 'supersession must target the active earlier same-span event' USING ERRCODE='55000';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM public.brain_factual_generation_coverage coverage
+            WHERE coverage.owner_id=requested_owner_id
+              AND coverage.generation_id=requested_generation_id
+              AND coverage.source_span_id=requested_source_span_id
+              AND coverage.disposition='assertion'
+              AND coverage.event_id=requested_supersedes_event_id
+        ) THEN
+            RAISE EXCEPTION 'cannot supersede factual event bound to immutable assertion coverage'
+                USING ERRCODE='55000';
         END IF;
     ELSIF requested_supersedes_event_id IS NOT NULL THEN
         RAISE EXCEPTION 'assertion cannot supersede an event' USING ERRCODE='55000';
@@ -1209,6 +1230,8 @@ DECLARE scope_row public.brain_authority_scope_state%ROWTYPE;
         latest public.brain_authority_epoch_events%ROWTYPE;
         binding public.brain_factual_snapshot_approval_bindings%ROWTYPE;
         snapshot public.brain_factual_graph_snapshots%ROWTYPE;
+        current_event_high_water BIGINT;
+        current_semantic_root TEXT;
         validation_time TIMESTAMPTZ;
 BEGIN
     SELECT * INTO scope_row FROM public.brain_authority_scope_state
@@ -1255,6 +1278,35 @@ BEGIN
     IF NOT FOUND OR snapshot.valid_from>validation_time
        OR (snapshot.valid_to IS NOT NULL AND snapshot.valid_to<=validation_time) THEN
         RAISE EXCEPTION 'factual snapshot must be currently valid at candidate publication' USING ERRCODE='55000';
+    END IF;
+    PERFORM 1 FROM public.brain_factual_generations
+    WHERE owner_id=snapshot.owner_id AND generation_id=snapshot.generation_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'factual snapshot generation is missing at candidate publication'
+            USING ERRCODE='55000';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.brain_factual_contradiction_state contradiction
+        WHERE contradiction.owner_id=snapshot.owner_id
+          AND contradiction.generation_id=snapshot.generation_id
+          AND contradiction.state_after='active' AND contradiction.severity='critical'
+    ) THEN
+        RAISE EXCEPTION 'active critical contradiction blocks candidate publication'
+            USING ERRCODE='55000';
+    END IF;
+    SELECT COALESCE(max(event.system_receipt_sequence),0) INTO current_event_high_water
+    FROM public.brain_graph_fact_events event
+    WHERE event.owner_id=snapshot.owner_id AND event.generation_id=snapshot.generation_id;
+    IF current_event_high_water<>snapshot.event_high_water THEN
+        RAISE EXCEPTION 'factual snapshot event high-water is stale at candidate publication'
+            USING ERRCODE='55000';
+    END IF;
+    current_semantic_root := public.brain_compute_factual_semantic_root(
+        snapshot.owner_id,snapshot.generation_id
+    );
+    IF current_semantic_root<>snapshot.semantic_root_hash THEN
+        RAISE EXCEPTION 'factual snapshot semantic root is stale at candidate publication'
+            USING ERRCODE='55000';
     END IF;
     INSERT INTO public.brain_v4_candidate_decisions(
         candidate_decision_id,authority_scope_id,semantic_content_hash,candidate_artifact_hash,
