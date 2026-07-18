@@ -12,6 +12,7 @@ import pytest
 from applypilot.brain.artifact_authority import (
     ArtifactAuthorityError,
     VerifiedManifest,
+    canonical_manifest_bytes,
     coordinate_artifact_registration,
     normalize_manifest,
     parse_json_strict,
@@ -132,8 +133,7 @@ def test_strict_json_rejects_duplicate_keys() -> None:
 
 def test_signature_binds_canonical_manifest_time_and_destination() -> None:
     manifest = _manifest()
-    normalized = normalize_manifest(manifest)
-    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    canonical = canonical_manifest_bytes(manifest)
     digest = hashlib.sha256(canonical).hexdigest()
     key = b"s" * 32
     signature = base64.urlsafe_b64encode(
@@ -204,8 +204,7 @@ def test_s3_verification_rejects_missing_compliance_lock() -> None:
 
 def test_invalid_signature_encoding_is_rejected_strictly() -> None:
     manifest = _manifest()
-    normalized = normalize_manifest(manifest)
-    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    canonical = canonical_manifest_bytes(manifest)
     with pytest.raises(ArtifactAuthorityError, match="signature encoding"):
         verify_manifest_signature(
             manifest,
@@ -225,8 +224,7 @@ def test_invalid_signature_encoding_is_rejected_strictly() -> None:
 def test_dry_run_verifies_s3_without_opening_database() -> None:
     manifest = _manifest()
     manifest["artifacts"][0]["artifactSha256"] = hashlib.sha256(b"content").hexdigest()
-    normalized = normalize_manifest(manifest)
-    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    canonical = canonical_manifest_bytes(manifest)
     key = b"s" * 32
     envelope = {
         "algorithm": "hmac-sha256",

@@ -25,6 +25,166 @@ from applypilot.brain.artifact_authority import (
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_SECRET_BYTES = 16 * 1024
 
+_WINDOWS_SYSTEM_SID = "S-1-5-18"
+_WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
+_WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0
+_WINDOWS_OTHER_ALLOW_ACE_TYPES = frozenset({4, 5, 9, 11})
+
+
+def _windows_sid_text(sid: object) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    text = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+        raise ArtifactAuthorityError("could not inspect secret input access control")
+    try:
+        if not text.value:
+            raise ArtifactAuthorityError("could not inspect secret input access control")
+        return text.value
+    finally:
+        kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _windows_current_user_sid() -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("user", _SidAndAttributes)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        raise ArtifactAuthorityError("could not inspect current Windows identity")
+    try:
+        required = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+        if not required.value:
+            raise ArtifactAuthorityError("could not inspect current Windows identity")
+        buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token, 1, buffer, required.value, ctypes.byref(required)
+        ):
+            raise ArtifactAuthorityError("could not inspect current Windows identity")
+        token_user = ctypes.cast(buffer, ctypes.POINTER(_TokenUser)).contents
+        return _windows_sid_text(token_user.user.sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _windows_allowed_access_sids(descriptor: int) -> set[str]:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("ace_count", wintypes.DWORD),
+            ("acl_bytes_in_use", wintypes.DWORD),
+            ("acl_bytes_free", wintypes.DWORD),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_int,
+    ]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetAce.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    dacl = ctypes.c_void_p()
+    security_descriptor = ctypes.c_void_p()
+    result = advapi32.GetSecurityInfo(
+        wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
+        1,
+        0x00000004,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(security_descriptor),
+    )
+    if result:
+        raise ArtifactAuthorityError("could not inspect secret input access control")
+    try:
+        if not dacl.value:
+            raise ArtifactAuthorityError("secret input permissions are too broad")
+        information = _AclSizeInformation()
+        if not advapi32.GetAclInformation(
+            dacl, ctypes.byref(information), ctypes.sizeof(information), 2
+        ):
+            raise ArtifactAuthorityError("could not inspect secret input access control")
+        allowed: set[str] = set()
+        for index in range(information.ace_count):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
+                raise ArtifactAuthorityError("could not inspect secret input access control")
+            ace_type = ctypes.c_ubyte.from_address(ace.value).value
+            access_mask = ctypes.c_uint32.from_address(ace.value + 4).value
+            if not access_mask:
+                continue
+            if ace_type == _WINDOWS_ACCESS_ALLOWED_ACE_TYPE:
+                allowed.add(_windows_sid_text(ctypes.c_void_p(ace.value + 8)))
+            elif ace_type in _WINDOWS_OTHER_ALLOW_ACE_TYPES:
+                raise ArtifactAuthorityError("secret input uses unsupported allow access control")
+        return allowed
+    finally:
+        if security_descriptor.value:
+            kernel32.LocalFree(security_descriptor)
+
+
+def _assert_windows_private_file(descriptor: int, path: Path) -> None:
+    allowed = {
+        _windows_current_user_sid(),
+        _WINDOWS_SYSTEM_SID,
+        _WINDOWS_ADMINISTRATORS_SID,
+    }
+    if _windows_allowed_access_sids(descriptor) - allowed:
+        raise ArtifactAuthorityError(f"secret input permissions are too broad: {path}")
+
 
 def _absolute_without_resolving(path: Path) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
@@ -68,6 +228,8 @@ def read_secure_regular_file(path: Path, *, max_bytes: int, require_private: boo
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (leaf.st_dev, leaf.st_ino):
             raise ArtifactAuthorityError(f"input file changed while opening: {absolute}")
+        if require_private and os.name == "nt":
+            _assert_windows_private_file(descriptor, absolute)
         chunks: list[bytes] = []
         remaining = max_bytes + 1
         while remaining:

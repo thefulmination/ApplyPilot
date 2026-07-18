@@ -236,7 +236,6 @@ def verify_manifest_signature(
     clock_skew: timedelta = MAX_CLOCK_SKEW,
     allow_expired_replay: bool = False,
 ) -> VerifiedManifest:
-    normalized = normalize_manifest(manifest)
     _required_keys(envelope, {"algorithm", "keyId", "manifestSha256", "signature"}, "signature")
     if envelope["algorithm"] != "hmac-sha256":
         raise ArtifactAuthorityError("unsupported signature algorithm")
@@ -246,7 +245,7 @@ def verify_manifest_signature(
     key = keys[key_id]
     if not isinstance(key, bytes) or len(key) < 32:
         raise ArtifactAuthorityError("HMAC key must contain at least 32 bytes")
-    canonical = canonical_manifest_bytes(normalized)
+    canonical = canonical_manifest_bytes(manifest)
     digest = hashlib.sha256(canonical).hexdigest()
     supplied_digest = envelope["manifestSha256"]
     if not isinstance(supplied_digest, str) or not hmac.compare_digest(supplied_digest, digest):
@@ -268,6 +267,7 @@ def verify_manifest_signature(
         raise ArtifactAuthorityError("invalid signature encoding")
     if not hmac.compare_digest(supplied, expected):
         raise ArtifactAuthorityError("invalid manifest signature")
+    normalized = normalize_manifest(manifest)
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     issued, expires = _utc(normalized["issuedAt"]), _utc(normalized["expiresAt"])
     if expires <= issued or current < issued - clock_skew or (current >= expires and not allow_expired_replay):

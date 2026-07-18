@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,8 +61,7 @@ def _manifest(*, expires_at: str = "2026-07-18T13:00:00Z") -> dict:
 
 
 def _envelope(manifest: dict, key: bytes = b"s" * 32) -> dict:
-    normalized = normalize_manifest(manifest)
-    canonical = canonical_manifest_bytes(normalized)
+    canonical = canonical_manifest_bytes(manifest)
     return {
         "algorithm": "hmac-sha256",
         "keyId": "key-1",
@@ -174,6 +174,75 @@ def test_hmac_is_domain_separated_by_purpose() -> None:
             expected_database_name="brain",
             now=NOW,
         )
+
+
+def test_signature_binds_exact_provider_alias_before_normalization() -> None:
+    s3_manifest = _manifest()
+    aws_s3_manifest = json.loads(json.dumps(s3_manifest))
+    aws_s3_manifest["artifacts"][0]["backend"] = "aws_s3"
+    s3_envelope = _envelope(s3_manifest)
+
+    verified = verify_manifest_signature(
+        s3_manifest,
+        s3_envelope,
+        keys={"key-1": b"s" * 32},
+        expected_system_id="42",
+        expected_database_name="brain",
+        now=NOW,
+    )
+    assert verified.manifest_sha256 == s3_envelope["manifestSha256"]
+    with pytest.raises(ArtifactAuthorityError, match="manifest digest mismatch"):
+        verify_manifest_signature(
+            aws_s3_manifest,
+            s3_envelope,
+            keys={"key-1": b"s" * 32},
+            expected_system_id="42",
+            expected_database_name="brain",
+            now=NOW,
+        )
+
+    aws_s3_envelope = _envelope(aws_s3_manifest)
+    assert aws_s3_envelope["manifestSha256"] != s3_envelope["manifestSha256"]
+    verified_alias = verify_manifest_signature(
+        aws_s3_manifest,
+        aws_s3_envelope,
+        keys={"key-1": b"s" * 32},
+        expected_system_id="42",
+        expected_database_name="brain",
+        now=NOW,
+    )
+    assert verified_alias.manifest["artifacts"][0]["backend"] == "s3"
+    assert verified_alias.manifest_sha256 == aws_s3_envelope["manifestSha256"]
+
+
+def test_signature_binds_exact_artifact_array_order_before_sorting() -> None:
+    ordered = _manifest()
+    second = dict(
+        ordered["artifacts"][0],
+        ordinal=2,
+        artifactSha256=hashlib.sha256(b"second").hexdigest(),
+        objectKey="sha256/second",
+        versionId="version-2",
+        etag="etag-2",
+    )
+    ordered["artifacts"].append(second)
+    reversed_order = json.loads(json.dumps(ordered))
+    reversed_order["artifacts"].reverse()
+    ordered_envelope = _envelope(ordered)
+
+    with pytest.raises(ArtifactAuthorityError, match="manifest digest mismatch"):
+        verify_manifest_signature(
+            reversed_order,
+            ordered_envelope,
+            keys={"key-1": b"s" * 32},
+            expected_system_id="42",
+            expected_database_name="brain",
+            now=NOW,
+        )
+    assert (
+        _envelope(reversed_order)["manifestSha256"]
+        != ordered_envelope["manifestSha256"]
+    )
 
 
 class _Cursor:
@@ -330,6 +399,54 @@ def test_secure_input_rejects_symlink(tmp_path: Path) -> None:
         cli.read_secure_regular_file(link, max_bytes=1024)
 
 
+def _set_windows_secret_acl(cli, path: Path, *, broad: bool) -> None:
+    principals = [cli._windows_current_user_sid(), "S-1-5-18", "S-1-5-32-544"]
+    if broad:
+        principals.append("S-1-1-0")
+    command = ["icacls", str(path), "/inheritance:r", "/grant:r"]
+    command.extend(f"*{sid}:(F)" for sid in principals)
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+def _set_windows_secret_directory_acl(cli, path: Path) -> None:
+    principals = [cli._windows_current_user_sid(), "S-1-5-18", "S-1-5-32-544"]
+    command = ["icacls", str(path), "/inheritance:r", "/grant:r"]
+    command.extend(f"*{sid}:(OI)(CI)(F)" for sid in principals)
+    command.append("*S-1-1-0:(OI)(CI)(R)")
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL behavior")
+def test_windows_private_secret_acl_allows_only_user_system_and_administrators(
+    tmp_path: Path,
+) -> None:
+    cli = _load_cli()
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"s" * 32)
+    _set_windows_secret_acl(cli, secret, broad=False)
+    assert cli.read_secure_regular_file(secret, max_bytes=64, require_private=True) == b"s" * 32
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL behavior")
+@pytest.mark.parametrize("broad_allow", ("explicit", "inherited"))
+def test_windows_private_secret_acl_rejects_broad_inherited_or_explicit_allow(
+    tmp_path: Path, broad_allow: str
+) -> None:
+    cli = _load_cli()
+    if broad_allow == "inherited":
+        secret_directory = tmp_path / "secrets"
+        secret_directory.mkdir()
+        _set_windows_secret_directory_acl(cli, secret_directory)
+        secret = secret_directory / "secret"
+        secret.write_bytes(b"s" * 32)
+    else:
+        secret = tmp_path / "secret"
+        secret.write_bytes(b"s" * 32)
+        _set_windows_secret_acl(cli, secret, broad=True)
+    with pytest.raises(ArtifactAuthorityError, match="permissions are too broad"):
+        cli.read_secure_regular_file(secret, max_bytes=64, require_private=True)
+
+
 def test_existing_receipt_refuses_before_any_input_or_external_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -362,6 +479,8 @@ def test_dry_run_ignores_hostile_database_environment_and_opens_no_database(
     for name, payload in files.items():
         paths[name] = tmp_path / name
         paths[name].write_bytes(payload)
+    if os.name == "nt":
+        _set_windows_secret_acl(cli, paths["hmac-key"], broad=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://hostile.invalid/production")
     monkeypatch.setenv("PGSERVICE", "hostile-service")
     monkeypatch.setattr(cli, "_aws_client", lambda *_args: object())
