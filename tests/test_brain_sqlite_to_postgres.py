@@ -19,12 +19,22 @@ from applypilot.brain.sqlite_to_postgres import _insert_observations
 from applypilot.brain.sqlite_to_postgres import _insert_label_confidence, _insert_labels
 from applypilot.brain.sqlite_to_postgres import _mark_run_failed
 from applypilot.brain.sqlite_to_postgres import _migration_run_resume_event
+from applypilot.brain.sqlite_to_postgres import _parity_metadata
 from applypilot.brain.sqlite_to_postgres import _record_completed_batches
 from applypilot.brain.sqlite_to_postgres import _source_bounds
 from applypilot.brain.sqlite_to_postgres import _verify_kg_artifacts
 from applypilot.brain.sqlite_to_postgres import finalize_sqlite_to_postgres_import
+from applypilot.brain.sqlite_to_postgres import recover_finalized_sqlite_to_postgres_import
 from applypilot.brain.parity import ParityResult
 from applypilot.brain.importer import SOURCE_TABLES
+
+
+DESTINATION_BINDING = {
+    "database": "brain",
+    "systemIdentifier": "7460123456789012345",
+    "databaseOid": "16384",
+    "databaseIncarnationId": None,
+}
 
 
 class _RecordingCursor:
@@ -49,6 +59,8 @@ class _RecordingCursor:
             self._row = {"label_event_id": 42}
         elif "SELECT migration_run_event_id,event_type FROM brain_migration_run_events" in normalized:
             self._row = self.connection.run_head
+        elif "JOIN brain_migration_sources source" in normalized and "event.metadata" in normalized:
+            self._row = self.connection.terminal_row
         elif "SELECT current_user AS current_user" in normalized:
             self._row = {"current_user": self.connection.current_user}
         elif "pg_try_advisory_lock" in normalized:
@@ -114,6 +126,7 @@ class _RecordingPostgres:
         self.lock_acquired = True
         self.artifacts: dict[str, dict[str, Any]] = {}
         self.policy_artifacts: dict[tuple[str, str], str] = {}
+        self.terminal_row: dict[str, Any] | None = None
 
     def cursor(self) -> _RecordingCursor:
         return _RecordingCursor(self)
@@ -217,6 +230,130 @@ def test_batch_finalization_requires_every_independent_clean_parity_result() -> 
             receipt,
             1,
             {"jobs": failed},
+        )
+
+
+def test_terminal_parity_metadata_preserves_independent_counts_and_hashes() -> None:
+    parity = ParityResult(
+        source_count=7,
+        target_count=7,
+        source_hash="a" * 64,
+        target_hash="a" * 64,
+        mismatch_count=0,
+        unresolved_count=0,
+    )
+
+    assert _parity_metadata({"jobs": parity}) == {
+        "jobs": {
+            "source_count": 7,
+            "target_count": 7,
+            "source_hash": "a" * 64,
+            "target_hash": "a" * 64,
+            "mismatch_count": 0,
+            "unresolved_count": 0,
+            "passed": True,
+        }
+    }
+
+
+def test_terminal_recovery_reconstructs_only_completed_durable_parity() -> None:
+    pg = _RecordingPostgres()
+    durable_parity = {
+        table.name: {
+            "source_count": 3 if table.name == "jobs" else 0,
+            "target_count": 3 if table.name == "jobs" else 0,
+            "source_hash": "c" * 64,
+            "target_hash": "c" * 64,
+            "mismatch_count": 0,
+            "unresolved_count": 0,
+            "passed": True,
+        }
+        for table in SOURCE_TABLES
+    }
+    pg.terminal_row = {
+        "migration_run_id": 91,
+        "migration_run_event_id": 191,
+        "event_type": "completed",
+        "source_fingerprint": "b" * 64,
+        "metadata": {
+            "source_sha256": "b" * 64,
+            "independent_parity": durable_parity,
+            "destination_binding": DESTINATION_BINDING,
+        },
+    }
+
+    result = recover_finalized_sqlite_to_postgres_import(
+        pg,
+        expected_sha256="b" * 64,
+        run_key="stable-run-key",
+        expected_destination_binding=DESTINATION_BINDING,
+    )
+
+    assert result.migration_run_id == 91
+    assert result.finalized is True
+    assert result.recovered is True
+    assert result.imported["jobs"] == 3
+    assert result.parity["jobs"]["source_hash"] == "c" * 64
+
+
+@pytest.mark.parametrize(
+    ("event_type", "metadata"),
+    [
+        ("started", {"source_sha256": "b" * 64, "independent_parity": {}, "destination_binding": DESTINATION_BINDING}),
+        ("completed", {"source_sha256": "b" * 64, "independent_parity": {}, "destination_binding": DESTINATION_BINDING}),
+    ],
+)
+def test_terminal_recovery_rejects_nonterminal_or_incomplete_metadata(event_type: str, metadata: dict[str, Any]) -> None:
+    pg = _RecordingPostgres()
+    pg.terminal_row = {
+        "migration_run_id": 92,
+        "migration_run_event_id": 192,
+        "event_type": event_type,
+        "source_fingerprint": "b" * 64,
+        "metadata": metadata,
+    }
+
+    with pytest.raises(Exception, match="terminal recovery"):
+        recover_finalized_sqlite_to_postgres_import(
+            pg,
+            expected_sha256="b" * 64,
+            run_key="stable-run-key",
+            expected_destination_binding=DESTINATION_BINDING,
+        )
+
+
+def test_terminal_recovery_rejects_different_destination_binding() -> None:
+    pg = _RecordingPostgres()
+    parity = {
+        table.name: {
+            "source_count": 0,
+            "target_count": 0,
+            "source_hash": "c" * 64,
+            "target_hash": "c" * 64,
+            "mismatch_count": 0,
+            "unresolved_count": 0,
+            "passed": True,
+        }
+        for table in SOURCE_TABLES
+    }
+    pg.terminal_row = {
+        "migration_run_id": 93,
+        "migration_run_event_id": 193,
+        "event_type": "completed",
+        "source_fingerprint": "b" * 64,
+        "metadata": {
+            "source_sha256": "b" * 64,
+            "independent_parity": parity,
+            "destination_binding": DESTINATION_BINDING,
+        },
+    }
+
+    with pytest.raises(Exception, match="destination"):
+        recover_finalized_sqlite_to_postgres_import(
+            pg,
+            expected_sha256="b" * 64,
+            run_key="stable-run-key",
+            expected_destination_binding={**DESTINATION_BINDING, "databaseOid": "999"},
         )
 
 

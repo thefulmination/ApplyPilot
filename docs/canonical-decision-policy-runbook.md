@@ -98,6 +98,70 @@ only. They cannot validate, promote, retire, stage, or lease a policy. Import th
 sealed cache into Postgres with the reviewed SQLite-to-Postgres importer and pass
 its parity gates before continuing.
 
+### Audited SQLite import CLI
+
+Put the PostgreSQL DSN in a dedicated environment variable. Never place it in
+the command line. Bulk import creates a controlled online SQLite backup, including
+committed WAL state, and refuses a source that changes while the backup is made:
+
+```powershell
+$env:BRAIN_IMPORT_DSN = '<set through the approved secret channel>'
+$env:APPLYPILOT_BRAIN_IMPORT_ATTESTATION_KEY_B64 = '<protected 32-byte-or-longer key, base64>'
+$env:APPLYPILOT_BRAIN_IMPORT_ATTESTATION_KEY_ID = '<brain-import-key-id>'
+$env:APPLYPILOT_WRITER_FREEZE_ATTESTATION_KEY_B64 = '<different protected key, base64>'
+$env:APPLYPILOT_WRITER_FREEZE_ATTESTATION_KEY_ID = '<writer-freeze-key-id>'
+python scripts/brain-sqlite-to-postgres.py --mode bulk-import --source C:\absolute\canonical.sqlite --sealed-snapshot C:\absolute\evidence\bulk.sqlite --postgres-dsn-env BRAIN_IMPORT_DSN --expected-database <database> --expected-system-identifier <system-identifier> --expected-database-oid <database-oid> --release-id <release-id> --release-nonce <32-128-url-safe-characters> --output C:\absolute\evidence\bulk-receipt.json
+```
+
+Use `--dry-run` only with `bulk-import`; it delegates to the importer's real
+dry-run API. A repeated import uses the same release binding, mode, and sealed
+snapshot, but must name a new receipt path because receipts are never overwritten.
+
+For `final-delta-finalize`, first stop every SQLite writer through the approved
+writer shutdown/freeze procedure. That procedure must publish a stable JSON marker
+containing the exact post-freeze DB and WAL hashes; the import CLI does not freeze
+writers or manufacture this evidence:
+
+The marker must be an authenticated `applypilot.writer-freeze.v2` receipt with
+purpose `writer-freeze`, matching release/source bindings, zero writer-process
+and active-writer-lease counts, a current `frozenAt`/`expiresAt` window, and
+complete database, WAL, and SHM existence/hash/size/file-identity state. Its
+purpose key must differ from the brain-import receipt key. `frozenAt` may be no
+more than 300 seconds old (`MAX_FREEZE_AGE_SECONDS`) and the complete
+`frozenAt` to `expiresAt` validity duration may be no more than 900 seconds
+(`MAX_FREEZE_VALIDITY_SECONDS`). Then run the final delta and parity finalization:
+The importer re-evaluates this authenticated time window with a fresh clock read
+immediately before terminal finalization and again immediately before publishing
+the promotion commit. Expiry during a long-running import is therefore a hard
+failure even if the marker was valid when the command started.
+
+```powershell
+python scripts/brain-sqlite-to-postgres.py --mode final-delta-finalize --source C:\absolute\canonical.sqlite --sealed-snapshot C:\absolute\evidence\final.sqlite --postgres-dsn-env BRAIN_IMPORT_DSN --expected-database <database> --expected-system-identifier <system-identifier> --expected-database-oid <database-oid> --release-id <release-id> --release-nonce <32-128-url-safe-characters> --writer-freeze-marker C:\absolute\evidence\writer-freeze.json --output C:\absolute\evidence\final-receipt.json
+```
+
+If the destination exposes a database-incarnation identifier, also pass
+`--expected-database-incarnation-id`. The final command checks live DB/WAL/SHM
+identity before import, before parity, after finalization, and after receipt
+publication. Any drift or marker replacement removes the receipt. If the
+durable terminal event commits but publication fails, rerun the same binding
+with `--recover-terminal`; recovery accepts only the stored completed event and
+its full clean per-table parity counts and hashes on the same bound database,
+PostgreSQL system identifier, database OID, and optional database incarnation.
+
+Final receipts use an authenticated two-phase publication protocol. The receipt
+itself is always `promotable: false`; a clean finalization marks it
+`promotionEligible: true`. It becomes consumable only when the adjacent
+`<receipt>.commit.json` exists, authenticates with the brain-import key, declares
+`promotable: true`, and binds the exact receipt hash, release, run key,
+destination, and terminal event. Never consume a receipt by checking its JSON
+alone; use the verifier that requires both artifacts. A publication-boundary
+failure cannot be repaired by deleting the receipt: the absence of the commit
+artifact is the fail-closed state.
+The consumable-evidence verifier is also a semantic gate, not only a signature
+check: it requires the exact receipt and commit schemas, final-delta mode,
+`dryRun: false`, a positive terminal event ID, exact destination bindings, and
+complete clean per-table parity counts and hashes.
+
 Prepare legacy research artifacts in the local cache when needed:
 
 ```powershell

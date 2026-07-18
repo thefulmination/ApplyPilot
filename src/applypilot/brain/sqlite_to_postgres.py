@@ -11,7 +11,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,9 @@ class ImportSummary:
     imported: dict[str, int]
     quarantined: dict[str, int]
     finalized: bool = False
+    parity: dict[str, dict[str, Any]] = field(default_factory=dict)
+    terminal_event_id: int | None = None
+    recovered: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +53,9 @@ class ImportSummary:
             "imported": dict(self.imported),
             "quarantined": dict(self.quarantined),
             "finalized": self.finalized,
+            "parity": {name: dict(result) for name, result in self.parity.items()},
+            "terminal_event_id": self.terminal_event_id,
+            "recovered": self.recovered,
         }
 
 
@@ -1207,15 +1213,150 @@ def _started_run_id(pg, source_sha256: str, run_key: str) -> int:
     return run_id
 
 
+def _parity_metadata(parity_results: Mapping[str, ParityResult]) -> dict[str, dict[str, Any]]:
+    return {
+        name: {
+            "source_count": result.source_count,
+            "target_count": result.target_count,
+            "source_hash": result.source_hash,
+            "target_hash": result.target_hash,
+            "mismatch_count": result.mismatch_count,
+            "unresolved_count": result.unresolved_count,
+            "passed": result.passed,
+        }
+        for name, result in sorted(parity_results.items())
+    }
+
+
+def _validated_terminal_parity(value: Any) -> dict[str, dict[str, Any]]:
+    expected_tables = {table.name for table in SOURCE_TABLES}
+    if not isinstance(value, dict) or set(value) != expected_tables:
+        raise BrainImportError("terminal recovery parity metadata is incomplete")
+    required_fields = {
+        "source_count",
+        "target_count",
+        "source_hash",
+        "target_hash",
+        "mismatch_count",
+        "unresolved_count",
+        "passed",
+    }
+    normalized: dict[str, dict[str, Any]] = {}
+    for name in sorted(expected_tables):
+        record = value[name]
+        if not isinstance(record, dict) or set(record) != required_fields:
+            raise BrainImportError(f"terminal recovery parity metadata is invalid for {name}")
+        counts = (
+            record["source_count"],
+            record["target_count"],
+            record["mismatch_count"],
+            record["unresolved_count"],
+        )
+        if any(type(item) is not int or item < 0 for item in counts):
+            raise BrainImportError(f"terminal recovery parity counts are invalid for {name}")
+        source_hash = record["source_hash"]
+        target_hash = record["target_hash"]
+        if any(
+            not isinstance(item, str)
+            or len(item) != 64
+            or any(character not in "0123456789abcdef" for character in item)
+            for item in (source_hash, target_hash)
+        ):
+            raise BrainImportError(f"terminal recovery parity hashes are invalid for {name}")
+        if (
+            record["passed"] is not True
+            or record["source_count"] != record["target_count"]
+            or source_hash != target_hash
+            or record["mismatch_count"] != 0
+            or record["unresolved_count"] != 0
+        ):
+            raise BrainImportError(f"terminal recovery parity is not clean for {name}")
+        normalized[name] = dict(record)
+    return normalized
+
+
+def _validated_destination_binding(value: Any) -> dict[str, Any]:
+    required = {"database", "systemIdentifier", "databaseOid", "databaseIncarnationId"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise BrainImportError("destination binding is incomplete")
+    normalized = dict(value)
+    for name in ("database", "systemIdentifier", "databaseOid"):
+        if not isinstance(normalized[name], str) or not normalized[name]:
+            raise BrainImportError(f"destination binding {name} is invalid")
+    incarnation = normalized["databaseIncarnationId"]
+    if incarnation is not None and (not isinstance(incarnation, str) or not incarnation):
+        raise BrainImportError("destination binding databaseIncarnationId is invalid")
+    return normalized
+
+
+def recover_finalized_sqlite_to_postgres_import(
+    pg,
+    *,
+    expected_sha256: str,
+    run_key: str,
+    expected_destination_binding: Mapping[str, Any],
+) -> ImportSummary:
+    """Reconstruct a finalized result exclusively from its durable terminal event."""
+    with pg.cursor() as cur:
+        cur.execute(
+            """SELECT run.migration_run_id,event.migration_run_event_id,event.event_type,event.metadata,
+                      source.source_fingerprint
+               FROM brain_migration_runs run
+               JOIN brain_migration_sources source
+                 ON source.migration_source_id=run.migration_source_id
+                AND source.source_namespace=run.source_namespace
+               JOIN LATERAL (
+                   SELECT migration_run_event_id,event_type,metadata
+                   FROM brain_migration_run_events
+                   WHERE migration_run_id=run.migration_run_id
+                     AND source_namespace=run.source_namespace
+                   ORDER BY migration_run_event_id DESC LIMIT 1
+               ) event ON TRUE
+               WHERE run.source_namespace=%s AND source.source_fingerprint=%s AND run.run_key=%s""",
+            (SOURCE_NAMESPACE, expected_sha256, run_key),
+        )
+        row = cur.fetchone()
+    if row is None or row["event_type"] != "completed":
+        raise BrainImportError("terminal recovery requires an existing completed migration run")
+    if row["source_fingerprint"] != expected_sha256:
+        raise BrainImportError("terminal recovery source fingerprint does not match")
+    metadata = row["metadata"]
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "source_sha256",
+        "independent_parity",
+        "destination_binding",
+    }:
+        raise BrainImportError("terminal recovery metadata is invalid")
+    if metadata["source_sha256"] != expected_sha256:
+        raise BrainImportError("terminal recovery metadata source fingerprint does not match")
+    parity = _validated_terminal_parity(metadata["independent_parity"])
+    durable_destination = _validated_destination_binding(metadata["destination_binding"])
+    expected_destination = _validated_destination_binding(expected_destination_binding)
+    if durable_destination != expected_destination:
+        raise BrainImportError("terminal recovery destination binding does not match")
+    return ImportSummary(
+        migration_run_id=int(row["migration_run_id"]),
+        source_sha256=expected_sha256,
+        imported={name: int(result["target_count"]) for name, result in parity.items()},
+        quarantined={},
+        finalized=True,
+        parity=parity,
+        terminal_event_id=int(row["migration_run_event_id"]),
+        recovered=True,
+    )
+
+
 def finalize_sqlite_to_postgres_import(
     pg,
     sqlite_path: str | Path,
     *,
     expected_sha256: str,
     run_key: str,
+    destination_binding: Mapping[str, Any],
 ) -> ImportSummary:
     """Compute independent parity and finalize a loaded run only when it is clean."""
     receipt = capture_sqlite_source_receipt(sqlite_path)
+    durable_destination = _validated_destination_binding(destination_binding)
     if receipt.sha256 != expected_sha256:
         raise BrainImportError(f"source SHA mismatch: expected {expected_sha256}, got {receipt.sha256}")
     guard = SQLiteSourceGuard(sqlite_path, expected_sha256)
@@ -1255,24 +1396,26 @@ def finalize_sqlite_to_postgres_import(
             head = cur.fetchone()
             if head is None or head["event_type"] != "started":
                 raise BrainImportError("migration run lost its started head during finalization")
-            parity_metadata = {
-                name: {
-                    "count": result.source_count,
-                    "sha256": result.source_hash,
-                }
-                for name, result in parity_results.items()
-            }
+            parity_metadata = _parity_metadata(parity_results)
             cur.execute(
                 """INSERT INTO brain_migration_run_events
                    (migration_run_id,source_namespace,event_type,actor_id,metadata,supersedes_run_event_id)
-                   VALUES (%s,%s,'completed','sqlite-to-postgres-importer',%s,%s)""",
+                   VALUES (%s,%s,'completed','sqlite-to-postgres-importer',%s,%s)
+                   RETURNING migration_run_event_id""",
                 (
                     run_id,
                     SOURCE_NAMESPACE,
-                    Jsonb({"source_sha256": receipt.sha256, "independent_parity": parity_metadata}),
+                    Jsonb(
+                        {
+                            "source_sha256": receipt.sha256,
+                            "independent_parity": parity_metadata,
+                            "destination_binding": durable_destination,
+                        }
+                    ),
                     head["migration_run_event_id"],
                 ),
             )
+            terminal_event_id = int(cur.fetchone()["migration_run_event_id"])
         _commit_terminal_phase(
             pg,
             recheck_source=guard.recheck,
@@ -1284,6 +1427,8 @@ def finalize_sqlite_to_postgres_import(
             imported={name: result.target_count for name, result in parity_results.items()},
             quarantined={},
             finalized=True,
+            parity=parity_metadata,
+            terminal_event_id=terminal_event_id,
         )
     except Exception as exc:
         if run_id is not None:
