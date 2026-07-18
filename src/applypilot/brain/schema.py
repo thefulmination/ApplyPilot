@@ -19,6 +19,7 @@ _SCHEMA_V3_SQL = Path(__file__).with_name("schema_v3.sql")
 _SCHEMA_V4_SQL = Path(__file__).with_name("schema_v4.sql")
 _SCHEMA_V5_SQL = Path(__file__).with_name("schema_v5.sql")
 _SCHEMA_V6_SQL = Path(__file__).with_name("schema_v6.sql")
+_SCHEMA_V7_SQL = Path(__file__).with_name("schema_v7.sql")
 _SCHEMA_LOCK_KEY = "applypilot:brain:schema:v1"
 _MIGRATION_NAME = "brain schema v1"
 _MIGRATION_V2_NAME = "brain schema v2 lifecycle principals"
@@ -26,13 +27,20 @@ _MIGRATION_V3_NAME = "brain schema v3 lane canary pins"
 _MIGRATION_V4_NAME = "brain schema v4 scoped candidate authority"
 _MIGRATION_V5_NAME = "brain schema v5 durable factual graph authority"
 _MIGRATION_V6_NAME = "brain schema v6 immutable artifact authority"
+_MIGRATION_V7_NAME = "brain schema v7 replay-safe artifact authority"
 _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e2576f1267d7"
 _EXPECTED_V5_CHECKSUM = "52d1726bb13df54591fcd6343884ec8f6f7d18ab7fbf74b4dc33ba509cb0e559"
 _EXPECTED_V6_CHECKSUM = "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
+_EXPECTED_V7_CHECKSUM = "f6b84e13a057bc5b0fcb5de74f4627fc01e4f308d577771b17400587e02b6834"
 _EXPECTED_V5_CATALOG_HASH = "87ed08bc34cc36e12d41fc44bdf4da1771bb67a609eabff2a3c39e0286e2b6a1"
+_EXPECTED_V6_CATALOG_HASH = "3670c106085e1ae081515cbc60d7ff2ae78b9f1b4f40345d60cdfe9c26f4a143"
+_EXPECTED_V7_CATALOG_HASH = "ae2efa868bc3b3b138897a57adbdfb3b3d496b92e61403decdcfdd0cfa22b60f"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
+_CURRENT_V5_CATALOG_HASH = "b9ac5d2ae418198d67eb52c8d9dde173448183ba5dde69118157257bf9c2e27a"
+_CURRENT_BASE_CATALOG_HASH = "44f3d3bf7d80d5023a5760a11c45f8b86166710220e418b02072cffbf9249160"
 _STATUS_ROLE = "brain_status_reader"
+_CURRENT_V6_CHECKSUM = "9500e1a632d9591f21650adf4a73ba2d43ab7c9420ae0a4bdfdabbe23a090e3e"
 _POLICY_CONTROLLER_ROLE = "brain_policy_controller"
 _GRAPH_AUTHORITY_ROLE = "brain_graph_authority"
 _CANDIDATE_READER_ROLE = "brain_candidate_reader"
@@ -579,14 +587,33 @@ def _schema_v6_bytes() -> bytes:
 def _schema_v6_checksum() -> str:
     return hashlib.sha256(_schema_v6_bytes()).hexdigest()
 
+def _schema_v7_bytes() -> bytes:
+    return _SCHEMA_V7_SQL.read_bytes()
+
+
+def _schema_v7_checksum() -> str:
+    return hashlib.sha256(_schema_v7_bytes()).hexdigest()
+
+
+def _assert_schema_v7_bytes_immutable() -> None:
+    actual_checksum = _schema_v7_checksum()
+    if actual_checksum != _EXPECTED_V7_CHECKSUM:
+        raise RuntimeError(
+            f"immutable schema v7 file checksum mismatch: expected {_EXPECTED_V7_CHECKSUM}, got {actual_checksum}"
+        )
+
+def _assert_current_schema_v6_bytes_immutable() -> None:
+    actual_checksum = _schema_v6_checksum()
+    if actual_checksum != _CURRENT_V6_CHECKSUM:
+        raise RuntimeError(
+            f"immutable committed schema v6 file checksum mismatch: "
+            f"expected {_CURRENT_V6_CHECKSUM}, got {actual_checksum}"
+        )
+
+
 
 def _assert_schema_v6_bytes_immutable() -> None:
-    actual_checksum = _schema_v6_checksum()
-    if actual_checksum != _EXPECTED_V6_CHECKSUM:
-        raise RuntimeError(
-            f"immutable schema v6 file checksum mismatch: expected {_EXPECTED_V6_CHECKSUM}, "
-            f"got {actual_checksum}"
-        )
+    _assert_current_schema_v6_bytes_immutable()
 
 
 def _assert_schema_v5_bytes_immutable() -> None:
@@ -978,7 +1005,7 @@ def _version_rows(cur):
     if not rows:
         raise RuntimeError("brain schema version ledger exists but is empty")
     versions = [row["version"] for row in rows]
-    if versions not in ([1], [1, 2], [1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6]):
+    if versions not in ([1], [1, 2], [1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7]):
         raise RuntimeError(
             "unsupported or non-contiguous brain schema version ledger: "
             + ", ".join(str(version) for version in versions)
@@ -995,12 +1022,18 @@ def _version_rows(cur):
         or rows[4]["applied_by"] != _MIGRATION_ROLE
     ):
         raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 5 contract")
-    if len(rows) == 6 and (
+    if len(rows) >= 6 and (
         rows[5]["migration_name"] != _MIGRATION_V6_NAME
-        or rows[5]["migration_checksum"] != _EXPECTED_V6_CHECKSUM
+        or rows[5]["migration_checksum"] not in {_EXPECTED_V6_CHECKSUM, _CURRENT_V6_CHECKSUM}
         or rows[5]["applied_by"] != _MIGRATION_ROLE
     ):
         raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 6 contract")
+    if len(rows) == 7 and (
+        rows[6]["migration_name"] != _MIGRATION_V7_NAME
+        or rows[6]["migration_checksum"] != _EXPECTED_V7_CHECKSUM
+        or rows[6]["applied_by"] != _MIGRATION_ROLE
+    ):
+        raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 7 contract")
     return rows
 
 
@@ -1597,8 +1630,9 @@ def _verify_contract(cur) -> None:
                 problems.append(f"ownership mismatch: brain_archive owned by {archive_owner['owner_name']}")
 
     catalog_hash = _catalog_contract_hash(cur, include_v5=len(versions) >= 5)
-    if _EXPECTED_CATALOG_HASH and catalog_hash != _EXPECTED_CATALOG_HASH:
-        problems.append(f"catalog contract hash mismatch: expected {_EXPECTED_CATALOG_HASH}, got {catalog_hash}")
+    expected_base_catalog_hash = _CURRENT_BASE_CATALOG_HASH if len(versions) >= 3 else _EXPECTED_CATALOG_HASH
+    if catalog_hash != expected_base_catalog_hash:
+        problems.append(f"catalog contract hash mismatch: expected {expected_base_catalog_hash}, got {catalog_hash}")
 
     cur.execute(
         "SELECT rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,"
@@ -2162,10 +2196,11 @@ def _verify_v5_contract(cur) -> None:
             problems.append("migration v5 ledger owner mismatch")
 
     actual_v5_catalog_hash = _v5_catalog_contract_hash(cur)
-    if actual_v5_catalog_hash != _EXPECTED_V5_CATALOG_HASH:
+    expected_v5_catalog_hash = _CURRENT_V5_CATALOG_HASH if len(versions) >= 5 else _EXPECTED_V5_CATALOG_HASH
+    if actual_v5_catalog_hash != expected_v5_catalog_hash:
         problems.append(
             "v5 exact catalog contract mismatch: "
-            f"expected {_EXPECTED_V5_CATALOG_HASH}, got {actual_v5_catalog_hash}"
+            f"expected {expected_v5_catalog_hash}, got {actual_v5_catalog_hash}"
         )
 
     cur.execute(
@@ -3104,8 +3139,10 @@ def _verify_v6_contract(cur) -> None:
 
 def verify_brain_schema_v6_in_transaction(cur) -> None:
     """Verify V1-V6 and the immutable artifact registration authority."""
-    verify_brain_schema_v5_in_transaction(cur)
+    _assert_current_schema_v6_bytes_immutable()
     _verify_v6_contract(cur)
+    if _catalog_contract_hash(cur, include_v5=True) != _EXPECTED_V6_CATALOG_HASH:
+        raise RuntimeError("brain schema v6 catalog contract hash mismatch")
 
 
 def verify_brain_schema_v6(conn) -> None:
@@ -3138,7 +3175,7 @@ def ensure_brain_schema_v6_in_transaction(
     cur.execute(
         "INSERT INTO public.brain_schema_versions "
         "(version,migration_name,migration_checksum,applied_by) VALUES (6,%s,%s,%s)",
-        (_MIGRATION_V6_NAME, _EXPECTED_V6_CHECKSUM, migration_identity),
+        (_MIGRATION_V6_NAME, _CURRENT_V6_CHECKSUM, migration_identity),
     )
     verify_brain_schema_v6_in_transaction(cur)
 
@@ -3281,9 +3318,238 @@ def ensure_policy_partition(conn, policy_version: str) -> str:
 
 ensure_schema_v1 = ensure_brain_schema_v1
 verify_schema_v1 = verify_brain_schema_v1
+def _verify_v7_contract(cur) -> None:
+    if _catalog_contract_hash(cur, include_v5=True) != _EXPECTED_V7_CATALOG_HASH:
+        raise RuntimeError("brain schema v7 catalog contract hash mismatch")
+    versions = _version_rows(cur)
+    if len(versions) != 7:
+        raise RuntimeError("brain schema v7 verification requires a contiguous V1-V7 ledger")
+    version = versions[6]
+    if (
+        version["version"] != 7 or version["migration_name"] != _MIGRATION_V7_NAME
+        or version["migration_checksum"] != _EXPECTED_V7_CHECKSUM
+        or version["applied_by"] != _MIGRATION_ROLE
+    ):
+        raise RuntimeError("brain schema v7 ledger contract mismatch")
+    cur.execute(
+        "SELECT p.proname,owner.rolname AS owner_name,p.prosecdef,p.proconfig,p.prosrc "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "JOIN pg_roles owner ON owner.oid=p.proowner "
+        "WHERE n.nspname='public' AND p.proname=ANY(%s)",
+        (["brain_register_authoritative_artifact_manifest", "brain_register_authoritative_artifact_manifest_v6"],),
+    )
+    functions = {row["proname"]: row for row in cur.fetchall()}
+    wrapper = functions.get("brain_register_authoritative_artifact_manifest")
+    legacy = functions.get("brain_register_authoritative_artifact_manifest_v6")
+    if (
+        wrapper is None or legacy is None
+        or wrapper["owner_name"] != "brain_artifact_authority_owner"
+        or legacy["owner_name"] != "brain_artifact_authority_owner"
+        or not wrapper["prosecdef"] or not legacy["prosecdef"]
+        or wrapper["proconfig"] != ["search_path=pg_catalog, public"]
+        or legacy["proconfig"] != ["search_path=pg_catalog, public"]
+        or "pg_advisory_xact_lock" not in wrapper["prosrc"]
+        or "replay destination mismatch" not in wrapper["prosrc"]
+    ):
+        raise RuntimeError("brain schema v7 registration function contract mismatch")
+    cur.execute(
+        "SELECT p.proname,COALESCE(grantee.rolname,'PUBLIC') AS grantee,acl.privilege_type "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl "
+        "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE n.nspname='public' AND p.proname=ANY(%s) AND acl.grantee<>p.proowner",
+        (["brain_register_authoritative_artifact_manifest", "brain_register_authoritative_artifact_manifest_v6"],),
+    )
+    grants = {(row["proname"], row["grantee"], row["privilege_type"]) for row in cur.fetchall()}
+    if grants != {(
+        "brain_register_authoritative_artifact_manifest",
+        "brain_artifact_authority_writer",
+        "EXECUTE",
+    )}:
+        raise RuntimeError("brain schema v7 function ACL contract mismatch")
+    cur.execute(
+        "SELECT p.proname,owner.rolname AS owner_name,p.prosecdef,p.proconfig,p.prosrc "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "JOIN pg_roles owner ON owner.oid=p.proowner "
+        "WHERE n.nspname='public' AND p.proname=ANY(%s)",
+        ([
+            "brain_artifact_is_authoritative",
+            "brain_snapshot_reference_provenance_matches",
+            "brain_snapshot_binding_is_authoritative",
+            "brain_check_policy_lifecycle",
+        ],),
+    )
+    support = {row["proname"]: row for row in cur.fetchall()}
+    expected_support = {
+        "brain_artifact_is_authoritative": ("brain_artifact_authority_owner", True),
+        "brain_snapshot_reference_provenance_matches": ("brain_artifact_authority_owner", False),
+        "brain_snapshot_binding_is_authoritative": ("brain_artifact_authority_owner", True),
+        "brain_check_policy_lifecycle": (_MIGRATION_ROLE, False),
+    }
+    if set(support) != set(expected_support):
+        raise RuntimeError("brain schema v7 support function set mismatch")
+    for name, (owner_name, security_definer) in expected_support.items():
+        function = support[name]
+        if function["owner_name"] != owner_name or function["prosecdef"] is not security_definer:
+            raise RuntimeError(f"brain schema v7 support function ownership mismatch: {name}")
+    for name in (
+        "brain_artifact_is_authoritative",
+        "brain_snapshot_reference_provenance_matches",
+        "brain_snapshot_binding_is_authoritative",
+    ):
+        if support[name]["proconfig"] != ["search_path=pg_catalog, public"]:
+            raise RuntimeError(f"brain schema v7 support function search_path mismatch: {name}")
+    if (
+        "applypilot.policy.snapshot-reference" not in support["brain_snapshot_reference_provenance_matches"]["prosrc"]
+        or "brain_artifact_authority_registrations" not in support["brain_snapshot_binding_is_authoritative"]["prosrc"]
+        or "brain_snapshot_binding_is_authoritative" not in support["brain_check_policy_lifecycle"]["prosrc"]
+    ):
+        raise RuntimeError("brain schema v7 snapshot support function body mismatch")
+    cur.execute(
+        "SELECT p.proname,COALESCE(grantee.rolname,'PUBLIC') AS grantee,acl.privilege_type "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl "
+        "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE n.nspname='public' AND p.proname=ANY(%s) AND acl.grantee<>p.proowner",
+        ([
+            "brain_artifact_is_authoritative",
+            "brain_snapshot_reference_provenance_matches",
+            "brain_snapshot_binding_is_authoritative",
+        ],),
+    )
+    support_grants = {
+        (row["proname"], row["grantee"], row["privilege_type"]) for row in cur.fetchall()
+    }
+    if support_grants != {
+        ("brain_artifact_is_authoritative", _MIGRATION_ROLE, "EXECUTE"),
+        ("brain_snapshot_reference_provenance_matches", _MIGRATION_ROLE, "EXECUTE"),
+        ("brain_snapshot_binding_is_authoritative", _MIGRATION_ROLE, "EXECUTE"),
+    }:
+        raise RuntimeError("brain schema v7 support function ACL mismatch")
+    cur.execute(
+        "SELECT c.relname,c.relkind,owner.rolname AS owner_name FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles owner ON owner.oid=c.relowner "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s)",
+        ([
+            "brain_artifact_authority_requests",
+            "brain_artifact_authority_registrations",
+            "brain_artifact_locations_artifact_location_id_seq",
+        ],),
+    )
+    relations = {
+        row["relname"]: (row["relkind"], row["owner_name"]) for row in cur.fetchall()
+    }
+    if relations != {
+        "brain_artifact_authority_requests": ("r", "brain_artifact_authority_owner"),
+        "brain_artifact_authority_registrations": ("r", "brain_artifact_authority_owner"),
+        "brain_artifact_locations_artifact_location_id_seq": ("S", _MIGRATION_ROLE),
+    }:
+        raise RuntimeError("brain schema v7 authority relation ownership mismatch")
+    cur.execute(
+        "SELECT c.relname,grantee.rolname AS grantee,acl.privilege_type "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+        "JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s) "
+        "AND grantee.rolname=ANY(%s) AND acl.grantee<>c.relowner",
+        (["brain_artifacts", "brain_artifact_locations", "brain_artifact_locations_artifact_location_id_seq"],
+         ["brain_artifact_authority_owner", "brain_artifact_authority_writer"]),
+    )
+    dependency_grants = {
+        (row["relname"], row["grantee"], row["privilege_type"]) for row in cur.fetchall()
+    }
+    if dependency_grants != {
+        ("brain_artifacts", "brain_artifact_authority_owner", "SELECT"),
+        ("brain_artifacts", "brain_artifact_authority_owner", "INSERT"),
+        ("brain_artifact_locations", "brain_artifact_authority_owner", "SELECT"),
+        ("brain_artifact_locations", "brain_artifact_authority_owner", "INSERT"),
+        ("brain_artifact_locations_artifact_location_id_seq", "brain_artifact_authority_owner", "SELECT"),
+        ("brain_artifact_locations_artifact_location_id_seq", "brain_artifact_authority_owner", "USAGE"),
+    }:
+        raise RuntimeError("brain schema v7 authority dependency ACL mismatch")
+    cur.execute(
+        "SELECT grantee.rolname AS grantee,acl.privilege_type FROM pg_namespace n "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) acl "
+        "JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE n.nspname='public' AND grantee.rolname=ANY(%s)",
+        (["brain_artifact_authority_owner", "brain_artifact_authority_writer"],),
+    )
+    schema_grants = {(row["grantee"], row["privilege_type"]) for row in cur.fetchall()}
+    if schema_grants != {
+        ("brain_artifact_authority_owner", "USAGE"),
+        ("brain_artifact_authority_writer", "USAGE"),
+    }:
+        raise RuntimeError("brain schema v7 authority schema ACL mismatch")
+    cur.execute(
+        "SELECT 1 FROM pg_default_acl defaults "
+        "CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl "
+        "LEFT JOIN pg_roles owner ON owner.oid=defaults.defaclrole "
+        "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE owner.rolname=ANY(%s) OR grantee.rolname=ANY(%s) LIMIT 1",
+        (["brain_artifact_authority_owner", "brain_artifact_authority_writer"],) * 2,
+    )
+    if cur.fetchone() is not None:
+        raise RuntimeError("brain schema v7 authority default ACL leakage")
+
+
+def verify_brain_schema_v7_in_transaction(cur) -> None:
+    _assert_current_schema_v6_bytes_immutable()
+    _assert_schema_v7_bytes_immutable()
+    _verify_v7_contract(cur)
+
+
+def verify_brain_schema_v7(conn) -> None:
+    _require_idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            verify_brain_schema_v7_in_transaction(cur)
+
+
+def ensure_brain_schema_v7_in_transaction(cur, *, lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS) -> None:
+    _assert_current_schema_v6_bytes_immutable()
+    _assert_schema_v7_bytes_immutable()
+    versions = _version_rows(cur)
+    if len(versions) == 7:
+        verify_brain_schema_v7_in_transaction(cur)
+        return
+    if len(versions) < 5:
+        ensure_brain_schema_v5_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
+    migration_identity = _activate_migration_identity(cur)
+    _acquire_xact_lock(cur, lock_timeout_seconds)
+    versions = _version_rows(cur)
+    if len(versions) == 5:
+        cur.execute(_schema_v6_bytes().decode("utf-8"))
+        cur.execute(
+            "INSERT INTO public.brain_schema_versions "
+            "(version,migration_name,migration_checksum,applied_by) VALUES (6,%s,%s,%s)",
+            (_MIGRATION_V6_NAME, _CURRENT_V6_CHECKSUM, migration_identity),
+        )
+        versions = [*versions, {"version": 6}]
+    if len(versions) != 6:
+        raise RuntimeError("brain schema v7 requires contiguous V1-V6 ledger")
+    cur.execute("GRANT CREATE ON SCHEMA public TO brain_artifact_authority_owner")
+    cur.execute(_schema_v7_bytes().decode("utf-8"))
+    cur.execute("REVOKE CREATE ON SCHEMA public FROM brain_artifact_authority_owner")
+    cur.execute(
+        "INSERT INTO public.brain_schema_versions "
+        "(version,migration_name,migration_checksum,applied_by) VALUES (7,%s,%s,%s)",
+        (_MIGRATION_V7_NAME, _EXPECTED_V7_CHECKSUM, migration_identity),
+    )
+    verify_brain_schema_v7_in_transaction(cur)
+
+
+def ensure_brain_schema_v7(conn, *, lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS) -> None:
+    _require_idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            ensure_brain_schema_v7_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
+
+
 ensure_schema_v4 = ensure_brain_schema_v4
 verify_schema_v4 = verify_brain_schema_v4
 ensure_schema_v5 = ensure_brain_schema_v5
 verify_schema_v5 = verify_brain_schema_v5
 ensure_schema_v6 = ensure_brain_schema_v6
 verify_schema_v6 = verify_brain_schema_v6
+ensure_schema_v7 = ensure_brain_schema_v7
+verify_schema_v7 = verify_brain_schema_v7

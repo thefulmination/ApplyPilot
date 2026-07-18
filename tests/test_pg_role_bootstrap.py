@@ -960,7 +960,7 @@ def test_atomic_bootstrap_removes_provider_admin_membership_after_v5_install(fle
 
             assert root.execute(
                 "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
-            ).fetchone()["versions"] == [1, 2, 3, 4, 5]
+            ).fetchone()["versions"] == [1, 2, 3, 4, 5, 6, 7]
             assert (
                 root.execute(
                     "SELECT 1 FROM pg_auth_members membership "
@@ -1004,7 +1004,7 @@ def test_atomic_bootstrap_removes_provider_admin_membership_after_v5_install(fle
             assert _read_v5_rollback_preservation_rows(root, preserved_v5_rows) == preserved_v5_rows
             assert root.execute(
                 "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
-            ).fetchone()["versions"] == [1, 2, 3, 4, 5]
+            ).fetchone()["versions"] == [1, 2, 3, 4, 5, 6, 7]
             assert root.execute(
                 "SELECT to_regclass('public.brain_immutable_artifact_references') AS relation"
             ).fetchone()["relation"] == "brain_immutable_artifact_references"

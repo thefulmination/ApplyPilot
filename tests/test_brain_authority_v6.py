@@ -11,7 +11,8 @@ V6_SQL = ROOT / "src" / "applypilot" / "brain" / "schema_v6.sql"
 
 def test_v6_is_checksum_pinned_and_registered() -> None:
     assert schema._SCHEMA_V6_SQL == V6_SQL
-    assert schema._EXPECTED_V6_CHECKSUM == schema._schema_v6_checksum()
+    assert schema._CURRENT_V6_CHECKSUM == schema._schema_v6_checksum()
+    assert schema._EXPECTED_V6_CHECKSUM == "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
     assert schema._MIGRATION_V6_NAME == "brain schema v6 immutable artifact authority"
     assert schema.ensure_schema_v6 is schema.ensure_brain_schema_v6
     assert schema.verify_schema_v6 is schema.verify_brain_schema_v6

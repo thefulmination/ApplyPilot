@@ -1803,6 +1803,7 @@ def _reconcile_role_memberships(
     role_name: str,
     approved_parent_roles: tuple[str, ...] = (),
     approved_grantee_roles: tuple[str, ...] = (),
+    validate_approved_grantee_descendants: bool = True,
 ) -> None:
     approved_parents = set(approved_parent_roles)
     approved_grantees = set(approved_grantee_roles)
@@ -1830,7 +1831,7 @@ def _reconcile_role_memberships(
     for row in cur.fetchall():
         member = _row_value(row, "rolname")
         revoke = member not in approved_grantees
-        if not revoke:
+        if not revoke and validate_approved_grantee_descendants:
             cur.execute(
                 "WITH RECURSIVE descendants(role_oid) AS ("
                 "SELECT oid FROM pg_roles WHERE rolname=%s UNION "
@@ -2470,6 +2471,48 @@ def ensure_brain_candidate_roles(
         raise
 
 
+def _verify_artifact_authority_membership_closure(
+    cur,
+    *,
+    allowed_session_descendant: str | None,
+) -> None:
+    cur.execute(
+        "WITH RECURSIVE closure(root_oid,member_oid,path) AS ("
+        "SELECT root.oid,membership.member,ARRAY[root.oid,membership.member] "
+        "FROM pg_catalog.pg_roles root "
+        "JOIN pg_catalog.pg_auth_members membership ON membership.roleid=root.oid "
+        "WHERE root.rolname=ANY(%s) "
+        "UNION ALL "
+        "SELECT closure.root_oid,membership.member,closure.path||membership.member "
+        "FROM closure JOIN pg_catalog.pg_auth_members membership "
+        "ON membership.roleid=closure.member_oid "
+        "WHERE NOT membership.member=ANY(closure.path)) "
+        "SELECT root.rolname AS root_role,member.rolname AS member_role "
+        "FROM closure JOIN pg_catalog.pg_roles root ON root.oid=closure.root_oid "
+        "JOIN pg_catalog.pg_roles member ON member.oid=closure.member_oid "
+        "ORDER BY root.rolname,member.rolname",
+        ([BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE],),
+    )
+    allowed = {
+        (BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, "brain_schema_migrator"),
+    }
+    if allowed_session_descendant is not None:
+        allowed.add((BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, allowed_session_descendant))
+    reachable = {
+        (_row_value(row, "root_role"), _row_value(row, "member_role", 1))
+        for row in cur.fetchall()
+    }
+    unauthorized = sorted(reachable - allowed)
+    if unauthorized:
+        rendered = ", ".join(f"{root}->{member}" for root, member in unauthorized)
+        raise RuntimeError(
+            "artifact authority roles have unauthorized direct or transitive descendants: " + rendered
+        )
+    missing = {(BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, "brain_schema_migrator")} - reachable
+    if missing:
+        raise RuntimeError("artifact authority owner is not delegated to the fixed schema migrator")
+
+
 def ensure_brain_artifact_authority_roles_in_transaction(
     cur,
     *,
@@ -2508,6 +2551,7 @@ def ensure_brain_artifact_authority_roles_in_transaction(
         cur,
         role_name=BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE,
         approved_grantee_roles=(migrator_role,),
+        validate_approved_grantee_descendants=False,
     )
     _reconcile_role_memberships(cur, role_name=BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE)
     return BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE
@@ -2526,8 +2570,8 @@ def _install_brain_authority_in_transaction(
 
     # Import locally to keep the fleet role module independent during ordinary runtime use.
     from applypilot.brain.schema import (
-        ensure_brain_schema_v6_in_transaction,
-        verify_brain_schema_v6_in_transaction,
+        ensure_brain_schema_v7_in_transaction,
+        verify_brain_schema_v7_in_transaction,
     )
 
     candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
@@ -2538,16 +2582,24 @@ def _install_brain_authority_in_transaction(
     database = sql.Identifier(_row_value(identity, "database_name", 1))
     migrator = sql.Identifier(topology.migrator_role)
 
+    preexisting_edges = tuple(
+        edge
+        for edge in _retired_membership_inventory(
+            cur, retired_admin_roles=(topology.migrator_role, session_name)
+        )
+        if edge["parent_role"] == topology.migrator_role and edge["member_role"] == session_name
+    )
+    if len(preexisting_edges) > 1:
+        raise RuntimeError("multiple provider-to-migrator grants cannot be preserved exactly")
+    for edge in preexisting_edges:
+        cur.execute(
+            sql.SQL("REVOKE {} FROM {} GRANTED BY {} RESTRICT").format(
+                migrator, session_user, sql.Identifier(edge["grantor_role"])
+            )
+        )
+
     ensure_brain_artifact_authority_roles_in_transaction(cur, migrator_role=topology.migrator_role)
 
-    # The provider identity receives migration authority only for this transaction.
-    cur.execute(
-        "SELECT EXISTS (SELECT 1 FROM pg_auth_members membership "
-        "WHERE membership.roleid=(SELECT oid FROM pg_roles WHERE rolname=%s) "
-        "AND membership.member=(SELECT oid FROM pg_roles WHERE rolname=%s)) AS present",
-        (topology.migrator_role, session_name),
-    )
-    membership_preexisted = bool(_row_value(cur.fetchone(), "present"))
     cur.execute(
         "SELECT EXISTS (SELECT 1 FROM pg_database database "
         "CROSS JOIN LATERAL aclexplode(database.datacl) acl "
@@ -2559,17 +2611,58 @@ def _install_brain_authority_in_transaction(
     create_preexisted = bool(_row_value(cur.fetchone(), "present"))
     if not create_preexisted:
         cur.execute(sql.SQL("GRANT CREATE ON DATABASE {} TO {}").format(database, migrator))
-    if not membership_preexisted:
-        cur.execute(sql.SQL("GRANT {} TO {}").format(migrator, session_user))
-    ensure_brain_schema_v6_in_transaction(cur)
-    cur.execute("SET LOCAL ROLE NONE")
-    if not membership_preexisted:
-        cur.execute(sql.SQL("REVOKE {} FROM {}").format(migrator, session_user))
+    cur.execute(
+        "SELECT owner.rolname AS owner_name FROM pg_namespace namespace "
+        "JOIN pg_roles owner ON owner.oid=namespace.nspowner "
+        "WHERE namespace.nspname='public'"
+    )
+    public_owner_before = _row_value(cur.fetchone(), "owner_name")
+    public_owner_changed = public_owner_before != topology.migrator_role
+    if public_owner_changed:
+        cur.execute(sql.SQL("ALTER SCHEMA public OWNER TO {}").format(migrator))
+    cur.execute(sql.SQL("GRANT {} TO {}").format(migrator, session_user))
+    ensure_brain_schema_v7_in_transaction(cur)
+    cur.execute("RESET ROLE")
+    if public_owner_changed:
+        cur.execute(
+            sql.SQL("ALTER SCHEMA public OWNER TO {}").format(sql.Identifier(public_owner_before))
+        )
+    cur.execute(
+        "SELECT pg_get_userbyid(nspowner) AS owner_name "
+        "FROM pg_namespace WHERE nspname='public'"
+    )
+    if _row_value(cur.fetchone(), "owner_name") != public_owner_before:
+        raise RuntimeError("public schema owner was not restored after fixed authority installation")
+    cur.execute(
+        "SELECT has_schema_privilege("
+        "'brain_artifact_authority_owner','public','CREATE') AS allowed"
+    )
+    if bool(_row_value(cur.fetchone(), "allowed")):
+        raise RuntimeError(
+            "brain_artifact_authority_owner retained CREATE on public after fixed authority installation"
+        )
+    cur.execute(sql.SQL("REVOKE {} FROM {}").format(migrator, session_user))
     if not create_preexisted:
         cur.execute(sql.SQL("REVOKE CREATE ON DATABASE {} FROM {}").format(database, migrator))
 
     candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
-    verify_brain_schema_v6_in_transaction(cur)
+    ensure_brain_artifact_authority_roles_in_transaction(cur, migrator_role=topology.migrator_role)
+    if preexisting_edges:
+        cur.execute(_retired_membership_rollback_sql(cur, memberships=preexisting_edges))
+    restored_edges = tuple(
+        edge
+        for edge in _retired_membership_inventory(
+            cur, retired_admin_roles=(topology.migrator_role, session_name)
+        )
+        if edge["parent_role"] == topology.migrator_role and edge["member_role"] == session_name
+    )
+    if restored_edges != preexisting_edges:
+        raise RuntimeError("provider-to-migrator membership was not restored exactly")
+    _verify_artifact_authority_membership_closure(
+        cur,
+        allowed_session_descendant=session_name if preexisting_edges else None,
+    )
+    verify_brain_schema_v7_in_transaction(cur)
     for capability in ("brain_policy_controller",):
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (capability,))
         if cur.fetchone() is None:
