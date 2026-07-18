@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from applypilot.fleet import pg_roles
+
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -73,14 +75,28 @@ def test_rollback_executor_verifies_hash_and_enforces_atomic_break_glass_order(t
     assert main_body.index("psycopg.connect") < main_body.index("_restore_hba_and_reload(conn")
     assert main_body.index("_restore_hba_and_reload(conn") < main_body.index("conn.execute(rollback_sql)")
 
+    authentication_key = b"applypilot-mapped-role-contract-key"
+    authentication_key_id = "mapped-role-contract-v1"
     receipt = tmp_path / "receipt.json"
     rollback = tmp_path / "rollback.sql"
     rollback.write_text("SELECT 1;\n", encoding="utf-8")
+    signed_receipt = pg_roles.authenticate_evidence_receipt(
+        {
+            "rollback_mode": "topology_exact",
+            "rollback_sql_path": str(rollback.resolve()),
+            "rollback_sql_sha256": "0" * 64,
+            "inventory": {"infrastructure_superuser_roles": ["postgres"]},
+        },
+        authentication_key=authentication_key,
+        authentication_key_id=authentication_key_id,
+    )
     receipt.write_text(
-        '{"rollback_sql_sha256":"' + ("0" * 64) + '","inventory":{"infrastructure_superuser_roles":["postgres"]}}',
+        json.dumps(signed_receipt),
         encoding="utf-8",
     )
     env = os.environ.copy()
+    env["APPLYPILOT_ROLLBACK_HMAC_KEY_HEX"] = authentication_key.hex()
+    env["APPLYPILOT_ROLLBACK_HMAC_KEY_ID"] = authentication_key_id
     env["APPLYPILOT_ADMIN_PG_DSN"] = "must-not-be-used-before-hash-verification"
     result = subprocess.run(
         [

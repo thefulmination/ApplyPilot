@@ -345,7 +345,7 @@ def test_hba_restore_is_bound_to_show_path_digest_owner_and_mode(tmp_path: Path)
         module._validated_hba_restore(FakeConnection(), receipt)
 
 
-def test_rollback_commits_database_before_hba_restore(tmp_path: Path, monkeypatch) -> None:
+def test_rollback_restores_hba_before_database_transaction(tmp_path: Path, monkeypatch) -> None:
     module = _rollback_script_module()
     events: list[str] = []
 
@@ -420,11 +420,11 @@ def test_rollback_commits_database_before_hba_restore(tmp_path: Path, monkeypatc
 
     assert module.main() == 0
     assert events.index("hba_preflight") < events.index("database_transaction_enter")
+    assert events.index("hba_restore") < events.index("database_transaction_enter")
     assert events.index("database_rollback_sql") < events.index("database_transaction_commit")
-    assert events.index("database_transaction_commit") < events.index("hba_restore")
 
 
-def test_real_rollback_commit_is_visible_before_hba_replacement(
+def test_hba_replacement_precedes_real_rollback_commit(
     fleet_db: str, tmp_path: Path, monkeypatch
 ) -> None:
     module = _rollback_script_module()
@@ -448,19 +448,19 @@ def test_real_rollback_commit_is_visible_before_hba_replacement(
         assert conn.info.transaction_status.name == "INTRANS"
         return ("validated",)
 
-    replacement_observed = False
+    rollback_visible_during_hba_restore = False
 
-    def observe_committed_rollback(_conn, _receipt, *, validated):
-        nonlocal replacement_observed
+    def observe_rollback_visibility(_conn, _receipt, *, validated):
+        nonlocal rollback_visible_during_hba_restore
         assert validated == ("validated",)
         with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as observer:
-            replacement_observed = observer.execute(
+            rollback_visible_during_hba_restore = observer.execute(
                 "SELECT to_regclass(%s) IS NOT NULL AS committed",
                 (f"public.{marker}",),
             ).fetchone()["committed"]
 
     monkeypatch.setattr(module, "_validated_hba_restore", preflight)
-    monkeypatch.setattr(module, "_restore_hba_and_reload", observe_committed_rollback)
+    monkeypatch.setattr(module, "_restore_hba_and_reload", observe_rollback_visibility)
     monkeypatch.setattr(module, "_hba_restore_supported", lambda: True)
     monkeypatch.setenv("APPLYPILOT_ROLLBACK_HMAC_KEY_HEX", _EVIDENCE_KEY.hex())
     monkeypatch.setenv("APPLYPILOT_ROLLBACK_HMAC_KEY_ID", _EVIDENCE_KEY_ID)
@@ -479,7 +479,12 @@ def test_real_rollback_commit_is_visible_before_hba_replacement(
     )
     try:
         assert module.main() == 0
-        assert replacement_observed is True
+        assert rollback_visible_during_hba_restore is False
+        with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as observer:
+            assert observer.execute(
+                "SELECT to_regclass(%s) IS NOT NULL AS committed",
+                (f"public.{marker}",),
+            ).fetchone()["committed"] is True
     finally:
         with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as cleanup:
             cleanup.execute(sql.SQL("DROP TABLE IF EXISTS public.{} CASCADE").format(sql.Identifier(marker)))

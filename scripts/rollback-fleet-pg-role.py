@@ -320,15 +320,12 @@ def main() -> int:
             conn.commit()
             if conn.info.transaction_status.name != "IDLE":
                 raise RuntimeError("HBA preflight transaction did not return to idle state")
+        if args.restore_hba:
+            _restore_hba_and_reload(conn, receipt, validated=hba_preflight)
         # psycopg's transaction context is the executable equivalent of
         # psql --single-transaction --set=ON_ERROR_STOP=on.
         with conn.transaction():
             conn.execute(rollback_sql)
-        if args.restore_hba:
-            try:
-                _restore_hba_and_reload(conn, receipt, validated=hba_preflight)
-            except BaseException as error:
-                raise RuntimeError(f"database rollback committed; HBA recovery failed: {error}") from error
     print("authenticated database rollback committed")
     return 0
 
