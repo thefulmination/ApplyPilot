@@ -16,6 +16,7 @@ from applypilot.brain.artifact_authority import (
     normalize_manifest,
     parse_json_strict,
     register_verified_manifest,
+    signing_message,
     verify_manifest_signature,
     verify_s3_versions,
 )
@@ -40,7 +41,7 @@ def _manifest() -> dict:
                 "objectKey": "sha256/aa",
                 "versionId": "version-1",
                 "etag": "etag-1",
-                "awsChecksumSha256": "checksum-1",
+                "awsChecksumSha256": base64.b64encode(hashlib.sha256(b"content").digest()).decode(),
                 "storageImmutable": True,
                 "encryptionMode": "customer_managed",
                 "encryptionKeyId": "kms-key-1",
@@ -51,8 +52,16 @@ def _manifest() -> dict:
 
 
 class _Cursor:
-    def __init__(self) -> None:
+    def __init__(self, receipt=None) -> None:
         self.params = None
+        self.receipt = receipt or {
+            "status": "registered",
+            "request_id": "11111111-1111-1111-1111-111111111111",
+            "manifest_sha256": "b" * 64,
+            "destination_system_id": "42",
+            "destination_database_name": "brain",
+            "artifact_count": 1,
+        }
 
     def __enter__(self):
         return self
@@ -64,7 +73,7 @@ class _Cursor:
         self.params = params
 
     def fetchone(self):
-        return ({"status": "registered"},)
+        return (self.receipt,)
 
 
 class _Connection:
@@ -87,7 +96,7 @@ def test_registration_translates_signed_manifest_to_fixed_database_contract() ->
     manifest = normalize_manifest(_manifest())
     connection = _Connection()
     receipt = register_verified_manifest(connection, VerifiedManifest(manifest, "b" * 64, "key-1"))
-    assert receipt == {"status": "registered"}
+    assert receipt["status"] == "registered"
     assert connection.committed is True
     payload = json.loads(connection.cursor_value.params[-1])
     assert payload == [
@@ -101,7 +110,7 @@ def test_registration_translates_signed_manifest_to_fixed_database_contract() ->
             "media_type": "application/json",
             "object_key": "sha256/aa",
             "policy_source_id": "policy-1",
-            "provider_checksum": "checksum-1",
+            "provider_checksum": base64.b64encode(hashlib.sha256(b"content").digest()).decode(),
             "provider_version_id": "version-1",
             "storage_immutable": True,
         }
@@ -126,8 +135,10 @@ def test_signature_binds_canonical_manifest_time_and_destination() -> None:
     normalized = normalize_manifest(manifest)
     canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(canonical).hexdigest()
-    key = b"secret"
-    signature = base64.urlsafe_b64encode(hmac.new(key, canonical, hashlib.sha256).digest()).rstrip(b"=").decode()
+    key = b"s" * 32
+    signature = base64.urlsafe_b64encode(
+        hmac.new(key, signing_message(canonical), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
     verified = verify_manifest_signature(
         manifest,
         {"algorithm": "hmac-sha256", "keyId": "key-1", "manifestSha256": digest, "signature": signature},
@@ -153,7 +164,8 @@ class _S3:
         return {
             "VersionId": "version-1",
             "ContentLength": 7,
-            "ChecksumSHA256": "checksum-1",
+            "ContentType": "application/json",
+            "ChecksumSHA256": base64.b64encode(hashlib.sha256(b"content").digest()).decode(),
             "ETag": '"etag-1"',
             "ObjectLockMode": "COMPLIANCE",
             "ObjectLockRetainUntilDate": datetime(2099, 1, 1, tzinfo=timezone.utc),
@@ -162,7 +174,12 @@ class _S3:
         }
 
     def get_object(self, **_kwargs):
-        return {"Body": io.BytesIO(b"content")}
+        return {
+            "Body": io.BytesIO(b"content"),
+            "ChecksumSHA256": base64.b64encode(hashlib.sha256(b"content").digest()).decode(),
+            "ContentLength": 7,
+            "VersionId": "version-1",
+        }
 
 
 def test_s3_verification_binds_exact_version_content_lock_and_encryption() -> None:
@@ -198,7 +215,7 @@ def test_invalid_signature_encoding_is_rejected_strictly() -> None:
                 "manifestSha256": hashlib.sha256(canonical).hexdigest(),
                 "signature": "not+url/safe!",
             },
-            keys={"key-1": b"secret"},
+            keys={"key-1": b"s" * 32},
             expected_system_id="42",
             expected_database_name="brain",
             now=datetime(2026, 7, 18, 12, 30, tzinfo=timezone.utc),
@@ -210,12 +227,14 @@ def test_dry_run_verifies_s3_without_opening_database() -> None:
     manifest["artifacts"][0]["artifactSha256"] = hashlib.sha256(b"content").hexdigest()
     normalized = normalize_manifest(manifest)
     canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
-    key = b"secret"
+    key = b"s" * 32
     envelope = {
         "algorithm": "hmac-sha256",
         "keyId": "key-1",
         "manifestSha256": hashlib.sha256(canonical).hexdigest(),
-        "signature": base64.urlsafe_b64encode(hmac.new(key, canonical, hashlib.sha256).digest()).rstrip(b"=").decode(),
+        "signature": base64.urlsafe_b64encode(
+            hmac.new(key, signing_message(canonical), hashlib.sha256).digest()
+        ).rstrip(b"=").decode(),
     }
     result = coordinate_artifact_registration(
         manifest,
@@ -228,6 +247,6 @@ def test_dry_run_verifies_s3_without_opening_database() -> None:
         dry_run=True,
         now=datetime(2026, 7, 18, 12, 30, tzinfo=timezone.utc),
     )
-    assert result["dryRun"] is True
+    assert result["dry_run"] is True
     assert result["authoritative"] is False
     assert result["promotable"] is False
