@@ -447,6 +447,56 @@ def test_windows_private_secret_acl_rejects_broad_inherited_or_explicit_allow(
         cli.read_secure_regular_file(secret, max_bytes=64, require_private=True)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL behavior")
+@pytest.mark.parametrize("owner", (None, "S-1-1-0"))
+def test_windows_private_secret_rejects_null_or_disallowed_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str | None
+) -> None:
+    cli = _load_cli()
+    current_user = cli._windows_current_user_sid()
+    monkeypatch.setattr(
+        cli,
+        "_windows_file_security",
+        lambda _descriptor: (owner, {current_user, "S-1-5-18", "S-1-5-32-544"}),
+    )
+    with pytest.raises(ArtifactAuthorityError, match="owner"):
+        cli._assert_windows_private_file(123, tmp_path / "secret")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL behavior")
+def test_windows_private_secret_rejects_null_dacl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli = _load_cli()
+    current_user = cli._windows_current_user_sid()
+    monkeypatch.setattr(
+        cli, "_windows_file_security", lambda _descriptor: (current_user, None)
+    )
+    with pytest.raises(ArtifactAuthorityError, match="permissions are too broad"):
+        cli._assert_windows_private_file(123, tmp_path / "secret")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL behavior")
+@pytest.mark.parametrize(
+    ("ace_type", "message"),
+    ((5, "unsupported allow"), (255, "unknown access control")),
+)
+def test_windows_private_secret_rejects_object_specific_and_unknown_ace_types(
+    ace_type: int, message: str
+) -> None:
+    cli = _load_cli()
+    with pytest.raises(ArtifactAuthorityError, match=message):
+        cli._windows_classify_ace(ace_type, 1)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL behavior")
+def test_windows_private_secret_classifies_known_non_grant_and_zero_mask_aces() -> None:
+    cli = _load_cli()
+    assert cli._windows_classify_ace(1, 1) == "non-grant"
+    assert cli._windows_classify_ace(2, 1) == "non-grant"
+    assert cli._windows_classify_ace(255, 0) == "zero"
+
+
 def test_existing_receipt_refuses_before_any_input_or_external_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

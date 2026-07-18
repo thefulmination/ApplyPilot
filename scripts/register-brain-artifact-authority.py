@@ -28,7 +28,10 @@ MAX_SECRET_BYTES = 16 * 1024
 _WINDOWS_SYSTEM_SID = "S-1-5-18"
 _WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
 _WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0
-_WINDOWS_OTHER_ALLOW_ACE_TYPES = frozenset({4, 5, 9, 11})
+_WINDOWS_UNSUPPORTED_ALLOW_ACE_TYPES = frozenset({4, 5, 9, 11})
+_WINDOWS_NON_GRANT_ACE_TYPES = frozenset(
+    {1, 2, 3, 6, 7, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+)
 
 
 def _windows_sid_text(sid: object) -> str:
@@ -98,7 +101,19 @@ def _windows_current_user_sid() -> str:
         kernel32.CloseHandle(token)
 
 
-def _windows_allowed_access_sids(descriptor: int) -> set[str]:
+def _windows_classify_ace(ace_type: int, access_mask: int) -> str:
+    if not access_mask:
+        return "zero"
+    if ace_type == _WINDOWS_ACCESS_ALLOWED_ACE_TYPE:
+        return "allow"
+    if ace_type in _WINDOWS_UNSUPPORTED_ALLOW_ACE_TYPES:
+        raise ArtifactAuthorityError("secret input uses unsupported allow access control")
+    if ace_type in _WINDOWS_NON_GRANT_ACE_TYPES:
+        return "non-grant"
+    raise ArtifactAuthorityError("secret input uses unknown access control")
+
+
+def _windows_file_security(descriptor: int) -> tuple[str | None, set[str] | None]:
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -116,7 +131,7 @@ def _windows_allowed_access_sids(descriptor: int) -> set[str]:
         wintypes.HANDLE,
         ctypes.c_int,
         wintypes.DWORD,
-        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_void_p,
@@ -135,13 +150,14 @@ def _windows_allowed_access_sids(descriptor: int) -> set[str]:
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
 
+    owner = ctypes.c_void_p()
     dacl = ctypes.c_void_p()
     security_descriptor = ctypes.c_void_p()
     result = advapi32.GetSecurityInfo(
         wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
         1,
-        0x00000004,
-        None,
+        0x00000001 | 0x00000004,
+        ctypes.byref(owner),
         None,
         ctypes.byref(dacl),
         None,
@@ -150,8 +166,9 @@ def _windows_allowed_access_sids(descriptor: int) -> set[str]:
     if result:
         raise ArtifactAuthorityError("could not inspect secret input access control")
     try:
+        owner_sid = _windows_sid_text(owner) if owner.value else None
         if not dacl.value:
-            raise ArtifactAuthorityError("secret input permissions are too broad")
+            return owner_sid, None
         information = _AclSizeInformation()
         if not advapi32.GetAclInformation(
             dacl, ctypes.byref(information), ctypes.sizeof(information), 2
@@ -163,14 +180,16 @@ def _windows_allowed_access_sids(descriptor: int) -> set[str]:
             if not advapi32.GetAce(dacl, index, ctypes.byref(ace)) or not ace.value:
                 raise ArtifactAuthorityError("could not inspect secret input access control")
             ace_type = ctypes.c_ubyte.from_address(ace.value).value
+            ace_size = ctypes.c_uint16.from_address(ace.value + 2).value
+            if ace_size < 8:
+                raise ArtifactAuthorityError("secret input uses malformed access control")
             access_mask = ctypes.c_uint32.from_address(ace.value + 4).value
-            if not access_mask:
-                continue
-            if ace_type == _WINDOWS_ACCESS_ALLOWED_ACE_TYPE:
+            classification = _windows_classify_ace(ace_type, access_mask)
+            if classification == "allow":
+                if ace_size < 16:
+                    raise ArtifactAuthorityError("secret input uses malformed access control")
                 allowed.add(_windows_sid_text(ctypes.c_void_p(ace.value + 8)))
-            elif ace_type in _WINDOWS_OTHER_ALLOW_ACE_TYPES:
-                raise ArtifactAuthorityError("secret input uses unsupported allow access control")
-        return allowed
+        return owner_sid, allowed
     finally:
         if security_descriptor.value:
             kernel32.LocalFree(security_descriptor)
@@ -182,7 +201,10 @@ def _assert_windows_private_file(descriptor: int, path: Path) -> None:
         _WINDOWS_SYSTEM_SID,
         _WINDOWS_ADMINISTRATORS_SID,
     }
-    if _windows_allowed_access_sids(descriptor) - allowed:
+    owner, granted = _windows_file_security(descriptor)
+    if owner is None or owner not in allowed:
+        raise ArtifactAuthorityError(f"secret input owner is not trusted: {path}")
+    if granted is None or granted - allowed:
         raise ArtifactAuthorityError(f"secret input permissions are too broad: {path}")
 
 
