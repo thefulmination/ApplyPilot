@@ -4,20 +4,40 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import hashlib
-import hmac
 import json
 import os
 import re
 import sqlite3
 import subprocess
+import sys
+import tempfile
 import tomllib
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
+
+
+_SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(_SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIRECTORY))
+
+from release_evidence_common import (  # noqa: E402
+    ALGORITHM,
+    PRODUCER,
+    PRODUCER_VERSION,
+    TEST_ENVIRONMENT_POLICY,
+    TEST_SUITE_POLICIES,
+    assert_separated_keys,
+    atomic_write_no_overwrite,
+    canonical_json,
+    purpose_key,
+    strict_json_loads,
+    validate_release_binding,
+    verify_receipt,
+)
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -48,16 +68,13 @@ _REQUIRED_ARTIFACT_ROLES = {
     "label_learning_corpus",
     "label_learning_summary",
 }
-_TRUSTED_TEST_PRODUCERS = {"applypilot-release-verifier-v1"}
-_TRUSTED_TOPOLOGY_PRODUCER = "applypilot-railway-topology-verifier-v1"
 _TEST_SUITES = {
-    "python": "applypilot-runtime-release-v1",
-    "typescript": "applypilot-brain-release-v1",
+    "python": TEST_SUITE_POLICIES["runtime"],
+    "typescript": TEST_SUITE_POLICIES["brain"],
 }
-_ATTESTATION_ALGORITHM = "HMAC-SHA256"
 _MAX_TEST_RECEIPT_AGE = timedelta(hours=24)
 _MAX_TOPOLOGY_RECEIPT_LIFETIME = timedelta(hours=1)
-_TOPOLOGY_SOURCE_COMMAND = "railway status --json"
+_MAX_CLOCK_SKEW = timedelta(minutes=2)
 _TOPOLOGY_ENVIRONMENT = "staging"
 _ROLLBACK_ROLES = {
     "rollback-only",
@@ -207,25 +224,6 @@ def _positive_or_zero_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _attestation_configuration() -> tuple[bytes, str]:
-    encoded_key = os.environ.get("APPLYPILOT_RELEASE_ATTESTATION_KEY_B64")
-    key_id = os.environ.get("APPLYPILOT_RELEASE_ATTESTATION_KEY_ID")
-    if not _nonempty_string(encoded_key) or not _nonempty_string(key_id):
-        raise RuntimeError("release attestation key and key ID environment variables are required")
-    try:
-        key = base64.b64decode(encoded_key, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise RuntimeError("release attestation key must be valid base64") from exc
-    if len(key) < 32:
-        raise RuntimeError("release attestation key must decode to at least 32 bytes")
-    return key, key_id
-
-
-def _canonical_receipt_payload(receipt: dict[str, Any]) -> bytes:
-    payload = {key: value for key, value in receipt.items() if key != "authentication"}
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-
-
 def _authenticated_receipt(
     path: Path,
     key: bytes,
@@ -233,34 +231,11 @@ def _authenticated_receipt(
     label: str,
 ) -> tuple[dict[str, Any], bytes, str, str]:
     receipt_bytes, receipt_sha256 = _stable_read_bytes(path)
-    try:
-        receipt = json.loads(receipt_bytes.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{label} is not valid UTF-8 JSON") from exc
+    receipt = strict_json_loads(receipt_bytes, label)
     if not isinstance(receipt, dict):
         raise RuntimeError(f"{label} must be a JSON object")
-    authentication = receipt.get("authentication")
-    if not isinstance(authentication, dict) or set(authentication) != {
-        "algorithm",
-        "keyId",
-        "signature",
-    }:
-        raise RuntimeError(f"{label} must contain exactly one authentication object")
-    if authentication.get("algorithm") != _ATTESTATION_ALGORITHM:
-        raise RuntimeError(f"{label} authentication algorithm is unsupported")
-    if authentication.get("keyId") != expected_key_id:
-        raise RuntimeError(f"{label} authentication key ID does not match the expected key")
-    signature = authentication.get("signature")
-    if not _nonempty_string(signature):
-        raise RuntimeError(f"{label} authentication signature is missing")
-    try:
-        supplied = base64.b64decode(signature, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise RuntimeError(f"{label} authentication signature is not valid base64") from exc
-    expected = hmac.digest(key, _canonical_receipt_payload(receipt), hashlib.sha256)
-    if not hmac.compare_digest(supplied, expected):
-        raise RuntimeError(f"{label} authentication signature is invalid")
-    return receipt, receipt_bytes, receipt_sha256, authentication["keyId"]
+    key_id = verify_receipt(receipt, key=key, expected_key_id=expected_key_id, label=label)
+    return receipt, receipt_bytes, receipt_sha256, key_id
 
 
 def _normalized_artifact_path(value: Any) -> PurePosixPath:
@@ -309,10 +284,7 @@ def _reconcile_artifact_manifest(inventory_path: Path, verified: list[dict[str, 
     manifest_record = next(item for item in verified if item["role"] == "artifact_manifest")
     if len(content) != manifest_record["bytes"] or digest != manifest_record["sha256"]:
         raise RuntimeError("artifact manifest changed after inventory verification")
-    try:
-        document = json.loads(content.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("artifact manifest is not valid UTF-8 JSON") from exc
+    document = strict_json_loads(content, "artifact manifest")
     if (
         not isinstance(document, dict)
         or set(document) != {"schemaVersion", "files"}
@@ -403,41 +375,80 @@ def _verify_sqlite_source(
     path = Path(source_value).resolve()
     if not path.is_file() or path.is_symlink():
         raise RuntimeError(f"canonical SQLite source is missing or is a symlink: {path}")
+    sidecars = [Path(f"{path}{suffix}") for suffix in ("-wal", "-shm")]
+    if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+        raise RuntimeError("canonical SQLite source has live WAL/SHM sidecars; close and checkpoint it first")
     if not _positive_or_zero_integer(source.get("bytes")) or not _sha256_value(source.get("sha256")):
         raise RuntimeError("canonical SQLite source bytes/hash declaration is invalid")
     before = path.stat()
     actual_bytes, actual_sha256 = _stable_file_record(path)
+    if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+        raise RuntimeError("canonical SQLite source gained WAL/SHM sidecars while being verified")
     if actual_bytes != source["bytes"] or actual_sha256 != source["sha256"]:
         raise RuntimeError(
             f"canonical SQLite source drift: {path}; expected bytes/hash "
             f"{source['bytes']}/{source['sha256']}, got {actual_bytes}/{actual_sha256}"
         )
-    uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro&immutable=1"
+    snapshot_bytes: int
+    snapshot_sha256: str
+    snapshot_identity: tuple[int, int, int, int]
+    source_uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro"
     try:
-        with sqlite3.connect(uri, uri=True) as connection:
-            connection.execute("PRAGMA query_only = ON")
-            quick_check_rows = connection.execute("PRAGMA quick_check").fetchall()
-            if quick_check_rows != [("ok",)]:
-                raise RuntimeError(f"canonical SQLite source failed quick_check: {quick_check_rows!r}")
-            pragmas = {
-                name: connection.execute(f"PRAGMA {name}").fetchone()[0]
-                for name in ("schema_version", "page_count", "page_size", "user_version")
-            }
-            table_names = [
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_schema "
-                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
-                    "ORDER BY name COLLATE BINARY"
-                )
-            ]
-            counts = {
-                name: connection.execute(f'SELECT COUNT(*) FROM "{name.replace(chr(34), chr(34) * 2)}"').fetchone()[0]
-                for name in table_names
-            }
+        with tempfile.TemporaryDirectory(prefix="applypilot-sqlite-snapshot-") as temporary_directory:
+            snapshot = Path(temporary_directory) / "canonical.db"
+            with closing(sqlite3.connect(source_uri, uri=True)) as source_connection, closing(
+                sqlite3.connect(snapshot)
+            ) as destination:
+                source_connection.execute("PRAGMA query_only = ON")
+                source_pragmas = {
+                    name: source_connection.execute(f"PRAGMA {name}").fetchone()[0]
+                    for name in ("schema_version", "page_count", "page_size", "user_version")
+                }
+
+                def reject_sidecar_during_backup(_status: int, _remaining: int, _total: int) -> None:
+                    if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+                        raise RuntimeError(
+                            "canonical SQLite source gained WAL/SHM sidecars while creating a controlled backup"
+                        )
+
+                source_connection.backup(destination, pages=64, progress=reject_sidecar_during_backup)
+            if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+                raise RuntimeError("canonical SQLite source gained WAL/SHM sidecars while creating a controlled backup")
+            snapshot_before = snapshot.stat()
+            snapshot_bytes, snapshot_sha256 = _stable_file_record(snapshot)
+            snapshot_after = snapshot.stat()
+            if _file_identity(snapshot_before) != _file_identity(snapshot_after):
+                raise RuntimeError("controlled SQLite backup changed while hashing")
+            snapshot_identity = _file_identity(snapshot_after)
+            snapshot_uri = f"file:{quote(snapshot.as_posix(), safe='/:')}?mode=ro&immutable=1"
+            with closing(sqlite3.connect(snapshot_uri, uri=True)) as connection:
+                connection.execute("PRAGMA query_only = ON")
+                quick_check_rows = connection.execute("PRAGMA quick_check").fetchall()
+                if quick_check_rows != [("ok",)]:
+                    raise RuntimeError(f"canonical SQLite source failed quick_check: {quick_check_rows!r}")
+                pragmas = {
+                    name: connection.execute(f"PRAGMA {name}").fetchone()[0]
+                    for name in ("schema_version", "page_count", "page_size", "user_version")
+                }
+                table_names = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_schema "
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY name COLLATE BINARY"
+                    )
+                ]
+                counts = {
+                    name: connection.execute(f'SELECT COUNT(*) FROM "{name.replace(chr(34), chr(34) * 2)}"').fetchone()[0]
+                    for name in table_names
+                }
     except sqlite3.DatabaseError as exc:
         raise RuntimeError("canonical SQLite source is not a valid SQLite database") from exc
+    if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+        raise RuntimeError("canonical SQLite source gained WAL/SHM sidecars while being verified")
     after_bytes, after_sha256 = _stable_file_record(path)
+    if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
+        raise RuntimeError("canonical SQLite source gained WAL/SHM sidecars during final source verification")
     after = path.stat()
     if _file_identity(before) != _file_identity(after) or (after_bytes, after_sha256) != (actual_bytes, actual_sha256):
         raise RuntimeError(f"release input changed while inspecting SQLite source: {path}")
@@ -445,11 +456,20 @@ def _verify_sqlite_source(
         "logicalSource": "canonical-sqlite-authority-snapshot",
         "bytes": actual_bytes,
         "sha256": actual_sha256,
+        "snapshotBytes": snapshot_bytes,
+        "snapshotSha256": snapshot_sha256,
+        "snapshotIdentity": {
+            "device": snapshot_identity[0],
+            "inode": snapshot_identity[1],
+            "bytes": snapshot_identity[2],
+            "modifiedNs": snapshot_identity[3],
+        },
         "quickCheck": "ok",
-        "schemaVersion": pragmas["schema_version"],
-        "pageCount": pragmas["page_count"],
-        "pageSize": pragmas["page_size"],
-        "userVersion": pragmas["user_version"],
+        "schemaVersion": source_pragmas["schema_version"],
+        "pageCount": source_pragmas["page_count"],
+        "pageSize": source_pragmas["page_size"],
+        "userVersion": source_pragmas["user_version"],
+        "snapshotSchemaVersion": pragmas["schema_version"],
         "tableCounts": counts,
         "sourceUnchangedDuringCapture": True,
     }
@@ -560,6 +580,8 @@ def _test_receipt(
     expected_commit: str,
     expected_tree: str,
     repository_kind: str,
+    release_id: str,
+    release_nonce: str,
     generated_at: datetime,
     attestation_key: bytes,
     attestation_key_id: str,
@@ -571,8 +593,13 @@ def _test_receipt(
     )
     required = {
         "schemaVersion",
+        "receiptPurpose",
         "producer",
+        "producerVersion",
+        "releaseId",
+        "releaseNonce",
         "suiteIdentity",
+        "suitePolicySha256",
         "status",
         "sourceCommitSha",
         "sourceTreeSha",
@@ -584,13 +611,21 @@ def _test_receipt(
     }
     if not isinstance(receipt, dict) or set(receipt) != required:
         raise RuntimeError("test receipt schema is incomplete or contains unknown claims")
-    if receipt.get("schemaVersion") != "applypilot_test_receipt_v1":
+    if receipt.get("schemaVersion") != "applypilot_test_receipt_v2":
         raise RuntimeError("test receipt schema version is unsupported")
-    producer = receipt.get("producer")
-    if producer not in _TRUSTED_TEST_PRODUCERS:
+    policy = _TEST_SUITES[repository_kind]
+    if receipt.get("producer") != PRODUCER or receipt.get("producerVersion") != PRODUCER_VERSION:
         raise RuntimeError("test receipt producer is not permitted by the trusted producer policy")
-    if receipt.get("suiteIdentity") != _TEST_SUITES[repository_kind]:
+    if (
+        receipt.get("receiptPurpose") != policy["purpose"]
+        or receipt.get("releaseId") != release_id
+        or receipt.get("releaseNonce") != release_nonce
+    ):
+        raise RuntimeError("test receipt is not bound to this release purpose, ID, and nonce")
+    if receipt.get("suiteIdentity") != policy["suiteIdentity"]:
         raise RuntimeError("test receipt suite identity does not match the repository release suite")
+    if receipt.get("suitePolicySha256") != hashlib.sha256(canonical_json(policy)).hexdigest():
+        raise RuntimeError("test receipt suite policy hash does not match the exact approved command set")
     if (
         receipt.get("status") != "passed"
         or receipt.get("sourceCommitSha") != expected_commit
@@ -598,43 +633,99 @@ def _test_receipt(
     ):
         raise RuntimeError("test receipt does not prove the selected source commit and tree passed")
     commands = receipt.get("commands")
-    if (
-        not isinstance(commands, list)
-        or not commands
-        or any(
-            not isinstance(command, dict)
-            or set(command) != {"command", "exitCode"}
-            or not _nonempty_string(command.get("command"))
-            or command.get("exitCode") != 0
-            or isinstance(command.get("exitCode"), bool)
-            for command in commands
-        )
-    ):
-        raise RuntimeError("test receipt must contain one or more successful commands with exit code zero")
     environment = receipt.get("environment")
     if (
         not isinstance(environment, dict)
-        or not {"runner", "os"}.issubset(environment)
-        or any(not _nonempty_string(key) or not _nonempty_string(value) for key, value in environment.items())
+        or set(environment)
+        != {
+            "platform",
+            "pythonExecutable",
+            "pythonVersion",
+            "executionPolicySha256",
+            "inheritedEnvironmentSha256",
+        }
+        or any(
+            not _nonempty_string(environment.get(name))
+            for name in ("platform", "pythonExecutable", "pythonVersion")
+        )
+        or environment.get("executionPolicySha256")
+        != hashlib.sha256(canonical_json(TEST_ENVIRONMENT_POLICY)).hexdigest()
     ):
         raise RuntimeError("test receipt environment is incomplete")
+    inherited_hashes = environment.get("inheritedEnvironmentSha256")
+    if (
+        not isinstance(inherited_hashes, dict)
+        or not set(inherited_hashes).issubset(TEST_ENVIRONMENT_POLICY["inheritedAllowlist"])
+        or any(not _sha256_value(value) for value in inherited_hashes.values())
+    ):
+        raise RuntimeError("test receipt inherited environment evidence is invalid")
+    if not isinstance(commands, list) or len(commands) != len(policy["commands"]):
+        raise RuntimeError("test receipt does not contain the exact approved command set")
+    command_keys = {
+        "commandId",
+        "command",
+        "argv",
+        "exitCode",
+        "stdoutSha256",
+        "stderrSha256",
+        "logSha256",
+        "startedAt",
+        "completedAt",
+        "executable",
+    }
+    command_intervals: list[tuple[datetime, datetime]] = []
+    for record, (command_id, command, arguments) in zip(commands, policy["commands"], strict=True):
+        executable = record.get("executable") if isinstance(record, dict) else None
+        expected_tail = list(arguments) if policy["purpose"] == "runtime-tests" else list(arguments[1:])
+        if (
+            not isinstance(record, dict)
+            or set(record) != command_keys
+            or record.get("commandId") != command_id
+            or record.get("command") != command
+            or not isinstance(executable, dict)
+            or set(executable) != {"path", "sha256"}
+            or not _nonempty_string(executable.get("path"))
+            or not Path(executable["path"]).is_absolute()
+            or not _sha256_value(executable.get("sha256"))
+            or record.get("argv") != [executable["path"], *expected_tail]
+            or (
+                policy["purpose"] == "runtime-tests"
+                and executable["path"] != environment["pythonExecutable"]
+            )
+            or record.get("exitCode") != 0
+            or any(not _sha256_value(record.get(field)) for field in ("stdoutSha256", "stderrSha256", "logSha256"))
+        ):
+            raise RuntimeError("test receipt does not contain the exact successful approved command set and log digests")
+        command_started = _parse_timestamp(record.get("startedAt"), "test command startedAt")
+        command_completed = _parse_timestamp(record.get("completedAt"), "test command completedAt")
+        if command_completed < command_started:
+            raise RuntimeError("test command completion timestamp precedes its start")
+        command_intervals.append((command_started, command_completed))
     started = _parse_timestamp(receipt.get("startedAt"), "test receipt startedAt")
     completed = _parse_timestamp(receipt.get("completedAt"), "test receipt completedAt")
     if completed < started:
         raise RuntimeError("test receipt completion timestamp precedes its start")
-    if completed > generated_at or generated_at - completed > _MAX_TEST_RECEIPT_AGE:
+    if (
+        started != command_intervals[0][0]
+        or completed != command_intervals[-1][1]
+        or any(current[0] < previous[1] for previous, current in zip(command_intervals, command_intervals[1:]))
+    ):
+        raise RuntimeError("test receipt timestamps do not exactly contain the ordered approved commands")
+    if completed > generated_at + _MAX_CLOCK_SKEW or generated_at - completed > _MAX_TEST_RECEIPT_AGE:
         raise RuntimeError("test receipt is stale or was completed after manifest generation")
     return {
         "path": path.name,
         "bytes": len(receipt_bytes),
         "sha256": receipt_sha256,
         "schemaVersion": receipt["schemaVersion"],
-        "producer": producer,
+        "producer": PRODUCER,
+        "producerVersion": PRODUCER_VERSION,
         "suiteIdentity": receipt["suiteIdentity"],
+        "suitePolicySha256": receipt["suitePolicySha256"],
         "commandCount": len(commands),
         "startedAt": started.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "completedAt": completed.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "authentication": {"algorithm": _ATTESTATION_ALGORITHM, "keyId": key_id},
+        "authentication": {"algorithm": ALGORITHM, "keyId": key_id},
     }
 
 
@@ -682,6 +773,8 @@ def _validate_deployment(args: argparse.Namespace) -> dict[str, str]:
 def _topology_receipt(
     path: Path,
     args: argparse.Namespace,
+    release_id: str,
+    release_nonce: str,
     generated_at: datetime,
     attestation_key: bytes,
     attestation_key_id: str,
@@ -694,7 +787,11 @@ def _topology_receipt(
     )
     required = {
         "schemaVersion",
+        "receiptPurpose",
         "producer",
+        "producerVersion",
+        "releaseId",
+        "releaseNonce",
         "status",
         "railwayProject",
         "railwayProjectId",
@@ -703,7 +800,8 @@ def _topology_receipt(
         "atsWorkerServiceId",
         "linkedinWorkerServiceId",
         "databaseName",
-        "sourceCommand",
+        "commands",
+        "railwayCli",
         "environment",
         "capturedAt",
         "expiresAt",
@@ -723,20 +821,83 @@ def _topology_receipt(
     if any(receipt.get(field) != value for field, value in expected.items()):
         raise RuntimeError("Railway topology receipt does not match the exact deployment identity")
     if (
-        receipt.get("schemaVersion") != "applypilot_railway_topology_receipt_v1"
-        or receipt.get("producer") != _TRUSTED_TOPOLOGY_PRODUCER
+        receipt.get("schemaVersion") != "applypilot_railway_topology_receipt_v2"
+        or receipt.get("receiptPurpose") != "railway-topology"
+        or receipt.get("producer") != PRODUCER
+        or receipt.get("producerVersion") != PRODUCER_VERSION
+        or receipt.get("releaseId") != release_id
+        or receipt.get("releaseNonce") != release_nonce
         or receipt.get("status") != "verified"
-        or receipt.get("sourceCommand") != _TOPOLOGY_SOURCE_COMMAND
         or receipt.get("environment") != _TOPOLOGY_ENVIRONMENT
     ):
-        raise RuntimeError("Railway topology receipt status, producer, command, or environment is invalid")
+        raise RuntimeError("Railway topology receipt release binding, status, producer, or environment is invalid")
+    commands = receipt.get("commands")
+    railway_cli = receipt.get("railwayCli")
+    if (
+        not isinstance(railway_cli, dict)
+        or set(railway_cli) != {"version", "executable", "statusSchema", "variablesSchema"}
+        or railway_cli.get("version") != "railway 5.23.0"
+        or railway_cli.get("statusSchema") != "railway-cli-5-project-status-v1"
+        or railway_cli.get("variablesSchema") != "railway-cli-5-flat-service-variables-v1"
+        or not isinstance(railway_cli.get("executable"), dict)
+        or set(railway_cli["executable"]) != {"path", "sha256"}
+        or not _nonempty_string(railway_cli["executable"].get("path"))
+        or not Path(railway_cli["executable"]["path"]).is_absolute()
+        or not _sha256_value(railway_cli["executable"].get("sha256"))
+    ):
+        raise RuntimeError("Railway topology receipt CLI or output-schema identity is invalid")
+    railway_path = railway_cli["executable"]["path"]
+    expected_commands = (
+        ("railway-version", "railway --version", [railway_path, "--version"]),
+        ("railway-status", "railway status --json", [railway_path, "status", "--json"]),
+        (
+            "railway-postgres-variables",
+            f"railway variables --service {args.postgres_service_id} --json",
+            [railway_path, "variables", "--service", args.postgres_service_id, "--json"],
+        ),
+    )
+    command_keys = {
+        "commandId",
+        "command",
+        "argv",
+        "exitCode",
+        "stdoutSha256",
+        "stderrSha256",
+        "logSha256",
+        "startedAt",
+        "completedAt",
+        "executable",
+    }
+    if not isinstance(commands, list) or len(commands) != len(expected_commands):
+        raise RuntimeError("Railway topology receipt does not contain the exact observation commands")
+    command_intervals: list[tuple[datetime, datetime]] = []
+    for record, (command_id, command, argv) in zip(commands, expected_commands, strict=True):
+        if (
+            not isinstance(record, dict)
+            or set(record) != command_keys
+            or record.get("commandId") != command_id
+            or record.get("command") != command
+            or record.get("argv") != argv
+            or record.get("executable") != railway_cli["executable"]
+            or record.get("exitCode") != 0
+            or any(not _sha256_value(record.get(field)) for field in ("stdoutSha256", "stderrSha256", "logSha256"))
+        ):
+            raise RuntimeError("Railway topology receipt command or raw output/log digest is invalid")
+        command_started = _parse_timestamp(record.get("startedAt"), "Railway command startedAt")
+        command_completed = _parse_timestamp(record.get("completedAt"), "Railway command completedAt")
+        if command_completed < command_started:
+            raise RuntimeError("Railway command completion timestamp precedes its start")
+        command_intervals.append((command_started, command_completed))
     captured = _parse_timestamp(receipt.get("capturedAt"), "Railway topology receipt capturedAt")
     expires = _parse_timestamp(receipt.get("expiresAt"), "Railway topology receipt expiresAt")
     if (
         expires <= captured
         or expires - captured > _MAX_TOPOLOGY_RECEIPT_LIFETIME
-        or captured > generated_at
-        or generated_at > expires
+        or captured != command_intervals[0][0]
+        or command_intervals[-1][1] > expires
+        or any(current[0] < previous[1] for previous, current in zip(command_intervals, command_intervals[1:]))
+        or captured > generated_at + _MAX_CLOCK_SKEW
+        or generated_at > expires + _MAX_CLOCK_SKEW
     ):
         raise RuntimeError("Railway topology receipt timestamps are stale, future-dated, or overlong")
     return {
@@ -745,9 +906,11 @@ def _topology_receipt(
         "sha256": receipt_sha256,
         "schemaVersion": receipt["schemaVersion"],
         "producer": receipt["producer"],
+        "producerVersion": receipt["producerVersion"],
+        "commandOutputSha256": {record["commandId"]: record["stdoutSha256"] for record in commands},
         "capturedAt": captured.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "expiresAt": expires.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "authentication": {"algorithm": _ATTESTATION_ALGORITHM, "keyId": key_id},
+        "authentication": {"algorithm": ALGORITHM, "keyId": key_id},
     }
 
 
@@ -755,19 +918,21 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     runtime_repo = args.runtime_repo.resolve()
     brain_repo = args.brain_repo.resolve()
     template_bytes, template_sha256 = _stable_read_bytes(args.template.resolve())
-    try:
-        template = json.loads(template_bytes.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("compatibility-manifest template is not valid UTF-8 JSON") from exc
+    template = strict_json_loads(template_bytes, "compatibility-manifest template")
+    if not isinstance(template, dict):
+        raise RuntimeError("compatibility-manifest template must be a JSON object")
     if template.get("schemaVersion") not in {
         "applypilot_compatibility_manifest_v2",
         "applypilot_compatibility_manifest_v3",
     }:
         raise RuntimeError("unsupported compatibility-manifest template")
-    if not _nonempty_string(args.release_id):
-        raise RuntimeError("release ID must be non-empty")
-    generated_at = _parse_timestamp(args.generated_at, "--generated-at")
-    attestation_key, attestation_key_id = _attestation_configuration()
+    release_id, release_nonce = validate_release_binding(args.release_id, args.release_nonce)
+    generated_at = datetime.now(timezone.utc)
+    attestations = {
+        purpose: purpose_key(purpose)
+        for purpose in ("runtime-tests", "brain-tests", "railway-topology")
+    }
+    assert_separated_keys(attestations)
     deployment_ids = _validate_deployment(args)
 
     runtime_commit, runtime_tree = _git_identity(runtime_repo, args.runtime_ref)
@@ -788,25 +953,28 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         runtime_commit,
         runtime_tree,
         "python",
+        release_id,
+        release_nonce,
         generated_at,
-        attestation_key,
-        attestation_key_id,
+        *attestations["runtime-tests"],
     )
     brain_tests = _test_receipt(
         args.brain_test_receipt,
         brain_commit,
         brain_tree,
         "typescript",
+        release_id,
+        release_nonce,
         generated_at,
-        attestation_key,
-        attestation_key_id,
+        *attestations["brain-tests"],
     )
     topology_receipt = _topology_receipt(
         args.railway_topology_receipt,
         args,
+        release_id,
+        release_nonce,
         generated_at,
-        attestation_key,
-        attestation_key_id,
+        *attestations["railway-topology"],
     )
 
     python_repo = {
@@ -842,7 +1010,8 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     schemas["fleetPython"], schemas["fleetSql"], schemas["fleetMigrationManifest"] = fleet_records
     manifest: dict[str, Any] = {
         "schemaVersion": "applypilot_compatibility_manifest_v3",
-        "releaseId": args.release_id,
+        "releaseId": release_id,
+        "releaseNonce": release_nonce,
         "generatedAt": generated_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "releaseState": "staging_candidate",
         "promotionAuthorized": False,
@@ -901,8 +1070,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-ref", default="HEAD")
     parser.add_argument("--brain-ref", default="HEAD")
     parser.add_argument("--release-id", required=True)
+    parser.add_argument("--release-nonce", required=True)
     parser.add_argument("--database-name", required=True)
-    parser.add_argument("--generated-at", required=True)
     parser.add_argument("--artifact-source-root", type=Path)
     parser.add_argument("--sqlite-source", type=Path)
     parser.add_argument("--runtime-test-receipt", type=Path)
@@ -918,40 +1087,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _fsync_directory(directory_path: Path) -> None:
-    try:
-        descriptor = os.open(directory_path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
-
-
 def _write_exclusive_fsync(path: Path, content: bytes) -> None:
-    descriptor: int | None = None
-    created = False
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        if descriptor is not None:
-            os.close(descriptor)
-        if created:
-            try:
-                path.unlink(missing_ok=True)
-            finally:
-                _fsync_directory(path.parent)
-        raise
-    _fsync_directory(path.parent)
+    atomic_write_no_overwrite(path, content)
 
 
 def main() -> int:
@@ -960,21 +1097,21 @@ def main() -> int:
     if output.name.lower().endswith(".sha256"):
         raise SystemExit("manifest output cannot use the .sha256 sidecar suffix")
     sidecar = output.with_name(output.name + ".sha256")
+    if output.exists() != sidecar.exists():
+        raise SystemExit("refusing incomplete immutable release evidence; remove the partial pair and regenerate")
+    if output.exists() and sidecar.exists():
+        raise SystemExit("refusing to overwrite complete immutable release evidence")
     manifest = build_manifest(args)
     encoded = (json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     sidecar_bytes = f"{digest}  {output.name}\n".encode("ascii")
-    if output.exists() and output.read_bytes() != encoded:
-        raise SystemExit("refusing to overwrite conflicting immutable release manifest")
-    if sidecar.exists() and sidecar.read_bytes() != sidecar_bytes:
-        raise SystemExit("refusing to overwrite conflicting immutable release sidecar")
-    if output.exists() and sidecar.exists():
-        raise SystemExit("refusing to overwrite complete immutable release evidence")
     output.parent.mkdir(parents=True, exist_ok=True)
-    if not output.exists():
-        _write_exclusive_fsync(output, encoded)
-    if not sidecar.exists():
+    _write_exclusive_fsync(output, encoded)
+    try:
         _write_exclusive_fsync(sidecar, sidecar_bytes)
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
     print(json.dumps({"manifest": str(output), "sha256": digest, "sidecar": str(sidecar)}, sort_keys=True))
     return 0
 

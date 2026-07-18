@@ -1,228 +1,489 @@
 #!/usr/bin/env python3
-"""Sign an unsigned release receipt for the compatibility manifest verifier."""
+"""Produce authenticated ApplyPilot release evidence from executed observations."""
 
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import hashlib
-import hmac
 import json
 import os
-import stat
+import platform
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
-_ALGORITHM = "HMAC-SHA256"
-_KEY_ENV = "APPLYPILOT_RELEASE_ATTESTATION_KEY_B64"
-_KEY_ID_ENV = "APPLYPILOT_RELEASE_ATTESTATION_KEY_ID"
+_SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(_SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIRECTORY))
+
+from release_evidence_common import (  # noqa: E402
+    NON_RELEASE_PRODUCER,
+    PRODUCER,
+    PRODUCER_VERSION,
+    TEST_ENVIRONMENT_POLICY,
+    TEST_SUITE_POLICIES,
+    atomic_write_no_overwrite,
+    canonical_json,
+    regular_file,
+    sign_receipt,
+    stable_read_bytes,
+    strict_json_loads,
+    validate_release_binding,
+)
+
+
+_TOPOLOGY_PURPOSE = "railway-topology"
+_TOPOLOGY_LIFETIME = timedelta(minutes=30)
+_RAILWAY_STATUS_SCHEMA = "railway-cli-5-project-status-v1"
+_RAILWAY_VARIABLES_SCHEMA = "railway-cli-5-flat-service-variables-v1"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _framed_log_digest(stdout: bytes, stderr: bytes, exit_code: int) -> str:
+    digest = hashlib.sha256()
+    for label, content in ((b"stdout", stdout), (b"stderr", stderr)):
+        digest.update(len(label).to_bytes(8, "big"))
+        digest.update(label)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    digest.update(exit_code.to_bytes(8, "big", signed=True))
+    return digest.hexdigest()
+
+
+def _stable_file_sha256(path: Path) -> str:
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise RuntimeError(f"command executable changed while hashing: {path}")
+    return digest.hexdigest()
+
+
+def _resolved_executable(command: str) -> dict[str, str]:
+    resolved = shutil.which(command)
+    if resolved is None:
+        raise RuntimeError(f"required command executable is not available: {command}")
+    path = Path(resolved).resolve(strict=True)
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"required command executable is not a regular file: {path}")
+    return {"path": str(path), "sha256": _stable_file_sha256(path)}
+
+
+def _rejected_test_environment() -> list[str]:
+    exact = set(TEST_ENVIRONMENT_POLICY["rejectedExact"])
+    prefixes = tuple(TEST_ENVIRONMENT_POLICY["rejectedPrefixes"])
+    rejected = []
+    for name in os.environ:
+        normalized = name.upper()
+        if normalized in exact or normalized.startswith(prefixes):
+            rejected.append(name)
+    return sorted(rejected, key=str.upper)
+
+
+def _test_environment() -> tuple[dict[str, str], dict[str, str]]:
+    rejected = _rejected_test_environment()
+    if rejected:
+        raise RuntimeError(
+            "release test environment contains prohibited selection/injection variables: " + ", ".join(rejected)
+        )
+    ambient = {name.upper(): value for name, value in os.environ.items()}
+    inherited = {
+        name: ambient[name]
+        for name in TEST_ENVIRONMENT_POLICY["inheritedAllowlist"]
+        if name in ambient
+    }
+    if "PATH" in inherited:
+        path_entries: list[str] = []
+        seen: set[str] = set()
+        for entry in inherited["PATH"].split(os.pathsep):
+            if not entry or not Path(entry).is_absolute():
+                continue
+            normalized = os.path.normcase(os.path.normpath(entry))
+            if normalized not in seen:
+                seen.add(normalized)
+                path_entries.append(entry)
+        inherited["PATH"] = os.pathsep.join(path_entries)
+    fixed = {
+        name: os.devnull if value == "<OS_DEVNULL>" else value
+        for name, value in TEST_ENVIRONMENT_POLICY["fixed"].items()
+    }
+    child = {**inherited, **fixed}
+    value_hashes = {name: _sha256(value.encode("utf-8")) for name, value in sorted(inherited.items())}
+    return child, value_hashes
+
+
+def _git(repo: Path, *arguments: str, environment: dict[str, str]) -> str:
+    git = _resolved_executable("git")
+    result = subprocess.run(
+        [
+            git["path"],
+            "-c",
+            "core.autocrlf=true" if os.name == "nt" else "core.autocrlf=input",
+            "-c",
+            "core.filemode=false" if os.name == "nt" else "core.filemode=true",
+            "-C",
+            str(repo),
+            *arguments,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    return result.stdout.strip()
+
+
+def _assert_clean_identity(repo: Path, environment: dict[str, str]) -> tuple[str, str]:
+    if not repo.is_dir():
+        raise RuntimeError(f"release repository is not a directory: {repo}")
+    status = _git(repo, "status", "--porcelain=v1", "--untracked-files=all", environment=environment)
+    if status:
+        raise RuntimeError(f"release repository must be clean before and after evidence production: {repo}")
+    commit = _git(repo, "rev-parse", "HEAD^{commit}", environment=environment)
+    tree = _git(repo, "rev-parse", "HEAD^{tree}", environment=environment)
+    return commit, tree
+
+
+def _command_result(
+    *,
+    command_id: str,
+    command: str,
+    argv: list[str],
+    cwd: Path,
+    environment: dict[str, str] | None = None,
+    executable: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], bytes, bytes, datetime, datetime]:
+    started = _utc_now()
+    result = subprocess.run(argv, cwd=cwd, capture_output=True, check=False, env=environment)
+    completed = _utc_now()
+    record = {
+        "commandId": command_id,
+        "command": command,
+        "argv": argv,
+        "executable": executable or _resolved_executable(argv[0]),
+        "exitCode": result.returncode,
+        "stdoutSha256": _sha256(result.stdout),
+        "stderrSha256": _sha256(result.stderr),
+        "logSha256": _framed_log_digest(result.stdout, result.stderr, result.returncode),
+        "startedAt": _timestamp(started),
+        "completedAt": _timestamp(completed),
+    }
+    return record, result.stdout, result.stderr, started, completed
+
+
+def _publish(path: Path, receipt: dict[str, Any], purpose: str) -> None:
+    encoded = (json.dumps(sign_receipt(receipt, purpose), indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode()
+    try:
+        atomic_write_no_overwrite(path, encoded)
+    except FileExistsError as exc:
+        raise RuntimeError(f"output already exists; refusing to overwrite: {path}") from exc
+
+
+def produce_test_evidence(
+    *,
+    suite: str,
+    repo: Path,
+    release_id: str,
+    release_nonce: str,
+    output: Path,
+) -> None:
+    release_id, release_nonce = validate_release_binding(release_id, release_nonce)
+    policy = TEST_SUITE_POLICIES[suite]
+    repo = repo.resolve(strict=True)
+    environment, inherited_environment_hashes = _test_environment()
+    commit_before, tree_before = _assert_clean_identity(repo, environment)
+    policy_hash = _sha256(canonical_json(policy))
+    execution_policy_hash = _sha256(canonical_json(TEST_ENVIRONMENT_POLICY))
+    records: list[dict[str, Any]] = []
+    first_started: datetime | None = None
+    last_completed: datetime | None = None
+    for command_id, command, arguments in policy["commands"]:
+        if arguments[0] == "npm":
+            executable = _resolved_executable("npm")
+            argv = [executable["path"], *arguments[1:]]
+        else:
+            executable = _resolved_executable(sys.executable)
+            argv = [executable["path"], *arguments]
+        record, _stdout, _stderr, started, completed = _command_result(
+            command_id=command_id,
+            command=command,
+            argv=argv,
+            cwd=repo,
+            environment=environment,
+            executable=executable,
+        )
+        records.append(record)
+        first_started = first_started or started
+        last_completed = completed
+        if record["exitCode"] != 0:
+            raise RuntimeError(f"required release command failed: {command}")
+    commit_after, tree_after = _assert_clean_identity(repo, environment)
+    if (commit_before, tree_before) != (commit_after, tree_after):
+        raise RuntimeError("release repository identity changed during evidence production")
+    assert first_started is not None and last_completed is not None
+    receipt = {
+        "schemaVersion": "applypilot_test_receipt_v2",
+        "receiptPurpose": policy["purpose"],
+        "producer": PRODUCER,
+        "producerVersion": PRODUCER_VERSION,
+        "releaseId": release_id,
+        "releaseNonce": release_nonce,
+        "suiteIdentity": policy["suiteIdentity"],
+        "suitePolicySha256": policy_hash,
+        "status": "passed",
+        "sourceCommitSha": commit_after,
+        "sourceTreeSha": tree_after,
+        "commands": records,
+        "environment": {
+            "platform": platform.platform(),
+            "pythonExecutable": str(Path(sys.executable).resolve()),
+            "pythonVersion": platform.python_version(),
+            "executionPolicySha256": execution_policy_hash,
+            "inheritedEnvironmentSha256": inherited_environment_hashes,
+        },
+        "startedAt": _timestamp(first_started),
+        "completedAt": _timestamp(last_completed),
+    }
+    _publish(output, receipt, policy["purpose"])
+
+
+def _edges(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {"edges"} or not isinstance(value.get("edges"), list):
+        raise RuntimeError(f"Railway {label} does not match the supported {_RAILWAY_STATUS_SCHEMA} shape")
+    nodes: list[dict[str, Any]] = []
+    for edge in value["edges"]:
+        if not isinstance(edge, dict) or set(edge) != {"node"} or not isinstance(edge.get("node"), dict):
+            raise RuntimeError(f"Railway {label} contains an unknown or ambiguous edge shape")
+        nodes.append(edge["node"])
+    return nodes
+
+
+def _unique_by_id(nodes: list[dict[str, Any]], label: str) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        identifier = node.get("id")
+        if not isinstance(identifier, str) or not identifier or identifier in result:
+            raise RuntimeError(f"Railway {label} contains a missing or duplicate id")
+        result[identifier] = node
+    return result
+
+
+def _validate_railway_status(document: Any, args: argparse.Namespace) -> dict[str, str]:
+    if not isinstance(document, dict):
+        raise RuntimeError(f"Railway status does not match the supported {_RAILWAY_STATUS_SCHEMA} shape")
+    if document.get("id") != args.railway_project_id or document.get("name") != args.railway_project:
+        raise RuntimeError("Railway status project identity does not match the requested project")
+    services = _unique_by_id(_edges(document.get("services"), "services"), "services")
+    expected_service_ids = {
+        args.postgres_service_id,
+        args.ats_worker_service_id,
+        args.linkedin_worker_service_id,
+    }
+    if not expected_service_ids.issubset(services):
+        raise RuntimeError("Railway status target services are missing from the project service relationship")
+    environments = _unique_by_id(_edges(document.get("environments"), "environments"), "environments")
+    target = environments.get(args.railway_environment_id)
+    if target is None:
+        raise RuntimeError("Railway status target environment is missing from the project")
+    environment_name = target.get("name")
+    if not isinstance(environment_name, str) or not environment_name:
+        raise RuntimeError("Railway status target environment name is missing")
+    instances = _edges(target.get("serviceInstances"), "target environment serviceInstances")
+    by_service: dict[str, dict[str, Any]] = {}
+    for instance in instances:
+        service_id = instance.get("serviceId")
+        if instance.get("environmentId") != args.railway_environment_id:
+            raise RuntimeError("Railway service instance is bound to the wrong environment")
+        if not isinstance(service_id, str) or not service_id or service_id in by_service:
+            raise RuntimeError("Railway target environment has a missing or duplicate service instance")
+        by_service[service_id] = instance
+    if not expected_service_ids.issubset(by_service):
+        raise RuntimeError("Railway target environment is missing a required Postgres, ATS, or LinkedIn service instance")
+    for service_id in expected_service_ids:
+        project_name = services[service_id].get("name")
+        instance_name = by_service[service_id].get("serviceName")
+        if not isinstance(project_name, str) or not project_name or instance_name != project_name:
+            raise RuntimeError("Railway project service and target-environment instance names disagree")
+    return {
+        "environmentName": environment_name,
+        "postgresServiceName": str(services[args.postgres_service_id]["name"]),
+    }
+
+
+def _validate_railway_variables(document: Any, args: argparse.Namespace, observed: dict[str, str]) -> None:
+    if not isinstance(document, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in document.items()
+    ):
+        raise RuntimeError(f"Railway variables do not match the supported {_RAILWAY_VARIABLES_SCHEMA} shape")
+    expected = {
+        "RAILWAY_PROJECT_ID": args.railway_project_id,
+        "RAILWAY_PROJECT_NAME": args.railway_project,
+        "RAILWAY_ENVIRONMENT_ID": args.railway_environment_id,
+        "RAILWAY_ENVIRONMENT_NAME": observed["environmentName"],
+        "RAILWAY_SERVICE_ID": args.postgres_service_id,
+        "RAILWAY_SERVICE_NAME": observed["postgresServiceName"],
+        "PGDATABASE": args.database_name,
+        "POSTGRES_DB": args.database_name,
+    }
+    mismatches = sorted(name for name, value in expected.items() if document.get(name) != value)
+    if mismatches:
+        raise RuntimeError("Railway Postgres variables do not match required structural metadata: " + ", ".join(mismatches))
+
+
+def _railway_observation(
+    *, command_id: str, command: str, argv: list[str], cwd: Path, executable: dict[str, str]
+) -> tuple[dict[str, Any], Any, datetime, datetime]:
+    record, stdout, _stderr, started, completed = _command_result(
+        command_id=command_id, command=command, argv=argv, cwd=cwd, executable=executable
+    )
+    if record["exitCode"] != 0:
+        raise RuntimeError(f"required Railway observation failed: {command}")
+    document = strict_json_loads(stdout, f"{command} output")
+    return record, document, started, completed
+
+
+def produce_railway_evidence(args: argparse.Namespace) -> None:
+    release_id, release_nonce = validate_release_binding(args.release_id, args.release_nonce)
+    cwd = args.working_directory.resolve(strict=True)
+    railway = _resolved_executable("railway")
+    version_record, version_stdout, _stderr, captured_at, _ = _command_result(
+        command_id="railway-version",
+        command="railway --version",
+        argv=[railway["path"], "--version"],
+        cwd=cwd,
+        executable=railway,
+    )
+    if version_record["exitCode"] != 0:
+        raise RuntimeError("required Railway version observation failed")
+    version = version_stdout.decode("utf-8", errors="strict").strip()
+    if version != "railway 5.23.0":
+        raise RuntimeError("unsupported Railway CLI version for structural release evidence")
+    status_record, status_document, _, _ = _railway_observation(
+        command_id="railway-status",
+        command="railway status --json",
+        argv=[railway["path"], "status", "--json"],
+        cwd=cwd,
+        executable=railway,
+    )
+    variables_command = f"railway variables --service {args.postgres_service_id} --json"
+    variables_record, variables_document, _, completed = _railway_observation(
+        command_id="railway-postgres-variables",
+        command=variables_command,
+        argv=[railway["path"], "variables", "--service", args.postgres_service_id, "--json"],
+        cwd=cwd,
+        executable=railway,
+    )
+    observed = _validate_railway_status(status_document, args)
+    _validate_railway_variables(variables_document, args, observed)
+    receipt = {
+        "schemaVersion": "applypilot_railway_topology_receipt_v2",
+        "receiptPurpose": _TOPOLOGY_PURPOSE,
+        "producer": PRODUCER,
+        "producerVersion": PRODUCER_VERSION,
+        "releaseId": release_id,
+        "releaseNonce": release_nonce,
+        "status": "verified",
+        "railwayProject": args.railway_project,
+        "railwayProjectId": args.railway_project_id,
+        "railwayEnvironmentId": args.railway_environment_id,
+        "postgresServiceId": args.postgres_service_id,
+        "atsWorkerServiceId": args.ats_worker_service_id,
+        "linkedinWorkerServiceId": args.linkedin_worker_service_id,
+        "databaseName": args.database_name,
+        "commands": [version_record, status_record, variables_record],
+        "railwayCli": {
+            "version": version,
+            "executable": railway,
+            "statusSchema": _RAILWAY_STATUS_SCHEMA,
+            "variablesSchema": _RAILWAY_VARIABLES_SCHEMA,
+        },
+        "environment": "staging",
+        "capturedAt": _timestamp(captured_at),
+        "expiresAt": _timestamp(completed + _TOPOLOGY_LIFETIME),
+    }
+    _publish(args.output, receipt, _TOPOLOGY_PURPOSE)
+
+
+def sign_nonrelease_claim(input_path: Path, output_path: Path) -> None:
+    source = regular_file(input_path.resolve(strict=True), "non-release input")
+    document = strict_json_loads(stable_read_bytes(source, "non-release input"), "non-release input")
+    if not isinstance(document, dict) or document.get("nonRelease") is not True:
+        raise RuntimeError("low-level signing is restricted to documents explicitly marked nonRelease=true")
+    if "authentication" in document:
+        raise RuntimeError("non-release input already contains authentication")
+    document = {**document, "producer": NON_RELEASE_PRODUCER}
+    _publish(output_path, document, "nonrelease-claims")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="strict unsigned JSON receipt")
-    parser.add_argument("--output", type=Path, required=True, help="new signed JSON receipt")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    tests = subparsers.add_parser("produce-tests", help="execute an exact approved release test suite")
+    tests.add_argument("--suite", choices=sorted(TEST_SUITE_POLICIES), required=True)
+    tests.add_argument("--repo", type=Path, required=True)
+    tests.add_argument("--release-id", required=True)
+    tests.add_argument("--release-nonce", required=True)
+    tests.add_argument("--output", type=Path, required=True)
+
+    railway = subparsers.add_parser("produce-railway", help="execute and capture Railway topology observations")
+    railway.add_argument("--release-id", required=True)
+    railway.add_argument("--release-nonce", required=True)
+    railway.add_argument("--working-directory", type=Path, default=Path.cwd())
+    railway.add_argument("--railway-project", required=True)
+    railway.add_argument("--railway-project-id", required=True)
+    railway.add_argument("--railway-environment-id", required=True)
+    railway.add_argument("--postgres-service-id", required=True)
+    railway.add_argument("--ats-worker-service-id", required=True)
+    railway.add_argument("--linkedin-worker-service-id", required=True)
+    railway.add_argument("--database-name", required=True)
+    railway.add_argument("--output", type=Path, required=True)
+
+    low_level = subparsers.add_parser("sign-nonrelease", help="authenticate a non-release diagnostic claim")
+    low_level.add_argument("--input", type=Path, required=True)
+    low_level.add_argument("--output", type=Path, required=True)
     return parser
-
-
-def _nonempty_string(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
-
-
-def _attestation_configuration() -> tuple[bytes, str]:
-    encoded_key = os.environ.get(_KEY_ENV)
-    key_id = os.environ.get(_KEY_ID_ENV)
-    if not _nonempty_string(encoded_key) or not _nonempty_string(key_id):
-        raise RuntimeError("release attestation key and key ID environment variables are required")
-    try:
-        key = base64.b64decode(encoded_key, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise RuntimeError("release attestation key must be valid base64") from exc
-    if len(key) < 32:
-        raise RuntimeError("release attestation key must decode to at least 32 bytes")
-    return key, key_id
-
-
-def _absolute_lexical_path(path: Path) -> Path:
-    return Path(os.path.abspath(path))
-
-
-def _reject_symlink_components(path: Path) -> None:
-    absolute = _absolute_lexical_path(path)
-    for component in (*reversed(absolute.parents), absolute):
-        if component.is_symlink():
-            raise RuntimeError(f"path must not contain symlinks: {path}")
-
-
-def _validate_paths(input_path: Path, output_path: Path) -> tuple[Path, Path]:
-    source = _absolute_lexical_path(input_path)
-    target = _absolute_lexical_path(output_path)
-    _reject_symlink_components(source)
-    _reject_symlink_components(target)
-    if os.path.normcase(str(source)) == os.path.normcase(str(target)):
-        raise RuntimeError("input and output must not be the same file")
-    try:
-        source_stat = source.stat()
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"input file does not exist: {input_path}") from exc
-    if not stat.S_ISREG(source_stat.st_mode):
-        raise RuntimeError(f"input must be a regular file: {input_path}")
-    if target.exists() or target.is_symlink():
-        raise RuntimeError(f"output already exists; refusing to overwrite: {output_path}")
-    if not target.parent.is_dir():
-        raise RuntimeError(f"output parent directory does not exist: {output_path.parent}")
-    return source, target
-
-
-def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int, int]:
-    return (
-        stat_result.st_dev,
-        stat_result.st_ino,
-        stat_result.st_size,
-        stat_result.st_mtime_ns,
-    )
-
-
-def _stable_read_bytes(path: Path) -> bytes:
-    before = path.stat()
-    first = path.read_bytes()
-    middle = path.stat()
-    second = path.read_bytes()
-    after = path.stat()
-    if len({_file_identity(item) for item in (before, middle, after)}) != 1 or first != second:
-        raise RuntimeError(f"release receipt changed while reading: {path}")
-    return second
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant is not permitted: {value}")
-
-
-def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate object key is not permitted: {key}")
-        result[key] = value
-    return result
-
-
-def _parse_receipt(content: bytes, *, require_unsigned: bool) -> dict[str, Any]:
-    try:
-        text = content.decode("utf-8-sig")
-        receipt = json.loads(text, object_pairs_hook=_strict_object, parse_constant=_reject_constant)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("release receipt must be valid UTF-8 JSON") from exc
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
-    if not isinstance(receipt, dict):
-        raise RuntimeError("release receipt must be a JSON object")
-    if require_unsigned and "authentication" in receipt:
-        raise RuntimeError("unsigned release receipt already contains authentication")
-    return receipt
-
-
-def _canonical_receipt_payload(receipt: dict[str, Any]) -> bytes:
-    payload = {key: value for key, value in receipt.items() if key != "authentication"}
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-
-
-def _signed_receipt(receipt: dict[str, Any], key: bytes, key_id: str) -> dict[str, Any]:
-    signature = base64.b64encode(hmac.digest(key, _canonical_receipt_payload(receipt), hashlib.sha256)).decode("ascii")
-    return {
-        **receipt,
-        "authentication": {
-            "algorithm": _ALGORITHM,
-            "keyId": key_id,
-            "signature": signature,
-        },
-    }
-
-
-def _verify_signed_receipt(receipt: dict[str, Any], key: bytes, key_id: str) -> None:
-    authentication = receipt.get("authentication")
-    if not isinstance(authentication, dict) or set(authentication) != {"algorithm", "keyId", "signature"}:
-        raise RuntimeError("signed release receipt has an invalid authentication object")
-    if authentication.get("algorithm") != _ALGORITHM or authentication.get("keyId") != key_id:
-        raise RuntimeError("signed release receipt authentication metadata does not match")
-    signature = authentication.get("signature")
-    if not _nonempty_string(signature):
-        raise RuntimeError("signed release receipt authentication signature is missing")
-    try:
-        supplied = base64.b64decode(signature, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise RuntimeError("signed release receipt authentication signature is not valid base64") from exc
-    expected = hmac.digest(key, _canonical_receipt_payload(receipt), hashlib.sha256)
-    if not hmac.compare_digest(supplied, expected):
-        raise RuntimeError("signed release receipt authentication signature is invalid")
-
-
-def _fsync_directory(directory: Path) -> None:
-    try:
-        descriptor = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
-
-
-def _write_exclusive_fsync(path: Path, content: bytes) -> None:
-    descriptor: int | None = None
-    created = False
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
-        if os.name == "posix":
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        if descriptor is not None:
-            os.close(descriptor)
-        if created:
-            try:
-                path.unlink(missing_ok=True)
-            finally:
-                _fsync_directory(path.parent)
-        raise
-    _fsync_directory(path.parent)
-
-
-def sign_release_receipt(input_path: Path, output_path: Path) -> None:
-    source, target = _validate_paths(input_path, output_path)
-    receipt = _parse_receipt(_stable_read_bytes(source), require_unsigned=True)
-    key, key_id = _attestation_configuration()
-    signed = _signed_receipt(receipt, key, key_id)
-    encoded = (json.dumps(signed, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
-    try:
-        _write_exclusive_fsync(target, encoded)
-    except FileExistsError as exc:
-        raise RuntimeError(f"output already exists; refusing to overwrite: {output_path}") from exc
-    try:
-        written = _parse_receipt(_stable_read_bytes(target), require_unsigned=False)
-        _verify_signed_receipt(written, key, key_id)
-    except BaseException:
-        try:
-            target.unlink(missing_ok=True)
-        finally:
-            _fsync_directory(target.parent)
-        raise
 
 
 def main() -> int:
     args = _parser().parse_args()
     try:
-        sign_release_receipt(args.input, args.output)
-    except (OSError, RuntimeError) as exc:
+        if args.mode == "produce-tests":
+            produce_test_evidence(
+                suite=args.suite,
+                repo=args.repo,
+                release_id=args.release_id,
+                release_nonce=args.release_nonce,
+                output=args.output,
+            )
+        elif args.mode == "produce-railway":
+            produce_railway_evidence(args)
+        else:
+            sign_nonrelease_claim(args.input, args.output)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         raise SystemExit(f"error: {exc}") from None
     return 0
 

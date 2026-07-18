@@ -12,21 +12,72 @@ import sys
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build-compatibility-manifest.py"
-TRUSTED_PRODUCER = "applypilot-release-verifier-v1"
-RUNTIME_SUITE = "applypilot-runtime-release-v1"
-BRAIN_SUITE = "applypilot-brain-release-v1"
-TOPOLOGY_PRODUCER = "applypilot-railway-topology-verifier-v1"
-ATTESTATION_KEY = b"release-attestation-test-key-material-32-bytes-minimum"
-ATTESTATION_KEY_ID = "release-test-key-v1"
+TRUSTED_PRODUCER = "applypilot-release-evidence-producer-v2"
+PRODUCER_VERSION = "2.0.0"
+RUNTIME_SUITE = "applypilot-runtime-release-v2"
+BRAIN_SUITE = "applypilot-brain-release-v2"
+RELEASE_ID = "applypilot-test-rc1"
+RELEASE_NONCE = "release_nonce_0123456789abcdef0123456789abcdef"
+RUNTIME_KEY = b"runtime-test-attestation-key-material-32-bytes-minimum"
+BRAIN_KEY = b"brain-test-attestation-key-material-32-bytes-minimum"
+TOPOLOGY_KEY = b"railway-topology-attestation-key-material-32-bytes"
+RUNTIME_KEY_ID = "runtime-release-test-key-v2"
+BRAIN_KEY_ID = "brain-release-test-key-v2"
+TOPOLOGY_KEY_ID = "railway-release-test-key-v2"
 ATTESTATION_ENV = {
-    "APPLYPILOT_RELEASE_ATTESTATION_KEY_B64": base64.b64encode(ATTESTATION_KEY).decode(),
-    "APPLYPILOT_RELEASE_ATTESTATION_KEY_ID": ATTESTATION_KEY_ID,
+    "APPLYPILOT_RUNTIME_TEST_ATTESTATION_KEY_B64": base64.b64encode(RUNTIME_KEY).decode(),
+    "APPLYPILOT_RUNTIME_TEST_ATTESTATION_KEY_ID": RUNTIME_KEY_ID,
+    "APPLYPILOT_BRAIN_TEST_ATTESTATION_KEY_B64": base64.b64encode(BRAIN_KEY).decode(),
+    "APPLYPILOT_BRAIN_TEST_ATTESTATION_KEY_ID": BRAIN_KEY_ID,
+    "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_B64": base64.b64encode(TOPOLOGY_KEY).decode(),
+    "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_ID": TOPOLOGY_KEY_ID,
+}
+SUITE_POLICIES = {
+    RUNTIME_SUITE: {
+        "purpose": "runtime-tests",
+        "suiteIdentity": RUNTIME_SUITE,
+        "commands": (
+            ("pytest", "python -m pytest -q", ("-m", "pytest", "-q")),
+            ("ruff", "python -m ruff check .", ("-m", "ruff", "check", ".")),
+        ),
+    },
+    BRAIN_SUITE: {
+        "purpose": "brain-tests",
+        "suiteIdentity": BRAIN_SUITE,
+        "commands": (
+            ("typecheck", "npm run typecheck", ("npm", "run", "typecheck")),
+            ("tests", "npm test", ("npm", "test")),
+        ),
+    },
+}
+TEST_ENVIRONMENT_POLICY = {
+    "schemaVersion": "applypilot-test-environment-policy-v1",
+    "inheritedAllowlist": (
+        "APPDATA", "COMSPEC", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOCALAPPDATA", "PATH",
+        "PATHEXT", "SSL_CERT_DIR", "SSL_CERT_FILE", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "TZ",
+        "USERPROFILE", "WINDIR",
+    ),
+    "fixed": {
+        "GIT_CONFIG_GLOBAL": "<OS_DEVNULL>", "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
+        "NPM_CONFIG_AUDIT": "false", "NPM_CONFIG_FUND": "false",
+        "NPM_CONFIG_USERCONFIG": "<OS_DEVNULL>",
+        "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1",
+    },
+    "rejectedExact": (
+        "BABEL_ENV", "GREP", "JEST_SHARD", "MOCHA_GREP", "NODE_ENV", "NODE_OPTIONS", "NODE_PATH",
+        "ONLY", "PYTHONBREAKPOINT", "PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONWARNINGS",
+        "PYTEST_ADDOPTS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTEST_PLUGINS", "SKIP", "TEST",
+        "TEST_FILTER", "TEST_GREP", "TEST_NAME_PATTERN", "TEST_PATH_PATTERN", "TEST_PATTERN", "TESTS",
+        "VITEST", "VITEST_RELATED", "VITEST_SHARD",
+    ),
+    "rejectedPrefixes": ("NPM_CONFIG_",),
 }
 UUIDS = {
     "project": "11111111-1111-4111-8111-111111111111",
@@ -153,9 +204,18 @@ class Fixture:
 def _sign_receipt(
     document: dict[str, Any],
     *,
-    key: bytes = ATTESTATION_KEY,
-    key_id: str = ATTESTATION_KEY_ID,
+    key: bytes | None = None,
+    key_id: str | None = None,
 ) -> dict[str, Any]:
+    purpose = document.get("receiptPurpose")
+    defaults = {
+        "runtime-tests": (RUNTIME_KEY, RUNTIME_KEY_ID),
+        "brain-tests": (BRAIN_KEY, BRAIN_KEY_ID),
+        "railway-topology": (TOPOLOGY_KEY, TOPOLOGY_KEY_ID),
+    }
+    default_key, default_id = defaults[purpose]
+    key = key or default_key
+    key_id = key_id or default_id
     payload = {name: value for name, value in document.items() if name != "authentication"}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     signature = base64.b64encode(hmac.digest(key, canonical, hashlib.sha256)).decode()
@@ -171,6 +231,25 @@ def _sign_receipt(
 
 def _write_signed_receipt(path: Path, document: dict[str, Any], **kwargs: Any) -> None:
     path.write_text(json.dumps(_sign_receipt(document, **kwargs)), encoding="utf-8")
+
+
+def _timestamp(value: datetime) -> str:
+    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _command_record(command_id: str, command: str, argv: list[str], when: datetime) -> dict[str, Any]:
+    return {
+        "commandId": command_id,
+        "command": command,
+        "argv": argv,
+        "executable": {"path": argv[0], "sha256": "5" * 64},
+        "exitCode": 0,
+        "stdoutSha256": "6" * 64,
+        "stderrSha256": "7" * 64,
+        "logSha256": "8" * 64,
+        "startedAt": _timestamp(when),
+        "completedAt": _timestamp(when + timedelta(seconds=1)),
+    }
 
 
 def _build_fixture(tmp_path: Path) -> Fixture:
@@ -230,11 +309,17 @@ def _build_fixture(tmp_path: Path) -> Fixture:
     sqlite_hash = hashlib.sha256(sqlite.read_bytes()).hexdigest()
 
     topology_receipt = tmp_path / "railway-topology.json"
+    receipt_time = datetime.now(timezone.utc) - timedelta(minutes=1)
+    railway_path = str((tmp_path / "railway.exe").resolve())
     _write_signed_receipt(
         topology_receipt,
         {
-            "schemaVersion": "applypilot_railway_topology_receipt_v1",
-            "producer": TOPOLOGY_PRODUCER,
+            "schemaVersion": "applypilot_railway_topology_receipt_v2",
+            "receiptPurpose": "railway-topology",
+            "producer": TRUSTED_PRODUCER,
+            "producerVersion": PRODUCER_VERSION,
+            "releaseId": RELEASE_ID,
+            "releaseNonce": RELEASE_NONCE,
             "status": "verified",
             "railwayProject": "applypilot-staging",
             "railwayProjectId": UUIDS["project"],
@@ -243,10 +328,30 @@ def _build_fixture(tmp_path: Path) -> Fixture:
             "atsWorkerServiceId": UUIDS["ats"],
             "linkedinWorkerServiceId": UUIDS["linkedin"],
             "databaseName": "applypilot_brain_staging",
-            "sourceCommand": "railway status --json",
+            "commands": [
+                _command_record(
+                    "railway-version", "railway --version", [railway_path, "--version"], receipt_time
+                ),
+                _command_record(
+                    "railway-status", "railway status --json", [railway_path, "status", "--json"],
+                    receipt_time + timedelta(seconds=2),
+                ),
+                _command_record(
+                    "railway-postgres-variables",
+                    f"railway variables --service {UUIDS['postgres']} --json",
+                    [railway_path, "variables", "--service", UUIDS["postgres"], "--json"],
+                    receipt_time + timedelta(seconds=4),
+                ),
+            ],
+            "railwayCli": {
+                "version": "railway 5.23.0",
+                "executable": {"path": railway_path, "sha256": "5" * 64},
+                "statusSchema": "railway-cli-5-project-status-v1",
+                "variablesSchema": "railway-cli-5-flat-service-variables-v1",
+            },
             "environment": "staging",
-            "capturedAt": "2026-07-17T19:50:00Z",
-            "expiresAt": "2026-07-17T20:20:00Z",
+            "capturedAt": _timestamp(receipt_time),
+            "expiresAt": _timestamp(receipt_time + timedelta(minutes=30)),
         },
     )
 
@@ -301,7 +406,9 @@ def _build_fixture(tmp_path: Path) -> Fixture:
         "--brain-repo",
         str(brain),
         "--release-id",
-        "applypilot-test-rc1",
+        RELEASE_ID,
+        "--release-nonce",
+        RELEASE_NONCE,
         "--database-name",
         "applypilot_brain_staging",
         "--artifact-source-root",
@@ -310,8 +417,6 @@ def _build_fixture(tmp_path: Path) -> Fixture:
         str(sqlite),
         "--railway-topology-receipt",
         str(topology_receipt),
-        "--generated-at",
-        "2026-07-17T20:00:00Z",
         "--railway-project",
         "applypilot-staging",
         "--railway-project-id",
@@ -359,20 +464,41 @@ def _run(
 
 
 def _test_receipt(commit: str, tree: str, suite: str) -> dict[str, Any]:
+    policy = SUITE_POLICIES[suite]
+    when = datetime.now(timezone.utc) - timedelta(minutes=2)
+    commands = []
+    for index, (command_id, command, arguments) in enumerate(policy["commands"]):
+        if policy["purpose"] == "runtime-tests":
+            argv = [str(Path(sys.executable).resolve()), *arguments]
+        else:
+            argv = [str((Path.cwd() / "npm.cmd").resolve()), *arguments[1:]]
+        commands.append(_command_record(command_id, command, argv, when + timedelta(seconds=index * 2)))
     return {
-        "schemaVersion": "applypilot_test_receipt_v1",
+        "schemaVersion": "applypilot_test_receipt_v2",
+        "receiptPurpose": policy["purpose"],
         "producer": TRUSTED_PRODUCER,
+        "producerVersion": PRODUCER_VERSION,
+        "releaseId": RELEASE_ID,
+        "releaseNonce": RELEASE_NONCE,
         "suiteIdentity": suite,
+        "suitePolicySha256": hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        ).hexdigest(),
         "status": "passed",
         "sourceCommitSha": commit,
         "sourceTreeSha": tree,
-        "commands": [
-            {"command": "python -m pytest -q", "exitCode": 0},
-            {"command": "python -m ruff check .", "exitCode": 0},
-        ],
-        "environment": {"runner": "release-verifier", "os": "windows", "python": "3.12"},
-        "startedAt": "2026-07-17T19:00:00Z",
-        "completedAt": "2026-07-17T19:30:00Z",
+        "commands": commands,
+        "environment": {
+            "platform": "test-platform",
+            "pythonExecutable": str(Path(sys.executable).resolve()),
+            "pythonVersion": "3.12",
+            "executionPolicySha256": hashlib.sha256(
+                json.dumps(TEST_ENVIRONMENT_POLICY, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+            ).hexdigest(),
+            "inheritedEnvironmentSha256": {"PATH": "4" * 64},
+        },
+        "startedAt": _timestamp(when),
+        "completedAt": commands[-1]["completedAt"],
     }
 
 
@@ -384,12 +510,16 @@ def test_manifest_generator_emits_only_current_allowlisted_evidence(release_fixt
     template = fixture.write_template(document, "stale-template.json")
     output = fixture.root / "manifest.json"
 
+    before = datetime.now(timezone.utc)
     result = _run(fixture.command_for(output="manifest.json", template=template), check=True)
+    after = datetime.now(timezone.utc)
     manifest = json.loads(output.read_text(encoding="utf-8"))
 
     assert json.loads(result.stdout)["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert manifest["schemaVersion"] == "applypilot_compatibility_manifest_v3"
-    assert manifest["generatedAt"] == "2026-07-17T20:00:00.000Z"
+    generated_at = datetime.fromisoformat(manifest["generatedAt"].replace("Z", "+00:00"))
+    assert before <= generated_at <= after
+    assert manifest["releaseNonce"] == RELEASE_NONCE
     assert manifest["repositories"]["python"]["sourceCommitSha"] == fixture.runtime_head
     assert manifest["repositories"]["typescript"]["sourceCommitSha"] == fixture.brain_head
     assert "testedCommitSha" not in manifest["repositories"]["python"]
@@ -403,7 +533,7 @@ def test_manifest_generator_emits_only_current_allowlisted_evidence(release_fixt
     assert manifest["deployment"]["linkedinWorkerServiceId"] == UUIDS["linkedin"]
     assert manifest["deployment"]["topologyReceipt"]["authentication"] == {
         "algorithm": "HMAC-SHA256",
-        "keyId": ATTESTATION_KEY_ID,
+        "keyId": TOPOLOGY_KEY_ID,
     }
     assert manifest["canonicalSqliteSource"]["quickCheck"] == "ok"
     assert manifest["canonicalSqliteSource"]["schemaVersion"] == 2
@@ -412,8 +542,10 @@ def test_manifest_generator_emits_only_current_allowlisted_evidence(release_fixt
         "job decisions": 3,
         "jobs": 2,
     }
+    assert len(manifest["canonicalSqliteSource"]["snapshotSha256"]) == 64
+    assert manifest["canonicalSqliteSource"]["snapshotBytes"] > 0
     assert "signature" not in json.dumps(manifest)
-    assert ATTESTATION_ENV["APPLYPILOT_RELEASE_ATTESTATION_KEY_B64"] not in json.dumps(manifest)
+    assert all(value not in json.dumps(manifest) for key, value in ATTESTATION_ENV.items() if key.endswith("_KEY_B64"))
     assert len(manifest["artifacts"]["files"]) == len(ARTIFACT_ROLES)
 
 
@@ -520,12 +652,12 @@ def test_strict_receipts_bind_suite_commands_environment_commit_and_tree(release
     invalid_receipts.append(("tree", bad_tree, "source commit and tree"))
     bad_command = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
     bad_command["commands"][1]["exitCode"] = 1
-    invalid_receipts.append(("command", bad_command, "successful commands"))
+    invalid_receipts.append(("command", bad_command, "approved command set"))
     bad_environment = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
     bad_environment["environment"] = {"python": "3.12"}
     invalid_receipts.append(("environment", bad_environment, "environment"))
     bad_time = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
-    bad_time["completedAt"] = "2026-07-17T18:00:00Z"
+    bad_time["completedAt"] = _timestamp(datetime.now(timezone.utc) - timedelta(hours=1))
     invalid_receipts.append(("timestamp", bad_time, "precedes"))
     for name, bad, message in invalid_receipts:
         _write_signed_receipt(runtime_receipt, bad)
@@ -539,14 +671,30 @@ def test_strict_receipts_bind_suite_commands_environment_commit_and_tree(release
         assert message in result.stderr
 
 
+@pytest.mark.parametrize(("command", "argv"), [("echo passed", ["echo", "passed"]), ("python --version", [sys.executable, "--version"])])
+def test_successful_but_unapproved_commands_cannot_satisfy_release_suite(
+    release_fixture: Fixture, command: str, argv: list[str]
+) -> None:
+    fixture = release_fixture
+    receipt = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
+    receipt["commands"][0].update(command=command, argv=argv)
+    path = fixture.root / "unapproved-command.json"
+    _write_signed_receipt(path, receipt)
+    result = _run(
+        fixture.command_for(output="unapproved-command-output.json", extra=["--runtime-test-receipt", str(path)])
+    )
+    assert result.returncode != 0
+    assert "approved command set" in result.stderr
+
+
 @pytest.mark.parametrize("attack", ["unsigned", "wrong_key", "wrong_key_id", "tampered", "stale"])
 def test_test_receipt_authentication_rejects_adversarial_claims(release_fixture: Fixture, attack: str) -> None:
     fixture = release_fixture
     path = fixture.root / f"test-receipt-{attack}.json"
     receipt = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
     if attack == "stale":
-        receipt["startedAt"] = "2026-07-15T18:00:00Z"
-        receipt["completedAt"] = "2026-07-15T18:30:00Z"
+        receipt["startedAt"] = _timestamp(datetime.now(timezone.utc) - timedelta(days=2, minutes=1))
+        receipt["completedAt"] = _timestamp(datetime.now(timezone.utc) - timedelta(days=2))
     if attack == "unsigned":
         path.write_text(json.dumps(receipt), encoding="utf-8")
     elif attack == "wrong_key":
@@ -569,15 +717,78 @@ def test_test_receipt_authentication_rejects_adversarial_claims(release_fixture:
     assert not (fixture.root / f"test-receipt-{attack}-output.json").exists()
 
 
+def test_receipts_cannot_replay_across_release_nonce_or_future_clock(release_fixture: Fixture) -> None:
+    fixture = release_fixture
+    path = fixture.root / "replay.json"
+    receipt = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
+    receipt["releaseNonce"] = "different_nonce_0123456789abcdef0123456789abcdef"
+    _write_signed_receipt(path, receipt)
+    replay = _run(
+        fixture.command_for(output="replay-output.json", extra=["--runtime-test-receipt", str(path)])
+    )
+    assert replay.returncode != 0
+    assert "release purpose, ID, and nonce" in replay.stderr
+
+    receipt = _test_receipt(fixture.runtime_head, fixture.runtime_tree, RUNTIME_SUITE)
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    receipt["startedAt"] = _timestamp(future)
+    for index, command in enumerate(receipt["commands"]):
+        command["startedAt"] = _timestamp(future + timedelta(seconds=index * 2))
+        command["completedAt"] = _timestamp(future + timedelta(seconds=index * 2 + 1))
+    receipt["completedAt"] = receipt["commands"][-1]["completedAt"]
+    _write_signed_receipt(path, receipt)
+    future_result = _run(
+        fixture.command_for(output="future-output.json", extra=["--runtime-test-receipt", str(path)])
+    )
+    assert future_result.returncode != 0
+    assert "after manifest generation" in future_result.stderr
+
+
+def test_generated_at_is_not_a_caller_controlled_argument(release_fixture: Fixture) -> None:
+    command = release_fixture.command_for(output="caller-time.json")
+    command.extend(["--generated-at", "2000-01-01T00:00:00Z"])
+    result = _run(command)
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
+    assert not (release_fixture.root / "caller-time.json").exists()
+
+
+def test_receipt_purpose_keys_must_be_cryptographically_distinct(release_fixture: Fixture) -> None:
+    env = {
+        "APPLYPILOT_BRAIN_TEST_ATTESTATION_KEY_B64": ATTESTATION_ENV[
+            "APPLYPILOT_RUNTIME_TEST_ATTESTATION_KEY_B64"
+        ]
+    }
+    result = _run(release_fixture.command_for(output="reused-key.json"), env=env)
+    assert result.returncode != 0
+    assert "distinct keys and key IDs" in result.stderr
+
+
+def test_manifest_strict_json_rejects_duplicate_keys_and_nonstandard_constants(release_fixture: Fixture) -> None:
+    duplicate = release_fixture.root / "duplicate-template.json"
+    duplicate.write_text('{"schemaVersion":"applypilot_compatibility_manifest_v3","schemaVersion":"x"}', encoding="utf-8")
+    duplicate_result = _run(
+        release_fixture.command_for(output="duplicate-output.json", template=duplicate)
+    )
+    assert duplicate_result.returncode != 0
+    assert "duplicate object key" in duplicate_result.stderr
+
+    nonstandard = release_fixture.root / "nan-template.json"
+    nonstandard.write_text('{"schemaVersion":"applypilot_compatibility_manifest_v3","value":NaN}', encoding="utf-8")
+    nan_result = _run(release_fixture.command_for(output="nan-output.json", template=nonstandard))
+    assert nan_result.returncode != 0
+    assert "non-standard JSON constant" in nan_result.stderr
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("producer", "forged-producer", "producer"),
         ("status", "pending", "status"),
-        ("sourceCommand", "railway status", "command"),
+        ("commands", [], "observation commands"),
         ("environment", "production", "environment"),
         ("postgresServiceId", UUIDS["ats"], "deployment identity"),
-        ("expiresAt", "2026-07-17T19:55:00Z", "stale"),
+        ("expiresAt", "2000-01-01T00:00:00Z", "stale"),
     ],
 )
 def test_topology_receipt_requires_authenticated_exact_fresh_observation(
@@ -602,14 +813,17 @@ def test_topology_receipt_tampering_and_missing_key_fail_closed(release_fixture:
     assert result.returncode != 0
     assert "signature is invalid" in result.stderr
 
-    env = {"APPLYPILOT_RELEASE_ATTESTATION_KEY_B64": "", "APPLYPILOT_RELEASE_ATTESTATION_KEY_ID": ""}
+    env = {
+        "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_B64": "",
+        "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_ID": "",
+    }
     result = _run(fixture.command_for(output="missing-key.json"), env=env)
     assert result.returncode != 0
     assert "environment variables are required" in result.stderr
 
     short_key_env = {
-        "APPLYPILOT_RELEASE_ATTESTATION_KEY_B64": base64.b64encode(b"too-short").decode(),
-        "APPLYPILOT_RELEASE_ATTESTATION_KEY_ID": ATTESTATION_KEY_ID,
+        "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_B64": base64.b64encode(b"too-short").decode(),
+        "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_ID": TOPOLOGY_KEY_ID,
     }
     result = _run(fixture.command_for(output="short-key.json"), env=short_key_env)
     assert result.returncode != 0
@@ -676,6 +890,66 @@ def test_sqlite_evidence_is_derived_directly_and_non_sqlite_is_rejected(
     result = _run(command)
     assert result.returncode != 0
     assert "not a valid SQLite database" in result.stderr
+
+
+def test_sqlite_live_wal_sidecars_are_rejected_before_immutable_read_omits_committed_data(
+    release_fixture: Fixture,
+) -> None:
+    fixture = release_fixture
+    live = fixture.source / "live-wal.db"
+    writer = sqlite3.connect(live)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE committed_only_in_wal (value TEXT)")
+        writer.execute("INSERT INTO committed_only_in_wal VALUES ('present')")
+        writer.commit()
+        assert Path(f"{live}-wal").exists()
+        with sqlite3.connect(live) as normal_reader:
+            assert normal_reader.execute("SELECT COUNT(*) FROM committed_only_in_wal").fetchone()[0] == 1
+        immutable_uri = f"file:{live.as_posix()}?mode=ro&immutable=1"
+        with sqlite3.connect(immutable_uri, uri=True) as immutable_reader:
+            with pytest.raises(sqlite3.DatabaseError):
+                immutable_reader.execute("SELECT COUNT(*) FROM committed_only_in_wal").fetchone()
+
+        document = fixture.document()
+        document["canonicalSqliteSource"] = {
+            "path": str(live),
+            "bytes": live.stat().st_size,
+            "sha256": hashlib.sha256(live.read_bytes()).hexdigest(),
+        }
+        template = fixture.write_template(document, "live-wal-template.json")
+        command = fixture.command_for(output="live-wal-output.json", template=template)
+        command[command.index("--sqlite-source") + 1] = str(live)
+        result = _run(command)
+        assert result.returncode != 0
+        assert "live WAL/SHM sidecars" in result.stderr
+        assert not (fixture.root / "live-wal-output.json").exists()
+    finally:
+        writer.close()
+
+
+def test_sqlite_late_wal_created_during_final_source_hash_fails_closed(
+    release_fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = release_fixture
+    module = _load_module()
+    original = module._stable_file_record
+    source_calls = 0
+
+    def create_late_sidecar(path: Path) -> tuple[int, str]:
+        nonlocal source_calls
+        result = original(path)
+        if Path(path) == fixture.sqlite:
+            source_calls += 1
+            if source_calls == 2:
+                Path(f"{fixture.sqlite}-wal").write_bytes(b"late-wal")
+        return result
+
+    monkeypatch.setattr(module, "_stable_file_record", create_late_sidecar)
+    with pytest.raises(RuntimeError, match="during final source verification"):
+        module._verify_sqlite_source(fixture.document(), fixture.sqlite)
+    assert source_calls == 2
 
 
 @pytest.mark.parametrize(
@@ -787,7 +1061,7 @@ def test_interrupted_exclusive_write_removes_partial_file(tmp_path: Path, monkey
     assert not target.exists()
 
 
-def test_partial_evidence_pair_is_repairable_and_complete_pair_is_immutable(release_fixture: Fixture) -> None:
+def test_partial_evidence_pair_fails_closed_and_complete_pair_is_immutable(release_fixture: Fixture) -> None:
     fixture = release_fixture
     output = fixture.root / "repair.json"
     command = fixture.command_for(output="repair.json")
@@ -795,12 +1069,10 @@ def test_partial_evidence_pair_is_repairable_and_complete_pair_is_immutable(rele
     result = json.loads(first.stdout)
     sidecar = output.with_name(output.name + ".sha256")
     sidecar.unlink()
-    repaired = _run(command, check=True)
-    assert json.loads(repaired.stdout)["sha256"] == result["sha256"]
-    assert sidecar.exists()
-    complete = _run(command)
-    assert complete.returncode != 0
-    assert "complete immutable release evidence" in complete.stderr
+    partial = _run(command)
+    assert partial.returncode != 0
+    assert "incomplete immutable release evidence" in partial.stderr
+    assert hashlib.sha256(output.read_bytes()).hexdigest() == result["sha256"]
 
 
 @pytest.mark.parametrize(
