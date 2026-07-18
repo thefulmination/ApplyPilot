@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -40,9 +41,33 @@ UUIDS = {
     "project": "11111111-1111-4111-8111-111111111111",
     "environment": "22222222-2222-4222-8222-222222222222",
     "postgres": "33333333-3333-4333-8333-333333333333",
-    "ats": "44444444-4444-4444-8444-444444444444",
-    "linkedin": "55555555-5555-4555-8555-555555555555",
+    "control_plane": "44444444-4444-4444-8444-444444444444",
+    "gateway": "55555555-5555-4555-8555-555555555555",
 }
+
+
+def _approved_tool_environment() -> dict[str, str]:
+    tools = {
+        "APPLYPILOT_RUNTIME_TEST_PYTHON": Path(sys.executable).resolve(),
+        "APPLYPILOT_RELEASE_GIT": Path(shutil.which("git") or "").resolve(),
+    }
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    if node is not None and npm is not None:
+        node_path = Path(node).resolve()
+        npm_launcher = Path(npm).resolve()
+        npm_cli = (
+            node_path.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            if os.name == "nt"
+            else npm_launcher
+        )
+        tools["APPLYPILOT_BRAIN_TEST_NODE"] = node_path
+        tools["APPLYPILOT_BRAIN_TEST_NPM_CLI"] = npm_cli.resolve()
+    approved: dict[str, str] = {}
+    for prefix, path in tools.items():
+        approved[f"{prefix}_PATH"] = str(path)
+        approved[f"{prefix}_SHA256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return approved
 
 
 def _load_module(path: Path, name: str) -> ModuleType:
@@ -58,7 +83,7 @@ def _run(arguments: list[str], env: dict[str, str] | None = None) -> subprocess.
         [sys.executable, str(SIGNER), *arguments],
         capture_output=True,
         text=True,
-        env={**os.environ, **ENV, **(env or {})},
+        env={**os.environ, **ENV, **_approved_tool_environment(), **(env or {})},
     )
 
 
@@ -81,7 +106,13 @@ def _runtime_repo(path: Path, *, failing: bool = False) -> Path:
     tests = path / "tests"
     tests.mkdir()
     assertion = "False" if failing else "True"
-    (tests / "test_release.py").write_text(f"def test_release():\n    assert {assertion}\n", encoding="utf-8")
+    (tests / "test_release.py").write_text(
+        "import os\n\n"
+        "def test_release():\n"
+        f"    assert {assertion}\n"
+        "    assert os.environ.get('APPLYPILOT_RELEASE_SECRET_MARKER') is None\n",
+        encoding="utf-8",
+    )
     _git(path, "add", ".")
     _git(path, "commit", "-q", "-m", "release source")
     return path
@@ -96,8 +127,8 @@ def _brain_repo(path: Path) -> Path:
         json.dumps(
             {
                 "scripts": {
-                    "typecheck": "node -e \"process.stdout.write('typed')\"",
-                    "test": "node -e \"process.stdout.write('tested')\"",
+                    "typecheck": "node -e \"if(process.env.APPLYPILOT_RELEASE_SECRET_MARKER)process.exit(17);process.stdout.write('typed')\"",
+                    "test": "node -e \"if(process.env.APPLYPILOT_RELEASE_SECRET_MARKER)process.exit(17);process.stdout.write('tested')\"",
                 }
             }
         ),
@@ -124,17 +155,20 @@ def test_runtime_producer_executes_exact_suite_and_binds_logs_repo_and_release(t
             RELEASE_NONCE,
             "--output",
             str(output),
-        ]
+        ],
+        env={"APPLYPILOT_RELEASE_SECRET_MARKER": "must-not-reach-python"},
     )
 
     assert result.returncode == 0, result.stderr
     receipt = json.loads(output.read_text(encoding="utf-8"))
-    assert receipt["schemaVersion"] == "applypilot_test_receipt_v2"
+    assert receipt["schemaVersion"] == "applypilot_test_receipt_v4"
     assert receipt["receiptPurpose"] == "runtime-tests"
     assert receipt["releaseId"] == RELEASE_ID
     assert receipt["releaseNonce"] == RELEASE_NONCE
     assert receipt["sourceCommitSha"] == _git(repo, "rev-parse", "HEAD")
     assert receipt["sourceTreeSha"] == _git(repo, "rev-parse", "HEAD^{tree}")
+    assert receipt["sourceControl"]["system"] == "git"
+    assert receipt["sourceControl"]["executable"]["purpose"] == "release-git"
     assert [record["command"] for record in receipt["commands"]] == [
         "python -m pytest -q",
         "python -m ruff check .",
@@ -158,7 +192,13 @@ def test_brain_producer_executes_resolved_npm_commands_in_sanitized_environment(
         [
             "produce-tests", "--suite", "brain", "--repo", str(repo), "--release-id", RELEASE_ID,
             "--release-nonce", RELEASE_NONCE, "--output", str(output),
-        ]
+        ],
+        env={
+            "APPLYPILOT_RELEASE_SECRET_MARKER": "must-not-reach-npm",
+            "APPLYPILOT_RUNTIME_TEST_ATTESTATION_KEY_B64": ENV[
+                "APPLYPILOT_RUNTIME_TEST_ATTESTATION_KEY_B64"
+            ],
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -166,7 +206,82 @@ def test_brain_producer_executes_resolved_npm_commands_in_sanitized_environment(
     assert [record["command"] for record in receipt["commands"]] == ["npm run typecheck", "npm test"]
     assert all(Path(record["argv"][0]).is_absolute() for record in receipt["commands"])
     assert all(record["executable"]["path"] == record["argv"][0] for record in receipt["commands"])
+    assert all(record["executable"]["purpose"] == "brain-node" for record in receipt["commands"])
+    assert all(record["dependencies"]["npmCli"]["purpose"] == "brain-npm-cli" for record in receipt["commands"])
+    assert all(record["argv"][1] == record["dependencies"]["npmCli"]["path"] for record in receipt["commands"])
+    assert all(
+        record["executionEnvironment"]["PATH"] == str(Path(record["executable"]["path"]).parent)
+        for record in receipt["commands"]
+    )
     assert receipt["authentication"]["keyId"] == ENV["APPLYPILOT_BRAIN_TEST_ATTESTATION_KEY_ID"]
+
+
+def test_brain_producer_uses_pinned_node_and_npm_payload_with_poisoned_path(tmp_path: Path) -> None:
+    repo = _brain_repo(tmp_path / "brain-poisoned-path")
+    poison = tmp_path / "poison"
+    poison.mkdir()
+    marker = tmp_path / "ambient-launcher-ran"
+    if os.name == "nt":
+        (poison / "node.cmd").write_text(f'@echo poisoned>{marker}\r\n@exit /b 91\r\n', encoding="utf-8")
+        (poison / "npm.cmd").write_text(f'@echo poisoned>{marker}\r\n@exit /b 92\r\n', encoding="utf-8")
+    else:
+        for name in ("node", "npm"):
+            script = poison / name
+            script.write_text(f"#!/bin/sh\necho poisoned > {marker}\nexit 91\n", encoding="utf-8")
+            script.chmod(0o755)
+    output = tmp_path / "brain-poisoned-path.json"
+
+    result = _run(
+        [
+            "produce-tests", "--suite", "brain", "--repo", str(repo), "--release-id", RELEASE_ID,
+            "--release-nonce", RELEASE_NONCE, "--output", str(output),
+        ],
+        env={"PATH": str(poison)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert all(record["argv"][0] != str(poison / "node") for record in receipt["commands"])
+    assert all(record["argv"][1] != str(poison / "npm") for record in receipt["commands"])
+
+
+def test_executable_path_swap_cannot_yield_a_pre_swap_identity_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signer = _load_module(SIGNER, "executable_path_swap_test")
+    approved_path = tmp_path / ("python.exe" if os.name == "nt" else "python")
+    approved_path.write_bytes(Path(sys.executable).read_bytes())
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"attacker replacement")
+    approved_sha256 = hashlib.sha256(approved_path.read_bytes()).hexdigest()
+    monkeypatch.setenv("APPLYPILOT_RUNTIME_TEST_PYTHON_PATH", str(approved_path))
+    monkeypatch.setenv("APPLYPILOT_RUNTIME_TEST_PYTHON_SHA256", approved_sha256)
+    executable = signer._trusted_executable("runtime-python")
+    swap_was_blocked = False
+
+    def swap_during_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        nonlocal swap_was_blocked
+        try:
+            os.replace(replacement, approved_path)
+        except OSError:
+            swap_was_blocked = True
+        return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(signer.subprocess, "run", swap_during_run)
+    if os.name == "nt":
+        record, *_rest = signer._command_result(
+            command_id="probe", command="probe", argv=[str(approved_path)], cwd=tmp_path,
+            environment={}, executable=executable,
+        )
+        assert swap_was_blocked
+        assert record["executable"]["sha256"] == hashlib.sha256(approved_path.read_bytes()).hexdigest()
+    else:
+        with pytest.raises(RuntimeError, match="changed during protected execution"):
+            signer._command_result(
+                command_id="probe", command="probe", argv=[str(approved_path)], cwd=tmp_path,
+                environment={}, executable=executable,
+            )
 
 
 def test_failed_suite_and_dirty_repo_fail_without_publishing(tmp_path: Path) -> None:
@@ -258,6 +373,7 @@ def test_generic_claim_signing_is_nonrelease_only_and_cannot_masquerade_as_recei
     [
         ('{"nonRelease":true,"nonRelease":true}', "duplicate object key"),
         ('{"nonRelease":true,"value":NaN}', "non-standard JSON constant"),
+        ('{"nonRelease":true,"value":1e999}', "non-finite JSON number"),
         ("[]", "nonRelease=true"),
     ],
 )
@@ -271,12 +387,23 @@ def test_low_level_parser_is_strict(tmp_path: Path, content: str, message: str) 
     assert not output.exists()
 
 
+def test_canonical_json_rejects_non_finite_values() -> None:
+    common = _load_module(COMMON, "release_evidence_common_canonical_json_test")
+    with pytest.raises(ValueError, match="Out of range float values"):
+        common.canonical_json({"value": float("inf")})
+
+
 def _observation_record(command_id: str, command: str, argv: list[str], when: datetime) -> dict[str, Any]:
     return {
         "commandId": command_id,
         "command": command,
         "argv": argv,
-        "executable": {"path": argv[0], "sha256": "4" * 64},
+        "executable": {
+            "path": argv[0],
+            "sha256": "4" * 64,
+            "purpose": "railway-cli",
+            "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+        },
         "exitCode": 0,
         "stdoutSha256": "1" * 64,
         "stderrSha256": "2" * 64,
@@ -288,8 +415,13 @@ def _observation_record(command_id: str, command: str, argv: list[str], when: da
 
 def _mock_railway_cli(signer: ModuleType, monkeypatch: pytest.MonkeyPatch, when: datetime, tmp_path: Path) -> str:
     railway_path = str((tmp_path / "railway.exe").resolve())
-    executable = {"path": railway_path, "sha256": "4" * 64}
-    monkeypatch.setattr(signer, "_resolved_executable", lambda _command: executable)
+    executable = {
+        "path": railway_path,
+        "sha256": "4" * 64,
+        "purpose": "railway-cli",
+        "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+    }
+    monkeypatch.setattr(signer, "_trusted_executable", lambda _purpose: executable)
 
     def command_result(**kwargs: Any):
         record = _observation_record(kwargs["command_id"], kwargs["command"], kwargs["argv"], when)
@@ -302,8 +434,8 @@ def _mock_railway_cli(signer: ModuleType, monkeypatch: pytest.MonkeyPatch, when:
 def _railway_status() -> dict[str, Any]:
     services = [
         {"id": UUIDS["postgres"], "name": "Postgres"},
-        {"id": UUIDS["ats"], "name": "fleet-worker"},
-        {"id": UUIDS["linkedin"], "name": "linkedin-worker"},
+        {"id": UUIDS["control_plane"], "name": "applypilot-control-plane"},
+        {"id": UUIDS["gateway"], "name": "applypilot-tailscale-gateway"},
     ]
     instances = [
         {
@@ -325,17 +457,26 @@ def _railway_status() -> dict[str, Any]:
     }
 
 
-def _railway_variables() -> dict[str, str]:
-    return {
+def _railway_variables(service: str) -> dict[str, str]:
+    identities = {
+        "postgres": (UUIDS["postgres"], "Postgres", None),
+        "control_plane": (UUIDS["control_plane"], "applypilot-control-plane", "control-plane"),
+        "gateway": (UUIDS["gateway"], "applypilot-tailscale-gateway", "gateway"),
+    }
+    service_id, service_name, role = identities[service]
+    variables = {
         "RAILWAY_PROJECT_ID": UUIDS["project"],
         "RAILWAY_PROJECT_NAME": "applypilot-staging",
         "RAILWAY_ENVIRONMENT_ID": UUIDS["environment"],
         "RAILWAY_ENVIRONMENT_NAME": "production",
-        "RAILWAY_SERVICE_ID": UUIDS["postgres"],
-        "RAILWAY_SERVICE_NAME": "Postgres",
-        "PGDATABASE": "applypilot_brain_staging",
-        "POSTGRES_DB": "applypilot_brain_staging",
+        "RAILWAY_SERVICE_ID": service_id,
+        "RAILWAY_SERVICE_NAME": service_name,
     }
+    if service == "postgres":
+        variables.update(PGDATABASE="applypilot_brain_staging", POSTGRES_DB="applypilot_brain_staging")
+    else:
+        variables["APPLYPILOT_SERVICE_ROLE"] = str(role)
+    return variables
 
 
 def test_railway_producer_captures_exact_commands_and_raw_output_hashes(
@@ -349,14 +490,20 @@ def test_railway_producer_captures_exact_commands_and_raw_output_hashes(
     monkeypatch.setenv("APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_ID", "railway-key-v2")
     when = datetime.now(timezone.utc)
     railway_path = _mock_railway_cli(signer, monkeypatch, when, tmp_path)
-    status = _railway_status()
-    variables = _railway_variables()
+    documents = [
+        _railway_status(),
+        _railway_variables("postgres"),
+        _railway_variables("control_plane"),
+        _railway_variables("gateway"),
+    ]
+    for document in documents[1:]:
+        document["TEST_SECRET_VALUE"] = "must-not-enter-receipt"
     calls = 0
 
     def observation(**kwargs: Any):
         nonlocal calls
         calls += 1
-        document = status if calls == 1 else variables
+        document = documents[calls - 1]
         raw = json.dumps(document).encode()
         record = _observation_record(kwargs["command_id"], kwargs["command"], kwargs["argv"], when)
         record["stdoutSha256"] = hashlib.sha256(raw).hexdigest()
@@ -371,23 +518,44 @@ def test_railway_producer_captures_exact_commands_and_raw_output_hashes(
         railway_project="applypilot-staging",
         railway_project_id=UUIDS["project"],
         railway_environment_id=UUIDS["environment"],
+        expected_railway_environment_name="production",
         postgres_service_id=UUIDS["postgres"],
-        ats_worker_service_id=UUIDS["ats"],
-        linkedin_worker_service_id=UUIDS["linkedin"],
+        control_plane_service_id=UUIDS["control_plane"],
+        control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"],
+        gateway_service_name="applypilot-tailscale-gateway",
         database_name="applypilot_brain_staging",
         output=output,
     )
     signer.produce_railway_evidence(args)
     receipt = json.loads(output.read_text(encoding="utf-8"))
-    assert calls == 2
+    assert "must-not-enter-receipt" not in output.read_text(encoding="utf-8")
+    assert calls == 4
     assert [record["commandId"] for record in receipt["commands"]] == [
         "railway-version",
         "railway-status",
         "railway-postgres-variables",
+        "railway-control-plane-variables",
+        "railway-gateway-variables",
     ]
     assert all(len(record["stdoutSha256"]) == 64 for record in receipt["commands"])
     assert receipt["railwayCli"]["version"] == "railway 5.23.0"
     assert receipt["railwayCli"]["executable"]["path"] == railway_path
+    assert receipt["releaseStage"] == "staging"
+    assert "releaseEnvironment" not in receipt
+    assert receipt["expectedRailwayEnvironmentName"] == "production"
+    assert receipt["observedRailwayEnvironmentName"] == "production"
+    assert receipt["executionBoundary"] == {
+        "browserExecutionLocation": "fleet-nodes-only",
+        "linkedinExecutionLocation": "owner-home-node-only",
+        "railwayBrowserWorkersPermitted": False,
+        "runtimeEnforcementProven": False,
+    }
+    assert receipt["serviceRoles"] == {"controlPlane": "control-plane", "gateway": "gateway"}
+    assert receipt["workerBrowserContractMarkersPresent"] == []
+    assert "runtime process tree" in receipt["topologyLimitation"]
+    assert "atsWorkerServiceId" not in receipt
+    assert "linkedinWorkerServiceId" not in receipt
 
 
 def test_railway_producer_rejects_missing_observed_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -410,9 +578,12 @@ def test_railway_producer_rejects_missing_observed_identity(tmp_path: Path, monk
         railway_project="applypilot-staging",
         railway_project_id=UUIDS["project"],
         railway_environment_id=UUIDS["environment"],
+        expected_railway_environment_name="production",
         postgres_service_id=UUIDS["postgres"],
-        ats_worker_service_id=UUIDS["ats"],
-        linkedin_worker_service_id=UUIDS["linkedin"],
+        control_plane_service_id=UUIDS["control_plane"],
+        control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"],
+        gateway_service_name="applypilot-tailscale-gateway",
         database_name="applypilot_brain_staging",
         output=tmp_path / "missing.json",
     )
@@ -445,7 +616,9 @@ def test_railway_identity_in_unrelated_diagnostics_does_not_satisfy_structure(
         release_id=RELEASE_ID, release_nonce=RELEASE_NONCE, working_directory=tmp_path,
         railway_project="applypilot-staging", railway_project_id=UUIDS["project"],
         railway_environment_id=UUIDS["environment"], postgres_service_id=UUIDS["postgres"],
-        ats_worker_service_id=UUIDS["ats"], linkedin_worker_service_id=UUIDS["linkedin"],
+        expected_railway_environment_name="production",
+        control_plane_service_id=UUIDS["control_plane"], control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"], gateway_service_name="applypilot-tailscale-gateway",
         database_name="applypilot_brain_staging", output=tmp_path / "diagnostic.json",
     )
     with pytest.raises(RuntimeError, match="project identity"):
@@ -458,38 +631,229 @@ def test_railway_structure_requires_linkedin_instance_and_canonical_database(tmp
     args = signer.argparse.Namespace(
         railway_project="applypilot-staging", railway_project_id=UUIDS["project"],
         railway_environment_id=UUIDS["environment"], postgres_service_id=UUIDS["postgres"],
-        ats_worker_service_id=UUIDS["ats"], linkedin_worker_service_id=UUIDS["linkedin"],
+        expected_railway_environment_name="production",
+        control_plane_service_id=UUIDS["control_plane"], control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"], gateway_service_name="applypilot-tailscale-gateway",
         database_name="applypilot_brain_clean_20260717_v2",
     )
     status = _railway_status()
     instances = status["environments"]["edges"][0]["node"]["serviceInstances"]["edges"]
     status["environments"]["edges"][0]["node"]["serviceInstances"]["edges"] = [
-        edge for edge in instances if edge["node"]["serviceId"] != UUIDS["linkedin"]
+        edge for edge in instances if edge["node"]["serviceId"] != UUIDS["gateway"]
     ]
-    with pytest.raises(RuntimeError, match="missing a required Postgres, ATS, or LinkedIn"):
+    with pytest.raises(RuntimeError, match="exactly the required"):
         signer._validate_railway_status(status, args)
 
+    unexpected = _railway_status()
+    unexpected["environments"]["edges"][0]["node"]["serviceInstances"]["edges"].append(
+        {
+            "node": {
+                "id": "unexpected-instance",
+                "environmentId": UUIDS["environment"],
+                "serviceId": "66666666-6666-4666-8666-666666666666",
+                "serviceName": "unexpected-worker",
+            }
+        }
+    )
+    with pytest.raises(RuntimeError, match="exactly the required"):
+        signer._validate_railway_status(unexpected, args)
+
+    wrong_name = _railway_status()
+    for edge in wrong_name["services"]["edges"]:
+        if edge["node"]["id"] == UUIDS["control_plane"]:
+            edge["node"]["name"] = "unexpected-control-plane"
+    for edge in wrong_name["environments"]["edges"][0]["node"]["serviceInstances"]["edges"]:
+        if edge["node"]["serviceId"] == UUIDS["control_plane"]:
+            edge["node"]["serviceName"] = "unexpected-control-plane"
+    with pytest.raises(RuntimeError, match="exact expected name"):
+        signer._validate_railway_status(wrong_name, args)
+
     observed = signer._validate_railway_status(_railway_status(), args)
-    variables = _railway_variables()
+    variables = _railway_variables("postgres")
     with pytest.raises(RuntimeError, match="PGDATABASE, POSTGRES_DB"):
-        signer._validate_railway_variables(variables, args, observed)
+        signer._validate_railway_service_variables(variables, args, observed, "postgres")
+
+
+@pytest.mark.parametrize(
+    ("field", "duplicate"),
+    [
+        ("control_plane_service_id", UUIDS["postgres"]),
+        ("gateway_service_id", UUIDS["postgres"]),
+        ("gateway_service_id", UUIDS["control_plane"]),
+    ],
+)
+def test_railway_producer_requires_pairwise_distinct_service_ids(
+    field: str, duplicate: str
+) -> None:
+    signer = _load_module(SIGNER, f"railway_distinct_service_ids_{field}_{duplicate[0]}")
+    args = signer.argparse.Namespace(
+        railway_project="applypilot-staging",
+        railway_project_id=UUIDS["project"],
+        railway_environment_id=UUIDS["environment"],
+        postgres_service_id=UUIDS["postgres"],
+        expected_railway_environment_name="production",
+        control_plane_service_id=UUIDS["control_plane"],
+        control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"],
+        gateway_service_name="applypilot-tailscale-gateway",
+        database_name="applypilot_brain_staging",
+    )
+    setattr(args, field, duplicate)
+
+    with pytest.raises(RuntimeError, match="service IDs must be pairwise distinct"):
+        signer._validate_railway_status(_railway_status(), args)
+
+
+@pytest.mark.parametrize(
+    ("service", "mutation", "message"),
+    [
+        ("control_plane", {"APPLYPILOT_SERVICE_ROLE": "worker"}, "service role"),
+        ("gateway", {"APPLYPILOT_WORKER_CONTRACT": "apply"}, "worker/browser contract marker"),
+        ("control_plane", {"PLAYWRIGHT_BROWSERS_PATH": "/browsers"}, "worker/browser contract marker"),
+        ("postgres", {"APPLYPILOT_WORKER_ID": "railway-worker"}, "worker/browser contract marker"),
+    ],
+)
+def test_railway_control_services_require_exact_roles_and_reject_browser_worker_markers(
+    service: str, mutation: dict[str, str], message: str
+) -> None:
+    signer = _load_module(SIGNER, f"railway_role_marker_{service}_{next(iter(mutation))}")
+    args = signer.argparse.Namespace(
+        railway_project="applypilot-staging",
+        railway_project_id=UUIDS["project"],
+        railway_environment_id=UUIDS["environment"],
+        expected_railway_environment_name="production",
+        postgres_service_id=UUIDS["postgres"],
+        control_plane_service_id=UUIDS["control_plane"],
+        control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"],
+        gateway_service_name="applypilot-tailscale-gateway",
+        database_name="applypilot_brain_staging",
+    )
+    observed = signer._validate_railway_status(_railway_status(), args)
+    variables = _railway_variables(service)
+    variables.update(mutation)
+    with pytest.raises(RuntimeError, match=message):
+        signer._validate_railway_service_variables(variables, args, observed, service)
+
+
+def test_railway_environment_name_must_exactly_match_explicit_staging_policy() -> None:
+    signer = _load_module(SIGNER, "railway_environment_name_policy_test")
+    args = signer.argparse.Namespace(
+        railway_project="applypilot-staging",
+        railway_project_id=UUIDS["project"],
+        railway_environment_id=UUIDS["environment"],
+        expected_railway_environment_name="staging",
+        postgres_service_id=UUIDS["postgres"],
+        control_plane_service_id=UUIDS["control_plane"],
+        control_plane_service_name="applypilot-control-plane",
+        gateway_service_id=UUIDS["gateway"],
+        gateway_service_name="applypilot-tailscale-gateway",
+        database_name="applypilot_brain_staging",
+    )
+    with pytest.raises(RuntimeError, match="environment name"):
+        signer._validate_railway_status(_railway_status(), args)
+
+
+def test_observation_environment_strips_release_and_signing_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer = _load_module(SIGNER, "observation_environment_secret_test")
+    markers = {
+        "APPLYPILOT_RELEASE_SECRET_MARKER": "release-secret",
+        "APPLYPILOT_RUNTIME_TEST_ATTESTATION_KEY_B64": "signing-secret",
+        "RAILWAY_TOKEN": "railway-secret",
+        "GITHUB_TOKEN": "verification-secret",
+        "ROLLBACK_DATABASE_URL": "rollback-secret",
+    }
+    for name, value in markers.items():
+        monkeypatch.setenv(name, value)
+    child, _hashes = signer._observation_environment()
+    assert not set(markers).intersection(child)
+    assert set(child).issubset(
+        set(signer.TEST_ENVIRONMENT_POLICY["inheritedAllowlist"])
+        | set(signer.TEST_ENVIRONMENT_POLICY["fixed"])
+    )
+
+
+def test_trusted_executable_hash_mismatch_fails_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer = _load_module(SIGNER, "trusted_executable_preflight_test")
+    monkeypatch.setenv("APPLYPILOT_RUNTIME_TEST_PYTHON_PATH", str(Path(sys.executable).resolve()))
+    monkeypatch.setenv("APPLYPILOT_RUNTIME_TEST_PYTHON_SHA256", "0" * 64)
+    called = False
+
+    def unexpected_run(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("subprocess must not run for an unapproved executable")
+
+    monkeypatch.setattr(signer.subprocess, "run", unexpected_run)
+    with pytest.raises(RuntimeError, match="approved SHA-256"):
+        signer._trusted_executable("runtime-python")
+    assert called is False
 
 
 def test_atomic_publication_never_exposes_partial_final_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     common = _load_module(COMMON, "release_evidence_common_atomic_test")
     target = tmp_path / "receipt.json"
-    original_link = common.os.link
     observed_before_link: list[bool] = []
+    if os.name == "nt":
+        original_windows_link = common._windows_link_relative
 
-    def inspect_then_link(source: Path, destination: Path) -> None:
-        observed_before_link.append(destination.exists())
-        original_link(source, destination)
+        def inspect_then_windows_link(descriptor: int, parent: int, destination: str) -> None:
+            observed_before_link.append(target.exists())
+            original_windows_link(descriptor, parent, destination)
 
-    monkeypatch.setattr(common.os, "link", inspect_then_link)
+        monkeypatch.setattr(common, "_windows_link_relative", inspect_then_windows_link)
+    else:
+        original_link = common.os.link
+
+        def inspect_then_link(source: str, destination: str, **kwargs: Any) -> None:
+            observed_before_link.append(target.exists())
+            original_link(source, destination, **kwargs)
+
+        monkeypatch.setattr(common.os, "link", inspect_then_link)
     common.atomic_write_no_overwrite(target, b"complete")
     assert observed_before_link == [False]
     assert target.read_bytes() == b"complete"
     assert not list(tmp_path.glob(".*.tmp-*"))
+
+
+def test_publication_rejects_windows_reparse_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    common = _load_module(COMMON, "release_evidence_common_reparse_test")
+    target = tmp_path / "receipt.json"
+    monkeypatch.setattr(common, "_windows_path_has_reparse_component", lambda _path: True)
+    monkeypatch.setattr(common, "_is_windows", lambda: True)
+    with pytest.raises(RuntimeError, match="reparse point"):
+        common.atomic_write_no_overwrite(target, b"evidence")
+    assert not target.exists()
+
+
+def test_publication_rejects_real_symlink_or_reparse_parent(tmp_path: Path) -> None:
+    common = _load_module(COMMON, "release_evidence_common_real_reparse_test")
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(real_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink/reparse creation is unavailable on this host")
+    with pytest.raises(RuntimeError, match="symlink|reparse point|junction"):
+        common.atomic_write_no_overwrite(alias / "receipt.json", b"evidence")
+    assert not (real_parent / "receipt.json").exists()
+
+
+def test_publication_fails_closed_without_a_supported_secure_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    common = _load_module(COMMON, "release_evidence_common_unsupported_backend_test")
+    monkeypatch.setattr(common, "_is_windows", lambda: False)
+    monkeypatch.setattr(common.os, "name", "unsupported")
+    with pytest.raises(RuntimeError, match="descriptor-relative release-evidence publication"):
+        common.atomic_write_no_overwrite(tmp_path / "receipt.json", b"evidence")
 
 
 def test_atomic_publication_cleans_temp_on_fsync_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

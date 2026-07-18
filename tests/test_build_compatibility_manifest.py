@@ -6,13 +6,16 @@ import hmac
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -65,7 +68,8 @@ TEST_ENVIRONMENT_POLICY = {
         "USERPROFILE", "WINDIR",
     ),
     "fixed": {
-        "GIT_CONFIG_GLOBAL": "<OS_DEVNULL>", "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_GLOBAL": "<OS_DEVNULL>", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
         "NPM_CONFIG_AUDIT": "false", "NPM_CONFIG_FUND": "false",
         "NPM_CONFIG_USERCONFIG": "<OS_DEVNULL>",
         "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1",
@@ -83,8 +87,8 @@ UUIDS = {
     "project": "11111111-1111-4111-8111-111111111111",
     "environment": "22222222-2222-4222-8222-222222222222",
     "postgres": "33333333-3333-4333-8333-333333333333",
-    "ats": "44444444-4444-4444-8444-444444444444",
-    "linkedin": "55555555-5555-4555-8555-555555555555",
+    "control_plane": "44444444-4444-4444-8444-444444444444",
+    "gateway": "55555555-5555-4555-8555-555555555555",
 }
 ARTIFACT_ROLES = (
     "artifact_manifest",
@@ -238,11 +242,21 @@ def _timestamp(value: datetime) -> str:
 
 
 def _command_record(command_id: str, command: str, argv: list[str], when: datetime) -> dict[str, Any]:
-    return {
+    purpose = "railway-cli"
+    if command_id in {"pytest", "ruff"}:
+        purpose = "runtime-python"
+    elif command_id in {"typecheck", "tests"}:
+        purpose = "brain-node"
+    record = {
         "commandId": command_id,
         "command": command,
         "argv": argv,
-        "executable": {"path": argv[0], "sha256": "5" * 64},
+        "executable": {
+            "path": argv[0],
+            "sha256": "5" * 64,
+            "purpose": purpose,
+            "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+        },
         "exitCode": 0,
         "stdoutSha256": "6" * 64,
         "stderrSha256": "7" * 64,
@@ -250,6 +264,17 @@ def _command_record(command_id: str, command: str, argv: list[str], when: dateti
         "startedAt": _timestamp(when),
         "completedAt": _timestamp(when + timedelta(seconds=1)),
     }
+    if command_id in {"typecheck", "tests"}:
+        record["dependencies"] = {
+            "npmCli": {
+                "path": argv[1],
+                "sha256": "9" * 64,
+                "purpose": "brain-npm-cli",
+                "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+            }
+        }
+        record["executionEnvironment"] = {"PATH": str(Path(argv[0]).parent)}
+    return record
 
 
 def _build_fixture(tmp_path: Path) -> Fixture:
@@ -314,7 +339,7 @@ def _build_fixture(tmp_path: Path) -> Fixture:
     _write_signed_receipt(
         topology_receipt,
         {
-            "schemaVersion": "applypilot_railway_topology_receipt_v2",
+            "schemaVersion": "applypilot_railway_topology_receipt_v4",
             "receiptPurpose": "railway-topology",
             "producer": TRUSTED_PRODUCER,
             "producerVersion": PRODUCER_VERSION,
@@ -324,9 +349,15 @@ def _build_fixture(tmp_path: Path) -> Fixture:
             "railwayProject": "applypilot-staging",
             "railwayProjectId": UUIDS["project"],
             "railwayEnvironmentId": UUIDS["environment"],
+            "expectedRailwayEnvironmentName": "production",
+            "observedRailwayEnvironmentName": "production",
             "postgresServiceId": UUIDS["postgres"],
-            "atsWorkerServiceId": UUIDS["ats"],
-            "linkedinWorkerServiceId": UUIDS["linkedin"],
+            "controlPlaneServiceId": UUIDS["control_plane"],
+            "controlPlaneServiceName": "applypilot-control-plane",
+            "gatewayServiceId": UUIDS["gateway"],
+            "gatewayServiceName": "applypilot-tailscale-gateway",
+            "serviceRoles": {"controlPlane": "control-plane", "gateway": "gateway"},
+            "workerBrowserContractMarkersPresent": [],
             "databaseName": "applypilot_brain_staging",
             "commands": [
                 _command_record(
@@ -342,14 +373,41 @@ def _build_fixture(tmp_path: Path) -> Fixture:
                     [railway_path, "variables", "--service", UUIDS["postgres"], "--json"],
                     receipt_time + timedelta(seconds=4),
                 ),
+                _command_record(
+                    "railway-control-plane-variables",
+                    f"railway variables --service {UUIDS['control_plane']} --json",
+                    [railway_path, "variables", "--service", UUIDS["control_plane"], "--json"],
+                    receipt_time + timedelta(seconds=6),
+                ),
+                _command_record(
+                    "railway-gateway-variables",
+                    f"railway variables --service {UUIDS['gateway']} --json",
+                    [railway_path, "variables", "--service", UUIDS["gateway"], "--json"],
+                    receipt_time + timedelta(seconds=8),
+                ),
             ],
             "railwayCli": {
                 "version": "railway 5.23.0",
-                "executable": {"path": railway_path, "sha256": "5" * 64},
+                "executable": {
+                    "path": railway_path,
+                    "sha256": "5" * 64,
+                    "purpose": "railway-cli",
+                    "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+                },
                 "statusSchema": "railway-cli-5-project-status-v1",
                 "variablesSchema": "railway-cli-5-flat-service-variables-v1",
             },
-            "environment": "staging",
+            "releaseStage": "staging",
+            "executionBoundary": {
+                "browserExecutionLocation": "fleet-nodes-only",
+                "linkedinExecutionLocation": "owner-home-node-only",
+                "railwayBrowserWorkersPermitted": False,
+                "runtimeEnforcementProven": False,
+            },
+            "topologyLimitation": (
+                "Railway CLI status and variables prove configured service identity and role markers, "
+                "not the runtime process tree or fleet-node routing enforcement."
+            ),
             "capturedAt": _timestamp(receipt_time),
             "expiresAt": _timestamp(receipt_time + timedelta(minutes=30)),
         },
@@ -423,12 +481,18 @@ def _build_fixture(tmp_path: Path) -> Fixture:
         UUIDS["project"],
         "--railway-environment-id",
         UUIDS["environment"],
+        "--expected-railway-environment-name",
+        "production",
         "--postgres-service-id",
         UUIDS["postgres"],
-        "--ats-worker-service-id",
-        UUIDS["ats"],
-        "--linkedin-worker-service-id",
-        UUIDS["linkedin"],
+        "--control-plane-service-id",
+        UUIDS["control_plane"],
+        "--control-plane-service-name",
+        "applypilot-control-plane",
+        "--gateway-service-id",
+        UUIDS["gateway"],
+        "--gateway-service-name",
+        "applypilot-tailscale-gateway",
         "--output",
         str(output),
     ]
@@ -459,7 +523,12 @@ def _run(
     check: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process_env = {**os.environ, **ATTESTATION_ENV, **(env or {})}
+    git = Path(shutil.which("git") or "").resolve()
+    tool_env = {
+        "APPLYPILOT_RELEASE_GIT_PATH": str(git),
+        "APPLYPILOT_RELEASE_GIT_SHA256": hashlib.sha256(git.read_bytes()).hexdigest(),
+    }
+    process_env = {**os.environ, **ATTESTATION_ENV, **tool_env, **(env or {})}
     return subprocess.run(command, check=check, capture_output=True, text=True, env=process_env)
 
 
@@ -471,10 +540,15 @@ def _test_receipt(commit: str, tree: str, suite: str) -> dict[str, Any]:
         if policy["purpose"] == "runtime-tests":
             argv = [str(Path(sys.executable).resolve()), *arguments]
         else:
-            argv = [str((Path.cwd() / "npm.cmd").resolve()), *arguments[1:]]
+            argv = [
+                str((Path.cwd() / "node.exe").resolve()),
+                str((Path.cwd() / "npm-cli.js").resolve()),
+                *arguments[1:],
+            ]
         commands.append(_command_record(command_id, command, argv, when + timedelta(seconds=index * 2)))
+    git = Path(shutil.which("git") or "").resolve()
     return {
-        "schemaVersion": "applypilot_test_receipt_v2",
+        "schemaVersion": "applypilot_test_receipt_v4",
         "receiptPurpose": policy["purpose"],
         "producer": TRUSTED_PRODUCER,
         "producerVersion": PRODUCER_VERSION,
@@ -487,6 +561,15 @@ def _test_receipt(commit: str, tree: str, suite: str) -> dict[str, Any]:
         "status": "passed",
         "sourceCommitSha": commit,
         "sourceTreeSha": tree,
+        "sourceControl": {
+            "system": "git",
+            "executable": {
+                "path": str(git),
+                "sha256": hashlib.sha256(git.read_bytes()).hexdigest(),
+                "purpose": "release-git",
+                "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+            },
+        },
         "commands": commands,
         "environment": {
             "platform": "test-platform",
@@ -516,7 +599,7 @@ def test_manifest_generator_emits_only_current_allowlisted_evidence(release_fixt
     manifest = json.loads(output.read_text(encoding="utf-8"))
 
     assert json.loads(result.stdout)["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
-    assert manifest["schemaVersion"] == "applypilot_compatibility_manifest_v3"
+    assert manifest["schemaVersion"] == "applypilot_compatibility_manifest_v4"
     generated_at = datetime.fromisoformat(manifest["generatedAt"].replace("Z", "+00:00"))
     assert before <= generated_at <= after
     assert manifest["releaseNonce"] == RELEASE_NONCE
@@ -529,8 +612,24 @@ def test_manifest_generator_emits_only_current_allowlisted_evidence(release_fixt
     assert "postgresParity" not in manifest
     assert "authorityPromotionReceipt" not in manifest
     assert "imageDigest" not in manifest["deployment"]
-    assert manifest["deployment"]["atsWorkerServiceId"] == UUIDS["ats"]
-    assert manifest["deployment"]["linkedinWorkerServiceId"] == UUIDS["linkedin"]
+    assert manifest["deployment"]["controlPlaneServiceId"] == UUIDS["control_plane"]
+    assert manifest["deployment"]["gatewayServiceId"] == UUIDS["gateway"]
+    assert manifest["deployment"]["releaseStage"] == "staging"
+    assert "releaseEnvironment" not in manifest["deployment"]
+    assert manifest["deployment"]["expectedRailwayEnvironmentName"] == "production"
+    assert manifest["deployment"]["observedRailwayEnvironmentName"] == "production"
+    assert manifest["deployment"]["executionBoundary"]["browserExecutionLocation"] == "fleet-nodes-only"
+    assert manifest["deployment"]["executionBoundary"]["linkedinExecutionLocation"] == "owner-home-node-only"
+    assert manifest["deployment"]["executionBoundary"]["railwayBrowserWorkersPermitted"] is False
+    assert manifest["deployment"]["executionBoundary"]["runtimeEnforcementProven"] is False
+    assert manifest["deployment"]["serviceRoles"] == {
+        "controlPlane": "control-plane",
+        "gateway": "gateway",
+    }
+    assert manifest["deployment"]["workerBrowserContractMarkersPresent"] == []
+    assert "runtime process tree" in manifest["deployment"]["topologyLimitations"][0]
+    assert "atsWorkerServiceId" not in json.dumps(manifest)
+    assert "linkedinWorkerServiceId" not in json.dumps(manifest)
     assert manifest["deployment"]["topologyReceipt"]["authentication"] == {
         "algorithm": "HMAC-SHA256",
         "keyId": TOPOLOGY_KEY_ID,
@@ -547,6 +646,9 @@ def test_manifest_generator_emits_only_current_allowlisted_evidence(release_fixt
     assert "signature" not in json.dumps(manifest)
     assert all(value not in json.dumps(manifest) for key, value in ATTESTATION_ENV.items() if key.endswith("_KEY_B64"))
     assert len(manifest["artifacts"]["files"]) == len(ARTIFACT_ROLES)
+    assert manifest["security"]["nonceUniquenessVerified"] is False
+    assert manifest["security"]["nonceReplayDefense"] == "external-durable-registry-required"
+    assert manifest["verification"]["gitExecutable"]["purpose"] == "release-git"
 
 
 def test_schema_bundle_uses_independent_framed_path_and_content_hash(release_fixture: Fixture) -> None:
@@ -671,6 +773,36 @@ def test_strict_receipts_bind_suite_commands_environment_commit_and_tree(release
         assert message in result.stderr
 
 
+@pytest.mark.parametrize("attack", ["node", "npm_cli", "argv", "path"])
+def test_brain_receipt_binds_pinned_node_npm_payload_and_execution_path(
+    release_fixture: Fixture, attack: str
+) -> None:
+    fixture = release_fixture
+    receipt = _test_receipt(fixture.brain_head, fixture.brain_tree, BRAIN_SUITE)
+    command = receipt["commands"][0]
+    if attack == "node":
+        command["executable"]["path"] = str((fixture.root / "ambient-node.exe").resolve())
+    elif attack == "npm_cli":
+        command["dependencies"]["npmCli"]["path"] = str((fixture.root / "ambient-npm-cli.js").resolve())
+    elif attack == "argv":
+        command["argv"][1] = str((fixture.root / "ambient-npm-cli.js").resolve())
+    else:
+        command["executionEnvironment"]["PATH"] = str((fixture.root / "poisoned-path").resolve())
+    path = fixture.root / f"brain-dependency-{attack}.json"
+    _write_signed_receipt(path, receipt)
+
+    result = _run(
+        fixture.command_for(
+            output=f"brain-dependency-{attack}-output.json",
+            extra=["--brain-test-receipt", str(path)],
+        )
+    )
+
+    assert result.returncode != 0
+    assert "approved command set" in result.stderr
+    assert not (fixture.root / f"brain-dependency-{attack}-output.json").exists()
+
+
 @pytest.mark.parametrize(("command", "argv"), [("echo passed", ["echo", "passed"]), ("python --version", [sys.executable, "--version"])])
 def test_successful_but_unapproved_commands_cannot_satisfy_release_suite(
     release_fixture: Fixture, command: str, argv: list[str]
@@ -766,7 +898,7 @@ def test_receipt_purpose_keys_must_be_cryptographically_distinct(release_fixture
 
 def test_manifest_strict_json_rejects_duplicate_keys_and_nonstandard_constants(release_fixture: Fixture) -> None:
     duplicate = release_fixture.root / "duplicate-template.json"
-    duplicate.write_text('{"schemaVersion":"applypilot_compatibility_manifest_v3","schemaVersion":"x"}', encoding="utf-8")
+    duplicate.write_text('{"schemaVersion":"applypilot_compatibility_manifest_v4","schemaVersion":"x"}', encoding="utf-8")
     duplicate_result = _run(
         release_fixture.command_for(output="duplicate-output.json", template=duplicate)
     )
@@ -774,10 +906,18 @@ def test_manifest_strict_json_rejects_duplicate_keys_and_nonstandard_constants(r
     assert "duplicate object key" in duplicate_result.stderr
 
     nonstandard = release_fixture.root / "nan-template.json"
-    nonstandard.write_text('{"schemaVersion":"applypilot_compatibility_manifest_v3","value":NaN}', encoding="utf-8")
+    nonstandard.write_text('{"schemaVersion":"applypilot_compatibility_manifest_v4","value":NaN}', encoding="utf-8")
     nan_result = _run(release_fixture.command_for(output="nan-output.json", template=nonstandard))
     assert nan_result.returncode != 0
     assert "non-standard JSON constant" in nan_result.stderr
+
+    overflow = release_fixture.root / "overflow-template.json"
+    overflow.write_text(
+        '{"schemaVersion":"applypilot_compatibility_manifest_v4","value":1e999}', encoding="utf-8"
+    )
+    overflow_result = _run(release_fixture.command_for(output="overflow-output.json", template=overflow))
+    assert overflow_result.returncode != 0
+    assert "non-finite JSON number" in overflow_result.stderr
 
 
 @pytest.mark.parametrize(
@@ -786,8 +926,9 @@ def test_manifest_strict_json_rejects_duplicate_keys_and_nonstandard_constants(r
         ("producer", "forged-producer", "producer"),
         ("status", "pending", "status"),
         ("commands", [], "observation commands"),
-        ("environment", "production", "environment"),
-        ("postgresServiceId", UUIDS["ats"], "deployment identity"),
+        ("releaseStage", "production", "environment"),
+        ("observedRailwayEnvironmentName", "staging", "environment"),
+        ("postgresServiceId", UUIDS["control_plane"], "deployment identity"),
         ("expiresAt", "2000-01-01T00:00:00Z", "stale"),
     ],
 )
@@ -828,6 +969,55 @@ def test_topology_receipt_tampering_and_missing_key_fail_closed(release_fixture:
     result = _run(fixture.command_for(output="short-key.json"), env=short_key_env)
     assert result.returncode != 0
     assert "at least 32 bytes" in result.stderr
+
+
+def test_git_observations_receive_sanitized_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    markers = {
+        "APPLYPILOT_RELEASE_SECRET_MARKER": "release-secret",
+        "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION_KEY_B64": "signing-secret",
+        "RAILWAY_TOKEN": "railway-secret",
+        "GITHUB_TOKEN": "verification-secret",
+        "ROLLBACK_DATABASE_URL": "rollback-secret",
+    }
+    for name, value in markers.items():
+        monkeypatch.setenv(name, value)
+    executable = {
+        "path": str((tmp_path / "git.exe").resolve()),
+        "sha256": "5" * 64,
+        "purpose": "release-git",
+        "trustPolicy": "protected-handle-pre-post-exact-path-sha256-v2",
+    }
+    monkeypatch.setattr(module, "_trusted_executable", lambda _purpose: executable)
+
+    @contextmanager
+    def protected(_executable: dict[str, str]):
+        yield {"path": executable["path"], "passFds": ()}
+
+    monkeypatch.setattr(module, "_protected_executable_execution", protected)
+
+    def observe(*_args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        child = kwargs["env"]
+        assert not set(markers).intersection(child)
+        return subprocess.CompletedProcess(kwargs.get("args", _args[0]), 0, stdout="observed\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", observe)
+    assert module._git(tmp_path, "rev-parse", "HEAD") == "observed"
+
+
+def test_git_replace_refs_cannot_substitute_release_objects(release_fixture: Fixture) -> None:
+    fixture = release_fixture
+    original_tree = _git(fixture.runtime, "rev-parse", f"{fixture.runtime_head}^{{tree}}")
+    _git(fixture.runtime, "replace", fixture.runtime_head, "rollback")
+
+    output = fixture.root / "replace-ref.json"
+    _run(fixture.command_for(output=output.name), check=True)
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+
+    assert manifest["repositories"]["python"]["sourceCommitSha"] == fixture.runtime_head
+    assert manifest["repositories"]["python"]["sourceTreeSha"] == original_tree
 
 
 def test_declared_release_branches_must_equal_selected_commit_heads(release_fixture: Fixture) -> None:
@@ -890,6 +1080,23 @@ def test_sqlite_evidence_is_derived_directly_and_non_sqlite_is_rejected(
     result = _run(command)
     assert result.returncode != 0
     assert "not a valid SQLite database" in result.stderr
+
+
+def test_canonical_sqlite_symlink_is_rejected_before_resolution(release_fixture: Fixture) -> None:
+    fixture = release_fixture
+    alias = fixture.source / "brain-alias.db"
+    try:
+        alias.symlink_to(fixture.sqlite)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    command = fixture.command_for(output="sqlite-symlink-output.json")
+    command[command.index("--sqlite-source") + 1] = str(alias)
+
+    result = _run(command)
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr or "reparse" in result.stderr
+    assert not (fixture.root / "sqlite-symlink-output.json").exists()
 
 
 def test_sqlite_live_wal_sidecars_are_rejected_before_immutable_read_omits_committed_data(
@@ -1071,7 +1278,7 @@ def test_partial_evidence_pair_fails_closed_and_complete_pair_is_immutable(relea
     sidecar.unlink()
     partial = _run(command)
     assert partial.returncode != 0
-    assert "incomplete immutable release evidence" in partial.stderr
+    assert "refusing to overwrite release evidence" in partial.stderr
     assert hashlib.sha256(output.read_bytes()).hexdigest() == result["sha256"]
 
 
@@ -1094,12 +1301,50 @@ def test_deployment_identity_rejects_empty_or_invalid_values(
     assert "deployment identity" in result.stderr
 
 
-def test_ats_and_linkedin_services_must_be_distinct(release_fixture: Fixture) -> None:
-    command = release_fixture.command_for(output="same-workers.json")
-    command[command.index("--linkedin-worker-service-id") + 1] = UUIDS["ats"]
+@pytest.mark.parametrize(
+    ("argument", "duplicate"),
+    [
+        ("--control-plane-service-id", UUIDS["postgres"]),
+        ("--gateway-service-id", UUIDS["postgres"]),
+        ("--gateway-service-id", UUIDS["control_plane"]),
+    ],
+)
+def test_railway_service_ids_must_be_pairwise_distinct(
+    release_fixture: Fixture, argument: str, duplicate: str
+) -> None:
+    command = release_fixture.command_for(output=f"duplicate-service-{argument[2:]}.json")
+    command[command.index(argument) + 1] = duplicate
     result = _run(command)
     assert result.returncode != 0
-    assert "ATS and LinkedIn worker service IDs must differ" in result.stderr
+    assert "service IDs must be pairwise distinct" in result.stderr
+
+
+def test_expired_topology_receipt_publishes_no_manifest_or_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    output = tmp_path / "expired-at-publication.json"
+    expires = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    manifest = {"deployment": {"topologyReceipt": {"expiresAt": _timestamp(expires)}}}
+
+    class Parser:
+        @staticmethod
+        def parse_args() -> SimpleNamespace:
+            return SimpleNamespace(output=output)
+
+    monkeypatch.setattr(module, "_parser", lambda: Parser())
+    monkeypatch.setattr(module, "build_manifest", lambda _args: manifest)
+    monkeypatch.setattr(
+        module,
+        "_utc_now",
+        lambda: expires + timedelta(milliseconds=1),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="expired before final publication"):
+        module.main()
+    assert not output.exists()
+    assert not output.with_name(output.name + ".sha256").exists()
 
 
 def _load_module():

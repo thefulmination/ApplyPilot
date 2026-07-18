@@ -26,6 +26,7 @@ if str(_SCRIPT_DIRECTORY) not in sys.path:
 
 from release_evidence_common import (  # noqa: E402
     ALGORITHM,
+    EXECUTABLE_TRUST_POLICY,
     PRODUCER,
     PRODUCER_VERSION,
     TEST_ENVIRONMENT_POLICY,
@@ -33,8 +34,13 @@ from release_evidence_common import (  # noqa: E402
     assert_separated_keys,
     atomic_write_no_overwrite,
     canonical_json,
+    observation_environment,
+    protected_executable_execution,
     purpose_key,
+    regular_file,
+    remove_published_file,
     strict_json_loads,
+    trusted_executable,
     validate_release_binding,
     verify_receipt,
 )
@@ -75,7 +81,17 @@ _TEST_SUITES = {
 _MAX_TEST_RECEIPT_AGE = timedelta(hours=24)
 _MAX_TOPOLOGY_RECEIPT_LIFETIME = timedelta(hours=1)
 _MAX_CLOCK_SKEW = timedelta(minutes=2)
-_TOPOLOGY_ENVIRONMENT = "staging"
+_RELEASE_STAGE = "staging"
+_EXECUTION_BOUNDARY = {
+    "browserExecutionLocation": "fleet-nodes-only",
+    "linkedinExecutionLocation": "owner-home-node-only",
+    "railwayBrowserWorkersPermitted": False,
+    "runtimeEnforcementProven": False,
+}
+_TOPOLOGY_LIMITATION = (
+    "Railway CLI status and variables prove configured service identity and role markers, "
+    "not the runtime process tree or fleet-node routing enforcement."
+)
 _ROLLBACK_ROLES = {
     "rollback-only",
     "reference-only",
@@ -107,6 +123,13 @@ _CANDIDATE_KEYS = {
     "pairwiseSnapshot",
     "outcomeSnapshot",
 }
+_trusted_executable = trusted_executable
+_observation_environment = observation_environment
+_protected_executable_execution = protected_executable_execution
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _read_bytes(path: Path) -> bytes:
@@ -155,21 +178,41 @@ def _stable_file_record(path: Path) -> tuple[int, str]:
 
 
 def _git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *arguments],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    git = _trusted_executable("release-git")
+    environment, _hashes = _observation_environment()
+    with _protected_executable_execution(git) as boundary:
+        options: dict[str, Any] = {}
+        if boundary["passFds"]:
+            options["pass_fds"] = boundary["passFds"]
+        result = subprocess.run(
+            [boundary["path"], "-C", str(repo), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            **options,
+        )
+    if _trusted_executable("release-git") != git:
+        raise RuntimeError("approved Git executable identity changed after observation")
     return result.stdout.strip()
 
 
 def _git_bytes(repo: Path, commit: str, relative_path: str) -> bytes:
-    result = subprocess.run(
-        ["git", "-C", str(repo), "show", f"{commit}:{relative_path}"],
-        check=True,
-        capture_output=True,
-    )
+    git = _trusted_executable("release-git")
+    environment, _hashes = _observation_environment()
+    with _protected_executable_execution(git) as boundary:
+        options: dict[str, Any] = {}
+        if boundary["passFds"]:
+            options["pass_fds"] = boundary["passFds"]
+        result = subprocess.run(
+            [boundary["path"], "-C", str(repo), "show", f"{commit}:{relative_path}"],
+            check=True,
+            capture_output=True,
+            env=environment,
+            **options,
+        )
+    if _trusted_executable("release-git") != git:
+        raise RuntimeError("approved Git executable identity changed after observation")
     return result.stdout
 
 
@@ -372,9 +415,14 @@ def _verify_sqlite_source(
     source_value = source_override if source_override is not None else source.get("path")
     if not isinstance(source_value, (str, Path)) or not str(source_value).strip():
         raise RuntimeError("canonical SQLite source path is missing")
-    path = Path(source_value).resolve()
-    if not path.is_file() or path.is_symlink():
-        raise RuntimeError(f"canonical SQLite source is missing or is a symlink: {path}")
+    unresolved_path = Path(os.path.abspath(source_value))
+    try:
+        path = regular_file(unresolved_path, "canonical SQLite source")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"canonical SQLite source is missing, is a symlink, or contains a reparse point: "
+            f"{unresolved_path}"
+        ) from exc
     sidecars = [Path(f"{path}{suffix}") for suffix in ("-wal", "-shm")]
     if any(sidecar.exists() or sidecar.is_symlink() for sidecar in sidecars):
         raise RuntimeError("canonical SQLite source has live WAL/SHM sidecars; close and checkpoint it first")
@@ -504,11 +552,20 @@ def _validated_rollback(repo: Path, value: Any, source_commit: str) -> dict[str,
         raise RuntimeError("repository rollback branch or commit does not resolve") from exc
     if resolved_commit != commit_sha:
         raise RuntimeError("repository rollback commit is not an exact full Git commit identity")
-    reachability = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", commit_sha, branch_commit],
-        capture_output=True,
-        text=True,
-    )
+    git = _trusted_executable("release-git")
+    with _protected_executable_execution(git) as boundary:
+        options: dict[str, Any] = {}
+        if boundary["passFds"]:
+            options["pass_fds"] = boundary["passFds"]
+        reachability = subprocess.run(
+            [boundary["path"], "-C", str(repo), "merge-base", "--is-ancestor", commit_sha, branch_commit],
+            capture_output=True,
+            text=True,
+            env=_observation_environment()[0],
+            **options,
+        )
+    if _trusted_executable("release-git") != git:
+        raise RuntimeError("approved Git executable identity changed after observation")
     if reachability.returncode != 0:
         raise RuntimeError("repository rollback commit is not reachable from its declared branch")
     return {"branch": branch, "commitSha": commit_sha, "role": role}
@@ -603,6 +660,7 @@ def _test_receipt(
         "status",
         "sourceCommitSha",
         "sourceTreeSha",
+        "sourceControl",
         "commands",
         "environment",
         "startedAt",
@@ -611,7 +669,7 @@ def _test_receipt(
     }
     if not isinstance(receipt, dict) or set(receipt) != required:
         raise RuntimeError("test receipt schema is incomplete or contains unknown claims")
-    if receipt.get("schemaVersion") != "applypilot_test_receipt_v2":
+    if receipt.get("schemaVersion") != "applypilot_test_receipt_v4":
         raise RuntimeError("test receipt schema version is unsupported")
     policy = _TEST_SUITES[repository_kind]
     if receipt.get("producer") != PRODUCER or receipt.get("producerVersion") != PRODUCER_VERSION:
@@ -634,6 +692,7 @@ def _test_receipt(
         raise RuntimeError("test receipt does not prove the selected source commit and tree passed")
     commands = receipt.get("commands")
     environment = receipt.get("environment")
+    source_control = receipt.get("sourceControl")
     if (
         not isinstance(environment, dict)
         or set(environment)
@@ -659,6 +718,20 @@ def _test_receipt(
         or any(not _sha256_value(value) for value in inherited_hashes.values())
     ):
         raise RuntimeError("test receipt inherited environment evidence is invalid")
+    source_control_executable = source_control.get("executable") if isinstance(source_control, dict) else None
+    if (
+        not isinstance(source_control, dict)
+        or set(source_control) != {"system", "executable"}
+        or source_control.get("system") != "git"
+        or not isinstance(source_control_executable, dict)
+        or set(source_control_executable) != {"path", "sha256", "purpose", "trustPolicy"}
+        or not _nonempty_string(source_control_executable.get("path"))
+        or not Path(source_control_executable["path"]).is_absolute()
+        or not _sha256_value(source_control_executable.get("sha256"))
+        or source_control_executable.get("purpose") != "release-git"
+        or source_control_executable.get("trustPolicy") != EXECUTABLE_TRUST_POLICY
+    ):
+        raise RuntimeError("test receipt source-control executable identity is invalid")
     if not isinstance(commands, list) or len(commands) != len(policy["commands"]):
         raise RuntimeError("test receipt does not contain the exact approved command set")
     command_keys = {
@@ -676,18 +749,47 @@ def _test_receipt(
     command_intervals: list[tuple[datetime, datetime]] = []
     for record, (command_id, command, arguments) in zip(commands, policy["commands"], strict=True):
         executable = record.get("executable") if isinstance(record, dict) else None
-        expected_tail = list(arguments) if policy["purpose"] == "runtime-tests" else list(arguments[1:])
+        is_brain = policy["purpose"] == "brain-tests"
+        expected_keys = command_keys | ({"dependencies", "executionEnvironment"} if is_brain else set())
+        dependencies = record.get("dependencies") if isinstance(record, dict) else None
+        npm_cli = dependencies.get("npmCli") if isinstance(dependencies, dict) else None
+        expected_argv = (
+            [executable.get("path"), npm_cli.get("path"), *arguments[1:]]
+            if is_brain and isinstance(executable, dict) and isinstance(npm_cli, dict)
+            else [executable.get("path"), *arguments]
+            if isinstance(executable, dict)
+            else []
+        )
         if (
             not isinstance(record, dict)
-            or set(record) != command_keys
+            or set(record) != expected_keys
             or record.get("commandId") != command_id
             or record.get("command") != command
             or not isinstance(executable, dict)
-            or set(executable) != {"path", "sha256"}
+            or set(executable) != {"path", "sha256", "purpose", "trustPolicy"}
             or not _nonempty_string(executable.get("path"))
             or not Path(executable["path"]).is_absolute()
             or not _sha256_value(executable.get("sha256"))
-            or record.get("argv") != [executable["path"], *expected_tail]
+            or executable.get("purpose")
+            != ("brain-node" if is_brain else "runtime-python")
+            or executable.get("trustPolicy") != EXECUTABLE_TRUST_POLICY
+            or record.get("argv") != expected_argv
+            or (
+                is_brain
+                and (
+                    not isinstance(dependencies, dict)
+                    or set(dependencies) != {"npmCli"}
+                    or not isinstance(npm_cli, dict)
+                    or set(npm_cli) != {"path", "sha256", "purpose", "trustPolicy"}
+                    or not _nonempty_string(npm_cli.get("path"))
+                    or not Path(npm_cli["path"]).is_absolute()
+                    or not _sha256_value(npm_cli.get("sha256"))
+                    or npm_cli.get("purpose") != "brain-npm-cli"
+                    or npm_cli.get("trustPolicy") != EXECUTABLE_TRUST_POLICY
+                    or record.get("executionEnvironment")
+                    != {"PATH": str(Path(executable["path"]).parent)}
+                )
+            )
             or (
                 policy["purpose"] == "runtime-tests"
                 and executable["path"] != environment["pythonExecutable"]
@@ -726,6 +828,7 @@ def _test_receipt(
         "startedAt": started.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "completedAt": completed.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "authentication": {"algorithm": ALGORITHM, "keyId": key_id},
+        "sourceControl": source_control,
     }
 
 
@@ -756,17 +859,30 @@ def _validate_deployment(args: argparse.Namespace) -> dict[str, str]:
         "railwayProjectId": args.railway_project_id,
         "railwayEnvironmentId": args.railway_environment_id,
         "postgresServiceId": args.postgres_service_id,
-        "atsWorkerServiceId": args.ats_worker_service_id,
-        "linkedinWorkerServiceId": args.linkedin_worker_service_id,
+        "controlPlaneServiceId": args.control_plane_service_id,
+        "gatewayServiceId": args.gateway_service_id,
     }
-    if not _nonempty_string(args.railway_project) or any(
+    if (
+        not _nonempty_string(args.railway_project)
+        or not _nonempty_string(args.expected_railway_environment_name)
+        or any(
         not _nonempty_string(value) or not _UUID_RE.fullmatch(value) for value in values.values()
+        )
     ):
         raise RuntimeError("deployment identity requires a non-empty Railway project and valid UUID IDs")
     if not _nonempty_string(args.database_name) or not _DATABASE_RE.fullmatch(args.database_name):
         raise RuntimeError("deployment identity contains an invalid PostgreSQL database name")
-    if args.ats_worker_service_id == args.linkedin_worker_service_id:
-        raise RuntimeError("ATS and LinkedIn worker service IDs must differ")
+    if not _nonempty_string(args.control_plane_service_name) or not _nonempty_string(
+        args.gateway_service_name
+    ):
+        raise RuntimeError("deployment identity requires exact control-plane and gateway service names")
+    service_ids = {
+        args.postgres_service_id,
+        args.control_plane_service_id,
+        args.gateway_service_id,
+    }
+    if len(service_ids) != 3:
+        raise RuntimeError("PostgreSQL, control-plane, and gateway service IDs must be pairwise distinct")
     return values
 
 
@@ -796,13 +912,21 @@ def _topology_receipt(
         "railwayProject",
         "railwayProjectId",
         "railwayEnvironmentId",
+        "expectedRailwayEnvironmentName",
+        "observedRailwayEnvironmentName",
         "postgresServiceId",
-        "atsWorkerServiceId",
-        "linkedinWorkerServiceId",
+        "controlPlaneServiceId",
+        "controlPlaneServiceName",
+        "gatewayServiceId",
+        "gatewayServiceName",
+        "serviceRoles",
+        "workerBrowserContractMarkersPresent",
         "databaseName",
         "commands",
         "railwayCli",
-        "environment",
+        "releaseStage",
+        "executionBoundary",
+        "topologyLimitation",
         "capturedAt",
         "expiresAt",
         "authentication",
@@ -813,22 +937,31 @@ def _topology_receipt(
         "railwayProject": args.railway_project,
         "railwayProjectId": args.railway_project_id,
         "railwayEnvironmentId": args.railway_environment_id,
+        "expectedRailwayEnvironmentName": args.expected_railway_environment_name,
         "postgresServiceId": args.postgres_service_id,
-        "atsWorkerServiceId": args.ats_worker_service_id,
-        "linkedinWorkerServiceId": args.linkedin_worker_service_id,
+        "controlPlaneServiceId": args.control_plane_service_id,
+        "controlPlaneServiceName": args.control_plane_service_name,
+        "gatewayServiceId": args.gateway_service_id,
+        "gatewayServiceName": args.gateway_service_name,
         "databaseName": args.database_name,
     }
     if any(receipt.get(field) != value for field, value in expected.items()):
         raise RuntimeError("Railway topology receipt does not match the exact deployment identity")
     if (
-        receipt.get("schemaVersion") != "applypilot_railway_topology_receipt_v2"
+        receipt.get("schemaVersion") != "applypilot_railway_topology_receipt_v4"
         or receipt.get("receiptPurpose") != "railway-topology"
         or receipt.get("producer") != PRODUCER
         or receipt.get("producerVersion") != PRODUCER_VERSION
         or receipt.get("releaseId") != release_id
         or receipt.get("releaseNonce") != release_nonce
         or receipt.get("status") != "verified"
-        or receipt.get("environment") != _TOPOLOGY_ENVIRONMENT
+        or receipt.get("releaseStage") != _RELEASE_STAGE
+        or receipt.get("observedRailwayEnvironmentName")
+        != receipt.get("expectedRailwayEnvironmentName")
+        or receipt.get("executionBoundary") != _EXECUTION_BOUNDARY
+        or receipt.get("serviceRoles") != {"controlPlane": "control-plane", "gateway": "gateway"}
+        or receipt.get("workerBrowserContractMarkersPresent") != []
+        or receipt.get("topologyLimitation") != _TOPOLOGY_LIMITATION
     ):
         raise RuntimeError("Railway topology receipt release binding, status, producer, or environment is invalid")
     commands = receipt.get("commands")
@@ -840,10 +973,12 @@ def _topology_receipt(
         or railway_cli.get("statusSchema") != "railway-cli-5-project-status-v1"
         or railway_cli.get("variablesSchema") != "railway-cli-5-flat-service-variables-v1"
         or not isinstance(railway_cli.get("executable"), dict)
-        or set(railway_cli["executable"]) != {"path", "sha256"}
+        or set(railway_cli["executable"]) != {"path", "sha256", "purpose", "trustPolicy"}
         or not _nonempty_string(railway_cli["executable"].get("path"))
         or not Path(railway_cli["executable"]["path"]).is_absolute()
         or not _sha256_value(railway_cli["executable"].get("sha256"))
+        or railway_cli["executable"].get("purpose") != "railway-cli"
+        or railway_cli["executable"].get("trustPolicy") != EXECUTABLE_TRUST_POLICY
     ):
         raise RuntimeError("Railway topology receipt CLI or output-schema identity is invalid")
     railway_path = railway_cli["executable"]["path"]
@@ -854,6 +989,16 @@ def _topology_receipt(
             "railway-postgres-variables",
             f"railway variables --service {args.postgres_service_id} --json",
             [railway_path, "variables", "--service", args.postgres_service_id, "--json"],
+        ),
+        (
+            "railway-control-plane-variables",
+            f"railway variables --service {args.control_plane_service_id} --json",
+            [railway_path, "variables", "--service", args.control_plane_service_id, "--json"],
+        ),
+        (
+            "railway-gateway-variables",
+            f"railway variables --service {args.gateway_service_id} --json",
+            [railway_path, "variables", "--service", args.gateway_service_id, "--json"],
         ),
     )
     command_keys = {
@@ -911,6 +1056,15 @@ def _topology_receipt(
         "capturedAt": captured.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "expiresAt": expires.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "authentication": {"algorithm": ALGORITHM, "keyId": key_id},
+        "releaseStage": receipt["releaseStage"],
+        "expectedRailwayEnvironmentName": receipt["expectedRailwayEnvironmentName"],
+        "observedRailwayEnvironmentName": receipt["observedRailwayEnvironmentName"],
+        "controlPlaneServiceName": receipt["controlPlaneServiceName"],
+        "gatewayServiceName": receipt["gatewayServiceName"],
+        "serviceRoles": receipt["serviceRoles"],
+        "workerBrowserContractMarkersPresent": receipt["workerBrowserContractMarkersPresent"],
+        "executionBoundary": receipt["executionBoundary"],
+        "topologyLimitation": receipt["topologyLimitation"],
     }
 
 
@@ -927,13 +1081,14 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     }:
         raise RuntimeError("unsupported compatibility-manifest template")
     release_id, release_nonce = validate_release_binding(args.release_id, args.release_nonce)
-    generated_at = datetime.now(timezone.utc)
+    generated_at = _utc_now()
     attestations = {
         purpose: purpose_key(purpose)
         for purpose in ("runtime-tests", "brain-tests", "railway-topology")
     }
     assert_separated_keys(attestations)
     deployment_ids = _validate_deployment(args)
+    git_executable = _trusted_executable("release-git")
 
     runtime_commit, runtime_tree = _git_identity(runtime_repo, args.runtime_ref)
     brain_commit, brain_tree = _git_identity(brain_repo, args.brain_ref)
@@ -976,6 +1131,8 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         generated_at,
         *attestations["railway-topology"],
     )
+    if _trusted_executable("release-git") != git_executable:
+        raise RuntimeError("approved Git executable identity changed during manifest generation")
 
     python_repo = {
         "repository": runtime_template["repository"],
@@ -1009,7 +1166,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     }
     schemas["fleetPython"], schemas["fleetSql"], schemas["fleetMigrationManifest"] = fleet_records
     manifest: dict[str, Any] = {
-        "schemaVersion": "applypilot_compatibility_manifest_v3",
+        "schemaVersion": "applypilot_compatibility_manifest_v4",
         "releaseId": release_id,
         "releaseNonce": release_nonce,
         "generatedAt": generated_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -1024,20 +1181,36 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "deployment": {
             "railwayProject": args.railway_project,
             **deployment_ids,
+            "controlPlaneServiceName": args.control_plane_service_name,
+            "gatewayServiceName": args.gateway_service_name,
+            "serviceRoles": topology_receipt["serviceRoles"],
+            "workerBrowserContractMarkersPresent": topology_receipt[
+                "workerBrowserContractMarkersPresent"
+            ],
+            "releaseStage": topology_receipt["releaseStage"],
+            "expectedRailwayEnvironmentName": topology_receipt["expectedRailwayEnvironmentName"],
+            "observedRailwayEnvironmentName": topology_receipt["observedRailwayEnvironmentName"],
+            "executionBoundary": topology_receipt["executionBoundary"],
             "targetDatabaseName": args.database_name,
             "databaseNameMustMatch": True,
             "topologyReceipt": topology_receipt,
             "liveBrainSchemaVersions": [],
             "liveBrainSchemaV5Verified": False,
+            "topologyLimitations": [
+                topology_receipt["topologyLimitation"]
+            ],
         },
     }
     manifest["verification"] = {
         "releaseManifestGenerator": "scripts/build-compatibility-manifest.py",
+        "gitExecutable": git_executable,
         "artifactInventoryVerified": True,
         "artifactManifestReconciled": True,
         "canonicalSqliteBytesVerified": True,
         "canonicalSqliteDirectlyVerified": True,
         "railwayTopologyReceiptVerified": True,
+        "railwayBrowserWorkerMarkersAbsent": True,
+        "browserExecutionRuntimeBoundaryProven": False,
         "runtimeSourceTests": "passed" if runtime_tests else "pending-final-release-gate",
         "typescriptSourceTests": "passed" if brain_tests else "pending-final-release-gate",
         "realPostgresTests": "pending-final-release-gate",
@@ -1050,8 +1223,20 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "atsCanaryEnabled": False,
         "linkedinCanaryEnabled": False,
         "productionTouched": False,
+        "browserExecutionMustRemainOnFleetNodes": True,
+        "linkedinMustRemainOwnerHomeNodeOnly": True,
+    }
+    manifest["security"] = {
+        "nonceUniquenessVerified": False,
+        "nonceReplayDefense": "external-durable-registry-required",
+        "residualRisk": (
+            "This repository has no durable release-evidence nonce registry or anchor. "
+            "The release orchestrator must atomically register and reject reused release ID/nonce pairs."
+        ),
     }
     manifest["promotionBlockers"] = [
+        "Atomically register this release ID/nonce in an external durable release-evidence registry before promotion.",
+        "Prove from runtime process and routing evidence that Railway launches no browser workers and LinkedIn remains owner-node only.",
         "Commit and publish this manifest, then bind its release-evidence commit in the annotated tags.",
         "Install and verify brain schema V5 in the exact target database named by this manifest.",
         "Prove bounded principals, fresh pinned-version heartbeats, paused lanes, and zero open leases.",
@@ -1080,9 +1265,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--railway-project", required=True)
     parser.add_argument("--railway-project-id", required=True)
     parser.add_argument("--railway-environment-id", required=True)
+    parser.add_argument("--expected-railway-environment-name", required=True)
     parser.add_argument("--postgres-service-id", required=True)
-    parser.add_argument("--ats-worker-service-id", required=True)
-    parser.add_argument("--linkedin-worker-service-id", required=True)
+    parser.add_argument("--control-plane-service-id", required=True)
+    parser.add_argument("--control-plane-service-name", required=True)
+    parser.add_argument("--gateway-service-id", required=True)
+    parser.add_argument("--gateway-service-name", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -1091,28 +1279,54 @@ def _write_exclusive_fsync(path: Path, content: bytes) -> None:
     atomic_write_no_overwrite(path, content)
 
 
+def _assert_topology_receipt_fresh_for_publication(
+    manifest: dict[str, Any], publication_time: datetime
+) -> None:
+    try:
+        expires_value = manifest["deployment"]["topologyReceipt"]["expiresAt"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("manifest topology receipt expiry is missing at final publication") from exc
+    expires = _parse_timestamp(expires_value, "manifest topology receipt expiresAt")
+    if publication_time >= expires:
+        raise RuntimeError("Railway topology receipt expired before final publication")
+
+
 def main() -> int:
     args = _parser().parse_args()
-    output = args.output.resolve()
+    output = Path(os.path.abspath(args.output))
     if output.name.lower().endswith(".sha256"):
         raise SystemExit("manifest output cannot use the .sha256 sidecar suffix")
     sidecar = output.with_name(output.name + ".sha256")
-    if output.exists() != sidecar.exists():
-        raise SystemExit("refusing incomplete immutable release evidence; remove the partial pair and regenerate")
-    if output.exists() and sidecar.exists():
-        raise SystemExit("refusing to overwrite complete immutable release evidence")
     manifest = build_manifest(args)
-    encoded = (json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     sidecar_bytes = f"{digest}  {output.name}\n".encode("ascii")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    _write_exclusive_fsync(output, encoded)
+    _assert_topology_receipt_fresh_for_publication(manifest, _utc_now())
+    try:
+        _write_exclusive_fsync(output, encoded)
+    except FileExistsError as exc:
+        raise SystemExit(f"refusing to overwrite release evidence: {output}") from exc
     try:
         _write_exclusive_fsync(sidecar, sidecar_bytes)
-    except BaseException:
-        output.unlink(missing_ok=True)
+    except BaseException as exc:
+        try:
+            remove_published_file(output)
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                f"sidecar publication failed and descriptor-relative output cleanup also failed: {output}"
+            ) from cleanup_error
+        if isinstance(exc, FileExistsError):
+            raise SystemExit(f"refusing to overwrite release evidence: {sidecar}") from exc
         raise
-    print(json.dumps({"manifest": str(output), "sha256": digest, "sidecar": str(sidecar)}, sort_keys=True))
+    print(
+        json.dumps(
+            {"manifest": str(output), "sha256": digest, "sidecar": str(sidecar)},
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
     return 0
 
 
