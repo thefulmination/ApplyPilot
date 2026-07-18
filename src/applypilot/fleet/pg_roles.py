@@ -7,10 +7,16 @@ be controlled separately.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
 import re
+import stat
 from typing import Any
 
 from psycopg import sql
@@ -35,8 +41,11 @@ _CANDIDATE_ALL_RELATIONS = (
     "brain_graph_approval_consumptions",
     "brain_immutable_artifact_references",
 )
-_CANDIDATE_PUBLISH_SIGNATURE = (
+_CANDIDATE_V4_PUBLISH_SIGNATURE = (
     "public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)"
+)
+_CANDIDATE_V5_PUBLISH_SIGNATURE = (
+    "public.brain_publish_v5_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)"
 )
 
 
@@ -81,6 +90,232 @@ class CandidateRoleReconciliationReceipt:
     reader_role: str
     writer_role: str
     reconciled_at: str
+
+
+@dataclass(frozen=True)
+class DurableEvidencePaths:
+    """Prevalidated exclusive paths for internally written preparation evidence."""
+
+    preparation_receipt_path: Path
+    rollback_sql_path: Path
+    authentication_key: bytes
+    authentication_key_id: str
+    _parent_identities: tuple[tuple[str, int, int], ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        concrete_path_type = type(Path())
+        for field_name in ("preparation_receipt_path", "rollback_sql_path"):
+            value = getattr(self, field_name)
+            if type(value) is not concrete_path_type:
+                raise TypeError(f"{field_name} must be a concrete pathlib.Path")
+            if not value.is_absolute():
+                raise ValueError(f"{field_name} must be absolute")
+        if self.preparation_receipt_path == self.rollback_sql_path:
+            raise ValueError("preparation receipt and rollback SQL paths must be distinct")
+        if type(self.authentication_key) is not bytes or len(self.authentication_key) < 32:
+            raise ValueError("evidence authentication_key must be at least 32 bytes")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", self.authentication_key_id):
+            raise ValueError("evidence authentication_key_id is invalid")
+        identities = tuple(
+            _evidence_parent_identity(path.parent)
+            for path in (self.preparation_receipt_path, self.rollback_sql_path)
+        )
+        object.__setattr__(self, "_parent_identities", identities)
+
+
+def _evidence_parent_identity(parent: Path) -> tuple[str, int, int]:
+    metadata = os.lstat(parent)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"durable evidence parent must be a real directory: {parent}")
+    resolved = parent.resolve(strict=True)
+    if resolved != parent:
+        raise RuntimeError(f"durable evidence parent path must be canonical and contain no symlinks: {parent}")
+    return (str(resolved), metadata.st_dev, metadata.st_ino)
+
+
+def _fsync_parent_directory(parent: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _canonical_receipt_bytes(receipt: Mapping[str, Any]) -> bytes:
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_authentication"}
+    return json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def authenticate_evidence_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    authentication_key: bytes,
+    authentication_key_id: str,
+) -> dict[str, Any]:
+    """Return a receipt authenticated by a separately trusted operator key."""
+    if type(authentication_key) is not bytes or len(authentication_key) < 32:
+        raise ValueError("evidence authentication key must be at least 32 bytes")
+    signed = dict(receipt)
+    signed["receipt_authentication"] = {
+        "algorithm": "hmac-sha256",
+        "key_id": authentication_key_id,
+        "digest": hmac.new(authentication_key, _canonical_receipt_bytes(signed), hashlib.sha256).hexdigest(),
+    }
+    return signed
+
+
+def verify_evidence_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    authentication_key: bytes,
+    expected_key_id: str | None = None,
+) -> None:
+    authentication = receipt.get("receipt_authentication")
+    if not isinstance(authentication, Mapping):
+        raise ValueError("legacy or unsigned evidence receipt is not accepted")
+    if authentication.get("algorithm") != "hmac-sha256":
+        raise ValueError("unsupported evidence receipt authentication algorithm")
+    key_id = authentication.get("key_id")
+    digest = authentication.get("digest")
+    if not isinstance(key_id, str) or not isinstance(digest, str):
+        raise ValueError("evidence receipt authentication metadata is malformed")
+    if expected_key_id is not None and key_id != expected_key_id:
+        raise ValueError("evidence receipt key id does not match the trusted operator key")
+    expected = hmac.new(authentication_key, _canonical_receipt_bytes(receipt), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, digest):
+        raise ValueError("evidence receipt authentication failed")
+
+
+def _write_exclusive_fsync(
+    path: Path,
+    payload: bytes,
+    *,
+    expected_parent_identity: tuple[str, int, int],
+) -> tuple[int, int]:
+    if _evidence_parent_identity(path.parent) != expected_parent_identity:
+        raise RuntimeError(f"durable evidence parent directory changed after validation: {path.parent}")
+    if os.path.lexists(path):
+        raise FileExistsError(f"durable evidence path already exists: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    metadata = os.fstat(descriptor)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_parent_directory(path.parent)
+    except BaseException:
+        os.close(descriptor)
+        _remove_created_evidence(
+            path,
+            expected_identity=(metadata.st_dev, metadata.st_ino),
+            expected_parent_identity=expected_parent_identity,
+        )
+        raise
+    else:
+        os.close(descriptor)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _remove_created_evidence(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_parent_identity: tuple[str, int, int],
+) -> None:
+    if _evidence_parent_identity(path.parent) != expected_parent_identity:
+        raise RuntimeError("cannot safely clean partial evidence after parent substitution")
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != expected_identity:
+        raise RuntimeError("cannot safely clean partial evidence after leaf substitution")
+    path.unlink()
+    _fsync_parent_directory(path.parent)
+
+
+def _validate_evidence_paths(evidence_paths: DurableEvidencePaths) -> None:
+    if type(evidence_paths) is not DurableEvidencePaths:
+        raise TypeError("evidence_paths must be an exact DurableEvidencePaths instance")
+    collisions = [
+        path
+        for path in (
+            evidence_paths.preparation_receipt_path,
+            evidence_paths.rollback_sql_path,
+        )
+        if os.path.lexists(path)
+    ]
+    if collisions:
+        raise FileExistsError("durable evidence paths already exist: " + ", ".join(map(str, collisions)))
+    missing_parents = sorted(
+        {
+            path.parent
+            for path in (
+                evidence_paths.preparation_receipt_path,
+                evidence_paths.rollback_sql_path,
+            )
+            if not path.parent.is_dir()
+        },
+        key=str,
+    )
+    if missing_parents:
+        raise RuntimeError("durable evidence parent directories do not exist: " + ", ".join(map(str, missing_parents)))
+
+
+def _write_preparation_evidence(
+    evidence_paths: DurableEvidencePaths,
+    *,
+    inventory: Mapping[str, Any],
+    rollback_sql: str,
+) -> None:
+    rollback_bytes = rollback_sql.encode("utf-8")
+    receipt = {
+        "status": "prepared_before_database_mutation",
+        "prepared_at": inventory["prepared_at"],
+        "database_name": inventory["database_name"],
+        "inventory": inventory,
+        "rollback_sql_path": str(evidence_paths.rollback_sql_path),
+        "rollback_sql_sha256": hashlib.sha256(rollback_bytes).hexdigest(),
+        "in_doubt": True,
+        "escalation_required": True,
+    }
+    for key in (
+        "atomic_bootstrap",
+        "automatic_rollback_supported",
+        "commit_outcome_on_interruption",
+        "legacy_rollback_sql_recovers_v1_v4",
+        "legacy_rollback_sql_recovers_v1_v5",
+        "rollback_mode",
+        "topology",
+    ):
+        if key in inventory:
+            receipt[key] = inventory[key]
+    receipt = authenticate_evidence_receipt(
+        receipt,
+        authentication_key=evidence_paths.authentication_key,
+        authentication_key_id=evidence_paths.authentication_key_id,
+    )
+    receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    rollback_identity = _write_exclusive_fsync(
+        evidence_paths.rollback_sql_path,
+        rollback_bytes,
+        expected_parent_identity=evidence_paths._parent_identities[1],
+    )
+    try:
+        _write_exclusive_fsync(
+            evidence_paths.preparation_receipt_path,
+            receipt_bytes,
+            expected_parent_identity=evidence_paths._parent_identities[0],
+        )
+    except BaseException:
+        _remove_created_evidence(
+            evidence_paths.rollback_sql_path,
+            expected_identity=rollback_identity,
+            expected_parent_identity=evidence_paths._parent_identities[1],
+        )
+        raise
 
 
 @dataclass(frozen=True)
@@ -262,9 +497,7 @@ def _user_schemas(cur) -> tuple[str, ...]:
     return tuple(_row_value(row, "nspname") for row in cur.fetchall())
 
 
-def _transfer_application_ownership(
-    cur, *, new_owner_role: str, apply: bool = True
-) -> tuple[dict[str, Any], ...]:
+def _transfer_application_ownership(cur, *, new_owner_role: str, apply: bool = True) -> tuple[dict[str, Any], ...]:
     """Transfer only application objects, never cluster/system-owned objects."""
     new_owner = sql.Identifier(new_owner_role)
     transferred: list[dict[str, Any]] = []
@@ -380,9 +613,7 @@ def _transfer_application_ownership(
         "WHERE n.nspname=ANY(%s) ORDER BY n.nspname,o.oprname",
         (list(schemas),),
     )
-    unsupported_operators = [
-        f"{_row_value(row, 'nspname')}.{_row_value(row, 'oprname', 1)}" for row in cur.fetchall()
-    ]
+    unsupported_operators = [f"{_row_value(row, 'nspname')}.{_row_value(row, 'oprname', 1)}" for row in cur.fetchall()]
     if unsupported_operators:
         raise RuntimeError("bootstrap cannot transfer user-defined operators: " + ", ".join(unsupported_operators))
 
@@ -393,11 +624,15 @@ def _transfer_application_ownership(
     )
     for row in cur.fetchall():
         owner_name = _row_value(row, "owner_name", 1)
+        schema_name = _row_value(row, "nspname")
+        schema = sql.Identifier(schema_name)
+        if apply:
+            if owner_name != new_owner_role:
+                cur.execute(sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(schema, new_owner))
+            # Ownership privileges are not inherited by members of the owner role.
+            cur.execute(sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {}").format(schema, new_owner))
         if owner_name == new_owner_role:
             continue
-        schema_name = _row_value(row, "nspname")
-        if apply:
-            cur.execute(sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(sql.Identifier(schema_name), new_owner))
         transferred.append(
             {
                 "object_kind": "schema",
@@ -528,15 +763,28 @@ def _database_inventory(cur, *, role_name: str, manifest: RegrantManifest) -> di
     if set(break_glass_roles) & set((manifest.database_owner_role, *controller_roles, *verifier_roles)):
         raise RuntimeError("break-glass roles must be disjoint from owner/controller/verifier roles")
     cur.execute(
-        "SELECT session_user AS session_name,current_database() AS database_name,owner.rolname AS owner_name "
+        "SELECT session_user AS session_name,current_user AS current_name,current_database() AS database_name,"
+        "owner.rolname AS owner_name "
         "FROM pg_database d JOIN pg_roles owner ON owner.oid=d.datdba "
         "WHERE d.datname=current_database()"
     )
     database_row = cur.fetchone()
     migration_session = _row_value(database_row, "session_name")
-    prior_owner = _row_value(database_row, "owner_name", 2)
-    if migration_session not in controller_roles:
-        raise RuntimeError("role reconciliation session_user must be an explicit controller role")
+    current_user = _row_value(database_row, "current_name", 1)
+    prior_owner = _row_value(database_row, "owner_name", 3)
+    if migration_session != current_user:
+        raise RuntimeError("offline role provisioning forbids SET ROLE")
+    if migration_session not in break_glass_roles:
+        raise RuntimeError("fleet worker role reconciliation requires an explicit offline provider-admin identity")
+    cur.execute(
+        "SELECT rolcanlogin,rolsuper,rolcreaterole FROM pg_roles WHERE rolname=%s",
+        (migration_session,),
+    )
+    provisioner = cur.fetchone()
+    if provisioner is None or not all(
+        _row_value(provisioner, name, index) for index, name in enumerate(("rolcanlogin", "rolsuper", "rolcreaterole"))
+    ):
+        raise RuntimeError("offline provider-admin must be LOGIN SUPERUSER CREATEROLE")
     if prior_owner != manifest.database_owner_role and prior_owner not in retired_admin_roles:
         raise RuntimeError(f"current database owner {prior_owner!r} must be the dedicated owner or explicitly retired")
 
@@ -585,14 +833,10 @@ def _database_inventory(cur, *, role_name: str, manifest: RegrantManifest) -> di
         raise RuntimeError("dedicated database owner role must be NOLOGIN and NOSUPERUSER")
     if not any(allowlist_attributes.get(name, (False, False))[0] for name in controller_roles):
         raise RuntimeError("at least one explicit controller role must be LOGIN")
-    invalid_controllers = sorted(
-        name for name in controller_roles if allowlist_attributes.get(name, (False, False))[1]
-    )
+    invalid_controllers = sorted(name for name in controller_roles if allowlist_attributes.get(name, (False, False))[1])
     if invalid_controllers:
         raise RuntimeError("controller roles must be NOSUPERUSER: " + ", ".join(invalid_controllers))
-    invalid_break_glass = sorted(
-        name for name in break_glass_roles if allowlist_attributes.get(name) != (True, True)
-    )
+    invalid_break_glass = sorted(name for name in break_glass_roles if allowlist_attributes.get(name) != (True, True))
     if invalid_break_glass:
         raise RuntimeError("break-glass roles must remain LOGIN SUPERUSER: " + ", ".join(invalid_break_glass))
     cur.execute(
@@ -851,9 +1095,7 @@ def _direct_acl_snapshot(cur, *, grantee: str) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _default_acl_snapshot(
-    cur, *, grantee: str
-) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+def _default_acl_snapshot(cur, *, grantee: str) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
     cur.execute(
         "SELECT owner.rolname AS owner_name,n.nspname AS schema_name,d.defaclobjtype,"
         "acl.privilege_type,acl.is_grantable FROM pg_catalog.pg_default_acl d "
@@ -896,9 +1138,7 @@ def _default_acl_snapshot(
     return entries, scopes
 
 
-def _structured_regrant_snapshot(
-    cur, regrants: tuple[dict[str, Any], ...]
-) -> tuple[dict[str, Any], ...]:
+def _structured_regrant_snapshot(cur, regrants: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
     snapshots: list[dict[str, Any]] = []
     for grant in regrants:
         kind = grant["object_kind"]
@@ -1009,11 +1249,15 @@ def _acl_target_sql(cur, target: Mapping[str, Any]) -> str:
     if kind in {"table", "sequence", "type"}:
         return sql.Identifier(target["schema_name"], target["object_name"]).as_string(cur.connection)
     if kind in {"function", "procedure"}:
-        return sql.SQL("{}.{}({})").format(
-            sql.Identifier(target["schema_name"]),
-            sql.Identifier(target["object_name"]),
-            sql.SQL(target["arguments"]),
-        ).as_string(cur.connection)
+        return (
+            sql.SQL("{}.{}({})")
+            .format(
+                sql.Identifier(target["schema_name"]),
+                sql.Identifier(target["object_name"]),
+                sql.SQL(target["arguments"]),
+            )
+            .as_string(cur.connection)
+        )
     raise RuntimeError(f"unsupported rollback ACL object kind: {kind}")
 
 
@@ -1026,9 +1270,7 @@ def _grant_acl_sql(cur, *, target: Mapping[str, Any], grantee: str, acl: Iterabl
         privileges = sorted(item["privilege"] for item in acl if bool(item["grantable"]) is grantable)
         if privileges:
             suffix = " WITH GRANT OPTION" if grantable else ""
-            statements.append(
-                f"GRANT {', '.join(privileges)} ON {object_kind} {identity} TO {quoted_grantee}{suffix};"
-            )
+            statements.append(f"GRANT {', '.join(privileges)} ON {object_kind} {identity} TO {quoted_grantee}{suffix};")
     return statements
 
 
@@ -1038,9 +1280,7 @@ def _default_acl_prefix(cur, scope: Mapping[str, Any]) -> tuple[str, str]:
     prefix = f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner}"
     if schema:
         prefix += f" IN SCHEMA {sql.Identifier(schema).as_string(cur.connection)}"
-    object_name = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES"}[
-        scope["object_type"]
-    ]
+    object_name = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES"}[scope["object_type"]]
     return prefix, object_name
 
 
@@ -1082,7 +1322,9 @@ def _mapped_role_rollback_sql(
     regrant_snapshots: tuple[dict[str, Any], ...],
 ) -> str:
     quoted_role = sql.Identifier(role_name).as_string(cur.connection)
-    statements = [f"DELETE FROM public.fleet_worker_principals WHERE role_name={sql.Literal(role_name).as_string(cur.connection)};"]
+    statements = [
+        f"DELETE FROM public.fleet_worker_principals WHERE role_name={sql.Literal(role_name).as_string(cur.connection)};"
+    ]
 
     for regrant in regrant_snapshots:
         if regrant["object_kind"].startswith("default_"):
@@ -1100,9 +1342,7 @@ def _mapped_role_rollback_sql(
                 )
                 if privileges:
                     suffix = " WITH GRANT OPTION" if grantable else ""
-                    statements.append(
-                        f"{prefix} GRANT {', '.join(privileges)} ON {object_name} TO {grantee}{suffix};"
-                    )
+                    statements.append(f"{prefix} GRANT {', '.join(privileges)} ON {object_name} TO {grantee}{suffix};")
         else:
             object_kind = regrant["object_kind"].upper()
             identity = _acl_target_sql(cur, regrant)
@@ -1157,9 +1397,7 @@ def _mapped_role_rollback_sql(
             privileges = sorted(item["privilege"] for item in acl if bool(item["grantable"]) is grantable)
             if privileges:
                 suffix = " WITH GRANT OPTION" if grantable else ""
-                statements.append(
-                    f"{prefix} GRANT {', '.join(privileges)} ON {object_name} TO {quoted_role}{suffix};"
-                )
+                statements.append(f"{prefix} GRANT {', '.join(privileges)} ON {object_name} TO {quoted_role}{suffix};")
 
     def restore_membership(parent_role: str, member_role: str, membership: Mapping[str, Any]) -> None:
         parent = sql.Identifier(parent_role).as_string(cur.connection)
@@ -1376,9 +1614,7 @@ def _install_identity_function(cur) -> None:
     )
     principal_owner = _row_value(cur.fetchone(), "rolname")
     cur.execute(
-        sql.SQL("ALTER FUNCTION public.fleet_worker_identity() OWNER TO {}").format(
-            sql.Identifier(principal_owner)
-        )
+        sql.SQL("ALTER FUNCTION public.fleet_worker_identity() OWNER TO {}").format(sql.Identifier(principal_owner))
     )
 
 
@@ -1395,7 +1631,7 @@ def _harden_database_connect(
     )
     if _row_value(cur.fetchone(), "rolname") != database_owner_role:
         cur.execute(sql.SQL("ALTER DATABASE {} OWNER TO {}").format(database, sql.Identifier(database_owner_role)))
-    cur.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(database))
+    cur.execute(sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM PUBLIC").format(database))
     for role_name in retired_admin_roles:
         role = sql.Identifier(role_name)
         cur.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(database, role))
@@ -1412,9 +1648,9 @@ def _harden_database_connect(
             )
         ):
             cur.execute(
-                sql.SQL(
-                    "ALTER ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-                ).format(role)
+                sql.SQL("ALTER ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS").format(
+                    role
+                )
             )
 
 
@@ -1432,8 +1668,7 @@ def _effective_connect_grantees(cur) -> tuple[dict[str, Any], ...]:
             "superuser": _row_value(row, "rolsuper", 2),
             "database_owner": _row_value(row, "database_owner", 3),
             "effective_connect": _row_value(row, "effective_connect", 4),
-            "reconnect_capable": _row_value(row, "rolcanlogin", 1)
-            and _row_value(row, "effective_connect", 4),
+            "reconnect_capable": _row_value(row, "rolcanlogin", 1) and _row_value(row, "effective_connect", 4),
         }
         for row in cur.fetchall()
     )
@@ -1515,7 +1750,15 @@ def _revoke_legacy_privileges(cur, *, role: sql.Identifier, database: sql.Identi
             )
 
 
-def _revoke_memberships(cur, *, role_name: str, role: sql.Identifier) -> None:
+def _reconcile_role_memberships(
+    cur,
+    *,
+    role_name: str,
+    approved_parent_roles: tuple[str, ...] = (),
+    approved_grantee_roles: tuple[str, ...] = (),
+) -> None:
+    approved_parents = set(approved_parent_roles)
+    approved_grantees = set(approved_grantee_roles)
     cur.execute(
         "SELECT parent.rolname FROM pg_auth_members membership "
         "JOIN pg_roles parent ON parent.oid=membership.roleid "
@@ -1524,11 +1767,51 @@ def _revoke_memberships(cur, *, role_name: str, role: sql.Identifier) -> None:
         (role_name,),
     )
     for row in cur.fetchall():
-        cur.execute(
-            sql.SQL("REVOKE {} FROM {}").format(
-                sql.Identifier(_row_value(row, "rolname")),
-                role,
+        parent = _row_value(row, "rolname")
+        if parent not in approved_parents:
+            cur.execute(
+                sql.SQL("REVOKE {} FROM {}").format(sql.Identifier(parent), sql.Identifier(role_name))
             )
+
+    cur.execute(
+        "SELECT member.rolname FROM pg_auth_members membership "
+        "JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "WHERE parent.rolname=%s ORDER BY member.rolname",
+        (role_name,),
+    )
+    for row in cur.fetchall():
+        member = _row_value(row, "rolname")
+        revoke = member not in approved_grantees
+        if not revoke:
+            cur.execute(
+                "WITH RECURSIVE descendants(role_oid) AS ("
+                "SELECT oid FROM pg_roles WHERE rolname=%s UNION "
+                "SELECT membership.member FROM pg_auth_members membership "
+                "JOIN descendants ON descendants.role_oid=membership.roleid) "
+                "SELECT rolname FROM descendants JOIN pg_roles ON pg_roles.oid=descendants.role_oid "
+                "WHERE rolname<>ALL(%s) ORDER BY rolname",
+                (member, list(approved_grantees)),
+            )
+            revoke = cur.fetchone() is not None
+        if revoke:
+            cur.execute(
+                sql.SQL("REVOKE {} FROM {}").format(sql.Identifier(role_name), sql.Identifier(member))
+            )
+
+    cur.execute(
+        "SELECT parent.rolname AS parent_role,member.rolname AS member_role "
+        "FROM pg_auth_members membership JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "WHERE (member.rolname=%s AND parent.rolname<>ALL(%s)) "
+        "OR (parent.rolname=%s AND member.rolname<>ALL(%s))",
+        (role_name, list(approved_parents), role_name, list(approved_grantees)),
+    )
+    violation = cur.fetchone()
+    if violation is not None:
+        raise RuntimeError(
+            f"role membership boundary invalid for {role_name}: "
+            f"{violation['parent_role']} -> {violation['member_role']}"
         )
 
 
@@ -1758,6 +2041,7 @@ def _validate_post_password_boundary(
     database_owner_role: str,
     retired_admin_roles: tuple[str, ...],
     break_glass_roles: tuple[str, ...],
+    approved_grantee_roles: tuple[str, ...],
 ) -> tuple[dict[str, Any], ...]:
     cur.execute(
         "SELECT rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole, "
@@ -1789,8 +2073,9 @@ def _validate_post_password_boundary(
     cur.execute(
         "SELECT 1 FROM pg_catalog.pg_auth_members membership "
         "JOIN pg_catalog.pg_roles member ON member.oid=membership.member "
-        "WHERE member.rolname=%s LIMIT 1",
-        (role_name,),
+        "JOIN pg_catalog.pg_roles parent ON parent.oid=membership.roleid "
+        "WHERE member.rolname=%s OR (parent.rolname=%s AND member.rolname<>ALL(%s)) LIMIT 1",
+        (role_name, role_name, list(approved_grantee_roles)),
     )
     if cur.fetchone() is not None:
         raise RuntimeError("fleet worker role membership drifted during password reconciliation")
@@ -1870,9 +2155,7 @@ def _validate_post_password_boundary(
         if not _row_value(row, "rolcanlogin", 1) or not _row_value(row, "rolsuper", 2)
     ]
     if invalid_break_glass:
-        raise RuntimeError(
-            "break-glass roles must remain LOGIN SUPERUSER: " + ", ".join(invalid_break_glass)
-        )
+        raise RuntimeError("break-glass roles must remain LOGIN SUPERUSER: " + ", ".join(invalid_break_glass))
     effective = _effective_connect_grantees(cur)
     reconnect_roles = {row["role_name"] for row in effective if row["reconnect_capable"]}
     cur.execute(
@@ -1928,171 +2211,283 @@ def validate_runtime_principal(conn, *, worker_id: str, contract: str) -> Runtim
     return identity
 
 
-def ensure_brain_candidate_roles(
-    conn,
+def ensure_brain_candidate_roles_in_transaction(
+    cur,
     *,
     reader_role: str = BRAIN_CANDIDATE_READER_ROLE,
     writer_role: str = BRAIN_CANDIDATE_WRITER_ROLE,
+    reader_approved_grantees: tuple[str, ...] = (),
+    writer_approved_grantees: tuple[str, ...] = (),
 ) -> CandidateRoleReconciliationReceipt:
-    """Reconcile NOLOGIN V4 candidate capabilities without granting fleet authority."""
+    """Reconcile V5 candidate capabilities using the caller's active transaction."""
     if reader_role == writer_role:
         raise ValueError("candidate reader and writer roles must be distinct")
     for role_name in (reader_role, writer_role):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", role_name):
             raise ValueError("candidate role names must be plain PostgreSQL identifiers")
+    cur.execute("SET LOCAL search_path=pg_catalog")
+    cur.execute("SELECT rolsuper OR rolcreaterole AS allowed FROM pg_roles WHERE rolname=current_user")
+    row = cur.fetchone()
+    if row is None or not _row_value(row, "allowed"):
+        raise RuntimeError("candidate role reconciliation requires CREATEROLE or provider-admin authority")
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_CANDIDATE_ROLE_LOCK_KEY,))
+    for role_name in (reader_role, writer_role):
+        identifier = sql.Identifier(role_name)
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,))
+        if cur.fetchone() is None:
+            cur.execute(sql.SQL("CREATE ROLE {}").format(identifier))
+        cur.execute(
+            sql.SQL(
+                "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+            ).format(identifier)
+        )
+        cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(identifier))
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier))
+
+    _reconcile_role_memberships(
+        cur,
+        role_name=reader_role,
+        approved_grantee_roles=reader_approved_grantees,
+    )
+    _reconcile_role_memberships(
+        cur,
+        role_name=writer_role,
+        approved_grantee_roles=writer_approved_grantees,
+    )
+    cur.execute(
+        "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\' "
+        "AND nspname <> 'information_schema'"
+    )
+    namespaces = [row["nspname"] for row in cur.fetchall()]
+    cur.execute(
+        "SELECT n.nspname,t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
+        "WHERE n.nspname=ANY(%s) AND t.typtype IN ('c','d','e','r','m') "
+        "ORDER BY n.nspname,t.typname",
+        (namespaces,),
+    )
+    grantable_types = [(row["nspname"], row["typname"]) for row in cur.fetchall()]
+    cur.execute(
+        "SELECT object_kind,object_name FROM ("
+        "SELECT 'relation' AS object_kind,format('%%I.%%I',n.nspname,c.relname) AS object_name "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE c.relowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+        "UNION ALL SELECT 'function',format('%%I.%%I',n.nspname,p.proname) "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "WHERE p.proowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+        "UNION ALL SELECT 'schema',n.nspname FROM pg_namespace n "
+        "WHERE n.nspowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+        "UNION ALL SELECT 'type',format('%%I.%%I',n.nspname,t.typname) "
+        "FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
+        "WHERE t.typowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
+        "UNION ALL SELECT 'database',d.datname FROM pg_database d "
+        "WHERE d.datdba IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))"
+        ") owned ORDER BY object_kind,object_name",
+        ([reader_role, writer_role],) * 5,
+    )
+    owned_objects = [f"{row['object_kind']}:{row['object_name']}" for row in cur.fetchall()]
+    if owned_objects:
+        raise RuntimeError("candidate roles must not own database objects: " + ", ".join(owned_objects))
+    cur.execute("SELECT current_database() AS database_name")
+    database = sql.Identifier(cur.fetchone()["database_name"])
+    for role_name in (reader_role, writer_role):
+        identifier = sql.Identifier(role_name)
+        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(database, identifier))
+        for namespace in namespaces:
+            schema_name = sql.Identifier(namespace)
+            cur.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} FROM {}").format(schema_name, identifier)
+            )
+            cur.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(schema_name, identifier)
+            )
+            cur.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM {}").format(schema_name, identifier)
+            )
+            cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA {} FROM {}").format(schema_name, identifier))
+        for namespace, type_name in grantable_types:
+            cur.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON TYPE {}.{} FROM {}").format(
+                    sql.Identifier(namespace), sql.Identifier(type_name), identifier
+                )
+            )
+    cur.execute(
+        "SELECT owner.rolname AS owner_role,n.nspname AS schema_name,da.defaclobjtype "
+        "FROM pg_default_acl da JOIN pg_roles owner ON owner.oid=da.defaclrole "
+        "LEFT JOIN pg_namespace n ON n.oid=da.defaclnamespace CROSS JOIN LATERAL aclexplode(da.defaclacl) acl "
+        "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))",
+        ([reader_role, writer_role],),
+    )
+    default_acl_kinds = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES", "n": "SCHEMAS"}
+    for default_acl in cur.fetchall():
+        for role_name in (reader_role, writer_role):
+            cur.execute(
+                sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} {} REVOKE ALL ON {} FROM {}").format(
+                    sql.Identifier(default_acl["owner_role"]),
+                    sql.SQL("")
+                    if default_acl["schema_name"] is None
+                    else sql.SQL("IN SCHEMA {} ").format(sql.Identifier(default_acl["schema_name"])),
+                    sql.SQL(default_acl_kinds[default_acl["defaclobjtype"]]),
+                    sql.Identifier(role_name),
+                )
+            )
+    for role_name in (reader_role, writer_role):
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role_name)))
+
+    for relation in _CANDIDATE_ALL_RELATIONS:
+        cur.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",))
+        if cur.fetchone()["relation"] is None:
+            continue
+        table = sql.SQL("public.{}").format(sql.Identifier(relation))
+        cur.execute(
+            sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}, {}").format(
+                table, sql.Identifier(reader_role), sql.Identifier(writer_role)
+            )
+        )
+        if relation in _CANDIDATE_READ_RELATIONS:
+            cur.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, sql.Identifier(reader_role)))
+    selected_publish_signature = None
+    for signature in (_CANDIDATE_V5_PUBLISH_SIGNATURE, _CANDIDATE_V4_PUBLISH_SIGNATURE):
+        cur.execute("SELECT to_regprocedure(%s) AS procedure", (signature,))
+        if cur.fetchone()["procedure"] is not None:
+            procedure = sql.SQL(signature)
+            cur.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {}, {}").format(
+                    procedure, sql.Identifier(reader_role), sql.Identifier(writer_role)
+                )
+            )
+            if selected_publish_signature is None:
+                selected_publish_signature = signature
+    if selected_publish_signature is not None:
+        procedure = sql.SQL(selected_publish_signature)
+        cur.execute(
+            sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {}, {}").format(
+                procedure, sql.Identifier(reader_role), sql.Identifier(writer_role)
+            )
+        )
+        cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(procedure, sql.Identifier(writer_role)))
+    cur.execute(
+        "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+        "FROM pg_roles WHERE rolname=ANY(%s)",
+        ([reader_role, writer_role],),
+    )
+    roles = {role["rolname"]: role for role in cur.fetchall()}
+    for role_name in (reader_role, writer_role):
+        role = roles.get(role_name)
+        if role is None or any(
+            role[key]
+            for key in (
+                "rolcanlogin",
+                "rolinherit",
+                "rolsuper",
+                "rolcreatedb",
+                "rolcreaterole",
+                "rolreplication",
+                "rolbypassrls",
+            )
+        ):
+            raise RuntimeError(f"candidate role attributes invalid for {role_name}")
+    cur.execute("SELECT rolcreaterole FROM pg_roles WHERE rolname='brain_schema_migrator'")
+    migrator = cur.fetchone()
+    if migrator is not None and migrator["rolcreaterole"]:
+        raise RuntimeError("brain_schema_migrator must not retain CREATEROLE")
+    return CandidateRoleReconciliationReceipt(
+        reader_role=reader_role,
+        writer_role=writer_role,
+        reconciled_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def ensure_brain_candidate_roles(
+    conn,
+    *,
+    reader_role: str = BRAIN_CANDIDATE_READER_ROLE,
+    writer_role: str = BRAIN_CANDIDATE_WRITER_ROLE,
+    reader_approved_grantees: tuple[str, ...] = (),
+    writer_approved_grantees: tuple[str, ...] = (),
+) -> CandidateRoleReconciliationReceipt:
+    """Reconcile NOLOGIN V5 candidate capabilities in one standalone transaction."""
     if conn.info.transaction_status.name != "IDLE":
         raise RuntimeError("candidate role reconciliation requires an idle connection")
     try:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute("SET LOCAL search_path=pg_catalog")
-                cur.execute("SELECT rolsuper OR rolcreaterole AS allowed FROM pg_roles WHERE rolname=current_user")
-                row = cur.fetchone()
-                if row is None or not _row_value(row, "allowed"):
-                    raise RuntimeError("candidate role reconciliation requires CREATEROLE or provider-admin authority")
-                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_CANDIDATE_ROLE_LOCK_KEY,))
-                for role_name in (reader_role, writer_role):
-                    identifier = sql.Identifier(role_name)
-                    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,))
-                    if cur.fetchone() is None:
-                        cur.execute(sql.SQL("CREATE ROLE {}").format(identifier))
-                    cur.execute(
-                        sql.SQL(
-                            "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
-                            "NOREPLICATION NOBYPASSRLS"
-                        ).format(identifier)
-                    )
-                    cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(identifier))
-                    cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier))
-
-                cur.execute(
-                    "SELECT parent.rolname AS parent_role,member.rolname AS member_role "
-                    "FROM pg_auth_members membership JOIN pg_roles parent ON parent.oid=membership.roleid "
-                    "JOIN pg_roles member ON member.oid=membership.member WHERE member.rolname=ANY(%s)",
-                    ([reader_role, writer_role],),
+                return ensure_brain_candidate_roles_in_transaction(
+                    cur,
+                    reader_role=reader_role,
+                    writer_role=writer_role,
+                    reader_approved_grantees=reader_approved_grantees,
+                    writer_approved_grantees=writer_approved_grantees,
                 )
-                for membership in cur.fetchall():
-                    cur.execute(sql.SQL("REVOKE {} FROM {}").format(
-                        sql.Identifier(membership["parent_role"]), sql.Identifier(membership["member_role"])
-                    ))
-                cur.execute(
-                    "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' ESCAPE '\\' "
-                    "AND nspname <> 'information_schema'"
-                )
-                namespaces = [row["nspname"] for row in cur.fetchall()]
-                cur.execute(
-                    "SELECT n.nspname,t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
-                    "WHERE n.nspname=ANY(%s) AND t.typtype IN ('c','d','e','r','m') "
-                    "ORDER BY n.nspname,t.typname",
-                    (namespaces,),
-                )
-                grantable_types = [(row["nspname"], row["typname"]) for row in cur.fetchall()]
-                cur.execute(
-                    "SELECT object_kind,object_name FROM ("
-                    "SELECT 'relation' AS object_kind,format('%%I.%%I',n.nspname,c.relname) AS object_name "
-                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                    "WHERE c.relowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
-                    "UNION ALL SELECT 'function',format('%%I.%%I',n.nspname,p.proname) "
-                    "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
-                    "WHERE p.proowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
-                    "UNION ALL SELECT 'schema',n.nspname FROM pg_namespace n "
-                    "WHERE n.nspowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
-                    "UNION ALL SELECT 'type',format('%%I.%%I',n.nspname,t.typname) "
-                    "FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
-                    "WHERE t.typowner IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) "
-                    "UNION ALL SELECT 'database',d.datname FROM pg_database d "
-                    "WHERE d.datdba IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))"
-                    ") owned ORDER BY object_kind,object_name",
-                    ([reader_role, writer_role],) * 5,
-                )
-                owned_objects = [f"{row['object_kind']}:{row['object_name']}" for row in cur.fetchall()]
-                if owned_objects:
-                    raise RuntimeError(
-                        "candidate roles must not own database objects: " + ", ".join(owned_objects)
-                    )
-                cur.execute("SELECT current_database() AS database_name")
-                database = sql.Identifier(cur.fetchone()["database_name"])
-                for role_name in (reader_role, writer_role):
-                    identifier = sql.Identifier(role_name)
-                    cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(database, identifier))
-                    for namespace in namespaces:
-                        schema_name = sql.Identifier(namespace)
-                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} FROM {}").format(
-                            schema_name, identifier
-                        ))
-                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(
-                            schema_name, identifier
-                        ))
-                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM {}").format(
-                            schema_name, identifier
-                        ))
-                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA {} FROM {}").format(schema_name, identifier))
-                    for namespace, type_name in grantable_types:
-                        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TYPE {}.{} FROM {}").format(
-                            sql.Identifier(namespace), sql.Identifier(type_name), identifier
-                        ))
-                cur.execute(
-                    "SELECT owner.rolname AS owner_role,n.nspname AS schema_name,da.defaclobjtype "
-                    "FROM pg_default_acl da JOIN pg_roles owner ON owner.oid=da.defaclrole "
-                    "LEFT JOIN pg_namespace n ON n.oid=da.defaclnamespace CROSS JOIN LATERAL aclexplode(da.defaclacl) acl "
-                    "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))",
-                    ([reader_role, writer_role],),
-                )
-                default_acl_kinds = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES", "n": "SCHEMAS"}
-                for default_acl in cur.fetchall():
-                    for role_name in (reader_role, writer_role):
-                        cur.execute(
-                            sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} {} REVOKE ALL ON {} FROM {}").format(
-                                sql.Identifier(default_acl["owner_role"]),
-                                sql.SQL("") if default_acl["schema_name"] is None else sql.SQL("IN SCHEMA {} ").format(sql.Identifier(default_acl["schema_name"])),
-                                sql.SQL(default_acl_kinds[default_acl["defaclobjtype"]]),
-                                sql.Identifier(role_name),
-                            )
-                        )
-                for role_name in (reader_role, writer_role):
-                    cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role_name)))
-
-                for relation in _CANDIDATE_ALL_RELATIONS:
-                    cur.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",))
-                    if cur.fetchone()["relation"] is None:
-                        continue
-                    table = sql.SQL("public.{}").format(sql.Identifier(relation))
-                    cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}, {}").format(
-                        table, sql.Identifier(reader_role), sql.Identifier(writer_role)
-                    ))
-                    if relation in _CANDIDATE_READ_RELATIONS:
-                        cur.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, sql.Identifier(reader_role)))
-                cur.execute("SELECT to_regprocedure(%s) AS procedure", (_CANDIDATE_PUBLISH_SIGNATURE,))
-                if cur.fetchone()["procedure"] is not None:
-                    procedure = sql.SQL(_CANDIDATE_PUBLISH_SIGNATURE)
-                    cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {}, {}").format(
-                        procedure, sql.Identifier(reader_role), sql.Identifier(writer_role)
-                    ))
-                    cur.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(procedure, sql.Identifier(writer_role)))
-                cur.execute(
-                    "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
-                    "FROM pg_roles WHERE rolname=ANY(%s)", ([reader_role, writer_role],)
-                )
-                roles = {role["rolname"]: role for role in cur.fetchall()}
-                for role_name in (reader_role, writer_role):
-                    role = roles.get(role_name)
-                    if role is None or any(
-                        role[key]
-                        for key in ("rolcanlogin", "rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-                    ):
-                        raise RuntimeError(f"candidate role attributes invalid for {role_name}")
-                cur.execute("SELECT rolcreaterole FROM pg_roles WHERE rolname='brain_schema_migrator'")
-                migrator = cur.fetchone()
-                if migrator is not None and migrator["rolcreaterole"]:
-                    raise RuntimeError("brain_schema_migrator must not retain CREATEROLE")
-        return CandidateRoleReconciliationReceipt(
-            reader_role=reader_role,
-            writer_role=writer_role,
-            reconciled_at=datetime.now(timezone.utc).isoformat(),
-        )
     except BaseException:
         conn.rollback()
         raise
+
+
+def _install_brain_authority_in_transaction(
+    cur,
+    *,
+    topology: BootstrapTopology,
+) -> CandidateRoleReconciliationReceipt:
+    """Install the fixed authority schema; callers cannot inject bootstrap SQL."""
+    if topology.migrator_role != "brain_schema_migrator":
+        raise RuntimeError("atomic authority installation requires fixed brain_schema_migrator role")
+    if topology.verifier_role != "brain_schema_verifier":
+        raise RuntimeError("atomic authority installation requires fixed brain_schema_verifier role")
+
+    # Import locally to keep the fleet role module independent during ordinary runtime use.
+    from applypilot.brain.schema import (
+        ensure_brain_schema_v5_in_transaction,
+        verify_brain_schema_v5_in_transaction,
+    )
+
+    candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
+    cur.execute("SELECT session_user AS session_name,current_database() AS database_name")
+    identity = cur.fetchone()
+    session_user = sql.Identifier(_row_value(identity, "session_name"))
+    session_name = _row_value(identity, "session_name")
+    database = sql.Identifier(_row_value(identity, "database_name", 1))
+    migrator = sql.Identifier(topology.migrator_role)
+
+    # The provider identity receives migration authority only for this transaction.
+    cur.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_auth_members membership "
+        "WHERE membership.roleid=(SELECT oid FROM pg_roles WHERE rolname=%s) "
+        "AND membership.member=(SELECT oid FROM pg_roles WHERE rolname=%s)) AS present",
+        (topology.migrator_role, session_name),
+    )
+    membership_preexisted = bool(_row_value(cur.fetchone(), "present"))
+    cur.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_database database "
+        "CROSS JOIN LATERAL aclexplode(database.datacl) acl "
+        "WHERE database.datname=current_database() "
+        "AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s) "
+        "AND acl.privilege_type='CREATE') AS present",
+        (topology.migrator_role,),
+    )
+    create_preexisted = bool(_row_value(cur.fetchone(), "present"))
+    if not create_preexisted:
+        cur.execute(sql.SQL("GRANT CREATE ON DATABASE {} TO {}").format(database, migrator))
+    if not membership_preexisted:
+        cur.execute(sql.SQL("GRANT {} TO {}").format(migrator, session_user))
+    ensure_brain_schema_v5_in_transaction(cur)
+    cur.execute("SET LOCAL ROLE NONE")
+    if not membership_preexisted:
+        cur.execute(sql.SQL("REVOKE {} FROM {}").format(migrator, session_user))
+    if not create_preexisted:
+        cur.execute(sql.SQL("REVOKE CREATE ON DATABASE {} FROM {}").format(database, migrator))
+
+    candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
+    verify_brain_schema_v5_in_transaction(cur)
+    for capability in ("brain_policy_controller",):
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (capability,))
+        if cur.fetchone() is None:
+            raise RuntimeError(f"fixed authority installer did not create {capability}")
+        cur.execute(
+            sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
+                sql.Identifier(capability), sql.Identifier(topology.controller_role)
+            )
+        )
+    return candidate_roles
 
 
 def _bootstrap_object_rollback_sql(cur, ownership: tuple[dict[str, Any], ...]) -> str:
@@ -2101,18 +2496,14 @@ def _bootstrap_object_rollback_sql(cur, ownership: tuple[dict[str, Any], ...]) -
         object_kind = item["object_kind"]
         owner = sql.Identifier(item["owner_before"])
         if object_kind == "schema":
-            statement = sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(
-                sql.Identifier(item["schema_name"]), owner
-            )
+            statement = sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(sql.Identifier(item["schema_name"]), owner)
         elif object_kind in {"function", "procedure"}:
             identity = sql.SQL("{}.{}({})").format(
                 sql.Identifier(item["schema_name"]),
                 sql.Identifier(item["object_name"]),
                 sql.SQL(item["arguments"]),
             )
-            statement = sql.SQL("ALTER {} {} OWNER TO {}").format(
-                sql.SQL(object_kind.upper()), identity, owner
-            )
+            statement = sql.SQL("ALTER {} {} OWNER TO {}").format(sql.SQL(object_kind.upper()), identity, owner)
         else:
             statement = sql.SQL("ALTER {} {} OWNER TO {}").format(
                 sql.SQL(object_kind.upper()),
@@ -2121,6 +2512,293 @@ def _bootstrap_object_rollback_sql(cur, ownership: tuple[dict[str, Any], ...]) -
             )
         statements.append(statement.as_string(cur.connection) + ";")
     return "\n".join(statements) + ("\n" if statements else "")
+
+
+def _forward_v5_deactivation_sql(
+    cur,
+    *,
+    topology: BootstrapTopology,
+    database_name: str,
+    database_owner_before: str,
+    ownership: tuple[dict[str, Any], ...],
+    other_databases: tuple[dict[str, Any], ...],
+) -> str:
+    """Deactivate the combined release while preserving additive authority data."""
+    database = sql.Identifier(database_name).as_string(cur.connection)
+    statements = [
+        sql.SQL("REVOKE {} FROM {};")
+        .format(sql.Identifier("brain_policy_controller"), sql.Identifier(topology.controller_role))
+        .as_string(cur.connection),
+        sql.SQL("ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;")
+        .format(sql.Identifier(topology.controller_role))
+        .as_string(cur.connection),
+        f"REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {database} FROM PUBLIC;",
+    ]
+    for role_name in (
+        topology.controller_role,
+        topology.verifier_role,
+        BRAIN_CANDIDATE_READER_ROLE,
+        BRAIN_CANDIDATE_WRITER_ROLE,
+    ):
+        statements.append(
+            sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM {};")
+            .format(sql.Identifier(database_name), sql.Identifier(role_name))
+            .as_string(cur.connection)
+        )
+    for signature in (_CANDIDATE_V5_PUBLISH_SIGNATURE, _CANDIDATE_V4_PUBLISH_SIGNATURE):
+        statements.append(
+            sql.SQL("REVOKE ALL PRIVILEGES ON FUNCTION {} FROM {};")
+            .format(sql.SQL(signature), sql.Identifier(BRAIN_CANDIDATE_WRITER_ROLE))
+            .as_string(cur.connection)
+        )
+    statements.append(
+        sql.SQL("ALTER DATABASE {} OWNER TO {};")
+        .format(sql.Identifier(database_name), sql.Identifier(database_owner_before))
+        .as_string(cur.connection)
+    )
+    statements.append(
+        _other_database_connect_rollback_sql(
+            cur,
+            databases=other_databases,
+            infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+        ).rstrip()
+    )
+    statements.append(_bootstrap_object_rollback_sql(cur, ownership).rstrip())
+    return "\n".join(statement for statement in statements if statement) + "\n"
+
+
+def _other_database_inventory(
+    cur,
+    *,
+    infrastructure_superuser_roles: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    cur.execute(
+        "SELECT database.datname AS database_name,owner.rolname AS owner_role,database.datconnlimit "
+        "FROM pg_database database JOIN pg_roles owner ON owner.oid=database.datdba "
+        "WHERE database.datallowconn AND NOT database.datistemplate "
+        "AND database.datname<>current_database() ORDER BY database.datname"
+    )
+    databases = [dict(row) for row in cur.fetchall()]
+    if not databases:
+        return ()
+    database_names = [row["database_name"] for row in databases]
+    cur.execute(
+        "SELECT datname AS database_name,usename AS role_name,count(*) AS session_count "
+        "FROM pg_stat_activity WHERE datname=ANY(%s) AND pid<>pg_backend_pid() "
+        "AND usename IS NOT NULL GROUP BY datname,usename ORDER BY datname,usename",
+        (database_names,),
+    )
+    sessions_by_database: dict[str, list[dict[str, Any]]] = {name: [] for name in database_names}
+    for row in cur.fetchall():
+        session = {
+            "role_name": _row_value(row, "role_name", 1),
+            "session_count": _row_value(row, "session_count", 2),
+        }
+        database_name = _row_value(row, "database_name")
+        sessions_by_database[database_name].append(session)
+
+    cur.execute(
+        "SELECT database.datname AS database_name,"
+        "CASE WHEN acl.grantee=0 THEN 'PUBLIC' ELSE grantee.rolname END AS grantee,"
+        "acl.privilege_type,acl.is_grantable "
+        "FROM pg_database database "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(database.datacl,acldefault('d',database.datdba))) acl "
+        "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE database.datname=ANY(%s) AND acl.privilege_type=ANY(%s) "
+        "ORDER BY database.datname,grantee,acl.privilege_type,acl.is_grantable",
+        (database_names, ["CONNECT", "CREATE", "TEMPORARY"]),
+    )
+    grants_by_database: dict[str, list[dict[str, Any]]] = {name: [] for name in database_names}
+    for row in cur.fetchall():
+        grants_by_database[_row_value(row, "database_name")].append(
+            {
+                "grantee": _row_value(row, "grantee", 1),
+                "privilege": _row_value(row, "privilege_type", 2),
+                "grantable": _row_value(row, "is_grantable", 3),
+            }
+        )
+    return tuple(
+        {
+            "database_name": row["database_name"],
+            "owner_role": row["owner_role"],
+            "connection_limit_before": row["datconnlimit"],
+            "acl_grants_before": tuple(grants_by_database[row["database_name"]]),
+            "connect_grants_before": tuple(
+                grant for grant in grants_by_database[row["database_name"]] if grant["privilege"] == "CONNECT"
+            ),
+            "active_sessions": tuple(sessions_by_database[row["database_name"]]),
+        }
+        for row in databases
+    )
+
+
+def _other_database_connect_rollback_sql(
+    cur,
+    *,
+    databases: tuple[dict[str, Any], ...],
+    infrastructure_superuser_roles: tuple[str, ...],
+) -> str:
+    statements: list[str] = []
+    for database in databases:
+        database_identifier = sql.Identifier(database["database_name"])
+        statements.append(
+            sql.SQL("ALTER DATABASE {} CONNECTION LIMIT {};")
+            .format(database_identifier, sql.Literal(database["connection_limit_before"]))
+            .as_string(cur.connection)
+        )
+        touched_roles = {
+            database["owner_role"],
+            *infrastructure_superuser_roles,
+            *(grant["grantee"] for grant in database["acl_grants_before"] if grant["grantee"] != "PUBLIC"),
+        }
+        statements.append(
+            sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM PUBLIC;")
+            .format(database_identifier)
+            .as_string(cur.connection)
+        )
+        for role_name in sorted(touched_roles):
+            statements.append(
+                sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM {};")
+                .format(database_identifier, sql.Identifier(role_name))
+                .as_string(cur.connection)
+            )
+        for grant in database["acl_grants_before"]:
+            grantee = sql.SQL("PUBLIC") if grant["grantee"] == "PUBLIC" else sql.Identifier(grant["grantee"])
+            statement = sql.SQL("GRANT {} ON DATABASE {} TO {}").format(
+                sql.SQL(grant["privilege"]), database_identifier, grantee
+            )
+            if grant["grantable"]:
+                statement += sql.SQL(" WITH GRANT OPTION")
+            statements.append(statement.as_string(cur.connection) + ";")
+    return "\n".join(statements) + ("\n" if statements else "")
+
+
+def _isolate_other_databases(
+    cur,
+    *,
+    databases: tuple[dict[str, Any], ...],
+    infrastructure_superuser_roles: tuple[str, ...],
+) -> None:
+    for database in databases:
+        database_identifier = sql.Identifier(database["database_name"])
+        allowed = {database["owner_role"], *infrastructure_superuser_roles}
+        cur.execute(sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM PUBLIC").format(database_identifier))
+        for grant in database["acl_grants_before"]:
+            grantee = grant["grantee"]
+            if grantee != "PUBLIC" and grantee not in allowed:
+                cur.execute(
+                    sql.SQL("REVOKE {} ON DATABASE {} FROM {}").format(
+                        sql.SQL(grant["privilege"]), database_identifier, sql.Identifier(grantee)
+                    )
+                )
+        for role_name in sorted(allowed):
+            cur.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(database_identifier, sql.Identifier(role_name))
+            )
+
+
+def _set_other_database_admission_fence(cur, *, databases: tuple[dict[str, Any], ...]) -> None:
+    for database in databases:
+        cur.execute(
+            sql.SQL("ALTER DATABASE {} CONNECTION LIMIT 0").format(sql.Identifier(database["database_name"]))
+        )
+
+
+def _restore_other_database_admission_fence(cur, *, databases: tuple[dict[str, Any], ...]) -> None:
+    for database in databases:
+        cur.execute(
+            sql.SQL("ALTER DATABASE {} CONNECTION LIMIT {}").format(
+                sql.Identifier(database["database_name"]),
+                sql.Literal(database["connection_limit_before"]),
+            )
+        )
+
+
+def _terminate_and_validate_other_database_sessions(
+    cur,
+    *,
+    databases: tuple[dict[str, Any], ...],
+    infrastructure_superuser_roles: tuple[str, ...],
+) -> None:
+    if not databases:
+        return
+    database_names = [database["database_name"] for database in databases]
+    allowed = list(infrastructure_superuser_roles)
+    cur.execute(
+        "SELECT pid,datname,usename,pg_terminate_backend(pid) AS terminated "
+        "FROM pg_stat_activity WHERE datname=ANY(%s) AND pid<>pg_backend_pid() "
+        "AND usename IS NOT NULL AND usename<>ALL(%s) ORDER BY datname,usename,pid",
+        (database_names, allowed),
+    )
+    failed = [
+        f"{row['datname']}:{row['usename']}:{row['pid']}" for row in cur.fetchall() if not row["terminated"]
+    ]
+    cur.execute(
+        "SELECT datname,usename,count(*) AS session_count FROM pg_stat_activity "
+        "WHERE datname=ANY(%s) AND pid<>pg_backend_pid() AND usename IS NOT NULL "
+        "AND usename<>ALL(%s) GROUP BY datname,usename ORDER BY datname,usename",
+        (database_names, allowed),
+    )
+    survivors = [f"{row['datname']}:{row['usename']}:{row['session_count']}" for row in cur.fetchall()]
+    if failed or survivors:
+        raise RuntimeError(
+            "cross-database admission fence could not clear non-breakglass sessions: "
+            f"failed={failed!r}, survivors={survivors!r}"
+        )
+
+
+def _validate_other_database_fence(cur, *, databases: tuple[dict[str, Any], ...]) -> None:
+    if not databases:
+        return
+    cur.execute(
+        "SELECT datname,datconnlimit FROM pg_database WHERE datname=ANY(%s) AND datconnlimit<>0 ORDER BY datname",
+        ([database["database_name"] for database in databases],),
+    )
+    violations = [f"{row['datname']}:{row['datconnlimit']}" for row in cur.fetchall()]
+    if violations:
+        raise RuntimeError("cross-database admission fence changed before bootstrap commit: " + ", ".join(violations))
+
+
+def _validate_other_database_isolation(
+    cur,
+    *,
+    databases: tuple[dict[str, Any], ...],
+    topology: BootstrapTopology,
+) -> None:
+    protected_roles = (
+        topology.controller_role,
+        topology.verifier_role,
+        topology.migrator_role,
+        "brain_status_reader",
+        "brain_policy_controller",
+        BRAIN_CANDIDATE_READER_ROLE,
+        BRAIN_CANDIDATE_WRITER_ROLE,
+    )
+    violations: list[str] = []
+    for database in databases:
+        cur.execute(
+            "SELECT acl.privilege_type FROM pg_database database "
+            "CROSS JOIN LATERAL aclexplode(COALESCE(database.datacl,acldefault('d',database.datdba))) acl "
+            "WHERE database.datname=%s AND acl.grantee=0 AND acl.privilege_type=ANY(%s)",
+            (database["database_name"], ["CONNECT", "CREATE", "TEMPORARY"]),
+        )
+        violations.extend(
+            f"{database['database_name']}:PUBLIC:{row['privilege_type']}" for row in cur.fetchall()
+        )
+        for role_name in protected_roles:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,))
+            if cur.fetchone() is None:
+                continue
+            cur.execute(
+                "SELECT has_database_privilege(%s,%s,'CONNECT') AS allowed",
+                (role_name, database["database_name"]),
+            )
+            if _row_value(cur.fetchone(), "allowed"):
+                violations.append(f"{database['database_name']}:{role_name}")
+    if violations:
+        raise RuntimeError(
+            "controller or brain capability retains CONNECT to another database: " + ", ".join(violations)
+        )
 
 
 def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
@@ -2146,9 +2824,7 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
         raise RuntimeError("bootstrap requires at least one retired provider-admin role")
     if permanent_roles & set(topology.retired_admin_roles):
         raise RuntimeError("permanent topology roles must be disjoint from retired admins")
-    if set(topology.infrastructure_superuser_roles) & (
-        permanent_roles | set(topology.retired_admin_roles)
-    ):
+    if set(topology.infrastructure_superuser_roles) & (permanent_roles | set(topology.retired_admin_roles)):
         raise RuntimeError("infrastructure superusers must be disjoint from managed topology roles")
 
     cur.execute(
@@ -2195,14 +2871,11 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
     if missing_infrastructure:
         raise RuntimeError("infrastructure superuser roles do not exist: " + ", ".join(missing_infrastructure))
     unsafe_infrastructure = sorted(
-        name
-        for name in infrastructure
-        if not role_index[name]["can_login"] or not role_index[name]["superuser"]
+        name for name in infrastructure if not role_index[name]["can_login"] or not role_index[name]["superuser"]
     )
     if unsafe_infrastructure:
         raise RuntimeError(
-            "infrastructure break-glass roles must be LOGIN SUPERUSER roles: "
-            + ", ".join(unsafe_infrastructure)
+            "infrastructure break-glass roles must be LOGIN SUPERUSER roles: " + ", ".join(unsafe_infrastructure)
         )
     unknown_superusers = sorted(
         item["role_name"]
@@ -2224,8 +2897,7 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
     missing_services = sorted(expected_services - set(active_services))
     if unknown_services or missing_services:
         raise RuntimeError(
-            "bootstrap active service inventory mismatch: "
-            f"unknown={unknown_services!r}, missing={missing_services!r}"
+            f"bootstrap active service inventory mismatch: unknown={unknown_services!r}, missing={missing_services!r}"
         )
 
     cur.execute(
@@ -2236,19 +2908,14 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
         "AND (acl.grantee=0 OR acl.grantee<>d.datdba) ORDER BY grantee"
     )
     direct_connect = tuple(_row_value(row, "grantee") for row in cur.fetchall())
-    unknown_connect = sorted(
-        set(direct_connect)
-        - {"PUBLIC"}
-        - set(topology.retired_admin_roles)
-        - infrastructure
-    )
+    unknown_connect = sorted(set(direct_connect) - {"PUBLIC"} - set(topology.retired_admin_roles) - infrastructure)
     if unknown_connect:
-        raise RuntimeError(
-            "unknown explicit CONNECT dependencies block bootstrap: " + ", ".join(unknown_connect)
-        )
+        raise RuntimeError("unknown explicit CONNECT dependencies block bootstrap: " + ", ".join(unknown_connect))
 
-    ownership = _transfer_application_ownership(
-        cur, new_owner_role=topology.migrator_role, apply=False
+    ownership = _transfer_application_ownership(cur, new_owner_role=topology.migrator_role, apply=False)
+    other_databases = _other_database_inventory(
+        cur,
+        infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
     )
     return {
         "session_user": session_user,
@@ -2258,19 +2925,20 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
         "active_services": active_services,
         "direct_connect_before": direct_connect,
         "application_ownership": ownership,
+        "other_connectable_databases": other_databases,
     }
 
 
 def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[dict[str, Any], ...]:
     expected_attributes = {
-        topology.database_owner_role: (False, False, False, False, False, False),
-        topology.migrator_role: (False, False, False, False, False, False),
-        topology.verifier_role: (False, False, False, False, False, False),
-        topology.controller_role: (True, False, False, True, False, False),
+        topology.database_owner_role: (False, False, False, False, False, False, False),
+        topology.migrator_role: (False, False, False, False, False, False, False),
+        topology.verifier_role: (False, False, False, False, False, False, False),
+        topology.controller_role: (True, False, False, False, False, False, False),
     }
     for role_name, expected in expected_attributes.items():
         cur.execute(
-            "SELECT rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+            "SELECT rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
             "FROM pg_roles WHERE rolname=%s",
             (role_name,),
         )
@@ -2278,11 +2946,32 @@ def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[d
         actual = tuple(
             _row_value(row, name, index)
             for index, name in enumerate(
-                ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+                (
+                    "rolcanlogin",
+                    "rolinherit",
+                    "rolsuper",
+                    "rolcreatedb",
+                    "rolcreaterole",
+                    "rolreplication",
+                    "rolbypassrls",
+                )
             )
         )
         if actual != expected:
             raise RuntimeError(f"bootstrap role attributes invalid for {role_name}: {actual!r}")
+    cur.execute(
+        "SELECT role_name FROM unnest(%s::text[]) role_name "
+        "WHERE pg_has_role(%s,role_name,'MEMBER') ORDER BY role_name",
+        (
+            [topology.database_owner_role, topology.migrator_role],
+            topology.controller_role,
+        ),
+    )
+    forbidden_memberships = [_row_value(row, "role_name") for row in cur.fetchall()]
+    if forbidden_memberships:
+        raise RuntimeError(
+            "persistent controller retains owner or migrator membership: " + ", ".join(forbidden_memberships)
+        )
     for role_name in topology.retired_admin_roles:
         cur.execute(
             "SELECT rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
@@ -2327,9 +3016,18 @@ def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[d
     }
     if actual_connect != expected_connect:
         raise RuntimeError(
-            "bootstrap CONNECT ACL mismatch: "
-            f"expected={sorted(expected_connect)!r}, actual={sorted(actual_connect)!r}"
+            f"bootstrap CONNECT ACL mismatch: expected={sorted(expected_connect)!r}, actual={sorted(actual_connect)!r}"
         )
+    cur.execute(
+        "SELECT acl.privilege_type FROM pg_database d "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) acl "
+        "WHERE d.datname=current_database() AND acl.grantee=0 "
+        "AND acl.privilege_type=ANY(%s) ORDER BY acl.privilege_type",
+        (["CONNECT", "CREATE", "TEMPORARY"],),
+    )
+    public_privileges = [_row_value(row, "privilege_type") for row in cur.fetchall()]
+    if public_privileges:
+        raise RuntimeError("bootstrap PUBLIC database privileges remain: " + ", ".join(public_privileges))
     effective = _effective_connect_grantees(cur)
     reconnect = {row["role_name"] for row in effective if row["reconnect_capable"]}
     expected_reconnect = {topology.controller_role, *topology.infrastructure_superuser_roles}
@@ -2346,23 +3044,26 @@ def bootstrap_database_roles(
     controller_password: str,
     *,
     topology: BootstrapTopology,
-    evidence_writer: Callable[[Mapping[str, Any], str], None] | None,
+    evidence_paths: DurableEvidencePaths,
+    install_brain_authority: bool = False,
 ) -> BootstrapReceipt:
-    """One-time provider-admin bootstrap with pre-mutation durable evidence."""
-    if evidence_writer is None:
-        raise RuntimeError("durable bootstrap evidence writer is required")
+    """Perform a fenced role handoff and optional fixed authority install."""
+    _validate_evidence_paths(evidence_paths)
+    if conn.autocommit:
+        raise RuntimeError("atomic bootstrap requires autocommit to be disabled")
     if conn.info.transaction_status.name != "IDLE":
         raise RuntimeError("bootstrap requires an idle provider-admin connection")
-    verifier = _client_scram_verifier(
-        conn, role_name=topology.controller_role, password=controller_password
-    )
+    verifier = _client_scram_verifier(conn, role_name=topology.controller_role, password=controller_password)
+    fence_active = False
+    lock_acquired = False
     try:
         with conn.cursor() as cur:
-            cur.execute("SET LOCAL search_path=pg_catalog")
             cur.execute(
-                "SELECT pg_advisory_xact_lock(pg_catalog.hashtext(%s))",
+                "SELECT pg_advisory_lock(pg_catalog.hashtext(%s))",
                 ("applypilot:fleet-role-bootstrap:v1",),
             )
+            lock_acquired = True
+            cur.execute("SET LOCAL search_path=pg_catalog")
             inventory = _bootstrap_inventory(cur, topology=topology)
             connect_allowlist = (
                 topology.database_owner_role,
@@ -2370,104 +3071,141 @@ def bootstrap_database_roles(
                 topology.verifier_role,
                 *topology.infrastructure_superuser_roles,
             )
-            rollback_sql = _public_acl_rollback_sql(
-                cur,
-                connect_allowlist=connect_allowlist,
-                database_owner_before=inventory["database_owner_before"],
-                database_owner_after=topology.database_owner_role,
-                retired_admin_roles=topology.retired_admin_roles,
-            )
-            rollback_sql += _bootstrap_object_rollback_sql(
-                cur, inventory["application_ownership"]
-            )
-            for granted_role in (topology.database_owner_role, topology.migrator_role):
-                rollback_sql += sql.SQL("REVOKE {} FROM {};\n").format(
-                    sql.Identifier(granted_role), sql.Identifier(topology.controller_role)
-                ).as_string(conn)
-            for role_name in (
-                topology.controller_role,
-                topology.verifier_role,
-                topology.migrator_role,
-                topology.database_owner_role,
-            ):
-                rollback_sql += sql.SQL("DROP OWNED BY {};\nDROP ROLE {};\n").format(
-                    sql.Identifier(role_name), sql.Identifier(role_name)
-                ).as_string(conn)
+            rollback_mode = "forward_v5_deactivation" if install_brain_authority else "topology_exact"
+            if install_brain_authority:
+                rollback_sql = _forward_v5_deactivation_sql(
+                    cur,
+                    topology=topology,
+                    database_name=inventory["database_name"],
+                    database_owner_before=inventory["database_owner_before"],
+                    ownership=inventory["application_ownership"],
+                    other_databases=inventory["other_connectable_databases"],
+                )
+            else:
+                rollback_sql = _public_acl_rollback_sql(
+                    cur,
+                    connect_allowlist=connect_allowlist,
+                    database_owner_before=inventory["database_owner_before"],
+                    database_owner_after=topology.database_owner_role,
+                    retired_admin_roles=topology.retired_admin_roles,
+                )
+                rollback_sql += _other_database_connect_rollback_sql(
+                    cur,
+                    databases=inventory["other_connectable_databases"],
+                    infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+                )
+                rollback_sql += _bootstrap_object_rollback_sql(cur, inventory["application_ownership"])
+                for role_name in (
+                    topology.controller_role,
+                    topology.verifier_role,
+                    topology.migrator_role,
+                    topology.database_owner_role,
+                ):
+                    rollback_sql += (
+                        sql.SQL("DROP OWNED BY {};\nDROP ROLE {};\n")
+                        .format(sql.Identifier(role_name), sql.Identifier(role_name))
+                        .as_string(conn)
+                    )
 
             prepared_at = datetime.now(timezone.utc).isoformat()
-            evidence_writer(
-                {
-                    **inventory,
-                    "topology": {
-                        "database_owner_role": topology.database_owner_role,
-                        "controller_role": topology.controller_role,
-                        "verifier_role": topology.verifier_role,
-                        "migrator_role": topology.migrator_role,
-                        "retired_admin_roles": topology.retired_admin_roles,
-                        "infrastructure_superuser_roles": topology.infrastructure_superuser_roles,
-                    },
-                    "prepared_at": prepared_at,
-                    "escalation_required": False,
+            prepared_inventory = {
+                **inventory,
+                "atomic_bootstrap": True,
+                "automatic_rollback_supported": True,
+                "rollback_mode": rollback_mode,
+                "commit_outcome_on_interruption": "unknown",
+                "legacy_rollback_sql_recovers_v1_v4": False,
+                "legacy_rollback_sql_recovers_v1_v5": False,
+                "topology": {
+                    "database_owner_role": topology.database_owner_role,
+                    "controller_role": topology.controller_role,
+                    "verifier_role": topology.verifier_role,
+                    "migrator_role": topology.migrator_role,
+                    "retired_admin_roles": topology.retired_admin_roles,
+                    "infrastructure_superuser_roles": topology.infrastructure_superuser_roles,
                 },
-                rollback_sql,
+                "prepared_at": prepared_at,
+                "authority_install_requested": install_brain_authority,
+                "escalation_required": install_brain_authority,
+            }
+            _write_preparation_evidence(
+                evidence_paths,
+                inventory=prepared_inventory,
+                rollback_sql=rollback_sql,
+            )
+            _set_other_database_admission_fence(cur, databases=inventory["other_connectable_databases"])
+        conn.commit()
+        fence_active = bool(inventory["other_connectable_databases"])
+
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL search_path=pg_catalog")
+            _terminate_and_validate_other_database_sessions(
+                cur,
+                databases=inventory["other_connectable_databases"],
+                infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+            )
+            _isolate_other_databases(
+                cur,
+                databases=inventory["other_connectable_databases"],
+                infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
             )
 
             cur.execute(
                 sql.SQL(
-                    "CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                    "CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
                 ).format(sql.Identifier(topology.database_owner_role))
             )
             cur.execute(
                 sql.SQL(
-                    "CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                    "CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
                 ).format(sql.Identifier(topology.migrator_role))
             )
             cur.execute(
                 sql.SQL(
-                    "CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                    "CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
                 ).format(sql.Identifier(topology.verifier_role))
             )
             cur.execute(
                 sql.SQL(
-                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION "
+                    "CREATE ROLE {} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION "
                     "NOBYPASSRLS PASSWORD {}"
                 ).format(sql.Identifier(topology.controller_role), sql.Literal(verifier))
             )
-            for granted_role in (topology.database_owner_role, topology.migrator_role):
-                cur.execute(
-                    sql.SQL("GRANT {} TO {}").format(
-                        sql.Identifier(granted_role), sql.Identifier(topology.controller_role)
-                    )
-                )
             _transfer_application_ownership(cur, new_owner_role=topology.migrator_role)
             database = sql.Identifier(inventory["database_name"])
             cur.execute(
-                sql.SQL("ALTER DATABASE {} OWNER TO {}").format(
-                    database, sql.Identifier(topology.database_owner_role)
-                )
+                sql.SQL("ALTER DATABASE {} OWNER TO {}").format(database, sql.Identifier(topology.database_owner_role))
             )
-            cur.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(database))
+            cur.execute(sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM PUBLIC").format(database))
             for role_name in topology.retired_admin_roles:
                 cur.execute(
-                    sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(
-                        database, sql.Identifier(role_name)
-                    )
+                    sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(database, sql.Identifier(role_name))
                 )
             for role_name in connect_allowlist:
-                cur.execute(
-                    sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-                        database, sql.Identifier(role_name)
-                    )
-                )
+                cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(database, sql.Identifier(role_name)))
             for role_name in topology.retired_admin_roles:
                 cur.execute(
                     sql.SQL(
-                        "ALTER ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
-                        "NOREPLICATION NOBYPASSRLS"
+                        "ALTER ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
                     ).format(sql.Identifier(role_name))
                 )
+            if install_brain_authority:
+                _install_brain_authority_in_transaction(cur, topology=topology)
+            _validate_other_database_isolation(
+                cur,
+                databases=inventory["other_connectable_databases"],
+                topology=topology,
+            )
             effective = _validate_bootstrap_boundary(cur, topology=topology)
+            _validate_other_database_fence(cur, databases=inventory["other_connectable_databases"])
+            _terminate_and_validate_other_database_sessions(
+                cur,
+                databases=inventory["other_connectable_databases"],
+                infrastructure_superuser_roles=topology.infrastructure_superuser_roles,
+            )
+            _restore_other_database_admission_fence(cur, databases=inventory["other_connectable_databases"])
         conn.commit()
+        fence_active = False
         return BootstrapReceipt(
             database_name=inventory["database_name"],
             session_user=inventory["session_user"],
@@ -2479,15 +3217,37 @@ def bootstrap_database_roles(
                 "retired_admin_roles": topology.retired_admin_roles,
                 "infrastructure_superuser_roles": topology.infrastructure_superuser_roles,
             },
-            inventory=inventory,
+            inventory=prepared_inventory,
             effective_connect_grantees=effective,
             rollback_sql=rollback_sql,
-            escalation_required=False,
+            escalation_required=install_brain_authority,
             bootstrapped_at=prepared_at,
         )
     except BaseException:
         conn.rollback()
+        if fence_active:
+            try:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        _restore_other_database_admission_fence(
+                            cur, databases=inventory["other_connectable_databases"]
+                        )
+                fence_active = False
+            except BaseException as recovery_error:
+                raise RuntimeError(
+                    "bootstrap failed and the cross-database admission fence could not be restored; "
+                    "execute the authenticated rollback receipt"
+                ) from recovery_error
         raise
+    finally:
+        if lock_acquired:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_unlock(pg_catalog.hashtext(%s))",
+                    ("applypilot:fleet-role-bootstrap:v1",),
+                )
+            conn.commit()
 
 
 def ensure_fleet_worker_role(
@@ -2498,7 +3258,8 @@ def ensure_fleet_worker_role(
     worker_id: str | None = None,
     contract: str | None = None,
     regrant_manifest: RegrantManifest | None = None,
-    evidence_writer: Callable[[Mapping[str, Any], str], None] | None = None,
+    evidence_paths: DurableEvidencePaths | None = None,
+    approved_grantee_roles: tuple[str, ...] = (),
 ) -> RoleReconciliationReceipt:
     """Create or reconcile the remote-worker role on the current database.
 
@@ -2510,8 +3271,9 @@ def ensure_fleet_worker_role(
         raise ValueError(f"unsupported fleet worker contract: {contract}")
     if regrant_manifest is None:
         raise RuntimeError("explicit regrant manifest is required before database-wide ACL changes")
-    if evidence_writer is None:
-        raise RuntimeError("durable evidence writer is required before database hardening")
+    if evidence_paths is None:
+        raise RuntimeError("durable evidence paths are required before database hardening")
+    _validate_evidence_paths(evidence_paths)
     if conn.info.transaction_status.name != "IDLE":
         raise RuntimeError("role reconciliation requires an idle connection for its single transaction")
     password_verifier = _client_scram_verifier(conn, role_name=role, password=password)
@@ -2559,12 +3321,8 @@ def ensure_fleet_worker_role(
                     raise RuntimeError("fleet worker role is already mapped to a different node identity")
                 if contract is not None and contract != mapped_contract:
                     raise RuntimeError("fleet worker role is already mapped to a different contract")
-            effective_worker = worker_id or (
-                existing_principal["worker_id"] if existing_principal else None
-            )
-            effective_contract = contract or (
-                existing_principal["contract"] if existing_principal else None
-            )
+            effective_worker = worker_id or (existing_principal["worker_id"] if existing_principal else None)
+            effective_contract = contract or (existing_principal["contract"] if existing_principal else None)
             if not effective_worker or not effective_contract:
                 raise RuntimeError("fleet worker principal mapping is required before LOGIN can be enabled")
             functions = _functions_for_contract(effective_contract)
@@ -2603,7 +3361,11 @@ def ensure_fleet_worker_role(
                 "contract": effective_contract,
                 "prepared_at": prepared_at,
             }
-            evidence_writer(evidence_inventory, rollback_sql)
+            _write_preparation_evidence(
+                evidence_paths,
+                inventory=evidence_inventory,
+                rollback_sql=rollback_sql,
+            )
 
             if not role_exists:
                 cur.execute(sql.SQL("CREATE ROLE {}").format(role_identifier))
@@ -2615,7 +3377,11 @@ def ensure_fleet_worker_role(
                 retired_admin_roles=regrant_manifest.retired_admin_roles,
             )
             _revoke_legacy_privileges(cur, role=role_identifier, database=database)
-            _revoke_memberships(cur, role_name=role, role=role_identifier)
+            _reconcile_role_memberships(
+                cur,
+                role_name=role,
+                approved_grantee_roles=approved_grantee_roles,
+            )
             cur.execute(sql.SQL("ALTER ROLE {} NOLOGIN NOINHERIT").format(role_identifier))
             cur.execute(
                 "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
@@ -2660,6 +3426,7 @@ def ensure_fleet_worker_role(
                 database_owner_role=regrant_manifest.database_owner_role,
                 retired_admin_roles=regrant_manifest.retired_admin_roles,
                 break_glass_roles=regrant_manifest.infrastructure_superuser_roles,
+                approved_grantee_roles=approved_grantee_roles,
             )
         conn.commit()
         return RoleReconciliationReceipt(

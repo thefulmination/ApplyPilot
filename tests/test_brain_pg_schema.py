@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import os
 from pathlib import Path
 import sqlite3
 from threading import Barrier
@@ -24,7 +25,14 @@ from applypilot.brain.sqlite_to_postgres import (
     _release_import_context,
     BrainImportError,
 )
-from applypilot.fleet import schema as fleet_schema
+from applypilot.fleet import pg_roles, schema as fleet_schema
+from conftest import (
+    DISPOSABLE_CLUSTER_COMMENT_PREFIX,
+    DISPOSABLE_CLUSTER_MARKER_ENV,
+    DISPOSABLE_CLUSTER_MARKER_ROLE,
+    DISPOSABLE_DATABASE_COMMENT,
+    require_disposable_postgres,
+)
 
 
 def _bootstrap_script_module():
@@ -93,11 +101,145 @@ TEST_ROLES = (
     "linkedin_worker_role",
     "brain_rogue_writer",
 )
+FIXED_BRAIN_ROLES = (
+    "brain_candidate_reader",
+    "brain_candidate_writer",
+    "brain_status_reader",
+    "brain_policy_controller",
+    "brain_schema_verifier",
+    "brain_schema_migrator",
+)
 HASHES = tuple(character * 64 for character in "abcdef0123456789")
 
 
-def _cleanup(dsn: str) -> None:
+def _drop_fixed_role(conn, role: str) -> None:
+    column_acls = conn.execute(
+        "SELECT n.nspname,c.relname,a.attname,acl.privilege_type,grantor.rolname AS grantor "
+        "FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "CROSS JOIN LATERAL aclexplode(a.attacl) acl "
+        "JOIN pg_roles grantor ON grantor.oid=acl.grantor "
+        "WHERE a.attnum>0 AND NOT a.attisdropped "
+        "AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s)",
+        (role,),
+    ).fetchall()
+    for acl in column_acls:
+        conn.execute(pg_sql.SQL("SET LOCAL ROLE {}").format(pg_sql.Identifier(acl["grantor"])))
+        conn.execute(
+            pg_sql.SQL("REVOKE {} ({}) ON TABLE {}.{} FROM {} CASCADE").format(
+                pg_sql.SQL(acl["privilege_type"]),
+                pg_sql.Identifier(acl["attname"]),
+                pg_sql.Identifier(acl["nspname"]),
+                pg_sql.Identifier(acl["relname"]),
+                pg_sql.Identifier(role),
+            )
+        )
+        conn.execute("RESET ROLE")
+    conn.execute(pg_sql.SQL("DROP OWNED BY {} CASCADE").format(pg_sql.Identifier(role)))
+    conn.execute(pg_sql.SQL("DROP ROLE {}").format(pg_sql.Identifier(role)))
+
+
+def test_fixed_role_cleanup_requires_environment_and_database_markers(fleet_db, monkeypatch):
+    with psycopg.connect(fleet_db, row_factory=dict_row) as conn:
+        monkeypatch.delenv("APPLYPILOT_PGTEST_DISPOSABLE", raising=False)
+        with pytest.raises(RuntimeError, match="APPLYPILOT_PGTEST_DISPOSABLE"):
+            require_disposable_postgres(conn)
+
+        monkeypatch.setenv("APPLYPILOT_PGTEST_DISPOSABLE", "1")
+        database_name = conn.execute("SELECT current_database() AS name").fetchone()["name"]
+        conn.execute(pg_sql.SQL("COMMENT ON DATABASE {} IS 'wrong-marker'").format(pg_sql.Identifier(database_name)))
+        conn.commit()
+        try:
+            with pytest.raises(RuntimeError, match="exact disposable database comment"):
+                require_disposable_postgres(conn)
+        finally:
+            conn.execute(
+                pg_sql.SQL("COMMENT ON DATABASE {} IS {}").format(
+                    pg_sql.Identifier(database_name),
+                    pg_sql.Literal(DISPOSABLE_DATABASE_COMMENT),
+                )
+            )
+            conn.commit()
+        cluster_nonce = os.environ[DISPOSABLE_CLUSTER_MARKER_ENV]
+        monkeypatch.delenv(DISPOSABLE_CLUSTER_MARKER_ENV)
+        with pytest.raises(RuntimeError, match="cluster marker nonce"):
+            require_disposable_postgres(conn)
+        monkeypatch.setenv(DISPOSABLE_CLUSTER_MARKER_ENV, cluster_nonce)
+        require_disposable_postgres(conn)
+
+
+def test_cluster_cleanup_rejects_another_connectable_database(fleet_db):
+    other_database = "applypilot_shared_cluster_probe"
+    with psycopg.connect(fleet_db, row_factory=dict_row, autocommit=True) as conn:
+        require_disposable_postgres(conn)
+        conn.execute(pg_sql.SQL("CREATE DATABASE {}").format(pg_sql.Identifier(other_database)))
+        try:
+            with pytest.raises(RuntimeError, match="no other connectable databases"):
+                require_disposable_postgres(conn)
+        finally:
+            conn.execute(pg_sql.SQL("DROP DATABASE {} WITH (FORCE)").format(pg_sql.Identifier(other_database)))
+        require_disposable_postgres(conn)
+
+
+def test_unprivileged_login_cannot_forge_disposable_cluster_or_database_markers(fleet_db):
+    role_name = "disposable_marker_forgery_test"
+    password = "disposable-marker-forgery-password"
+    forged_role = "forged_disposable_cluster_marker"
+    with psycopg.connect(fleet_db, row_factory=dict_row) as provider:
+        require_disposable_postgres(provider)
+        database_name = provider.execute("SELECT current_database() AS name").fetchone()["name"]
+        provider.execute(
+            pg_sql.SQL(
+                "CREATE ROLE {} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                "NOREPLICATION NOBYPASSRLS PASSWORD {}"
+            ).format(pg_sql.Identifier(role_name), pg_sql.Literal(password))
+        )
+        provider.execute(
+            pg_sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                pg_sql.Identifier(database_name), pg_sql.Identifier(role_name)
+            )
+        )
+        provider.commit()
+        parameters = conninfo_to_dict(fleet_db)
+        parameters.update(user=role_name, password=password)
+        try:
+            with psycopg.connect(make_conninfo(**parameters), row_factory=dict_row) as attacker:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    attacker.execute(
+                        pg_sql.SQL("COMMENT ON DATABASE {} IS {}").format(
+                            pg_sql.Identifier(database_name),
+                            pg_sql.Literal(DISPOSABLE_DATABASE_COMMENT),
+                        )
+                    )
+                attacker.rollback()
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    attacker.execute(
+                        pg_sql.SQL("COMMENT ON ROLE {} IS {}").format(
+                            pg_sql.Identifier(DISPOSABLE_CLUSTER_MARKER_ROLE),
+                            pg_sql.Literal(DISPOSABLE_CLUSTER_COMMENT_PREFIX + "forged"),
+                        )
+                    )
+                attacker.rollback()
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    attacker.execute(pg_sql.SQL("CREATE ROLE {}").format(pg_sql.Identifier(forged_role)))
+        finally:
+            provider.rollback()
+            require_disposable_postgres(provider)
+            provider.execute(pg_sql.SQL("DROP ROLE IF EXISTS {}").format(pg_sql.Identifier(forged_role)))
+            provider.execute(
+                pg_sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(
+                    pg_sql.Identifier(database_name), pg_sql.Identifier(role_name)
+                )
+            )
+            provider.execute(pg_sql.SQL("DROP OWNED BY {}").format(pg_sql.Identifier(role_name)))
+            provider.execute(pg_sql.SQL("DROP ROLE {}").format(pg_sql.Identifier(role_name)))
+            provider.commit()
+        require_disposable_postgres(provider)
+
+
+def _cleanup(dsn: str, *, drop_fixed_roles: bool = False) -> None:
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        require_disposable_postgres(conn)
         conn.execute("DROP SCHEMA IF EXISTS brain_archive CASCADE")
         conn.execute("DROP TABLE IF EXISTS public.brain_job_decisions CASCADE")
         relations = conn.execute(
@@ -143,6 +285,13 @@ def _cleanup(dsn: str) -> None:
                 )
                 conn.execute(f"DROP OWNED BY {role}")
                 conn.execute(f"DROP ROLE {role}")
+        if drop_fixed_roles:
+            for role in FIXED_BRAIN_ROLES:
+                if conn.execute(
+                    "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=%s) AS present",
+                    (role,),
+                ).fetchone()["present"]:
+                    _drop_fixed_role(conn, role)
         conn.execute("ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC")
         conn.execute("ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC")
         conn.execute("ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM PUBLIC")
@@ -151,6 +300,7 @@ def _cleanup(dsn: str) -> None:
 
 @pytest.fixture
 def brain_pg(fleet_db):
+    _cleanup(fleet_db, drop_fixed_roles=True)
     with psycopg.connect(fleet_db, row_factory=dict_row) as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS public.fleet_desired_state("
@@ -170,7 +320,12 @@ def brain_pg(fleet_db):
         conn.execute(
             "DO $$ BEGIN CREATE ROLE brain_schema_verifier LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
         )
-        for role in ("brain_status_reader", "brain_policy_controller", "brain_candidate_reader", "brain_candidate_writer"):
+        for role in (
+            "brain_status_reader",
+            "brain_policy_controller",
+            "brain_candidate_reader",
+            "brain_candidate_writer",
+        ):
             conn.execute(
                 pg_sql.SQL(
                     "DO $$ BEGIN CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB "
@@ -182,9 +337,7 @@ def brain_pg(fleet_db):
         conn.execute("GRANT brain_schema_migrator TO postgres")
         conn.execute("GRANT USAGE, CREATE ON SCHEMA public TO brain_schema_migrator")
         conn.execute("GRANT CREATE ON DATABASE postgres TO brain_schema_migrator")
-        conn.execute(
-            "GRANT SELECT ON ALL TABLES IN SCHEMA public TO brain_schema_migrator WITH GRANT OPTION"
-        )
+        conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO brain_schema_migrator WITH GRANT OPTION")
         for relation in (
             "fleet_config",
             "fleet_decision_policies",
@@ -199,16 +352,12 @@ def brain_pg(fleet_db):
             if conn.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",)).fetchone()["relation"]:
                 conn.execute(
                     pg_sql.SQL(
-                        "GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} "
-                        "TO brain_schema_migrator WITH GRANT OPTION"
-                    ).format(
-                        pg_sql.Identifier("public"), pg_sql.Identifier(relation)
-                    )
+                        "GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO brain_schema_migrator WITH GRANT OPTION"
+                    ).format(pg_sql.Identifier("public"), pg_sql.Identifier(relation))
                 )
         conn.commit()
-    _cleanup(fleet_db)
     yield fleet_db
-    _cleanup(fleet_db)
+    _cleanup(fleet_db, drop_fixed_roles=True)
 
 
 def _dsn_for(dsn: str, role: str) -> str:
@@ -228,10 +377,9 @@ def _set_role_password(conn, dsn: str, role: str) -> None:
 
 def _create_lifecycle_login(conn, dsn: str, login: str, capability: str) -> None:
     conn.execute(
-        pg_sql.SQL(
-            "CREATE ROLE {} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
-            "NOREPLICATION NOBYPASSRLS"
-        ).format(pg_sql.Identifier(login))
+        pg_sql.SQL("CREATE ROLE {} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS").format(
+            pg_sql.Identifier(login)
+        )
     )
     _set_role_password(conn, dsn, login)
     conn.execute(
@@ -283,20 +431,13 @@ def test_v3_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
         row_factory=dict_row,
     ) as controller:
         with pytest.raises(psycopg.errors.NoDataFound, match="unknown policy_version"):
-            controller.execute(
-                "SELECT public.brain_controller_transition_policy("
-                "'missing-policy','validated',NULL)"
-            )
+            controller.execute("SELECT public.brain_controller_transition_policy('missing-policy','validated',NULL)")
         controller.rollback()
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            controller.execute(
-                "SELECT public.brain_transition_policy('missing-policy','validated')"
-            )
+            controller.execute("SELECT public.brain_transition_policy('missing-policy','validated')")
         controller.rollback()
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            controller.execute(
-                "UPDATE public.fleet_config SET paused=TRUE WHERE id=1"
-            )
+            controller.execute("UPDATE public.fleet_config SET paused=TRUE WHERE id=1")
         controller.rollback()
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             controller.execute(
@@ -317,16 +458,11 @@ def test_v3_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
         row_factory=dict_row,
     ) as controller:
         with pytest.raises(psycopg.errors.InsufficientPrivilege, match="outside its lifecycle capability"):
-            controller.execute(
-                "SELECT public.brain_controller_transition_policy("
-                "'missing-policy','validated',NULL)"
-            )
+            controller.execute("SELECT public.brain_controller_transition_policy('missing-policy','validated',NULL)")
         controller.rollback()
     with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
         owner.execute("REVOKE brain_rogue_writer FROM brain_controller_test_login")
-        owner.execute(
-            "GRANT UPDATE (paused) ON public.fleet_config TO brain_controller_test_login"
-        )
+        owner.execute("GRANT UPDATE (paused) ON public.fleet_config TO brain_controller_test_login")
         owner.commit()
         with pytest.raises(RuntimeError, match="lifecycle login brain_controller_test_login exceeds"):
             schema.ensure_schema_v1(owner)
@@ -335,10 +471,7 @@ def test_v3_lifecycle_principals_enforce_read_and_mutation_boundaries(brain_pg):
         row_factory=dict_row,
     ) as controller:
         with pytest.raises(psycopg.errors.InsufficientPrivilege, match="outside its lifecycle capability"):
-            controller.execute(
-                "SELECT public.brain_controller_transition_policy("
-                "'missing-policy','validated',NULL)"
-            )
+            controller.execute("SELECT public.brain_controller_transition_policy('missing-policy','validated',NULL)")
 
 
 def test_v3_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
@@ -357,19 +490,13 @@ def test_v3_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
             "VALUES('ats-canary-real','ats','draft')"
         )
         owner.execute("SET LOCAL ROLE NONE")
-        owner.execute(
-            "ALTER TABLE public.brain_decision_policies "
-            "DISABLE TRIGGER brain_decision_policies_lifecycle"
-        )
+        owner.execute("ALTER TABLE public.brain_decision_policies DISABLE TRIGGER brain_decision_policies_lifecycle")
         owner.execute(
             "UPDATE public.brain_decision_policies SET lifecycle='canary',"
             "validated_at=now(),canary_at=now() "
             "WHERE policy_version='ats-canary-real'"
         )
-        owner.execute(
-            "ALTER TABLE public.brain_decision_policies "
-            "ENABLE TRIGGER brain_decision_policies_lifecycle"
-        )
+        owner.execute("ALTER TABLE public.brain_decision_policies ENABLE TRIGGER brain_decision_policies_lifecycle")
         owner.commit()
         owner.execute("RESET ROLE")
         owner.execute(
@@ -394,8 +521,7 @@ def test_v3_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
         owner.execute("GRANT USAGE ON SCHEMA public TO ats_worker_role")
         owner.execute("GRANT USAGE ON TYPE public.apply_queue TO ats_worker_role")
         owner.execute(
-            "GRANT EXECUTE ON FUNCTION "
-            "public.fleet_worker_lease_ats(TEXT,TEXT,INTEGER,TEXT,INTEGER) TO ats_worker_role"
+            "GRANT EXECUTE ON FUNCTION public.fleet_worker_lease_ats(TEXT,TEXT,INTEGER,TEXT,INTEGER) TO ats_worker_role"
         )
         owner.execute(
             "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
@@ -453,9 +579,7 @@ def test_v3_controller_arms_and_stops_real_postgres_ats_canary(brain_pg):
             _dsn_for(brain_pg, "ats_worker_role"),
             row_factory=dict_row,
         ) as worker:
-            leased = worker.execute(
-                "SELECT url FROM public.fleet_worker_lease_ats(NULL,NULL,1200,NULL,900)"
-            ).fetchone()
+            leased = worker.execute("SELECT url FROM public.fleet_worker_lease_ats(NULL,NULL,1200,NULL,900)").fetchone()
             assert leased["url"] == "https://example.test/job"
             worker.commit()
         stopped = stop_canary(controller, "ats")
@@ -493,19 +617,13 @@ def test_v3_controller_arms_and_stops_real_postgres_linkedin_canary(brain_pg):
             "VALUES('linkedin-canary-real','linkedin','draft')"
         )
         owner.execute("SET LOCAL ROLE NONE")
-        owner.execute(
-            "ALTER TABLE public.brain_decision_policies "
-            "DISABLE TRIGGER brain_decision_policies_lifecycle"
-        )
+        owner.execute("ALTER TABLE public.brain_decision_policies DISABLE TRIGGER brain_decision_policies_lifecycle")
         owner.execute(
             "UPDATE public.brain_decision_policies SET lifecycle='canary',"
             "validated_at=now(),canary_at=now() "
             "WHERE policy_version='linkedin-canary-real'"
         )
-        owner.execute(
-            "ALTER TABLE public.brain_decision_policies "
-            "ENABLE TRIGGER brain_decision_policies_lifecycle"
-        )
+        owner.execute("ALTER TABLE public.brain_decision_policies ENABLE TRIGGER brain_decision_policies_lifecycle")
         owner.commit()
         owner.execute("RESET ROLE")
         owner.execute(
@@ -632,16 +750,48 @@ def test_existing_v2_database_upgrades_atomically_to_v3(brain_pg):
         schema.ensure_schema_v1(conn)
 
         versions = conn.execute(
-            "SELECT version,migration_name,migration_checksum FROM public.brain_schema_versions "
-            "ORDER BY version"
+            "SELECT version,migration_name,migration_checksum FROM public.brain_schema_versions ORDER BY version"
         ).fetchall()
         assert [row["version"] for row in versions] == [1, 2, 3]
         assert versions[2]["migration_name"] == schema._MIGRATION_V3_NAME
         assert versions[2]["migration_checksum"] == schema._schema_v3_checksum()
-        assert conn.execute(
-            "SELECT migration_name,migration_checksum,applied_at,applied_by "
-            "FROM public.brain_schema_versions WHERE version=2"
-        ).fetchone() == before_v2
+        assert (
+            conn.execute(
+                "SELECT migration_name,migration_checksum,applied_at,applied_by "
+                "FROM public.brain_schema_versions WHERE version=2"
+            ).fetchone()
+            == before_v2
+        )
+
+
+def test_standalone_v4_install_is_atomic_from_v1_through_v4(brain_pg, monkeypatch):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        with monkeypatch.context() as patch:
+            patch.setattr(schema, "_schema_v4_bytes", lambda: b"CREATE TABLE broken (")
+            with pytest.raises(psycopg.errors.SyntaxError):
+                schema.ensure_brain_schema_v4(conn)
+        assert (
+            conn.execute("SELECT to_regclass('public.brain_schema_versions') AS relation").fetchone()["relation"]
+            is None
+        )
+        conn.rollback()
+
+        schema.ensure_brain_schema_v4(conn)
+        assert [
+            row["version"]
+            for row in conn.execute("SELECT version FROM public.brain_schema_versions ORDER BY version").fetchall()
+        ] == [1, 2, 3, 4]
+
+
+def test_v4_catalog_verification_is_stable_under_changed_search_path(brain_pg):
+    with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
+        schema.ensure_brain_schema_v4(conn)
+        conn.execute("SET search_path=pg_catalog")
+        conn.commit()
+
+        schema.verify_brain_schema_v4(conn)
+
+        assert conn.execute("SELECT current_setting('search_path') AS value").fetchone()["value"] == "pg_catalog"
 
 
 def test_failed_v2_to_v3_upgrade_rolls_back_and_retries(brain_pg, monkeypatch):
@@ -653,18 +803,14 @@ def test_failed_v2_to_v3_upgrade_rolls_back_and_retries(brain_pg, monkeypatch):
                 schema.ensure_schema_v1(conn)
         assert [
             row["version"]
-            for row in conn.execute(
-                "SELECT version FROM public.brain_schema_versions ORDER BY version"
-            ).fetchall()
+            for row in conn.execute("SELECT version FROM public.brain_schema_versions ORDER BY version").fetchall()
         ] == [1, 2]
         conn.rollback()
 
         schema.ensure_schema_v1(conn)
         assert [
             row["version"]
-            for row in conn.execute(
-                "SELECT version FROM public.brain_schema_versions ORDER BY version"
-            ).fetchall()
+            for row in conn.execute("SELECT version FROM public.brain_schema_versions ORDER BY version").fetchall()
         ] == [1, 2, 3]
 
 
@@ -684,24 +830,20 @@ def test_existing_v1_database_upgrades_atomically_to_v3(brain_pg):
                         migration_identity,
                     ),
                 )
-        before = conn.execute(
-            "SELECT version FROM public.brain_schema_versions ORDER BY version"
-        ).fetchall()
+        before = conn.execute("SELECT version FROM public.brain_schema_versions ORDER BY version").fetchall()
         conn.rollback()
         assert [row["version"] for row in before] == [1]
 
         schema.ensure_schema_v1(conn)
         first = conn.execute(
-            "SELECT version,migration_checksum,applied_at "
-            "FROM public.brain_schema_versions ORDER BY version"
+            "SELECT version,migration_checksum,applied_at FROM public.brain_schema_versions ORDER BY version"
         ).fetchall()
         conn.rollback()
         assert [row["version"] for row in first] == [1, 2, 3]
 
         schema.ensure_schema_v1(conn)
         second = conn.execute(
-            "SELECT version,migration_checksum,applied_at "
-            "FROM public.brain_schema_versions ORDER BY version"
+            "SELECT version,migration_checksum,applied_at FROM public.brain_schema_versions ORDER BY version"
         ).fetchall()
         conn.rollback()
         assert second == first
@@ -727,19 +869,18 @@ def test_failed_v1_to_v2_upgrade_rolls_back_and_retries(brain_pg, monkeypatch):
             patch.setattr(schema, "_schema_v2_bytes", lambda: b"CREATE TABLE broken (")
             with pytest.raises(psycopg.errors.SyntaxError):
                 schema.ensure_schema_v1(conn)
-        versions = conn.execute(
-            "SELECT version FROM public.brain_schema_versions ORDER BY version"
-        ).fetchall()
+        versions = conn.execute("SELECT version FROM public.brain_schema_versions ORDER BY version").fetchall()
         assert [row["version"] for row in versions] == [1]
-        assert conn.execute(
-            "SELECT to_regclass('public.brain_canary_lifecycle_events') AS relation"
-        ).fetchone()["relation"] is None
+        assert (
+            conn.execute("SELECT to_regclass('public.brain_canary_lifecycle_events') AS relation").fetchone()[
+                "relation"
+            ]
+            is None
+        )
         conn.rollback()
 
         schema.ensure_schema_v1(conn)
-        versions = conn.execute(
-            "SELECT version FROM public.brain_schema_versions ORDER BY version"
-        ).fetchall()
+        versions = conn.execute("SELECT version FROM public.brain_schema_versions ORDER BY version").fetchall()
         assert [row["version"] for row in versions] == [1, 2, 3]
 
 
@@ -1124,12 +1265,15 @@ def test_decision_delta_accepts_new_ids_that_sort_before_existing_ids(brain_pg):
         )
         conn.commit()
 
-        assert _insert_decisions(
-            conn,
-            source,
-            {"https://jobs/new": "job-new", "https://jobs/existing": "job-existing"},
-            1,
-        ) == 2
+        assert (
+            _insert_decisions(
+                conn,
+                source,
+                {"https://jobs/new": "job-new", "https://jobs/existing": "job-existing"},
+                1,
+            )
+            == 2
+        )
         assert conn.execute(
             "SELECT source_decision_id FROM brain_job_decisions "
             "WHERE source_namespace='applypilot-sqlite' ORDER BY source_decision_id"
@@ -2508,29 +2652,54 @@ def test_exact_owner_rejects_membership_proxy_owner(brain_pg):
             schema.verify_schema_v1(conn)
 
 
-def test_bootstrap_v4_authority_creates_candidates_before_schema_and_reconciles_after(brain_pg):
-    bootstrap = _bootstrap_script_module()
+def test_bootstrap_v5_authority_creates_candidates_before_schema_and_reconciles_after(brain_pg):
     with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
         schema.ensure_brain_schema_v1(conn)
+        require_disposable_postgres(conn)
         conn.execute("REVOKE ALL PRIVILEGES ON SCHEMA public FROM brain_candidate_reader, brain_candidate_writer")
         conn.execute("DROP ROLE brain_candidate_reader")
         conn.execute("DROP ROLE brain_candidate_writer")
+        conn.execute(
+            "CREATE ROLE brain_controller_test_login LOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
         conn.commit()
 
-        candidate_roles = bootstrap._install_v4_authority(conn)
+        topology = pg_roles.BootstrapTopology(
+            database_owner_role="postgres",
+            controller_role="brain_controller_test_login",
+            verifier_role="brain_schema_verifier",
+            migrator_role="brain_schema_migrator",
+            retired_admin_roles=(),
+            infrastructure_superuser_roles=("postgres",),
+        )
+        with conn.transaction():
+            with conn.cursor() as cur:
+                candidate_roles = pg_roles._install_brain_authority_in_transaction(cur, topology=topology)
 
         assert candidate_roles.reader_role == "brain_candidate_reader"
         assert candidate_roles.writer_role == "brain_candidate_writer"
         assert conn.execute(
             "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
-        ).fetchone()["versions"] == [1, 2, 3, 4]
-        assert conn.execute(
-            "SELECT has_function_privilege('brain_candidate_writer',"
-            "'public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)'"
-            "::regprocedure,'EXECUTE') AS allowed"
-        ).fetchone()["allowed"] is True
+        ).fetchone()["versions"] == [1, 2, 3, 4, 5]
+        assert (
+            conn.execute(
+                "SELECT has_function_privilege('brain_candidate_writer',"
+                "'public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)'"
+                "::regprocedure,'EXECUTE') AS allowed"
+            ).fetchone()["allowed"]
+            is False
+        )
+        assert (
+            conn.execute(
+                "SELECT has_function_privilege('brain_candidate_writer',"
+                "'public.brain_publish_v5_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)'"
+                "::regprocedure,'EXECUTE') AS allowed"
+            ).fetchone()["allowed"]
+            is True
+        )
         conn.commit()
-        schema.verify_brain_schema_v4(conn)
+        schema.verify_brain_schema_v5(conn)
 
 
 def test_verifier_has_public_usage_and_only_enumerated_brain_reads(brain_pg):

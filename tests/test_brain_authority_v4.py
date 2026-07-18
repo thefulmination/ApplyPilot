@@ -23,6 +23,17 @@ def _bootstrap_script_module():
     return module
 
 
+def _bootstrap_topology() -> pg_roles.BootstrapTopology:
+    return pg_roles.BootstrapTopology(
+        database_owner_role="postgres",
+        controller_role="brain_policy_controller",
+        verifier_role="brain_schema_verifier",
+        migrator_role="brain_schema_migrator",
+        retired_admin_roles=(),
+        infrastructure_superuser_roles=("postgres",),
+    )
+
+
 WRITER = "brain_candidate_writer_login"
 READER = "brain_candidate_reader_login"
 HASHES = tuple(character * 64 for character in "abcdef0123456789")
@@ -91,12 +102,22 @@ def authority_pg(fleet_db):
     with psycopg.connect(fleet_db, row_factory=dict_row) as conn:
         conn.execute("DROP SCHEMA IF EXISTS brain_archive CASCADE")
         relations = conn.execute(
-            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "SELECT c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname='public' AND left(c.relname,6)='brain_' "
-            "AND c.relkind IN ('r','p','v','m','f')"
+            "AND c.relkind IN ('r','p','v','m','f') ORDER BY CASE WHEN c.relkind IN ('v','m') THEN 0 ELSE 1 END"
         ).fetchall()
         for relation in relations:
-            conn.execute(sql.SQL("DROP TABLE IF EXISTS public.{} CASCADE").format(sql.Identifier(relation["relname"])))
+            object_type = {
+                "v": sql.SQL("VIEW"),
+                "m": sql.SQL("MATERIALIZED VIEW"),
+                "f": sql.SQL("FOREIGN TABLE"),
+            }.get(relation["relkind"], sql.SQL("TABLE"))
+            conn.execute(
+                sql.SQL("DROP {} IF EXISTS public.{} CASCADE").format(
+                    object_type,
+                    sql.Identifier(relation["relname"]),
+                )
+            )
         functions = conn.execute(
             "SELECT p.proname,pg_get_function_identity_arguments(p.oid) AS arguments FROM pg_proc p "
             "JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND left(p.proname,6)='brain_'"
@@ -251,7 +272,11 @@ def test_candidate_reconcile_removes_preexisting_memberships_and_authority(autho
         assert "candidate role memberships retained" in str(verification_error.value)
         assert "candidate table ACL contract mismatch" in str(verification_error.value)
         assert "candidate function ACL contract mismatch" in str(verification_error.value)
-        pg_roles.ensure_brain_candidate_roles(owner)
+        pg_roles.ensure_brain_candidate_roles(
+            owner,
+            reader_approved_grantees=(READER,),
+            writer_approved_grantees=(WRITER,),
+        )
         schema.verify_brain_schema_v4(owner)
     with psycopg.connect(_dsn_for(authority_pg, WRITER), row_factory=dict_row) as writer:
         _assert_42501(writer, "INSERT INTO public.apply_queue(url) VALUES('https://forged.test')")
@@ -464,7 +489,7 @@ def test_v4_verification_rejects_effective_public_table_authority(authority_pg):
 
 
 def test_v4_verification_rejects_effective_public_fleet_authority(authority_pg):
-    bootstrap = _bootstrap_script_module()
+    _bootstrap_script_module()
     with psycopg.connect(authority_pg, row_factory=dict_row) as owner:
         owner.execute(
             "GRANT EXECUTE ON FUNCTION public.fleet_worker_lease_ats(TEXT,TEXT,INTEGER,TEXT,INTEGER) TO PUBLIC"
@@ -473,10 +498,18 @@ def test_v4_verification_rejects_effective_public_fleet_authority(authority_pg):
         with pytest.raises(RuntimeError, match="effective function authority exposure.*fleet_worker_lease_ats"):
             schema.verify_brain_schema_v4(owner)
         with pytest.raises(RuntimeError, match="effective function authority exposure.*fleet_worker_lease_ats"):
-            bootstrap._install_v4_authority(owner)
+            with owner.transaction():
+                with owner.cursor() as cur:
+                    schema.ensure_brain_schema_v5_in_transaction(cur)
         owner.execute(
             "REVOKE EXECUTE ON FUNCTION public.fleet_worker_lease_ats(TEXT,TEXT,INTEGER,TEXT,INTEGER) FROM PUBLIC"
         )
         owner.commit()
-        bootstrap._install_v4_authority(owner)
-        schema.verify_brain_schema_v4(owner)
+        with owner.transaction():
+            with owner.cursor() as cur:
+                schema.ensure_brain_schema_v5_in_transaction(cur)
+        schema.verify_brain_schema_v5(owner)
+
+
+def test_v4_migration_bytes_have_fixed_committed_checksum():
+    assert schema._schema_v4_checksum() == schema._EXPECTED_V4_CHECKSUM
