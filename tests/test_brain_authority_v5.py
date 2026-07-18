@@ -194,7 +194,8 @@ def test_v5_upgrade_preserves_prior_checksums_and_supersedes_publish_acl(authori
         ).fetchall()
         assert [row["version"] for row in rows] == [1, 2, 3, 4, 5]
         assert rows[3]["migration_checksum"] == schema._EXPECTED_V4_CHECKSUM
-        assert rows[4]["migration_checksum"] == schema._schema_v5_checksum()
+        assert rows[4]["migration_checksum"] == schema._EXPECTED_V5_CHECKSUM
+        assert schema._schema_v5_checksum() == schema._EXPECTED_V5_CHECKSUM
         assert not conn.execute(
             "SELECT has_function_privilege('brain_candidate_writer',"
             "'public.brain_publish_v4_candidate(text,text,text,text,text,bigint,uuid,text,text,text,text,text,bigint)',"
@@ -214,6 +215,22 @@ def test_v5_upgrade_preserves_prior_checksums_and_supersedes_publish_acl(authori
                 "owner_id,generation_id,membership_manifest_hash) VALUES('forged','forged',%s)",
                 (_hash("forged"),),
             )
+
+
+def test_v5_rejects_modified_migration_bytes_before_execution(authority_pg, monkeypatch, tmp_path):
+    modified_migration = tmp_path / "schema_v5.sql"
+    modified_migration.write_bytes(schema._schema_v5_bytes() + b"\n-- unauthorized mutation\n")
+    monkeypatch.setattr(schema, "_SCHEMA_V5_SQL", modified_migration)
+
+    with psycopg.connect(authority_pg, row_factory=dict_row) as conn:
+        with pytest.raises(RuntimeError, match="immutable schema v5 file checksum mismatch"):
+            schema.ensure_brain_schema_v5(conn)
+        assert conn.execute(
+            "SELECT count(*) AS count FROM public.brain_schema_versions WHERE version=5"
+        ).fetchone()["count"] == 0
+        assert conn.execute(
+            "SELECT to_regclass('public.brain_factual_generations') AS relation"
+        ).fetchone()["relation"] is None
 
 
 def test_v5_upgrade_preserves_v4_revoke_and_requires_newer_epoch(authority_pg):
@@ -920,6 +937,14 @@ def test_v5_computed_roots_reject_tampering_and_ignore_insert_order(authority_v5
             )
 
 
+def test_v5_ontology_root_contract_uses_c_collation_for_every_text_sort_key():
+    definition = schema._schema_v5_bytes().decode("utf-8")
+    assert (
+        'ORDER BY term.predicate COLLATE "C",term.term_id COLLATE "C"'
+        in " ".join(definition.split())
+    )
+
+
 def test_v5_graph_authority_is_bounded_and_separate_from_policy_controller(authority_v5_pg):
     with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
         manifest = _artifact(conn, "bounded-manifest")
@@ -1164,6 +1189,53 @@ def test_v5_snapshot_creation_rejects_inactive_validity_window(authority_v5_pg):
             conn.rollback()
 
 
+def test_v5_snapshot_expiry_is_rechecked_after_waiting_for_generation_lock(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as setup:
+        seeded = _generation(setup)
+        _admit(setup, seeded, approval="approval-lock", event="event-lock", sequence=1)
+        setup.execute(
+            "SELECT public.brain_record_factual_assertion_coverage("
+            "'owner-a','generation-a','span-a','event-lock')"
+        )
+        coverage_hash = _artifact(setup, "lock-expiry-coverage")
+        snapshot_hash = _artifact(setup, "lock-expiry-snapshot")
+        semantic_root = _semantic_root(setup)
+        setup.commit()
+
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as blocker:
+        blocker.execute(
+            "SELECT 1 FROM public.brain_factual_generations "
+            "WHERE owner_id='owner-a' AND generation_id='generation-a' FOR UPDATE"
+        )
+
+        def publish_waiting_snapshot() -> str:
+            with psycopg.connect(authority_v5_pg, row_factory=dict_row) as publisher:
+                try:
+                    publisher.execute(
+                        "SELECT public.brain_publish_factual_snapshot("
+                        "'owner-a','snapshot-lock-expired','generation-a',%s,%s,%s,1,now(),%s,%s)",
+                        (
+                            semantic_root,
+                            coverage_hash,
+                            seeded["manifest"],
+                            datetime.now(UTC) + timedelta(milliseconds=300),
+                            snapshot_hash,
+                        ),
+                    )
+                    publisher.commit()
+                    return "accepted"
+                except psycopg.Error as exc:
+                    publisher.rollback()
+                    return str(exc)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(publish_waiting_snapshot)
+            time.sleep(0.5)
+            assert not result.done()
+            blocker.commit()
+            assert "currently valid" in result.result(timeout=3)
+
+
 def test_v5_expired_snapshot_rejected_at_binding(authority_v5_pg):
     with psycopg.connect(authority_v5_pg, row_factory=dict_row) as owner:
         authority, approved_id = _bound_v5_authority(
@@ -1265,6 +1337,46 @@ def test_v5_semantic_root_framing_prevents_field_boundary_collisions(authority_v
             roots.append(_semantic_root(conn))
             conn.execute("ROLLBACK TO SAVEPOINT collision_state")
         assert roots[0] != roots[1]
+
+
+def test_v5_semantic_root_binds_active_contradiction_transition_and_lineage(authority_v5_pg):
+    with psycopg.connect(authority_v5_pg, row_factory=dict_row) as conn:
+        _generation(conn)
+        conn.execute(
+            "SELECT public.brain_create_factual_contradiction("
+            "'owner-a','contradiction-root','generation-a',%s)",
+            (_artifact(conn, "contradiction-root"),),
+        )
+        opened_id = conn.execute(
+            "SELECT public.brain_append_factual_contradiction_event("
+            "'owner-a','contradiction-root',1,'opened','active','noncritical',NULL,NULL) AS id"
+        ).fetchone()["id"]
+        confirmed_id = conn.execute(
+            "SELECT public.brain_append_factual_contradiction_event("
+            "'owner-a','contradiction-root',2,'confirmed','active','noncritical',%s,NULL) AS id",
+            (opened_id,),
+        ).fetchone()["id"]
+        confirmed_root = _semantic_root(conn)
+
+        conn.execute("SET session_replication_role=replica")
+        conn.execute(
+            "UPDATE public.brain_factual_contradiction_events SET event_type='opened' "
+            "WHERE contradiction_event_id=%s",
+            (confirmed_id,),
+        )
+        conn.execute("SET session_replication_role=origin")
+        opened_root = _semantic_root(conn)
+
+        conn.execute("SET session_replication_role=replica")
+        conn.execute(
+            "UPDATE public.brain_factual_contradiction_events "
+            "SET event_type='confirmed',previous_event_id=NULL WHERE contradiction_event_id=%s",
+            (confirmed_id,),
+        )
+        conn.execute("SET session_replication_role=origin")
+        unlinked_root = _semantic_root(conn)
+
+        assert len({confirmed_root, opened_root, unlinked_root}) == 3
 
 
 def test_v5_exact_function_fingerprint_rejects_literal_whitespace_bypass(authority_v5_pg):

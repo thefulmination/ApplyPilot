@@ -436,7 +436,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$
         'applypilot:factual-ontology:v1' || E'\n' || COALESCE(string_agg(
             jsonb_build_array(term.predicate,term.term_namespace,term.term_digest,term.term_id,
                               term.canonical_label,term.term_artifact_hash)::TEXT,
-            E'\n' ORDER BY term.predicate,term.term_id
+            E'\n' ORDER BY term.predicate COLLATE "C",term.term_id COLLATE "C"
         ),'')
     )
     FROM public.brain_factual_ontology_terms term
@@ -538,6 +538,8 @@ BEGIN
             public.brain_v5_frame(contradiction.contradiction_id)
             || public.brain_v5_frame(contradiction.contradiction_artifact_hash)
             || public.brain_v5_frame(state.event_sequence::TEXT)
+            || public.brain_v5_frame(event.event_type)
+            || public.brain_v5_frame(event.previous_event_id::TEXT)
             || public.brain_v5_frame(state.state_after)
             || public.brain_v5_frame(state.severity)
             || public.brain_v5_frame(event.review_receipt_hash) AS row_payload
@@ -948,11 +950,12 @@ CREATE FUNCTION public.brain_publish_factual_snapshot(
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
 DECLARE closure public.brain_factual_generation_closures%ROWTYPE;
         coverage_count BIGINT; actual_high_water BIGINT; actual_root TEXT;
-        actual_semantic_root TEXT; validation_time TIMESTAMPTZ := clock_timestamp();
+        actual_semantic_root TEXT; validation_time TIMESTAMPTZ;
 BEGIN
     PERFORM 1 FROM public.brain_factual_generations
     WHERE owner_id=requested_owner_id AND generation_id=requested_generation_id FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'factual generation is missing' USING ERRCODE='55000'; END IF;
+    validation_time := clock_timestamp();
     IF requested_valid_from>validation_time
        OR (requested_valid_to IS NOT NULL AND requested_valid_to<=validation_time) THEN
         RAISE EXCEPTION 'factual snapshot must be currently valid at creation' USING ERRCODE='22007';

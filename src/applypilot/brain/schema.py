@@ -25,7 +25,8 @@ _MIGRATION_V3_NAME = "brain schema v3 lane canary pins"
 _MIGRATION_V4_NAME = "brain schema v4 scoped candidate authority"
 _MIGRATION_V5_NAME = "brain schema v5 durable factual graph authority"
 _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e2576f1267d7"
-_EXPECTED_V5_CATALOG_HASH = "fc93fe1c589af7ea47f0168739e988f4fae0634e12b4e7697d9fcf0bbf268281"
+_EXPECTED_V5_CHECKSUM = "39fd21da6b829e22d5c2e890a978d0c92de96c92691e205024314f5ca154fb09"
+_EXPECTED_V5_CATALOG_HASH = "7e2b39943c5e00eb27e75264356df199807d28840253a5ac498ed2d46f1f16b5"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
 _STATUS_ROLE = "brain_status_reader"
@@ -566,6 +567,15 @@ def _schema_v5_checksum() -> str:
     return hashlib.sha256(_schema_v5_bytes()).hexdigest()
 
 
+def _assert_schema_v5_bytes_immutable() -> None:
+    actual_checksum = _schema_v5_checksum()
+    if actual_checksum != _EXPECTED_V5_CHECKSUM:
+        raise RuntimeError(
+            f"immutable schema v5 file checksum mismatch: expected {_EXPECTED_V5_CHECKSUM}, "
+            f"got {actual_checksum}"
+        )
+
+
 def _compact_sql(value: str) -> str:
     return re.sub(r"\s+", "", value).lower().replace("::text", "")
 
@@ -938,7 +948,7 @@ def _version_rows(cur):
         raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 4 contract")
     if len(rows) == 5 and (
         rows[4]["migration_name"] != _MIGRATION_V5_NAME
-        or rows[4]["migration_checksum"] != _schema_v5_checksum()
+        or rows[4]["migration_checksum"] != _EXPECTED_V5_CHECKSUM
         or rows[4]["applied_by"] != _MIGRATION_ROLE
     ):
         raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 5 contract")
@@ -2083,6 +2093,7 @@ def _verify_v4_contract(cur) -> None:
 
 def _verify_v5_contract(cur) -> None:
     """Verify V5's additive graph authority and superseding candidate ACL."""
+    _assert_schema_v5_bytes_immutable()
     versions = _version_rows(cur)
     problems: list[str] = []
     if _schema_v4_checksum() != _EXPECTED_V4_CHECKSUM:
@@ -2096,7 +2107,7 @@ def _verify_v5_contract(cur) -> None:
         version = versions[4]
         if version["migration_name"] != _MIGRATION_V5_NAME:
             problems.append("migration v5 name mismatch")
-        if version["migration_checksum"] != _schema_v5_checksum():
+        if version["migration_checksum"] != _EXPECTED_V5_CHECKSUM:
             problems.append("migration v5 checksum mismatch")
         if version["applied_by"] != _MIGRATION_ROLE:
             problems.append("migration v5 ledger owner mismatch")
@@ -2807,6 +2818,7 @@ def ensure_brain_schema_v5_in_transaction(
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
 ) -> None:
     """Install or verify the immutable V1-V5 ledger in the caller's transaction."""
+    _assert_schema_v5_bytes_immutable()
     versions = _version_rows(cur)
     if len(versions) == 5:
         verify_brain_schema_v5_in_transaction(cur)
@@ -2826,7 +2838,7 @@ def ensure_brain_schema_v5_in_transaction(
     cur.execute(
         "INSERT INTO public.brain_schema_versions "
         "(version,migration_name,migration_checksum,applied_by) VALUES (5,%s,%s,%s)",
-        (_MIGRATION_V5_NAME, _schema_v5_checksum(), migration_identity),
+        (_MIGRATION_V5_NAME, _EXPECTED_V5_CHECKSUM, migration_identity),
     )
     verify_brain_schema_v5_in_transaction(cur)
 
