@@ -68,3 +68,76 @@ three LinkedIn.
 
 Invalid non-null hashes continue to fail compilation. Wrapper serialization
 uses the existing RFC 8785 error boundary. Import still fails closed when the
+wrapper artifact is absent, its byte length or media type conflicts, or its
+registered provenance does not identify the expected snapshot reference.
+
+## Artifact-ledger provenance
+
+Schema V6 registration writes `brain_artifacts.provenance` with two fields:
+`authority_request_id` and the manifest's opaque `policySourceId` string.
+No schema or registration-function change is required.
+
+For snapshot-reference artifacts only, `policySourceId` is the UTF-8 decoding
+of the same deterministic RFC 8785 JSON bytes stored as the wrapper content.
+Consequently it is the closed object with exactly `kind`, `lane`,
+`policyVersion`, `role`, `schemaVersion`, `sourceField`, and
+`sourceSha256`. The compiler descriptor carries this string so a downstream
+authority-manifest builder cannot substitute policyVersion alone.
+
+Registration and lifecycle validation parse
+`brain_artifacts.provenance->>'policy_source_id'` as JSON only when the
+binding role is one of `label_snapshot`, `pairwise_snapshot`, or
+`outcome_snapshot`. They require exact equality with the expected closed
+object. Other artifact roles retain their existing opaque-string
+`policySourceId` semantics.
+
+## Normalization and duplicate handling
+
+Lane is not case-folded or trimmed. The existing source compiler accepts only
+the exact normalized values `ats` and `linkedin`; every wrapper copies that
+validated value.
+
+Each source row has one column per snapshot role, so compilation can emit at
+most one descriptor for each role. The ordered descriptor tuple is the
+canonical de-duplication boundary. The importer keeps the existing
+`(policy_version, artifact_role)` conflict check: an identical binding is
+idempotent, while a different wrapper hash fails closed. Content-addressed
+ledger insertion may coalesce byte-identical artifacts, but policy identity in
+the wrapper means different policies do not normally share snapshot-reference
+bytes even when they name the same source fingerprint.
+
+## Exact TDD acceptance cases
+
+1. A populated ATS row emits three snapshot-reference descriptors in
+   `label_snapshot`, `pairwise_snapshot`, `outcome_snapshot` order.
+   Each descriptor's content equals the expected RFC 8785 bytes; its SHA-256
+   equals the digest of those bytes and differs from `sourceSha256`; its media
+   type is the existing RFC 8785 JSON media type; and its `policy_source_id`
+   equals the UTF-8 wrapper content.
+2. Recompiling semantically identical input produces byte-for-byte equal
+   descriptors with no timestamp or environment field.
+3. Each null snapshot column omits only its corresponding role. A row with all
+   three null columns emits no snapshot descriptor and preserves null source
+   metadata.
+4. A fourteen-row fixture with the committed candidate shape reports exact
+   totals: the sum of emitted snapshot descriptors equals the number of
+   non-null snapshot columns, and the six ATS/LinkedIn candidate identities
+   produce six descriptors.
+5. Importer tests preload the wrapper descriptors in the artifact ledger and
+   assert each policy binding equals the wrapper content hash, never the source
+   fingerprint.
+6. Parity source projection recomputes the same three role/hash pairs as the
+   importer, so source and target binding arrays are equal.
+7. Import fails closed when a wrapper artifact is absent, when byte length or
+   media type differs, and when an existing role binding names a different
+   hash.
+8. Existing lifecycle tests retain the exact ten-role requirement without any
+   role rename or additional role.
+
+## Verification
+
+Run the focused policy compiler, importer, and parity tests; Ruff the changed
+Python and test files; byte-compile the changed Python modules; and run
+`git diff --check`. The final report states the exact emitted role order,
+zero-to-three per-policy count behavior, six known candidate wrappers, and
+the content-hash-versus-source-hash distinction.
