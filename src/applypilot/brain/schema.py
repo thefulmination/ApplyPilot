@@ -18,14 +18,17 @@ _SCHEMA_V2_SQL = Path(__file__).with_name("schema_v2.sql")
 _SCHEMA_V3_SQL = Path(__file__).with_name("schema_v3.sql")
 _SCHEMA_V4_SQL = Path(__file__).with_name("schema_v4.sql")
 _SCHEMA_V5_SQL = Path(__file__).with_name("schema_v5.sql")
+_SCHEMA_V6_SQL = Path(__file__).with_name("schema_v6.sql")
 _SCHEMA_LOCK_KEY = "applypilot:brain:schema:v1"
 _MIGRATION_NAME = "brain schema v1"
 _MIGRATION_V2_NAME = "brain schema v2 lifecycle principals"
 _MIGRATION_V3_NAME = "brain schema v3 lane canary pins"
 _MIGRATION_V4_NAME = "brain schema v4 scoped candidate authority"
 _MIGRATION_V5_NAME = "brain schema v5 durable factual graph authority"
+_MIGRATION_V6_NAME = "brain schema v6 immutable artifact authority"
 _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e2576f1267d7"
 _EXPECTED_V5_CHECKSUM = "52d1726bb13df54591fcd6343884ec8f6f7d18ab7fbf74b4dc33ba509cb0e559"
+_EXPECTED_V6_CHECKSUM = "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
 _EXPECTED_V5_CATALOG_HASH = "87ed08bc34cc36e12d41fc44bdf4da1771bb67a609eabff2a3c39e0286e2b6a1"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
@@ -569,6 +572,23 @@ def _schema_v5_checksum() -> str:
     return hashlib.sha256(_schema_v5_bytes()).hexdigest()
 
 
+def _schema_v6_bytes() -> bytes:
+    return _SCHEMA_V6_SQL.read_bytes()
+
+
+def _schema_v6_checksum() -> str:
+    return hashlib.sha256(_schema_v6_bytes()).hexdigest()
+
+
+def _assert_schema_v6_bytes_immutable() -> None:
+    actual_checksum = _schema_v6_checksum()
+    if actual_checksum != _EXPECTED_V6_CHECKSUM:
+        raise RuntimeError(
+            f"immutable schema v6 file checksum mismatch: expected {_EXPECTED_V6_CHECKSUM}, "
+            f"got {actual_checksum}"
+        )
+
+
 def _assert_schema_v5_bytes_immutable() -> None:
     actual_checksum = _schema_v5_checksum()
     if actual_checksum != _EXPECTED_V5_CHECKSUM:
@@ -591,6 +611,19 @@ def _function_body_fingerprint(definition: str) -> str | None:
 
 def _raw_function_body_fingerprint(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _v6_function_body_fingerprint(name: str) -> str:
+    definition = _schema_v6_bytes().decode("utf-8")
+    match = re.search(
+        rf"CREATE(?: OR REPLACE)? FUNCTION public\.{re.escape(name)}\b.*?"
+        r"\bAS\s+(\$[A-Za-z0-9_]*\$)(.*?)\1",
+        definition,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        raise RuntimeError(f"schema v6 function body missing: {name}")
+    return _raw_function_body_fingerprint(match.group(2))
 
 
 def _stable_catalog_records(records) -> list[dict[str, object]]:
@@ -945,7 +978,7 @@ def _version_rows(cur):
     if not rows:
         raise RuntimeError("brain schema version ledger exists but is empty")
     versions = [row["version"] for row in rows]
-    if versions not in ([1], [1, 2], [1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5]):
+    if versions not in ([1], [1, 2], [1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6]):
         raise RuntimeError(
             "unsupported or non-contiguous brain schema version ledger: "
             + ", ".join(str(version) for version in versions)
@@ -956,12 +989,18 @@ def _version_rows(cur):
         or rows[3]["applied_by"] != _MIGRATION_ROLE
     ):
         raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 4 contract")
-    if len(rows) == 5 and (
+    if len(rows) >= 5 and (
         rows[4]["migration_name"] != _MIGRATION_V5_NAME
         or rows[4]["migration_checksum"] != _EXPECTED_V5_CHECKSUM
         or rows[4]["applied_by"] != _MIGRATION_ROLE
     ):
         raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 5 contract")
+    if len(rows) == 6 and (
+        rows[5]["migration_name"] != _MIGRATION_V6_NAME
+        or rows[5]["migration_checksum"] != _EXPECTED_V6_CHECKSUM
+        or rows[5]["applied_by"] != _MIGRATION_ROLE
+    ):
+        raise RuntimeError("unsupported or non-contiguous brain schema version ledger: invalid version 6 contract")
     return rows
 
 
@@ -2865,6 +2904,256 @@ def ensure_brain_schema_v5(
             ensure_brain_schema_v5_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
 
 
+def _verify_v6_contract(cur) -> None:
+    versions = _version_rows(cur)
+    if len(versions) != 6:
+        raise RuntimeError("brain schema v6 verification requires a contiguous V1-V6 ledger")
+    cur.execute(
+        "SELECT c.relname, owner.rolname AS owner_name FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_roles owner ON owner.oid=c.relowner "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s)",
+        (["brain_artifact_authority_requests", "brain_artifact_authority_registrations"],),
+    )
+    owners = {row["relname"]: row["owner_name"] for row in cur.fetchall()}
+    if owners != {
+        "brain_artifact_authority_requests": "brain_artifact_authority_owner",
+        "brain_artifact_authority_registrations": "brain_artifact_authority_owner",
+    }:
+        raise RuntimeError("brain schema v6 authority table ownership mismatch")
+    expected_columns = {
+        "brain_artifact_authority_requests": (
+            ("request_id", "uuid", True), ("manifest_sha256", "text", True), ("purpose", "text", True),
+            ("key_id", "text", True), ("issued_at", "timestamp with time zone", True),
+            ("expires_at", "timestamp with time zone", True), ("destination_system_id", "text", True),
+            ("destination_database_name", "text", True), ("artifact_count", "integer", True),
+            ("receipt", "jsonb", True), ("registered_at", "timestamp with time zone", True),
+        ),
+        "brain_artifact_authority_registrations": (
+            ("request_id", "uuid", True), ("artifact_ordinal", "integer", True),
+            ("artifact_hash", "text", True), ("byte_length", "bigint", True), ("media_type", "text", True),
+            ("backend", "text", True), ("bucket", "text", True), ("object_key", "text", True),
+            ("provider_version_id", "text", True), ("provider_checksum", "text", True),
+            ("encryption_mode", "text", True), ("encryption_key_id", "text", True),
+            ("policy_source_id", "text", False), ("registered_at", "timestamp with time zone", True),
+        ),
+    }
+    cur.execute(
+        "SELECT c.relname,a.attname,format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s) ORDER BY c.relname,a.attnum",
+        (list(expected_columns),),
+    )
+    actual_columns: dict[str, list[tuple[str, str, bool]]] = {name: [] for name in expected_columns}
+    for column in cur.fetchall():
+        actual_columns[column["relname"]].append(
+            (column["attname"], column["data_type"], column["attnotnull"])
+        )
+    if {name: tuple(columns) for name, columns in actual_columns.items()} != expected_columns:
+        raise RuntimeError("brain schema v6 column contract mismatch")
+    cur.execute(
+        "SELECT c.relname,con.contype,count(*) AS count FROM pg_constraint con "
+        "JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='public' AND c.relname=ANY(%s) GROUP BY c.relname,con.contype",
+        (list(expected_columns),),
+    )
+    constraint_counts = {(row["relname"], row["contype"]): row["count"] for row in cur.fetchall()}
+    if constraint_counts != {
+        ("brain_artifact_authority_requests", "c"): 8,
+        ("brain_artifact_authority_requests", "p"): 1,
+        ("brain_artifact_authority_registrations", "c"): 11,
+        ("brain_artifact_authority_registrations", "f"): 2,
+        ("brain_artifact_authority_registrations", "p"): 1,
+        ("brain_artifact_authority_registrations", "u"): 1,
+    }:
+        raise RuntimeError(f"brain schema v6 constraint contract mismatch: {constraint_counts!r}")
+    cur.execute(
+        "SELECT c.relname,t.tgname,p.proname AS function_name,t.tgenabled "
+        "FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_proc p ON p.oid=t.tgfoid "
+        "WHERE NOT t.tgisinternal AND n.nspname='public' AND c.relname=ANY(%s) "
+        "ORDER BY c.relname,t.tgname",
+        (list(expected_columns),),
+    )
+    triggers = [(row["relname"], row["tgname"], row["function_name"], row["tgenabled"]) for row in cur.fetchall()]
+    expected_triggers = sorted(
+        (relation, f"{relation}_append_only", "brain_reject_mutation", "O")
+        for relation in expected_columns
+    ) + sorted(
+        (relation, f"{relation}_no_truncate", "brain_reject_mutation", "O")
+        for relation in expected_columns
+    )
+    if sorted(triggers) != sorted(expected_triggers):
+        raise RuntimeError("brain schema v6 trigger contract mismatch")
+    cur.execute(
+        "SELECT owner.rolname AS owner_name, p.prosecdef, p.proconfig "
+        "FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "JOIN pg_roles owner ON owner.oid=p.proowner "
+        "WHERE n.nspname='public' AND p.proname='brain_register_authoritative_artifact_manifest'"
+    )
+    function = cur.fetchone()
+    if (
+        function is None
+        or function["owner_name"] != "brain_artifact_authority_owner"
+        or not function["prosecdef"]
+        or function["proconfig"] != ["search_path=pg_catalog, public"]
+    ):
+        raise RuntimeError("brain schema v6 registration function contract mismatch")
+    cur.execute(
+        "SELECT p.proname,p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+        "WHERE n.nspname='public' AND p.proname=ANY(%s)",
+        ([
+            "brain_register_authoritative_artifact_manifest",
+            "brain_artifact_is_authoritative",
+            "brain_check_policy_lifecycle",
+        ],),
+    )
+    bodies = {row["proname"]: _raw_function_body_fingerprint(row["prosrc"]) for row in cur.fetchall()}
+    if bodies != {
+        name: _v6_function_body_fingerprint(name)
+        for name in (
+            "brain_register_authoritative_artifact_manifest",
+            "brain_artifact_is_authoritative",
+            "brain_check_policy_lifecycle",
+        )
+    }:
+        raise RuntimeError("brain schema v6 function body contract mismatch")
+    cur.execute(
+        "SELECT owner.rolname AS owner_name FROM pg_proc p "
+        "JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner "
+        "WHERE n.nspname='public' AND p.proname='brain_check_policy_lifecycle'"
+    )
+    lifecycle = cur.fetchone()
+    if lifecycle is None or lifecycle["owner_name"] != _MIGRATION_ROLE:
+        raise RuntimeError("brain schema v6 lifecycle function owner mismatch")
+    cur.execute(
+        "SELECT owner.rolname AS owner_name,p.proconfig,p.prosrc,p.prosecdef FROM pg_proc p "
+        "JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner "
+        "WHERE n.nspname='public' AND p.proname='brain_artifact_is_authoritative'"
+    )
+    authority_predicate = cur.fetchone()
+    if (
+        authority_predicate is None
+        or authority_predicate["owner_name"] != "brain_artifact_authority_owner"
+        or not authority_predicate["prosecdef"]
+        or authority_predicate["proconfig"] != ["search_path=pg_catalog, public"]
+        or "brain_artifact_authority_registrations" not in authority_predicate["prosrc"]
+    ):
+        raise RuntimeError("brain schema v6 authority predicate contract mismatch")
+    for role_name in ("brain_artifact_authority_owner", "brain_artifact_authority_writer"):
+        cur.execute(
+            "SELECT rolsuper, rolcreaterole, rolcreatedb, rolcanlogin FROM pg_roles WHERE rolname=%s",
+            (role_name,),
+        )
+        role = cur.fetchone()
+        if role is None or role["rolsuper"] or role["rolcreaterole"] or role["rolcreatedb"] or role["rolcanlogin"]:
+            raise RuntimeError(f"brain schema v6 unsafe or missing role: {role_name}")
+        cur.execute("SELECT has_schema_privilege(%s,'public','CREATE') AS allowed", (role_name,))
+        if cur.fetchone()["allowed"]:
+            raise RuntimeError(f"brain schema v6 role retains public schema CREATE: {role_name}")
+    cur.execute(
+        "SELECT has_function_privilege('brain_artifact_authority_writer', "
+        "'public.brain_register_authoritative_artifact_manifest(uuid,text,text,text,timestamptz,timestamptz,text,text,jsonb)', "
+        "'EXECUTE') AS writer_execute, EXISTS ("
+        "SELECT 1 FROM pg_proc p CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl "
+        "WHERE p.oid='public.brain_register_authoritative_artifact_manifest"
+        "(uuid,text,text,text,timestamptz,timestamptz,text,text,jsonb)'::regprocedure "
+        "AND acl.grantee=0 AND acl.privilege_type='EXECUTE') AS public_execute"
+    )
+    grants = cur.fetchone()
+    if not grants["writer_execute"] or grants["public_execute"]:
+        raise RuntimeError("brain schema v6 registration function ACL mismatch")
+    cur.execute(
+        "SELECT parent.rolname AS parent_role, member.rolname AS member_role "
+        "FROM pg_auth_members membership JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "WHERE parent.rolname=ANY(%s) OR member.rolname=ANY(%s) "
+        "ORDER BY parent.rolname,member.rolname",
+        (["brain_artifact_authority_owner", "brain_artifact_authority_writer"],) * 2,
+    )
+    memberships = [(row["parent_role"], row["member_role"]) for row in cur.fetchall()]
+    if memberships != [("brain_artifact_authority_owner", _MIGRATION_ROLE)]:
+        raise RuntimeError("brain schema v6 role membership contract mismatch")
+    cur.execute(
+        "SELECT has_table_privilege('brain_artifact_authority_owner','public.brain_artifacts','SELECT,INSERT') "
+        "AS artifacts, has_table_privilege('brain_artifact_authority_owner',"
+        "'public.brain_artifact_locations','SELECT,INSERT') AS locations, "
+        "has_sequence_privilege('brain_artifact_authority_owner',"
+        "'public.brain_artifact_locations_artifact_location_id_seq','USAGE,SELECT') AS identity_sequence"
+    )
+    owner_grants = cur.fetchone()
+    if not all(owner_grants.values()):
+        raise RuntimeError("brain schema v6 owner dependency ACL mismatch")
+    cur.execute(
+        "SELECT has_table_privilege('brain_artifact_authority_owner','public.brain_artifacts',"
+        "'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS artifacts_extra,"
+        "has_table_privilege('brain_artifact_authority_owner','public.brain_artifact_locations',"
+        "'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS locations_extra,"
+        "has_sequence_privilege('brain_artifact_authority_owner',"
+        "'public.brain_artifact_locations_artifact_location_id_seq','UPDATE') AS sequence_update,"
+        "has_table_privilege('brain_artifact_authority_writer','public.brain_artifact_authority_requests',"
+        "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS writer_requests,"
+        "has_table_privilege('brain_artifact_authority_writer','public.brain_artifact_authority_registrations',"
+        "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS writer_registrations"
+    )
+    forbidden_grants = cur.fetchone()
+    if any(forbidden_grants.values()):
+        raise RuntimeError("brain schema v6 excessive table or sequence ACL")
+
+
+def verify_brain_schema_v6_in_transaction(cur) -> None:
+    """Verify V1-V6 and the immutable artifact registration authority."""
+    verify_brain_schema_v5_in_transaction(cur)
+    _verify_v6_contract(cur)
+
+
+def verify_brain_schema_v6(conn) -> None:
+    _require_idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            verify_brain_schema_v6_in_transaction(cur)
+
+
+def ensure_brain_schema_v6_in_transaction(
+    cur,
+    *,
+    lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
+) -> None:
+    _assert_schema_v6_bytes_immutable()
+    versions = _version_rows(cur)
+    if len(versions) == 6:
+        verify_brain_schema_v6_in_transaction(cur)
+        return
+    ensure_brain_schema_v5_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
+    migration_identity = _activate_migration_identity(cur)
+    _acquire_xact_lock(cur, lock_timeout_seconds)
+    versions = _version_rows(cur)
+    if len(versions) == 6:
+        verify_brain_schema_v6_in_transaction(cur)
+        return
+    if len(versions) != 5:
+        raise RuntimeError("brain schema v6 requires contiguous V1-V5 ledger")
+    cur.execute(_schema_v6_bytes().decode("utf-8"))
+    cur.execute(
+        "INSERT INTO public.brain_schema_versions "
+        "(version,migration_name,migration_checksum,applied_by) VALUES (6,%s,%s,%s)",
+        (_MIGRATION_V6_NAME, _EXPECTED_V6_CHECKSUM, migration_identity),
+    )
+    verify_brain_schema_v6_in_transaction(cur)
+
+
+def ensure_brain_schema_v6(
+    conn,
+    *,
+    lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
+) -> None:
+    _require_idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            ensure_brain_schema_v6_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
+
+
 def ensure_policy_partition(conn, policy_version: str) -> str:
     """Create and verify the owner-only LIST partition for one policy version."""
     if not isinstance(policy_version, str) or not policy_version.strip():
@@ -2996,3 +3285,5 @@ ensure_schema_v4 = ensure_brain_schema_v4
 verify_schema_v4 = verify_brain_schema_v4
 ensure_schema_v5 = ensure_brain_schema_v5
 verify_schema_v5 = verify_brain_schema_v5
+ensure_schema_v6 = ensure_brain_schema_v6
+verify_schema_v6 = verify_brain_schema_v6

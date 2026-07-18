@@ -24,6 +24,7 @@ from psycopg import sql
 DEFAULT_ROLE = "fleet_worker"
 _ROLE_LOCK_KEY = "applypilot:fleet-worker-role:v2"
 _CANDIDATE_ROLE_LOCK_KEY = "applypilot:brain-candidate-roles:v1"
+_ARTIFACT_AUTHORITY_ROLE_LOCK_KEY = "applypilot:brain-artifact-authority-roles:v1"
 
 
 class CrossDatabaseInventoryDriftError(RuntimeError):
@@ -32,6 +33,8 @@ class CrossDatabaseInventoryDriftError(RuntimeError):
 
 BRAIN_CANDIDATE_READER_ROLE = "brain_candidate_reader"
 BRAIN_CANDIDATE_WRITER_ROLE = "brain_candidate_writer"
+BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE = "brain_artifact_authority_owner"
+BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE = "brain_artifact_authority_writer"
 _CANDIDATE_READ_RELATIONS = (
     "brain_authority_scope_state",
     "brain_v4_candidate_decisions",
@@ -2467,6 +2470,49 @@ def ensure_brain_candidate_roles(
         raise
 
 
+def ensure_brain_artifact_authority_roles_in_transaction(
+    cur,
+    *,
+    migrator_role: str = "brain_schema_migrator",
+) -> tuple[str, str]:
+    """Reconcile the fixed NOLOGIN v6 owner/writer capability roles."""
+    if migrator_role != "brain_schema_migrator":
+        raise RuntimeError("artifact authority roles require fixed brain_schema_migrator")
+    cur.execute("SET LOCAL search_path=pg_catalog")
+    cur.execute("SELECT rolsuper OR rolcreaterole AS allowed FROM pg_roles WHERE rolname=current_user")
+    row = cur.fetchone()
+    if row is None or not _row_value(row, "allowed"):
+        raise RuntimeError("artifact authority role reconciliation requires CREATEROLE or provider-admin authority")
+    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (migrator_role,))
+    if cur.fetchone() is None:
+        raise RuntimeError("artifact authority role reconciliation requires brain_schema_migrator")
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_ARTIFACT_AUTHORITY_ROLE_LOCK_KEY,))
+    for role_name in (BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE):
+        identifier = sql.Identifier(role_name)
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,))
+        if cur.fetchone() is None:
+            cur.execute(sql.SQL("CREATE ROLE {}").format(identifier))
+        cur.execute(
+            sql.SQL(
+                "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+            ).format(identifier)
+        )
+        cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(identifier))
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier))
+    cur.execute(
+        sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
+            sql.Identifier(BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE), sql.Identifier(migrator_role)
+        )
+    )
+    _reconcile_role_memberships(
+        cur,
+        role_name=BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE,
+        approved_grantee_roles=(migrator_role,),
+    )
+    _reconcile_role_memberships(cur, role_name=BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE)
+    return BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE
+
+
 def _install_brain_authority_in_transaction(
     cur,
     *,
@@ -2480,8 +2526,8 @@ def _install_brain_authority_in_transaction(
 
     # Import locally to keep the fleet role module independent during ordinary runtime use.
     from applypilot.brain.schema import (
-        ensure_brain_schema_v5_in_transaction,
-        verify_brain_schema_v5_in_transaction,
+        ensure_brain_schema_v6_in_transaction,
+        verify_brain_schema_v6_in_transaction,
     )
 
     candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
@@ -2491,6 +2537,8 @@ def _install_brain_authority_in_transaction(
     session_name = _row_value(identity, "session_name")
     database = sql.Identifier(_row_value(identity, "database_name", 1))
     migrator = sql.Identifier(topology.migrator_role)
+
+    ensure_brain_artifact_authority_roles_in_transaction(cur, migrator_role=topology.migrator_role)
 
     # The provider identity receives migration authority only for this transaction.
     cur.execute(
@@ -2513,7 +2561,7 @@ def _install_brain_authority_in_transaction(
         cur.execute(sql.SQL("GRANT CREATE ON DATABASE {} TO {}").format(database, migrator))
     if not membership_preexisted:
         cur.execute(sql.SQL("GRANT {} TO {}").format(migrator, session_user))
-    ensure_brain_schema_v5_in_transaction(cur)
+    ensure_brain_schema_v6_in_transaction(cur)
     cur.execute("SET LOCAL ROLE NONE")
     if not membership_preexisted:
         cur.execute(sql.SQL("REVOKE {} FROM {}").format(migrator, session_user))
@@ -2521,7 +2569,7 @@ def _install_brain_authority_in_transaction(
         cur.execute(sql.SQL("REVOKE CREATE ON DATABASE {} FROM {}").format(database, migrator))
 
     candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
-    verify_brain_schema_v5_in_transaction(cur)
+    verify_brain_schema_v6_in_transaction(cur)
     for capability in ("brain_policy_controller",):
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (capability,))
         if cur.fetchone() is None:

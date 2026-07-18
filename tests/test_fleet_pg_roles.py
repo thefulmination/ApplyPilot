@@ -1405,3 +1405,51 @@ def test_candidate_capability_roles_are_nologin_and_cannot_create_or_escalate(fl
                     provider.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role_name)))
                     provider.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
             provider.commit()
+
+
+def test_artifact_authority_roles_are_fixed_nologin_and_membership_closed(fleet_db):
+    with psycopg.connect(fleet_db, row_factory=dict_row) as provider:
+        try:
+            provider.execute(
+                "DO $$ BEGIN CREATE ROLE brain_schema_migrator NOLOGIN NOINHERIT NOSUPERUSER "
+                "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; "
+                "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+            )
+            provider.commit()
+            with provider.transaction():
+                with provider.cursor() as cursor:
+                    assert pg_roles.ensure_brain_artifact_authority_roles_in_transaction(cursor) == (
+                        "brain_artifact_authority_owner",
+                        "brain_artifact_authority_writer",
+                    )
+            roles = provider.execute(
+                "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+                "FROM pg_roles WHERE rolname IN "
+                "('brain_artifact_authority_owner','brain_artifact_authority_writer') ORDER BY rolname"
+            ).fetchall()
+            assert len(roles) == 2
+            assert all(not any(value for key, value in role.items() if key != "rolname") for role in roles)
+            assert provider.execute(
+                "SELECT array_agg(parent.rolname || '->' || member.rolname ORDER BY parent.rolname,member.rolname) "
+                "AS edges FROM pg_auth_members membership "
+                "JOIN pg_roles parent ON parent.oid=membership.roleid "
+                "JOIN pg_roles member ON member.oid=membership.member "
+                "WHERE parent.rolname LIKE 'brain_artifact_authority_%' "
+                "OR member.rolname LIKE 'brain_artifact_authority_%'"
+            ).fetchone()["edges"] == ["brain_artifact_authority_owner->brain_schema_migrator"]
+            assert provider.execute(
+                "SELECT has_schema_privilege('brain_artifact_authority_owner','public','CREATE') AS owner_create,"
+                "has_schema_privilege('brain_artifact_authority_writer','public','CREATE') AS writer_create"
+            ).fetchone() == {"owner_create": False, "writer_create": False}
+        finally:
+            provider.rollback()
+            require_disposable_postgres(provider)
+            for role_name in (
+                "brain_artifact_authority_owner",
+                "brain_artifact_authority_writer",
+                "brain_schema_migrator",
+            ):
+                if provider.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    provider.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role_name)))
+                    provider.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+            provider.commit()

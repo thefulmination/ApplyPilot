@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -33,6 +34,178 @@ from conftest import (
     DISPOSABLE_DATABASE_COMMENT,
     require_disposable_postgres,
 )
+
+
+def test_v6_clean_install_registration_replay_and_direct_dml_denial(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        with connection.transaction():
+            connection.execute("SET LOCAL ROLE brain_schema_migrator")
+            migrations = (
+                (1, schema._MIGRATION_NAME, schema._schema_bytes(), schema._schema_checksum()),
+                (2, schema._MIGRATION_V2_NAME, schema._schema_v2_bytes(), schema._schema_v2_checksum()),
+                (3, schema._MIGRATION_V3_NAME, schema._schema_v3_bytes(), schema._schema_v3_checksum()),
+                (4, schema._MIGRATION_V4_NAME, schema._schema_v4_bytes(), schema._EXPECTED_V4_CHECKSUM),
+                (5, schema._MIGRATION_V5_NAME, schema._schema_v5_bytes(), schema._EXPECTED_V5_CHECKSUM),
+                (6, schema._MIGRATION_V6_NAME, schema._schema_v6_bytes(), schema._EXPECTED_V6_CHECKSUM),
+            )
+            for version, name, migration, checksum in migrations:
+                statements = [migration.decode("utf-8")]
+                if version == 6:
+                    connection.execute("SET LOCAL ROLE NONE")
+                    connection.execute(
+                        "GRANT USAGE, CREATE ON SCHEMA public TO brain_schema_migrator WITH GRANT OPTION"
+                    )
+                    connection.execute("SET LOCAL ROLE brain_schema_migrator")
+                    sql_text = statements[0]
+                    markers = (
+                        "CREATE FUNCTION public.brain_register_authoritative_artifact_manifest",
+                        "ALTER FUNCTION public.brain_register_authoritative_artifact_manifest",
+                        "CREATE OR REPLACE FUNCTION public.brain_check_policy_lifecycle",
+                        "SET ROLE brain_artifact_authority_owner;",
+                    )
+                    offsets = [sql_text.index(marker) for marker in markers]
+                    statements = [
+                        sql_text[: offsets[0]],
+                        sql_text[offsets[0] : offsets[1]],
+                        sql_text[offsets[1] : offsets[2]],
+                        sql_text[offsets[2] : offsets[3]],
+                        sql_text[offsets[3] :],
+                    ]
+                try:
+                    for section, statement in enumerate(statements, start=1):
+                        connection.execute(statement)
+                except Exception as exc:
+                    position = getattr(getattr(exc, "diag", None), "statement_position", None)
+                    raise AssertionError(
+                        f"raw migration v{version} section {section} failed at position {position}"
+                    ) from exc
+                connection.execute(
+                    "INSERT INTO brain_schema_versions "
+                    "(version,migration_name,migration_checksum,applied_by) VALUES (%s,%s,%s,%s)",
+                    (version, name, checksum, "brain_schema_migrator"),
+                )
+        assert connection.execute(
+            "SELECT array_agg(version ORDER BY version) AS versions FROM brain_schema_versions"
+        ).fetchone()["versions"] == [1, 2, 3, 4, 5, 6]
+        system_id = connection.execute("SELECT system_identifier::text AS id FROM pg_control_system()").fetchone()["id"]
+        database_name = connection.execute("SELECT current_database() AS name").fetchone()["name"]
+        payload = json.dumps([{
+            "artifact_hash": "a" * 64, "byte_length": 7, "media_type": "application/json", "backend": "s3",
+            "bucket": "immutable", "object_key": "sha256/aa", "provider_version_id": "version-1",
+            "provider_checksum": "checksum-1", "storage_immutable": True, "encryption_mode": "customer_managed",
+            "encryption_key_id": "kms-key-1", "policy_source_id": "policy-1",
+        }])
+        params = (
+            "11111111-1111-1111-1111-111111111111", "b" * 64,
+            "brain-artifact-authority-registration-v1", "key-1", "2026-07-18T12:00:00Z",
+            "2099-07-18T13:00:00Z", system_id, database_name, payload,
+        )
+        connection.execute("SET ROLE brain_artifact_authority_writer")
+        statement = (
+            "SELECT brain_register_authoritative_artifact_manifest("
+            "%s::uuid,%s,%s,%s,%s::timestamptz,%s::timestamptz,%s,%s,%s::jsonb) AS receipt"
+        )
+        receipt = connection.execute(statement, params).fetchone()["receipt"]
+        assert connection.execute(statement, params).fetchone()["receipt"] == receipt
+        with pytest.raises(psycopg.errors.UniqueViolation, match="different manifest digest"):
+            with connection.transaction():
+                connection.execute(statement, (params[0], "c" * 64, *params[2:]))
+        partial_payload = json.dumps(
+            [
+                dict(json.loads(payload)[0], artifact_hash="d" * 64),
+                dict(json.loads(payload)[0], artifact_hash="not-a-digest"),
+            ]
+        )
+        partial_request = "33333333-3333-3333-3333-333333333333"
+        with pytest.raises(psycopg.errors.InvalidParameterValue, match="invalid artifact"):
+            with connection.transaction():
+                connection.execute(statement, (partial_request, "d" * 64, *params[2:-1], partial_payload))
+        connection.execute("RESET ROLE")
+        connection.execute(
+            "INSERT INTO brain_artifacts "
+            "(request_id,artifact_hash,media_type,byte_length,schema_version,location) "
+            "VALUES ('unregistered','f' || repeat('f',63),'application/json',1,1,'memory://unregistered')"
+        )
+        connection.execute(
+            "INSERT INTO brain_artifact_locations "
+            "(artifact_hash,backend,bucket_or_container,object_key,provider_version_id,provider_checksum,"
+            "storage_immutable,encryption_mode,encryption_key_id,durability,verified_at) "
+            "VALUES (repeat('f',64),'s3','immutable','unregistered','version-x','checksum-x',TRUE,"
+            "'customer_managed','kms-key-1','verified',now())"
+        )
+        assert connection.execute(
+            "SELECT brain_artifact_is_authoritative(%s) AS registered,"
+            "brain_artifact_is_authoritative(%s) AS unregistered",
+            ("a" * 64, "f" * 64),
+        ).fetchone() == {"registered": True, "unregistered": False}
+        assert connection.execute(
+            "SELECT (SELECT count(*) FROM brain_artifact_authority_requests WHERE request_id=%s) AS requests,"
+            "(SELECT count(*) FROM brain_artifacts WHERE artifact_hash=%s) AS artifacts",
+            (partial_request, "d" * 64),
+        ).fetchone() == {"requests": 0, "artifacts": 0}
+        connection.execute("SET ROLE brain_artifact_authority_writer")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with connection.transaction():
+                connection.execute(
+                    "INSERT INTO brain_artifact_authority_requests "
+                    "(request_id,manifest_sha256,purpose,key_id,issued_at,expires_at,destination_system_id,"
+                    "destination_database_name,artifact_count,receipt) VALUES "
+                    "('22222222-2222-2222-2222-222222222222',%s,%s,'key',now(),now()+interval '1 hour',"
+                    "%s,%s,1,'{}')",
+                    ("c" * 64, "brain-artifact-authority-registration-v1", system_id, database_name),
+                )
+        connection.execute("RESET ROLE")
+        with connection.cursor() as cursor:
+            schema._verify_v6_contract(cursor)
+        connection.commit()
+
+        concurrent_payload = json.dumps([dict(json.loads(payload)[0], artifact_hash="e" * 64)])
+        concurrent_params = (
+            "44444444-4444-4444-4444-444444444444", "e" * 64, *params[2:-1], concurrent_payload
+        )
+
+        def register_concurrently():
+            with psycopg.connect(brain_pg, row_factory=dict_row) as contender:
+                contender.execute("SET ROLE brain_artifact_authority_writer")
+                return contender.execute(statement, concurrent_params).fetchone()["receipt"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            receipts = [future.result() for future in (pool.submit(register_concurrently), pool.submit(register_concurrently))]
+        assert receipts[0] == receipts[1]
+        assert connection.execute(
+            "SELECT count(*) AS count FROM brain_artifact_authority_requests WHERE request_id=%s",
+            (concurrent_params[0],),
+        ).fetchone()["count"] == 1
+        connection.commit()
+
+        with connection.transaction():
+            for artifact_hash in HASHES:
+                connection.execute(
+                    "INSERT INTO brain_artifacts "
+                    "(request_id,artifact_hash,media_type,byte_length,schema_version,location) "
+                    "VALUES (%s,%s,'application/json',1,1,%s) ON CONFLICT (artifact_hash) DO NOTHING",
+                    (f"policy-{artifact_hash}", artifact_hash, f"memory://{artifact_hash}"),
+                )
+        _insert_policy(connection, version="v6-nonauthoritative")
+        _attach_policy_contract(connection, "v6-nonauthoritative")
+        connection.execute(
+            "UPDATE fleet_config SET paused=TRUE,ats_paused=TRUE,ats_apply_mode='stopped',"
+            "linkedin_apply_mode='stopped',canary_enabled=FALSE,linkedin_canary_enabled=FALSE WHERE id=1"
+        )
+        connection.commit()
+        _create_lifecycle_login(connection, brain_pg, "v6_controller_login", "brain_policy_controller")
+        connection.commit()
+        with psycopg.connect(_dsn_for(brain_pg, "v6_controller_login"), row_factory=dict_row) as controller:
+            with pytest.raises(psycopg.errors.CheckViolation, match="authoritative artifacts"):
+                controller.execute(
+                    "SELECT brain_controller_transition_policy('v6-nonauthoritative','validated',NULL)"
+                )
+            controller.rollback()
+        with pytest.raises(RuntimeError, match="retains public schema CREATE"):
+            with connection.transaction():
+                connection.execute("GRANT CREATE ON SCHEMA public TO brain_artifact_authority_writer")
+                with connection.cursor() as cursor:
+                    schema._verify_v6_contract(cursor)
 
 
 def _bootstrap_script_module():
@@ -97,13 +270,17 @@ TEST_ROLES = (
     "fleet_worker",
     "brain_status_test_login",
     "brain_controller_test_login",
+    "v6_controller_login",
     "ats_worker_role",
     "linkedin_worker_role",
     "brain_rogue_writer",
 )
 FIXED_BRAIN_ROLES = (
+    "brain_artifact_authority_owner",
+    "brain_artifact_authority_writer",
     "brain_candidate_reader",
     "brain_candidate_writer",
+    "brain_graph_authority",
     "brain_status_reader",
     "brain_policy_controller",
     "brain_schema_verifier",
@@ -113,6 +290,21 @@ HASHES = tuple(character * 64 for character in "abcdef0123456789")
 
 
 def _drop_fixed_role(conn, role: str) -> None:
+    if conn.execute("SELECT 1 FROM pg_namespace WHERE nspname='public'").fetchone() is not None:
+        schema_grantors = conn.execute(
+            "SELECT DISTINCT grantor.rolname AS grantor FROM pg_namespace n "
+            "CROSS JOIN LATERAL aclexplode(n.nspacl) acl JOIN pg_roles grantor ON grantor.oid=acl.grantor "
+            "WHERE n.nspname='public' AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=%s)",
+            (role,),
+        ).fetchall()
+        for grantor in schema_grantors:
+            conn.execute(pg_sql.SQL("SET LOCAL ROLE {}").format(pg_sql.Identifier(grantor["grantor"])))
+            conn.execute(
+                pg_sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA public FROM {} CASCADE").format(
+                    pg_sql.Identifier(role)
+                )
+            )
+            conn.execute("RESET ROLE")
     column_acls = conn.execute(
         "SELECT n.nspname,c.relname,a.attname,acl.privilege_type,grantor.rolname AS grantor "
         "FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
@@ -325,6 +517,9 @@ def brain_pg(fleet_db):
             "brain_policy_controller",
             "brain_candidate_reader",
             "brain_candidate_writer",
+            "brain_graph_authority",
+            "brain_artifact_authority_owner",
+            "brain_artifact_authority_writer",
         ):
             conn.execute(
                 pg_sql.SQL(
@@ -333,6 +528,12 @@ def brain_pg(fleet_db):
                     "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
                 ).format(pg_sql.Identifier(role))
             )
+        conn.execute(
+            "GRANT brain_artifact_authority_owner TO brain_schema_migrator WITH INHERIT FALSE, SET TRUE"
+        )
+        conn.execute(
+            "GRANT USAGE ON SCHEMA public TO brain_artifact_authority_owner, brain_artifact_authority_writer"
+        )
         _set_role_password(conn, fleet_db, "brain_schema_verifier")
         conn.execute("GRANT brain_schema_migrator TO postgres")
         conn.execute("GRANT USAGE, CREATE ON SCHEMA public TO brain_schema_migrator")
