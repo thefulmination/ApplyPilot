@@ -20,6 +20,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 
 from applypilot.apply import pgqueue
+from applypilot.brain import schema as brain_schema
 from applypilot.fleet import pg_roles
 from conftest import require_disposable_postgres
 
@@ -671,6 +672,240 @@ def _atomic_topology() -> pg_roles.BootstrapTopology:
         retired_admin_roles=(ATOMIC_RETIRED_ADMIN,),
         infrastructure_superuser_roles=("postgres",),
     )
+
+
+def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
+    fleet_db: str,
+    monkeypatch,
+) -> None:
+    owner = "existing_authority_owner_test"
+    controller = "existing_authority_controller_test"
+    retired = "existing_authority_retired_test"
+    legacy_controller = "existing_authority_legacy_controller_test"
+    worker = "existing_authority_worker_test"
+    topology = pg_roles.BootstrapTopology(
+        database_owner_role=owner,
+        controller_role=controller,
+        verifier_role="brain_schema_verifier",
+        migrator_role="brain_schema_migrator",
+        retired_admin_roles=(retired, legacy_controller),
+        infrastructure_superuser_roles=("postgres",),
+    )
+    role_names = (
+        "brain_artifact_authority_writer",
+        "brain_artifact_authority_owner",
+        "brain_candidate_writer",
+        "brain_candidate_reader",
+        "brain_policy_controller",
+        "brain_status_reader",
+        "brain_schema_verifier",
+        "brain_schema_migrator",
+        worker,
+        legacy_controller,
+        retired,
+        controller,
+        owner,
+    )
+    with pgqueue.connect(fleet_db) as root:
+        require_disposable_postgres(root)
+        version = int(root.execute("SHOW server_version_num").fetchone()["server_version_num"])
+        if version // 10000 != 18:
+            pytest.skip("existing topology authority upgrade requires PostgreSQL 18")
+        database_name = conninfo_to_dict(root.info.dsn)["dbname"]
+        try:
+            root.execute(sql.SQL("CREATE ROLE {} NOLOGIN INHERIT").format(sql.Identifier(owner)))
+            root.execute(sql.SQL("CREATE ROLE {} LOGIN INHERIT PASSWORD {}").format(
+                sql.Identifier(controller), sql.Literal("existing-controller-password")
+            ))
+            root.execute(sql.SQL("CREATE ROLE {} NOLOGIN INHERIT").format(sql.Identifier(retired)))
+            root.execute(sql.SQL("CREATE ROLE {} LOGIN INHERIT CREATEDB PASSWORD {}").format(
+                sql.Identifier(legacy_controller), sql.Literal("legacy-controller-password")
+            ))
+            root.execute(sql.SQL("CREATE ROLE {} LOGIN NOINHERIT PASSWORD {}").format(
+                sql.Identifier(worker), sql.Literal("worker-password")
+            ))
+            for role_name in ("brain_schema_migrator", "brain_schema_verifier"):
+                root.execute(sql.SQL("CREATE ROLE {} NOLOGIN INHERIT").format(sql.Identifier(role_name)))
+            for role_name in ("brain_status_reader", "brain_policy_controller"):
+                root.execute(sql.SQL("CREATE ROLE {} NOLOGIN NOINHERIT").format(sql.Identifier(role_name)))
+            root.execute(sql.SQL(
+                "GRANT brain_policy_controller TO {} WITH ADMIN FALSE, INHERIT TRUE, SET TRUE"
+            ).format(sql.Identifier(controller)))
+            root.execute(sql.SQL("GRANT {} TO {} WITH INHERIT TRUE, SET TRUE").format(
+                sql.Identifier(owner), sql.Identifier(legacy_controller)
+            ))
+            root.execute(sql.SQL(
+                "GRANT {} TO {} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+            ).format(sql.Identifier(worker), sql.Identifier(legacy_controller)))
+            root.execute(sql.SQL("ALTER DATABASE {} OWNER TO {}").format(
+                sql.Identifier(database_name), sql.Identifier(owner)
+            ))
+            root.execute(sql.SQL(
+                "REVOKE CONNECT,CREATE,TEMPORARY ON DATABASE {} FROM PUBLIC"
+            ).format(sql.Identifier(database_name)))
+            root.execute(sql.SQL("GRANT CREATE ON DATABASE {} TO brain_schema_migrator").format(
+                sql.Identifier(database_name)
+            ))
+            root.execute(
+                "GRANT USAGE,CREATE ON SCHEMA public TO brain_schema_migrator WITH GRANT OPTION"
+            )
+            root.execute(
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO brain_schema_migrator WITH GRANT OPTION"
+            )
+            root.execute(
+                "GRANT SELECT,INSERT,UPDATE ON public.fleet_config,public.fleet_decision_policies,"
+                "public.apply_queue,public.linkedin_queue,public.workers,public.worker_heartbeat,"
+                "public.fleet_worker_principals,public.fleet_desired_state,public.rate_governor "
+                "TO brain_schema_migrator WITH GRANT OPTION"
+            )
+            for column in (
+                "ats_canary_worker_id",
+                "ats_canary_version",
+                "linkedin_canary_worker_id",
+                "linkedin_canary_version",
+            ):
+                root.execute(f"ALTER TABLE public.fleet_config ADD COLUMN IF NOT EXISTS {column} text")
+            root.execute(
+                "UPDATE public.fleet_config SET paused=TRUE,ats_paused=TRUE,"
+                "ats_apply_mode='stopped',linkedin_apply_mode='stopped',"
+                "canary_enabled=FALSE,linkedin_canary_enabled=FALSE WHERE id=1"
+            )
+            for table_name in ("apply_queue", "compute_queue", "linkedin_queue"):
+                root.execute(sql.SQL("DELETE FROM public.{}").format(sql.Identifier(table_name)))
+            root.execute(
+                "INSERT INTO public.compute_queue(url,task,status,lease_owner,lease_expires_at) "
+                "VALUES('https://historical.example/job','score','leased','old-worker',"
+                "clock_timestamp()+interval '1 hour')"
+            )
+            root.execute(
+                "INSERT INTO public.workers(worker_id,machine_owner,capabilities) "
+                "VALUES('existing-worker','existing-owner','{\"can_ats\":true}'::jsonb)"
+            )
+            root.execute(
+                "INSERT INTO public.fleet_worker_principals(role_name,worker_id,contract) "
+                "VALUES(%s,'existing-worker','apply')",
+                (worker,),
+            )
+            root.execute(
+                "CREATE TABLE IF NOT EXISTS public.applypilot_fleet_schema_migrations("
+                "migration_id text PRIMARY KEY,migration_sha256 text NOT NULL)"
+            )
+            root.execute("DELETE FROM public.applypilot_fleet_schema_migrations")
+            with root.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO public.applypilot_fleet_schema_migrations(migration_id,migration_sha256) VALUES(%s,%s)",
+                    [
+                        ("20260715_001_application_authority", "65d10d1a16e9829a7995f48776697e3200daf7a5074147a9a3ed8c0293f56bea"),
+                        ("20260717_002_lane_specific_canary_pins", "1ee176c419508cd5a9c7004460798d14fd6749addbf293892fd2d859a1b6dd1d"),
+                    ],
+                )
+            with root.cursor() as cur:
+                cur.execute("SET LOCAL ROLE brain_schema_migrator")
+                brain_schema.ensure_brain_schema_v1_in_transaction(cur)
+                cur.execute("RESET ROLE")
+            root.commit()
+            identity = root.execute(
+                "SELECT (pg_control_system()).system_identifier::text AS system_identifier"
+            ).fetchone()
+            root.commit()
+
+            blocked_evidence = _test_evidence_paths()
+            with pytest.raises(RuntimeError, match="zero active unexpired leases"):
+                pg_roles.upgrade_brain_authority_existing_topology(
+                    root,
+                    topology=topology,
+                    evidence_paths=blocked_evidence,
+                    expected_database_name=database_name,
+                    expected_system_identifier=identity["system_identifier"],
+                )
+            assert not blocked_evidence.preparation_receipt_path.exists()
+            assert not blocked_evidence.rollback_sql_path.exists()
+            root.execute(
+                "UPDATE public.compute_queue SET status='done',lease_owner=NULL,lease_expires_at=NULL "
+                "WHERE url='https://historical.example/job' AND task='score'"
+            )
+            root.commit()
+
+            original_transition = pg_roles._transition_existing_authority_topology
+            blocked_statements: list[str] = []
+
+            def transition_with_lock_probe(cur, *, topology):
+                probes = (
+                    "UPDATE public.fleet_config SET paused=FALSE WHERE id=1",
+                    "UPDATE public.apply_queue SET status=status WHERE FALSE",
+                    "UPDATE public.compute_queue SET status=status WHERE FALSE",
+                    "UPDATE public.linkedin_queue SET status=status WHERE FALSE",
+                )
+                for statement in probes:
+                    with psycopg.connect(fleet_db, row_factory=dict_row) as contender:
+                        contender.execute("SET lock_timeout='100ms'")
+                        with pytest.raises(psycopg.errors.LockNotAvailable):
+                            contender.execute(statement)
+                        contender.rollback()
+                    blocked_statements.append(statement)
+                return original_transition(cur, topology=topology)
+
+            monkeypatch.setattr(
+                pg_roles,
+                "_transition_existing_authority_topology",
+                transition_with_lock_probe,
+            )
+
+            receipt = pg_roles.upgrade_brain_authority_existing_topology(
+                root,
+                topology=topology,
+                evidence_paths=_test_evidence_paths(),
+                expected_database_name=database_name,
+                expected_system_identifier=identity["system_identifier"],
+            )
+
+            assert root.execute(
+                "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
+            ).fetchone()["versions"] == [1, 2, 3, 4, 5, 6, 7]
+            assert root.execute(
+                "SELECT rolcanlogin,rolinherit,rolcreatedb FROM pg_roles WHERE rolname=%s",
+                (legacy_controller,),
+            ).fetchone() == {"rolcanlogin": False, "rolinherit": False, "rolcreatedb": False}
+            assert root.execute(
+                "SELECT count(*) AS count FROM pg_auth_members membership "
+                "JOIN pg_roles parent ON parent.oid=membership.roleid "
+                "JOIN pg_roles member ON member.oid=membership.member "
+                "WHERE parent.rolname=%s OR member.rolname=%s",
+                (legacy_controller, legacy_controller),
+            ).fetchone()["count"] == 0
+            assert root.execute(
+                "SELECT rolcanlogin,rolinherit,rolpassword IS NOT NULL AS has_password "
+                "FROM pg_authid WHERE rolname=%s",
+                (owner,),
+            ).fetchone() == {"rolcanlogin": True, "rolinherit": False, "has_password": False}
+            assert legacy_controller not in receipt.rollback_sql
+            assert len(blocked_statements) == 4
+            assert root.execute(
+                "SELECT paused,ats_paused,ats_apply_mode,linkedin_apply_mode FROM public.fleet_config WHERE id=1"
+            ).fetchone() == {
+                "paused": True,
+                "ats_paused": True,
+                "ats_apply_mode": "stopped",
+                "linkedin_apply_mode": "stopped",
+            }
+            assert root.execute(
+                "SELECT status FROM public.compute_queue "
+                "WHERE url='https://historical.example/job' AND task='score'"
+            ).fetchone()["status"] == "done"
+        finally:
+            root.rollback()
+            require_disposable_postgres(root)
+            root.execute(sql.SQL("ALTER DATABASE {} OWNER TO postgres").format(sql.Identifier(database_name)))
+            root.execute("DROP SCHEMA IF EXISTS brain_archive CASCADE")
+            root.execute("DROP SCHEMA public CASCADE")
+            for role_name in role_names:
+                if root.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (role_name,)).fetchone():
+                    root.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role_name)))
+                    root.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
+            root.execute("CREATE SCHEMA public AUTHORIZATION pg_database_owner")
+            root.execute("GRANT ALL ON SCHEMA public TO pg_database_owner")
+            root.execute("GRANT USAGE ON SCHEMA public TO PUBLIC")
+            root.commit()
 
 
 def test_pg18_bootstrap_validates_connection_then_database_then_evidence(monkeypatch) -> None:

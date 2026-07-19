@@ -4203,6 +4203,486 @@ def bootstrap_database_roles(
             conn.commit()
 
 
+def upgrade_brain_authority_existing_topology(
+    conn,
+    *,
+    topology: BootstrapTopology,
+    evidence_paths: DurableEvidencePaths,
+    expected_database_name: str,
+    expected_system_identifier: str,
+) -> BootstrapReceipt:
+    """Atomically install fixed brain authority on an existing role topology.
+
+    This is intentionally narrower than :func:`bootstrap_database_roles`: it
+    neither creates/replaces the permanent fleet roles nor changes database
+    ownership or admission ACLs.  It exists for databases that completed the
+    earlier role handoff before the fixed authority schema was introduced.
+    """
+    if conn.autocommit:
+        raise RuntimeError("atomic authority upgrade requires autocommit to be disabled")
+    if conn.info.transaction_status.name != "IDLE":
+        raise RuntimeError("authority upgrade requires an idle provider-admin connection")
+    _validate_evidence_paths(evidence_paths)
+    lock_acquired = False
+    try:
+        with conn.cursor() as cur:
+            _require_pg18_authority_catalog(cur)
+            cur.execute(
+                "SELECT pg_advisory_lock(pg_catalog.hashtext(%s))",
+                ("applypilot:brain-authority-existing-topology:v1",),
+            )
+            lock_acquired = True
+            cur.execute("SET LOCAL search_path=pg_catalog")
+            _lock_cluster_security_catalogs(cur)
+            _lock_existing_authority_runtime_state(cur)
+            inventory = _existing_authority_topology_inventory(
+                cur,
+                topology=topology,
+                expected_database_name=expected_database_name,
+                expected_system_identifier=expected_system_identifier,
+            )
+            rollback_sql = _forward_v5_deactivation_sql(
+                cur,
+                topology=topology,
+                database_name=inventory["database_name"],
+                database_owner_before=inventory["database_owner_before"],
+                ownership=(),
+                other_databases=(),
+                retired_memberships=(),
+            )
+            prepared_at = datetime.now(timezone.utc).isoformat()
+            prepared_inventory = {
+                **inventory,
+                "atomic_bootstrap": False,
+                "atomic_existing_topology_upgrade": True,
+                "automatic_rollback_supported": True,
+                "rollback_mode": "forward_v5_deactivation",
+                "commit_outcome_on_interruption": "unknown",
+                "legacy_rollback_sql_recovers_v1_v4": False,
+                "legacy_rollback_sql_recovers_v1_v5": False,
+                "topology": {
+                    "database_owner_role": topology.database_owner_role,
+                    "controller_role": topology.controller_role,
+                    "verifier_role": topology.verifier_role,
+                    "migrator_role": topology.migrator_role,
+                    "retired_admin_roles": topology.retired_admin_roles,
+                    "infrastructure_superuser_roles": topology.infrastructure_superuser_roles,
+                },
+                "prepared_at": prepared_at,
+                "authority_install_requested": True,
+                "escalation_required": True,
+            }
+            _write_preparation_evidence(
+                evidence_paths,
+                inventory=prepared_inventory,
+                rollback_sql=rollback_sql,
+            )
+            _transition_existing_authority_topology(cur, topology=topology)
+            candidate_roles = _install_brain_authority_in_transaction(cur, topology=topology)
+            _existing_authority_topology_inventory(
+                cur,
+                topology=topology,
+                expected_database_name=expected_database_name,
+                expected_system_identifier=expected_system_identifier,
+                require_v7=True,
+            )
+        conn.commit()
+        return BootstrapReceipt(
+            database_name=inventory["database_name"],
+            session_user=inventory["session_user"],
+            topology=prepared_inventory["topology"],
+            inventory={
+                **prepared_inventory,
+                "candidate_roles": {
+                    "reader_role": candidate_roles.reader_role,
+                    "writer_role": candidate_roles.writer_role,
+                    "reconciled_at": candidate_roles.reconciled_at,
+                },
+            },
+            effective_connect_grantees=(),
+            rollback_sql=rollback_sql,
+            escalation_required=False,
+            bootstrapped_at=prepared_at,
+        )
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        if lock_acquired:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_unlock(pg_catalog.hashtext(%s))",
+                    ("applypilot:brain-authority-existing-topology:v1",),
+                )
+            conn.commit()
+
+
+def _existing_authority_topology_inventory(
+    cur,
+    *,
+    topology: BootstrapTopology,
+    expected_database_name: str,
+    expected_system_identifier: str,
+    require_v7: bool = False,
+) -> dict[str, Any]:
+    role_names = (
+        topology.database_owner_role,
+        topology.controller_role,
+        topology.verifier_role,
+        topology.migrator_role,
+        *topology.retired_admin_roles,
+        *topology.infrastructure_superuser_roles,
+    )
+    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", name) for name in role_names):
+        raise ValueError("authority upgrade role names must be plain PostgreSQL identifiers")
+    permanent_roles = {
+        topology.database_owner_role,
+        topology.controller_role,
+        topology.verifier_role,
+        topology.migrator_role,
+    }
+    if len(permanent_roles) != 4:
+        raise RuntimeError("authority upgrade owner/controller/verifier/migrator roles must be distinct")
+    if not topology.retired_admin_roles:
+        raise RuntimeError("authority upgrade requires at least one retired provider-admin role")
+    if permanent_roles & set(topology.retired_admin_roles):
+        raise RuntimeError("permanent topology roles must be disjoint from retired admins")
+    if set(topology.infrastructure_superuser_roles) & (permanent_roles | set(topology.retired_admin_roles)):
+        raise RuntimeError("infrastructure superusers must be disjoint from managed topology roles")
+
+    if not expected_database_name or not expected_system_identifier.isdigit():
+        raise ValueError("authority upgrade requires exact database and numeric system-identifier pins")
+    cur.execute(
+        "SELECT session_user AS session_name,current_user AS current_name,current_database() AS database_name,"
+        "(pg_control_system()).system_identifier::text AS system_identifier,"
+        "owner.rolname AS database_owner FROM pg_database database "
+        "JOIN pg_roles owner ON owner.oid=database.datdba WHERE database.datname=current_database()"
+    )
+    identity = cur.fetchone()
+    session_user = _row_value(identity, "session_name")
+    if session_user != _row_value(identity, "current_name", 1):
+        raise RuntimeError("authority upgrade forbids SET ROLE and requires provider-admin identity")
+    if session_user not in topology.infrastructure_superuser_roles:
+        raise RuntimeError("authority upgrade session_user must be an explicit infrastructure break-glass role")
+    database_name = _row_value(identity, "database_name", 2)
+    system_identifier = _row_value(identity, "system_identifier", 3)
+    if database_name != expected_database_name or system_identifier != expected_system_identifier:
+        raise RuntimeError(
+            "authority upgrade target identity mismatch: "
+            f"expected={expected_system_identifier}/{expected_database_name}, "
+            f"actual={system_identifier}/{database_name}"
+        )
+    if _row_value(identity, "database_owner", 4) != topology.database_owner_role:
+        raise RuntimeError("authority upgrade database owner does not match the declared existing topology")
+
+    cur.execute(
+        "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+        "FROM pg_roles WHERE rolname=ANY(%s) ORDER BY rolname",
+        (list(role_names),),
+    )
+    roles = { _row_value(row, "rolname"): row for row in cur.fetchall() }
+    missing = sorted(set(role_names) - set(roles))
+    if missing:
+        raise RuntimeError("authority upgrade topology roles do not exist: " + ", ".join(missing))
+    admin = roles[session_user]
+    if not bool(_row_value(admin, "rolcanlogin", 1)) or not bool(_row_value(admin, "rolsuper", 3)):
+        raise RuntimeError("authority upgrade requires a LOGIN SUPERUSER provider-admin session")
+    expected_attributes = {
+        topology.database_owner_role: (None, None, False, False, False, False, False),
+        topology.controller_role: (True, None, False, False, False, False, False),
+        topology.verifier_role: (False, None, False, False, False, False, False),
+        topology.migrator_role: (False, None, False, False, False, False, False),
+    }
+    attribute_names = (
+        "rolcanlogin", "rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"
+    )
+    for role_name, expected in expected_attributes.items():
+        actual = tuple(bool(_row_value(roles[role_name], name, index + 1)) for index, name in enumerate(attribute_names))
+        if any(want is not None and got != want for got, want in zip(actual, expected, strict=True)):
+            raise RuntimeError(f"authority upgrade role attributes invalid for {role_name}: {actual!r}")
+    for role_name in topology.retired_admin_roles:
+        row = roles[role_name]
+        if any(bool(_row_value(row, name, index + 1)) for index, name in enumerate(attribute_names)
+               if name in {"rolsuper", "rolcreaterole", "rolreplication", "rolbypassrls"}):
+            raise RuntimeError(f"retired provider admin remains elevated: {role_name}")
+    for role_name in topology.infrastructure_superuser_roles:
+        row = roles[role_name]
+        if not bool(_row_value(row, "rolcanlogin", 1)) or not bool(_row_value(row, "rolsuper", 3)):
+            raise RuntimeError(f"infrastructure break-glass role is not LOGIN SUPERUSER: {role_name}")
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolsuper ORDER BY rolname")
+    unknown_superusers = sorted(
+        _row_value(row, "rolname") for row in cur.fetchall()
+        if _row_value(row, "rolname") not in topology.infrastructure_superuser_roles
+    )
+    if unknown_superusers:
+        raise RuntimeError("unknown superuser dependencies block authority upgrade: " + ", ".join(unknown_superusers))
+
+    cur.execute(
+        "SELECT role_name FROM unnest(%s::text[]) role_name "
+        "WHERE pg_has_role(%s,role_name,'MEMBER') ORDER BY role_name",
+        ([topology.database_owner_role, topology.migrator_role], topology.controller_role),
+    )
+    forbidden_controller_memberships = [
+        _row_value(row, "role_name") for row in cur.fetchall()
+    ]
+    if forbidden_controller_memberships:
+        raise RuntimeError(
+            "authority upgrade controller retains owner or migrator membership: "
+            + ", ".join(forbidden_controller_memberships)
+        )
+    cur.execute(
+        "SELECT privilege_type FROM pg_database database "
+        "CROSS JOIN LATERAL aclexplode(COALESCE(database.datacl,acldefault('d',database.datdba))) acl "
+        "WHERE database.datname=current_database() AND acl.grantee=0 "
+        "AND privilege_type=ANY(%s) ORDER BY privilege_type",
+        (["CONNECT", "CREATE", "TEMPORARY"],),
+    )
+    public_database_privileges = [
+        _row_value(row, "privilege_type") for row in cur.fetchall()
+    ]
+    if public_database_privileges:
+        raise RuntimeError(
+            "authority upgrade PUBLIC database privileges remain: "
+            + ", ".join(public_database_privileges)
+        )
+    cur.execute(
+        "SELECT usename,state FROM pg_stat_activity WHERE datname=current_database() "
+        "AND pid<>pg_backend_pid() AND state='idle in transaction' ORDER BY usename"
+    )
+    idle_transactions = cur.fetchall()
+    if idle_transactions:
+        raise RuntimeError(
+            f"authority upgrade is blocked by idle-in-transaction sessions: {idle_transactions!r}"
+        )
+
+    _verify_existing_authority_ledgers_and_gates(cur, require_v7=require_v7)
+    memberships = _retired_membership_inventory(
+        cur, retired_admin_roles=topology.retired_admin_roles
+    )
+    if not require_v7:
+        _reject_retired_role_ownership(cur, retired_admin_roles=topology.retired_admin_roles)
+        _validate_existing_retired_memberships(
+            cur,
+            topology=topology,
+            memberships=memberships,
+        )
+    if require_v7:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM public.brain_schema_versions WHERE version=7) AS installed"
+        )
+        if not bool(_row_value(cur.fetchone(), "installed")):
+            raise RuntimeError("authority upgrade did not install brain schema v7")
+        _require_persisted_controller_identity_if_v7(cur, controller_role=topology.controller_role)
+        _require_exact_controller_membership(cur, controller_role=topology.controller_role)
+        _validate_retired_admin_memberships_closed(
+            cur, retired_admin_roles=topology.retired_admin_roles
+        )
+        _verify_existing_provider_membership(cur, topology=topology)
+        expected_final_attributes = {
+            topology.database_owner_role: (True, False, False, False, False, False, False),
+            topology.controller_role: (True, False, False, False, False, False, False),
+            topology.verifier_role: (False, False, False, False, False, False, False),
+            topology.migrator_role: (False, False, False, False, False, False, False),
+        }
+        for role_name, expected in expected_final_attributes.items():
+            actual = tuple(
+                bool(_row_value(roles[role_name], name, index + 1))
+                for index, name in enumerate(attribute_names)
+            )
+            if actual != expected:
+                raise RuntimeError(f"authority upgrade final role attributes invalid for {role_name}: {actual!r}")
+    return {
+        "session_user": session_user,
+        "database_name": database_name,
+        "system_identifier": system_identifier,
+        "database_owner_before": _row_value(identity, "database_owner", 4),
+        "retired_admin_memberships_before": memberships,
+        "database_owner_password_present": _role_password_present(
+            cur, topology.database_owner_role
+        ),
+        "roles": tuple(
+            {
+                "role_name": name,
+                **{
+                    key.removeprefix("rol"): bool(_row_value(row, key, index + 1))
+                    for index, key in enumerate(attribute_names)
+                },
+            }
+            for name, row in sorted(roles.items())
+        ),
+    }
+
+
+def _role_password_present(cur, role_name: str) -> bool:
+    cur.execute("SELECT rolpassword IS NOT NULL AS present FROM pg_authid WHERE rolname=%s", (role_name,))
+    row = cur.fetchone()
+    return bool(_row_value(row, "present"))
+
+
+def _lock_existing_authority_runtime_state(cur) -> None:
+    # Fleet lease functions read fleet_config before leasing from a queue.  Use
+    # the same order and hold write-excluding locks through final verification
+    # and commit so a paused/zero-live-lease preflight cannot race a worker.
+    cur.execute("LOCK TABLE public.fleet_config IN SHARE ROW EXCLUSIVE MODE")
+    cur.execute("SELECT id FROM public.fleet_config WHERE id=1 FOR UPDATE")
+    if cur.fetchone() is None:
+        raise RuntimeError("authority upgrade requires the fleet_config singleton")
+    for table_name in ("apply_queue", "compute_queue", "linkedin_queue"):
+        cur.execute(
+            sql.SQL("LOCK TABLE public.{} IN SHARE ROW EXCLUSIVE MODE").format(
+                sql.Identifier(table_name)
+            )
+        )
+    cur.execute(
+        "LOCK TABLE public.applypilot_fleet_schema_migrations IN SHARE MODE"
+    )
+
+
+def _verify_existing_authority_ledgers_and_gates(cur, *, require_v7: bool) -> None:
+    from applypilot.brain.schema import verify_brain_schema_v1_in_transaction, verify_brain_schema_v7_in_transaction
+
+    cur.execute(
+        "SELECT version FROM public.brain_schema_versions ORDER BY version"
+    )
+    versions = [_row_value(row, "version") for row in cur.fetchall()]
+    expected = list(range(1, 8)) if require_v7 else [1, 2, 3]
+    if versions != expected:
+        raise RuntimeError(f"authority upgrade requires exact brain ledger prefix {expected!r}, got {versions!r}")
+    if require_v7:
+        verify_brain_schema_v7_in_transaction(cur)
+    else:
+        verify_brain_schema_v1_in_transaction(cur)
+    cur.execute(
+        "SELECT migration_id,migration_sha256 FROM public.applypilot_fleet_schema_migrations "
+        "ORDER BY migration_id"
+    )
+    fleet_rows = [tuple(row.values()) if isinstance(row, Mapping) else tuple(row) for row in cur.fetchall()]
+    expected_fleet = [
+        ("20260715_001_application_authority", "65d10d1a16e9829a7995f48776697e3200daf7a5074147a9a3ed8c0293f56bea"),
+        ("20260717_002_lane_specific_canary_pins", "1ee176c419508cd5a9c7004460798d14fd6749addbf293892fd2d859a1b6dd1d"),
+    ]
+    if fleet_rows not in (expected_fleet, [*expected_fleet, ("20260719_003_harden_application_authority_functions", "f256bfff5aab2a9a2a6c7aaaa72f6ae2021fa3d21d40c9945298aca9d7defa03")]):
+        raise RuntimeError(f"authority upgrade fleet migration ledger mismatch: {fleet_rows!r}")
+    cur.execute(
+        "SELECT paused,ats_paused,ats_apply_mode,linkedin_apply_mode,"
+        "canary_enabled,linkedin_canary_enabled FROM public.fleet_config WHERE id=1"
+    )
+    gate = cur.fetchone()
+    if gate is None or not bool(_row_value(gate, "paused")) or not bool(_row_value(gate, "ats_paused", 1)) \
+            or _row_value(gate, "ats_apply_mode", 2) != "stopped" \
+            or _row_value(gate, "linkedin_apply_mode", 3) != "stopped" \
+            or bool(_row_value(gate, "canary_enabled", 4)) \
+            or bool(_row_value(gate, "linkedin_canary_enabled", 5)):
+        raise RuntimeError("authority upgrade requires paused, stopped, canary-disabled fleet gates")
+    for table_name in ("apply_queue", "compute_queue", "linkedin_queue"):
+        cur.execute(
+            sql.SQL(
+                "SELECT count(*) AS count FROM public.{} WHERE status='leased' "
+                "AND lease_owner IS NOT NULL AND lease_expires_at>pg_catalog.now()"
+            ).format(sql.Identifier(table_name))
+        )
+        if int(_row_value(cur.fetchone(), "count")) != 0:
+            raise RuntimeError(f"authority upgrade requires zero active unexpired leases in {table_name}")
+
+
+def _validate_existing_retired_memberships(
+    cur,
+    *,
+    topology: BootstrapTopology,
+    memberships: tuple[dict[str, Any], ...],
+) -> None:
+    cur.execute("SELECT role_name FROM public.fleet_worker_principals ORDER BY role_name")
+    worker_roles = {_row_value(row, "role_name") for row in cur.fetchall()}
+    approved_parents = {topology.database_owner_role, *worker_roles}
+    for edge in memberships:
+        if edge["member_role"] not in topology.retired_admin_roles \
+                or edge["parent_role"] not in approved_parents \
+                or edge["grantor_role"] not in topology.infrastructure_superuser_roles:
+            raise RuntimeError(f"unexpected retired-admin membership blocks authority upgrade: {edge!r}")
+
+
+def _reject_retired_role_ownership(cur, *, retired_admin_roles: tuple[str, ...]) -> None:
+    cur.execute(
+        "SELECT role.rolname,count(*) AS owned_count FROM pg_shdepend dependency "
+        "JOIN pg_roles role ON role.oid=dependency.refobjid "
+        "WHERE dependency.refclassid='pg_authid'::regclass "
+        "AND dependency.deptype='o' AND role.rolname=ANY(%s) "
+        "GROUP BY role.rolname ORDER BY role.rolname",
+        (list(retired_admin_roles),),
+    )
+    owned = [
+        (_row_value(row, "rolname"), int(_row_value(row, "owned_count", 1)))
+        for row in cur.fetchall()
+    ]
+    if owned:
+        raise RuntimeError(f"retired provider admins still own database objects: {owned!r}")
+    cur.execute(
+        "SELECT grantee,object_kind,object_name FROM ("
+        "SELECT grantee,'table'::text AS object_kind,table_schema||'.'||table_name AS object_name "
+        "FROM information_schema.table_privileges UNION ALL "
+        "SELECT grantee,'routine',routine_schema||'.'||routine_name FROM information_schema.routine_privileges "
+        "UNION ALL SELECT grantee,'column',table_schema||'.'||table_name||'.'||column_name "
+        "FROM information_schema.column_privileges UNION ALL "
+        "SELECT grantee,'usage',object_schema||'.'||object_name FROM information_schema.usage_privileges"
+        ") grants WHERE grantee=ANY(%s) ORDER BY grantee,object_kind,object_name",
+        (list(retired_admin_roles),),
+    )
+    grants = cur.fetchall()
+    if grants:
+        raise RuntimeError(f"retired provider admins retain application ACLs: {grants!r}")
+
+
+def _verify_existing_provider_membership(cur, *, topology: BootstrapTopology) -> None:
+    cur.execute(
+        "SELECT parent.rolname AS parent_role,grantor.oid AS grantor_oid,"
+        "membership.admin_option,membership.inherit_option,membership.set_option "
+        "FROM pg_auth_members membership JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "JOIN pg_roles grantor ON grantor.oid=membership.grantor WHERE member.rolname=%s",
+        (topology.database_owner_role,),
+    )
+    rows = cur.fetchall()
+    if not (
+        len(rows) == 1
+        and _row_value(rows[0], "parent_role") == topology.migrator_role
+        and _row_value(rows[0], "grantor_oid", 1) == 10
+        and not bool(_row_value(rows[0], "admin_option", 2))
+        and not bool(_row_value(rows[0], "inherit_option", 3))
+        and bool(_row_value(rows[0], "set_option", 4))
+    ):
+        raise RuntimeError(f"authority upgrade provider membership mismatch: {rows!r}")
+
+
+def _transition_existing_authority_topology(cur, *, topology: BootstrapTopology) -> None:
+    # Close the known legacy admin graph first.  Forward rollback intentionally
+    # never restores these memberships or elevated/login attributes.
+    _close_retired_admin_memberships(cur, retired_admin_roles=topology.retired_admin_roles)
+    database = sql.Identifier(cur.connection.info.dbname)
+    for role_name in topology.retired_admin_roles:
+        cur.execute(sql.SQL("REVOKE CONNECT,CREATE,TEMPORARY ON DATABASE {} FROM {}").format(
+            database, sql.Identifier(role_name)
+        ))
+        cur.execute(sql.SQL(
+            "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        ).format(sql.Identifier(role_name)))
+    _validate_retired_admin_memberships_closed(cur, retired_admin_roles=topology.retired_admin_roles)
+
+    for role_name, login in (
+        (topology.database_owner_role, True),
+        (topology.migrator_role, False),
+        (topology.verifier_role, False),
+    ):
+        cur.execute(sql.SQL(
+            "ALTER ROLE {} {} NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        ).format(sql.Identifier(role_name), sql.SQL("LOGIN" if login else "NOLOGIN")))
+    _reconcile_exact_controller_membership(cur, controller_role=topology.controller_role)
+    cur.execute(sql.SQL(
+        "GRANT {} TO {} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+    ).format(sql.Identifier(topology.migrator_role), sql.Identifier(topology.database_owner_role)))
+    _verify_existing_provider_membership(cur, topology=topology)
+
+
 def ensure_fleet_worker_role(
     conn,
     password: str,

@@ -2934,12 +2934,18 @@ def _verify_v5_contract(cur) -> None:
         raise RuntimeError("brain schema v5 verification failed: " + "; ".join(problems))
 
 
+def verify_brain_schema_v1_in_transaction(cur) -> None:
+    """Deeply verify the immutable V1-V3 prefix in the caller's transaction."""
+    require_pg18_authority_catalog(cur)
+    _verify_contract(cur)
+
+
 def verify_brain_schema_v1(conn) -> None:
     """Deeply verify schema v1 without changing caller transaction state."""
     _require_idle(conn)
     with conn.transaction():
         with conn.cursor() as cur:
-            _verify_contract(cur)
+            verify_brain_schema_v1_in_transaction(cur)
 
 
 def ensure_brain_schema_v1_in_transaction(
