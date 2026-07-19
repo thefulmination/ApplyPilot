@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
@@ -65,6 +66,9 @@ def _approved_tool_environment() -> dict[str, str]:
         assert npm_cli is not None, f"could not resolve npm-cli.js from {npm_launcher}"
         tools["APPLYPILOT_BRAIN_TEST_NODE"] = node_path
         tools["APPLYPILOT_BRAIN_TEST_NPM_CLI"] = npm_cli.resolve()
+        script_shell = os.environ.get("COMSPEC") if os.name == "nt" else shutil.which("sh")
+        assert script_shell is not None, "could not resolve the npm script shell"
+        tools["APPLYPILOT_BRAIN_TEST_SCRIPT_SHELL"] = Path(script_shell).resolve()
     approved: dict[str, str] = {}
     for prefix, path in tools.items():
         approved[f"{prefix}_PATH"] = str(path)
@@ -212,6 +216,11 @@ def test_brain_producer_executes_resolved_npm_commands_in_sanitized_environment(
     assert all(record["dependencies"]["npmCli"]["purpose"] == "brain-npm-cli" for record in receipt["commands"])
     assert all(record["argv"][1] == record["dependencies"]["npmCli"]["path"] for record in receipt["commands"])
     assert all(
+        record["dependencies"]["scriptShell"]["purpose"] == "brain-script-shell"
+        and record["argv"][2:4] == ["--script-shell", record["dependencies"]["scriptShell"]["path"]]
+        for record in receipt["commands"]
+    )
+    assert all(
         record["executionEnvironment"]["PATH"] == str(Path(record["executable"]["path"]).parent)
         for record in receipt["commands"]
     )
@@ -284,6 +293,69 @@ def test_executable_path_swap_cannot_yield_a_pre_swap_identity_record(
                 command_id="probe", command="probe", argv=[str(approved_path)], cwd=tmp_path,
                 environment={}, executable=executable,
             )
+
+
+def test_npm_script_shell_uses_approved_protected_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signer = _load_module(SIGNER, "npm_script_shell_boundary_test")
+    identities = {
+        "brain-node": {"path": "/approved/node", "purpose": "brain-node", "sha256": "1" * 64},
+        "brain-npm-cli": {
+            "path": "/approved/npm-cli.js",
+            "purpose": "brain-npm-cli",
+            "sha256": "2" * 64,
+        },
+        "brain-script-shell": {
+            "path": "/approved/sh",
+            "purpose": "brain-script-shell",
+            "sha256": "3" * 64,
+        },
+    }
+    descriptors = {"brain-node": 11, "brain-npm-cli": 12, "brain-script-shell": 13}
+    monkeypatch.setattr(signer, "_trusted_executable", identities.__getitem__)
+
+    @contextmanager
+    def protected(executable: dict[str, str]):
+        descriptor = descriptors[executable["purpose"]]
+        yield {"path": f"/proc/self/fd/{descriptor}", "passFds": (descriptor,)}
+
+    captured: dict[str, Any] = {}
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        captured.update(argv=argv, kwargs=kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(signer, "_protected_executable_execution", protected)
+    monkeypatch.setattr(signer.subprocess, "run", run)
+    signer._command_result(
+        command_id="typecheck",
+        command="npm run typecheck",
+        argv=[
+            identities["brain-node"]["path"],
+            identities["brain-npm-cli"]["path"],
+            "--script-shell",
+            identities["brain-script-shell"]["path"],
+            "run",
+            "typecheck",
+        ],
+        cwd=tmp_path,
+        environment={"PATH": "/approved"},
+        executable=identities["brain-node"],
+        dependencies={
+            "npmCli": identities["brain-npm-cli"],
+            "scriptShell": identities["brain-script-shell"],
+        },
+    )
+    assert captured["argv"] == [
+        "/proc/self/fd/11",
+        "/proc/self/fd/12",
+        "--script-shell",
+        "/proc/self/fd/13",
+        "run",
+        "typecheck",
+    ]
+    assert captured["kwargs"]["pass_fds"] == (11, 12, 13)
 
 
 def test_failed_suite_and_dirty_repo_fail_without_publishing(tmp_path: Path) -> None:

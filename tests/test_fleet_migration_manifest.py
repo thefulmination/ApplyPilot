@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import psycopg
@@ -123,6 +124,7 @@ def test_repository_manifest_pins_the_exact_legacy_predecessor():
     assert tuple(item.id for item in manifest.migrations) == (
         "20260715_001_application_authority",
         "20260717_002_lane_specific_canary_pins",
+        "20260719_003_harden_application_authority_functions",
     )
     migrator.verify_predecessor(manifest, REPO_ROOT)
 
@@ -271,36 +273,81 @@ def test_failed_migration_rolls_back_sql_and_ledger(migration_pg, tmp_path):
 
 
 def test_application_authority_is_single_owner_and_crash_conservative(migration_pg):
+    signatures = (
+        "public.fleet_worker_authorize_lease(text,text,text,text,uuid,text,integer)",
+        "public.fleet_worker_mark_browser_interaction(text,text,bigint)",
+        "public.fleet_worker_terminalize(text,text,bigint,text,jsonb)",
+        "public.fleet_worker_requeue(text,text,bigint)",
+        "public.fleet_worker_expire_authority()",
+    )
     manifest = migrator.load_manifest(MANIFEST_PATH)
-    with psycopg.connect(migration_pg, row_factory=dict_row) as conn:
-        conn.execute("SET ROLE applypilot_fleet_migrator")
-        migrator.apply_manifest(conn, manifest, REPO_ROOT)
-        op = "00000000-0000-0000-0000-000000000001"
-        first = conn.execute(
-            "SELECT * FROM fleet_worker_authorize_lease(%s,%s,%s,%s,%s::uuid,%s,%s)",
-            ("app-1", "https://jobs.example/a", "worker-a", "ats", op, "hash-a", 60),
-        ).fetchone()
-        assert first["authority_epoch"] == 1
-        assert conn.execute(
-            "SELECT fleet_worker_mark_browser_interaction(%s,%s,%s)",
-            ("app-1", "worker-a", 1),
-        ).fetchone()["fleet_worker_mark_browser_interaction"]
-        conn.commit()
-        with pytest.raises(psycopg.errors.RaiseException, match="not claimable"):
-            conn.execute(
-                "SELECT * FROM fleet_worker_authorize_lease(%s,%s,%s,%s,%s::uuid,%s,%s)",
-                ("app-1", "https://jobs.example/a?alias=1", "worker-b", "linkedin", op, "hash-a", 60),
+    with psycopg.connect(migration_pg, autocommit=True, row_factory=dict_row) as provider:
+        created_worker_role = not provider.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='fleet_worker') AS present"
+        ).fetchone()["present"]
+        if created_worker_role:
+            provider.execute("CREATE ROLE fleet_worker NOLOGIN")
+    try:
+        with psycopg.connect(migration_pg, row_factory=dict_row) as conn:
+            conn.execute("SET ROLE applypilot_fleet_migrator")
+            legacy_manifest = replace(manifest, migrations=manifest.migrations[:2])
+            legacy_result = migrator.apply_manifest(conn, legacy_manifest, REPO_ROOT)
+            assert legacy_result.applied == (
+                "20260715_001_application_authority",
+                "20260717_002_lane_specific_canary_pins",
             )
-        conn.rollback()
-        assert not conn.execute(
-            "SELECT fleet_worker_requeue(%s,%s,%s)", ("app-1", "worker-a", 1)
-        ).fetchone()["fleet_worker_requeue"]
-        assert conn.execute(
-            "SELECT fleet_worker_terminalize(%s,%s,%s,%s,%s::jsonb)",
-            ("app-1", "worker-a", 1, "applied", '{"receipt":"r1"}'),
-        ).fetchone()["fleet_worker_terminalize"]
-        row = conn.execute(
-            "SELECT state, terminal_status, terminal_evidence->>'receipt' AS receipt "
-            "FROM fleet_application_authority WHERE canonical_application_id='app-1'"
-        ).fetchone()
-        assert (row["state"], row["terminal_status"], row["receipt"]) == ("terminal", "applied", "r1")
+            result = migrator.apply_manifest(conn, manifest, REPO_ROOT)
+            assert result.already_applied == legacy_result.applied
+            assert result.applied == ("20260719_003_harden_application_authority_functions",)
+            for signature in signatures:
+                row = conn.execute(
+                    "SELECT p.oid::regprocedure::text AS signature,p.prosecdef,p.proconfig,"
+                    "COALESCE(bool_or(acl.grantee=0 AND acl.privilege_type='EXECUTE'),FALSE) "
+                    "AS public_execute,"
+                    "COALESCE(bool_or(grantee.rolname='fleet_worker' AND acl.privilege_type='EXECUTE'),FALSE) "
+                    "AS worker_execute "
+                    "FROM pg_proc p "
+                    "LEFT JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl ON TRUE "
+                    "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+                    "WHERE p.oid=to_regprocedure(%s) GROUP BY p.oid,p.prosecdef,p.proconfig",
+                    (signature,),
+                ).fetchone()
+                assert row is not None, signature
+                assert row["prosecdef"] is True, signature
+                assert row["proconfig"] == ["search_path=pg_catalog, public"], signature
+                assert row["public_execute"] is False, signature
+                assert row["worker_execute"] is True, signature
+            op = "00000000-0000-0000-0000-000000000001"
+            first = conn.execute(
+                "SELECT * FROM fleet_worker_authorize_lease(%s,%s,%s,%s,%s::uuid,%s,%s)",
+                ("app-1", "https://jobs.example/a", "worker-a", "ats", op, "hash-a", 60),
+            ).fetchone()
+            assert first["authority_epoch"] == 1
+            assert conn.execute(
+                "SELECT fleet_worker_mark_browser_interaction(%s,%s,%s)",
+                ("app-1", "worker-a", 1),
+            ).fetchone()["fleet_worker_mark_browser_interaction"]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException, match="not claimable"):
+                conn.execute(
+                    "SELECT * FROM fleet_worker_authorize_lease(%s,%s,%s,%s,%s::uuid,%s,%s)",
+                    ("app-1", "https://jobs.example/a?alias=1", "worker-b", "linkedin", op, "hash-a", 60),
+                )
+            conn.rollback()
+            assert not conn.execute(
+                "SELECT fleet_worker_requeue(%s,%s,%s)", ("app-1", "worker-a", 1)
+            ).fetchone()["fleet_worker_requeue"]
+            assert conn.execute(
+                "SELECT fleet_worker_terminalize(%s,%s,%s,%s,%s::jsonb)",
+                ("app-1", "worker-a", 1, "applied", '{"receipt":"r1"}'),
+            ).fetchone()["fleet_worker_terminalize"]
+            row = conn.execute(
+                "SELECT state, terminal_status, terminal_evidence->>'receipt' AS receipt "
+                "FROM fleet_application_authority WHERE canonical_application_id='app-1'"
+            ).fetchone()
+            assert (row["state"], row["terminal_status"], row["receipt"]) == ("terminal", "applied", "r1")
+    finally:
+        if created_worker_role:
+            with psycopg.connect(migration_pg, autocommit=True) as provider:
+                provider.execute("DROP OWNED BY fleet_worker")
+                provider.execute("DROP ROLE fleet_worker")

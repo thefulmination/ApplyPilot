@@ -109,6 +109,7 @@ _EXECUTABLE_APPROVAL_ENV = {
     "runtime-python": "APPLYPILOT_RUNTIME_TEST_PYTHON",
     "brain-node": "APPLYPILOT_BRAIN_TEST_NODE",
     "brain-npm-cli": "APPLYPILOT_BRAIN_TEST_NPM_CLI",
+    "brain-script-shell": "APPLYPILOT_BRAIN_TEST_SCRIPT_SHELL",
     "railway-cli": "APPLYPILOT_RAILWAY_CLI",
     "release-git": "APPLYPILOT_RELEASE_GIT",
 }

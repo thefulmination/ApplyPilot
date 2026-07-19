@@ -1238,12 +1238,9 @@ def test_diagnosis_includes_desired_machine_worker_gaps(monkeypatch, fleet_db) -
     with pgqueue.connect(fleet_db) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "CREATE TABLE fleet_desired_state ("
-                "machine_owner TEXT PRIMARY KEY, desired_workers INTEGER NOT NULL)"
-            )
-            cur.execute(
-                "INSERT INTO fleet_desired_state (machine_owner, desired_workers) "
-                "VALUES ('m2', 2), ('m4', 1)"
+                "INSERT INTO fleet_desired_state (machine_owner, desired_workers, agent, model) "
+                "VALUES ('m2', 2, 'codex', 'test-model'), "
+                "('m4', 1, 'codex', 'test-model')"
             )
         heartbeat.beat(conn, "m2-0", machine_owner="m2", role="apply", state="idle")
         _push_ready_apply(

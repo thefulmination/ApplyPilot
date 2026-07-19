@@ -282,9 +282,12 @@ def produce_test_evidence(
         if arguments[0] == "npm":
             executable = _trusted_executable("brain-node")
             npm_cli = _trusted_executable("brain-npm-cli")
-            argv = [executable["path"], npm_cli["path"], *arguments[1:]]
+            argv = [executable["path"], npm_cli["path"]]
             command_environment = {**environment, "PATH": str(Path(executable["path"]).parent)}
-            dependencies = {"npmCli": npm_cli}
+            script_shell = _trusted_executable("brain-script-shell")
+            argv.extend(("--script-shell", script_shell["path"]))
+            dependencies = {"npmCli": npm_cli, "scriptShell": script_shell}
+            argv.extend(arguments[1:])
         else:
             executable = _trusted_executable("runtime-python")
             if os.path.normcase(executable["path"]) != os.path.normcase(str(Path(sys.executable).resolve())):
