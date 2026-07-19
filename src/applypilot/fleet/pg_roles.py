@@ -2259,6 +2259,12 @@ def validate_runtime_principal(conn, *, worker_id: str, contract: str) -> Runtim
     return identity
 
 
+def _require_pg18_authority_catalog(cur) -> None:
+    from applypilot.brain.schema import require_pg18_authority_catalog
+
+    require_pg18_authority_catalog(cur)
+
+
 def ensure_brain_candidate_roles_in_transaction(
     cur,
     *,
@@ -2268,6 +2274,7 @@ def ensure_brain_candidate_roles_in_transaction(
     writer_approved_grantees: tuple[str, ...] = (),
 ) -> CandidateRoleReconciliationReceipt:
     """Reconcile V5 candidate capabilities using the caller's active transaction."""
+    _require_pg18_authority_catalog(cur)
     if reader_role == writer_role:
         raise ValueError("candidate reader and writer roles must be distinct")
     for role_name in (reader_role, writer_role):
@@ -2695,6 +2702,7 @@ def ensure_brain_artifact_authority_roles_in_transaction(
     migrator_role: str = "brain_schema_migrator",
 ) -> tuple[str, str]:
     """Reconcile the fixed NOLOGIN v6 owner/writer capability roles."""
+    _require_pg18_authority_catalog(cur)
     if migrator_role != "brain_schema_migrator":
         raise RuntimeError("artifact authority roles require fixed brain_schema_migrator")
     cur.execute("SET LOCAL search_path=pg_catalog")
@@ -2782,6 +2790,7 @@ def _install_brain_authority_in_transaction(
     topology: BootstrapTopology,
 ) -> CandidateRoleReconciliationReceipt:
     """Install the fixed authority schema; callers cannot inject bootstrap SQL."""
+    _require_pg18_authority_catalog(cur)
     if topology.migrator_role != "brain_schema_migrator":
         raise RuntimeError("atomic authority installation requires fixed brain_schema_migrator role")
     if topology.verifier_role != "brain_schema_verifier":
@@ -3960,6 +3969,8 @@ def bootstrap_database_roles(
         raise RuntimeError("atomic bootstrap requires autocommit to be disabled")
     if conn.info.transaction_status.name != "IDLE":
         raise RuntimeError("bootstrap requires an idle provider-admin connection")
+    with conn.cursor() as preflight_cur:
+        _require_pg18_authority_catalog(preflight_cur)
     verifier = _client_scram_verifier(conn, role_name=topology.controller_role, password=controller_password)
     fence_active = False
     preserve_fence_on_failure = False

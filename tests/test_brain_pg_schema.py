@@ -1757,6 +1757,111 @@ def brain_pg(fleet_db):
     _cleanup(fleet_db, drop_fixed_roles=True)
 
 
+def _pg18_boundary_snapshot(connection) -> dict[str, object]:
+    roles = connection.execute(
+        "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+        "rolreplication,rolbypassrls FROM pg_roles "
+        "WHERE rolname LIKE 'brain\\_%' ESCAPE '\\' ORDER BY rolname"
+    ).fetchall()
+    relations = connection.execute(
+        "SELECT n.nspname,c.relname,c.relkind,owner.rolname AS owner_name "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_roles owner ON owner.oid=c.relowner "
+        "WHERE n.nspname IN ('public','brain_archive') "
+        "ORDER BY n.nspname,c.relname,c.relkind"
+    ).fetchall()
+    version_relation = connection.execute(
+        "SELECT to_regclass('public.brain_schema_versions') AS relation"
+    ).fetchone()["relation"]
+    versions = []
+    if version_relation is not None:
+        versions = connection.execute(
+            "SELECT version,migration_name,migration_checksum,applied_by "
+            "FROM public.brain_schema_versions ORDER BY version"
+        ).fetchall()
+    advisory_locks = connection.execute(
+        "SELECT classid,objid,objsubid,mode,granted FROM pg_locks "
+        "WHERE pid=pg_backend_pid() AND locktype='advisory' "
+        "ORDER BY classid,objid,objsubid,mode"
+    ).fetchall()
+    connection.commit()
+    return {
+        "roles": roles,
+        "relations": relations,
+        "versions": versions,
+        "advisory_locks": advisory_locks,
+    }
+
+
+def test_pg16_rejects_every_direct_authority_boundary_without_database_drift(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        version = int(connection.execute("SHOW server_version_num").fetchone()["server_version_num"])
+        connection.commit()
+        if version // 10000 == 18:
+            pytest.skip("unsupported-major rejection requires the fixed PostgreSQL 16 fixture")
+        before = _pg18_boundary_snapshot(connection)
+        topology = pg_roles.BootstrapTopology(
+            database_owner_role="postgres",
+            controller_role="brain_controller_test_login",
+            verifier_role="brain_schema_verifier",
+            migrator_role="brain_schema_migrator",
+            retired_admin_roles=(),
+            infrastructure_superuser_roles=("postgres",),
+        )
+
+        connection_boundaries = (
+            schema.ensure_brain_schema_v1,
+            schema.verify_brain_schema_v1,
+            schema.ensure_brain_schema_v4,
+            schema.verify_brain_schema_v4,
+            schema.ensure_brain_schema_v5,
+            schema.verify_brain_schema_v5,
+            schema.ensure_brain_schema_v6,
+            schema.verify_brain_schema_v6,
+            lambda conn: schema.ensure_brain_schema_v7(
+                conn, expected_controller_role="brain_controller_test_login"
+            ),
+            schema.verify_brain_schema_v7,
+        )
+        in_transaction_boundaries = (
+            schema.ensure_brain_schema_v1_in_transaction,
+            schema.ensure_brain_schema_v4_in_transaction,
+            schema.verify_brain_schema_v4_in_transaction,
+            schema.ensure_brain_schema_v5_in_transaction,
+            schema.verify_brain_schema_v5_in_transaction,
+            schema.ensure_brain_schema_v6_in_transaction,
+            schema.verify_brain_schema_v6_in_transaction,
+            lambda cur: schema.ensure_brain_schema_v7_in_transaction(
+                cur, expected_controller_role="brain_controller_test_login"
+            ),
+            schema.verify_brain_schema_v7_in_transaction,
+            pg_roles.ensure_brain_candidate_roles_in_transaction,
+            pg_roles.ensure_brain_artifact_authority_roles_in_transaction,
+            lambda cur: pg_roles._install_brain_authority_in_transaction(
+                cur, topology=topology
+            ),
+        )
+
+        for boundary in connection_boundaries:
+            with pytest.raises(
+                RuntimeError,
+                match="PostgreSQL 18 authority catalog contract required",
+            ):
+                boundary(connection)
+            connection.rollback()
+            assert _pg18_boundary_snapshot(connection) == before
+        for boundary in in_transaction_boundaries:
+            with pytest.raises(
+                RuntimeError,
+                match="PostgreSQL 18 authority catalog contract required",
+            ):
+                with connection.transaction():
+                    with connection.cursor() as cursor:
+                        boundary(cursor)
+            connection.rollback()
+            assert _pg18_boundary_snapshot(connection) == before
+
+
 def _dsn_for(dsn: str, role: str) -> str:
     return make_conninfo(dsn, user=role)
 

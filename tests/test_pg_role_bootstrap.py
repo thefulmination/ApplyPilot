@@ -660,6 +660,79 @@ def _atomic_topology() -> pg_roles.BootstrapTopology:
     )
 
 
+def test_pg16_bootstrap_rejects_before_lock_evidence_or_database_drift(
+    fleet_db: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    evidence = pg_roles.DurableEvidencePaths(
+        preparation_receipt_path=tmp_path / "prepared.json",
+        rollback_sql_path=tmp_path / "rollback.sql",
+        authentication_key=_EVIDENCE_KEY,
+        authentication_key_id=_EVIDENCE_KEY_ID,
+    )
+    evidence_reached = False
+
+    def reject_evidence(*_args, **_kwargs):
+        nonlocal evidence_reached
+        evidence_reached = True
+        raise AssertionError("bootstrap reached evidence write before PG18 preflight")
+
+    monkeypatch.setattr(pg_roles, "_write_preparation_evidence", reject_evidence)
+    with pgqueue.connect(fleet_db) as connection:
+        version = int(connection.execute("SHOW server_version_num").fetchone()["server_version_num"])
+        connection.commit()
+        if version // 10000 == 18:
+            pytest.skip("unsupported-major rejection requires the fixed PostgreSQL 16 fixture")
+        roles_before = connection.execute(
+            "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+            "rolreplication,rolbypassrls FROM pg_roles ORDER BY rolname"
+        ).fetchall()
+        relations_before = connection.execute(
+            "SELECT n.nspname,c.relname,c.relkind FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname IN ('public','brain_archive') "
+            "ORDER BY n.nspname,c.relname,c.relkind"
+        ).fetchall()
+        connection.commit()
+        with pytest.raises(
+            RuntimeError,
+            match="PostgreSQL 18 authority catalog contract required",
+        ):
+            pg_roles.bootstrap_database_roles(
+                connection,
+                CONTROLLER_PASSWORD,
+                topology=_atomic_topology(),
+                evidence_paths=evidence,
+                install_brain_authority=True,
+            )
+        connection.rollback()
+        assert evidence_reached is False
+        assert not evidence.preparation_receipt_path.exists()
+        assert not evidence.rollback_sql_path.exists()
+        assert connection.execute(
+            "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+            "rolreplication,rolbypassrls FROM pg_roles ORDER BY rolname"
+        ).fetchall() == roles_before
+        assert connection.execute(
+            "SELECT n.nspname,c.relname,c.relkind FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname IN ('public','brain_archive') "
+            "ORDER BY n.nspname,c.relname,c.relkind"
+        ).fetchall() == relations_before
+        connection.commit()
+        acquired = connection.execute(
+            "SELECT pg_try_advisory_lock(pg_catalog.hashtext(%s)) AS acquired",
+            ("applypilot:fleet-role-bootstrap:v1",),
+        ).fetchone()["acquired"]
+        assert acquired is True
+        connection.execute(
+            "SELECT pg_advisory_unlock(pg_catalog.hashtext(%s))",
+            ("applypilot:fleet-role-bootstrap:v1",),
+        )
+        connection.commit()
+
+
 def _create_atomic_lifecycle_roles(conn) -> None:
     for column in (
         "ats_canary_worker_id",

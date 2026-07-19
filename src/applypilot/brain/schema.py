@@ -9,6 +9,7 @@ import os
 import re
 import time
 from pathlib import Path
+from types import MappingProxyType
 
 from psycopg import sql
 from psycopg.pq import TransactionStatus
@@ -32,13 +33,56 @@ _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e25
 _EXPECTED_V5_CHECKSUM = "52d1726bb13df54591fcd6343884ec8f6f7d18ab7fbf74b4dc33ba509cb0e559"
 _EXPECTED_V6_CHECKSUM = "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
 _EXPECTED_V7_CHECKSUM = "d76b037dee1bfd285026ab2503b16be2a39b0c6726eac80a099e3f825ccdfc9f"
-_EXPECTED_V5_CATALOG_HASH = "87ed08bc34cc36e12d41fc44bdf4da1771bb67a609eabff2a3c39e0286e2b6a1"
-_EXPECTED_V6_CATALOG_HASH = "3670c106085e1ae081515cbc60d7ff2ae78b9f1b4f40345d60cdfe9c26f4a143"
-_EXPECTED_V7_CATALOG_HASH = "7d16206b92ff64ab7be2e80e49a0f5ad73ee95624e6763e03af8f5408b729b5b"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
-_CURRENT_V5_CATALOG_HASH = "b9ac5d2ae418198d67eb52c8d9dde173448183ba5dde69118157257bf9c2e27a"
-_CURRENT_BASE_CATALOG_HASH = "44f3d3bf7d80d5023a5760a11c45f8b86166710220e418b02072cffbf9249160"
+_UNPINNED_PG18_CATALOG_HASH = "PG18_PIN_REQUIRED"
+_PG_CATALOG_HASHES = MappingProxyType({
+    18: MappingProxyType({
+        name: _UNPINNED_PG18_CATALOG_HASH
+        for name in ("base", "current_base", "v5", "current_v5", "v6", "v7")
+    })
+})
+_PG18_CATALOG_SHAPES = MappingProxyType({
+    "pg_catalog.pg_constraint": (
+        ("oid", "oid"),
+        ("conname", "name"),
+        ("connamespace", "oid"),
+        ("contype", '"char"'),
+        ("condeferrable", "boolean"),
+        ("condeferred", "boolean"),
+        ("conenforced", "boolean"),
+        ("convalidated", "boolean"),
+        ("conrelid", "oid"),
+        ("contypid", "oid"),
+        ("conindid", "oid"),
+        ("conparentid", "oid"),
+        ("confrelid", "oid"),
+        ("confupdtype", '"char"'),
+        ("confdeltype", '"char"'),
+        ("confmatchtype", '"char"'),
+        ("conislocal", "boolean"),
+        ("coninhcount", "smallint"),
+        ("connoinherit", "boolean"),
+        ("conperiod", "boolean"),
+        ("conkey", "smallint[]"),
+        ("confkey", "smallint[]"),
+        ("conpfeqop", "oid[]"),
+        ("conppeqop", "oid[]"),
+        ("conffeqop", "oid[]"),
+        ("confdelsetcols", "smallint[]"),
+        ("conexclop", "oid[]"),
+        ("conbin", "pg_node_tree"),
+    ),
+    "pg_catalog.pg_auth_members": (
+        ("oid", "oid"),
+        ("roleid", "oid"),
+        ("member", "oid"),
+        ("grantor", "oid"),
+        ("admin_option", "boolean"),
+        ("inherit_option", "boolean"),
+        ("set_option", "boolean"),
+    ),
+})
 _STATUS_ROLE = "brain_status_reader"
 _CURRENT_V6_CHECKSUM = "9500e1a632d9591f21650adf4a73ba2d43ab7c9420ae0a4bdfdabbe23a090e3e"
 _POLICY_CONTROLLER_ROLE = "brain_policy_controller"
@@ -316,7 +360,6 @@ _LIFECYCLE_OWNER_READ_RELATIONS = _LIFECYCLE_LOCK_RELATIONS | {
     "apply_result_events",
     "fleet_worker_blocklist",
 }
-_EXPECTED_CATALOG_HASH = "ec8893845974635b73e65e391561c2ca4418dec11004378ad5e543890cc66d99"
 
 _FUNCTIONS = {
     "brain_reject_mutation": "",
@@ -1078,6 +1121,39 @@ def _assert_existing_ownership(cur, migration_identity: str) -> None:
         )
 
 
+def require_pg18_authority_catalog(cur) -> None:
+    """Reject unsupported authority databases before any transaction-visible mutation."""
+    cur.execute(
+        "SELECT current_setting('server_version_num')::integer AS server_version_num"
+    )
+    version = cur.fetchone()["server_version_num"]
+    if version // 10000 != 18:
+        raise RuntimeError(
+            "PostgreSQL 18 authority catalog contract required: "
+            f"server_version_num={version}"
+        )
+    for relation, expected in _PG18_CATALOG_SHAPES.items():
+        cur.execute(
+            "SELECT attname,format_type(atttypid,atttypmod) AS data_type "
+            "FROM pg_attribute WHERE attrelid=%s::regclass AND attnum>0 "
+            "AND NOT attisdropped ORDER BY attnum",
+            (relation,),
+        )
+        actual = tuple((row["attname"], row["data_type"]) for row in cur.fetchall())
+        if actual != expected:
+            raise RuntimeError(
+                f"PostgreSQL 18 authority catalog shape mismatch for {relation}: "
+                f"expected={expected!r}, actual={actual!r}"
+            )
+
+
+def _pg18_catalog_hash(name: str) -> str:
+    value = _PG_CATALOG_HASHES[18][name]
+    if value == _UNPINNED_PG18_CATALOG_HASH:
+        raise RuntimeError(f"PostgreSQL 18 catalog hash pin is not installed: {name}")
+    return value
+
+
 def _acquire_xact_lock(cur, timeout_seconds: float) -> None:
     deadline = time.monotonic() + _bounded_timeout(timeout_seconds)
     while True:
@@ -1092,6 +1168,56 @@ def _acquire_xact_lock(cur, timeout_seconds: float) -> None:
                 "timed out waiting for the brain schema v1 migration lock; another owner may be stalled while migrating"
             )
         time.sleep(0.05)
+
+
+def _catalog_constraint_records(
+    cur,
+    relation_names: list[str],
+    *,
+    include_archive: bool,
+):
+    cur.execute(
+        "SELECT constraint_namespace.nspname AS constraint_schema,"
+        "format('%%I.%%I',relation_namespace.nspname,relation.relname) AS relation_identity,"
+        "con.conname,con.contype,con.condeferrable,con.condeferred,con.conenforced,"
+        "con.convalidated,"
+        "CASE WHEN con.contypid=0 THEN NULL ELSE con.contypid::regtype::text END AS type_identity,"
+        "CASE WHEN con.conindid=0 THEN NULL ELSE con.conindid::regclass::text END AS index_identity,"
+        "CASE WHEN con.conparentid=0 THEN NULL ELSE "
+        "format('%%I.%%I.%%I',parent_namespace.nspname,parent_relation.relname,parent_constraint.conname) "
+        "END AS parent_constraint_identity,"
+        "CASE WHEN con.confrelid=0 THEN NULL ELSE con.confrelid::regclass::text "
+        "END AS referenced_relation_identity,"
+        "con.confupdtype,con.confdeltype,con.confmatchtype,con.conislocal,con.coninhcount,"
+        "con.connoinherit,con.conperiod,con.conkey,con.confkey,"
+        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "unnest(COALESCE(con.conpfeqop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "ORDER BY position) AS parent_fk_equality_operators,"
+        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "unnest(COALESCE(con.conppeqop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "ORDER BY position) AS parent_pk_equality_operators,"
+        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "unnest(COALESCE(con.conffeqop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "ORDER BY position) AS foreign_fk_equality_operators,"
+        "con.confdelsetcols,"
+        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "unnest(COALESCE(con.conexclop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "ORDER BY position) AS exclusion_operators,"
+        "pg_get_constraintdef(con.oid,false) AS definition "
+        "FROM pg_constraint con "
+        "JOIN pg_namespace constraint_namespace ON constraint_namespace.oid=con.connamespace "
+        "JOIN pg_class relation ON relation.oid=con.conrelid "
+        "JOIN pg_namespace relation_namespace ON relation_namespace.oid=relation.relnamespace "
+        "LEFT JOIN pg_constraint parent_constraint ON parent_constraint.oid=con.conparentid "
+        "LEFT JOIN pg_class parent_relation ON parent_relation.oid=parent_constraint.conrelid "
+        "LEFT JOIN pg_namespace parent_namespace ON parent_namespace.oid=parent_relation.relnamespace "
+        "WHERE (relation_namespace.nspname='public' AND relation.relname=ANY(%s)) "
+        "OR (%s AND relation_namespace.nspname='brain_archive' "
+        "AND relation.relname='brain_archive_manifests') "
+        "ORDER BY relation_namespace.nspname,relation.relname,con.conname",
+        (relation_names, include_archive),
+    )
+    return cur.fetchall()
 
 
 def _catalog_contract_hash(
@@ -1109,7 +1235,7 @@ def _catalog_contract_hash(
     cur.execute(
         "SELECT n.nspname AS schema_name,c.relname,a.attnum,a.attname,"
         "format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull,a.attidentity,a.attgenerated,"
-        "pg_get_expr(d.adbin,d.adrelid,true) AS default_expr "
+        "pg_get_expr(d.adbin,d.adrelid,false) AS default_expr "
         "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
         "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
         "LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum "
@@ -1119,21 +1245,11 @@ def _catalog_contract_hash(
         (relations,),
     )
     columns = cur.fetchall()
-    cur.execute(
-        "SELECT n.nspname AS schema_name,c.relname,con.conname,con.contype,con.convalidated,"
-        "pg_get_constraintdef(con.oid,true) AS definition "
-        "FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid "
-        "JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "WHERE (n.nspname='public' AND c.relname=ANY(%s)) "
-        "OR (n.nspname='brain_archive' AND c.relname='brain_archive_manifests') "
-        "ORDER BY n.nspname,c.relname,con.conname",
-        (relations,),
-    )
-    constraints = cur.fetchall()
+    constraints = _catalog_constraint_records(cur, relations, include_archive=True)
     cur.execute(
         "SELECT n.nspname AS schema_name,t.relname AS relation_name,i.relname AS index_name,"
         "x.indisunique,x.indisprimary,x.indisvalid,x.indisready,"
-        "pg_get_indexdef(i.oid) AS definition,pg_get_expr(x.indpred,x.indrelid,true) AS predicate,"
+        "pg_get_indexdef(i.oid,0,false) AS definition,pg_get_expr(x.indpred,x.indrelid,false) AS predicate,"
         "ARRAY(SELECT opc.opcname FROM unnest(x.indclass::oid[]) WITH ORDINALITY value(opcoid,ordinal) "
         "JOIN pg_opclass opc ON opc.oid=value.opcoid ORDER BY value.ordinal) AS opclasses "
         "FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid JOIN pg_class t ON t.oid=x.indrelid "
@@ -1146,7 +1262,7 @@ def _catalog_contract_hash(
     indexes = cur.fetchall()
     cur.execute(
         "SELECT n.nspname AS schema_name,c.relname,t.tgname,t.tgenabled,"
-        "pg_get_triggerdef(t.oid,true) AS definition,p.proname AS function_name,"
+        "pg_get_triggerdef(t.oid,false) AS definition,p.proname AS function_name,"
         "pg_get_function_identity_arguments(p.oid) AS function_arguments "
         "FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
         "JOIN pg_proc p ON p.oid=t.tgfoid WHERE NOT t.tgisinternal AND "
@@ -1200,7 +1316,7 @@ def _v5_catalog_contract_hash(cur) -> str:
             "SELECT c.relname,a.attnum,a.attname,format_type(a.atttypid,a.atttypmod) AS data_type,"
             "a.attnotnull,a.attidentity,a.attgenerated,a.attstorage,a.attcompression,"
             "coll.collname AS collation_name,"
-            "pg_get_expr(default_value.adbin,default_value.adrelid,true) AS default_expression "
+            "pg_get_expr(default_value.adbin,default_value.adrelid,false) AS default_expression "
             "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
             "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
             "LEFT JOIN pg_attrdef default_value ON default_value.adrelid=a.attrelid "
@@ -1210,23 +1326,17 @@ def _v5_catalog_contract_hash(cur) -> str:
             (sorted(_V5_CATALOG_RELATIONS),),
         )
         columns = cur.fetchall()
-        cur.execute(
-            "SELECT relation.relname,con.conname,con.contype,con.convalidated,con.condeferrable,"
-            "con.condeferred,con.confupdtype,con.confdeltype,con.confmatchtype,"
-            "pg_get_constraintdef(con.oid,true) AS definition "
-            "FROM pg_constraint con JOIN pg_class relation ON relation.oid=con.conrelid "
-            "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
-            "WHERE namespace.nspname='public' AND relation.relname=ANY(%s) "
-            "ORDER BY relation.relname,con.conname",
-            (sorted(_V5_CATALOG_RELATIONS),),
+        constraints = _catalog_constraint_records(
+            cur,
+            sorted(_V5_CATALOG_RELATIONS),
+            include_archive=False,
         )
-        constraints = cur.fetchall()
         cur.execute(
             "SELECT relation.relname,index_class.relname AS index_name,index_data.indisunique,"
             "index_data.indisprimary,index_data.indisexclusion,index_data.indimmediate,"
             "index_data.indisvalid,index_data.indisready,index_data.indislive,"
-            "pg_get_indexdef(index_class.oid) AS definition,"
-            "pg_get_expr(index_data.indpred,index_data.indrelid,true) AS predicate "
+            "pg_get_indexdef(index_class.oid,0,false) AS definition,"
+            "pg_get_expr(index_data.indpred,index_data.indrelid,false) AS predicate "
             "FROM pg_index index_data JOIN pg_class index_class ON index_class.oid=index_data.indexrelid "
             "JOIN pg_class relation ON relation.oid=index_data.indrelid "
             "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
@@ -1237,7 +1347,7 @@ def _v5_catalog_contract_hash(cur) -> str:
         indexes = cur.fetchall()
         cur.execute(
             "SELECT relation.relname,trigger.tgname,trigger.tgenabled,trigger.tgtype,"
-            "function.proname AS function_name,pg_get_triggerdef(trigger.oid,true) AS definition "
+            "function.proname AS function_name,pg_get_triggerdef(trigger.oid,false) AS definition "
             "FROM pg_trigger trigger JOIN pg_class relation ON relation.oid=trigger.tgrelid "
             "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
             "JOIN pg_proc function ON function.oid=trigger.tgfoid "
@@ -1247,7 +1357,7 @@ def _v5_catalog_contract_hash(cur) -> str:
         )
         triggers = cur.fetchall()
         cur.execute(
-            "SELECT c.relname,pg_get_viewdef(c.oid,true) AS definition "
+            "SELECT c.relname,pg_get_viewdef(c.oid,false) AS definition "
             "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname='public' AND c.relname='brain_factual_contradiction_state'"
         )
@@ -1321,6 +1431,7 @@ def _v5_catalog_contract_hash(cur) -> str:
 
 
 def _verify_contract(cur) -> None:
+    require_pg18_authority_catalog(cur)
     checksum = _schema_checksum()
     versions = _version_rows(cur)
     version = versions[0] if versions else None
@@ -1641,7 +1752,9 @@ def _verify_contract(cur) -> None:
                 problems.append(f"ownership mismatch: brain_archive owned by {archive_owner['owner_name']}")
 
     catalog_hash = _catalog_contract_hash(cur, include_v5=len(versions) >= 5)
-    expected_base_catalog_hash = _CURRENT_BASE_CATALOG_HASH if len(versions) >= 3 else _EXPECTED_CATALOG_HASH
+    expected_base_catalog_hash = _pg18_catalog_hash(
+        "current_base" if len(versions) >= 3 else "base"
+    )
     if catalog_hash != expected_base_catalog_hash:
         problems.append(f"catalog contract hash mismatch: expected {expected_base_catalog_hash}, got {catalog_hash}")
 
@@ -2207,7 +2320,9 @@ def _verify_v5_contract(cur) -> None:
             problems.append("migration v5 ledger owner mismatch")
 
     actual_v5_catalog_hash = _v5_catalog_contract_hash(cur)
-    expected_v5_catalog_hash = _CURRENT_V5_CATALOG_HASH if len(versions) >= 5 else _EXPECTED_V5_CATALOG_HASH
+    expected_v5_catalog_hash = _pg18_catalog_hash(
+        "current_v5" if len(versions) >= 5 else "v5"
+    )
     if actual_v5_catalog_hash != expected_v5_catalog_hash:
         problems.append(
             "v5 exact catalog contract mismatch: "
@@ -2775,6 +2890,7 @@ def ensure_brain_schema_v1_in_transaction(
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
 ) -> None:
     """Install or verify V1-V3 using the caller's active transaction."""
+    require_pg18_authority_catalog(cur)
     versions = _version_rows(cur)
     if len(versions) >= 3:
         _verify_contract(cur)
@@ -2833,6 +2949,7 @@ def ensure_brain_schema_v1(
 
 def verify_brain_schema_v4_in_transaction(cur) -> None:
     """Verify the V1-V4 contract using the caller's active transaction."""
+    require_pg18_authority_catalog(cur)
     _verify_contract(cur)
     _verify_v4_contract(cur)
 
@@ -2851,6 +2968,7 @@ def ensure_brain_schema_v4_in_transaction(
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
 ) -> None:
     """Install or verify the V1-V4 ledger using the caller's active transaction."""
+    require_pg18_authority_catalog(cur)
     ensure_brain_schema_v1_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
     versions = _version_rows(cur)
     if len(versions) == 4:
@@ -2895,6 +3013,7 @@ def ensure_brain_schema_v4(
 
 def verify_brain_schema_v5_in_transaction(cur) -> None:
     """Verify V1-V5 and V5's superseding authority boundary in one transaction."""
+    require_pg18_authority_catalog(cur)
     _verify_contract(cur)
     _verify_v5_contract(cur)
 
@@ -2913,6 +3032,7 @@ def ensure_brain_schema_v5_in_transaction(
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
 ) -> None:
     """Install or verify the immutable V1-V5 ledger in the caller's transaction."""
+    require_pg18_authority_catalog(cur)
     _assert_schema_v5_bytes_immutable()
     versions = _version_rows(cur)
     if len(versions) == 5:
@@ -3151,9 +3271,10 @@ def _verify_v6_contract(cur, *, upgraded_to_v7: bool = False) -> None:
 
 def verify_brain_schema_v6_in_transaction(cur) -> None:
     """Verify V1-V6 and the immutable artifact registration authority."""
+    require_pg18_authority_catalog(cur)
     _assert_current_schema_v6_bytes_immutable()
     _verify_v6_contract(cur)
-    if _catalog_contract_hash(cur, include_v5=True) != _EXPECTED_V6_CATALOG_HASH:
+    if _catalog_contract_hash(cur, include_v5=True) != _pg18_catalog_hash("v6"):
         raise RuntimeError("brain schema v6 catalog contract hash mismatch")
 
 
@@ -3169,6 +3290,7 @@ def ensure_brain_schema_v6_in_transaction(
     *,
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
 ) -> None:
+    require_pg18_authority_catalog(cur)
     _assert_schema_v6_bytes_immutable()
     versions = _version_rows(cur)
     if len(versions) == 6:
@@ -3755,10 +3877,11 @@ def _verify_v7_inherited_contracts(cur) -> None:
 
 def _verify_v7_contract(cur) -> None:
     actual_catalog_hash = _catalog_contract_hash(cur, include_v5=True, include_v7=True)
-    if actual_catalog_hash != _EXPECTED_V7_CATALOG_HASH:
+    expected_catalog_hash = _pg18_catalog_hash("v7")
+    if actual_catalog_hash != expected_catalog_hash:
         raise RuntimeError(
             "brain schema v7 catalog contract hash mismatch: "
-            f"expected {_EXPECTED_V7_CATALOG_HASH}, got {actual_catalog_hash}"
+            f"expected {expected_catalog_hash}, got {actual_catalog_hash}"
         )
     versions = _version_rows(cur)
     if len(versions) != 7:
@@ -3932,6 +4055,7 @@ def _verify_v7_contract(cur) -> None:
 
 
 def verify_brain_schema_v7_in_transaction(cur) -> None:
+    require_pg18_authority_catalog(cur)
     _assert_current_schema_v6_bytes_immutable()
     _assert_schema_v7_bytes_immutable()
     _verify_v7_inherited_contracts(cur)
@@ -3951,6 +4075,7 @@ def ensure_brain_schema_v7_in_transaction(
     lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
     expected_controller_role: str | None = None,
 ) -> None:
+    require_pg18_authority_catalog(cur)
     _assert_current_schema_v6_bytes_immutable()
     _assert_schema_v7_bytes_immutable()
     versions = _version_rows(cur)

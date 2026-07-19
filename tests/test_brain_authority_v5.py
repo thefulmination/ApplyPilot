@@ -578,8 +578,8 @@ def test_v5_catalog_hash_is_independent_of_database_result_order(authority_v5_pg
         with conn.cursor() as cursor:
             reversed_result_order = schema._v5_catalog_contract_hash(_ReverseFetchallCursor(cursor))
 
-        assert expected == schema._CURRENT_V5_CATALOG_HASH
-        assert schema._EXPECTED_V5_CATALOG_HASH == "87ed08bc34cc36e12d41fc44bdf4da1771bb67a609eabff2a3c39e0286e2b6a1"
+        assert expected == schema._PG_CATALOG_HASHES[18]["current_v5"]
+        assert schema._PG_CATALOG_HASHES[18]["v5"] != schema._UNPINNED_PG18_CATALOG_HASH
         assert reversed_result_order == expected
 
 
