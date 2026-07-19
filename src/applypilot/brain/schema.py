@@ -88,7 +88,7 @@ _PG18_CATALOG_SHAPES = MappingProxyType({
     ),
 })
 _STATUS_ROLE = "brain_status_reader"
-_CURRENT_V6_CHECKSUM = "9500e1a632d9591f21650adf4a73ba2d43ab7c9420ae0a4bdfdabbe23a090e3e"
+_CURRENT_V6_CHECKSUM = "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
 _POLICY_CONTROLLER_ROLE = "brain_policy_controller"
 _GRAPH_AUTHORITY_ROLE = "brain_graph_authority"
 _CANDIDATE_READER_ROLE = "brain_candidate_reader"
