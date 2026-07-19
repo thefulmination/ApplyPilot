@@ -34,11 +34,39 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
     existing public.brain_artifact_authority_requests%ROWTYPE;
+    item RECORD;
     database_system_id TEXT;
 BEGIN
-    IF request_id IS NULL OR manifest_sha256 !~ '^[0-9a-f]{64}$' THEN
-        RAISE EXCEPTION 'invalid artifact authority request identity' USING ERRCODE='22023';
+    IF request_id IS NULL OR manifest_sha256 !~ '^[0-9a-f]{64}$'
+       OR purpose IS DISTINCT FROM 'brain-artifact-authority-registration-v1'
+       OR key_id IS NULL OR btrim(key_id) = ''
+       OR issued_at IS NULL OR expires_at IS NULL OR expires_at <= issued_at
+       OR btrim(COALESCE(destination_system_id,'')) = ''
+       OR btrim(COALESCE(destination_database_name,'')) = '' THEN
+        RAISE EXCEPTION 'invalid artifact authority request shape' USING ERRCODE='22023';
     END IF;
+    IF jsonb_typeof(artifacts) IS DISTINCT FROM 'array' OR jsonb_array_length(artifacts) = 0 THEN
+        RAISE EXCEPTION 'artifacts must be a non-empty array' USING ERRCODE='22023';
+    END IF;
+    FOR item IN
+        SELECT value, ordinality::integer AS ordinal
+        FROM jsonb_array_elements(artifacts) WITH ORDINALITY
+    LOOP
+        IF jsonb_typeof(item.value) IS DISTINCT FROM 'object'
+           OR (item.value->>'artifact_hash') !~ '^[0-9a-f]{64}$'
+           OR (item.value->>'byte_length') !~ '^(0|[1-9][0-9]*)$'
+           OR btrim(COALESCE(item.value->>'media_type','')) = ''
+           OR item.value->>'backend' NOT IN ('s3','aws_s3')
+           OR btrim(COALESCE(item.value->>'bucket','')) = ''
+           OR btrim(COALESCE(item.value->>'object_key','')) = ''
+           OR btrim(COALESCE(item.value->>'provider_version_id','')) = ''
+           OR btrim(COALESCE(item.value->>'provider_checksum','')) = ''
+           OR COALESCE((item.value->>'storage_immutable')::boolean, false) IS NOT TRUE
+           OR item.value->>'encryption_mode' NOT IN ('provider_managed','customer_managed')
+           OR btrim(COALESCE(item.value->>'encryption_key_id','')) = '' THEN
+            RAISE EXCEPTION 'invalid artifact at ordinal %', item.ordinal USING ERRCODE='22023';
+        END IF;
+    END LOOP;
 
     PERFORM pg_advisory_xact_lock(hashtextextended('brain-artifact-authority:' || request_id::text, 0));
     SELECT * INTO existing
@@ -60,13 +88,15 @@ BEGIN
         RETURN existing.receipt;
     END IF;
 
+    IF clock_timestamp() < issued_at OR clock_timestamp() >= expires_at THEN
+        RAISE EXCEPTION 'invalid or expired artifact authority request' USING ERRCODE='22023';
+    END IF;
     RETURN public.brain_register_authoritative_artifact_manifest_v6(
         request_id, manifest_sha256, purpose, key_id, issued_at, expires_at,
         destination_system_id, destination_database_name, artifacts
     );
 END;
 $$;
-
 REVOKE ALL ON FUNCTION public.brain_register_authoritative_artifact_manifest(
     uuid,text,text,text,timestamptz,timestamptz,text,text,jsonb
 ) FROM PUBLIC;
@@ -135,6 +165,9 @@ AS $$
            SELECT 1
            FROM public.brain_artifact_authority_registrations registration
            WHERE registration.artifact_hash=$4
+             AND registration.artifact_hash = encode(
+                 sha256(convert_to(registration.policy_source_id,'UTF8')),'hex'
+             )
              AND public.brain_snapshot_reference_provenance_matches(
                  registration.policy_source_id,$1,$2,$3
              )

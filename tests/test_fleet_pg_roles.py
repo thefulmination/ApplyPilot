@@ -125,7 +125,7 @@ def _drop_role(conn) -> None:
 def worker_role(fleet_db):
     with pgqueue.connect(fleet_db) as conn:
         _drop_role(conn)
-        conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN NOSUPERUSER").format(sql.Identifier(DATABASE_OWNER_ROLE)))
+        conn.execute(sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER").format(sql.Identifier(DATABASE_OWNER_ROLE)))
         conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN NOSUPERUSER").format(sql.Identifier(MIGRATOR_ROLE)))
         conn.execute(
             sql.SQL("CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS").format(
@@ -897,7 +897,7 @@ def test_connect_acl_is_exact_and_receipt_contains_rollback_sql(fleet_db):
             "SELECT owner.rolname,owner.rolcanlogin FROM pg_database d "
             "JOIN pg_roles owner ON owner.oid=d.datdba WHERE d.datname=current_database()"
         ).fetchone()
-        assert owner == {"rolname": DATABASE_OWNER_ROLE, "rolcanlogin": False}
+        assert owner == {"rolname": DATABASE_OWNER_ROLE, "rolcanlogin": True}
         postgres_effective = next(row for row in receipt.effective_connect_grantees if row["role_name"] == "postgres")
         assert postgres_effective == {
             "role_name": "postgres",

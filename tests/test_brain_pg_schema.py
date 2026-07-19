@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import importlib.util
 import json
 import os
@@ -328,6 +329,69 @@ def test_v7_exact_replay_survives_expiry_but_new_expired_and_changed_requests_fa
         connection.rollback()
 
 
+def test_v7_same_digest_replay_rejects_invalid_structural_shape(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        params = _v7_registration_params(
+            connection,
+            request_id="71212121-1212-1212-1212-121212121212",
+            digest="1" * 64,
+            artifact_hash="2" * 64,
+        )
+        connection.execute("SET ROLE brain_artifact_authority_writer")
+        connection.execute(_V7_REGISTER_SQL, params)
+        connection.commit()
+        invalid = (
+            (*params[:2], "wrong-purpose", *params[3:]),
+            (*params[:3], "", *params[4:]),
+            (*params[:5], params[4], *params[6:]),
+            (*params[:8], "[]"),
+            (*params[:8], json.dumps([{"artifact_hash": "bad"}])),
+        )
+        for candidate in invalid:
+            with pytest.raises(psycopg.errors.InvalidParameterValue):
+                connection.execute(_V7_REGISTER_SQL, candidate)
+            connection.rollback()
+
+
+def test_v7_snapshot_binding_requires_digest_of_exact_canonical_provenance(brain_pg) -> None:
+    policy = "snapshot-digest-v7"
+    provenance = _snapshot_provenance(
+        policy=policy, lane="ats", role="label_snapshot", source_hash="a" * 64
+    )
+    exact_hash = hashlib.sha256(provenance.encode("utf-8")).hexdigest()
+    unrelated_hash = "f" * 64
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        params = list(_v7_registration_params(
+            connection,
+            request_id="71313131-1313-1313-1313-131313131313",
+            digest="3" * 64,
+            artifact_hash=exact_hash,
+        ))
+        artifact = json.loads(params[8])[0]
+        artifact["policy_source_id"] = provenance
+        unrelated = dict(
+            artifact,
+            artifact_hash=unrelated_hash,
+            object_key=f"sha256/{unrelated_hash}",
+            provider_version_id="version-unrelated",
+            provider_checksum="checksum-unrelated",
+        )
+        params[8] = json.dumps([artifact, unrelated])
+        connection.execute("SET ROLE brain_artifact_authority_writer")
+        connection.execute(_V7_REGISTER_SQL, tuple(params))
+        connection.commit()
+        connection.execute("RESET ROLE")
+        assert connection.execute(
+            "SELECT brain_snapshot_binding_is_authoritative(%s,%s,%s,%s) AS matched",
+            (policy, "ats", "label_snapshot", exact_hash),
+        ).fetchone()["matched"] is True
+        assert connection.execute(
+            "SELECT brain_snapshot_binding_is_authoritative(%s,%s,%s,%s) AS matched",
+            (policy, "ats", "label_snapshot", unrelated_hash),
+        ).fetchone()["matched"] is False
+
 def test_v7_concurrent_different_digest_has_one_winner_and_no_loser_writes(brain_pg) -> None:
     with psycopg.connect(brain_pg, row_factory=dict_row) as owner:
         _install_v7_authority(owner)
@@ -428,16 +492,25 @@ def test_v7_ten_binding_lifecycle_rejects_opaque_snapshot_then_accepts_canonical
             "clock_timestamp()+interval '1 hour' AS expires_at FROM pg_control_system()"
         ).fetchone()
         payload = []
+        snapshot_hashes = {}
+        pairwise_corrected = _snapshot_provenance(
+            policy=policy, lane="ats", role="pairwise_snapshot", source_hash="c" * 64
+        )
         for index, role in enumerate(roles):
             policy_source_id = f"opaque-{role}"
             if role in {"label_snapshot", "outcome_snapshot"}:
                 policy_source_id = _snapshot_provenance(
                     policy=policy, lane="ats", role=role, source_hash=("abcdef"[index % 6] * 64)
                 )
+            artifact_hash = HASHES[index]
+            if role.endswith("_snapshot"):
+                hash_source = pairwise_corrected if role == "pairwise_snapshot" else policy_source_id
+                artifact_hash = hashlib.sha256(hash_source.encode("utf-8")).hexdigest()
+                snapshot_hashes[role] = artifact_hash
             payload.append({
-                "artifact_hash": HASHES[index], "byte_length": index + 1,
+                "artifact_hash": artifact_hash, "byte_length": index + 1,
                 "media_type": "application/json", "backend": "s3", "bucket": "immutable",
-                "object_key": f"sha256/{HASHES[index]}",
+                "object_key": f"sha256/{artifact_hash}",
                 "provider_version_id": f"version-{index}", "provider_checksum": f"checksum-{index}",
                 "storage_immutable": True, "encryption_mode": "customer_managed",
                 "encryption_key_id": "kms-key-1", "policy_source_id": policy_source_id,
@@ -452,28 +525,43 @@ def test_v7_ten_binding_lifecycle_rejects_opaque_snapshot_then_accepts_canonical
         connection.commit()
         connection.execute("RESET ROLE")
         _insert_policy(connection, policy)
-        _attach_policy_contract(connection, policy)
-        connection.execute("UPDATE fleet_config SET paused=TRUE WHERE id=1")
-        connection.commit()
-        with pytest.raises(psycopg.errors.CheckViolation, match="authoritative artifacts"):
-            with connection.transaction():
-                connection.execute("SET LOCAL ROLE brain_schema_migrator")
-                connection.execute("SELECT brain_transition_policy(%s,'validated')", (policy,))
-        connection.rollback()
-        corrected = _snapshot_provenance(
-            policy=policy, lane="ats", role="pairwise_snapshot", source_hash="c" * 64
+        _attach_policy_contract(connection, policy, artifact_hashes=snapshot_hashes)
+        connection.execute(
+            "UPDATE fleet_config SET paused=TRUE,ats_paused=TRUE,"
+            "ats_apply_mode='stopped',linkedin_apply_mode='stopped',"
+            "canary_enabled=FALSE,linkedin_canary_enabled=FALSE WHERE id=1"
         )
+        _set_role_password(connection, brain_pg, "brain_controller_test_login")
+        connection.commit()
+        with psycopg.connect(
+            _dsn_for(brain_pg, "brain_controller_test_login"),
+            row_factory=dict_row,
+        ) as controller:
+            controller.execute("SET ROLE brain_policy_controller")
+            with pytest.raises(psycopg.errors.CheckViolation, match="authoritative artifacts"):
+                controller.execute(
+                    "SELECT brain_controller_transition_policy(%s,'validated',NULL)",
+                    (policy,),
+                )
+            controller.rollback()
+        corrected = pairwise_corrected
         connection.execute("SET session_replication_role=replica")
         connection.execute(
             "UPDATE brain_artifact_authority_registrations SET policy_source_id=%s "
             "WHERE artifact_hash=%s",
-            (corrected, HASHES[5]),
+            (corrected, snapshot_hashes["pairwise_snapshot"]),
         )
         connection.execute("SET session_replication_role=origin")
         connection.commit()
-        with connection.transaction():
-            connection.execute("SET LOCAL ROLE brain_schema_migrator")
-            connection.execute("SELECT brain_transition_policy(%s,'validated')", (policy,))
+        with psycopg.connect(
+            _dsn_for(brain_pg, "brain_controller_test_login"),
+            row_factory=dict_row,
+        ) as controller:
+            controller.execute("SET ROLE brain_policy_controller")
+            controller.execute(
+                "SELECT brain_controller_transition_policy(%s,'validated',NULL)",
+                (policy,),
+            )
         assert connection.execute(
             "SELECT lifecycle FROM brain_decision_policies WHERE policy_version=%s", (policy,)
         ).fetchone()["lifecycle"] == "validated"
@@ -539,6 +627,359 @@ def test_current_v6_database_upgrades_to_v7_without_rewriting_v6_ledger(brain_pg
         schema.verify_brain_schema_v7(connection)
 
 
+def test_v7_install_preserves_permanent_set_edge_for_non_superuser_database_owner(brain_pg) -> None:
+    password = "applypilot-v7-provider-test-only"
+    with psycopg.connect(brain_pg, row_factory=dict_row) as root:
+        require_disposable_postgres(root)
+        for authority_role in (
+            "brain_artifact_authority_writer",
+            "brain_artifact_authority_owner",
+        ):
+            _drop_fixed_role(root, authority_role)
+        root.execute("DROP OWNED BY brain_schema_migrator")
+        root.execute("DROP ROLE brain_schema_migrator")
+        root.execute(
+            pg_sql.SQL(
+                "CREATE ROLE brain_v7_provider LOGIN NOINHERIT NOSUPERUSER "
+                "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
+            ).format(pg_sql.Literal(password))
+        )
+        root.execute(
+            "CREATE ROLE brain_schema_migrator NOLOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        root.execute(
+            "CREATE ROLE brain_artifact_authority_owner NOLOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        root.execute(
+            "CREATE ROLE brain_artifact_authority_writer NOLOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        root.execute(
+            "GRANT brain_artifact_authority_owner TO brain_schema_migrator "
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
+        )
+        root.execute(
+            "GRANT brain_schema_migrator TO brain_v7_provider "
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
+        )
+        root.execute(
+            "CREATE ROLE brain_controller_test_login LOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        root.execute("GRANT USAGE, CREATE ON SCHEMA public TO brain_schema_migrator WITH GRANT OPTION")
+        root.execute("GRANT CREATE ON DATABASE postgres TO brain_schema_migrator")
+        root.execute(
+            "GRANT brain_schema_migrator TO postgres "
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
+        )
+        for relation in (
+            "fleet_config", "fleet_decision_policies", "apply_queue", "linkedin_queue",
+            "workers", "worker_heartbeat", "fleet_worker_principals", "fleet_desired_state",
+            "rate_governor", "applied_set", "apply_attempts", "apply_result_events",
+            "fleet_worker_blocklist",
+        ):
+            root.execute(
+                pg_sql.SQL(
+                    "GRANT SELECT, INSERT, UPDATE ON TABLE public.{} "
+                    "TO brain_schema_migrator WITH GRANT OPTION"
+                ).format(pg_sql.Identifier(relation))
+            )
+        root.commit()
+        schema.ensure_brain_schema_v1(root)
+        root.execute(
+            "GRANT brain_policy_controller TO brain_controller_test_login "
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
+        )
+        root.execute(
+            "REVOKE brain_schema_migrator FROM postgres GRANTED BY postgres RESTRICT"
+        )
+        root.execute("ALTER DATABASE postgres OWNER TO brain_v7_provider")
+        root.execute("ALTER SCHEMA public OWNER TO pg_database_owner")
+        root.commit()
+        parameters = conninfo_to_dict(brain_pg)
+        parameters.update(user="brain_v7_provider", password=password)
+        topology = pg_roles.BootstrapTopology(
+            database_owner_role="brain_v7_provider",
+            controller_role="brain_controller_test_login",
+            verifier_role="brain_schema_verifier",
+            migrator_role="brain_schema_migrator",
+            retired_admin_roles=(),
+            infrastructure_superuser_roles=("postgres",),
+        )
+        try:
+            with psycopg.connect(make_conninfo(**parameters), row_factory=dict_row) as provider:
+                assert provider.execute(
+                    "SELECT rolcanlogin,rolinherit,rolsuper,rolcreaterole "
+                    "FROM pg_roles WHERE rolname=current_user"
+                ).fetchone() == {
+                    "rolcanlogin": True,
+                    "rolinherit": False,
+                    "rolsuper": False,
+                    "rolcreaterole": False,
+                }
+                provider.commit()
+                root.execute("CREATE TABLE v7_unrelated_guard(id integer)")
+                root.execute("GRANT SELECT ON v7_unrelated_guard TO brain_candidate_reader")
+                root.commit()
+                with pytest.raises(
+                    RuntimeError,
+                    match="cross-owner ACL leakage|candidate.*authority exposure",
+                ):
+                    with provider.transaction():
+                        with provider.cursor() as cursor:
+                            pg_roles._install_brain_authority_in_transaction(
+                                cursor, topology=topology
+                            )
+                provider.rollback()
+                assert provider.execute(
+                    "SELECT pg_get_userbyid(nspowner) AS owner_name "
+                    "FROM pg_namespace WHERE nspname='public'"
+                ).fetchone()["owner_name"] == "pg_database_owner"
+                assert provider.execute(
+                    "SELECT admin_option,inherit_option,set_option,"
+                    "pg_get_userbyid(grantor) AS grantor FROM pg_auth_members "
+                    "WHERE roleid='brain_schema_migrator'::regrole "
+                    "AND member='brain_v7_provider'::regrole"
+                    " ORDER BY grantor"
+                ).fetchall() == [
+                    {
+                        "admin_option": False,
+                        "inherit_option": False,
+                        "set_option": True,
+                        "grantor": "postgres",
+                    },
+                ]
+                assert provider.execute(
+                    "SELECT has_table_privilege('brain_candidate_reader',"
+                    "'v7_unrelated_guard','SELECT') AS allowed"
+                ).fetchone()["allowed"] is True
+                assert root.execute(
+                    "SELECT array_agg(version ORDER BY version) AS versions "
+                    "FROM brain_schema_versions"
+                ).fetchone()["versions"] == [1, 2, 3]
+                root.commit()
+                provider.commit()
+                root.execute("REVOKE SELECT ON v7_unrelated_guard FROM brain_candidate_reader")
+                root.execute("DROP TABLE v7_unrelated_guard")
+                root.commit()
+                with provider.transaction():
+                    with provider.cursor() as cursor:
+                        pg_roles._install_brain_authority_in_transaction(
+                            cursor, topology=topology
+                        )
+                assert provider.execute(
+                    "SELECT pg_get_userbyid(nspowner) AS owner_name "
+                    "FROM pg_namespace WHERE nspname='public'"
+                ).fetchone()["owner_name"] == "pg_database_owner"
+                assert provider.execute(
+                    "SELECT admin_option,inherit_option,set_option,"
+                    "pg_get_userbyid(grantor) AS grantor "
+                    "FROM pg_auth_members "
+                    "WHERE roleid='brain_schema_migrator'::regrole "
+                    "AND member='brain_v7_provider'::regrole"
+                    " ORDER BY grantor"
+                ).fetchall() == [
+                    {
+                        "admin_option": False,
+                        "inherit_option": False,
+                        "set_option": True,
+                        "grantor": "postgres",
+                    },
+                ]
+                provider.commit()
+                schema.verify_brain_schema_v7(root)
+        finally:
+            root.rollback()
+            root.execute("ALTER DATABASE postgres OWNER TO postgres")
+            root.execute("ALTER SCHEMA public OWNER TO pg_database_owner")
+            root.commit()
+
+def test_v7_install_fails_closed_on_automatic_creator_membership_grant(brain_pg) -> None:
+    password = "applypilot-v7-provider-test-only"
+    with psycopg.connect(brain_pg, row_factory=dict_row) as root:
+        require_disposable_postgres(root)
+        root.execute("DROP OWNED BY brain_schema_migrator")
+        root.execute("DROP ROLE brain_schema_migrator")
+        root.execute(
+            pg_sql.SQL(
+                "CREATE ROLE brain_v7_provider LOGIN NOINHERIT NOSUPERUSER "
+                "NOCREATEDB CREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
+            ).format(pg_sql.Literal(password))
+        )
+        root.execute("ALTER DATABASE postgres OWNER TO brain_v7_provider")
+        root.commit()
+        parameters = conninfo_to_dict(brain_pg)
+        parameters.update(user="brain_v7_provider", password=password)
+        topology = pg_roles.BootstrapTopology(
+            database_owner_role="brain_v7_provider",
+            controller_role="brain_controller_test_login",
+            verifier_role="brain_schema_verifier",
+            migrator_role="brain_schema_migrator",
+            retired_admin_roles=(),
+            infrastructure_superuser_roles=("postgres",),
+        )
+        try:
+            with psycopg.connect(make_conninfo(**parameters), row_factory=dict_row) as provider:
+                provider.execute(
+                    "CREATE ROLE brain_schema_migrator NOLOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                provider.commit()
+                expected_edge = [
+                    {
+                        "admin_option": True,
+                        "inherit_option": False,
+                        "set_option": False,
+                        "grantor": "postgres",
+                    }
+                ]
+                query = (
+                    "SELECT admin_option,inherit_option,set_option,"
+                    "pg_get_userbyid(grantor) AS grantor FROM pg_auth_members "
+                    "WHERE roleid='brain_schema_migrator'::regrole "
+                    "AND member='brain_v7_provider'::regrole"
+                )
+                assert provider.execute(query).fetchall() == expected_edge
+                provider.commit()
+                with pytest.raises(RuntimeError, match="privileged pre-provisioning"):
+                    with provider.transaction():
+                        with provider.cursor() as cursor:
+                            pg_roles._install_brain_authority_in_transaction(
+                                cursor, topology=topology
+                            )
+                provider.rollback()
+                assert provider.execute(query).fetchall() == expected_edge
+        finally:
+            root.rollback()
+            root.execute("ALTER DATABASE postgres OWNER TO postgres")
+            root.commit()
+
+
+def test_v7_verifier_rejects_membership_option_grantor_and_multiplicity_drift(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        rename_password = "applypilot-v7-bootstrap-rename-test-only"
+        connection.execute(
+            pg_sql.SQL("CREATE ROLE brain_v7_renamer LOGIN SUPERUSER PASSWORD {}").format(
+                pg_sql.Literal(rename_password)
+            )
+        )
+        connection.commit()
+        rename_parameters = conninfo_to_dict(brain_pg)
+        rename_parameters.update(user="brain_v7_renamer", password=rename_password)
+        with psycopg.connect(make_conninfo(**rename_parameters), row_factory=dict_row) as renamer:
+            renamer.execute("ALTER ROLE postgres RENAME TO brain_v7_bootstrap_renamed")
+            renamer.commit()
+            try:
+                schema.verify_brain_schema_v7(connection)
+            finally:
+                renamer.execute("ALTER ROLE brain_v7_bootstrap_renamed RENAME TO postgres")
+                renamer.commit()
+        connection.execute("DROP ROLE brain_v7_renamer")
+        connection.commit()
+
+        with pytest.raises(psycopg.errors.FeatureNotSupported, match="bootstrap user"):
+            with connection.transaction():
+                connection.execute("ALTER ROLE postgres NOSUPERUSER")
+        connection.rollback()
+        schema.verify_brain_schema_v7(connection)
+
+        with pytest.raises(RuntimeError, match="database[- ]owner"):
+            with connection.transaction():
+                connection.execute(
+                    "CREATE ROLE brain_v7_owner_drift LOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                connection.execute("ALTER DATABASE postgres OWNER TO brain_v7_owner_drift")
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        mutations = (
+            "GRANT brain_artifact_authority_owner TO brain_schema_migrator "
+            "WITH ADMIN TRUE, INHERIT FALSE, SET TRUE",
+            "GRANT brain_artifact_authority_owner TO brain_schema_migrator "
+            "WITH ADMIN FALSE, INHERIT TRUE, SET TRUE",
+        )
+        for statement in mutations:
+            with pytest.raises(RuntimeError, match="membership"):
+                with connection.transaction():
+                    connection.execute(statement)
+                    with connection.cursor() as cursor:
+                        schema.verify_brain_schema_v7_in_transaction(cursor)
+            connection.rollback()
+
+        with pytest.raises(RuntimeError, match="membership"):
+            with connection.transaction():
+                connection.execute("CREATE ROLE brain_v7_alternate_grantor SUPERUSER NOLOGIN")
+                connection.execute(
+                    "GRANT brain_artifact_authority_owner TO brain_v7_alternate_grantor "
+                    "WITH ADMIN OPTION"
+                )
+                connection.execute("SET LOCAL ROLE brain_v7_alternate_grantor")
+                connection.execute(
+                    "GRANT brain_artifact_authority_owner TO brain_schema_migrator "
+                    "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+                )
+                connection.execute("RESET ROLE")
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+        schema.verify_brain_schema_v7(connection)
+
+def test_v7_verifier_rejects_public_and_arbitrary_inherited_authority_acls(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        connection.execute("CREATE ROLE brain_v7_rogue NOLOGIN")
+        connection.commit()
+        mutations = (
+            "GRANT SELECT ON brain_artifact_authority_requests TO brain_v7_rogue",
+            "GRANT SELECT ON brain_schema_versions TO PUBLIC",
+            "GRANT EXECUTE ON FUNCTION brain_v5_frame(text) TO brain_v7_rogue",
+        )
+        for statement in mutations:
+            with pytest.raises(RuntimeError, match="ACL"):
+                with connection.transaction():
+                    connection.execute(statement)
+                    with connection.cursor() as cursor:
+                        schema.verify_brain_schema_v7_in_transaction(cursor)
+            connection.rollback()
+        schema.verify_brain_schema_v7(connection)
+
+def test_v7_verifier_deeply_rejects_inherited_v1_v5_v6_drift(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+
+        mutations = (
+            (
+                "CREATE OR REPLACE FUNCTION brain_v5_frame(requested_value text) RETURNS text "
+                "LANGUAGE sql IMMUTABLE SET search_path=pg_catalog, public "
+                "AS 'SELECT requested_value || ''tampered'''",
+                "v5",
+            ),
+            (
+                "ALTER TABLE brain_artifact_authority_requests "
+                "DROP CONSTRAINT brain_artifact_authority_requests_manifest_sha256_check",
+                "v6",
+            ),
+            (
+                "DROP TRIGGER brain_artifact_authority_registrations_append_only "
+                "ON brain_artifact_authority_registrations",
+                "v6",
+            ),
+            ("ALTER TABLE brain_schema_versions OWNER TO postgres", "inherited"),
+        )
+        for statement, message in mutations:
+            with pytest.raises(RuntimeError, match=message):
+                with connection.transaction():
+                    connection.execute(statement)
+                    with connection.cursor() as cursor:
+                        schema.verify_brain_schema_v7_in_transaction(cursor)
+            connection.rollback()
+        schema.verify_brain_schema_v7(connection)
+
 def test_v7_verifier_rejects_owner_acl_sequence_and_default_acl_drift(brain_pg) -> None:
     with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
         _install_v7_authority(connection)
@@ -553,7 +994,10 @@ def test_v7_verifier_rejects_owner_acl_sequence_and_default_acl_drift(brain_pg) 
                     schema.verify_brain_schema_v7_in_transaction(cursor)
         connection.rollback()
 
-        with pytest.raises(RuntimeError, match="function ACL contract mismatch"):
+        with pytest.raises(
+            RuntimeError,
+            match="registration function ACL mismatch|function ACL contract mismatch",
+        ):
             with connection.transaction():
                 connection.execute(
                     "GRANT EXECUTE ON FUNCTION brain_register_authoritative_artifact_manifest("
@@ -563,7 +1007,10 @@ def test_v7_verifier_rejects_owner_acl_sequence_and_default_acl_drift(brain_pg) 
                     schema.verify_brain_schema_v7_in_transaction(cursor)
         connection.rollback()
 
-        with pytest.raises(RuntimeError, match="authority relation ownership mismatch"):
+        with pytest.raises(
+            RuntimeError,
+            match="authority relation ownership mismatch|inherited relation ownership mismatch",
+        ):
             with connection.transaction():
                 connection.execute("ALTER TABLE brain_artifact_locations OWNER TO postgres")
                 with connection.cursor() as cursor:
@@ -648,6 +1095,7 @@ TEST_ROLES = (
     "ats_worker_role",
     "linkedin_worker_role",
     "brain_rogue_writer",
+    "brain_v7_provider",
 )
 FIXED_BRAIN_ROLES = (
     "brain_artifact_authority_owner",
@@ -2035,7 +2483,12 @@ def test_outcome_email_fk_and_stable_applications(brain_pg):
                 )
 
 
-def _attach_policy_contract(conn, policy: str) -> dict[str, int]:
+def _attach_policy_contract(
+    conn,
+    policy: str,
+    *,
+    artifact_hashes: dict[str, str] | None = None,
+) -> dict[str, int]:
     roles = (
         "qualification_model",
         "preference_model",
@@ -2060,7 +2513,7 @@ def _attach_policy_contract(conn, policy: str) -> dict[str, int]:
         for index, role in enumerate(roles):
             conn.execute(
                 "INSERT INTO brain_policy_artifacts (policy_version, artifact_role, artifact_hash) VALUES (%s, %s, %s)",
-                (policy, role, HASHES[index]),
+                (policy, role, (artifact_hashes or {}).get(role, HASHES[index])),
             )
         for approval in ("validated", "canary", "active", "retired"):
             conn.execute(
@@ -2730,15 +3183,18 @@ def test_schema_version_ledger_rejects_future_and_interrupted_versions(brain_pg)
             schema.verify_schema_v1(conn)
 
 
-def test_superuser_without_exact_migration_identity_is_denied(brain_pg, monkeypatch):
+def test_bootstrap_superuser_migrates_without_permanent_migrator_membership(brain_pg, monkeypatch):
     monkeypatch.setenv("APPLYPILOT_BRAIN_MIGRATION_ROLE", "postgres")
     with psycopg.connect(brain_pg, row_factory=dict_row) as conn:
         conn.execute("REVOKE brain_schema_migrator FROM postgres")
         conn.commit()
-        with pytest.raises(RuntimeError, match="fixed role brain_schema_migrator"):
-            schema.ensure_schema_v1(conn)
-        conn.execute("GRANT brain_schema_migrator TO postgres")
-        conn.commit()
+        schema.ensure_schema_v1(conn)
+        assert conn.execute(
+            "SELECT 1 FROM pg_auth_members membership "
+            "JOIN pg_roles parent ON parent.oid=membership.roleid "
+            "JOIN pg_roles member ON member.oid=membership.member "
+            "WHERE parent.rolname='brain_schema_migrator' AND member.oid=10"
+        ).fetchone() is None
 
 
 def test_explicit_read_only_verifier_acl_and_schema_create_revocation(brain_pg, monkeypatch):
@@ -3286,12 +3742,7 @@ def test_bootstrap_v5_authority_creates_candidates_before_schema_and_reconciles_
             "JOIN pg_roles member ON member.oid=membership.member "
             "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
             "WHERE parent.rolname='brain_schema_migrator' AND member.rolname='postgres'"
-        ).fetchone() == {
-            "admin_option": False,
-            "inherit_option": True,
-            "set_option": True,
-            "grantor_role": "postgres",
-        }
+        ).fetchone() is None
 
 
 def test_v7_bootstrap_rejects_unauthorized_transitive_authority_descendant_and_rolls_back(brain_pg):
@@ -3319,7 +3770,10 @@ def test_v7_bootstrap_rejects_unauthorized_transitive_authority_descendant_and_r
             retired_admin_roles=(),
             infrastructure_superuser_roles=("postgres",),
         )
-        with pytest.raises(RuntimeError, match="unauthorized direct or transitive descendants"):
+        with pytest.raises(
+            RuntimeError,
+            match="unauthorized direct or transitive descendants|recursive authority membership contract mismatch",
+        ):
             with conn.transaction():
                 with conn.cursor() as cur:
                     pg_roles._install_brain_authority_in_transaction(cur, topology=topology)

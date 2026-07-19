@@ -870,8 +870,8 @@ def _database_inventory(cur, *, role_name: str, manifest: RegrantManifest) -> di
         for row in cur.fetchall()
     }
     owner_attributes = allowlist_attributes.get(manifest.database_owner_role)
-    if owner_attributes != (False, False):
-        raise RuntimeError("dedicated database owner role must be NOLOGIN and NOSUPERUSER")
+    if owner_attributes != (True, False):
+        raise RuntimeError("dedicated database owner role must be LOGIN and NOSUPERUSER")
     if not any(allowlist_attributes.get(name, (False, False))[0] for name in controller_roles):
         raise RuntimeError("at least one explicit controller role must be LOGIN")
     invalid_controllers = sorted(name for name in controller_roles if allowlist_attributes.get(name, (False, False))[1])
@@ -2161,10 +2161,10 @@ def _validate_post_password_boundary(
     owner = cur.fetchone()
     if (
         _row_value(owner, "rolname") != database_owner_role
-        or _row_value(owner, "rolcanlogin", 1)
+        or not _row_value(owner, "rolcanlogin", 1)
         or _row_value(owner, "rolsuper", 2)
     ):
-        raise RuntimeError("database owner must be the dedicated NOLOGIN NOSUPERUSER role")
+        raise RuntimeError("database owner must be the dedicated LOGIN NOSUPERUSER role")
     if retired_admin_roles:
         cur.execute(
             "SELECT rolname,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
@@ -2274,10 +2274,11 @@ def ensure_brain_candidate_roles_in_transaction(
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]{0,62}", role_name):
             raise ValueError("candidate role names must be plain PostgreSQL identifiers")
     cur.execute("SET LOCAL search_path=pg_catalog")
-    cur.execute("SELECT rolsuper OR rolcreaterole AS allowed FROM pg_roles WHERE rolname=current_user")
+    cur.execute("SELECT rolsuper,rolcreaterole FROM pg_roles WHERE rolname=current_user")
     row = cur.fetchone()
-    if row is None or not _row_value(row, "allowed"):
+    if row is None or not (row["rolsuper"] or row["rolcreaterole"]):
         raise RuntimeError("candidate role reconciliation requires CREATEROLE or provider-admin authority")
+    is_superuser = bool(row["rolsuper"])
     cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_CANDIDATE_ROLE_LOCK_KEY,))
     for role_name in (reader_role, writer_role):
         identifier = sql.Identifier(role_name)
@@ -2285,10 +2286,30 @@ def ensure_brain_candidate_roles_in_transaction(
         if cur.fetchone() is None:
             cur.execute(sql.SQL("CREATE ROLE {}").format(identifier))
         cur.execute(
-            sql.SQL(
-                "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-            ).format(identifier)
+            "SELECT rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+            "rolreplication,rolbypassrls FROM pg_roles WHERE rolname=%s",
+            (role_name,),
         )
+        attributes = cur.fetchone()
+        if attributes is None or any(
+            attributes[name] for name in ("rolsuper", "rolreplication", "rolbypassrls")
+        ):
+            raise RuntimeError(f"unsafe privileged capability role requires superuser repair: {role_name}")
+        attribute_repairs = [
+            sql.SQL(clause)
+            for enabled, clause in (
+                (attributes["rolcanlogin"], "NOLOGIN"),
+                (attributes["rolinherit"], "NOINHERIT"),
+                (attributes["rolcreatedb"], "NOCREATEDB"),
+                (attributes["rolcreaterole"], "NOCREATEROLE"),
+            )
+            if enabled
+        ]
+        if attribute_repairs:
+            cur.execute(
+                sql.SQL("ALTER ROLE {} ").format(identifier)
+                + sql.SQL(" ").join(attribute_repairs)
+            )
         cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(identifier))
         cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier))
 
@@ -2337,50 +2358,72 @@ def ensure_brain_candidate_roles_in_transaction(
         raise RuntimeError("candidate roles must not own database objects: " + ", ".join(owned_objects))
     cur.execute("SELECT current_database() AS database_name")
     database = sql.Identifier(cur.fetchone()["database_name"])
-    for role_name in (reader_role, writer_role):
-        identifier = sql.Identifier(role_name)
-        cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(database, identifier))
-        for namespace in namespaces:
-            schema_name = sql.Identifier(namespace)
-            cur.execute(
-                sql.SQL("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} FROM {}").format(schema_name, identifier)
-            )
-            cur.execute(
-                sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(schema_name, identifier)
-            )
-            cur.execute(
-                sql.SQL("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM {}").format(schema_name, identifier)
-            )
-            cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA {} FROM {}").format(schema_name, identifier))
-        for namespace, type_name in grantable_types:
-            cur.execute(
-                sql.SQL("REVOKE ALL PRIVILEGES ON TYPE {}.{} FROM {}").format(
-                    sql.Identifier(namespace), sql.Identifier(type_name), identifier
-                )
-            )
-    cur.execute(
-        "SELECT owner.rolname AS owner_role,n.nspname AS schema_name,da.defaclobjtype "
-        "FROM pg_default_acl da JOIN pg_roles owner ON owner.oid=da.defaclrole "
-        "LEFT JOIN pg_namespace n ON n.oid=da.defaclnamespace CROSS JOIN LATERAL aclexplode(da.defaclacl) acl "
-        "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))",
-        ([reader_role, writer_role],),
-    )
-    default_acl_kinds = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES", "n": "SCHEMAS"}
-    for default_acl in cur.fetchall():
+    if is_superuser:
         for role_name in (reader_role, writer_role):
-            cur.execute(
-                sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} {} REVOKE ALL ON {} FROM {}").format(
-                    sql.Identifier(default_acl["owner_role"]),
-                    sql.SQL("")
-                    if default_acl["schema_name"] is None
-                    else sql.SQL("IN SCHEMA {} ").format(sql.Identifier(default_acl["schema_name"])),
-                    sql.SQL(default_acl_kinds[default_acl["defaclobjtype"]]),
-                    sql.Identifier(role_name),
+            identifier = sql.Identifier(role_name)
+            cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(database, identifier))
+            for namespace in namespaces:
+                schema_name = sql.Identifier(namespace)
+                cur.execute(
+                    sql.SQL("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} FROM {}").format(schema_name, identifier)
                 )
-            )
+                cur.execute(
+                    sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(schema_name, identifier)
+                )
+                cur.execute(
+                    sql.SQL("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM {}").format(schema_name, identifier)
+                )
+                cur.execute(sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA {} FROM {}").format(schema_name, identifier))
+            for namespace, type_name in grantable_types:
+                cur.execute(
+                    sql.SQL("REVOKE ALL PRIVILEGES ON TYPE {}.{} FROM {}").format(
+                        sql.Identifier(namespace), sql.Identifier(type_name), identifier
+                    )
+                )
+        cur.execute(
+            "SELECT owner.rolname AS owner_role,n.nspname AS schema_name,da.defaclobjtype "
+            "FROM pg_default_acl da JOIN pg_roles owner ON owner.oid=da.defaclrole "
+            "LEFT JOIN pg_namespace n ON n.oid=da.defaclnamespace CROSS JOIN LATERAL aclexplode(da.defaclacl) acl "
+            "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s))",
+            ([reader_role, writer_role],),
+        )
+        default_acl_kinds = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES", "n": "SCHEMAS"}
+        for default_acl in cur.fetchall():
+            for role_name in (reader_role, writer_role):
+                cur.execute(
+                    sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} {} REVOKE ALL ON {} FROM {}").format(
+                        sql.Identifier(default_acl["owner_role"]),
+                        sql.SQL("")
+                        if default_acl["schema_name"] is None
+                        else sql.SQL("IN SCHEMA {} ").format(sql.Identifier(default_acl["schema_name"])),
+                        sql.SQL(default_acl_kinds[default_acl["defaclobjtype"]]),
+                        sql.Identifier(role_name),
+                    )
+                )
     for role_name in (reader_role, writer_role):
         cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role_name)))
 
+    if not is_superuser:
+        cur.execute(
+            "SELECT n.nspname,c.relname,grantee.rolname AS grantee,acl.privilege_type "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+            "JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+            "WHERE grantee.rolname=ANY(%s) AND NOT ("
+            "n.nspname='public' AND c.relname=ANY(%s)) LIMIT 1",
+            ([reader_role, writer_role], list(_CANDIDATE_ALL_RELATIONS)),
+        )
+        if cur.fetchone() is not None:
+            raise RuntimeError("non-superuser candidate reconciliation found cross-owner ACL leakage")
+        cur.execute(
+            "SELECT 1 FROM pg_default_acl defaults "
+            "CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl "
+            "WHERE acl.grantee IN (SELECT oid FROM pg_roles WHERE rolname=ANY(%s)) LIMIT 1",
+            ([reader_role, writer_role],),
+        )
+        if cur.fetchone() is not None:
+            raise RuntimeError("non-superuser candidate reconciliation found default ACL leakage")
+        cur.execute("SET LOCAL ROLE brain_schema_migrator")
     for relation in _CANDIDATE_ALL_RELATIONS:
         cur.execute("SELECT to_regclass(%s) AS relation", (f"public.{relation}",))
         if cur.fetchone()["relation"] is None:
@@ -2438,6 +2481,8 @@ def ensure_brain_candidate_roles_in_transaction(
     migrator = cur.fetchone()
     if migrator is not None and migrator["rolcreaterole"]:
         raise RuntimeError("brain_schema_migrator must not retain CREATEROLE")
+    if not is_superuser:
+        cur.execute("RESET ROLE")
     return CandidateRoleReconciliationReceipt(
         reader_role=reader_role,
         writer_role=writer_role,
@@ -2536,17 +2581,60 @@ def ensure_brain_artifact_authority_roles_in_transaction(
         if cur.fetchone() is None:
             cur.execute(sql.SQL("CREATE ROLE {}").format(identifier))
         cur.execute(
-            sql.SQL(
-                "ALTER ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-            ).format(identifier)
+            "SELECT rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+            "rolreplication,rolbypassrls FROM pg_roles WHERE rolname=%s",
+            (role_name,),
         )
+        attributes = cur.fetchone()
+        if attributes is None or any(
+            attributes[name] for name in ("rolsuper", "rolreplication", "rolbypassrls")
+        ):
+            raise RuntimeError(f"unsafe privileged capability role requires superuser repair: {role_name}")
+        attribute_repairs = [
+            sql.SQL(clause)
+            for enabled, clause in (
+                (attributes["rolcanlogin"], "NOLOGIN"),
+                (attributes["rolinherit"], "NOINHERIT"),
+                (attributes["rolcreatedb"], "NOCREATEDB"),
+                (attributes["rolcreaterole"], "NOCREATEROLE"),
+            )
+            if enabled
+        ]
+        if attribute_repairs:
+            cur.execute(
+                sql.SQL("ALTER ROLE {} ").format(identifier)
+                + sql.SQL(" ").join(attribute_repairs)
+            )
         cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM {}").format(identifier))
         cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(identifier))
     cur.execute(
-        sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
-            sql.Identifier(BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE), sql.Identifier(migrator_role)
-        )
+        "SELECT grantor.oid AS grantor_oid,grantor.rolname AS grantor_role,"
+        "grantor.rolsuper AS grantor_is_superuser,"
+        "membership.admin_option,"
+        "membership.inherit_option,membership.set_option "
+        "FROM pg_auth_members membership "
+        "JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+        "WHERE parent.rolname=%s AND member.rolname=%s "
+        "ORDER BY grantor.rolname",
+        (BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, migrator_role),
     )
+    owner_memberships = cur.fetchall()
+    exact_owner_membership = (
+        len(owner_memberships) == 1
+        and _row_value(owner_memberships[0], "grantor_oid") == 10
+        and bool(_row_value(owner_memberships[0], "grantor_is_superuser", 2))
+        and not bool(_row_value(owner_memberships[0], "admin_option", 3))
+        and not bool(_row_value(owner_memberships[0], "inherit_option", 4))
+        and bool(_row_value(owner_memberships[0], "set_option", 5))
+    )
+    if not exact_owner_membership:
+        cur.execute(
+            sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
+                sql.Identifier(BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE), sql.Identifier(migrator_role)
+            )
+        )
     _reconcile_role_memberships(
         cur,
         role_name=BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE,
@@ -2574,31 +2662,157 @@ def _install_brain_authority_in_transaction(
         verify_brain_schema_v7_in_transaction,
     )
 
-    candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
-    cur.execute("SELECT session_user AS session_name,current_database() AS database_name")
+    cur.execute(
+        "SELECT session_user AS session_name,current_database() AS database_name,"
+        "(SELECT rolsuper FROM pg_roles WHERE rolname=session_user) AS session_is_superuser"
+    )
     identity = cur.fetchone()
-    session_user = sql.Identifier(_row_value(identity, "session_name"))
     session_name = _row_value(identity, "session_name")
     database = sql.Identifier(_row_value(identity, "database_name", 1))
     migrator = sql.Identifier(topology.migrator_role)
+    session_is_superuser = bool(_row_value(identity, "session_is_superuser", 2))
+    database_owner_descendant = None
 
-    preexisting_edges = tuple(
-        edge
-        for edge in _retired_membership_inventory(
-            cur, retired_admin_roles=(topology.migrator_role, session_name)
-        )
-        if edge["parent_role"] == topology.migrator_role and edge["member_role"] == session_name
-    )
-    if len(preexisting_edges) > 1:
-        raise RuntimeError("multiple provider-to-migrator grants cannot be preserved exactly")
-    for edge in preexisting_edges:
+    if session_is_superuser:
         cur.execute(
-            sql.SQL("REVOKE {} FROM {} GRANTED BY {} RESTRICT").format(
-                migrator, session_user, sql.Identifier(edge["grantor_role"])
+            "SELECT owner.oid,owner.rolname FROM pg_database database "
+            "JOIN pg_roles owner ON owner.oid=database.datdba "
+            "WHERE database.datname=current_database()"
+        )
+        database_owner_role = cur.fetchone()
+        if _row_value(database_owner_role, "oid") == 10:
+            cur.execute(
+                "SELECT grantor.rolname AS grantor_role FROM pg_auth_members membership "
+                "JOIN pg_roles parent ON parent.oid=membership.roleid "
+                "JOIN pg_roles member ON member.oid=membership.member "
+                "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+                "WHERE parent.rolname=%s AND member.oid=10",
+                (topology.migrator_role,),
+            )
+            for bootstrap_edge in cur.fetchall():
+                cur.execute(
+                    sql.SQL("REVOKE {} FROM {} GRANTED BY {} RESTRICT").format(
+                        migrator,
+                        sql.Identifier(_row_value(database_owner_role, "rolname", 1)),
+                        sql.Identifier(_row_value(bootstrap_edge, "grantor_role")),
+                    )
+                )
+        else:
+            database_owner_descendant = _row_value(database_owner_role, "rolname", 1)
+
+    if not session_is_superuser:
+        cur.execute(
+            "SELECT owner.rolname AS owner_name FROM pg_database database "
+            "JOIN pg_roles owner ON owner.oid=database.datdba "
+            "WHERE database.datname=current_database()"
+        )
+        actual_database_owner = _row_value(cur.fetchone(), "owner_name")
+        cur.execute(
+            "SELECT rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+            "rolreplication,rolbypassrls FROM pg_roles WHERE rolname=%s",
+            (session_name,),
+        )
+        provider_attributes = cur.fetchone()
+        provider_exact = (
+            actual_database_owner == session_name
+            and provider_attributes is not None
+            and bool(_row_value(provider_attributes, "rolcanlogin"))
+            and not any(
+                bool(_row_value(provider_attributes, attribute))
+                for attribute in (
+                    "rolinherit",
+                    "rolsuper",
+                    "rolcreatedb",
+                    "rolcreaterole",
+                    "rolreplication",
+                    "rolbypassrls",
+                )
             )
         )
-
-    ensure_brain_artifact_authority_roles_in_transaction(cur, migrator_role=topology.migrator_role)
+        cur.execute(
+            "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+            "rolreplication,rolbypassrls FROM pg_roles "
+            "WHERE rolname=ANY(%s) ORDER BY rolname",
+            ([BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE],),
+        )
+        provisioned_roles = cur.fetchall()
+        roles_exact = len(provisioned_roles) == 2 and all(
+            not bool(row[attribute])
+            for row in provisioned_roles
+            for attribute in (
+                "rolcanlogin",
+                "rolinherit",
+                "rolsuper",
+                "rolcreatedb",
+                "rolcreaterole",
+                "rolreplication",
+                "rolbypassrls",
+            )
+        )
+        cur.execute(
+            "SELECT parent.rolname AS parent_role,member.rolname AS member_role,"
+            "grantor.oid AS grantor_oid,grantor.rolsuper AS grantor_is_superuser,"
+            "membership.admin_option,"
+            "membership.inherit_option,membership.set_option "
+            "FROM pg_auth_members membership "
+            "JOIN pg_roles parent ON parent.oid=membership.roleid "
+            "JOIN pg_roles member ON member.oid=membership.member "
+            "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+            "WHERE parent.rolname=ANY(%s) OR member.rolname=ANY(%s)",
+            (
+                [BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE],
+                [BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE, BRAIN_ARTIFACT_AUTHORITY_WRITER_ROLE],
+            ),
+        )
+        provisioned_memberships = cur.fetchall()
+        membership_exact = (
+            len(provisioned_memberships) == 1
+            and _row_value(provisioned_memberships[0], "parent_role")
+            == BRAIN_ARTIFACT_AUTHORITY_OWNER_ROLE
+            and _row_value(provisioned_memberships[0], "member_role", 1) == topology.migrator_role
+            and _row_value(provisioned_memberships[0], "grantor_oid", 2) == 10
+            and bool(_row_value(provisioned_memberships[0], "grantor_is_superuser", 3))
+            and not bool(_row_value(provisioned_memberships[0], "admin_option", 4))
+            and not bool(_row_value(provisioned_memberships[0], "inherit_option", 5))
+            and bool(_row_value(provisioned_memberships[0], "set_option", 6))
+        )
+        cur.execute(
+            "SELECT parent.rolname AS parent_role,grantor.oid AS grantor_oid,"
+            "grantor.rolsuper AS grantor_is_superuser,membership.admin_option,"
+            "membership.inherit_option,membership.set_option "
+            "FROM pg_auth_members membership "
+            "JOIN pg_roles parent ON parent.oid=membership.roleid "
+            "JOIN pg_roles member ON member.oid=membership.member "
+            "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+            "WHERE member.rolname=%s",
+            (session_name,),
+        )
+        provider_memberships = cur.fetchall()
+        provider_membership_exact = (
+            len(provider_memberships) == 1
+            and _row_value(provider_memberships[0], "parent_role") == topology.migrator_role
+            and _row_value(provider_memberships[0], "grantor_oid", 1) == 10
+            and bool(_row_value(provider_memberships[0], "grantor_is_superuser", 2))
+            and not bool(_row_value(provider_memberships[0], "admin_option", 3))
+            and not bool(_row_value(provider_memberships[0], "inherit_option", 4))
+            and bool(_row_value(provider_memberships[0], "set_option", 5))
+        )
+        if not provider_exact or not roles_exact or not membership_exact or not provider_membership_exact:
+            raise RuntimeError(
+                "non-superuser authority installation requires privileged pre-provisioning "
+                "of exact owner/writer roles and OID 10-granted permanent memberships"
+            )
+    if session_is_superuser:
+        candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
+        ensure_brain_artifact_authority_roles_in_transaction(
+            cur, migrator_role=topology.migrator_role
+        )
+    else:
+        candidate_roles = CandidateRoleReconciliationReceipt(
+            reader_role=BRAIN_CANDIDATE_READER_ROLE,
+            writer_role=BRAIN_CANDIDATE_WRITER_ROLE,
+            reconciled_at=datetime.now(timezone.utc).isoformat(),
+        )
 
     cur.execute(
         "SELECT EXISTS (SELECT 1 FROM pg_database database "
@@ -2617,10 +2831,19 @@ def _install_brain_authority_in_transaction(
         "WHERE namespace.nspname='public'"
     )
     public_owner_before = _row_value(cur.fetchone(), "owner_name")
-    public_owner_changed = public_owner_before != topology.migrator_role
+    # Dedicated non-superuser providers preserve public's pg_database_owner
+    # ownership. PostgreSQL forbids explicit members of that predefined role,
+    # so the permanent migrator SET edge plus schema grant options are used.
+    public_owner_changed = session_is_superuser and public_owner_before != topology.migrator_role
     if public_owner_changed:
         cur.execute(sql.SQL("ALTER SCHEMA public OWNER TO {}").format(migrator))
-    cur.execute(sql.SQL("GRANT {} TO {}").format(migrator, session_user))
+    else:
+        cur.execute(
+            sql.SQL(
+                "GRANT USAGE, CREATE ON SCHEMA public TO {} WITH GRANT OPTION"
+            ).format(migrator)
+        )
+    cur.execute(sql.SQL("SET LOCAL ROLE {}").format(migrator))
     ensure_brain_schema_v7_in_transaction(cur)
     cur.execute("RESET ROLE")
     if public_owner_changed:
@@ -2641,37 +2864,44 @@ def _install_brain_authority_in_transaction(
         raise RuntimeError(
             "brain_artifact_authority_owner retained CREATE on public after fixed authority installation"
         )
-    cur.execute(sql.SQL("REVOKE {} FROM {}").format(migrator, session_user))
+    if session_is_superuser:
+        candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
+        ensure_brain_artifact_authority_roles_in_transaction(
+            cur, migrator_role=topology.migrator_role
+        )
     if not create_preexisted:
         cur.execute(sql.SQL("REVOKE CREATE ON DATABASE {} FROM {}").format(database, migrator))
-
-    candidate_roles = ensure_brain_candidate_roles_in_transaction(cur)
-    ensure_brain_artifact_authority_roles_in_transaction(cur, migrator_role=topology.migrator_role)
-    if preexisting_edges:
-        cur.execute(_retired_membership_rollback_sql(cur, memberships=preexisting_edges))
-    restored_edges = tuple(
-        edge
-        for edge in _retired_membership_inventory(
-            cur, retired_admin_roles=(topology.migrator_role, session_name)
-        )
-        if edge["parent_role"] == topology.migrator_role and edge["member_role"] == session_name
-    )
-    if restored_edges != preexisting_edges:
-        raise RuntimeError("provider-to-migrator membership was not restored exactly")
     _verify_artifact_authority_membership_closure(
         cur,
-        allowed_session_descendant=session_name if preexisting_edges else None,
+        allowed_session_descendant=(
+            database_owner_descendant if session_is_superuser else session_name
+        ),
     )
+    cur.execute(sql.SQL("SET LOCAL ROLE {}").format(migrator))
     verify_brain_schema_v7_in_transaction(cur)
+    cur.execute("RESET ROLE")
     for capability in ("brain_policy_controller",):
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (capability,))
         if cur.fetchone() is None:
             raise RuntimeError(f"fixed authority installer did not create {capability}")
         cur.execute(
-            sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
-                sql.Identifier(capability), sql.Identifier(topology.controller_role)
-            )
+            "SELECT 1 FROM pg_auth_members membership "
+            "JOIN pg_roles parent ON parent.oid=membership.roleid "
+            "JOIN pg_roles member ON member.oid=membership.member "
+            "WHERE parent.rolname=%s AND member.rolname=%s",
+            (capability, topology.controller_role),
         )
+        if cur.fetchone() is None:
+            if not session_is_superuser:
+                raise RuntimeError(
+                    "non-superuser authority installation requires privileged pre-provisioning "
+                    f"of {capability} controller membership"
+                )
+            cur.execute(
+                sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
+                    sql.Identifier(capability), sql.Identifier(topology.controller_role)
+                )
+            )
     return candidate_roles
 
 
@@ -3447,7 +3677,7 @@ def _bootstrap_inventory(cur, *, topology: BootstrapTopology) -> dict[str, Any]:
 
 def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[dict[str, Any], ...]:
     expected_attributes = {
-        topology.database_owner_role: (False, False, False, False, False, False, False),
+        topology.database_owner_role: (True, False, False, False, False, False, False),
         topology.migrator_role: (False, False, False, False, False, False, False),
         topology.verifier_role: (False, False, False, False, False, False, False),
         topology.controller_role: (True, False, False, False, False, False, False),
@@ -3546,7 +3776,11 @@ def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[d
         raise RuntimeError("bootstrap PUBLIC database privileges remain: " + ", ".join(public_privileges))
     effective = _effective_connect_grantees(cur)
     reconnect = {row["role_name"] for row in effective if row["reconnect_capable"]}
-    expected_reconnect = {topology.controller_role, *topology.infrastructure_superuser_roles}
+    expected_reconnect = {
+        topology.database_owner_role,
+        topology.controller_role,
+        *topology.infrastructure_superuser_roles,
+    }
     if reconnect != expected_reconnect:
         raise RuntimeError(
             "bootstrap reconnect principals are not controller plus break-glass only: "
@@ -3687,7 +3921,7 @@ def bootstrap_database_roles(
 
             cur.execute(
                 sql.SQL(
-                    "CREATE ROLE {} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                    "CREATE ROLE {} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
                 ).format(sql.Identifier(topology.database_owner_role))
             )
             cur.execute(
@@ -3710,6 +3944,14 @@ def bootstrap_database_roles(
             database = sql.Identifier(inventory["database_name"])
             cur.execute(
                 sql.SQL("ALTER DATABASE {} OWNER TO {}").format(database, sql.Identifier(topology.database_owner_role))
+            )
+            cur.execute(
+                sql.SQL(
+                    "GRANT {} TO {} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+                ).format(
+                    sql.Identifier(topology.migrator_role),
+                    sql.Identifier(topology.database_owner_role),
+                )
             )
             cur.execute(sql.SQL("REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE {} FROM PUBLIC").format(database))
             for role_name in topology.retired_admin_roles:
