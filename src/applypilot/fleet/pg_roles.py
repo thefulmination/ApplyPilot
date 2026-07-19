@@ -3020,6 +3020,10 @@ def _install_brain_authority_in_transaction(
         cur.execute(
             sql.SQL("ALTER SCHEMA public OWNER TO {}").format(sql.Identifier(public_owner_before))
         )
+    # ALTER SCHEMA OWNER normalizes away a redundant grant to the temporary
+    # owner. Restore verifier access only after returning ownership, without
+    # retaining CREATE on the schema.
+    cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(migrator))
     cur.execute(
         "SELECT pg_get_userbyid(nspowner) AS owner_name "
         "FROM pg_namespace WHERE nspname='public'"
@@ -4467,6 +4471,11 @@ def _existing_authority_topology_inventory(
     default_acl_dependencies = _retired_default_acl_dependencies(
         cur, retired_admin_roles=topology.retired_admin_roles
     )
+    legacy_capability_memberships = (
+        _existing_capability_memberships(cur, topology=topology)
+        if not require_v7
+        else ()
+    )
     if not require_v7:
         _reject_retired_role_ownership(cur, retired_admin_roles=topology.retired_admin_roles)
         _validate_existing_retired_memberships(
@@ -4506,6 +4515,7 @@ def _existing_authority_topology_inventory(
         "database_owner_before": _row_value(identity, "database_owner", 4),
         "retired_admin_memberships_before": memberships,
         "retired_admin_default_acl_dependencies": default_acl_dependencies,
+        "legacy_capability_memberships_before": legacy_capability_memberships,
         "database_owner_password_present": _role_password_present(
             cur, topology.database_owner_role
         ),
@@ -4689,6 +4699,42 @@ def _verify_existing_provider_membership(cur, *, topology: BootstrapTopology) ->
         raise RuntimeError(f"authority upgrade provider membership mismatch: {rows!r}")
 
 
+def _existing_capability_memberships(
+    cur,
+    *,
+    topology: BootstrapTopology,
+) -> tuple[dict[str, Any], ...]:
+    cur.execute(
+        "SELECT parent.rolname AS parent_role,member.rolname AS member_role,"
+        "grantor.rolname AS grantor_role,membership.admin_option,"
+        "membership.inherit_option,membership.set_option "
+        "FROM pg_auth_members membership JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+        "WHERE parent.rolname=ANY(%s) OR member.rolname=ANY(%s) "
+        "ORDER BY parent.rolname,member.rolname,grantor.rolname",
+        (
+            [topology.migrator_role, topology.verifier_role],
+            [topology.migrator_role, topology.verifier_role],
+        ),
+    )
+    rows = tuple(dict(row) for row in cur.fetchall())
+    infrastructure = set(topology.infrastructure_superuser_roles)
+    unexpected = [
+        row
+        for row in rows
+        if row["parent_role"] not in {topology.migrator_role, topology.verifier_role}
+        or row["member_role"] not in infrastructure
+        or row["grantor_role"] not in infrastructure
+        or bool(row["admin_option"])
+    ]
+    if unexpected:
+        raise RuntimeError(
+            f"unexpected legacy schema capability memberships block authority upgrade: {unexpected!r}"
+        )
+    return rows
+
+
 def _transition_existing_authority_topology(cur, *, topology: BootstrapTopology) -> None:
     # Close the known legacy admin graph first.  Forward rollback intentionally
     # never restores these memberships or elevated/login attributes.
@@ -4711,10 +4757,23 @@ def _transition_existing_authority_topology(cur, *, topology: BootstrapTopology)
         cur.execute(sql.SQL(
             "ALTER ROLE {} {} NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
         ).format(sql.Identifier(role_name), sql.SQL("LOGIN" if login else "NOLOGIN")))
+    _reconcile_role_memberships(cur, role_name=topology.migrator_role)
+    _reconcile_role_memberships(cur, role_name=topology.verifier_role)
+    _reconcile_role_memberships(cur, role_name=topology.database_owner_role)
     _reconcile_exact_controller_membership(cur, controller_role=topology.controller_role)
     cur.execute(sql.SQL(
         "GRANT {} TO {} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
     ).format(sql.Identifier(topology.migrator_role), sql.Identifier(topology.database_owner_role)))
+    _reconcile_role_memberships(
+        cur,
+        role_name=topology.migrator_role,
+        approved_grantee_roles=(topology.database_owner_role,),
+    )
+    _reconcile_role_memberships(
+        cur,
+        role_name=topology.database_owner_role,
+        approved_parent_roles=(topology.migrator_role,),
+    )
     _verify_existing_provider_membership(cur, topology=topology)
 
 

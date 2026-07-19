@@ -729,6 +729,9 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
             ).format(sql.Identifier(legacy_controller)))
             for role_name in ("brain_schema_migrator", "brain_schema_verifier"):
                 root.execute(sql.SQL("CREATE ROLE {} NOLOGIN INHERIT").format(sql.Identifier(role_name)))
+                root.execute(sql.SQL(
+                    "GRANT {} TO postgres WITH ADMIN FALSE, INHERIT TRUE, SET TRUE"
+                ).format(sql.Identifier(role_name)))
             for role_name in ("brain_status_reader", "brain_policy_controller"):
                 root.execute(sql.SQL("CREATE ROLE {} NOLOGIN NOINHERIT").format(sql.Identifier(role_name)))
             root.execute(sql.SQL(
@@ -887,11 +890,21 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
                 (legacy_controller,),
             ).fetchone() == {"rolcanlogin": False, "rolinherit": False, "rolcreatedb": False}
             assert root.execute(
+                "SELECT has_schema_privilege('brain_schema_migrator','public','USAGE') AS allowed"
+            ).fetchone()["allowed"] is True
+            assert root.execute(
                 "SELECT count(*) AS count FROM pg_auth_members membership "
                 "JOIN pg_roles parent ON parent.oid=membership.roleid "
                 "JOIN pg_roles member ON member.oid=membership.member "
                 "WHERE parent.rolname=%s OR member.rolname=%s",
                 (legacy_controller, legacy_controller),
+            ).fetchone()["count"] == 0
+            assert root.execute(
+                "SELECT count(*) AS count FROM pg_auth_members membership "
+                "JOIN pg_roles parent ON parent.oid=membership.roleid "
+                "JOIN pg_roles member ON member.oid=membership.member "
+                "WHERE parent.rolname IN ('brain_schema_migrator','brain_schema_verifier') "
+                "AND member.rolname='postgres'"
             ).fetchone()["count"] == 0
             assert root.execute(
                 "SELECT rolcanlogin,rolinherit,rolpassword IS NOT NULL AS has_password "
