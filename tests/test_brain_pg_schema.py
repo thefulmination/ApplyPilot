@@ -2524,9 +2524,9 @@ def test_policy_import_uses_compiled_artifacts_and_compact_graph_binding(brain_p
             None,
             None,
             HASHES[0],
-            HASHES[1],
-            HASHES[2],
-            HASHES[3],
+            None,
+            None,
+            None,
             '{"models":{"qualificationEvidence":{"weights":[1]}}}',
             None,
             "2026-07-16T00:00:00Z",
@@ -2579,19 +2579,7 @@ def test_policy_import_uses_compiled_artifacts_and_compact_graph_binding(brain_p
         ).fetchall()
         assert bindings == [
             {"artifact_role": "config", "artifact_hash": compiled.artifact("config").sha256},
-            {
-                "artifact_role": "label_snapshot",
-                "artifact_hash": compiled.artifact("label_snapshot").sha256,
-            },
             {"artifact_role": "knowledge_graph", "artifact_hash": HASHES[0]},
-            {
-                "artifact_role": "outcome_snapshot",
-                "artifact_hash": compiled.artifact("outcome_snapshot").sha256,
-            },
-            {
-                "artifact_role": "pairwise_snapshot",
-                "artifact_hash": compiled.artifact("pairwise_snapshot").sha256,
-            },
             {
                 "artifact_role": "qualification_model",
                 "artifact_hash": compiled.artifact("qualification_model").sha256,
