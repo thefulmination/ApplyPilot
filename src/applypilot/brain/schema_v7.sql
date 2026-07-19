@@ -183,6 +183,24 @@ GRANT EXECUTE ON FUNCTION public.brain_snapshot_binding_is_authoritative(
 
 SET ROLE brain_schema_migrator;
 
+CREATE TABLE public.brain_v7_topology_contract (
+    singleton_id smallint NOT NULL,
+    controller_role_oid oid NOT NULL,
+    CONSTRAINT brain_v7_topology_contract_pkey PRIMARY KEY (singleton_id),
+    CONSTRAINT brain_v7_topology_contract_singleton_check CHECK (singleton_id = 1)
+);
+
+REVOKE ALL ON TABLE public.brain_v7_topology_contract FROM PUBLIC;
+GRANT SELECT ON TABLE public.brain_v7_topology_contract TO brain_schema_verifier;
+
+CREATE TRIGGER brain_v7_topology_contract_append_only
+BEFORE UPDATE OR DELETE ON public.brain_v7_topology_contract
+FOR EACH ROW EXECUTE FUNCTION public.brain_reject_mutation();
+
+CREATE TRIGGER brain_v7_topology_contract_append_only_truncate
+BEFORE TRUNCATE ON public.brain_v7_topology_contract
+FOR EACH STATEMENT EXECUTE FUNCTION public.brain_reject_mutation();
+
 CREATE OR REPLACE FUNCTION public.brain_check_policy_lifecycle() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE required_roles CONSTANT TEXT[] := ARRAY[

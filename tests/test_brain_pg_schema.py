@@ -606,6 +606,9 @@ def test_current_v6_database_upgrades_to_v7_without_rewriting_v6_ledger(brain_pg
             "SELECT migration_checksum FROM public.brain_schema_versions WHERE version=6"
         ).fetchone()
         assert v6_row["migration_checksum"] == schema._CURRENT_V6_CHECKSUM
+        connection.commit()
+        with pytest.raises(RuntimeError, match="first installation requires expected_controller_role"):
+            schema.ensure_brain_schema_v7(connection)
         topology = pg_roles.BootstrapTopology(
             database_owner_role="postgres",
             controller_role="brain_controller_test_login",
@@ -1023,6 +1026,24 @@ def test_v7_verifier_rejects_membership_option_grantor_and_multiplicity_drift(br
         ]
         connection.commit()
 
+        with pytest.raises(RuntimeError, match="controller (membership|topology)"):
+            with connection.transaction():
+                connection.execute(
+                    "CREATE ROLE brain_v7_wrong_controller LOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                connection.execute(
+                    "REVOKE brain_policy_controller FROM brain_controller_test_login "
+                    "GRANTED BY postgres RESTRICT"
+                )
+                connection.execute(
+                    "GRANT brain_policy_controller TO brain_v7_wrong_controller "
+                    "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
         with pytest.raises(RuntimeError, match="controller membership"):
             with connection.transaction():
                 connection.execute("CREATE ROLE brain_v7_controller_grantor SUPERUSER NOLOGIN")
@@ -1058,6 +1079,229 @@ def test_v7_verifier_rejects_membership_option_grantor_and_multiplicity_drift(br
                 with connection.cursor() as cursor:
                     schema.verify_brain_schema_v7_in_transaction(cursor)
         connection.rollback()
+
+
+def test_v7_controller_topology_is_oid_bound_immutable_and_closed(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        persisted_oid = connection.execute(
+            "SELECT controller_role_oid FROM brain_v7_topology_contract WHERE singleton_id=1"
+        ).fetchone()["controller_role_oid"]
+        connection.commit()
+
+        with pytest.raises(RuntimeError, match="invalid version 7 contract"):
+            with connection.transaction():
+                connection.execute("SET LOCAL session_replication_role=replica")
+                connection.execute(
+                    "UPDATE brain_schema_versions SET migration_checksum=%s WHERE version=7",
+                    ("c1b8143bb676201d62dd4ed6da74a70034c9b83af3c40cea27c0e93e2b28026a",),
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        for statement in (
+            "UPDATE brain_v7_topology_contract SET controller_role_oid=controller_role_oid",
+            "DELETE FROM brain_v7_topology_contract",
+            "TRUNCATE brain_v7_topology_contract",
+        ):
+            with pytest.raises(
+                psycopg.errors.ObjectNotInPrerequisiteState,
+                match="append-only",
+            ):
+                with connection.transaction():
+                    connection.execute(statement)
+            connection.rollback()
+
+        for statement in (
+            "ALTER ROLE brain_controller_test_login INHERIT",
+            "ALTER ROLE brain_controller_test_login CREATEROLE",
+        ):
+            with pytest.raises(RuntimeError, match="controller membership"):
+                with connection.transaction():
+                    connection.execute(statement)
+                    with connection.cursor() as cursor:
+                        schema.verify_brain_schema_v7_in_transaction(cursor)
+            connection.rollback()
+
+        with pytest.raises(RuntimeError, match="controller membership closure"):
+            with connection.transaction():
+                connection.execute(
+                    "CREATE ROLE brain_v7_controller_attacker LOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                connection.execute(
+                    "GRANT brain_controller_test_login TO brain_v7_controller_attacker"
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        with pytest.raises(RuntimeError, match="topology ACL"):
+            with connection.transaction():
+                connection.execute(
+                    "GRANT UPDATE ON brain_v7_topology_contract "
+                    "TO brain_artifact_authority_writer"
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        with connection.transaction():
+            connection.execute(
+                "ALTER ROLE brain_controller_test_login RENAME TO brain_controller_oid_renamed"
+            )
+            with connection.cursor() as cursor:
+                schema.verify_brain_schema_v7_in_transaction(cursor)
+            connection.execute(
+                "ALTER ROLE brain_controller_oid_renamed RENAME TO brain_controller_test_login"
+            )
+
+        with pytest.raises(RuntimeError, match="controller (membership|topology)"):
+            with connection.transaction():
+                connection.execute(
+                    "REVOKE brain_policy_controller FROM brain_controller_test_login "
+                    "GRANTED BY postgres RESTRICT"
+                )
+                connection.execute("DROP ROLE brain_controller_test_login")
+                connection.execute(
+                    "CREATE ROLE brain_controller_test_login LOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                connection.execute(
+                    "GRANT brain_policy_controller TO brain_controller_test_login "
+                    "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
+                )
+                assert connection.execute(
+                    "SELECT 'brain_controller_test_login'::regrole::oid AS oid"
+                ).fetchone()["oid"] != persisted_oid
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        with pytest.raises(RuntimeError, match="controller (membership|topology)"):
+            with connection.transaction():
+                connection.execute(
+                    "CREATE ROLE brain_v7_wrong_topology LOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                wrong_oid = connection.execute(
+                    "SELECT 'brain_v7_wrong_topology'::regrole::oid AS oid"
+                ).fetchone()["oid"]
+                connection.execute("SET LOCAL session_replication_role=replica")
+                connection.execute(
+                    "UPDATE brain_v7_topology_contract SET controller_role_oid=%s",
+                    (wrong_oid,),
+                )
+                connection.execute("SET LOCAL session_replication_role=origin")
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+        schema.verify_brain_schema_v7(connection)
+
+
+def test_v7_existing_install_rejects_supplied_controller_topology_before_repair(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        connection.execute(
+            "CREATE ROLE brain_v7_supplied_wrong_controller LOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        connection.commit()
+        before_topology = connection.execute(
+            "SELECT singleton_id,controller_role_oid FROM brain_v7_topology_contract"
+        ).fetchall()
+        before_memberships = connection.execute(
+            "SELECT member,grantor,admin_option,inherit_option,set_option "
+            "FROM pg_auth_members WHERE roleid='brain_policy_controller'::regrole"
+        ).fetchall()
+        topology = pg_roles.BootstrapTopology(
+            database_owner_role="postgres",
+            controller_role="brain_v7_supplied_wrong_controller",
+            verifier_role="brain_schema_verifier",
+            migrator_role="brain_schema_migrator",
+            retired_admin_roles=(),
+            infrastructure_superuser_roles=("postgres",),
+        )
+        with pytest.raises(RuntimeError, match="persisted.*controller identity mismatch"):
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    pg_roles._install_brain_authority_in_transaction(cursor, topology=topology)
+        connection.rollback()
+        assert connection.execute(
+            "SELECT singleton_id,controller_role_oid FROM brain_v7_topology_contract"
+        ).fetchall() == before_topology
+        assert connection.execute(
+            "SELECT member,grantor,admin_option,inherit_option,set_option "
+            "FROM pg_auth_members WHERE roleid='brain_policy_controller'::regrole"
+        ).fetchall() == before_memberships
+        connection.commit()
+        schema.ensure_brain_schema_v7(
+            connection,
+            expected_controller_role="brain_controller_test_login",
+        )
+        with pytest.raises(RuntimeError, match="supplied controller topology mismatch"):
+            schema.ensure_brain_schema_v7(
+                connection,
+                expected_controller_role="brain_v7_supplied_wrong_controller",
+            )
+        schema.verify_brain_schema_v7(connection)
+
+
+def test_v7_topology_relation_rejects_structural_and_default_acl_drift(brain_pg) -> None:
+    with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
+        _install_v7_authority(connection)
+        controller_oid = connection.execute(
+            "SELECT controller_role_oid FROM brain_v7_topology_contract"
+        ).fetchone()["controller_role_oid"]
+        connection.commit()
+
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with connection.transaction():
+                connection.execute(
+                    "INSERT INTO brain_v7_topology_contract(singleton_id,controller_role_oid) "
+                    "VALUES (2,%s)",
+                    (controller_oid,),
+                )
+        connection.rollback()
+
+        mutations = (
+            ("ALTER TABLE brain_v7_topology_contract OWNER TO postgres", "topology relation"),
+            (
+                "ALTER TABLE brain_v7_topology_contract "
+                "DROP CONSTRAINT brain_v7_topology_contract_singleton_check",
+                "topology constraint",
+            ),
+            (
+                "DROP TRIGGER brain_v7_topology_contract_append_only "
+                "ON brain_v7_topology_contract",
+                "topology trigger",
+            ),
+            (
+                "ALTER TABLE brain_v7_topology_contract "
+                "ALTER COLUMN controller_role_oid DROP NOT NULL",
+                "topology column",
+            ),
+        )
+        for statement, message in mutations:
+            with pytest.raises(RuntimeError, match=message):
+                with connection.transaction():
+                    connection.execute(statement)
+                    with connection.cursor() as cursor:
+                        schema.verify_brain_schema_v7_in_transaction(cursor)
+            connection.rollback()
+
+        with pytest.raises(RuntimeError, match="authority default ACL leakage"):
+            with connection.transaction():
+                connection.execute(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE brain_schema_migrator IN SCHEMA public "
+                    "GRANT UPDATE ON TABLES TO brain_artifact_authority_writer"
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+        schema.verify_brain_schema_v7(connection)
+
 
 def test_v7_verifier_rejects_public_and_arbitrary_inherited_authority_acls(brain_pg) -> None:
     with psycopg.connect(brain_pg, row_factory=dict_row) as connection:

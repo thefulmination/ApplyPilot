@@ -31,10 +31,10 @@ _MIGRATION_V7_NAME = "brain schema v7 replay-safe artifact authority"
 _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e2576f1267d7"
 _EXPECTED_V5_CHECKSUM = "52d1726bb13df54591fcd6343884ec8f6f7d18ab7fbf74b4dc33ba509cb0e559"
 _EXPECTED_V6_CHECKSUM = "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
-_EXPECTED_V7_CHECKSUM = "c1b8143bb676201d62dd4ed6da74a70034c9b83af3c40cea27c0e93e2b28026a"
+_EXPECTED_V7_CHECKSUM = "d76b037dee1bfd285026ab2503b16be2a39b0c6726eac80a099e3f825ccdfc9f"
 _EXPECTED_V5_CATALOG_HASH = "87ed08bc34cc36e12d41fc44bdf4da1771bb67a609eabff2a3c39e0286e2b6a1"
 _EXPECTED_V6_CATALOG_HASH = "3670c106085e1ae081515cbc60d7ff2ae78b9f1b4f40345d60cdfe9c26f4a143"
-_EXPECTED_V7_CATALOG_HASH = "f50273c3f86ab01f0c6a78c2628cc5612c94ce9957137910e1f97f229a3a5177"
+_EXPECTED_V7_CATALOG_HASH = "7d16206b92ff64ab7be2e80e49a0f5ad73ee95624e6763e03af8f5408b729b5b"
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
 _CURRENT_V5_CATALOG_HASH = "b9ac5d2ae418198d67eb52c8d9dde173448183ba5dde69118157257bf9c2e27a"
@@ -79,6 +79,7 @@ _V5_RELATIONS = {
     "brain_factual_snapshot_approval_bindings",
     "brain_v5_candidate_publication_events",
 }
+_V7_RELATIONS = {"brain_v7_topology_contract"}
 _V5_CATALOG_RELATIONS = _V5_RELATIONS | {
     "brain_factual_contradiction_state",
     "brain_graph_approval_consumptions",
@@ -1093,13 +1094,18 @@ def _acquire_xact_lock(cur, timeout_seconds: float) -> None:
         time.sleep(0.05)
 
 
-def _catalog_contract_hash(cur, *, include_v5: bool = False) -> str:
+def _catalog_contract_hash(
+    cur,
+    *,
+    include_v5: bool = False,
+    include_v7: bool = False,
+) -> str:
     # pg_get_* output is search_path-sensitive; pin it so the immutable catalog
     # fingerprint reflects catalog state rather than a prior helper's session setting.
     cur.execute("SELECT current_setting('search_path') AS current_search_path")
     prior_search_path = cur.fetchone()["current_search_path"]
     cur.execute("SET LOCAL search_path=pg_catalog, public")
-    relations = list(_RELATIONS)
+    relations = list(_RELATIONS) + (sorted(_V7_RELATIONS) if include_v7 else [])
     cur.execute(
         "SELECT n.nspname AS schema_name,c.relname,a.attnum,a.attname,"
         "format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull,a.attidentity,a.attgenerated,"
@@ -1584,6 +1590,8 @@ def _verify_contract(cur) -> None:
     allowed_public_relations = set(_RELATIONS) | _V4_RELATIONS | set(children)
     if len(versions) >= 5:
         allowed_public_relations |= _V5_RELATIONS
+    if len(versions) >= 7:
+        allowed_public_relations |= _V7_RELATIONS
     cur.execute(
         "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
         "WHERE n.nspname='public' AND left(c.relname,6)='brain_' AND c.relkind IN ('r','p')"
@@ -3509,9 +3517,137 @@ def _verify_v7_acl_contract(cur) -> None:
             + ", ".join(sorted(invalid_function_acls))
         )
 
-def _verify_v7_controller_membership_contract(cur) -> None:
+def _verify_v7_topology_relation_contract(cur) -> int:
     cur.execute(
-        "SELECT member.rolname AS member_role,grantor.oid AS grantor_oid,"
+        "SELECT c.relkind,owner.rolname AS owner_name "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "JOIN pg_roles owner ON owner.oid=c.relowner "
+        "WHERE n.nspname='public' AND c.relname='brain_v7_topology_contract'"
+    )
+    relation = cur.fetchone()
+    if relation != {"relkind": "r", "owner_name": _MIGRATION_ROLE}:
+        raise RuntimeError(f"brain schema v7 topology relation mismatch: {relation!r}")
+    cur.execute(
+        "SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS data_type,"
+        "a.attnotnull,pg_get_expr(d.adbin,d.adrelid,true) AS default_expr "
+        "FROM pg_attribute a LEFT JOIN pg_attrdef d "
+        "ON d.adrelid=a.attrelid AND d.adnum=a.attnum "
+        "WHERE a.attrelid='public.brain_v7_topology_contract'::regclass "
+        "AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"
+    )
+    if cur.fetchall() != [
+        {
+            "attname": "singleton_id",
+            "data_type": "smallint",
+            "attnotnull": True,
+            "default_expr": None,
+        },
+        {
+            "attname": "controller_role_oid",
+            "data_type": "oid",
+            "attnotnull": True,
+            "default_expr": None,
+        },
+    ]:
+        raise RuntimeError("brain schema v7 topology column contract mismatch")
+    cur.execute(
+        "SELECT conname,contype,convalidated,pg_get_constraintdef(oid,true) AS definition "
+        "FROM pg_constraint WHERE conrelid='public.brain_v7_topology_contract'::regclass "
+        "ORDER BY conname"
+    )
+    constraints = cur.fetchall()
+    if constraints != [
+        {
+            "conname": "brain_v7_topology_contract_pkey",
+            "contype": "p",
+            "convalidated": True,
+            "definition": "PRIMARY KEY (singleton_id)",
+        },
+        {
+            "conname": "brain_v7_topology_contract_singleton_check",
+            "contype": "c",
+            "convalidated": True,
+            "definition": "CHECK (singleton_id = 1)",
+        },
+    ]:
+        raise RuntimeError(
+            f"brain schema v7 topology constraint contract mismatch: {constraints!r}"
+        )
+    cur.execute(
+        "SELECT tgname,tgenabled,tgtype,p.proname AS function_name "
+        "FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid "
+        "WHERE t.tgrelid='public.brain_v7_topology_contract'::regclass "
+        "AND NOT t.tgisinternal ORDER BY tgname"
+    )
+    if cur.fetchall() != [
+        {
+            "tgname": "brain_v7_topology_contract_append_only",
+            "tgenabled": "O",
+            "tgtype": 27,
+            "function_name": "brain_reject_mutation",
+        },
+        {
+            "tgname": "brain_v7_topology_contract_append_only_truncate",
+            "tgenabled": "O",
+            "tgtype": 34,
+            "function_name": "brain_reject_mutation",
+        },
+    ]:
+        raise RuntimeError("brain schema v7 topology trigger contract mismatch")
+    cur.execute(
+        "SELECT COALESCE(grantee.rolname,'PUBLIC') AS grantee,acl.privilege_type "
+        "FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) acl "
+        "LEFT JOIN pg_roles grantee ON grantee.oid=acl.grantee "
+        "WHERE c.oid='public.brain_v7_topology_contract'::regclass "
+        "AND acl.grantee<>c.relowner ORDER BY grantee,acl.privilege_type"
+    )
+    topology_acls = cur.fetchall()
+    if topology_acls != [{"grantee": _VERIFIER_ROLE, "privilege_type": "SELECT"}]:
+        raise RuntimeError(
+            f"brain schema v7 topology ACL contract mismatch: {topology_acls!r}"
+        )
+    cur.execute(
+        "SELECT singleton_id,controller_role_oid FROM public.brain_v7_topology_contract"
+    )
+    topology_rows = cur.fetchall()
+    if len(topology_rows) != 1 or topology_rows[0]["singleton_id"] != 1:
+        raise RuntimeError(
+            f"brain schema v7 topology singleton contract mismatch: {topology_rows!r}"
+        )
+    return topology_rows[0]["controller_role_oid"]
+
+
+def _resolve_safe_v7_controller_role_oid(cur, controller_role: str) -> int:
+    if not controller_role:
+        raise RuntimeError("brain schema v7 requires an expected controller role")
+    cur.execute(
+        "SELECT oid,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
+        "rolreplication,rolbypassrls FROM pg_roles WHERE rolname=%s",
+        (controller_role,),
+    )
+    role = cur.fetchone()
+    if not (
+        role is not None
+        and role["rolcanlogin"] is True
+        and role["rolinherit"] is False
+        and role["rolsuper"] is False
+        and role["rolcreatedb"] is False
+        and role["rolcreaterole"] is False
+        and role["rolreplication"] is False
+        and role["rolbypassrls"] is False
+    ):
+        raise RuntimeError(
+            f"brain schema v7 expected controller role attributes mismatch: {controller_role!r}"
+        )
+    return role["oid"]
+
+
+def _verify_v7_controller_membership_oid(cur, controller_role_oid: int) -> None:
+    cur.execute(
+        "SELECT member.oid AS member_oid,member.rolname AS member_role,"
+        "member.rolcanlogin,member.rolinherit,member.rolsuper,member.rolcreatedb,"
+        "member.rolcreaterole,member.rolreplication,member.rolbypassrls,"
+        "grantor.oid AS grantor_oid,"
         "grantor.rolsuper AS grantor_is_superuser,membership.admin_option,"
         "membership.inherit_option,membership.set_option "
         "FROM pg_auth_members membership "
@@ -3525,6 +3661,14 @@ def _verify_v7_controller_membership_contract(cur) -> None:
     rows = cur.fetchall()
     exact = (
         len(rows) == 1
+        and rows[0]["member_oid"] == controller_role_oid
+        and rows[0]["rolcanlogin"] is True
+        and rows[0]["rolinherit"] is False
+        and rows[0]["rolsuper"] is False
+        and rows[0]["rolcreatedb"] is False
+        and rows[0]["rolcreaterole"] is False
+        and rows[0]["rolreplication"] is False
+        and rows[0]["rolbypassrls"] is False
         and rows[0]["grantor_oid"] == 10
         and rows[0]["grantor_is_superuser"] is True
         and rows[0]["admin_option"] is False
@@ -3535,6 +3679,54 @@ def _verify_v7_controller_membership_contract(cur) -> None:
         raise RuntimeError(
             f"brain schema v7 exact controller membership contract mismatch: {rows!r}"
         )
+    cur.execute(
+        "WITH RECURSIVE closure(member_oid,path) AS ("
+        "SELECT membership.member,ARRAY[parent.oid,membership.member] "
+        "FROM pg_roles parent JOIN pg_auth_members membership "
+        "ON membership.roleid=parent.oid "
+        "WHERE parent.rolname=%s UNION ALL "
+        "SELECT membership.member,closure.path||membership.member "
+        "FROM closure JOIN pg_auth_members membership "
+        "ON membership.roleid=closure.member_oid "
+        "WHERE NOT membership.member=ANY(closure.path)) "
+        "SELECT DISTINCT member_oid FROM closure ORDER BY member_oid",
+        (_POLICY_CONTROLLER_ROLE,),
+    )
+    closure = [row["member_oid"] for row in cur.fetchall()]
+    if closure != [controller_role_oid]:
+        raise RuntimeError(
+            f"brain schema v7 controller membership closure mismatch: {closure!r}"
+        )
+
+
+def _verify_v7_controller_membership_contract(cur) -> None:
+    controller_role_oid = _verify_v7_topology_relation_contract(cur)
+    _verify_v7_controller_membership_oid(cur, controller_role_oid)
+
+
+def _expected_v7_controller_role_oid(cur, controller_role: str) -> int:
+    controller_role_oid = _resolve_safe_v7_controller_role_oid(cur, controller_role)
+    _verify_v7_controller_membership_oid(cur, controller_role_oid)
+    return controller_role_oid
+
+
+def _require_existing_v7_controller_identity(cur, controller_role: str) -> int:
+    controller_role_oid = _resolve_safe_v7_controller_role_oid(cur, controller_role)
+    cur.execute(
+        "SELECT singleton_id,controller_role_oid "
+        "FROM public.brain_v7_topology_contract ORDER BY singleton_id"
+    )
+    rows = cur.fetchall()
+    if not (
+        len(rows) == 1
+        and rows[0]["singleton_id"] == 1
+        and rows[0]["controller_role_oid"] == controller_role_oid
+    ):
+        raise RuntimeError(
+            "brain schema v7 supplied controller topology mismatch: "
+            f"expected role {controller_role!r} OID {controller_role_oid}, got {rows!r}"
+        )
+    return controller_role_oid
 
 
 def _verify_v7_inherited_contracts(cur) -> None:
@@ -3548,12 +3740,12 @@ def _verify_v7_inherited_contracts(cur) -> None:
         "JOIN pg_namespace n ON n.oid=c.relnamespace "
         "JOIN pg_roles owner ON owner.oid=c.relowner "
         "WHERE n.nspname='public' AND c.relname=ANY(%s)",
-        (list(_RELATIONS),),
+        (list(_RELATIONS) + sorted(_V7_RELATIONS),),
     )
     inherited_owners = {row["relname"]: row["owner_name"] for row in cur.fetchall()}
     invalid_owners = {
         name: inherited_owners.get(name)
-        for name in _RELATIONS
+        for name in [*list(_RELATIONS), *sorted(_V7_RELATIONS)]
         if inherited_owners.get(name) != _MIGRATION_ROLE
     }
     if invalid_owners:
@@ -3562,7 +3754,7 @@ def _verify_v7_inherited_contracts(cur) -> None:
         )
 
 def _verify_v7_contract(cur) -> None:
-    actual_catalog_hash = _catalog_contract_hash(cur, include_v5=True)
+    actual_catalog_hash = _catalog_contract_hash(cur, include_v5=True, include_v7=True)
     if actual_catalog_hash != _EXPECTED_V7_CATALOG_HASH:
         raise RuntimeError(
             "brain schema v7 catalog contract hash mismatch: "
@@ -3753,13 +3945,27 @@ def verify_brain_schema_v7(conn) -> None:
             verify_brain_schema_v7_in_transaction(cur)
 
 
-def ensure_brain_schema_v7_in_transaction(cur, *, lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS) -> None:
+def ensure_brain_schema_v7_in_transaction(
+    cur,
+    *,
+    lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
+    expected_controller_role: str | None = None,
+) -> None:
     _assert_current_schema_v6_bytes_immutable()
     _assert_schema_v7_bytes_immutable()
     versions = _version_rows(cur)
     if len(versions) == 7:
+        if expected_controller_role is not None:
+            _require_existing_v7_controller_identity(cur, expected_controller_role)
         verify_brain_schema_v7_in_transaction(cur)
         return
+    if expected_controller_role is None:
+        raise RuntimeError(
+            "brain schema v7 first installation requires expected_controller_role"
+        )
+    expected_controller_role_oid = _resolve_safe_v7_controller_role_oid(
+        cur, expected_controller_role
+    )
     if len(versions) < 5:
         ensure_brain_schema_v5_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
     migration_identity = _activate_migration_identity(cur)
@@ -3775,8 +3981,16 @@ def ensure_brain_schema_v7_in_transaction(cur, *, lock_timeout_seconds: float = 
         versions = [*versions, {"version": 6}]
     if len(versions) != 6:
         raise RuntimeError("brain schema v7 requires contiguous V1-V6 ledger")
+    expected_controller_role_oid = _expected_v7_controller_role_oid(
+        cur, expected_controller_role
+    )
     cur.execute("GRANT CREATE ON SCHEMA public TO brain_artifact_authority_owner")
     cur.execute(_schema_v7_bytes().decode("utf-8"))
+    cur.execute(
+        "INSERT INTO public.brain_v7_topology_contract "
+        "(singleton_id,controller_role_oid) VALUES (1,%s)",
+        (expected_controller_role_oid,),
+    )
     cur.execute("REVOKE CREATE ON SCHEMA public FROM brain_artifact_authority_owner")
     cur.execute(
         "INSERT INTO public.brain_schema_versions "
@@ -3786,11 +4000,20 @@ def ensure_brain_schema_v7_in_transaction(cur, *, lock_timeout_seconds: float = 
     verify_brain_schema_v7_in_transaction(cur)
 
 
-def ensure_brain_schema_v7(conn, *, lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS) -> None:
+def ensure_brain_schema_v7(
+    conn,
+    *,
+    lock_timeout_seconds: float = _LOCK_TIMEOUT_SECONDS,
+    expected_controller_role: str | None = None,
+) -> None:
     _require_idle(conn)
     with conn.transaction():
         with conn.cursor() as cur:
-            ensure_brain_schema_v7_in_transaction(cur, lock_timeout_seconds=lock_timeout_seconds)
+            ensure_brain_schema_v7_in_transaction(
+                cur,
+                lock_timeout_seconds=lock_timeout_seconds,
+                expected_controller_role=expected_controller_role,
+            )
 
 
 ensure_schema_v4 = ensure_brain_schema_v4

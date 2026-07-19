@@ -2560,7 +2560,10 @@ def _verify_artifact_authority_membership_closure(
 
 def _controller_membership_rows(cur) -> list[dict[str, Any]]:
     cur.execute(
-        "SELECT member.rolname AS member_role,grantor.oid AS grantor_oid,"
+        "SELECT member.oid AS member_oid,member.rolname AS member_role,"
+        "member.rolcanlogin,member.rolinherit,member.rolsuper,member.rolcreatedb,"
+        "member.rolcreaterole,member.rolreplication,member.rolbypassrls,"
+        "grantor.oid AS grantor_oid,"
         "grantor.rolname AS grantor_role,grantor.rolsuper AS grantor_is_superuser,"
         "membership.admin_option,membership.inherit_option,membership.set_option "
         "FROM pg_auth_members membership "
@@ -2581,20 +2584,72 @@ def _controller_membership_is_exact(
     return (
         len(rows) == 1
         and _row_value(rows[0], "member_role") == controller_role
-        and _row_value(rows[0], "grantor_oid", 1) == 10
-        and bool(_row_value(rows[0], "grantor_is_superuser", 3))
-        and not bool(_row_value(rows[0], "admin_option", 4))
-        and not bool(_row_value(rows[0], "inherit_option", 5))
-        and bool(_row_value(rows[0], "set_option", 6))
+        and bool(_row_value(rows[0], "rolcanlogin"))
+        and not bool(_row_value(rows[0], "rolinherit"))
+        and not bool(_row_value(rows[0], "rolsuper"))
+        and not bool(_row_value(rows[0], "rolcreatedb"))
+        and not bool(_row_value(rows[0], "rolcreaterole"))
+        and not bool(_row_value(rows[0], "rolreplication"))
+        and not bool(_row_value(rows[0], "rolbypassrls"))
+        and _row_value(rows[0], "grantor_oid") == 10
+        and bool(_row_value(rows[0], "grantor_is_superuser"))
+        and not bool(_row_value(rows[0], "admin_option"))
+        and not bool(_row_value(rows[0], "inherit_option"))
+        and bool(_row_value(rows[0], "set_option"))
     )
+
+
+def _controller_membership_closure(cur) -> list[int]:
+    cur.execute(
+        "WITH RECURSIVE closure(member_oid,path) AS ("
+        "SELECT membership.member,ARRAY[parent.oid,membership.member] "
+        "FROM pg_roles parent JOIN pg_auth_members membership "
+        "ON membership.roleid=parent.oid WHERE parent.rolname='brain_policy_controller' "
+        "UNION ALL SELECT membership.member,closure.path||membership.member "
+        "FROM closure JOIN pg_auth_members membership "
+        "ON membership.roleid=closure.member_oid "
+        "WHERE NOT membership.member=ANY(closure.path)) "
+        "SELECT DISTINCT member_oid FROM closure ORDER BY member_oid"
+    )
+    return [_row_value(row, "member_oid") for row in cur.fetchall()]
 
 
 def _require_exact_controller_membership(cur, *, controller_role: str) -> None:
     rows = _controller_membership_rows(cur)
-    if not _controller_membership_is_exact(rows, controller_role=controller_role):
+    exact = _controller_membership_is_exact(rows, controller_role=controller_role)
+    closure = _controller_membership_closure(cur)
+    if not exact or closure != [_row_value(rows[0], "member_oid") if exact else None]:
         raise RuntimeError(
             "exact brain_policy_controller membership contract mismatch: "
-            f"expected OID 10-granted {controller_role!r}, got {rows!r}"
+            f"expected sole safe OID 10-granted {controller_role!r}, "
+            f"got rows={rows!r}, closure={closure!r}"
+        )
+
+
+def _require_persisted_controller_identity_if_v7(cur, *, controller_role: str) -> None:
+    cur.execute("SELECT to_regclass('public.brain_v7_topology_contract') AS relation")
+    if _row_value(cur.fetchone(), "relation") is None:
+        return
+    cur.execute("SELECT oid FROM pg_roles WHERE rolname=%s", (controller_role,))
+    expected = cur.fetchone()
+    if expected is None:
+        raise RuntimeError(
+            f"persisted brain schema v7 controller identity mismatch: missing {controller_role!r}"
+        )
+    expected_oid = _row_value(expected, "oid")
+    cur.execute(
+        "SELECT singleton_id,controller_role_oid "
+        "FROM public.brain_v7_topology_contract ORDER BY singleton_id"
+    )
+    rows = cur.fetchall()
+    if not (
+        len(rows) == 1
+        and _row_value(rows[0], "singleton_id") == 1
+        and _row_value(rows[0], "controller_role_oid", 1) == expected_oid
+    ):
+        raise RuntimeError(
+            "persisted brain schema v7 controller identity mismatch: "
+            f"expected {controller_role!r} OID {expected_oid}, got {rows!r}"
         )
 
 
@@ -2603,6 +2658,15 @@ def _reconcile_exact_controller_membership(cur, *, controller_role: str) -> None
     bootstrap_role = cur.fetchone()
     if bootstrap_role is None or not bool(_row_value(bootstrap_role, "rolsuper", 1)):
         raise RuntimeError("controller membership grantor OID 10 must remain a superuser")
+    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (controller_role,))
+    if cur.fetchone() is None:
+        raise RuntimeError(f"controller role does not exist: {controller_role!r}")
+    cur.execute(
+        sql.SQL(
+            "ALTER ROLE {} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS"
+        ).format(sql.Identifier(controller_role))
+    )
     rows = _controller_membership_rows(cur)
     if _controller_membership_is_exact(rows, controller_role=controller_role):
         return
@@ -2740,6 +2804,11 @@ def _install_brain_authority_in_transaction(
     migrator = sql.Identifier(topology.migrator_role)
     session_is_superuser = bool(_row_value(identity, "session_is_superuser", 2))
     database_owner_descendant = None
+
+    _require_persisted_controller_identity_if_v7(
+        cur,
+        controller_role=topology.controller_role,
+    )
 
     if session_is_superuser:
         cur.execute(
@@ -2933,7 +3002,10 @@ def _install_brain_authority_in_transaction(
             controller_role=topology.controller_role,
         )
     cur.execute(sql.SQL("SET LOCAL ROLE {}").format(migrator))
-    ensure_brain_schema_v7_in_transaction(cur)
+    ensure_brain_schema_v7_in_transaction(
+        cur,
+        expected_controller_role=topology.controller_role,
+    )
     cur.execute("RESET ROLE")
     if public_owner_changed:
         cur.execute(
@@ -3782,6 +3854,10 @@ def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[d
             "SELECT EXISTS(SELECT 1 FROM public.brain_schema_versions WHERE version=7) AS installed"
         )
         if bool(_row_value(cur.fetchone(), "installed")):
+            _require_persisted_controller_identity_if_v7(
+                cur,
+                controller_role=topology.controller_role,
+            )
             _require_exact_controller_membership(
                 cur,
                 controller_role=topology.controller_role,
