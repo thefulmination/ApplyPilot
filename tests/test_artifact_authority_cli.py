@@ -529,6 +529,8 @@ def test_dry_run_ignores_hostile_database_environment_and_opens_no_database(
     for name, payload in files.items():
         paths[name] = tmp_path / name
         paths[name].write_bytes(payload)
+    if os.name != "nt":
+        paths["hmac-key"].chmod(0o600)
     if os.name == "nt":
         _set_windows_secret_acl(cli, paths["hmac-key"], broad=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql://hostile.invalid/production")

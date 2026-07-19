@@ -137,6 +137,19 @@ def test_python_ci_installs_jobspy_and_excludes_windows_only_suite() -> None:
     assert "--ignore=tests/test_fleet_machine_blackout_scripts.py" in test_command
 
 
+def test_python_ci_marks_service_postgres_as_disposable_before_tests() -> None:
+    job = _load_workflow()["jobs"]["test"]
+    steps = {step["name"]: step for step in job["steps"]}
+    marker = steps["Mark disposable PostgreSQL service"]
+    marker_script = marker["run"]
+    assert "applypilot:disposable-postgres-test-database:v1" in marker_script
+    assert "CREATE ROLE applypilot_disposable_cluster_marker" in marker_script
+    assert "applypilot:disposable-postgres-test-cluster:v1:" in marker_script
+    test_environment = steps["Test"]["env"]
+    assert test_environment["APPLYPILOT_PGTEST_DISPOSABLE"] == "1"
+    assert test_environment["APPLYPILOT_PGTEST_CLUSTER_MARKER"].startswith("ci-")
+
+
 def test_python_ci_matrix_matches_declared_support() -> None:
     job = _load_workflow()["jobs"]["test"]
     assert job["strategy"]["matrix"]["python-version"] == ["3.11", "3.12"]

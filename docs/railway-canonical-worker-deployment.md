@@ -266,7 +266,7 @@ pool; workers continue to receive and reuse a direct connection.
    `python -c "from applypilot.fleet.software_version import current_sw_version; print(current_sw_version())"`.
 4. Set `APPLYPILOT_RELEASE_VERSION` to that exact value and pin the same value in
    Postgres.
-5. Apply fleet migrations from the owner/migration service, including
+5. Apply schema migrations from the owner/migration service, including
    `20260717_002_lane_specific_canary_pins`, and verify the fleet ledger. Then
    install and verify canonical brain schema v3. The worker has no
    schema-authority role and exits if required fleet objects are absent.

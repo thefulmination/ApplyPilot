@@ -515,8 +515,8 @@ def test_rollback_rejects_hba_restore_on_windows_before_database_access(
         raise AssertionError("database inputs must not be opened")
 
     monkeypatch.setattr(module, "_verified_inputs", unexpected_inputs)
-    monkeypatch.setattr(module.os, "name", "nt")
-    assert module._hba_restore_supported() is False
+    assert module._hba_restore_supported(platform_name="nt") is False
+    monkeypatch.setattr(module, "_hba_restore_supported", lambda: False)
     monkeypatch.setattr(
         sys,
         "argv",

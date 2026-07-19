@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hashlib
 import hmac
 import json
@@ -119,6 +120,9 @@ _PURPOSE_ENV = {
     "railway-topology": "APPLYPILOT_RAILWAY_TOPOLOGY_ATTESTATION",
     "nonrelease-claims": "APPLYPILOT_NONRELEASE_ATTESTATION",
 }
+_POSIX_DIR_FD_SUPPORTED = os.name == "posix" and all(
+    function in os.supports_dir_fd for function in (os.open, os.link, os.unlink)
+)
 
 
 def nonempty_string(value: Any) -> bool:
@@ -429,8 +433,7 @@ def reject_symlink_components(path: Path) -> None:
 
 
 def _posix_parent_descriptor(path: Path) -> tuple[int, str]:
-    required = (os.open, os.link, os.unlink)
-    if os.name != "posix" or any(function not in os.supports_dir_fd for function in required):
+    if not _POSIX_DIR_FD_SUPPORTED:
         raise RuntimeError("platform lacks descriptor-relative release-evidence publication")
     absolute = Path(os.path.abspath(path))
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -440,7 +443,14 @@ def _posix_parent_descriptor(path: Path) -> tuple[int, str]:
     descriptor = os.open(absolute.anchor, directory_flags)
     try:
         for component in absolute.parent.parts[1:]:
-            child = os.open(component, directory_flags | nofollow, dir_fd=descriptor)
+            try:
+                child = os.open(component, directory_flags | nofollow, dir_fd=descriptor)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise RuntimeError(
+                        f"path must not contain symlinks or non-directory components: {path}"
+                    ) from exc
+                raise
             os.close(descriptor)
             descriptor = child
     except BaseException:

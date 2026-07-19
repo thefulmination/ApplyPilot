@@ -56,11 +56,13 @@ def _approved_tool_environment() -> dict[str, str]:
     if node is not None and npm is not None:
         node_path = Path(node).resolve()
         npm_launcher = Path(npm).resolve()
-        npm_cli = (
-            node_path.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
-            if os.name == "nt"
-            else npm_launcher
+        npm_candidates = (
+            node_path.parent / "node_modules" / "npm" / "bin" / "npm-cli.js",
+            node_path.parent.parent / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js",
+            npm_launcher,
         )
+        npm_cli = next((candidate for candidate in npm_candidates if candidate.suffix == ".js" and candidate.is_file()), None)
+        assert npm_cli is not None, f"could not resolve npm-cli.js from {npm_launcher}"
         tools["APPLYPILOT_BRAIN_TEST_NODE"] = node_path
         tools["APPLYPILOT_BRAIN_TEST_NPM_CLI"] = npm_cli.resolve()
     approved: dict[str, str] = {}
@@ -851,7 +853,7 @@ def test_publication_fails_closed_without_a_supported_secure_backend(
 ) -> None:
     common = _load_module(COMMON, "release_evidence_common_unsupported_backend_test")
     monkeypatch.setattr(common, "_is_windows", lambda: False)
-    monkeypatch.setattr(common.os, "name", "unsupported")
+    monkeypatch.setattr(common, "_POSIX_DIR_FD_SUPPORTED", False)
     with pytest.raises(RuntimeError, match="descriptor-relative release-evidence publication"):
         common.atomic_write_no_overwrite(tmp_path / "receipt.json", b"evidence")
 

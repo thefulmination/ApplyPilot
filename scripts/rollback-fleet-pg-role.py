@@ -27,10 +27,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _hba_restore_supported() -> bool:
+def _hba_restore_supported(*, platform_name: str | None = None) -> bool:
     """HBA replacement requires descriptor-relative filesystem operations."""
+    effective_platform = os.name if platform_name is None else platform_name
     return (
-        os.name != "nt"
+        effective_platform != "nt"
         and os.open in os.supports_dir_fd
         and os.replace in os.supports_dir_fd
         and os.unlink in os.supports_dir_fd
