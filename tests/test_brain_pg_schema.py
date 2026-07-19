@@ -933,7 +933,7 @@ def test_v7_verifier_rejects_membership_option_grantor_and_multiplicity_drift(br
         connection.execute("DROP ROLE brain_v7_renamer")
         connection.commit()
 
-        with pytest.raises(psycopg.errors.FeatureNotSupported, match="bootstrap user"):
+        with pytest.raises(psycopg.errors.FeatureNotSupported, match="bootstrap superuser"):
             with connection.transaction():
                 connection.execute("ALTER ROLE postgres NOSUPERUSER")
         connection.rollback()

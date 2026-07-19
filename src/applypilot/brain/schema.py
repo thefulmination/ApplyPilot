@@ -38,8 +38,12 @@ _VERIFIER_ROLE = "brain_schema_verifier"
 _UNPINNED_PG18_CATALOG_HASH = "PG18_PIN_REQUIRED"
 _PG_CATALOG_HASHES = MappingProxyType({
     18: MappingProxyType({
-        name: _UNPINNED_PG18_CATALOG_HASH
-        for name in ("base", "current_base", "v5", "current_v5", "v6", "v7")
+        "base": "27a72935640c194066495edf6752745ceb2be51e160bc92cf0f52b6bca987372",
+        "current_base": "f5842f1c742e20a8979995c2f132cc3235276a0338339782bfb1725d4ca8aac1",
+        "v5": "ff594b521d6b7d6071293cfa9d0fd7ced881867b6d79f69d76d994319ef6791e",
+        "current_v5": "8f7ec08a4490cdbf7ab0b46e708610603edd480fc444cb85cd660f1cc2200889",
+        "v6": "ce00f4398caba196039a555c43d8a11f1f3889b628f0a61e778a674a64433590",
+        "v7": "912bf090f866316e9a47aabee704f7ec25de3be5d802ed515213744090f21852",
     })
 })
 _PG18_CATALOG_SHAPES = MappingProxyType({
@@ -3128,9 +3132,11 @@ def _verify_v6_contract(cur, *, upgraded_to_v7: bool = False) -> None:
     constraint_counts = {(row["relname"], row["contype"]): row["count"] for row in cur.fetchall()}
     if constraint_counts != {
         ("brain_artifact_authority_requests", "c"): 8,
+        ("brain_artifact_authority_requests", "n"): 11,
         ("brain_artifact_authority_requests", "p"): 1,
         ("brain_artifact_authority_registrations", "c"): 11,
         ("brain_artifact_authority_registrations", "f"): 2,
+        ("brain_artifact_authority_registrations", "n"): 13,
         ("brain_artifact_authority_registrations", "p"): 1,
         ("brain_artifact_authority_registrations", "u"): 1,
     }:
@@ -3274,8 +3280,13 @@ def verify_brain_schema_v6_in_transaction(cur) -> None:
     require_pg18_authority_catalog(cur)
     _assert_current_schema_v6_bytes_immutable()
     _verify_v6_contract(cur)
-    if _catalog_contract_hash(cur, include_v5=True) != _pg18_catalog_hash("v6"):
-        raise RuntimeError("brain schema v6 catalog contract hash mismatch")
+    actual_catalog_hash = _catalog_contract_hash(cur, include_v5=True)
+    expected_catalog_hash = _pg18_catalog_hash("v6")
+    if actual_catalog_hash != expected_catalog_hash:
+        raise RuntimeError(
+            "brain schema v6 catalog contract hash mismatch: "
+            f"expected {expected_catalog_hash}, got {actual_catalog_hash}"
+        )
 
 
 def verify_brain_schema_v6(conn) -> None:
@@ -3673,23 +3684,40 @@ def _verify_v7_topology_relation_contract(cur) -> int:
     ]:
         raise RuntimeError("brain schema v7 topology column contract mismatch")
     cur.execute(
-        "SELECT conname,contype,convalidated,pg_get_constraintdef(oid,true) AS definition "
+        "SELECT conname,contype,convalidated,conenforced,"
+        "pg_get_constraintdef(oid,false) AS definition "
         "FROM pg_constraint WHERE conrelid='public.brain_v7_topology_contract'::regclass "
         "ORDER BY conname"
     )
     constraints = cur.fetchall()
     if constraints != [
         {
+            "conname": "brain_v7_topology_contract_controller_role_oid_not_null",
+            "contype": "n",
+            "convalidated": True,
+            "conenforced": True,
+            "definition": "NOT NULL controller_role_oid",
+        },
+        {
             "conname": "brain_v7_topology_contract_pkey",
             "contype": "p",
             "convalidated": True,
+            "conenforced": True,
             "definition": "PRIMARY KEY (singleton_id)",
         },
         {
             "conname": "brain_v7_topology_contract_singleton_check",
             "contype": "c",
             "convalidated": True,
-            "definition": "CHECK (singleton_id = 1)",
+            "conenforced": True,
+            "definition": "CHECK ((singleton_id = 1))",
+        },
+        {
+            "conname": "brain_v7_topology_contract_singleton_id_not_null",
+            "contype": "n",
+            "convalidated": True,
+            "conenforced": True,
+            "definition": "NOT NULL singleton_id",
         },
     ]:
         raise RuntimeError(
