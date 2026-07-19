@@ -18,6 +18,7 @@
 
 - [ ] Add parameterized schema-boundary tests covering V1/V4/V5/V6/V7 ensure and verify entry points. Snapshot roles, public relations, ledger, and advisory locks; assert `RuntimeError` matching `PostgreSQL 18 authority catalog contract required`, then assert identical snapshots.
 - [ ] Add direct candidate-role, artifact-role, fixed-install, and bootstrap cases. Bootstrap uses fresh `DurableEvidencePaths` and asserts absent evidence files, unchanged database state, and no fleet bootstrap advisory lock.
+- [ ] Name unsupported-major tests with `unsupported_major` and structural PG18 tests with `pg18` so the prescribed selector is an executable gate rather than a zero-test command.
 - [ ] Run `\.venv\Scripts\python.exe -m pytest -q tests/test_brain_pg_schema.py tests/test_pg_role_bootstrap.py -k "pg18 or unsupported_major"`.
 - [ ] Expected: new tests fail because PostgreSQL 16 currently reaches schema/catalog operations or locks.
 
@@ -55,6 +56,7 @@ def require_pg18_authority_catalog(cur) -> None:
             )
 ```
 - [ ] Call the helper before any other query in every approved direct boundary. In `bootstrap_database_roles`, call it after idle/autocommit validation but before SCRAM derivation, advisory lock, inventory, or evidence work.
+- [ ] Add ordering tripwires proving bootstrap validation is connection idle/autocommit first, PG18 database preflight second, and evidence-path validation third.
 - [ ] Re-run Task 1 tests. Expected: all PG16 rejection tests pass with zero drift.
 - [ ] Commit the guard and red/green tests.
 
@@ -77,7 +79,7 @@ _PG_CATALOG_HASHES = MappingProxyType({
 ```
 - [ ] Extend base and V5 constraint SELECTs with every approved scalar/array field. Resolve namespace, relation, type, index, parent constraint, referenced relation, and operator OIDs to stable qualified identities; never serialize raw cluster-local OIDs.
 - [ ] Use `pg_get_expr(...,false)`, `pg_get_constraintdef(...,false)`, `pg_get_indexdef(oid,0,false)`, `pg_get_triggerdef(...,false)`, and `pg_get_viewdef(...,false)` consistently only inside hash-generation functions.
-- [ ] Add static tests asserting the exact constraint field set, absence of old scalar pin names/PG16 hashes, immutable map structure, and non-pretty hash calls.
+- [ ] Add adversarial wrong-major, extra-column, missing-column, reordered-column, and retyped-column doubles. Add static tests asserting the exact constraint field set, explicit namespace-qualified identities, absence of OID `reg*::text` rendering and old scalar pin names/PG16 hashes, immutable map structure, and non-pretty calls confined to hash functions.
 - [ ] Run Ruff, pycompile, and PG16 zero-drift tests; commit the query-shape boundary and immediately send its SHA to the PG18 diagnostic lane.
 
 ### Task 4: Authoritative PG18 pins and PG18 NOT NULL constraints

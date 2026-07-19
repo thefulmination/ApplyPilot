@@ -1757,6 +1757,104 @@ def brain_pg(fleet_db):
     _cleanup(fleet_db, drop_fixed_roles=True)
 
 
+class _Pg18CatalogShapeCursor:
+    def __init__(
+        self,
+        *,
+        version: int = 180004,
+        shapes: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> None:
+        self.version = version
+        self.shapes = dict(schema._PG18_CATALOG_SHAPES if shapes is None else shapes)
+        self._one = None
+        self._many = []
+
+    def execute(self, statement: str, parameters=None) -> None:
+        if "server_version_num" in statement:
+            self._one = {"server_version_num": self.version}
+            self._many = []
+            return
+        relation = parameters[0]
+        self._one = None
+        self._many = [
+            {"attname": name, "data_type": data_type}
+            for name, data_type in self.shapes[relation]
+        ]
+
+    def fetchone(self):
+        return self._one
+
+    def fetchall(self):
+        return self._many
+
+
+class _CatalogConstraintQueryCursor:
+    def __init__(self) -> None:
+        self.statement = ""
+
+    def execute(self, statement: str, _parameters=None) -> None:
+        self.statement = statement
+
+    def fetchall(self):
+        return []
+
+
+def test_unsupported_major_pg18_catalog_guard_rejects_wrong_major_double() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="PostgreSQL 18 authority catalog contract required",
+    ):
+        schema.require_pg18_authority_catalog(_Pg18CatalogShapeCursor(version=170999))
+
+
+@pytest.mark.parametrize("defect", ("extra", "missing", "reordered", "retyped"))
+def test_pg18_catalog_shape_guard_rejects_adversarial_double(defect: str) -> None:
+    shapes = dict(schema._PG18_CATALOG_SHAPES)
+    relation = "pg_catalog.pg_constraint"
+    columns = list(shapes[relation])
+    if defect == "extra":
+        columns.append(("unexpected_column", "text"))
+    elif defect == "missing":
+        columns.pop()
+    elif defect == "reordered":
+        columns[0], columns[1] = columns[1], columns[0]
+    else:
+        name, _data_type = columns[0]
+        columns[0] = (name, "text")
+    shapes[relation] = tuple(columns)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"PostgreSQL 18 authority catalog shape mismatch for pg_catalog\.pg_constraint",
+    ):
+        schema.require_pg18_authority_catalog(_Pg18CatalogShapeCursor(shapes=shapes))
+
+
+def test_pg18_catalog_shape_guard_accepts_exact_double() -> None:
+    schema.require_pg18_authority_catalog(_Pg18CatalogShapeCursor())
+
+
+def test_pg18_catalog_constraint_query_uses_explicit_qualified_identities() -> None:
+    cursor = _CatalogConstraintQueryCursor()
+    schema._catalog_constraint_records(
+        cursor,
+        ["brain_schema_versions"],
+        include_archive=True,
+    )
+
+    for oid_text_cast in ("::regtype::text", "::regclass::text", "::regoperator::text"):
+        assert oid_text_cast not in cursor.statement
+    for catalog_join in (
+        "JOIN pg_type constraint_type",
+        "JOIN pg_class backing_index",
+        "JOIN pg_class referenced_relation",
+        "JOIN pg_operator operator",
+        "JOIN pg_type left_type",
+        "JOIN pg_type right_type",
+    ):
+        assert catalog_join in cursor.statement
+
+
 def _pg18_boundary_snapshot(connection) -> dict[str, object]:
     roles = connection.execute(
         "SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,"
@@ -1793,7 +1891,9 @@ def _pg18_boundary_snapshot(connection) -> dict[str, object]:
     }
 
 
-def test_pg16_rejects_every_direct_authority_boundary_without_database_drift(brain_pg) -> None:
+def test_unsupported_major_pg16_rejects_every_direct_authority_boundary_without_database_drift(
+    brain_pg,
+) -> None:
     with psycopg.connect(brain_pg, row_factory=dict_row) as connection:
         version = int(connection.execute("SHOW server_version_num").fetchone()["server_version_num"])
         connection.commit()

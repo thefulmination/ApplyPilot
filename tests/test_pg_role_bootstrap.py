@@ -660,7 +660,53 @@ def _atomic_topology() -> pg_roles.BootstrapTopology:
     )
 
 
-def test_pg16_bootstrap_rejects_before_lock_evidence_or_database_drift(
+def test_pg18_bootstrap_validates_connection_then_database_then_evidence(monkeypatch) -> None:
+    events: list[str] = []
+
+    class StopAfterOrdering(RuntimeError):
+        pass
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeConnection:
+        autocommit = False
+        info = type("Info", (), {"transaction_status": type("Status", (), {"name": "IDLE"})()})()
+
+        def cursor(self):
+            return FakeCursor()
+
+    monkeypatch.setattr(
+        pg_roles,
+        "_require_pg18_authority_catalog",
+        lambda _cursor: events.append("pg18_database_preflight"),
+    )
+    monkeypatch.setattr(
+        pg_roles,
+        "_validate_evidence_paths",
+        lambda _paths: events.append("evidence_paths"),
+    )
+
+    def stop_before_scram(*_args, **_kwargs):
+        raise StopAfterOrdering("ordering observed")
+
+    monkeypatch.setattr(pg_roles, "_client_scram_verifier", stop_before_scram)
+    with pytest.raises(StopAfterOrdering, match="ordering observed"):
+        pg_roles.bootstrap_database_roles(
+            FakeConnection(),
+            CONTROLLER_PASSWORD,
+            topology=_atomic_topology(),
+            evidence_paths=object(),
+            install_brain_authority=True,
+        )
+    assert events == ["pg18_database_preflight", "evidence_paths"]
+
+
+def test_unsupported_major_pg16_bootstrap_rejects_before_lock_evidence_or_database_drift(
     fleet_db: str,
     tmp_path: Path,
     monkeypatch,

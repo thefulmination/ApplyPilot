@@ -3964,13 +3964,13 @@ def bootstrap_database_roles(
     install_brain_authority: bool = False,
 ) -> BootstrapReceipt:
     """Perform a fenced role handoff and optional fixed authority install."""
-    _validate_evidence_paths(evidence_paths)
     if conn.autocommit:
         raise RuntimeError("atomic bootstrap requires autocommit to be disabled")
     if conn.info.transaction_status.name != "IDLE":
         raise RuntimeError("bootstrap requires an idle provider-admin connection")
     with conn.cursor() as preflight_cur:
         _require_pg18_authority_catalog(preflight_cur)
+    _validate_evidence_paths(evidence_paths)
     verifier = _client_scram_verifier(conn, role_name=topology.controller_role, password=controller_password)
     fence_active = False
     preserve_fence_on_failure = False

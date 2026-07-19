@@ -38,12 +38,12 @@ _VERIFIER_ROLE = "brain_schema_verifier"
 _UNPINNED_PG18_CATALOG_HASH = "PG18_PIN_REQUIRED"
 _PG_CATALOG_HASHES = MappingProxyType({
     18: MappingProxyType({
-        "base": "27a72935640c194066495edf6752745ceb2be51e160bc92cf0f52b6bca987372",
-        "current_base": "f5842f1c742e20a8979995c2f132cc3235276a0338339782bfb1725d4ca8aac1",
-        "v5": "ff594b521d6b7d6071293cfa9d0fd7ced881867b6d79f69d76d994319ef6791e",
-        "current_v5": "8f7ec08a4490cdbf7ab0b46e708610603edd480fc444cb85cd660f1cc2200889",
-        "v6": "ce00f4398caba196039a555c43d8a11f1f3889b628f0a61e778a674a64433590",
-        "v7": "912bf090f866316e9a47aabee704f7ec25de3be5d802ed515213744090f21852",
+        "base": _UNPINNED_PG18_CATALOG_HASH,
+        "current_base": _UNPINNED_PG18_CATALOG_HASH,
+        "v5": _UNPINNED_PG18_CATALOG_HASH,
+        "current_v5": _UNPINNED_PG18_CATALOG_HASH,
+        "v6": _UNPINNED_PG18_CATALOG_HASH,
+        "v7": _UNPINNED_PG18_CATALOG_HASH,
     })
 })
 _PG18_CATALOG_SHAPES = MappingProxyType({
@@ -1185,36 +1185,90 @@ def _catalog_constraint_records(
         "format('%%I.%%I',relation_namespace.nspname,relation.relname) AS relation_identity,"
         "con.conname,con.contype,con.condeferrable,con.condeferred,con.conenforced,"
         "con.convalidated,"
-        "CASE WHEN con.contypid=0 THEN NULL ELSE con.contypid::regtype::text END AS type_identity,"
-        "CASE WHEN con.conindid=0 THEN NULL ELSE con.conindid::regclass::text END AS index_identity,"
+        "CASE WHEN con.contypid=0 THEN NULL ELSE "
+        "format('%%I.%%I',constraint_type_namespace.nspname,constraint_type.typname) "
+        "END AS type_identity,"
+        "CASE WHEN con.conindid=0 THEN NULL ELSE "
+        "format('%%I.%%I',backing_index_namespace.nspname,backing_index.relname) "
+        "END AS index_identity,"
         "CASE WHEN con.conparentid=0 THEN NULL ELSE "
         "format('%%I.%%I.%%I',parent_namespace.nspname,parent_relation.relname,parent_constraint.conname) "
         "END AS parent_constraint_identity,"
-        "CASE WHEN con.confrelid=0 THEN NULL ELSE con.confrelid::regclass::text "
+        "CASE WHEN con.confrelid=0 THEN NULL ELSE "
+        "format('%%I.%%I',referenced_namespace.nspname,referenced_relation.relname) "
         "END AS referenced_relation_identity,"
         "con.confupdtype,con.confdeltype,con.confmatchtype,con.conislocal,con.coninhcount,"
         "con.connoinherit,con.conperiod,con.conkey,con.confkey,"
-        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "ARRAY(SELECT format('%%I.%%I(%%s,%%s)',operator_namespace.nspname,operator.oprname,"
+        "CASE WHEN operator.oprleft=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',left_type_namespace.nspname,left_type.typname) END,"
+        "CASE WHEN operator.oprright=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',right_type_namespace.nspname,right_type.typname) END) FROM "
         "unnest(COALESCE(con.conpfeqop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "JOIN pg_operator operator ON operator.oid=item.operator_oid "
+        "JOIN pg_namespace operator_namespace ON operator_namespace.oid=operator.oprnamespace "
+        "LEFT JOIN pg_type left_type ON left_type.oid=operator.oprleft "
+        "LEFT JOIN pg_namespace left_type_namespace ON left_type_namespace.oid=left_type.typnamespace "
+        "LEFT JOIN pg_type right_type ON right_type.oid=operator.oprright "
+        "LEFT JOIN pg_namespace right_type_namespace ON right_type_namespace.oid=right_type.typnamespace "
         "ORDER BY position) AS parent_fk_equality_operators,"
-        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "ARRAY(SELECT format('%%I.%%I(%%s,%%s)',operator_namespace.nspname,operator.oprname,"
+        "CASE WHEN operator.oprleft=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',left_type_namespace.nspname,left_type.typname) END,"
+        "CASE WHEN operator.oprright=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',right_type_namespace.nspname,right_type.typname) END) FROM "
         "unnest(COALESCE(con.conppeqop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "JOIN pg_operator operator ON operator.oid=item.operator_oid "
+        "JOIN pg_namespace operator_namespace ON operator_namespace.oid=operator.oprnamespace "
+        "LEFT JOIN pg_type left_type ON left_type.oid=operator.oprleft "
+        "LEFT JOIN pg_namespace left_type_namespace ON left_type_namespace.oid=left_type.typnamespace "
+        "LEFT JOIN pg_type right_type ON right_type.oid=operator.oprright "
+        "LEFT JOIN pg_namespace right_type_namespace ON right_type_namespace.oid=right_type.typnamespace "
         "ORDER BY position) AS parent_pk_equality_operators,"
-        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "ARRAY(SELECT format('%%I.%%I(%%s,%%s)',operator_namespace.nspname,operator.oprname,"
+        "CASE WHEN operator.oprleft=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',left_type_namespace.nspname,left_type.typname) END,"
+        "CASE WHEN operator.oprright=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',right_type_namespace.nspname,right_type.typname) END) FROM "
         "unnest(COALESCE(con.conffeqop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "JOIN pg_operator operator ON operator.oid=item.operator_oid "
+        "JOIN pg_namespace operator_namespace ON operator_namespace.oid=operator.oprnamespace "
+        "LEFT JOIN pg_type left_type ON left_type.oid=operator.oprleft "
+        "LEFT JOIN pg_namespace left_type_namespace ON left_type_namespace.oid=left_type.typnamespace "
+        "LEFT JOIN pg_type right_type ON right_type.oid=operator.oprright "
+        "LEFT JOIN pg_namespace right_type_namespace ON right_type_namespace.oid=right_type.typnamespace "
         "ORDER BY position) AS foreign_fk_equality_operators,"
         "con.confdelsetcols,"
-        "ARRAY(SELECT operator_oid::regoperator::text FROM "
+        "ARRAY(SELECT format('%%I.%%I(%%s,%%s)',operator_namespace.nspname,operator.oprname,"
+        "CASE WHEN operator.oprleft=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',left_type_namespace.nspname,left_type.typname) END,"
+        "CASE WHEN operator.oprright=0 THEN 'NONE' ELSE "
+        "format('%%I.%%I',right_type_namespace.nspname,right_type.typname) END) FROM "
         "unnest(COALESCE(con.conexclop,ARRAY[]::oid[])) WITH ORDINALITY item(operator_oid,position) "
+        "JOIN pg_operator operator ON operator.oid=item.operator_oid "
+        "JOIN pg_namespace operator_namespace ON operator_namespace.oid=operator.oprnamespace "
+        "LEFT JOIN pg_type left_type ON left_type.oid=operator.oprleft "
+        "LEFT JOIN pg_namespace left_type_namespace ON left_type_namespace.oid=left_type.typnamespace "
+        "LEFT JOIN pg_type right_type ON right_type.oid=operator.oprright "
+        "LEFT JOIN pg_namespace right_type_namespace ON right_type_namespace.oid=right_type.typnamespace "
         "ORDER BY position) AS exclusion_operators,"
         "pg_get_constraintdef(con.oid,false) AS definition "
         "FROM pg_constraint con "
         "JOIN pg_namespace constraint_namespace ON constraint_namespace.oid=con.connamespace "
         "JOIN pg_class relation ON relation.oid=con.conrelid "
         "JOIN pg_namespace relation_namespace ON relation_namespace.oid=relation.relnamespace "
+        "LEFT JOIN pg_type constraint_type ON constraint_type.oid=con.contypid "
+        "LEFT JOIN pg_namespace constraint_type_namespace "
+        "ON constraint_type_namespace.oid=constraint_type.typnamespace "
+        "LEFT JOIN pg_class backing_index ON backing_index.oid=con.conindid "
+        "LEFT JOIN pg_namespace backing_index_namespace "
+        "ON backing_index_namespace.oid=backing_index.relnamespace "
         "LEFT JOIN pg_constraint parent_constraint ON parent_constraint.oid=con.conparentid "
         "LEFT JOIN pg_class parent_relation ON parent_relation.oid=parent_constraint.conrelid "
         "LEFT JOIN pg_namespace parent_namespace ON parent_namespace.oid=parent_relation.relnamespace "
+        "LEFT JOIN pg_class referenced_relation ON referenced_relation.oid=con.confrelid "
+        "LEFT JOIN pg_namespace referenced_namespace "
+        "ON referenced_namespace.oid=referenced_relation.relnamespace "
         "WHERE (relation_namespace.nspname='public' AND relation.relname=ANY(%s)) "
         "OR (%s AND relation_namespace.nspname='brain_archive' "
         "AND relation.relname='brain_archive_manifests') "
@@ -3685,7 +3739,7 @@ def _verify_v7_topology_relation_contract(cur) -> int:
         raise RuntimeError("brain schema v7 topology column contract mismatch")
     cur.execute(
         "SELECT conname,contype,convalidated,conenforced,"
-        "pg_get_constraintdef(oid,false) AS definition "
+        "pg_get_constraintdef(oid,true) AS definition "
         "FROM pg_constraint WHERE conrelid='public.brain_v7_topology_contract'::regclass "
         "ORDER BY conname"
     )
@@ -3710,7 +3764,7 @@ def _verify_v7_topology_relation_contract(cur) -> int:
             "contype": "c",
             "convalidated": True,
             "conenforced": True,
-            "definition": "CHECK ((singleton_id = 1))",
+            "definition": "CHECK (singleton_id = 1)",
         },
         {
             "conname": "brain_v7_topology_contract_singleton_id_not_null",
