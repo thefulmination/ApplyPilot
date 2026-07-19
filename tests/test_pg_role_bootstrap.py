@@ -112,15 +112,27 @@ def test_bootstrap_api_has_no_caller_supplied_sql_callback() -> None:
     assert "install_brain_authority" in bootstrap_parameters
 
 
-def test_evidence_api_rejects_hostile_callable_without_invoking_it() -> None:
+def test_evidence_api_rejects_hostile_callable_without_invoking_it(monkeypatch) -> None:
     invoked = False
     captured_arguments: list[object] = []
 
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
     class CapturableConnection:
+        autocommit = False
         commit_calls = 0
+        info = type("Info", (), {"transaction_status": type("Status", (), {"name": "IDLE"})()})()
 
         def commit(self):
             self.commit_calls += 1
+
+        def cursor(self):
+            return FakeCursor()
 
     class HostileCallable:
         def __call__(self, *args, **_kwargs):
@@ -131,6 +143,7 @@ def test_evidence_api_rejects_hostile_callable_without_invoking_it() -> None:
 
     hostile = HostileCallable()
     connection = CapturableConnection()
+    monkeypatch.setattr(pg_roles, "_require_pg18_authority_catalog", lambda _cursor: None)
     with pytest.raises(TypeError, match="DurableEvidencePaths"):
         pg_roles.bootstrap_database_roles(
             connection,

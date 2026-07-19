@@ -38,12 +38,12 @@ _VERIFIER_ROLE = "brain_schema_verifier"
 _UNPINNED_PG18_CATALOG_HASH = "PG18_PIN_REQUIRED"
 _PG_CATALOG_HASHES = MappingProxyType({
     18: MappingProxyType({
-        "base": _UNPINNED_PG18_CATALOG_HASH,
-        "current_base": _UNPINNED_PG18_CATALOG_HASH,
-        "v5": _UNPINNED_PG18_CATALOG_HASH,
-        "current_v5": _UNPINNED_PG18_CATALOG_HASH,
-        "v6": _UNPINNED_PG18_CATALOG_HASH,
-        "v7": _UNPINNED_PG18_CATALOG_HASH,
+        "base": "22cfe2c608305d89dd773a0f0a4ed91a35be066aab0468154de08be2361b2c6a",
+        "current_base": "bc4b812202b72029bd2422fff11b2d803bfe4f59283ae0fe8faddcf79dfe4648",
+        "v5": "c84d51b987a3a6915d3af9f186c3c179f09828c2e1e98f5fe04be60e9c063ad7",
+        "current_v5": "903d96ec8c9f0da427771ceae78a5c4d4b39fb38bb72a39bd8894e75b3b05bb1",
+        "v6": "413fdaacc60793dab624b7d12def0362d9539521be055d716bc9320450362329",
+        "v7": "b8bcc3e3fedea82fe0149d3dd0372332e24b94579c692e949d9b9c3dce8a0ee5",
     })
 })
 _PG18_CATALOG_SHAPES = MappingProxyType({
