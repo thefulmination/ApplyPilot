@@ -718,7 +718,7 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
                 sql.Identifier(controller), sql.Literal("existing-controller-password")
             ))
             root.execute(sql.SQL("CREATE ROLE {} NOLOGIN INHERIT").format(sql.Identifier(retired)))
-            root.execute(sql.SQL("CREATE ROLE {} LOGIN INHERIT CREATEDB PASSWORD {}").format(
+            root.execute(sql.SQL("CREATE ROLE {} LOGIN INHERIT CREATEROLE PASSWORD {}").format(
                 sql.Identifier(legacy_controller), sql.Literal("legacy-controller-password")
             ))
             root.execute(sql.SQL("CREATE ROLE {} LOGIN NOINHERIT PASSWORD {}").format(

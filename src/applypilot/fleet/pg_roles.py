@@ -4403,8 +4403,12 @@ def _existing_authority_topology_inventory(
             raise RuntimeError(f"authority upgrade role attributes invalid for {role_name}: {actual!r}")
     for role_name in topology.retired_admin_roles:
         row = roles[role_name]
+        # LOGIN/CREATEDB/CREATEROLE are repairable only for roles explicitly
+        # declared retired. Catalog locks, exact membership/ownership checks,
+        # and the atomic NOLOGIN/NOCREATEDB/NOCREATEROLE transition fence the
+        # legacy capability before the authority roles are created.
         if any(bool(_row_value(row, name, index + 1)) for index, name in enumerate(attribute_names)
-               if name in {"rolsuper", "rolcreaterole", "rolreplication", "rolbypassrls"}):
+               if name in {"rolsuper", "rolreplication", "rolbypassrls"}):
             raise RuntimeError(f"retired provider admin remains elevated: {role_name}")
     for role_name in topology.infrastructure_superuser_roles:
         row = roles[role_name]
