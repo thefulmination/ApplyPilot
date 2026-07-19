@@ -720,6 +720,48 @@ def test_v7_install_preserves_permanent_set_edge_for_non_superuser_database_owne
                     "rolcreaterole": False,
                 }
                 provider.commit()
+                root.execute(
+                    "GRANT brain_policy_controller TO brain_controller_test_login "
+                    "WITH ADMIN TRUE, INHERIT TRUE, SET FALSE"
+                )
+                root.commit()
+                versions_before = root.execute(
+                    "SELECT array_agg(version ORDER BY version) AS versions "
+                    "FROM brain_schema_versions"
+                ).fetchone()["versions"]
+                root.commit()
+                with pytest.raises(
+                    RuntimeError,
+                    match="exact brain_policy_controller membership",
+                ):
+                    with provider.transaction():
+                        with provider.cursor() as cursor:
+                            pg_roles._install_brain_authority_in_transaction(
+                                cursor, topology=topology
+                            )
+                provider.rollback()
+                assert provider.execute(
+                    "SELECT admin_option,inherit_option,set_option "
+                    "FROM pg_auth_members "
+                    "WHERE roleid='brain_policy_controller'::regrole "
+                    "AND member='brain_controller_test_login'::regrole"
+                ).fetchall() == [
+                    {
+                        "admin_option": True,
+                        "inherit_option": True,
+                        "set_option": False,
+                    }
+                ]
+                assert root.execute(
+                    "SELECT array_agg(version ORDER BY version) AS versions "
+                    "FROM brain_schema_versions"
+                ).fetchone()["versions"] == versions_before
+                root.commit()
+                root.execute(
+                    "GRANT brain_policy_controller TO brain_controller_test_login "
+                    "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+                )
+                root.commit()
                 root.execute("CREATE TABLE v7_unrelated_guard(id integer)")
                 root.execute("GRANT SELECT ON v7_unrelated_guard TO brain_candidate_reader")
                 root.commit()
@@ -807,6 +849,14 @@ def test_v7_install_fails_closed_on_automatic_creator_membership_grant(brain_pg)
                 "CREATE ROLE brain_v7_provider LOGIN NOINHERIT NOSUPERUSER "
                 "NOCREATEDB CREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
             ).format(pg_sql.Literal(password))
+        )
+        root.execute(
+            "CREATE ROLE brain_controller_test_login LOGIN NOINHERIT NOSUPERUSER "
+            "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+        )
+        root.execute(
+            "GRANT brain_policy_controller TO brain_controller_test_login "
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY postgres"
         )
         root.execute("ALTER DATABASE postgres OWNER TO brain_v7_provider")
         root.commit()
@@ -928,6 +978,86 @@ def test_v7_verifier_rejects_membership_option_grantor_and_multiplicity_drift(br
                     schema.verify_brain_schema_v7_in_transaction(cursor)
         connection.rollback()
         schema.verify_brain_schema_v7(connection)
+
+        with pytest.raises(RuntimeError, match="controller membership"):
+            with connection.transaction():
+                connection.execute(
+                    "GRANT brain_policy_controller TO brain_controller_test_login "
+                    "WITH ADMIN TRUE, INHERIT TRUE, SET FALSE"
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        connection.execute(
+            "GRANT brain_policy_controller TO brain_controller_test_login "
+            "WITH ADMIN TRUE, INHERIT TRUE, SET FALSE"
+        )
+        connection.commit()
+        topology = pg_roles.BootstrapTopology(
+            database_owner_role="brain_v7_provider",
+            controller_role="brain_controller_test_login",
+            verifier_role="brain_schema_verifier",
+            migrator_role="brain_schema_migrator",
+            retired_admin_roles=(),
+            infrastructure_superuser_roles=("postgres",),
+        )
+        with connection.transaction():
+            with connection.cursor() as cursor:
+                pg_roles._install_brain_authority_in_transaction(
+                    cursor,
+                    topology=topology,
+                )
+        schema.verify_brain_schema_v7(connection)
+        assert connection.execute(
+            "SELECT admin_option,inherit_option,set_option,grantor "
+            "FROM pg_auth_members "
+            "WHERE roleid='brain_policy_controller'::regrole"
+        ).fetchall() == [
+            {
+                "admin_option": False,
+                "inherit_option": False,
+                "set_option": True,
+                "grantor": 10,
+            }
+        ]
+        connection.commit()
+
+        with pytest.raises(RuntimeError, match="controller membership"):
+            with connection.transaction():
+                connection.execute("CREATE ROLE brain_v7_controller_grantor SUPERUSER NOLOGIN")
+                connection.execute(
+                    "GRANT brain_policy_controller TO brain_v7_controller_grantor "
+                    "WITH ADMIN TRUE, INHERIT FALSE, SET TRUE"
+                )
+                connection.execute(
+                    "REVOKE brain_policy_controller FROM brain_controller_test_login "
+                    "GRANTED BY postgres RESTRICT"
+                )
+                connection.execute("SET LOCAL ROLE brain_v7_controller_grantor")
+                connection.execute(
+                    "GRANT brain_policy_controller TO brain_controller_test_login "
+                    "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE "
+                    "GRANTED BY brain_v7_controller_grantor"
+                )
+                connection.execute("RESET ROLE")
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
+
+        with pytest.raises(RuntimeError, match="controller membership"):
+            with connection.transaction():
+                connection.execute(
+                    "CREATE ROLE brain_v7_extra_controller LOGIN NOINHERIT NOSUPERUSER "
+                    "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                )
+                connection.execute(
+                    "GRANT brain_policy_controller TO brain_v7_extra_controller "
+                    "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
+                )
+                with connection.cursor() as cursor:
+                    schema.verify_brain_schema_v7_in_transaction(cursor)
+        connection.rollback()
 
 def test_v7_verifier_rejects_public_and_arbitrary_inherited_authority_acls(brain_pg) -> None:
     with psycopg.connect(brain_pg, row_factory=dict_row) as connection:

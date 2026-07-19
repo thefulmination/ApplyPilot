@@ -3509,8 +3509,37 @@ def _verify_v7_acl_contract(cur) -> None:
             + ", ".join(sorted(invalid_function_acls))
         )
 
+def _verify_v7_controller_membership_contract(cur) -> None:
+    cur.execute(
+        "SELECT member.rolname AS member_role,grantor.oid AS grantor_oid,"
+        "grantor.rolsuper AS grantor_is_superuser,membership.admin_option,"
+        "membership.inherit_option,membership.set_option "
+        "FROM pg_auth_members membership "
+        "JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+        "WHERE parent.rolname=%s "
+        "ORDER BY member.rolname,grantor.rolname",
+        (_POLICY_CONTROLLER_ROLE,),
+    )
+    rows = cur.fetchall()
+    exact = (
+        len(rows) == 1
+        and rows[0]["grantor_oid"] == 10
+        and rows[0]["grantor_is_superuser"] is True
+        and rows[0]["admin_option"] is False
+        and rows[0]["inherit_option"] is False
+        and rows[0]["set_option"] is True
+    )
+    if not exact:
+        raise RuntimeError(
+            f"brain schema v7 exact controller membership contract mismatch: {rows!r}"
+        )
+
+
 def _verify_v7_inherited_contracts(cur) -> None:
     _verify_v7_membership_contract(cur)
+    _verify_v7_controller_membership_contract(cur)
     _verify_v5_contract(cur)
     _verify_v6_contract(cur, upgraded_to_v7=True)
     _verify_v7_acl_contract(cur)

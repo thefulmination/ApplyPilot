@@ -2558,6 +2558,73 @@ def _verify_artifact_authority_membership_closure(
         raise RuntimeError("artifact authority owner is not delegated to the fixed schema migrator")
 
 
+def _controller_membership_rows(cur) -> list[dict[str, Any]]:
+    cur.execute(
+        "SELECT member.rolname AS member_role,grantor.oid AS grantor_oid,"
+        "grantor.rolname AS grantor_role,grantor.rolsuper AS grantor_is_superuser,"
+        "membership.admin_option,membership.inherit_option,membership.set_option "
+        "FROM pg_auth_members membership "
+        "JOIN pg_roles parent ON parent.oid=membership.roleid "
+        "JOIN pg_roles member ON member.oid=membership.member "
+        "JOIN pg_roles grantor ON grantor.oid=membership.grantor "
+        "WHERE parent.rolname='brain_policy_controller' "
+        "ORDER BY member.rolname,grantor.rolname"
+    )
+    return cur.fetchall()
+
+
+def _controller_membership_is_exact(
+    rows: list[dict[str, Any]],
+    *,
+    controller_role: str,
+) -> bool:
+    return (
+        len(rows) == 1
+        and _row_value(rows[0], "member_role") == controller_role
+        and _row_value(rows[0], "grantor_oid", 1) == 10
+        and bool(_row_value(rows[0], "grantor_is_superuser", 3))
+        and not bool(_row_value(rows[0], "admin_option", 4))
+        and not bool(_row_value(rows[0], "inherit_option", 5))
+        and bool(_row_value(rows[0], "set_option", 6))
+    )
+
+
+def _require_exact_controller_membership(cur, *, controller_role: str) -> None:
+    rows = _controller_membership_rows(cur)
+    if not _controller_membership_is_exact(rows, controller_role=controller_role):
+        raise RuntimeError(
+            "exact brain_policy_controller membership contract mismatch: "
+            f"expected OID 10-granted {controller_role!r}, got {rows!r}"
+        )
+
+
+def _reconcile_exact_controller_membership(cur, *, controller_role: str) -> None:
+    cur.execute("SELECT rolname,rolsuper FROM pg_roles WHERE oid=10")
+    bootstrap_role = cur.fetchone()
+    if bootstrap_role is None or not bool(_row_value(bootstrap_role, "rolsuper", 1)):
+        raise RuntimeError("controller membership grantor OID 10 must remain a superuser")
+    rows = _controller_membership_rows(cur)
+    if _controller_membership_is_exact(rows, controller_role=controller_role):
+        return
+    for row in rows:
+        cur.execute(
+            sql.SQL("REVOKE brain_policy_controller FROM {} GRANTED BY {} RESTRICT").format(
+                sql.Identifier(_row_value(row, "member_role")),
+                sql.Identifier(_row_value(row, "grantor_role", 2)),
+            )
+        )
+    cur.execute(
+        sql.SQL(
+            "GRANT brain_policy_controller TO {} "
+            "WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY {}"
+        ).format(
+            sql.Identifier(controller_role),
+            sql.Identifier(_row_value(bootstrap_role, "rolname")),
+        )
+    )
+    _require_exact_controller_membership(cur, controller_role=controller_role)
+
+
 def ensure_brain_artifact_authority_roles_in_transaction(
     cur,
     *,
@@ -2658,6 +2725,7 @@ def _install_brain_authority_in_transaction(
 
     # Import locally to keep the fleet role module independent during ordinary runtime use.
     from applypilot.brain.schema import (
+        ensure_brain_schema_v1_in_transaction,
         ensure_brain_schema_v7_in_transaction,
         verify_brain_schema_v7_in_transaction,
     )
@@ -2701,6 +2769,10 @@ def _install_brain_authority_in_transaction(
             database_owner_descendant = _row_value(database_owner_role, "rolname", 1)
 
     if not session_is_superuser:
+        _require_exact_controller_membership(
+            cur,
+            controller_role=topology.controller_role,
+        )
         cur.execute(
             "SELECT owner.rolname AS owner_name FROM pg_database database "
             "JOIN pg_roles owner ON owner.oid=database.datdba "
@@ -2843,6 +2915,23 @@ def _install_brain_authority_in_transaction(
                 "GRANT USAGE, CREATE ON SCHEMA public TO {} WITH GRANT OPTION"
             ).format(migrator)
         )
+    if session_is_superuser:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brain_policy_controller') AS present"
+        )
+        if not bool(_row_value(cur.fetchone(), "present")):
+            cur.execute(sql.SQL("SET LOCAL ROLE {}").format(migrator))
+            ensure_brain_schema_v1_in_transaction(cur)
+            cur.execute("RESET ROLE")
+        _reconcile_exact_controller_membership(
+            cur,
+            controller_role=topology.controller_role,
+        )
+    else:
+        _require_exact_controller_membership(
+            cur,
+            controller_role=topology.controller_role,
+        )
     cur.execute(sql.SQL("SET LOCAL ROLE {}").format(migrator))
     ensure_brain_schema_v7_in_transaction(cur)
     cur.execute("RESET ROLE")
@@ -2880,28 +2969,10 @@ def _install_brain_authority_in_transaction(
     cur.execute(sql.SQL("SET LOCAL ROLE {}").format(migrator))
     verify_brain_schema_v7_in_transaction(cur)
     cur.execute("RESET ROLE")
-    for capability in ("brain_policy_controller",):
-        cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (capability,))
-        if cur.fetchone() is None:
-            raise RuntimeError(f"fixed authority installer did not create {capability}")
-        cur.execute(
-            "SELECT 1 FROM pg_auth_members membership "
-            "JOIN pg_roles parent ON parent.oid=membership.roleid "
-            "JOIN pg_roles member ON member.oid=membership.member "
-            "WHERE parent.rolname=%s AND member.rolname=%s",
-            (capability, topology.controller_role),
-        )
-        if cur.fetchone() is None:
-            if not session_is_superuser:
-                raise RuntimeError(
-                    "non-superuser authority installation requires privileged pre-provisioning "
-                    f"of {capability} controller membership"
-                )
-            cur.execute(
-                sql.SQL("GRANT {} TO {} WITH INHERIT FALSE, SET TRUE").format(
-                    sql.Identifier(capability), sql.Identifier(topology.controller_role)
-                )
-            )
+    _require_exact_controller_membership(
+        cur,
+        controller_role=topology.controller_role,
+    )
     return candidate_roles
 
 
@@ -3705,6 +3776,16 @@ def _validate_bootstrap_boundary(cur, *, topology: BootstrapTopology) -> tuple[d
         )
         if actual != expected:
             raise RuntimeError(f"bootstrap role attributes invalid for {role_name}: {actual!r}")
+    cur.execute("SELECT to_regclass('public.brain_schema_versions') AS relation")
+    if _row_value(cur.fetchone(), "relation") is not None:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM public.brain_schema_versions WHERE version=7) AS installed"
+        )
+        if bool(_row_value(cur.fetchone(), "installed")):
+            _require_exact_controller_membership(
+                cur,
+                controller_role=topology.controller_role,
+            )
     cur.execute(
         "SELECT role_name FROM unnest(%s::text[]) role_name "
         "WHERE pg_has_role(%s,role_name,'MEMBER') ORDER BY role_name",
