@@ -4464,6 +4464,9 @@ def _existing_authority_topology_inventory(
     memberships = _retired_membership_inventory(
         cur, retired_admin_roles=topology.retired_admin_roles
     )
+    default_acl_dependencies = _retired_default_acl_dependencies(
+        cur, retired_admin_roles=topology.retired_admin_roles
+    )
     if not require_v7:
         _reject_retired_role_ownership(cur, retired_admin_roles=topology.retired_admin_roles)
         _validate_existing_retired_memberships(
@@ -4502,6 +4505,7 @@ def _existing_authority_topology_inventory(
         "system_identifier": system_identifier,
         "database_owner_before": _row_value(identity, "database_owner", 4),
         "retired_admin_memberships_before": memberships,
+        "retired_admin_default_acl_dependencies": default_acl_dependencies,
         "database_owner_password_present": _role_password_present(
             cur, topology.database_owner_role
         ),
@@ -4611,7 +4615,8 @@ def _reject_retired_role_ownership(cur, *, retired_admin_roles: tuple[str, ...])
         "SELECT role.rolname,count(*) AS owned_count FROM pg_shdepend dependency "
         "JOIN pg_roles role ON role.oid=dependency.refobjid "
         "WHERE dependency.refclassid='pg_authid'::regclass "
-        "AND dependency.deptype='o' AND role.rolname=ANY(%s) "
+        "AND dependency.deptype='o' AND dependency.classid<>'pg_default_acl'::regclass "
+        "AND role.rolname=ANY(%s) "
         "GROUP BY role.rolname ORDER BY role.rolname",
         (list(retired_admin_roles),),
     )
@@ -4635,6 +4640,32 @@ def _reject_retired_role_ownership(cur, *, retired_admin_roles: tuple[str, ...])
     grants = cur.fetchall()
     if grants:
         raise RuntimeError(f"retired provider admins retain application ACLs: {grants!r}")
+
+
+def _retired_default_acl_dependencies(
+    cur,
+    *,
+    retired_admin_roles: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    """Inventory inert cross-database default ACLs owned by retiring roles.
+
+    A pg_default_acl row affects only objects created later by its owning role.
+    The same atomic transition makes every declared retired role NOLOGIN and
+    NOCREATEROLE and removes all membership paths, so these dependencies are
+    preserved as evidence instead of being mutated across another database.
+    All other owned-object classes remain a hard preflight failure.
+    """
+    cur.execute(
+        "SELECT role.rolname AS role_name,database.datname AS database_name,"
+        "dependency.objid,dependency.objsubid "
+        "FROM pg_shdepend dependency JOIN pg_roles role ON role.oid=dependency.refobjid "
+        "LEFT JOIN pg_database database ON database.oid=dependency.dbid "
+        "WHERE dependency.refclassid='pg_authid'::regclass "
+        "AND dependency.deptype='o' AND dependency.classid='pg_default_acl'::regclass "
+        "AND role.rolname=ANY(%s) ORDER BY role.rolname,database.datname,dependency.objid",
+        (list(retired_admin_roles),),
+    )
+    return tuple(dict(row) for row in cur.fetchall())
 
 
 def _verify_existing_provider_membership(cur, *, topology: BootstrapTopology) -> None:

@@ -724,6 +724,9 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
             root.execute(sql.SQL("CREATE ROLE {} LOGIN NOINHERIT PASSWORD {}").format(
                 sql.Identifier(worker), sql.Literal("worker-password")
             ))
+            root.execute(sql.SQL(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
+            ).format(sql.Identifier(legacy_controller)))
             for role_name in ("brain_schema_migrator", "brain_schema_verifier"):
                 root.execute(sql.SQL("CREATE ROLE {} NOLOGIN INHERIT").format(sql.Identifier(role_name)))
             for role_name in ("brain_status_reader", "brain_policy_controller"):
@@ -865,6 +868,11 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
                 expected_database_name=database_name,
                 expected_system_identifier=identity["system_identifier"],
             )
+            default_acl_dependencies = receipt.inventory["retired_admin_default_acl_dependencies"]
+            assert len(default_acl_dependencies) == 1
+            assert default_acl_dependencies[0]["role_name"] == legacy_controller
+            assert default_acl_dependencies[0]["database_name"] == database_name
+            assert default_acl_dependencies[0]["objsubid"] == 0
 
             assert root.execute(
                 "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
