@@ -799,10 +799,17 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
                         ("20260717_002_lane_specific_canary_pins", "1ee176c419508cd5a9c7004460798d14fd6749addbf293892fd2d859a1b6dd1d"),
                     ],
                 )
+            current_v1_checksum = brain_schema._schema_checksum
+            monkeypatch.setattr(
+                brain_schema,
+                "_schema_checksum",
+                lambda: "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5",
+            )
             with root.cursor() as cur:
                 cur.execute("SET LOCAL ROLE brain_schema_migrator")
                 brain_schema.ensure_brain_schema_v1_in_transaction(cur)
                 cur.execute("RESET ROLE")
+            monkeypatch.setattr(brain_schema, "_schema_checksum", current_v1_checksum)
             root.commit()
             identity = root.execute(
                 "SELECT (pg_control_system()).system_identifier::text AS system_identifier"
@@ -862,6 +869,11 @@ def test_existing_topology_upgrade_closes_legacy_admin_graph_and_installs_v7(
             assert root.execute(
                 "SELECT array_agg(version ORDER BY version) AS versions FROM public.brain_schema_versions"
             ).fetchone()["versions"] == [1, 2, 3, 4, 5, 6, 7]
+            assert root.execute(
+                "SELECT migration_checksum FROM public.brain_schema_versions WHERE version=1"
+            ).fetchone()["migration_checksum"] == (
+                "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5"
+            )
             assert root.execute(
                 "SELECT rolcanlogin,rolinherit,rolcreatedb FROM pg_roles WHERE rolname=%s",
                 (legacy_controller,),

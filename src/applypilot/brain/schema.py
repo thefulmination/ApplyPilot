@@ -33,6 +33,11 @@ _EXPECTED_V4_CHECKSUM = "51c61d0035cd7e503a7824539b56a505727bce8496f70e48f9d8e25
 _EXPECTED_V5_CHECKSUM = "52d1726bb13df54591fcd6343884ec8f6f7d18ab7fbf74b4dc33ba509cb0e559"
 _EXPECTED_V6_CHECKSUM = "74503db87872670bb7db61498fe0f870f0de13928286dc58c6049d57f8dd2955"
 _EXPECTED_V7_CHECKSUM = "d76b037dee1bfd285026ab2503b16be2a39b0c6726eac80a099e3f825ccdfc9f"
+_LEGACY_V1_CHECKSUMS = frozenset({
+    # Canonical V1 ledger value emitted before the PG18 catalog fingerprint
+    # pin correction. The deep catalog verifier below remains mandatory.
+    "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5",
+})
 _MIGRATION_ROLE = "brain_schema_migrator"
 _VERIFIER_ROLE = "brain_schema_verifier"
 _UNPINNED_PG18_CATALOG_HASH = "PG18_PIN_REQUIRED"
@@ -1501,7 +1506,7 @@ def _verify_contract(cur) -> None:
         migration_identity = _MIGRATION_ROLE
         if version["migration_name"] != _MIGRATION_NAME:
             problems.append("migration name mismatch")
-        if version["migration_checksum"] != checksum:
+        if version["migration_checksum"] not in {checksum, *_LEGACY_V1_CHECKSUMS}:
             problems.append("migration checksum mismatch")
         if version["applied_by"] != _MIGRATION_ROLE:
             problems.append(f"migration ledger owner mismatch: expected {_MIGRATION_ROLE}, got {version['applied_by']}")
