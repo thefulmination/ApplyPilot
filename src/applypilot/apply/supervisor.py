@@ -20,15 +20,39 @@ apply subprocess dies, so recovery is automatic instead of a 40-minute manual ca
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from applypilot import config
-from applypilot.apply.chrome import _kill_on_port, BASE_CDP_PORT
+from applypilot.apply.chrome import (
+    BASE_CDP_PORT,
+    _process_exists,
+    reserve_browser_cleanup,
+    terminate_verified_process,
+)
+from applypilot.apply.process_guard import (
+    SpawnedChildGuard,
+    darwin_process_executable,
+    emergency_cleanup_direct_child,
+    parse_ps_lstart_local,
+)
+from applypilot.apply.lifecycle_fault import (
+    LoadedLifecycleFault,
+    identity_digest,
+    enforce_no_lifecycle_faults,
+    legacy_lifecycle_hard_fault_marker,
+    lifecycle_hard_fault_paths,
+    load_lifecycle_hard_fault,
+    persist_lifecycle_hard_fault,
+    remove_lifecycle_fault_if_unchanged,
+)
 
 
 def _applied_count() -> int:
@@ -66,38 +90,562 @@ def _apply_cost_total() -> float:
 _ORPHAN_PATTERN = "_npx|playwright|modelcontextprotocol|@playwright"
 
 
-def _orphan_kill_cmd() -> list[str]:
-    """Platform command to kill orphaned Playwright-MCP node servers. Matched by command
-    line so the desktop app / unrelated node processes are never touched."""
+@dataclass
+class SupervisedProcessIdentity:
+    pid: int
+    created_at: float
+    executable: str
+    command: str
+    launched_at: float
+    ended_at: float | None = None
+    parent_pid: int = 0
+    parent_created_at: float = 0.0
+    parent_executable: str = ""
+    parent_command: str = ""
+
+
+@dataclass(frozen=True)
+class AuxiliaryProcessIdentity:
+    pid: int
+    created_at: float
+    executable: str
+    command: str
+    parent_pid: int
+    parent_created_at: float
+    parent_executable: str
+    parent_command: str
+
+
+@dataclass(frozen=True)
+class ProcessEnumeration:
+    rows: list[dict]
+    complete: bool
+    reason: str = ""
+
+
+def _process_snapshot() -> ProcessEnumeration:
+    """Return minimal process ancestry metadata; callers must hold browser ownership."""
     if sys.platform == "win32":
-        return ["powershell", "-NoProfile", "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-                f"Where-Object {{ $_.CommandLine -match '{_ORPHAN_PATTERN}' }} | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"]
-    # Mirror the Windows branch's Name='node.exe' pre-filter: require a node
-    # executable at the start of the command line so ONLY node processes
-    # (the MCP servers) can match -- never Chromium or python tooling whose
-    # paths merely contain 'playwright'.
-    return ["pkill", "-f", f"(^|/)node .*({_ORPHAN_PATTERN})"]
+        script = (
+            "Get-CimInstance Win32_Process | ForEach-Object {"
+            "[pscustomobject]@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;"
+            "Name=$_.Name;ExecutablePath=$_.ExecutablePath;CommandLine=$_.CommandLine;"
+            "Created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()/1000}} | "
+            "ConvertTo-Json -Compress"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            return ProcessEnumeration([], False, "windows_process_query_failed")
+        if (
+            result.returncode != 0
+            or not result.stdout.strip()
+            or bool(str(getattr(result, "stderr", "") or "").strip())
+        ):
+            return ProcessEnumeration([], False, "windows_process_query_failed")
+        try:
+            raw = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return ProcessEnumeration([], False, "windows_process_output_invalid")
+        rows = raw if isinstance(raw, list) else [raw]
+        if not all(isinstance(row, dict) for row in rows):
+            return ProcessEnumeration([], False, "windows_process_output_invalid")
+        try:
+            parsed = [{
+                "pid": int(row.get("ProcessId") or 0),
+                "ppid": int(row.get("ParentProcessId") or 0),
+                "name": str(row.get("Name") or ""),
+                "executable": str(row.get("ExecutablePath") or ""),
+                "command": str(row.get("CommandLine") or ""),
+                "created": (
+                    float(row["Created"]) if row.get("Created") is not None else None
+                ),
+            } for row in rows]
+        except (TypeError, ValueError):
+            return ProcessEnumeration([], False, "windows_process_output_invalid")
+        return ProcessEnumeration(parsed, True)
+
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,lstart=,comm=,args="],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return ProcessEnumeration([], False, "posix_process_query_failed")
+    if result.returncode != 0:
+        return ProcessEnumeration([], False, "posix_process_query_failed")
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 8)
+        if len(parts) < 8 or not parts[0].isdigit() or not parts[1].isdigit():
+            return ProcessEnumeration([], False, "posix_process_output_invalid")
+        try:
+            created = parse_ps_lstart_local(" ".join(parts[2:7]))
+        except (OSError, OverflowError, ValueError):
+            return ProcessEnumeration([], False, "posix_process_output_invalid")
+        rows.append({
+            "pid": int(parts[0]),
+            "ppid": int(parts[1]),
+            "name": parts[7],
+            "executable": _process_executable(int(parts[0])),
+            "command": parts[8] if len(parts) == 9 else "",
+            "created": created,
+        })
+    return ProcessEnumeration(rows, True)
 
 
-def _cleanup_orphans(log) -> None:
+def _process_executable(pid: int) -> str:
+    if sys.platform == "darwin":
+        return darwin_process_executable(pid)
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return ""
+
+
+def _owner_identity_is_valid(owner: SupervisedProcessIdentity) -> bool:
+    return bool(
+        owner.pid > 0
+        and owner.created_at > 0
+        and owner.launched_at > 0
+        and owner.ended_at is not None
+        and owner.ended_at >= owner.launched_at
+        and owner.executable
+        and "applypilot.cli" in owner.command
+        and "apply" in owner.command
+    )
+
+
+def _associated_auxiliary_pids(
+    processes: list[dict],
+    owner: SupervisedProcessIdentity,
+) -> list[int]:
+    if not _owner_identity_is_valid(owner):
+        return []
+    reused = [row for row in processes if int(row.get("pid") or 0) == owner.pid]
+    if reused:
+        created = reused[0].get("created")
+        if created is None or abs(float(created) - owner.created_at) >= 0.001:
+            return []
+
+    descendants = {owner.pid}
+    changed = True
+    while changed:
+        changed = False
+        for row in processes:
+            pid = int(row.get("pid") or 0)
+            ppid = int(row.get("ppid") or 0)
+            created = row.get("created")
+            within_lifetime = (
+                created is not None
+                and owner.launched_at <= float(created) <= float(owner.ended_at)
+            )
+            if pid and ppid in descendants and pid not in descendants and within_lifetime:
+                descendants.add(pid)
+                changed = True
+    eligible = []
+    for row in processes:
+        pid = int(row.get("pid") or 0)
+        name = os.path.basename(str(row.get("name") or "")).lower()
+        command = str(row.get("command") or "")
+        if (
+            pid in descendants
+            and pid != owner.pid
+            and name in {"node", "node.exe"}
+            and re.search(_ORPHAN_PATTERN, command, flags=re.IGNORECASE)
+        ):
+            eligible.append(pid)
+    return sorted(set(eligible))
+
+
+def _associated_auxiliary_processes(
+    processes: list[dict],
+    owner: SupervisedProcessIdentity,
+) -> list[AuxiliaryProcessIdentity]:
+    rows = {int(row.get("pid") or 0): row for row in processes}
+    approved = []
+    for pid in _associated_auxiliary_pids(processes, owner):
+        row = rows.get(pid)
+        parent = rows.get(int(row.get("ppid") or 0)) if row is not None else None
+        if row is None or parent is None:
+            continue
+        try:
+            created_at = float(row["created"])
+            parent_created_at = float(parent["created"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        executable = str(row.get("executable") or "")
+        command = str(row.get("command") or "")
+        parent_executable = str(parent.get("executable") or "")
+        parent_command = str(parent.get("command") or "")
+        if not executable or not command or not parent_executable or not parent_command:
+            continue
+        approved.append(
+            AuxiliaryProcessIdentity(
+                pid=pid,
+                created_at=created_at,
+                executable=executable,
+                command=command,
+                parent_pid=int(row.get("ppid") or 0),
+                parent_created_at=parent_created_at,
+                parent_executable=parent_executable,
+                parent_command=parent_command,
+            )
+        )
+    return approved
+
+
+def _has_incomplete_owned_auxiliary_candidate(
+    processes: list[dict],
+    owner: SupervisedProcessIdentity,
+    approved: list[AuxiliaryProcessIdentity],
+) -> bool:
+    rows = {int(row.get("pid") or 0): row for row in processes}
+    current_owner = rows.get(owner.pid)
+    if current_owner is not None:
+        try:
+            owner_created = float(current_owner["created"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        if abs(owner_created - owner.created_at) >= 0.001:
+            return False
+        owner_executable = str(current_owner.get("executable") or "")
+        owner_command = str(current_owner.get("command") or "")
+        if (
+            not owner_executable
+            or not owner_command
+            or os.path.normcase(owner_executable) != os.path.normcase(owner.executable)
+            or owner_command != owner.command
+        ):
+            return True
+
+    descendants = {owner.pid}
+    changed = True
+    while changed:
+        changed = False
+        for row in processes:
+            pid = int(row.get("pid") or 0)
+            ppid = int(row.get("ppid") or 0)
+            if pid and ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+
+    approved_pids = {candidate.pid for candidate in approved}
+    for row in processes:
+        pid = int(row.get("pid") or 0)
+        if pid == owner.pid or pid not in descendants:
+            continue
+        name = os.path.basename(str(row.get("name") or "")).lower()
+        executable = str(row.get("executable") or "")
+        command = str(row.get("command") or "")
+        if row.get("created") is None or not name or not executable or not command:
+            return True
+        marker = bool(re.search(_ORPHAN_PATTERN, command, flags=re.IGNORECASE))
+        potentially_auxiliary = marker
+        if not potentially_auxiliary:
+            continue
+        created = row.get("created")
+        if created is not None:
+            try:
+                if not owner.launched_at <= float(created) <= float(owner.ended_at):
+                    continue
+            except (TypeError, ValueError):
+                return True
+        if pid not in approved_pids:
+            return True
+    return False
+
+
+def _validate_and_kill_auxiliary(
+    approved: AuxiliaryProcessIdentity,
+    owner: SupervisedProcessIdentity,
+) -> bool:
+    if not _auxiliary_authority_is_current(approved, owner):
+        return False
+    return terminate_verified_process(
+        pid=approved.pid,
+        created_at=approved.created_at,
+        executable=approved.executable,
+        final_authority=lambda: _auxiliary_authority_is_current(approved, owner),
+    )
+
+
+def _auxiliary_authority_is_current(
+    approved: AuxiliaryProcessIdentity,
+    owner: SupervisedProcessIdentity,
+) -> bool:
+    if not _owner_identity_is_valid(owner):
+        return False
+    snapshot = _process_snapshot()
+    if not snapshot.complete:
+        return False
+    live_rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
+    live = live_rows.get(approved.pid)
+    parent = live_rows.get(approved.parent_pid)
+    if live is None or parent is None:
+        return False
+    try:
+        identity_matches = (
+            int(live.get("pid") or 0) == approved.pid
+            and int(live.get("ppid") or 0) == approved.parent_pid
+            and abs(float(live["created"]) - approved.created_at) < 0.001
+            and os.path.normcase(str(live.get("executable") or ""))
+            == os.path.normcase(approved.executable)
+            and str(live.get("command") or "") == approved.command
+            and int(parent.get("pid") or 0) == approved.parent_pid
+            and abs(float(parent["created"]) - approved.parent_created_at) < 0.001
+            and os.path.normcase(str(parent.get("executable") or ""))
+            == os.path.normcase(approved.parent_executable)
+            and str(parent.get("command") or "") == approved.parent_command
+            and owner.launched_at <= float(live["created"]) <= float(owner.ended_at)
+            and owner.launched_at <= float(parent["created"]) <= float(owner.ended_at)
+            and re.search(_ORPHAN_PATTERN, approved.command, flags=re.IGNORECASE)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(identity_matches)
+
+
+def _capture_supervised_identity(
+    pid: int,
+    launched_at: float,
+) -> SupervisedProcessIdentity | None:
+    try:
+        snapshot = _process_snapshot()
+        if not snapshot.complete:
+            return None
+        rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
+        row = rows[pid]
+        parent_pid = int(row.get("ppid") or 0)
+        parent = rows[parent_pid]
+        created = row.get("created")
+        parent_created = parent.get("created")
+        executable = str(row.get("executable") or "")
+        command = str(row.get("command") or "")
+        parent_executable = str(parent.get("executable") or "")
+        parent_command = str(parent.get("command") or "")
+        if (
+            created is None
+            or parent_created is None
+            or not executable
+            or not parent_executable
+            or "applypilot.cli" not in command
+            or "apply" not in command
+        ):
+            return None
+        return SupervisedProcessIdentity(
+            pid=pid,
+            created_at=float(created),
+            executable=executable,
+            command=command,
+            launched_at=launched_at,
+            parent_pid=parent_pid,
+            parent_created_at=float(parent_created),
+            parent_executable=parent_executable,
+            parent_command=parent_command,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _capture_guarded_supervised_child(
+    process: subprocess.Popen,
+    launched_at: float,
+) -> SupervisedProcessIdentity:
+    guard = SpawnedChildGuard.acquire(process)
+    if guard is None:
+        cleaned = emergency_cleanup_direct_child(process)
+        if not cleaned:
+            _persist_hard_fault(
+                "supervisor spawn guard unavailable cleanup uncertain", pid=process.pid
+            )
+        raise RuntimeError("supervisor child has no stable spawn guard")
+    try:
+        identity = _capture_supervised_identity(process.pid, launched_at)
+    except Exception as exc:
+        cleaned = guard.terminate_and_reap()
+        if not cleaned:
+            _persist_hard_fault(
+                "supervisor identity capture exception cleanup uncertain", pid=process.pid
+            )
+        raise RuntimeError("supervisor child identity capture raised") from exc
+    if identity is None:
+        cleaned = guard.terminate_and_reap()
+        if not cleaned:
+            _persist_hard_fault(
+                "supervisor identity capture missing cleanup uncertain", pid=process.pid
+            )
+        raise RuntimeError("supervisor child identity capture failed")
+    guard.release()
+    return identity
+
+
+def _hard_fault_marker() -> Path:
+    return legacy_lifecycle_hard_fault_marker()
+
+
+def _persist_hard_fault(
+    reason: str,
+    identity: SupervisedProcessIdentity | None = None,
+    *,
+    pid: int | None = None,
+) -> Path:
+    return persist_lifecycle_hard_fault(
+        reason,
+        pid=identity.pid if identity is not None else int(pid or 0),
+        created_at=identity.created_at if identity is not None else 0.0,
+        executable=identity.executable if identity is not None else "",
+        command=identity.command if identity is not None else "",
+    )
+
+
+def _remove_reconciled_fault(record: LoadedLifecycleFault) -> None:
+    if not remove_lifecycle_fault_if_unchanged(record.path, record.raw):
+        raise RuntimeError("hard-fault changed during reconciliation; faults retained")
+
+
+def _reconcile_hard_fault(path: Path) -> None:
+    try:
+        record = load_lifecycle_hard_fault(path)
+        payload = record.payload
+        pid = int(payload["pid"])
+        created_at = float(payload.get("created_at") or 0.0)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError("hard-fault payload is invalid and was not cleared") from exc
+    if pid <= 0:
+        raise RuntimeError("hard-fault has no reconcilable PID; fault retained")
+    snapshot = _process_snapshot()
+    if not snapshot.complete:
+        raise RuntimeError("hard-fault process query uncertain; fault retained")
+    rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
+    current = rows.get(pid)
+    if current is None:
+        try:
+            exists = _process_exists(pid)
+        except Exception as exc:
+            raise RuntimeError("hard-fault PID status uncertain; fault retained") from exc
+        if exists is False:
+            _remove_reconciled_fault(record)
+            return
+        raise RuntimeError("hard-fault reconciliation uncertain; fault retained")
+    full_identity = bool(
+        created_at > 0
+        and str(payload.get("executable_sha256") or "").startswith("sha256:")
+        and str(payload.get("command_sha256") or "").startswith("sha256:")
+    )
+    if not full_identity:
+        raise RuntimeError("hard-fault lacks identity; live PID may remain; fault retained")
+    try:
+        current_created = float(current["created"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("hard-fault live identity uncertain; fault retained") from exc
+    if current_created <= 0:
+        raise RuntimeError("hard-fault live identity uncertain; fault retained")
+    if abs(current_created - created_at) >= 0.001:
+        _remove_reconciled_fault(record)
+        return
+    executable = str(current.get("executable") or "")
+    command = str(current.get("command") or "")
+    if not executable or not command:
+        raise RuntimeError("hard-fault live identity uncertain; fault retained")
+    exact = (
+        identity_digest(executable) == payload.get("executable_sha256")
+        and identity_digest(command) == payload.get("command_sha256")
+    )
+    if not exact:
+        raise RuntimeError("hard-fault live identity mismatch uncertain; fault retained")
+
+    def final_authority() -> bool:
+        live_snapshot = _process_snapshot()
+        if not live_snapshot.complete:
+            return False
+        live = {
+            int(row.get("pid") or 0): row for row in live_snapshot.rows
+        }.get(pid)
+        return bool(
+            live is not None
+            and live.get("created") is not None
+            and abs(float(live["created"]) - created_at) < 0.001
+            and identity_digest(str(live.get("executable") or ""))
+            == payload.get("executable_sha256")
+            and identity_digest(str(live.get("command") or ""))
+            == payload.get("command_sha256")
+        )
+
+    if not terminate_verified_process(
+        pid=pid,
+        created_at=created_at,
+        executable=executable,
+        final_authority=final_authority,
+    ):
+        raise RuntimeError("hard-fault exact-child termination was not proven; fault retained")
+    _remove_reconciled_fault(record)
+
+
+def _enforce_hard_fault_gate() -> None:
+    paths = lifecycle_hard_fault_paths()
+    if not paths:
+        enforce_no_lifecycle_faults()
+        return
+    if os.environ.get("APPLYPILOT_RECONCILE_HARD_FAULT", "").strip() != "1":
+        enforce_no_lifecycle_faults()
+    for path in paths:
+        _reconcile_hard_fault(path)
+    enforce_no_lifecycle_faults()
+
+
+def _cleanup_orphans(
+    log,
+    *,
+    owner: SupervisedProcessIdentity | None = None,
+) -> bool:
     """Between attempts: free the CDP port (kill any leftover Chrome) and kill orphaned
     Playwright-MCP node servers so a fresh agent can't be hijacked. A hard-killed run
     leaves these behind. Best-effort; never raises."""
+    ownership = reserve_browser_cleanup(
+        0,
+        BASE_CDP_PORT,
+        config.CHROME_WORKER_DIR / "worker-0",
+    )
+    if ownership is None:
+        log("ORPHAN-CLEANUP: browser slot occupied; left all processes untouched")
+        return False
     try:
-        _kill_on_port(BASE_CDP_PORT)
-    except Exception:
-        pass
-    # Kill orphaned Playwright MCP node servers (apply's browser automation). Matched by
-    # command line so we never touch the desktop app or unrelated node processes.
-    try:
-        subprocess.run(
-            _orphan_kill_cmd(),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        snapshot = _process_snapshot()
+        if not snapshot.complete:
+            log(f"ORPHAN-CLEANUP: process enumeration uncertain ({snapshot.reason})")
+            return False
+        processes = snapshot.rows
+        approved_auxiliaries = (
+            _associated_auxiliary_processes(processes, owner) if owner is not None else []
         )
+        if owner is not None and _has_incomplete_owned_auxiliary_candidate(
+            processes, owner, approved_auxiliaries
+        ):
+            log("ORPHAN-CLEANUP: owned auxiliary identity incomplete")
+            return False
+        browser_cleaned = ownership.cleanup_browser()
+        auxiliaries_cleaned = True
+        for approved in approved_auxiliaries:
+            try:
+                if not _validate_and_kill_auxiliary(approved, owner):
+                    auxiliaries_cleaned = False
+            except Exception:
+                auxiliaries_cleaned = False
+        return browser_cleaned and auxiliaries_cleaned
     except Exception:
-        pass
+        return False
+    finally:
+        ownership.release()
 
 
 def supervise(
@@ -122,6 +670,7 @@ def supervise(
     uses an absolute "stop when COUNT(applied) >= target" -- this composes across
     restarts (an outer keep-alive task can relaunch this and it picks up where it left
     off), and on reaching it writes a done-marker the task watches to stop relaunching."""
+    _enforce_hard_fault_gate()
     log_path = config.LOG_DIR / "supervisor.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     done_marker = config.DB_PATH.parent / "keepalive.done"
@@ -179,6 +728,7 @@ def supervise(
 
     start = time.monotonic()
     attempt = 0
+    previous_apply_identity: SupervisedProcessIdentity | None = None
     log(f"SUPERVISOR start: total_budget=${total_cost_usd:.0f}, baseline_applied={baseline}, "
         f"baseline_cost=${max(0.0, baseline_cost):.2f}, stall={stall_minutes}m, "
         f"max_attempts={max_attempts}, max_hours={max_hours}, est_cost_per_apply=${est_cost_per_apply}")
@@ -187,26 +737,30 @@ def supervise(
     while True:
         elapsed_h = (time.monotonic() - start) / 3600.0
         if attempt >= max_attempts:
-            log(f"STOP: hit max_attempts={max_attempts}"); break
+            log(f"STOP: hit max_attempts={max_attempts}")
+            break
         if elapsed_h >= max_hours:
-            log(f"STOP: hit max_hours={max_hours:.1f}"); break
+            log(f"STOP: hit max_hours={max_hours:.1f}")
+            break
 
         applied_now = _applied_count()
         spent = session_spend(applied_now)
         if target_applied > 0:
             if applied_now >= target_applied:
                 log(f"STOP: applied target {target_applied} reached (applied={applied_now})")
-                write_done(f"target {target_applied} reached"); break
+                write_done(f"target {target_applied} reached")
+                break
             remaining = max(est_cost_per_apply, (target_applied - applied_now) * est_cost_per_apply)
         else:
             remaining = total_cost_usd - spent
             if remaining <= max(0.5, est_cost_per_apply):
                 log(f"STOP: budget ~${total_cost_usd:.0f} reached "
                     f"({applied_now - baseline} applies, spent ${spent:.2f})")
-                write_done("budget reached"); break
+                write_done("budget reached")
+                break
 
         attempt += 1
-        _cleanup_orphans(log)
+        _require_orphan_cleanup(log, previous_apply_identity)
         offsite_backup()  # periodic off-machine backup at each restart boundary
         # Reclaim any lease stranded by the previous crash so its job is retryable.
         try:
@@ -236,8 +790,11 @@ def supervise(
         log(f"ATTEMPT {attempt}: launching apply (spent ${spent:.2f}, "
             f"per-attempt cap ${remaining:.2f}, applied={applied_now})")
         out_path = config.LOG_DIR / f"supervised_attempt_{attempt}.out"
+        launched_at = time.time()
         with open(out_path, "w", encoding="utf-8") as out:
+            _enforce_hard_fault_gate()
             proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=child_env)
+        current_apply_identity = _capture_guarded_supervised_child(proc, launched_at)
 
         last_applied = applied_now
         last_progress = time.monotonic()
@@ -258,7 +815,7 @@ def supervise(
                    (session_spend(cur) >= total_cost_usd)
             if done:
                 log(f"STOP reached mid-attempt (applied={cur}) -- stopping run")
-                _kill_tree(proc)
+                _require_termination(proc, current_apply_identity, log, "budget stop")
                 write_done("target/budget reached mid-attempt")
                 offsite_backup(force=True)  # final off-machine backup on stop
                 log("SUPERVISOR done.")
@@ -272,25 +829,102 @@ def supervise(
             if quiet >= stall_minutes and stuck >= stall_minutes:
                 log(f"ATTEMPT {attempt} STALLED (no output {quiet:.0f}m, no apply {stuck:.0f}m) "
                     f"-- killing to restart")
-                _kill_tree(proc)
+                _require_termination(proc, current_apply_identity, log, "stall restart")
                 break
+
+        if current_apply_identity is not None:
+            current_apply_identity.ended_at = time.time()
+        previous_apply_identity = current_apply_identity
 
     offsite_backup(force=True)  # final off-machine backup on stop
     log(f"SUPERVISOR done: {_applied_count() - baseline} applies this session "
         f"over {attempt} attempt(s), {elapsed_h:.1f}h.")
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """Kill the apply subprocess and its children (Chrome/agent/MCP)."""
-    if proc.poll() is not None:
-        return
+def _terminate_process(
+    proc: subprocess.Popen,
+    expected: SupervisedProcessIdentity | None,
+) -> bool:
+    """Terminate the exact supervised child captured at spawn, never a bare PID."""
+    if expected is None or proc.pid != expected.pid or proc.poll() is not None:
+        return False
     try:
-        import platform
-        if platform.system() == "Windows":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        else:
-            proc.kill()
+        if not _supervised_authority_is_current(expected):
+            return False
+        if not terminate_verified_process(
+            pid=expected.pid,
+            created_at=expected.created_at,
+            executable=expected.executable,
+            final_authority=lambda: (
+                proc.pid == expected.pid
+                and proc.poll() is None
+                and _supervised_authority_is_current(expected)
+            ),
+            direct_child=proc,
+        ):
+            return False
         proc.wait(timeout=20)
-    except Exception:
-        pass
+        return True
+    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def _require_termination(
+    proc: subprocess.Popen,
+    expected: SupervisedProcessIdentity | None,
+    log,
+    reason: str,
+) -> None:
+    if _terminate_process(proc, expected):
+        return
+    message = f"HARD-FAULT: {reason} termination could not be proven; child may still be live"
+    _persist_hard_fault(reason, expected, pid=proc.pid)
+    log(message)
+    raise RuntimeError(message)
+
+
+def _require_orphan_cleanup(log, owner: SupervisedProcessIdentity | None) -> None:
+    if _cleanup_orphans(log, owner=owner):
+        return
+    message = "HARD-FAULT: orphan cleanup could not be proven; refusing next launch"
+    _persist_hard_fault("orphan cleanup uncertain", pid=0)
+    log(message)
+    raise RuntimeError(message)
+
+
+def _supervised_authority_is_current(expected: SupervisedProcessIdentity) -> bool:
+    try:
+        now = time.time()
+        if (
+            expected.launched_at <= 0
+            or now < expected.launched_at
+            or expected.parent_pid != os.getpid()
+            or expected.parent_created_at <= 0
+            or not expected.parent_executable
+            or not expected.parent_command
+            or "applypilot.cli" not in expected.command
+            or "apply" not in expected.command
+        ):
+            return False
+        snapshot = _process_snapshot()
+        if not snapshot.complete:
+            return False
+        rows = {int(row.get("pid") or 0): row for row in snapshot.rows}
+        child = rows.get(expected.pid)
+        parent = rows.get(expected.parent_pid)
+        if child is None or parent is None:
+            return False
+        return bool(
+            int(child.get("ppid") or 0) == expected.parent_pid
+            and abs(float(child["created"]) - expected.created_at) < 0.001
+            and os.path.normcase(str(child.get("executable") or ""))
+            == os.path.normcase(expected.executable)
+            and str(child.get("command") or "") == expected.command
+            and abs(float(parent["created"]) - expected.parent_created_at) < 0.001
+            and os.path.normcase(str(parent.get("executable") or ""))
+            == os.path.normcase(expected.parent_executable)
+            and str(parent.get("command") or "") == expected.parent_command
+            and expected.launched_at <= float(child["created"]) <= now
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        return False

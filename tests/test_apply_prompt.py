@@ -187,6 +187,35 @@ def test_build_prompt_dry_run_emits_dry_run_code(tmp_path: Path, monkeypatch) ->
     assert "Do NOT output RESULT:APPLIED" in text
 
 
+def test_controlled_cycle_documented_job_satisfies_real_prompt_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tailored_txt = tmp_path / "tailored.txt"
+    tailored_txt.write_text("Tailored resume text", encoding="utf-8")
+    tailored_txt.with_suffix(".pdf").write_bytes(b"%PDF-1.4\n")
+
+    _patch_prompt_config(monkeypatch, tmp_path)
+    controlled_url = "https://boards.greenhouse.io/example/jobs/123"
+    job = {
+        "url": controlled_url,
+        "application_url": controlled_url,
+        "title": "Controlled email-auth acceptance",
+        "company": "Owner-approved controlled target",
+        "site": "Owner-approved controlled target",
+        "score": 10,
+        "fit_score": 10,
+        "description": "Owner-approved controlled acceptance cycle.",
+        "source": "controlled_acceptance",
+        "tailored_resume_path": str(tailored_txt),
+    }
+
+    text = prompt.build_prompt(job, "Tailored resume text", worker_id=9)
+
+    assert "Controlled email-auth acceptance" in text
+    assert "Owner-approved controlled target" in text
+    assert "Fit Score: 10/10" in text
+
+
 def test_email_verification_uses_relay_result_not_direct_gmail(tmp_path: Path, monkeypatch) -> None:
     tailored_txt = tmp_path / "tailored.txt"
     tailored_txt.write_text("Tailored resume text", encoding="utf-8")

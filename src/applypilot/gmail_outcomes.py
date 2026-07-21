@@ -27,6 +27,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+from applypilot.ats_domains import ATS_SENDER_DOMAINS
+
 log = logging.getLogger(__name__)
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -221,21 +223,7 @@ _ACK_BODY = [
 # subdomains ATS platforms actually send from (e.g. greenhouse-mail.io, teamtailor-mail
 # .com) -- the bare board domains (greenhouse.io) never appear as the From, so matching
 # and ATS detection used to miss every greenhouse/teamtailor confirmation.
-_ATS_DOMAINS: frozenset[str] = frozenset({
-    "greenhouse.io", "greenhouse-mail.io",
-    "lever.co", "hire.lever.co",
-    "workday.com", "myworkdayjobs.com", "myworkday.com",
-    "icims.com", "brassring.com",
-    "smartrecruiters.com", "smartrecruiters-mail.com",
-    "workable.com", "workablemail.com", "taleo.net",
-    "jobvite.com", "jobvite-mail.com", "recruitee.com",
-    "ashbyhq.com", "ashbyhq-mail.com", "ashby.email",
-    "successfactors.com", "applytojob.com",
-    "bamboohr.com", "rippling.com",
-    "eightfold.ai", "beamery.com", "paradox.ai", "fountain.com",
-    "dover.com", "dover.io", "teamtailor.com", "teamtailor-mail.com",
-    "pinpointhq.com", "comeet.co", "gem.com", "breezy.hr", "hiringthing.com",
-})
+_ATS_DOMAINS = ATS_SENDER_DOMAINS
 
 # Generic webmail domains that give no company signal
 _GENERIC_DOMAINS: frozenset[str] = frozenset({

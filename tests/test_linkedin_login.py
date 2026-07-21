@@ -11,7 +11,18 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from applypilot.apply import chrome
+from applypilot.apply import lifecycle_fault
+
+
+@pytest.fixture(autouse=True)
+def _isolate_lifecycle_faults(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle_fault.config, "DB_PATH", tmp_path / "applypilot.db")
+    monkeypatch.setattr(chrome, "_chrome_procs", {})
+    monkeypatch.setattr(chrome, "_browser_reservations", {})
+    monkeypatch.setattr(chrome, "_job_handles", {})
 
 
 def _make_cookies(profile_dir: Path, cookies: list[tuple[str, str]]) -> None:
@@ -67,25 +78,145 @@ class TestLinkedInLoginPersistence:
 
         class FakeProc:
             pid = 12345
+            alive = True
+            _handle = 9001
 
             def poll(self):
-                return None
+                return None if self.alive else 0
 
+            def wait(self, timeout=None):
+                return 0 if not self.alive else None
+
+        proc = FakeProc()
+        monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+        monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
         monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
         monkeypatch.setattr(config, "resolve_browser_path", lambda browser: "chrome.exe")
-        monkeypatch.setattr(chrome, "_kill_on_port", lambda port: None)
-        monkeypatch.setattr(chrome, "_kill_process_tree", lambda pid: None)
-        monkeypatch.setattr(chrome.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+        seed = tmp_path / chrome.SEED_PROFILE_NAME
+        identity = chrome.BrowserProcessIdentity(
+            pid=proc.pid,
+            created_at=10.0,
+            executable="chrome.exe",
+            command=(
+                f"chrome.exe --remote-debugging-port={chrome.LINKEDIN_LOGIN_CDP_PORT} "
+                f'--user-data-dir="{seed}"'
+            ),
+            profile_dir=str(seed),
+            port=chrome.LINKEDIN_LOGIN_CDP_PORT,
+            parent_pid=50,
+            parent_created_at=5.0,
+            parent_executable="python.exe",
+            parent_command="python applypilot-worker.py",
+        )
+        monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *args: True)
+        monkeypatch.setattr(
+            chrome,
+            "_acquire_spawn_guard",
+            lambda process: chrome._SpawnGuard(process, "windows", process._handle),
+        )
+        monkeypatch.setattr(chrome, "_resume_windows_process", lambda handle: True)
+        monkeypatch.setattr(
+            chrome,
+            "_kill_process_tree",
+            lambda process, expected, reservation: setattr(proc, "alive", False) or True,
+        )
+        monkeypatch.setattr(chrome, "_process_identity", lambda pid: identity)
+        monkeypatch.setattr(
+            chrome,
+            "_windows_handle_identity",
+            lambda _handle: (proc.pid, identity.created_at, identity.executable),
+        )
+        monkeypatch.setattr(chrome.subprocess, "Popen", lambda *args, **kwargs: proc)
         monkeypatch.setattr(chrome, "_has_linkedin_session_cdp", lambda port: True)
+        monkeypatch.setattr(chrome, "_port_is_listening", lambda port: False)
         monkeypatch.setattr(chrome, "has_linkedin_session", lambda profile_dir: False)
         times = [0.0, 0.0, 11.0]
-        monkeypatch.setattr(chrome.time, "time", lambda: times.pop(0) if times else 11.0)
+        monkeypatch.setattr(chrome.time, "monotonic", lambda: times.pop(0) if times else 11.0)
         monkeypatch.setattr(chrome.time, "sleep", lambda seconds: None)
 
         ok, seed = chrome.linkedin_login(timeout_seconds=10, poll_seconds=0)
 
         assert ok is False
         assert seed == tmp_path / chrome.SEED_PROFILE_NAME
+
+    def test_cleanup_failure_overrides_success(self, tmp_path, monkeypatch):
+        from applypilot import config
+
+        class FakeProc:
+            pid = 12345
+            _handle = 9001
+
+            def poll(self):
+                return 0
+
+        proc = FakeProc()
+        seed = tmp_path / chrome.SEED_PROFILE_NAME
+        monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+        monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
+        monkeypatch.setattr(config, "resolve_browser_path", lambda _browser: "chrome.exe")
+        monkeypatch.setattr(chrome, "_port_is_listening", lambda _port: False)
+        monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+        monkeypatch.setattr(
+            chrome,
+            "_acquire_spawn_guard",
+            lambda process: chrome._SpawnGuard(process, "windows", process._handle),
+        )
+        monkeypatch.setattr(chrome, "_record_launched_browser_identity", lambda *_args: None)
+        monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *_args: True)
+        monkeypatch.setattr(chrome, "_resume_windows_process", lambda _handle: True)
+        monkeypatch.setattr(chrome, "has_linkedin_session", lambda _profile: True)
+        monkeypatch.setattr(chrome, "cleanup_worker", lambda *_args: False)
+
+        with pytest.raises(
+            lifecycle_fault.LifecycleHardFault,
+            match="cleanup could not be proven",
+        ):
+            chrome.linkedin_login(timeout_seconds=1, poll_seconds=0)
+
+        assert seed.exists()
+        assert len(lifecycle_fault.lifecycle_hard_fault_paths()) == 1
+
+    def test_cleanup_failure_preserves_login_error_as_cause(self, tmp_path, monkeypatch):
+        from applypilot import config
+
+        class FakeProc:
+            pid = 12345
+            _handle = 9001
+
+            def poll(self):
+                return None
+
+        proc = FakeProc()
+        monkeypatch.setenv("APPLYPILOT_BROWSER_LOCK_DIR", str(tmp_path / "locks"))
+        monkeypatch.setattr(chrome.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(config, "CHROME_WORKER_DIR", tmp_path)
+        monkeypatch.setattr(config, "resolve_browser_path", lambda _browser: "chrome.exe")
+        monkeypatch.setattr(chrome, "_port_is_listening", lambda _port: False)
+        monkeypatch.setattr(chrome.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+        monkeypatch.setattr(
+            chrome,
+            "_acquire_spawn_guard",
+            lambda process: chrome._SpawnGuard(process, "windows", process._handle),
+        )
+        monkeypatch.setattr(chrome, "_record_launched_browser_identity", lambda *_args: None)
+        monkeypatch.setattr(chrome, "_assign_kill_on_close_job", lambda *_args: True)
+        monkeypatch.setattr(chrome, "_resume_windows_process", lambda _handle: True)
+        monkeypatch.setattr(
+            chrome,
+            "has_linkedin_session",
+            lambda _profile: (_ for _ in ()).throw(ValueError("cookie read failed")),
+        )
+        monkeypatch.setattr(chrome, "cleanup_worker", lambda *_args: False)
+
+        with pytest.raises(
+            lifecycle_fault.LifecycleHardFault,
+            match="cleanup could not be proven",
+        ) as caught:
+            chrome.linkedin_login(timeout_seconds=1, poll_seconds=0)
+
+        assert isinstance(caught.value.__cause__, ValueError)
+        assert str(caught.value.__cause__) == "cookie read failed"
 
 
 class TestSeedClonePreference:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -35,7 +36,12 @@ def _connect():
     return conn
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    now_fn: Callable[[], datetime] | None = None,
+) -> int:
+    now_fn = now_fn or (lambda: datetime.now(ET))
     parser = argparse.ArgumentParser(prog="applypilot-fleet-control")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -63,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
                 allow_patterns=args.allow or ["home", "mac", "mac-*"],
                 block_patterns=args.block or ["*"],
                 reason=args.reason,
+                now=now_fn(),
             )
             print(f"created|{policy_id}|{args.name}")
             return 0

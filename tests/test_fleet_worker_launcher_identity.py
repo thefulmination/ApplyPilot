@@ -64,6 +64,15 @@ def test_worker_launcher_probes_fleet_pg_before_starting_apply_loop():
     assert "before starting worker" in script
 
 
+def test_direct_worker_launcher_enforces_lifecycle_fault_gate_before_exec():
+    script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
+
+    gate = script.index("enforce_no_lifecycle_faults")
+    launch = script.index("& $exe --dsn")
+    assert gate < launch
+    assert "operator reconciliation is required" in script
+
+
 def test_windows_apply_worker_forces_inbox_relay_not_direct_gmail():
     script = Path("run-fleet-worker.ps1").read_text(encoding="utf-8")
 

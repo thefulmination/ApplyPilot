@@ -18,9 +18,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit
 
 from rich.console import Console
 from rich.live import Live
@@ -28,13 +31,24 @@ from rich.live import Live
 from applypilot import config
 from applypilot import tenants as tenants_mod
 from applypilot.applications import record_application
+from applypilot.ats_domains import ATS_SENDER_DOMAINS
 from applypilot.database import get_connection
 from applypilot.apply import prompt as prompt_mod
 from applypilot import inbox_auth
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
+    reset_worker_dir, cleanup_on_exit,
     BASE_CDP_PORT,
+)
+from applypilot.apply.process_guard import (
+    SpawnedChildGuard,
+    emergency_cleanup_direct_child,
+)
+from applypilot.apply.lifecycle_fault import (
+    LifecycleHardFault,
+    enforce_no_lifecycle_faults,
+    persist_lifecycle_hard_fault,
+    require_browser_cleanup,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
@@ -176,11 +190,373 @@ _stop_event = threading.Event()
 
 # Track active apply-agent processes for skip (Ctrl+C) handling
 _agent_procs: dict[int, subprocess.Popen] = {}
+_agent_guards: dict[int, SpawnedChildGuard] = {}
 # Last apply-agent run stats per worker (cost_usd / tokens). run_job records cost to the
 # home SQLite (llm_usage); the cloud fleet has no SQLite, so the container worker reads the
 # real per-job cost from here to write into Postgres (drives the spend cap). Home unaffected.
 _last_run_stats: dict[int, dict] = {}
+INBOX_AUTH_REDACTION = "[INBOX_AUTH_REDACTED]"
+MAX_INBOX_AUTH_HINT_BYTES = 64 * 1024
+_AUTH_SECRET_MATERIAL_MULTIPLIER = 128
+_MIN_AUTH_SECRET_MATERIAL_BYTES = 4096
+_AUTH_SECRET_WORK_MULTIPLIER = 64
+_MIN_AUTH_SECRET_WORK_BYTES = 4096
+
+
+class _InboxAuthHintRejected(ValueError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _secret_material_budget(value: str) -> int:
+    input_bytes = len(value.encode("utf-8", errors="strict"))
+    return max(
+        _MIN_AUTH_SECRET_MATERIAL_BYTES,
+        input_bytes * _AUTH_SECRET_MATERIAL_MULTIPLIER,
+    )
+
+
+def _percent_escape_case(value: str, *, upper: bool) -> str:
+    def replace(match: re.Match) -> str:
+        digits = match.group(1)
+        return "%" + (digits.upper() if upper else digits.lower())
+
+    return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
+
+
+def _progressive_percent_decode_layers(value: str) -> Iterator[str]:
+    current = value
+    while True:
+        yield current
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        if len(decoded) >= len(current):
+            raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+        current = decoded
+
+
+def _exact_secret_variants(value: str) -> tuple[str, ...]:
+    """Return every exact decode layer and its relevant encoded forms."""
+    if not value:
+        return ()
+    variants: dict[str, None] = {}
+    material_bytes = 0
+    material_budget = _secret_material_budget(value)
+
+    def add(candidate: str) -> None:
+        nonlocal material_bytes
+        if not candidate or candidate in variants:
+            return
+        candidate_bytes = len(candidate.encode("utf-8", errors="strict"))
+        material_bytes += candidate_bytes
+        if material_bytes > material_budget:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+        variants[candidate] = None
+
+    for current in _progressive_percent_decode_layers(value):
+        plus_spaced = current.replace("+", " ")
+        plus_decoded = unquote_plus(current)
+        for candidate in (current, plus_spaced, plus_decoded):
+            add(candidate)
+            add(_percent_escape_case(candidate, upper=True))
+            add(_percent_escape_case(candidate, upper=False))
+            add(quote(candidate, safe=""))
+            add(quote_plus(candidate, safe=""))
+    return tuple(variants)
+
+
+def _trusted_ats_host_suffix(hostname: str) -> str | None:
+    matches = [
+        domain
+        for domain in ATS_SENDER_DOMAINS
+        if hostname == domain or hostname.endswith(f".{domain}")
+    ]
+    return max(matches, key=lambda domain: (domain.count("."), len(domain))) if matches else None
+
+
+def _raw_url_port(netloc: str) -> str | None:
+    authority = netloc.rpartition("@")[2]
+    if authority.startswith("["):
+        bracket = authority.find("]")
+        if bracket < 0 or authority[bracket + 1:bracket + 2] != ":":
+            return None
+        return authority[bracket + 2:] or None
+    _host, separator, port = authority.rpartition(":")
+    return port if separator and port else None
+
+
+def _decode_url_structural_delimiters(value: str) -> str:
+    delimiters = frozenset(":/?#@;&=\\")
+
+    def replace(match: re.Match) -> str:
+        decoded = chr(int(match.group(1), 16))
+        return decoded if decoded in delimiters else match.group(0)
+
+    return re.sub(r"%([0-9A-Fa-f]{2})", replace, value)
+
+
+def _magic_link_secrets(url: str) -> set[str]:
+    url_bytes = len(url.encode("utf-8", errors="strict"))
+    if url_bytes > MAX_INBOX_AUTH_HINT_BYTES:
+        raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
+    secrets: set[str] = set()
+    derived: set[str] = set()
+    pending: deque[str] = deque()
+    material_bytes = 0
+    material_budget = _secret_material_budget(url)
+    work_bytes = 0
+    work_budget = max(
+        _MIN_AUTH_SECRET_WORK_BYTES,
+        url_bytes * _AUTH_SECRET_WORK_MULTIPLIER,
+    )
+
+    def add_secret(value: str) -> None:
+        nonlocal material_bytes
+        if not value:
+            return
+        plus_spaced = value.replace("+", " ")
+        plus_decoded = unquote_plus(value)
+        candidates = (value, plus_spaced, plus_decoded)
+        variants = (
+            candidate_variant
+            for candidate in candidates
+            for candidate_variant in (
+                candidate,
+                _percent_escape_case(candidate, upper=True),
+                _percent_escape_case(candidate, upper=False),
+                quote(candidate, safe=""),
+                quote_plus(candidate, safe=""),
+            )
+        )
+        for variant in variants:
+            if not variant:
+                continue
+            if variant in secrets:
+                continue
+            material_bytes += len(variant.encode("utf-8", errors="strict"))
+            if material_bytes > material_budget:
+                raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+            secrets.add(variant)
+
+    def derive(value: str) -> None:
+        nonlocal work_bytes
+        if not value or value in derived:
+            return
+        work_bytes += len(value.encode("utf-8", errors="strict"))
+        if work_bytes > work_budget:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+        derived.add(value)
+        add_secret(value)
+        pending.append(value)
+
+    def derive_parameter(token: str) -> None:
+        raw_key, separator, raw_value = token.partition("=")
+        if not separator:
+            derive(token)
+            return
+        derive(raw_key)
+        derive(raw_value)
+
+    def derive_json(value: str) -> None:
+        stripped = value.strip()
+        if not stripped.startswith(("{", "[")):
+            return
+        try:
+            parsed_json = json.loads(
+                stripped,
+                parse_int=str,
+                parse_float=str,
+                parse_constant=str,
+            )
+        except json.JSONDecodeError:
+            return
+        except RecursionError as exc:
+            raise _InboxAuthHintRejected("inbox_auth_hint_too_complex") from exc
+
+        containers = [parsed_json]
+        while containers:
+            item = containers.pop()
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    derive(key)
+                    containers.append(child)
+            elif isinstance(item, list):
+                containers.extend(item)
+            elif isinstance(item, str):
+                derive(item)
+
+    derive(url)
+    while pending:
+        current = pending.popleft()
+        decoded = unquote(current)
+        if decoded != current:
+            if len(decoded) >= len(current):
+                raise _InboxAuthHintRejected("inbox_auth_hint_invalid_encoding")
+            derive(decoded)
+        form_decoded = unquote_plus(current)
+        if form_decoded != current:
+            derive(form_decoded)
+        derive(_decode_url_structural_delimiters(current))
+        derive_json(current)
+
+        parsed = urlsplit(current)
+
+        raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
+        if separator:
+            username, password_separator, password = raw_userinfo.partition(":")
+            derive(username)
+            if password_separator:
+                derive(password)
+        derive(_raw_url_port(parsed.netloc) or "")
+
+        hostname = parsed.hostname or ""
+        trusted_suffix = _trusted_ats_host_suffix(hostname)
+        if trusted_suffix and hostname == trusted_suffix:
+            secret_hostname = ""
+        elif trusted_suffix and hostname.endswith(f".{trusted_suffix}"):
+            prefix = hostname[: -(len(trusted_suffix) + 1)]
+            secret_hostname = prefix
+        else:
+            secret_hostname = hostname
+        for label in secret_hostname.split("."):
+            derive(label)
+
+        derive(parsed.query)
+        derive(parsed.fragment)
+        query_components = [parsed.query, parsed.fragment]
+        if not any((parsed.scheme, parsed.netloc, parsed.query, parsed.fragment)):
+            query_components.append(current)
+        for component in query_components:
+            if "=" not in component and not re.search(r"[&;]", component):
+                continue
+            for token in re.split(r"[&;]", component):
+                derive_parameter(token)
+
+        for segment in re.split(r"[/\\]", parsed.path):
+            if not segment:
+                continue
+            path_value, *matrix_tokens = segment.split(";")
+            derive(path_value)
+            for token in matrix_tokens:
+                derive_parameter(token)
+    return secrets
+
+
+def _inbox_auth_hint_secrets(hint: str) -> set[str]:
+    secrets: set[str] = set()
+    material_bytes = 0
+    # Bound both whole-hint variants and the independently bounded credential graph.
+    material_budget = _secret_material_budget(hint) * 2
+
+    def add_many(values) -> None:
+        nonlocal material_bytes
+        for value in values:
+            if not value or value in secrets:
+                continue
+            material_bytes += len(value.encode("utf-8", errors="strict"))
+            if material_bytes > material_budget:
+                raise _InboxAuthHintRejected("inbox_auth_hint_too_complex")
+            secrets.add(value)
+
+    add_many(_exact_secret_variants(hint))
+    for hint_layer in _progressive_percent_decode_layers(hint):
+        for line in hint_layer.splitlines():
+            key, separator, value = line.partition("=")
+            normalized_key = key.strip().lower()
+            if not separator or normalized_key not in {"code", "magic_link"}:
+                continue
+            credential = value.strip()
+            add_many(_exact_secret_variants(credential))
+            if normalized_key == "magic_link":
+                add_many(_magic_link_secrets(credential))
+    return secrets
+
+
+def _validate_inbox_auth_hint(hint: str | None) -> str | None:
+    if hint is None:
+        return None
+    if not isinstance(hint, str):
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid")
+    try:
+        hint_bytes = len(hint.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as exc:
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    if hint_bytes > MAX_INBOX_AUTH_HINT_BYTES:
+        raise _InboxAuthHintRejected("inbox_auth_hint_too_large")
+    try:
+        _inbox_auth_hint_secrets(hint)
+    except _InboxAuthHintRejected:
+        raise
+    except (UnicodeError, ValueError) as exc:
+        raise _InboxAuthHintRejected("inbox_auth_hint_invalid") from exc
+    return hint
+
+
+def _replace_exact_secret(text: str, secret: str) -> str:
+    if len(secret) < 6 and secret.isalnum():
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(secret)}(?![A-Za-z0-9])"
+        return re.sub(pattern, INBOX_AUTH_REDACTION, text)
+    return text.replace(secret, INBOX_AUTH_REDACTION)
+
+
+def _redact_inbox_auth_secrets(text: str, hint: str | None) -> str:
+    """Remove prompt-only inbox credentials before text reaches durable sinks."""
+    if not text or not hint:
+        return text
+    secrets = _inbox_auth_hint_secrets(hint)
+    redacted = text
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            redacted = _replace_exact_secret(redacted, secret)
+    return redacted
 _agent_lock = threading.Lock()
+
+
+def _terminate_agent_child(
+    worker_id: int,
+    process: subprocess.Popen,
+    guard: SpawnedChildGuard | None,
+    reason: str,
+) -> bool:
+    try:
+        if process.poll() is not None:
+            if guard is not None:
+                guard.release()
+            return True
+        if guard is None:
+            raise RuntimeError("stable child guard missing")
+        cleaned = guard.terminate_and_reap()
+    except Exception as exc:
+        persist_lifecycle_hard_fault(
+            f"agent {reason} cleanup exception",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(f"agent {reason} cleanup could not be proven") from exc
+    if not cleaned:
+        persist_lifecycle_hard_fault(
+            f"agent {reason} cleanup unproven",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(f"agent {reason} cleanup could not be proven")
+    return True
+
+
+def _acquire_agent_child_guard(process: subprocess.Popen) -> SpawnedChildGuard:
+    guard = SpawnedChildGuard.acquire(process)
+    if guard is not None:
+        return guard
+    cleaned = emergency_cleanup_direct_child(process)
+    if not cleaned:
+        persist_lifecycle_hard_fault(
+            "agent spawn guard unavailable cleanup uncertain",
+            pid=process.pid,
+        )
+        raise LifecycleHardFault(
+            "stable agent child guard unavailable; direct child cleanup uncertain"
+        )
+    raise RuntimeError("stable agent child guard unavailable; direct child reaped")
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -1570,6 +1946,12 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     no `supervised` parameter -- the prompt built here is IDENTICAL
     regardless of supervised mode (accounting is layered on by the run_job
     wrapper, not the run itself)."""
+    try:
+        inbox_auth_hint = _validate_inbox_auth_hint(inbox_auth_hint)
+    except _InboxAuthHintRejected as exc:
+        logger.warning("Rejected inbox auth hint: %s", exc.reason)
+        return f"failed:{exc.reason}", 0
+
     # Read tailored resume text
     resume_path = config.resolve_resume_stem(job.get("tailored_resume_path"))
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -1600,6 +1982,8 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         worker_id=worker_id,
         inbox_auth_hint=inbox_auth_hint,
     )
+    def redact_persistent(text) -> str:
+        return _redact_inbox_auth_secrets(str(text), inbox_auth_hint)
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
@@ -1640,8 +2024,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
     start = time.time()
     stats: dict = {}
     proc = None
+    guard = None
 
     try:
+        enforce_no_lifecycle_faults()
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1653,8 +2039,10 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
+        guard = _acquire_agent_child_guard(proc)
         with _agent_lock:
             _agent_procs[worker_id] = proc
+            _agent_guards[worker_id] = guard
 
         text_parts: list[str] = []
         final_result_text: list[str] = []  # text from the final 'result' message
@@ -1691,7 +2079,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                 if bt == "text":
                                     text_parts.append(block["text"])
                                     _note_terminal_result(block["text"])
-                                    lf.write(block["text"] + "\n")
+                                    lf.write(redact_persistent(block["text"]) + "\n")
                                 elif bt == "tool_use":
                                     name = (
                                         block.get("name", "")
@@ -1702,9 +2090,13 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                         application_tool_calls[0] += 1
                                     inp = block.get("input", {})
                                     if "url" in inp:
-                                        desc = f"{name} {inp['url'][:60]}"
+                                        safe_url = redact_persistent(inp["url"])
+                                        desc = f"{name} {safe_url[:60]}"
                                     elif "ref" in inp:
-                                        desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
+                                        detail = redact_persistent(
+                                            inp.get("element", inp.get("text", ""))
+                                        )
+                                        desc = f"{name} {detail}"[:50]
                                     elif "fields" in inp:
                                         desc = f"{name} ({len(inp['fields'])} fields)"
                                     elif "paths" in inp:
@@ -1712,12 +2104,19 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     else:
                                         desc = name
 
+                                    desc = redact_persistent(desc)
+
                                     lf.write(f"  >> {desc}\n")
                                     ws = get_state(worker_id)
                                     cur_actions = ws.actions if ws else 0
+                                    last_action = (
+                                        INBOX_AUTH_REDACTION
+                                        if INBOX_AUTH_REDACTION in desc
+                                        else desc[:35]
+                                    )
                                     update_state(worker_id,
                                                  actions=cur_actions + 1,
-                                                 last_action=desc[:35])
+                                                 last_action=last_action)
                         elif msg_type == "result":
                             stats_holder.update({
                                 "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
@@ -1742,17 +2141,23 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                                     _note_terminal_result(text)
                                     final_result_text.clear()
                                     final_result_text.append(text)
-                                    lf.write(text + "\n")
+                                    lf.write(redact_persistent(text) + "\n")
                             elif item_type in {"mcp_tool_call", "tool_call"}:
                                 name = item.get("name") or item.get("tool_name") or item_type
                                 if _tool_call_touches_application(str(name)):
                                     application_tool_calls[0] += 1
-                                lf.write(f"  >> {name}\n")
+                                safe_name = redact_persistent(str(name))
+                                lf.write(f"  >> {safe_name}\n")
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
+                                last_action = (
+                                    INBOX_AUTH_REDACTION
+                                    if INBOX_AUTH_REDACTION in safe_name
+                                    else safe_name[:35]
+                                )
                                 update_state(worker_id,
                                              actions=cur_actions + 1,
-                                             last_action=str(name)[:35])
+                                             last_action=last_action)
                         elif msg_type == "turn.completed":
                             usage = msg.get("usage", {})
                             stats_holder.update({
@@ -1771,11 +2176,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                             # into a logged, diagnosable reason.
                             err = msg.get("message") or msg.get("error") or line
                             text_parts.append(str(err))
-                            lf.write(str(err) + "\n")
+                            lf.write(redact_persistent(str(err)) + "\n")
                     except json.JSONDecodeError:
                         text_parts.append(line)
                         _note_terminal_result(line)
-                        lf.write(line + "\n")
+                        lf.write(redact_persistent(line) + "\n")
 
         # Start reading BEFORE writing the prompt so a large prompt can't deadlock
         # against a full stdout pipe.
@@ -1807,11 +2212,11 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
             if terminal_result_seen.wait(timeout=min(1.0, remaining)):
                 reader.join(timeout=float(os.environ.get("APPLYPILOT_TERMINAL_RESULT_GRACE_SECONDS") or 5))
                 if reader.is_alive():
-                    _kill_process_tree(proc.pid)
+                    _terminate_agent_child(worker_id, proc, guard, "terminal-result-grace")
                     reader.join(timeout=15)
                 break
         if reader.is_alive():
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "reader-timeout")
             reader.join(timeout=15)
             elapsed = int(time.time() - start)
             add_event(f"[W{worker_id}] TIMEOUT/hung ({elapsed}s)")
@@ -1821,16 +2226,19 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            _kill_process_tree(proc.pid)
+            _terminate_agent_child(worker_id, proc, guard, "wait-timeout")
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
         returncode = proc.returncode
         stats = stats_holder
+        guard.release()
+        guard = None
         proc = None
 
         output = "\n".join(text_parts)
+        persisted_output = redact_persistent(output)
         # Prefer the agent's FINAL result message for the RESULT code; only fall
         # back to scanning the full transcript when the final message has none.
         # This stops a page that merely contains the literal text
@@ -1845,14 +2253,16 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"{agent}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
+        job_log.write_text(persisted_output, encoding="utf-8")
         run_stats = dict(stats) if stats else {}
-        run_stats["transcript"] = output[-20000:]
+        run_stats["transcript"] = persisted_output[-20000:]
         run_stats["job_log"] = str(job_log)
         run_stats["job_log_path"] = str(job_log)
         run_stats["application_tool_calls"] = application_tool_calls[0]
         run_stats["transcript_digest"] = (
-            "sha256:" + hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
+            "sha256:" + hashlib.sha256(
+                persisted_output.encode("utf-8", errors="replace")
+            ).hexdigest()
         )
         run_stats["final_result_source"] = "final_message" if final_text and "RESULT:" in final_text else "transcript"
         _last_run_stats[worker_id] = run_stats
@@ -1910,6 +2320,7 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
                         else "unknown"
                     )
                     reason = _clean_reason(reason)
+                    reason = redact_persistent(reason)
                     PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue", "auth_required"}
                     if reason in PROMOTE_TO_STATUS:
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
@@ -1942,14 +2353,17 @@ def _run_job_impl(job: dict, port: int, worker_id: int = 0,
         return "failed:timeout", duration_ms
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
-        add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        safe_error = _redact_inbox_auth_secrets(str(e), inbox_auth_hint)
+        add_event(f"[W{worker_id}] ERROR: {safe_error[:40]}")
+        update_state(worker_id, status="failed", last_action=f"ERROR: {safe_error[:25]}")
+        return f"failed:{safe_error[:100]}", duration_ms
     finally:
         with _agent_lock:
             _agent_procs.pop(worker_id, None)
-        if proc is not None and proc.poll() is None:
-            _kill_process_tree(proc.pid)
+            _agent_guards.pop(worker_id, None)
+        active_fault = isinstance(sys.exc_info()[1], LifecycleHardFault)
+        if proc is not None and not active_fault:
+            _terminate_agent_child(worker_id, proc, guard, "finally")
 
 
 # ---------------------------------------------------------------------------
@@ -2088,10 +2502,13 @@ def _prearm_inbox_auth_request(job: dict) -> int | None:
         if not dsn:
             return None
         worker_id = os.environ.get("FLEET_WORKER_ID", "worker")
-        timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT", "300"))
-        agent_timeout = int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT", str(AGENT_TIMEOUT_SECONDS)))
-        postrun_timeout = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POSTRUN_TIMEOUT") or "45")
-        ttl_seconds = max(timeout, agent_timeout + postrun_timeout)
+        timeout = max(1, int(os.environ.get("APPLYPILOT_INBOX_AUTH_TIMEOUT") or 300))
+        agent_timeout = max(
+            1,
+            int(os.environ.get("APPLYPILOT_AGENT_TIMEOUT") or AGENT_TIMEOUT_SECONDS),
+            AGENT_TIMEOUT_SECONDS,
+        )
+        ttl_seconds = agent_timeout + timeout
         apply_target = job.get("application_url") or job["url"]
         with pgqueue.connect(dsn) as conn:
             return otp_relay.request_code(
@@ -2170,14 +2587,8 @@ def _relay_inbox_auth_hint(job: dict) -> str | None:
 
 def _format_inbox_auth_hint(match: inbox_auth.AuthEmailMatch) -> str:
     if match.candidate.kind == "magic_link":
-        return f"magic_link={match.candidate.value}\nreason={'; '.join(match.reasons)}"
-    return (
-        f"code={match.candidate.value}\n"
-        f"sender={match.sender}\n"
-        f"subject={match.subject}\n"
-        f"received_at={match.received_at or 'unknown'}\n"
-        f"reason={'; '.join(match.reasons)}"
-    )
+        return f"magic_link={match.candidate.value}"
+    return f"code={match.candidate.value}"
 
 
 def _poll_inbox_auth_hint(job: dict) -> str | None:
@@ -2199,7 +2610,11 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         poll = int(os.environ.get("APPLYPILOT_INBOX_AUTH_POLL_SECONDS", "5"))
         max_errors = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_ERRORS", "3"))
         minutes = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MINUTES", "15"))
-        max_messages = int(os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "25"))
+        from applypilot.mail_source import validate_max_messages
+
+        max_messages = validate_max_messages(
+            os.environ.get("APPLYPILOT_INBOX_AUTH_MAX_MESSAGES", "1000")
+        )
         challenge_type = os.environ.get("APPLYPILOT_INBOX_AUTH_CHALLENGE_TYPE", "email_code").strip().lower()
         if challenge_type not in {"email_code", "magic_link"}:
             logger.debug(
@@ -2207,6 +2622,7 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
                 challenge_type,
             )
             challenge_type = "email_code"
+        challenge_started_at = datetime.now(timezone.utc)
         challenge_id = inbox_auth.create_auth_challenge(
             job_url=job["url"],
             application_url=apply_target,
@@ -2217,33 +2633,24 @@ def _poll_inbox_auth_hint(job: dict) -> str | None:
         inbox_auth.mark_auth_challenge_attempt(challenge_id, "polling")
         inbox_auth.expire_stale_challenges()
 
+        def claim_matches(matches: list[inbox_auth.AuthEmailMatch]):
+            return inbox_auth.claim_unique_auth_match(
+                challenge_id,
+                matches,
+            )
+
         match = inbox_auth.watch_gmail_for_auth_code(
             timeout_seconds=timeout,
             poll_seconds=poll,
             max_errors=max_errors,
             minutes=minutes,
             max_messages=max_messages,
+            not_before=challenge_started_at,
+            provider_domain=provider,
+            claim_matches=claim_matches,
         )
         if not match:
             return None
-        try:
-            event_id = inbox_auth.record_inbox_event(
-                message_id=match.message_id,
-                thread_id=match.thread_id,
-                sender=match.sender,
-                subject=match.subject,
-                event_type="auth_code",
-                confidence=match.candidate.confidence,
-                matched_job_url=job["url"],
-                matched_company=job.get("company"),
-                matched_method=match.candidate.kind,
-                snippet=match.snippet,
-                received_at=match.received_at,
-            )
-            inbox_auth.resolve_auth_challenge(challenge_id=challenge_id, inbox_event_id=event_id)
-        except Exception:
-            logger.debug("Failed to persist inbox auth event/challenge resolution", exc_info=True)
-
         return _format_inbox_auth_hint(match)
     except Exception:
         logger.debug("Inbox auth polling failed", exc_info=True)
@@ -2787,6 +3194,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                         supervised=supervised,
                     )
 
+            cleanup_proc = chrome_proc
+            chrome_proc = None
+            require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
+
             # --auth-gated same-day halt: a challenge-class result means this
             # tenant hit a wall the agent can't solve unattended -- halt it
             # for the rest of the UTC day and keep applying to other hosts
@@ -2860,12 +3271,20 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 _update_host_breaker(job, ok=False, reason=reason, worker_id=worker_id)
 
         except KeyboardInterrupt:
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
             release_lock(job["url"])
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
             release_lock(job["url"])  # keeps the job retryable
@@ -2876,8 +3295,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             if _note_systemic_failure(job["url"]):
                 _trip_systemic_breaker(worker_id)
         finally:
-            if chrome_proc:
-                cleanup_worker(worker_id, chrome_proc)
+            if chrome_proc is not None:
+                cleanup_proc = chrome_proc
+                chrome_proc = None
+                require_browser_cleanup(cleanup_worker, worker_id, cleanup_proc)
 
         # Cost-budget guard: stop the whole run once accumulated apply cost hits
         # the cap (APPLYPILOT_APPLY_MAX_COST / --max-cost-usd; 0 = no cap). Read at
@@ -3077,15 +3498,17 @@ def main(limit: int = 1, target_url: str | None = None,
             # Kill all active apply-agent processes to skip current jobs
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+                    _terminate_agent_child(
+                        wid, cproc, _agent_guards.get(wid), "sigint-skip"
+                    )
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
             with _agent_lock:
                 for wid, cproc in list(_agent_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+                    _terminate_agent_child(
+                        wid, cproc, _agent_guards.get(wid), "sigint-stop"
+                    )
             kill_all_chrome()
             raise KeyboardInterrupt
 
