@@ -15,13 +15,15 @@ def test_railway_entrypoint_runs_canonical_v3_worker_fail_closed() -> None:
         "require_env APPLYPILOT_WORKER_ID",
         "require_env APPLYPILOT_WORKER_CONTRACT",
         "require_env APPLYPILOT_RELEASE_VERSION",
-        'require_file "${APPLYPILOT_DIR:-/data/applypilot}/profile.json"',
-        'require_file "${APPLYPILOT_DIR:-/data/applypilot}/resume.pdf"',
+            'wait_for_file "${APPLYPILOT_DIR:-/data/applypilot}/profile.json"',
+            'wait_for_file "${APPLYPILOT_DIR:-/data/applypilot}/resume.pdf"',
         'exec applypilot-fleet-apply "${worker_args[@]}"',
         '--worker-id "$APPLYPILOT_WORKER_ID"',
         '--machine-owner "$FLEET_MACHINE_OWNER"',
-    ):
-        assert required in script
+        ):
+            assert required in script
+    assert "python - <<'PY'" not in script
+    assert "python3 - <<'PY'" in script
 
     assert "applypilot.apply.container_worker" not in script
     assert "${APPLYPILOT_WORKER_ID:-0}" not in script

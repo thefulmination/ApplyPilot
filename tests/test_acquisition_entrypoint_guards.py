@@ -24,6 +24,7 @@ def test_linkedin_worker_startup_denies_after_server_admission_before_schema(mon
         def rollback(self): return None
 
     monkeypatch.setattr(worker, "_setup_apply_env", lambda: None)
+    monkeypatch.setenv("APPLYPILOT_FLEET_LABEL", "home")
     monkeypatch.setattr(pgqueue, "connect", lambda _dsn: Connection())
     monkeypatch.setattr(
         schema, "require_apply_result_event_schema",
@@ -38,7 +39,11 @@ def test_linkedin_worker_startup_denies_after_server_admission_before_schema(mon
                 "--worker-id",
                 "owner-1",
                 "--machine-owner",
-                "owner",
+                "home",
+                "--public-ip",
+                "1.1.1.1",
+                "--owner-ip",
+                "1.1.1.1",
             ]
         )
 

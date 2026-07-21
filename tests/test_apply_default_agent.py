@@ -74,6 +74,7 @@ def test_fleet_apply_worker_once_limits_loop_iterations(monkeypatch):
         "--dsn", "postgresql://example",
         "--worker-id", "mint-0",
         "--machine-owner", "mint",
+        "--home-ip", "1.1.1.1",
         "--once",
     ]) == 0
 
@@ -100,6 +101,7 @@ def test_fleet_apply_worker_max_iterations_limits_loop_iterations(monkeypatch):
         "--dsn", "postgresql://example",
         "--worker-id", "mint-0",
         "--machine-owner", "mint",
+        "--home-ip", "1.1.1.1",
         "--max-iterations", "3",
     ]) == 0
 

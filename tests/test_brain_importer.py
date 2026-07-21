@@ -366,6 +366,17 @@ def test_sealed_mutation_between_fresh_hash_and_open_is_rejected(source_backup: 
     manifest = reader.capture_manifest()
     original_hash_file = importer_module._hash_file
 
+    if os.name == "nt":
+        original_stat = Path.stat
+        unchanged_stat = reader.path.stat()
+
+        def stat_with_colliding_windows_times(path, *args, **kwargs):
+            if path == reader.path:
+                return unchanged_stat
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_with_colliding_windows_times)
+
     def hash_then_mutate_sealed(path):
         result = original_hash_file(path)
         with closing(sqlite3.connect(path)) as connection:

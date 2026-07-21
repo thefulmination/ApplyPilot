@@ -1,0 +1,886 @@
+{
+  "bootstrapped_at": "2026-07-16T20:46:46.976764+00:00",
+  "database_name": "railway",
+  "effective_connect_grantees": [
+    {
+      "can_login": true,
+      "database_owner": false,
+      "effective_connect": true,
+      "reconnect_capable": true,
+      "role_name": "postgres",
+      "superuser": true
+    },
+    {
+      "can_login": true,
+      "database_owner": false,
+      "effective_connect": true,
+      "reconnect_capable": true,
+      "role_name": "staging_controller_v2",
+      "superuser": false
+    },
+    {
+      "can_login": false,
+      "database_owner": true,
+      "effective_connect": true,
+      "reconnect_capable": false,
+      "role_name": "staging_owner_v2",
+      "superuser": false
+    },
+    {
+      "can_login": false,
+      "database_owner": false,
+      "effective_connect": true,
+      "reconnect_capable": false,
+      "role_name": "staging_verifier_v2",
+      "superuser": false
+    }
+  ],
+  "escalation_required": false,
+  "in_doubt": false,
+  "inventory": {
+    "active_services": [],
+    "application_ownership": [
+      {
+        "object_kind": "table",
+        "object_name": "agent_availability",
+        "owner_before": "postgres",
+        "qualified_name": "public.agent_availability",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "answer_bank",
+        "owner_before": "postgres",
+        "qualified_name": "public.answer_bank",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "applied_set",
+        "owner_before": "postgres",
+        "qualified_name": "public.applied_set",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "apply_attempts",
+        "owner_before": "postgres",
+        "qualified_name": "public.apply_attempts",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "apply_queue",
+        "owner_before": "postgres",
+        "qualified_name": "public.apply_queue",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "apply_result_events",
+        "owner_before": "postgres",
+        "qualified_name": "public.apply_result_events",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "auth_challenge",
+        "owner_before": "postgres",
+        "qualified_name": "public.auth_challenge",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "autotriage_actions",
+        "owner_before": "postgres",
+        "qualified_name": "public.autotriage_actions",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "command_acks",
+        "owner_before": "postgres",
+        "qualified_name": "public.command_acks",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "compute_queue",
+        "owner_before": "postgres",
+        "qualified_name": "public.compute_queue",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "dedup_repair_actions",
+        "owner_before": "postgres",
+        "qualified_name": "public.dedup_repair_actions",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "discovered_postings",
+        "owner_before": "postgres",
+        "qualified_name": "public.discovered_postings",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "email_reconcile_actions",
+        "owner_before": "postgres",
+        "qualified_name": "public.email_reconcile_actions",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_assets",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_assets",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_config",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_config",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_console_audit",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_console_audit",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_decision_policies",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_decision_policies",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_diagnoses",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_diagnoses",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_knobs",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_knobs",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_machine_blackout",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_machine_blackout",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_worker_blocklist",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_blocklist",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_worker_lease_ledger",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_lease_ledger",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "fleet_worker_principals",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_principals",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "inbox_events",
+        "owner_before": "postgres",
+        "qualified_name": "public.inbox_events",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "inbox_outcomes",
+        "owner_before": "postgres",
+        "qualified_name": "public.inbox_outcomes",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "linkedin_queue",
+        "owner_before": "postgres",
+        "qualified_name": "public.linkedin_queue",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "llm_usage",
+        "owner_before": "postgres",
+        "qualified_name": "public.llm_usage",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "otp_request",
+        "owner_before": "postgres",
+        "qualified_name": "public.otp_request",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "poison_jobs",
+        "owner_before": "postgres",
+        "qualified_name": "public.poison_jobs",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "rate_governor",
+        "owner_before": "postgres",
+        "qualified_name": "public.rate_governor",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "remote_commands",
+        "owner_before": "postgres",
+        "qualified_name": "public.remote_commands",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "search_tasks",
+        "owner_before": "postgres",
+        "qualified_name": "public.search_tasks",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "worker_heartbeat",
+        "owner_before": "postgres",
+        "qualified_name": "public.worker_heartbeat",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "table",
+        "object_name": "workers",
+        "owner_before": "postgres",
+        "qualified_name": "public.workers",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "apply_result_events_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.apply_result_events_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "auth_challenge_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.auth_challenge_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "autotriage_actions_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.autotriage_actions_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "dedup_repair_actions_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.dedup_repair_actions_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "discovered_postings_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.discovered_postings_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "email_reconcile_actions_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.email_reconcile_actions_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "fleet_console_audit_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_console_audit_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "fleet_diagnoses_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_diagnoses_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "fleet_knobs_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_knobs_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "fleet_machine_blackout_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_machine_blackout_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "inbox_events_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.inbox_events_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "llm_usage_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.llm_usage_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "otp_request_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.otp_request_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "sequence",
+        "object_name": "remote_commands_id_seq",
+        "owner_before": "postgres",
+        "qualified_name": "public.remote_commands_id_seq",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_request_id bigint, p_code text, p_kind text, p_email_ts timestamp with time zone, p_message_id text, p_answered_ttl integer",
+        "object_kind": "function",
+        "object_name": "fleet_controller_otp_answer",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_controller_otp_answer(p_request_id bigint, p_code text, p_kind text, p_email_ts timestamp with time zone, p_message_id text, p_answered_ttl integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_limit integer",
+        "object_kind": "function",
+        "object_name": "fleet_controller_otp_pending",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_controller_otp_pending(p_limit integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_controller_otp_purge",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_controller_otp_purge()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_ids text[]",
+        "object_kind": "function",
+        "object_name": "fleet_controller_otp_used_messages",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_controller_otp_used_messages(p_ids text[])",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_lane text, p_url text, p_evidence_ref text, p_verification_method text",
+        "object_kind": "function",
+        "object_name": "fleet_controller_verify_submission",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_controller_verify_submission(p_lane text, p_url text, p_evidence_ref text, p_verification_method text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_command_id bigint, p_worker text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_ack_command",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_ack_command(p_command_id bigint, p_worker text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_admission_snapshot",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_admission_snapshot()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_agent_blocks",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_agent_blocks()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_route text, p_route_version text, p_evidence jsonb",
+        "object_kind": "function",
+        "object_name": "fleet_worker_attempt_create",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_attempt_create(p_route text, p_route_version text, p_evidence jsonb)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_attempt uuid, p_expected text, p_state text, p_evidence jsonb",
+        "object_kind": "function",
+        "object_name": "fleet_worker_attempt_transition",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_attempt_transition(p_attempt uuid, p_expected text, p_state text, p_evidence jsonb)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_lane text, p_url text, p_worker text, p_attempt integer",
+        "object_kind": "function",
+        "object_name": "fleet_worker_authorize_lease",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_authorize_lease(p_lane text, p_url text, p_worker text, p_attempt integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_claim_liveness",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_claim_liveness()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_url text, p_task text, p_status text, p_result jsonb, p_usage jsonb",
+        "object_kind": "function",
+        "object_name": "fleet_worker_complete_compute",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_complete_compute(p_url text, p_task text, p_status text, p_result jsonb, p_usage jsonb)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_task_id text, p_postings jsonb, p_error text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_complete_search",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_complete_search(p_task_id text, p_postings jsonb, p_error text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_caps jsonb, p_window_seconds integer, p_cooldown_seconds integer",
+        "object_kind": "function",
+        "object_name": "fleet_worker_evaluate_agent_budget",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_evaluate_agent_budget(p_caps jsonb, p_window_seconds integer, p_cooldown_seconds integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_telemetry jsonb",
+        "object_kind": "function",
+        "object_name": "fleet_worker_heartbeat",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_heartbeat(p_telemetry jsonb)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_worker text, p_home_ip text, p_ttl integer, p_sw_version text, p_liveness_fresh integer",
+        "object_kind": "function",
+        "object_name": "fleet_worker_lease_ats",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_lease_ats(p_worker text, p_home_ip text, p_ttl integer, p_sw_version text, p_liveness_fresh integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_lease_compute",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_lease_compute()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_worker text, p_public_ip text, p_owner_ip text, p_ttl integer, p_sw_version text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_lease_linkedin",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_lease_linkedin(p_worker text, p_public_ip text, p_owner_ip text, p_ttl integer, p_sw_version text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_lease_search",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_lease_search()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_mark_browser_interaction",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_mark_browser_interaction()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_request_id bigint",
+        "object_kind": "function",
+        "object_name": "fleet_worker_otp_consume",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_otp_consume(p_request_id bigint)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_worker text, p_job_url text, p_application_url text, p_ttl_seconds integer",
+        "object_kind": "function",
+        "object_name": "fleet_worker_otp_request",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_otp_request(p_worker text, p_job_url text, p_application_url text, p_ttl_seconds integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_request_id bigint",
+        "object_kind": "function",
+        "object_name": "fleet_worker_otp_wait",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_otp_wait(p_request_id bigint)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_lane text, p_url text, p_worker text, p_kind text, p_halt_seconds integer, p_evidence jsonb",
+        "object_kind": "function",
+        "object_name": "fleet_worker_park",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_park(p_lane text, p_url text, p_worker text, p_kind text, p_halt_seconds integer, p_evidence jsonb)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_url text, p_worker text, p_error text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_park_infrastructure",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_park_infrastructure(p_url text, p_worker text, p_error text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_agent text, p_blocked_until timestamp with time zone",
+        "object_kind": "function",
+        "object_name": "fleet_worker_record_agent_wall",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_record_agent_wall(p_agent text, p_blocked_until timestamp with time zone)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_url text, p_worker text, p_attempt integer",
+        "object_kind": "function",
+        "object_name": "fleet_worker_refund_linkedin_canary",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_refund_linkedin_canary(p_url text, p_worker text, p_attempt integer)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_lane text, p_url text, p_worker text, p_error text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_requeue",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_requeue(p_lane text, p_url text, p_worker text, p_error text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_worker text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_runtime_state",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_runtime_state(p_worker text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "",
+        "object_kind": "function",
+        "object_name": "fleet_worker_schema_contract",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_schema_contract()",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_lane text, p_url text, p_worker text, p_status text, p_apply_status text, p_apply_error text, p_evidence jsonb",
+        "object_kind": "function",
+        "object_name": "fleet_worker_terminalize",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_terminalize(p_lane text, p_url text, p_worker text, p_status text, p_apply_status text, p_apply_error text, p_evidence jsonb)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_worker text, p_reported text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_version_status",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_version_status(p_worker text, p_reported text)",
+        "schema_name": "public"
+      },
+      {
+        "arguments": "p_url text, p_status text, p_reason text",
+        "object_kind": "function",
+        "object_name": "fleet_worker_write_liveness",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_worker_write_liveness(p_url text, p_status text, p_reason text)",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "type",
+        "object_name": "apply_queue_status",
+        "owner_before": "postgres",
+        "qualified_name": "public.apply_queue_status",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "type",
+        "object_name": "fleet_task_status",
+        "owner_before": "postgres",
+        "qualified_name": "public.fleet_task_status",
+        "schema_name": "public"
+      },
+      {
+        "object_kind": "schema",
+        "owner_before": "pg_database_owner",
+        "qualified_name": "public",
+        "schema_name": "public"
+      }
+    ],
+    "database_name": "railway",
+    "database_owner_before": "postgres",
+    "direct_connect_before": [
+      "PUBLIC"
+    ],
+    "roles": [
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_checkpoint",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_create_subscription",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_database_owner",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_execute_server_program",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_maintain",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_monitor",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_read_all_data",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_read_all_settings",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_read_all_stats",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_read_server_files",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_signal_autovacuum_worker",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_signal_backend",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_stat_scan_tables",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_use_reserved_connections",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_write_all_data",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "pg_write_server_files",
+        "superuser": false
+      },
+      {
+        "bypassrls": true,
+        "can_login": true,
+        "createdb": true,
+        "createrole": true,
+        "replication": true,
+        "role_name": "postgres",
+        "superuser": true
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "staging_controller",
+        "superuser": false
+      },
+      {
+        "bypassrls": true,
+        "can_login": true,
+        "createdb": true,
+        "createrole": true,
+        "replication": true,
+        "role_name": "staging_legacy_admin",
+        "superuser": true
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "staging_migrator",
+        "superuser": false
+      },
+      {
+        "bypassrls": false,
+        "can_login": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "role_name": "staging_verifier",
+        "superuser": false
+      }
+    ],
+    "session_user": "postgres"
+  },
+  "rollback_sql_path": "C:\\Users\\JStal\\.codex\\worktrees\\cloud-cutover-runtime-integration\\.staging-evidence\\bootstrap-v2-rollback.sql",
+  "rollback_sql_sha256": "f31ebb2b414a633723857c50449ed27a95d79c47987ffc6ea2716dc64027bfad",
+  "session_user": "postgres",
+  "status": "bootstrap_committed",
+  "topology": {
+    "controller_role": "staging_controller_v2",
+    "database_owner_role": "staging_owner_v2",
+    "infrastructure_superuser_roles": [
+      "postgres"
+    ],
+    "migrator_role": "staging_migrator_v2",
+    "retired_admin_roles": [
+      "staging_legacy_admin"
+    ],
+    "verifier_role": "staging_verifier_v2"
+  }
+}

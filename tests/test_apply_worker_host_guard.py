@@ -14,30 +14,54 @@ from applypilot.fleet.apply_worker_main import enforce_host_identity
 
 def test_refuses_foreign_machine_owner_on_labeled_box():
     with pytest.raises(SystemExit) as ei:
-        enforce_host_identity("m2", env={"APPLYPILOT_FLEET_LABEL": "home"})
+        enforce_host_identity(
+            "m2",
+            public_ip="1.1.1.1",
+            env={"APPLYPILOT_FLEET_LABEL": "home"},
+        )
     msg = str(ei.value)
     assert "home" in msg and "m2" in msg  # error names both the box and the foreign owner
 
 
 def test_allows_machine_owner_matching_box_label():
     # Must NOT raise: a home worker on the home box is exactly right.
-    enforce_host_identity("home", env={"APPLYPILOT_FLEET_LABEL": "home"})
+    enforce_host_identity(
+        "home",
+        public_ip="1.1.1.1",
+        env={"APPLYPILOT_FLEET_LABEL": "home"},
+    )
 
 
 def test_match_is_case_and_whitespace_insensitive():
     # Env/label drift (casing, stray spaces) must not cause a false refusal.
-    enforce_host_identity("  Home ", env={"APPLYPILOT_FLEET_LABEL": "home"})
+    enforce_host_identity(
+        "  Home ",
+        public_ip="1.1.1.1",
+        env={"APPLYPILOT_FLEET_LABEL": "home"},
+    )
 
 
 def test_unlabeled_or_unenrolled_worker_is_rejected():
     with pytest.raises(SystemExit, match="APPLYPILOT_FLEET_LABEL"):
-        enforce_host_identity("m2", env={})
+        enforce_host_identity("m2", public_ip="1.1.1.1", env={})
     with pytest.raises(SystemExit, match="APPLYPILOT_FLEET_LABEL"):
-        enforce_host_identity("m2", env={"APPLYPILOT_FLEET_LABEL": "   "})
+        enforce_host_identity(
+            "m2",
+            public_ip="1.1.1.1",
+            env={"APPLYPILOT_FLEET_LABEL": "   "},
+        )
 
 
 def test_blank_machine_owner_is_rejected_as_unenrolled():
     with pytest.raises(SystemExit, match="machine-owner"):
-        enforce_host_identity(None, env={"APPLYPILOT_FLEET_LABEL": "home"})
+        enforce_host_identity(
+            None,
+            public_ip="1.1.1.1",
+            env={"APPLYPILOT_FLEET_LABEL": "home"},
+        )
     with pytest.raises(SystemExit, match="machine-owner"):
-        enforce_host_identity("", env={"APPLYPILOT_FLEET_LABEL": "home"})
+        enforce_host_identity(
+            "",
+            public_ip="1.1.1.1",
+            env={"APPLYPILOT_FLEET_LABEL": "home"},
+        )

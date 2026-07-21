@@ -1,0 +1,182 @@
+{
+  "schemaVersion": "applypilot_compatibility_manifest_v2",
+  "releaseId": "applypilot-cloud-staging-2026-07-17-rc2",
+  "generatedAt": "2026-07-17T12:55:11.2160596Z",
+  "releaseState": "staging_candidate",
+  "promotionAuthorized": false,
+  "repositories": {
+    "python": {
+      "repository": "thefulmination/ApplyPilot",
+      "branch": "codex/cloud-cutover-runtime-integration",
+      "testedCommitSha": "623f469a75acb52417a6a6e9e39ea21dedb0b902",
+      "testedTreeSha": "d44a5b0587cebd595cff9cc8f4306c8e7ee0c3ad",
+      "releaseVersion": "0.3.0+git.tree.d44a5b0",
+      "rollback": {
+        "branch": "codex/fleet-dbhot-stage1-rollback",
+        "commitSha": "f364bfec643026bf57969efda31bd545bc214142",
+        "role": "fleet-authority-rollback-only"
+      }
+    },
+    "typescript": {
+      "repository": "thefulmination/res_build",
+      "branch": "codex/cloud-cutover-brain-integration",
+      "releaseEvidenceHeadSha": "ff06cd09c44c1498f5efa45d87c5e44e1d788844",
+      "testedCommitSha": "ff06cd09c44c1498f5efa45d87c5e44e1d788844",
+      "testedTreeSha": "2519c8a05410ba124fb63c7bb2dc7bfad35c10ca",
+      "rollback": {
+        "branch": "codex/repo-sync-consolidation",
+        "commitSha": "b1694ce52b879d7058cd48534ea6f3592c9a3641",
+        "role": "pre-integration-reference-not-automatic-runtime-rollback"
+      }
+    }
+  },
+  "schemas": {
+    "brainSql": {
+      "path": "src/applypilot/brain/schema_v1.sql",
+      "bytes": 77803,
+      "sha256": "1976fdc4dbeac4cf853ce6e445efb071651696ae47ee67b61e58aab98ff4e2a5"
+    },
+    "brainSqlV2": {
+      "path": "src/applypilot/brain/schema_v2.sql",
+      "bytes": 27172,
+      "sha256": "0d4f29cf873e7e6c5051851be3a1ecf9701fdd8d0570af6f9503e83bb783577a"
+    },
+    "fleetPython": {
+      "path": "src/applypilot/fleet/schema.py",
+      "bytes": 10480,
+      "sha256": "496689d22d2980cff423e8a5f545ff1b4c4ce1a2f61c89d0a125247f3ccdfa02"
+    },
+    "fleetSql": {
+      "path": "src/applypilot/fleet/schema_v3.sql",
+      "bytes": 170517,
+      "sha256": "7d9520b50707d32523fb6407071180f2137b4fa253628af76aa2c494236cad45"
+    },
+    "fleetMigrationManifest": {
+      "path": "src/applypilot/fleet/migrations/manifest-v1.json",
+      "bytes": 1159,
+      "sha256": "d52763ad00b4e6d086610c991a2bc3d9cedb68b0807bbaa70aad88de3e53b112"
+    }
+  },
+  "brain": {
+    "fitPolicyVersion": "fit_philosophy_policy_v1",
+    "fitPromptVersion": "fit_philosophy_prompt_v1_fit_philosophy_policy_v1_instruction_v2",
+    "qualificationModels": [
+      "canonical-qualification-v1",
+      "canonical-qualification-v2-kg"
+    ],
+    "preferenceModel": "regularized-bradley-terry-logistic",
+    "outcomeModel": "regularized-outcome-logistic",
+    "llmScoringModel": "deepseek-v4-pro",
+    "alternateLlmScoringModel": "gemini-3.1-pro-preview",
+    "embeddingModel": "text-embedding-3-large",
+    "decisionPolicies": {
+      "status": "draft",
+      "count": 14,
+      "rowSetSha256": "fcd1f5b32f9c6ee93030c94f4e6e5ac5f3917ee657ef34f7e992083b0811f20b",
+      "atsCanaryCandidate": {
+        "policyVersion": "canonical-v7-ats-20260712",
+        "kgVersion": "9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e",
+        "labelSnapshot": "951f869d6cca89c2b68dd8e88e1a072fced814b3086df11742a267a2f554d42a",
+        "pairwiseSnapshot": "9a87d1cadd836095f7c8c6cc3a7a965f49ef097a3b818ac05de41e84fb4b0cbd",
+        "outcomeSnapshot": "ddc78264cd2814771f68d1136179b1377f86966da6a6c14c738dad43de75f132"
+      },
+      "linkedinCanaryCandidate": {
+        "policyVersion": "canonical-v7-linkedin-20260712",
+        "kgVersion": "9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e",
+        "labelSnapshot": "d6b104672b91b92cd83232cc482fb568ed1dfec74ce7e00ff7e0e058cbb0919a",
+        "pairwiseSnapshot": "a3d99fcc9775ab6cca78f533d8425a49069cd85fbb71425884d7d55808d8b457",
+        "outcomeSnapshot": "b4309156d702da560844f8c6a413746461d1b09a0c29b134e3c5f41eecd9bb92"
+      }
+    }
+  },
+  "artifacts": {
+    "distribution": "external-content-addressed-bootstrap-required",
+    "sourceRoot": "C:\\Users\\JStal\\OneDrive\\Documents\\New project 9",
+    "sourceCheckout": "primary-repo-sync-checkout",
+    "ignoredByGit": true,
+    "files": [
+      {"role":"artifact_manifest","path":"data/review/applypilot-artifact-manifest.json","bytes":2316,"sha256":"ce707879a9079aaae96da8507c1db974a2f094a35d866f2ab262ffe87a096c79"},
+      {"role":"knowledge_graph","path":"data/applypilot_kg/knowledge_graph.json","bytes":3766105,"sha256":"9201805479fee6510d0f9f1973c0b7a453af76752828988f4de690ab68ddfd9e"},
+      {"role":"compact_knowledge_graph","path":"data/applypilot_kg/compact/compact_knowledge_graph.json","bytes":485869,"sha256":"91345970988cc8b99ea6d7e8340e976f414c14fd092ba6973c81946d566bd10e"},
+      {"role":"compact_kg_prompt_pack","path":"data/applypilot_kg/compact/compact_kg_prompt_pack.md","bytes":27180,"sha256":"6a0f2a68c70ca264568accd75617cf7daba83da6f376d4faa0f8e32f2d4404d3"},
+      {"role":"compact_canonical_facts","path":"data/applypilot_kg/compact/compact_canonical_facts.json","bytes":60793,"sha256":"b77e4ad9f73ddd8c80e14fe6f1c3d57fc961b06e72142de5e2dce3fc66922d5f"},
+      {"role":"compact_gap_signals","path":"data/applypilot_kg/compact/compact_gap_signals.json","bytes":29059,"sha256":"992d84f28f3befc2aba12874087c2fae7d897ba41b52d68ca668d94933c64dcc"},
+      {"role":"fitmap_observations","path":"data/applypilot_kg/fitmap_observations.jsonl","bytes":1879663,"sha256":"cef07ddc5955685fb517140da9913d83e72eeda1da3bbb1d2149eaff1046b592"},
+      {"role":"preference_profile","path":"data/review/applypilot-preference-profile.json","bytes":43921,"sha256":"705141f353431281e1c6aef13e00eef23ed0aa1501e63dac4d38b46987a5cb40"},
+      {"role":"pairwise_annotations","path":"data/review/applypilot-pairwise-annotation.jsonl","bytes":47330,"sha256":"a6109ab2a3b12bc3dd509e87a5ab534b246664d2a7c70044826c43b637cd064a"},
+      {"role":"pairwise_queue","path":"data/review/applypilot-pairwise-queue.json","bytes":835599,"sha256":"5e35406407e194eda5313e68c4d88916507d2416d8383180f9ffa09a8cdb52ff"},
+      {"role":"canonical_all_label_events","path":"data/review/applypilot-canonical-all-label-events.jsonl","bytes":2849926,"sha256":"0320572bc039ee01e8527c0d8125fda32d0bddef8f7cf2a2008e6d102f1cc1ac"},
+      {"role":"label_learning_corpus","path":"data/applypilot_kg/label_learning/label-corpus-latest.jsonl","bytes":8210720,"sha256":"3a76555bd8cb4cb39d1cf5495cc50ee41769a0fe731eea33c28f5e98fe7d312f"},
+      {"role":"label_learning_summary","path":"data/applypilot_kg/label_learning/label-corpus-summary-latest.json","bytes":506,"sha256":"31caeaf253e3a847c835f5f65340955012bb8055ed7211007eb3f43536e7dff4"}
+    ]
+  },
+  "canonicalSqliteSource": {
+    "path": "C:\\Users\\JStal\\AppData\\Local\\ApplyPilot\\applypilot.db",
+    "bytes": 7813488640,
+    "sha256": "02344457781051085c43ade3e55cadd2e0497f849183560272449a505f6afd2c",
+    "quickCheck": "ok",
+    "schemaVersion": 64,
+    "receipt": {
+      "path": "docs/superpowers/evidence/2026-07-16-distributed-consolidation/canonical-sqlite-source-receipt-2026-07-16.json",
+      "bytes": 823,
+      "sha256": "9d956de43af0e0a90f8778517dad93997607f35e21860acc063edc782375bbef"
+    }
+  },
+  "postgresParity": {
+    "database": "applypilot_brain_clean_20260717_v2",
+    "status": "completed",
+    "finalizedAt": "2026-07-17T09:50:44.299835Z",
+    "quarantines": 0,
+    "paritySetCount": 16,
+    "receipt": {
+      "path": "docs/superpowers/evidence/2026-07-16-distributed-consolidation/staging-brain-clean-import-parity-2026-07-17.json",
+      "bytes": 3020,
+      "sha256": "11fdd50f4a351b5a6d83eb3b918393bc9ec7f11c937b7072482dfb4d460dbdd4"
+    }
+  },
+  "deployment": {
+    "railwayProject": "applypilot-staging",
+    "projectId": "c957494a-5ab9-4adb-afa6-f52db9eb5bff",
+    "environmentId": "0569ca02-8b95-4ce9-beb7-7fde7cf2d711",
+    "postgresServiceId": "aa551e4f-51fa-49df-b02c-a45e3ea22fd1",
+    "workerServiceId": "9cba7353-f17a-474c-9660-1ec0a7fd9ca8",
+    "postgresVolumeId": "02dee98b-ef6e-4314-ba1e-579b4ef75812",
+    "workerVolumeId": "4eaef62a-8070-4954-82ad-cb574e889b5c",
+    "liveBrainSchemaVersions": [1, 2],
+    "liveBrainSchemaV2Verified": true,
+    "brainStatusPrincipal": "brain_status_operator",
+    "brainControllerPrincipal": "brain_policy_operator"
+  },
+  "verification": {
+    "typescript": {
+      "typecheck": "passed",
+      "testFilesPassed": 223,
+      "testsPassed": 1944,
+      "testsFailed": 0
+    },
+    "python": {
+      "focusedBrainTestsPassed": 108,
+      "disposableRealPostgresTestsPassed": 45,
+      "ruffFocused": "passed"
+    }
+  },
+  "guardrails": {
+    "lanesPaused": true,
+    "zeroFleetLeasesProvenForRelease": false,
+    "principalValidationProven": true,
+    "workerVersionIdentityProven": false,
+    "atsCanaryEnabled": false,
+    "linkedinCanaryEnabled": false,
+    "productionTouched": false
+  },
+  "promotionBlockers": [
+    "Bootstrap every ignored artifact from its pinned source bytes into staging storage and verify byte length plus SHA-256.",
+    "Correct or supersede the historical staging asset receipt whose preference-profile digest is malformed.",
+    "Validate and activate separate ATS and LinkedIn policy versions only after replay and canary evidence.",
+    "Upgrade and bind GGGTower and Tarpon to separate cloud worker principals while all apply lanes remain paused.",
+    "Prove exact RC2 heartbeat identity and zero leases after the node fleet is rebound to Railway Postgres.",
+    "Build and bind the deployable image digest.",
+    "Run separate ATS and LinkedIn canaries before database or fleet promotion.",
+    "Create and verify the combined release tag after this manifest and its SHA-256 sidecar are committed."
+  ]
+}

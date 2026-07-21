@@ -841,7 +841,65 @@ class _FileIdentity:
     @classmethod
     def read(cls, path: Path) -> _FileIdentity:
         stat = path.stat()
+        if os.name == "nt":
+            mtime_ns, change_time_ns = _windows_file_times_ns(path)
+            return cls(stat.st_dev, stat.st_ino, stat.st_size, mtime_ns, change_time_ns)
         return cls(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _windows_file_times_ns(path: Path) -> tuple[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileBasicInformation(ctypes.Structure):
+        _fields_ = [
+            ("creation_time", ctypes.c_longlong),
+            ("last_access_time", ctypes.c_longlong),
+            ("last_write_time", ctypes.c_longlong),
+            ("change_time", ctypes.c_longlong),
+            ("file_attributes", wintypes.DWORD),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel.GetFileInformationByHandleEx
+    get_information.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(path),
+        0x0080,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "cannot identify immutable snapshot", str(path))
+    try:
+        information = FileBasicInformation()
+        if not get_information(handle, 0, ctypes.byref(information), ctypes.sizeof(information)):
+            raise OSError(ctypes.get_last_error(), "cannot identify immutable snapshot", str(path))
+        windows_epoch_offset = 116_444_736_000_000_000
+        return (
+            (information.last_write_time - windows_epoch_offset) * 100,
+            (information.change_time - windows_epoch_offset) * 100,
+        )
+    finally:
+        close_handle(handle)
 
 
 @dataclass(frozen=True, slots=True)

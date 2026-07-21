@@ -612,6 +612,24 @@ CREATE TABLE IF NOT EXISTS workers (
     revoked_at    TIMESTAMPTZ
 );
 
+-- fleet_desired_state is the single declarative actuator input for worker
+-- enrollment.  Admission requires this table even while the fleet is paused;
+-- desired_workers stays positive so a paused worker can heartbeat and prove
+-- identity without receiving a lease.
+CREATE TABLE IF NOT EXISTS fleet_desired_state (
+    machine_owner TEXT PRIMARY KEY,
+    desired_workers INTEGER NOT NULL DEFAULT 0 CHECK (desired_workers >= 0),
+    agent TEXT NOT NULL,
+    model TEXT NOT NULL,
+    generation BIGINT NOT NULL DEFAULT 0,
+    updated_by TEXT NOT NULL DEFAULT 'schema-bootstrap',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_desired_state_freshness
+    ON fleet_desired_state (updated_at);
+ALTER TABLE fleet_desired_state
+    ALTER COLUMN updated_by SET DEFAULT 'schema-bootstrap';
+
 -- ---------------------------------------------------------------------------
 -- worker_heartbeat: fleet health substrate (R5, R7). Updated ~every 20s.
 -- ---------------------------------------------------------------------------
@@ -1008,6 +1026,20 @@ CREATE TABLE IF NOT EXISTS public.fleet_worker_principals (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_fleet_worker_principals_worker_contract
     ON public.fleet_worker_principals(worker_id, contract);
+
+-- Admission is SECURITY DEFINER and is created by the migration principal.
+-- Grant that principal read access to its snapshot inputs; worker login roles
+-- never receive direct table access and continue to use the function boundary.
+DO $$
+BEGIN
+    EXECUTE format(
+        'GRANT SELECT ON public.fleet_worker_principals, public.workers, '
+        'public.worker_heartbeat, public.fleet_config, public.apply_queue TO %I',
+        current_user
+    );
+    EXECUTE format('GRANT SELECT, UPDATE ON public.fleet_desired_state TO %I', current_user);
+END
+$$;
 
 CREATE OR REPLACE FUNCTION public.fleet_worker_mark_browser_interaction()
 RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER

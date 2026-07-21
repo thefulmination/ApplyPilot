@@ -124,9 +124,38 @@ jobs:
       - name: Lint
         run: ruff check src/
 
+      - name: Mark disposable PostgreSQL service
+        env:
+          APPLYPILOT_PGTEST_DSN: postgresql://postgres:applypilot-ci-test-only@127.0.0.1:5432/postgres
+          APPLYPILOT_PGTEST_CLUSTER_MARKER: ci-${{ github.run_id }}-${{ matrix.python-version }}
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          from psycopg import sql
+
+          dsn = os.environ["APPLYPILOT_PGTEST_DSN"]
+          nonce = os.environ["APPLYPILOT_PGTEST_CLUSTER_MARKER"]
+          with psycopg.connect(dsn) as connection:
+              connection.execute(
+                  "COMMENT ON DATABASE postgres IS 'applypilot:disposable-postgres-test-database:v1'"
+              )
+              connection.execute(
+                  "CREATE ROLE applypilot_disposable_cluster_marker "
+                  "NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+              )
+              connection.execute(
+                  sql.SQL("COMMENT ON ROLE applypilot_disposable_cluster_marker IS {}").format(
+                      sql.Literal("applypilot:disposable-postgres-test-cluster:v1:" + nonce)
+                  )
+              )
+          PY
+
       - name: Test
         env:
           APPLYPILOT_PGTEST_DSN: postgresql://postgres:applypilot-ci-test-only@127.0.0.1:5432/postgres
+          APPLYPILOT_PGTEST_DISPOSABLE: "1"
+          APPLYPILOT_PGTEST_CLUSTER_MARKER: ci-${{ github.run_id }}-${{ matrix.python-version }}
         run: >-
           pytest tests/ -v
           --ignore=tests/test_emergency_legacy_authority_containment.py

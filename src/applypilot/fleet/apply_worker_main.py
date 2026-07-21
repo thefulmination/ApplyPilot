@@ -16,6 +16,7 @@ import threading
 import time
 
 from applypilot.fleet import emergency_admission
+from applypilot.fleet.browser_host_guard import require_enrolled_browser_host
 from applypilot.fleet.version import worker_version
 
 logger = logging.getLogger("applypilot.fleet.apply_worker_main")
@@ -871,7 +872,7 @@ def run_apply(conn_factory, loop, *, max_iterations=None, idle_sleep=5.0,
     return counts
 
 
-def enforce_host_identity(machine_owner, *, env=None) -> None:
+def enforce_host_identity(machine_owner, *, public_ip, env=None) -> None:
     """Refuse to run a worker that belongs to a DIFFERENT machine than this box.
 
     Each box declares its own fleet identity in APPLYPILOT_FLEET_LABEL (set once per box:
@@ -883,22 +884,11 @@ def enforce_host_identity(machine_owner, *, env=None) -> None:
 
     Unknown or incomplete identity is not enrolled and must fail closed.
     """
-    env = os.environ if env is None else env
-    box = (env.get("APPLYPILOT_FLEET_LABEL") or "").strip()
-    owner = (machine_owner or "").strip()
-    if not box:
-        raise SystemExit(
-            "host-identity guard: APPLYPILOT_FLEET_LABEL is not set; refusing unenrolled worker"
-        )
-    if not owner:
-        raise SystemExit("host-identity guard: machine-owner is missing; refusing unenrolled worker")
-    if owner and owner.lower() != box.lower():
-        raise SystemExit(
-            f"host-identity guard: this box is '{box}' but was asked to run "
-            f"machine-owner '{owner}' workers -- refusing cross-host spawn. "
-            f"(e.g. m2/TARPON workers must never run on the home box.) Start this "
-            f"agent/worker on the '{owner}' box, or correct the label to '{box}'."
-        )
+    require_enrolled_browser_host(
+        machine_owner=machine_owner,
+        public_ip=public_ip,
+        env=env,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -930,11 +920,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:  # pragma: no cover - long-running
     args = build_parser().parse_args(argv)
-    if not args.dsn:
-        raise SystemExit("set --dsn or FLEET_PG_DSN")
     # Defense-in-depth: refuse to physically host another machine's workers (the fleet-agent
     # / run-fleet-worker launchers early-reject too, but this backstops manual + SSH launches).
-    enforce_host_identity(args.machine_owner)
+    enforce_host_identity(args.machine_owner, public_ip=args.home_ip)
+    if not args.dsn:
+        raise SystemExit("set --dsn or FLEET_PG_DSN")
     slot = _chrome_slot(args.worker_id, args.chrome_slot)
     from applypilot.apply import launcher, pgqueue
     from applypilot.fleet.agent_switch import AgentSwitcher
